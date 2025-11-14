@@ -1,0 +1,8 @@
+[target.thumbv7em-none-eabihf]
+linker = "rust-lld"
+rustflags = [
+  "-C", "link-arg=-Wl,--gc-sections",
+  "-C", "link-arg=-Wl,--icf=all",
+  "-C", "link-arg=-Wl,--print-gc-sections",
+  "-C", "link-arg=-Wl,-Map=firmware.map",
+]

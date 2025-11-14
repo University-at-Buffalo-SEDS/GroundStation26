@@ -1,0 +1,262 @@
+// tests/rust-system-test/single_threaded_test.rs
+#[cfg(test)]
+mod single_threaded_test {
+    use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
+    use sedsprintf_rs_2026::router::{BoardConfig, Clock, EndpointHandler, Router};
+    use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
+    use sedsprintf_rs_2026::TelemetryResult;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, TryRecvError};
+    use std::sync::Arc;
+
+
+    /// Clock that always returns 0
+    fn zero_clock() -> Box<dyn Clock + Send + Sync> {
+        Box::new(|| 0u64)
+    }
+
+    /// Simulated node in the Rust system test (single-threaded).
+    struct SimNode {
+        router: Router,
+        radio_hits: Arc<AtomicUsize>,
+        sd_hits: Arc<AtomicUsize>,
+    }
+
+    /// Build a handler that counts packets received on the Radio endpoint.
+    fn make_radio_handler(counter: Arc<AtomicUsize>) -> EndpointHandler {
+        EndpointHandler::new_packet_handler(DataEndpoint::GroundStation, move |_pkt: &TelemetryPacket| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    /// Build a handler that counts packets received on the SdCard endpoint.
+    fn make_sd_handler(counter: Arc<AtomicUsize>) -> EndpointHandler {
+        EndpointHandler::new_packet_handler(DataEndpoint::SdCard, move |_pkt: &TelemetryPacket| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    /// Helper to generate a simple float series like the C helper `make_series`.
+    fn make_series(buf: &mut [f32], base: f32) {
+        for (i, v) in buf.iter_mut().enumerate() {
+            *v = base + (i as f32) * 0.25;
+        }
+    }
+
+    /// Build a packet with endpoints [SD_CARD, Radio], mirroring the C system.
+    fn make_packet(ty: DataType, vals: &[f32], ts: u64) -> TelemetryPacket {
+        TelemetryPacket::from_f32_slice(
+            ty,
+            vals,
+            &[DataEndpoint::SdCard, DataEndpoint::GroundStation],
+            ts,
+        )
+        .unwrap()
+    }
+
+    /// Single-threaded stress test to profile router performance.
+    ///
+    /// This is intentionally heavy; run it explicitly (e.g. with cargo-flamegraph).
+    #[test]
+    fn single_threaded_router_stress() {
+        // ---------- 1) Shared bus (no bus thread) ----------
+        type BusMsg = (usize, Vec<u8>);
+        let (bus_tx, bus_rx) = mpsc::channel::<BusMsg>();
+
+        // ---------- 2) Build nodes (same topology as threaded test) ----------
+        //
+        // Node 0: "Radio Board" (radio_hits via Radio endpoint)
+        // Node 1: "Flight Controller Board" (sd_hits via SdCard endpoint)
+        // Node 2: "Power Board" (no local endpoints)
+        let mut nodes: Vec<SimNode> = Vec::new();
+
+        for (idx, _name) in ["Radio Board", "Flight Controller Board", "Power Board"]
+            .iter()
+            .enumerate()
+        {
+            let radio_hits = Arc::new(AtomicUsize::new(0));
+            let sd_hits = Arc::new(AtomicUsize::new(0));
+
+            let mut handlers = Vec::<EndpointHandler>::new();
+            match idx {
+                // Radio Board: only "radio" is local
+                0 => {
+                    handlers.push(make_radio_handler(radio_hits.clone()));
+                }
+                // Flight Controller Board: only "SD card" is local
+                1 => {
+                    handlers.push(make_sd_handler(sd_hits.clone()));
+                }
+                // Power Board: no local endpoints
+                _ => {}
+            }
+
+            let clock = zero_clock();
+
+            // tx: push a copy of the wire bytes onto the bus with source id
+            let tx = {
+                let bus_tx = bus_tx.clone();
+                move |bytes: &[u8]| -> TelemetryResult<()> {
+                    bus_tx.send((idx, bytes.to_vec())).unwrap();
+                    Ok(())
+                }
+            };
+
+            let router = if handlers.is_empty() {
+                Router::new::<_>(Some(tx), BoardConfig::default(), clock)
+            } else {
+                Router::new(Some(tx), BoardConfig::new(handlers), clock)
+            };
+
+            nodes.push(SimNode {
+                router,
+                radio_hits,
+                sd_hits,
+            });
+        }
+
+        // ---------- 3) Stress loop: single-threaded send + route + process ----------
+        //
+        // Each iteration:
+        //   A: GPS
+        //   B: GYRO + BARO
+        //   C: BATTERY + MESSAGE
+        // → 5 packets / iteration, all with [SD_CARD, Radio] endpoints.
+        //
+        // Crank this up for heavier profiling if you like.
+        const ITERS: usize = 10_000;
+        const PACKETS_PER_ITER: usize = 5;
+
+        let mut gps_buf = [0.0_f32; 8];
+        let mut gyro_buf = [0.0_f32; 8];
+        let mut baro_buf = [0.0_f32; 8];
+        let mut batt_buf = [0.0_f32; 8];
+        let msg = "hello world!";
+
+        for i in 0..ITERS {
+            // --- Sender A (radio board) ---
+            {
+                let node = &mut nodes[0];
+                make_series(&mut gps_buf[..2], 10.0);
+                let pkt = make_packet(DataType::GpsData, &gps_buf[..2], i as u64);
+                node.router.transmit_message(&pkt).unwrap();
+            }
+
+            // --- Sender B (flight controller) ---
+            {
+                let node = &mut nodes[1];
+
+                // "gyro"
+                make_series(&mut gyro_buf[..2], 0.5);
+                let pkt1 = make_packet(DataType::GpsData, &gyro_buf[..2], (i + 10_000) as u64);
+                node.router.transmit_message(&pkt1).unwrap();
+
+                // "barometer"
+                make_series(&mut baro_buf[..2], 101.3);
+                let pkt2 = make_packet(DataType::GpsData, &baro_buf[..2], (i + 20_000) as u64);
+                node.router.transmit_message(&pkt2).unwrap();
+            }
+
+            // --- Sender C (power board) ---
+            {
+                let node = &mut nodes[2];
+
+                // battery
+                make_series(&mut batt_buf[..1], 3.7);
+                let pkt1 =
+                    make_packet(DataType::BatteryVoltage, &batt_buf[..1], (i + 30_000) as u64);
+                node.router.transmit_message(&pkt1).unwrap();
+
+                // message as bytes
+                let pkt2 = TelemetryPacket::from_u8_slice(
+                    DataType::TelemetryError,
+                    msg.as_bytes(),
+                    &[DataEndpoint::SdCard, DataEndpoint::GroundStation],
+                    (i + 40_000) as u64,
+                )
+                .unwrap();
+                node.router.transmit_message(&pkt2).unwrap();
+            }
+
+            // --- Deliver all bus frames for this iteration ---
+            loop {
+                match bus_rx.try_recv() {
+                    Ok((from, frame)) => {
+                        for (idx, node) in nodes.iter_mut().enumerate() {
+                            if idx == from {
+                                continue; // no loopback
+                            }
+                            node.router
+                                .rx_serialized_packet_to_queue(&frame)
+                                .expect("rx_serialized_packet_to_queue failed");
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        panic!("bus channel disconnected unexpectedly");
+                    }
+                }
+            }
+
+            // --- Process all routers to completion (timeout = 0) ---
+            for node in nodes.iter_mut() {
+                node.router
+                    .process_all_queues_with_timeout(0)
+                    .expect("process_all_queues_with_timeout failed");
+            }
+        }
+
+        // ---------- 4) Final drain just in case ----------
+        for _ in 0..10 {
+            // drain any leftover bus frames
+            loop {
+                match bus_rx.try_recv() {
+                    Ok((from, frame)) => {
+                        for (idx, node) in nodes.iter_mut().enumerate() {
+                            if idx == from {
+                                continue;
+                            }
+                            node.router
+                                .rx_serialized_packet_to_queue(&frame)
+                                .expect("rx_serialized_packet_to_queue failed in final drain");
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+
+            // and process routers
+            for node in nodes.iter_mut() {
+                node.router
+                    .process_all_queues_with_timeout(0)
+                    .expect("process_all_queues_with_timeout failed in final drain");
+            }
+        }
+
+        // ---------- 5) Assertions (scaled by ITERS) ----------
+        let expected_total = ITERS * PACKETS_PER_ITER;
+
+        let radio_board = &nodes[0];
+        let flight_board = &nodes[1];
+        let power_board = &nodes[2];
+
+        let a_radio = radio_board.radio_hits.load(Ordering::SeqCst);
+        let b_sd = flight_board.sd_hits.load(Ordering::SeqCst);
+        let c_radio = power_board.radio_hits.load(Ordering::SeqCst);
+        let c_sd = power_board.sd_hits.load(Ordering::SeqCst);
+
+        println!(
+            "single-threaded: A.radio_hits={}, B.sd_hits={}, C.radio_hits={}, C.sd_hits={}",
+            a_radio, b_sd, c_radio, c_sd
+        );
+
+        assert_eq!(a_radio, expected_total, "Radio Board hit count");
+        assert_eq!(b_sd, expected_total, "Flight Controller SD hit count");
+        assert_eq!(c_radio, 0, "Power Board must not have a radio handler");
+        assert_eq!(c_sd, 0, "Power Board must not have an SD handler");
+    }
+}

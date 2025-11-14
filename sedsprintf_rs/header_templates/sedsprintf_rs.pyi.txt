@@ -1,0 +1,159 @@
+# sedsprintf_rs.pyi
+
+# =============================
+# Auto-generated Python type stubs for sedsprintf_rs. DO NOT EDIT AS CHANGES WILL BE OVERWRITTEN.
+# =============================
+from __future__ import annotations
+
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, List, Dict, overload
+from typing import Literal
+from enum import IntEnum
+from collections.abc import Buffer  # Python 3.12 buffer protocol typing
+
+
+# ==============================
+# Public enums / constants (parity with C header)
+# ==============================
+
+from enum import IntEnum
+
+/* {{AUTOGEN:PY_ENUMS}} */
+
+class ElemKind(IntEnum):
+    """Element kind for generic logging (C API parity)."""
+    UNSIGNED: int  #: Unsigned integers (u8/u16/u32/u64).
+    SIGNED: int    #: Signed integers (i8/i16/i32/i64).
+    FLOAT: int     #: Floating-point (f32/f64).
+
+
+# ==============================
+# Callback protocols (informal)
+# ==============================
+
+TxCallback = Callable[[bytes], None]
+"""Transmit callback. Must raise on failure to signal an I/O error."""
+
+NowMsCallback = Callable[[], int]
+"""Clock callback returning monotonic milliseconds."""
+
+PacketHandler = Callable[["Packet"], None]
+"""Endpoint handler invoked with a decoded Packet."""
+
+SerializedHandler = Callable[[bytes], None]
+"""Endpoint handler invoked with raw serialized packet bytes."""
+
+
+# ==============================
+# Packet object (immutable view of a telemetry packet)
+# ==============================
+
+class Packet:
+    """
+    Immutable, heap-backed telemetry packet.
+
+    Attributes:
+        ty:           DataType as an int (use DataType(...) to coerce).
+        data_size:    Declared schema payload size (bytes).
+        sender:       Sender string from the packet header.
+        endpoints:    List of DataEndpoint values as ints.
+        timestamp_ms: Packet timestamp in milliseconds (u64).
+        payload:      Raw payload bytes (already validated for size/schema).
+    """
+
+    @property
+    def ty(self) -> int: ...
+    @property
+    def data_size(self) -> int: ...
+    @property
+    def sender(self) -> str: ...
+    @property
+    def endpoints(self) -> List[int]: ...
+    @property
+    def timestamp_ms(self) -> int: ...
+    @property
+    def payload(self) -> bytes: ...
+
+    def header_string(self) -> str: ...
+    def __str__(self) -> str: ...
+    def wire_size(self) -> int: ...
+    def serialize(self) -> bytes: ...
+
+
+# ==============================
+# Router (lifecycle, logging, queues)
+# ==============================
+
+class Router:
+    """
+    Packet router.
+
+    __init__(tx=None, now_ms=None, handlers=None)
+        tx:        Optional transmit callback: (bytes) -> None
+        now_ms:    Optional monotonic clock callback: () -> int (ms)
+        handlers:  Optional list of tuples, each:
+                   (endpoint: int,
+                    packet_handler: Optional[Callable[[Packet], None]],
+                    serialized_handler: Optional[Callable[[bytes], None]])
+    """
+
+    def __init__(
+        self,
+        tx: Optional[TxCallback] = ...,
+        now_ms: Optional[NowMsCallback] = ...,
+        handlers: Optional[
+            Sequence[Tuple[int, Optional[PacketHandler], Optional[SerializedHandler]]]
+        ] = ...,
+    ) -> None: ...
+
+    def log_bytes(
+        self,
+        ty: int,
+        data: Buffer | bytes | bytearray | memoryview,
+        timestamp_ms: Optional[int] = ...,
+        queue: bool = ...,
+    ) -> None: ...
+
+    def log_f32(
+        self,
+        ty: int,
+        values: Sequence[float] | Buffer | bytes | bytearray | memoryview,
+        timestamp_ms: Optional[int] = ...,
+        queue: bool = ...,
+    ) -> None: ...
+
+    def log(
+        self,
+        ty: int,
+        data: Buffer | bytes | bytearray | memoryview | str,
+        elem_size: Literal[1, 2, 4, 8],
+        elem_kind: Literal[ElemKind.UNSIGNED, ElemKind.SIGNED, ElemKind.FLOAT, 0, 1, 2],
+        timestamp_ms: Optional[int] = ...,
+        queue: bool = ...,
+    ) -> None: ...
+
+    def receive_serialized(self, data: Buffer | bytes | bytearray | memoryview) -> None: ...
+    def process_send_queue(self) -> None: ...
+    def process_received_queue(self) -> None: ...
+    def process_all_queues(self) -> None: ...
+    def clear_rx_queue(self) -> None: ...
+    def clear_tx_queue(self) -> None: ...
+    def clear_queues(self) -> None: ...
+
+    def process_tx_queue_with_timeout(self, timeout_ms: int) -> None: ...
+    def process_rx_queue_with_timeout(self, timeout_ms: int) -> None: ...
+    def process_all_queues_with_timeout(self, timeout_ms: int) -> None: ...
+
+
+# ==============================
+# Top-level helpers
+# ==============================
+
+def deserialize_packet_py(data: Buffer | bytes | bytearray | memoryview) -> Packet: ...
+def peek_header_py(data: Buffer | bytes | bytearray | memoryview) -> Dict[str, Any]: ...
+def make_packet(
+    ty: int,
+    sender: str,
+    endpoints: Sequence[int],
+    timestamp_ms: int,
+    payload: Buffer | bytes | bytearray | memoryview,
+) -> Packet: ...
