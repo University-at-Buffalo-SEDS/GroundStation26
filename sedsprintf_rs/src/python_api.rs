@@ -774,7 +774,7 @@ pub fn make_packet(
 ///
 /// The module name is `sedsprintf_rs` on the Python side.
 #[pymodule]
-pub fn sedsprintf_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn sedsprintf_rs_2026(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // === Classes ===
     m.add_class::<PyRouter>()?;
     m.add_class::<PyPacket>()?;
