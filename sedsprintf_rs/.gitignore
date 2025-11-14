@@ -14,4 +14,6 @@ c-example-code/build/
 
 C-Headers/sedsprintf.h
 
-python-files/sedsprintf_rs.pyi
+python-files/sedsprintf_rs_2026/sedsprintf_rs_2026.pyi
+
+sedsprintf_rs.cpython-312-darwin.so

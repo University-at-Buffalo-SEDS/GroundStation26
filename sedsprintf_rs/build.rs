@@ -189,7 +189,8 @@ fn generate_pyi_stub() {
     // Write to an importable location inside the crate workspace
     let out_pyi = PathBuf::from(&crate_dir)
         .join("python-files")
-        .join("sedsprintf_rs.pyi");
+        .join("sedsprintf_rs_2026")
+        .join("sedsprintf_rs_2026.pyi");
     fs::create_dir_all(out_pyi.parent().unwrap()).expect("create python_bindings/");
     fs::write(&out_pyi, final_text).unwrap_or_else(|e| panic!("write {}: {e}", out_pyi.display()));
 }
