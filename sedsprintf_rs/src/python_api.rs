@@ -26,7 +26,7 @@ use alloc::{boxed::Box, string::String, sync::Arc as AArc, vec::Vec};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyTuple};
-use std::sync::{Arc as SArc, Mutex};
+use std::sync::{Arc as SArc, Mutex, OnceLock};
 
 use crate::{
     config::DataEndpoint, get_needed_message_size, message_meta, router::{BoardConfig, Clock, EndpointHandler, LeBytes, Router},
@@ -38,6 +38,9 @@ use crate::{
     MAX_VALUE_DATA_ENDPOINT,
     MAX_VALUE_DATA_TYPE,
 };
+
+static GLOBAL_ROUTER_SINGLETON: OnceLock<SArc<Mutex<Router>>> = OnceLock::new();
+
 
 // ============================================================================
 //  Shared helpers / constants
@@ -218,6 +221,86 @@ pub struct PyRouter {
 
 #[pymethods]
 impl PyRouter {
+
+
+    // ------------------------------------------------------------------------
+    //  Singleton construction
+    // ------------------------------------------------------------------------
+
+    /// Create or retrieve a per-process singleton Router.
+    ///
+    /// This creates a Router with:
+    ///   - no clock (timestamp=0 unless you pass explicit timestamps),
+    ///   - no endpoint handlers,
+    ///   - an optional TX callback.
+    ///
+    /// The first call initializes the singleton. Subsequent calls return
+    /// another `PyRouter` object wrapping the same underlying Router.
+    ///
+    /// If you pass a non-None `tx` after the singleton is already created,
+    /// an error is raised (the TX callback cannot be changed once set).
+    #[staticmethod]
+    #[pyo3(signature = (tx=None))]
+    fn new_singleton(py: Python<'_>, tx: Option<Py<PyAny>>) -> PyResult<Self> {
+        // Fast path: if singleton already exists, reuse it.
+        if let Some(existing) = GLOBAL_ROUTER_SINGLETON.get() {
+            // Once the singleton is created, its TX callback is fixed.
+            if tx.is_some() {
+                return Err(PyRuntimeError::new_err(
+                    "Router singleton already exists; TX callback cannot be changed",
+                ));
+            }
+
+            // We still return a fresh PyRouter wrapper, but sharing the same inner Arc.
+            return Ok(PyRouter {
+                inner: existing.clone(),
+                _tx_cb: None,
+                _pkt_cbs: Vec::new(),
+                _ser_cbs: Vec::new(),
+            });
+        }
+
+        // First-time initialization: build TX closure (if any).
+        let tx_keep = tx.as_ref().map(|p| p.clone_ref(py));
+        let tx_for_closure = tx_keep.as_ref().map(|p| p.clone_ref(py));
+
+        let transmit = if let Some(cb) = tx_for_closure {
+            Some(move |bytes: &[u8]| -> TelemetryResult<()> {
+                Python::attach(|py| {
+                    let arg = PyBytes::new(py, bytes);
+                    match cb.call1(py, (&arg,)) {
+                        Ok(_) => Ok(()),
+                        Err(err) => {
+                            err.restore(py);
+                            Err(TelemetryError::Io("tx error"))
+                        }
+                    }
+                })
+            })
+        } else {
+            None
+        };
+
+        // No clock callback; timestamp will be 0 unless you pass explicit ts.
+        let clock = PyClock { cb: None };
+
+        // No endpoint handlers for the singleton variant.
+        let cfg = BoardConfig::new(Vec::new());
+
+        let router = Router::new(transmit, cfg, Box::new(clock));
+        let arc = SArc::new(Mutex::new(router));
+
+        // Store as the global singleton (should succeed since we just checked).
+        let _ = GLOBAL_ROUTER_SINGLETON.set(arc.clone());
+
+        Ok(PyRouter {
+            inner: arc,
+            _tx_cb: tx_keep,
+            _pkt_cbs: Vec::new(),
+            _ser_cbs: Vec::new(),
+        })
+    }
+
     /// Create a new router.
     ///
     /// Parameters
