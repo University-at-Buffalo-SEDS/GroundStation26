@@ -8,7 +8,7 @@ import re
 
 # The line pattern in .gitignore you want to temporarily comment out.
 # This is treated as a literal and turned into a whole-line regex.
-PYI_IGNORE_LINE = "python-files/sedsprintf_rs/sedsprintf_rs.pyi"
+PYI_IGNORE_LINE = "python-files/sedsprintf_rs/sedsprintf_rs_2026.pyi"
 PYI_IGNORE_REGEX = re.compile(rf"^{re.escape(PYI_IGNORE_LINE)}$")
 
 
