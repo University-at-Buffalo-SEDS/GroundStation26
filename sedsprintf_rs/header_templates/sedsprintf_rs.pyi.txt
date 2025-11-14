@@ -96,6 +96,26 @@ class Router:
                     serialized_handler: Optional[Callable[[bytes], None]])
     """
 
+    @staticmethod
+    def new_singleton(tx: Optional[TxCallback] = ...,
+            now_ms: Optional[NowMsCallback] = ...,
+            handlers: Optional[
+                Sequence[Tuple[int, Optional[PacketHandler], Optional[SerializedHandler]]]
+            ] = ...,
+        ) -> "Router":
+        """
+        Create or retrieve a per-process singleton Router.
+
+        The first call creates the singleton with the given `tx` callback
+        (no clock and no endpoint handlers). Subsequent calls return another
+        Router object wrapping the same underlying singleton instance.
+
+        Passing a non-None `tx` after the singleton has already been created
+        will raise a RuntimeError.
+        """
+        ...
+
+
     def __init__(
         self,
         tx: Optional[TxCallback] = ...,

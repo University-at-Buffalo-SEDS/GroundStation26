@@ -41,7 +41,6 @@ use crate::{
 
 static GLOBAL_ROUTER_SINGLETON: OnceLock<SArc<Mutex<Router>>> = OnceLock::new();
 
-
 // ============================================================================
 //  Shared helpers / constants
 // ============================================================================
@@ -221,8 +220,6 @@ pub struct PyRouter {
 
 #[pymethods]
 impl PyRouter {
-
-
     // ------------------------------------------------------------------------
     //  Singleton construction
     // ------------------------------------------------------------------------
@@ -240,18 +237,24 @@ impl PyRouter {
     /// If you pass a non-None `tx` after the singleton is already created,
     /// an error is raised (the TX callback cannot be changed once set).
     #[staticmethod]
-    #[pyo3(signature = (tx=None))]
-    fn new_singleton(py: Python<'_>, tx: Option<Py<PyAny>>) -> PyResult<Self> {
-        // Fast path: if singleton already exists, reuse it.
+    #[pyo3(signature = (tx=None, now_ms=None, handlers=None))]
+    fn new_singleton(
+        py: Python<'_>,
+        tx: Option<Py<PyAny>>,
+        now_ms: Option<Py<PyAny>>,
+        handlers: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        // ----------------------------------------------------------
+        // 1. If the singleton already exists, return a new wrapper
+        // ----------------------------------------------------------
         if let Some(existing) = GLOBAL_ROUTER_SINGLETON.get() {
-            // Once the singleton is created, its TX callback is fixed.
-            if tx.is_some() {
+            // Prevent changing TX / clock / handlers after initialized
+            if tx.is_some() || now_ms.is_some() || handlers.is_some() {
                 return Err(PyRuntimeError::new_err(
-                    "Router singleton already exists; TX callback cannot be changed",
+                    "Router singleton already exists; cannot modify tx/now_ms/handlers",
                 ));
             }
 
-            // We still return a fresh PyRouter wrapper, but sharing the same inner Arc.
             return Ok(PyRouter {
                 inner: existing.clone(),
                 _tx_cb: None,
@@ -260,10 +263,16 @@ impl PyRouter {
             });
         }
 
-        // First-time initialization: build TX closure (if any).
-        let tx_keep = tx.as_ref().map(|p| p.clone_ref(py));
-        let tx_for_closure = tx_keep.as_ref().map(|p| p.clone_ref(py));
+        // ----------------------------------------------------------
+        // 2. FIRST CALL — build the whole router (same as __init__)
+        // ----------------------------------------------------------
 
+        // Copy callbacks to keep them alive
+        let tx_keep = tx.as_ref().map(|p| p.clone_ref(py));
+        let now_keep = now_ms.as_ref().map(|p| p.clone_ref(py));
+
+        // Build transmit callback
+        let tx_for_closure = tx_keep.as_ref().map(|p| p.clone_ref(py));
         let transmit = if let Some(cb) = tx_for_closure {
             Some(move |bytes: &[u8]| -> TelemetryResult<()> {
                 Python::attach(|py| {
@@ -281,23 +290,97 @@ impl PyRouter {
             None
         };
 
-        // No clock callback; timestamp will be 0 unless you pass explicit ts.
-        let clock = PyClock { cb: None };
+        // Build endpoint handlers (same as __init__)
+        let mut handlers_vec = Vec::new();
+        let mut keep_pkt = Vec::new();
+        let mut keep_ser = Vec::new();
 
-        // No endpoint handlers for the singleton variant.
-        let cfg = BoardConfig::new(Vec::new());
+        if let Some(hs) = handlers {
+            let list = hs.cast::<PyList>().map_err(|_| {
+                PyValueError::new_err("handlers must be list of (endpoint, pkt_cb, ser_cb) tuples")
+            })?;
 
+            for item in list.iter() {
+                let tup = item
+                    .cast::<PyTuple>()
+                    .map_err(|_| PyValueError::new_err("handler must be a 3-tuple"))?;
+                if tup.len() != 3 {
+                    return Err(PyValueError::new_err("tuple arity must be 3"));
+                }
+
+                let ep_u32: u32 = tup.get_item(0)?.extract()?;
+                let endpoint = endpoint_from_u32(ep_u32).map_err(py_err_from)?;
+
+                // Packet handler
+                if !tup.get_item(1)?.is_none() {
+                    let cb: Py<PyAny> = tup.get_item(1)?.extract()?;
+                    let cb_for_closure = cb.clone_ref(py);
+                    keep_pkt.push(cb);
+
+                    let eh = EndpointHandler::new_packet_handler(endpoint, move |pkt| {
+                        Python::attach(|py| {
+                            let py_pkt = PyPacket { inner: pkt.clone() };
+                            let any = Py::new(py, py_pkt)
+                                .map_err(|_| TelemetryError::Io("packet wrapper"))?;
+                            match cb_for_closure.call1(py, (&any,)) {
+                                Ok(_) => Ok(()),
+                                Err(err) => {
+                                    err.restore(py);
+                                    Err(TelemetryError::Io("packet handler error"))
+                                }
+                            }
+                        })
+                    });
+
+                    handlers_vec.push(eh);
+                }
+
+                // Serialized handler
+                if !tup.get_item(2)?.is_none() {
+                    let cb: Py<PyAny> = tup.get_item(2)?.extract()?;
+                    let cb_for_closure = cb.clone_ref(py);
+                    keep_ser.push(cb);
+
+                    let eh = EndpointHandler::new_serialized_handler(endpoint, move |bytes| {
+                        Python::attach(|py| {
+                            let arg = PyBytes::new(py, bytes);
+                            match cb_for_closure.call1(py, (&arg,)) {
+                                Ok(_) => Ok(()),
+                                Err(err) => {
+                                    err.restore(py);
+                                    Err(TelemetryError::Io("serialized handler error"))
+                                }
+                            }
+                        })
+                    });
+
+                    handlers_vec.push(eh);
+                }
+            }
+        }
+
+        // Build clock callback
+        let clock = PyClock {
+            cb: now_keep.as_ref().map(|p| p.clone_ref(py)),
+        };
+
+        // Build router
+        let cfg = BoardConfig::new(handlers_vec);
         let router = Router::new(transmit, cfg, Box::new(clock));
+
         let arc = SArc::new(Mutex::new(router));
 
-        // Store as the global singleton (should succeed since we just checked).
-        let _ = GLOBAL_ROUTER_SINGLETON.set(arc.clone());
+        // Store it into OnceLock
+        GLOBAL_ROUTER_SINGLETON
+            .set(arc.clone())
+            .map_err(|_existing| PyRuntimeError::new_err("Router singleton already exists"))?;
 
+        // Return wrapper
         Ok(PyRouter {
             inner: arc,
             _tx_cb: tx_keep,
-            _pkt_cbs: Vec::new(),
-            _ser_cbs: Vec::new(),
+            _pkt_cbs: keep_pkt,
+            _ser_cbs: keep_ser,
         })
     }
 
