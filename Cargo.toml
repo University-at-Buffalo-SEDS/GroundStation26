@@ -1,0 +1,14 @@
+[workspace]
+members = ["backend", "frontend", "shared"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version  = "0.1.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8.7"
+sedsprintf_rs_2026 = { git = "https://github.com/University-at-Buffalo-SEDS/sedsprintf_2026.git", branch = "main" }

@@ -1,0 +1,289 @@
+use groundstation_shared::TelemetryRow;
+use leptos::prelude::*;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::JsCast;
+use web_sys::{MessageEvent, WebSocket};
+use gloo_net::http::Request;
+
+const HISTORY_MS: i64 = 60_000 * 20; // 20 minutes
+
+#[component]
+pub fn TelemetryDashboard() -> impl IntoView {
+    // All telemetry rows
+    let (rows, set_rows) = signal(Vec::<TelemetryRow>::new());
+    // Active sensor tab
+    let (active_tab, set_active_tab) = signal("GYRO_DATA".to_string());
+
+    // Initial pull from DB
+    Effect::new({
+        let set_rows = set_rows.clone();
+        move |_| {
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(resp) = Request::get("/api/recent").send().await {
+                    if let Ok(list) = resp.json::<Vec<TelemetryRow>>().await {
+                        set_rows.set(list);
+                    }
+                }
+            });
+        }
+    });
+
+    // Live WebSocket updates
+    Effect::new({
+        let set_rows = set_rows.clone();
+        move |_| {
+            let ws = WebSocket::new("ws://localhost:3000/ws")
+                .expect("failed to create WebSocket");
+
+            let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+                if let Some(text) = event.data().as_string() {
+                    if let Ok(row) = serde_json::from_str::<TelemetryRow>(&text) {
+                        set_rows.update(|v| {
+                            v.push(row);
+                            // keep ~20 minutes of history
+                            if let Some(last) = v.last() {
+                                let cutoff = last.timestamp_ms - HISTORY_MS;
+                                v.retain(|r| r.timestamp_ms >= cutoff);
+                            }
+                        });
+                    }
+                }
+            });
+
+            ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+            onmessage.forget();
+        }
+    });
+
+    // Rows for the selected sensor type
+    let tab_rows = Signal::derive(move || {
+        let kind = active_tab.get();
+        rows.get()
+            .into_iter()
+            .filter(|r| r.data_type == kind)
+            .collect::<Vec<_>>()
+    });
+
+    // Latest row for summary cards
+    let latest_row = Signal::derive(move || tab_rows.get().last().cloned());
+
+    // Build SVG paths (single graph, 3 curves)
+    let graph_paths = Signal::derive(move || {
+        let data = tab_rows.get();
+        build_three_polyline(&data, 1200.0, 360.0)
+    });
+
+    let v0_path = Signal::derive(move || graph_paths.get().0.clone());
+    let v1_path = Signal::derive(move || graph_paths.get().1.clone());
+    let v2_path = Signal::derive(move || graph_paths.get().2.clone());
+
+    let fmt_opt = |v: Option<f32>| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "-".to_string());
+
+    view! {
+        <div style="
+            min-height: 100vh;
+            padding: 1.5rem;
+            color: #e5e7eb;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background-color: #020617;
+            display: flex;
+            flex-direction: column;
+        ">
+            <h1 style="color:#f97316; margin-bottom:1rem;">
+                "Telemetry Dashboard"
+            </h1>
+
+            {/* Top row: tabs + summary cards */}
+            <div style="
+                display:flex;
+                flex-wrap:wrap;
+                gap:1rem;
+                align-items:flex-start;
+                margin-bottom: 1rem;
+            ">
+                {/* Tabs */}
+                <nav style="display:flex; flex-wrap:wrap; gap:0.5rem;">
+                    {sensor_tab("GYRO_DATA", "Gyro", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("ACCEL_DATA", "Accel", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("BAROMETER_DATA", "Barom", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("BATTERY_VOLTAGE", "Batt V", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("BATTERY_CURRENT", "Batt I", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("GPS_DATA", "GPS", Signal::from(active_tab), set_active_tab)}
+                </nav>
+
+                {/* Summary cards */}
+                <Show
+                    when=move || latest_row.get().is_some()
+                    fallback=move || view! { <p style="color:#9ca3af; margin-left:1rem;">"Waiting for telemetry…"</p> }
+                >
+                    {move || {
+                        latest_row.get().map(|row| {
+                            view! {
+                                <div style="display:flex; gap:0.75rem; margin-left:1rem;">
+                                    <SummaryCard label="v0" value=fmt_opt(row.v0) />
+                                    <SummaryCard label="v1" value=fmt_opt(row.v1) />
+                                    <SummaryCard label="v2" value=fmt_opt(row.v2) />
+                                </div>
+                            }
+                        }).into_view()
+                    }}
+                </Show>
+            </div>
+
+            {/* BIG centered graph – main focus */}
+            <div style="
+                flex: 1;
+                display:flex;
+                align-items:center;
+                justify-content:center;
+                margin-bottom: 1.5rem;
+            ">
+                <div style="
+                    width: 100%;
+                    max-width: 1200px;
+                ">
+                    <svg
+                        viewBox="0 0 1200 360"
+                        width="100%"
+                        height="min(60vh, 420px)"
+                        style="
+                            display:block;
+                            margin:0 auto;
+                            border:1px solid #4b5563;
+                            background:#020617;
+                        "
+                    >
+                        {/* v0 = orange, v1 = cyan, v2 = lime */}
+                        <path d=move || v0_path.get() stroke="#f97316" fill="none" stroke-width="2"/>
+                        <path d=move || v1_path.get() stroke="#22d3ee" fill="none" stroke-width="2"/>
+                        <path d=move || v2_path.get() stroke="#a3e635" fill="none" stroke-width="2"/>
+                    </svg>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn SummaryCard(label: &'static str, value: String) -> impl IntoView {
+    view! {
+        <div style="
+            padding:0.75rem;
+            border-radius:0.5rem;
+            background:#0f172a;
+            border:1px solid #4b5563;
+            min-width:90px;
+        ">
+            <div style="font-size:0.75rem; color:#9ca3af;">{label}</div>
+            <div style="font-size:1.25rem;">{value}</div>
+        </div>
+    }
+}
+
+fn sensor_tab(
+    tag: &'static str,
+    label: &'static str,
+    active: Signal<String>,
+    set: WriteSignal<String>,
+) -> impl IntoView {
+    view! {
+        <button
+            style=move || {
+                if active.get() == tag {
+                    "padding:0.4rem 0.8rem; border-radius:0.5rem; \
+                     border:1px solid #f97316; background:#111827; \
+                     color:#f97316; cursor:pointer;"
+                } else {
+                    "padding:0.4rem 0.8rem; border-radius:0.5rem; \
+                     border:1px solid #4b5563; background:#020617; \
+                     color:#e5e7eb; cursor:pointer;"
+                }
+            }
+            on:click=move |_| set.set(tag.to_string())
+        >
+            {label}
+        </button>
+    }
+}
+
+/// Build three SVG path strings (v0, v1, v2) for a single graph.
+fn build_three_polyline(
+    rows: &[TelemetryRow],
+    width: f32,
+    height: f32,
+) -> (String, String, String) {
+    if rows.is_empty() {
+        return (String::new(), String::new(), String::new());
+    }
+
+    // Find min/max across all v0/v1/v2
+    let mut min_v: Option<f32> = None;
+    let mut max_v: Option<f32> = None;
+
+    for r in rows {
+        for v in [r.v0, r.v1, r.v2] {
+            if let Some(x) = v {
+                min_v = Some(min_v.map(|m| m.min(x)).unwrap_or(x));
+                max_v = Some(max_v.map(|m| m.max(x)).unwrap_or(x));
+            }
+        }
+    }
+
+    let (min_v, mut max_v) = match (min_v, max_v) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return (String::new(), String::new(), String::new()),
+    };
+
+    if (max_v - min_v).abs() < 1e-6 {
+        max_v = min_v + 1.0;
+    }
+
+    let map_y = |v: f32| height - ((v - min_v) / (max_v - min_v)) * height;
+
+    let n = rows.len().max(1) as f32;
+    let denom = (n - 1.0).max(1.0);
+
+    let mut p0 = String::new();
+    let mut p1 = String::new();
+    let mut p2 = String::new();
+
+    let mut started0 = false;
+    let mut started1 = false;
+    let mut started2 = false;
+
+    for (i, r) in rows.iter().enumerate() {
+        let x = width * (i as f32) / denom;
+
+        if let Some(v) = r.v0 {
+            let y = map_y(v);
+            if !started0 {
+                p0.push_str(&format!("M {:.2} {:.2}", x, y));
+                started0 = true;
+            } else {
+                p0.push_str(&format!(" L {:.2} {:.2}", x, y));
+            }
+        }
+
+        if let Some(v) = r.v1 {
+            let y = map_y(v);
+            if !started1 {
+                p1.push_str(&format!("M {:.2} {:.2}", x, y));
+                started1 = true;
+            } else {
+                p1.push_str(&format!(" L {:.2} {:.2}", x, y));
+            }
+        }
+
+        if let Some(v) = r.v2 {
+            let y = map_y(v);
+            if !started2 {
+                p2.push_str(&format!("M {:.2} {:.2}", x, y));
+                started2 = true;
+            } else {
+                p2.push_str(&format!(" L {:.2} {:.2}", x, y));
+            }
+        }
+    }
+
+    (p0, p1, p2)
+}

@@ -1,0 +1,18 @@
+[package]
+name = "groundstation_frontend"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+leptos = { version = "0.8.12", default-features = false, features = ["csr"] }
+groundstation_shared = { path = "../shared" }
+serde_json.workspace = true
+wasm-bindgen = "0.2"
+gloo-net = { version = "0.6.0", features = ["http"] }
+
+# for WebSocket + DOM
+web-sys = { version = "0.3", features = ["Window", "WebSocket", "MessageEvent"] }
+wasm-bindgen-futures = "0.4.55"

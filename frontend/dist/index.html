@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>GroundStation 26</title>
+
+    <!-- Global dark mode styles -->
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            width: 100%;
+            background-color: #020617; /* near-black navy */
+            color: #e5e7eb;            /* light gray text */
+            font-family: system-ui, -apple-system, BlinkMacSystemFont,
+                         'Segoe UI', Roboto, sans-serif;
+        }
+
+        #root {
+            height: 100%;
+            width: 100%;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- Mount point for Leptos -->
+
+    <!-- Load WASM bundle -->
+    <script type="module">
+        import init from "./pkg/groundstation_frontend.js";
+
+        // Initialize WASM → mount Leptos
+        init().catch(err => {
+            console.error("WASM init error:", err);
+            document.getElementById("root").innerText =
+                "Failed to load WASM bundle. Check console.";
+        });
+    </script>
+</body>
+</html>

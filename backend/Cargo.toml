@@ -1,0 +1,23 @@
+[package]
+name = "groundstation_backend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { workspace = true, features = ["ws"] }
+tokio.workspace = true
+serde_json.workspace = true
+sedsprintf_rs_2026.workspace = true
+
+groundstation_shared = { path = "../shared" }
+
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite"] }
+
+
+# for ring buffer, ws, etc.
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+anyhow = "1.0.100"
+tower-http = { version = "0.6.6", features = ["fs"] }
+rand = "0.9.2"
+serde = { version = "1.0.228", features = ["derive"] }
