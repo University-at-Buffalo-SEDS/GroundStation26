@@ -6,3 +6,4 @@
 /target
 Cargo.lock
 /backend/groundstation.db
+venv/
