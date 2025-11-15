@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use chrono::Utc;
 use groundstation_shared::{TelemetryCommand, TelemetryRow};
 
 use axum::extract::ws::Utf8Bytes;
@@ -33,10 +34,16 @@ pub fn router(state: Arc<AppState>) -> Router {
 async fn get_recent(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    let now_ms = Utc::now().timestamp_millis();
+    let cutoff = now_ms - 20 * 60 * 1000; // 20 minutes
+
     let rows_db = sqlx::query(
         "SELECT timestamp_ms, data_type, v0, v1, v2 \
-         FROM telemetry ORDER BY id DESC LIMIT 50"
+         FROM telemetry \
+         WHERE timestamp_ms >= ? \
+         ORDER BY timestamp_ms ASC"
     )
+    .bind(cutoff)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
@@ -45,10 +52,10 @@ async fn get_recent(
         .into_iter()
         .map(|row| TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
-            data_type: row.get::<String, _>("data_type"),
-            v0: row.get::<Option<f32>, _>("v0"),
-            v1: row.get::<Option<f32>, _>("v1"),
-            v2: row.get::<Option<f32>, _>("v2"),
+            data_type:    row.get::<String, _>("data_type"),
+            v0:           row.get::<Option<f32>, _>("v0"),
+            v1:           row.get::<Option<f32>, _>("v1"),
+            v2:           row.get::<Option<f32>, _>("v2"),
         })
         .collect();
 

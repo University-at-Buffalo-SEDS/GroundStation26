@@ -14,7 +14,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
     // Active sensor tab
     let (active_tab, set_active_tab) = signal("GYRO_DATA".to_string());
 
-    // Initial pull from DB
+    // Initial pull from DB (so refresh shows the same history)
     Effect::new({
         let set_rows = set_rows.clone();
         move |_| {
@@ -67,15 +67,21 @@ pub fn TelemetryDashboard() -> impl IntoView {
     // Latest row for summary cards
     let latest_row = Signal::derive(move || tab_rows.get().last().cloned());
 
-    // Build SVG paths (single graph, 3 curves)
-    let graph_paths = Signal::derive(move || {
+    // Build SVG data: paths + y-scale
+    let graph_data = Signal::derive(move || {
         let data = tab_rows.get();
         build_three_polyline(&data, 1200.0, 360.0)
     });
 
-    let v0_path = Signal::derive(move || graph_paths.get().0.clone());
-    let v1_path = Signal::derive(move || graph_paths.get().1.clone());
-    let v2_path = Signal::derive(move || graph_paths.get().2.clone());
+    let v0_path = Signal::derive(move || graph_data.get().0.clone());
+    let v1_path = Signal::derive(move || graph_data.get().1.clone());
+    let v2_path = Signal::derive(move || graph_data.get().2.clone());
+    let y_min  = Signal::derive(move || graph_data.get().3);
+    let y_max  = Signal::derive(move || graph_data.get().4);
+    let y_mid  = Signal::derive(move || {
+        let (lo, hi) = (y_min.get(), y_max.get());
+        (lo + hi) * 0.5
+    });
 
     let fmt_opt = |v: Option<f32>| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "-".to_string());
 
@@ -153,6 +159,26 @@ pub fn TelemetryDashboard() -> impl IntoView {
                             background:#020617;
                         "
                     >
+                        {/* Axes */}
+                        <line x1="60" y1="20"  x2="60"  y2="340" stroke="#4b5563" stroke-width="1"/>
+                        <line x1="60" y1="340" x2="1180" y2="340" stroke="#4b5563" stroke-width="1"/>
+
+                        {/* Y-axis labels */}
+                        <text x="10" y="26"  fill="#9ca3af" font-size="10">
+                            {move || format!("{:.2}", y_max.get())}
+                        </text>
+                        <text x="10" y="184" fill="#9ca3af" font-size="10">
+                            {move || format!("{:.2}", y_mid.get())}
+                        </text>
+                        <text x="10" y="344" fill="#9ca3af" font-size="10">
+                            {move || format!("{:.2}", y_min.get())}
+                        </text>
+
+                        {/* X-axis labels (relative time) */}
+                        <text x="70"   y="355" fill="#9ca3af" font-size="10">"-20 min"</text>
+                        <text x="600"  y="355" fill="#9ca3af" font-size="10">"-10 min"</text>
+                        <text x="1120" y="355" fill="#9ca3af" font-size="10">"now"</text>
+
                         {/* v0 = orange, v1 = cyan, v2 = lime */}
                         <path d=move || v0_path.get() stroke="#f97316" fill="none" stroke-width="2"/>
                         <path d=move || v1_path.get() stroke="#22d3ee" fill="none" stroke-width="2"/>
@@ -206,14 +232,14 @@ fn sensor_tab(
     }
 }
 
-/// Build three SVG path strings (v0, v1, v2) for a single graph.
+/// Build three SVG path strings (v0, v1, v2) for a single graph, plus y-min/max.
 fn build_three_polyline(
     rows: &[TelemetryRow],
     width: f32,
     height: f32,
-) -> (String, String, String) {
+) -> (String, String, String, f32, f32) {
     if rows.is_empty() {
-        return (String::new(), String::new(), String::new());
+        return (String::new(), String::new(), String::new(), 0.0, 1.0);
     }
 
     // Find min/max across all v0/v1/v2
@@ -231,14 +257,23 @@ fn build_three_polyline(
 
     let (min_v, mut max_v) = match (min_v, max_v) {
         (Some(a), Some(b)) => (a, b),
-        _ => return (String::new(), String::new(), String::new()),
+        _ => return (String::new(), String::new(), String::new(), 0.0, 1.0),
     };
 
     if (max_v - min_v).abs() < 1e-6 {
         max_v = min_v + 1.0;
     }
 
-    let map_y = |v: f32| height - ((v - min_v) / (max_v - min_v)) * height;
+    // Plot margins inside the SVG
+    let left   = 60.0;
+    let right  = width - 20.0;
+    let top    = 20.0;
+    let bottom = height - 20.0;
+
+    let plot_width  = right - left;
+    let plot_height = bottom - top;
+
+    let map_y = |v: f32| bottom - ((v - min_v) / (max_v - min_v)) * plot_height;
 
     let n = rows.len().max(1) as f32;
     let denom = (n - 1.0).max(1.0);
@@ -252,7 +287,7 @@ fn build_three_polyline(
     let mut started2 = false;
 
     for (i, r) in rows.iter().enumerate() {
-        let x = width * (i as f32) / denom;
+        let x = left + plot_width * (i as f32) / denom;
 
         if let Some(v) = r.v0 {
             let y = map_y(v);
@@ -285,5 +320,5 @@ fn build_three_polyline(
         }
     }
 
-    (p0, p1, p2)
+    (p0, p1, p2, min_v, max_v)
 }
