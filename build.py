@@ -26,8 +26,8 @@ def main() -> None:
     # 2) Run the backend (from workspace root so -p works)
     try:
         run(
-            ["cargo", "run", "-p", "groundstation_backend"],
-            cwd=repo_root,
+            ["cargo", "build", "--release", "-p", "groundstation_backend"],
+            cwd=f"{repo_root}/backend" ,
         )
     except subprocess.CalledProcessError as e:
         print("Backend exited with error.", file=sys.stderr)
