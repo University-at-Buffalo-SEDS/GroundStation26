@@ -5,7 +5,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{MessageEvent, WebSocket};
 use gloo_net::http::Request;
 
-const HISTORY_MS: i64 = 60_000 * 20; // 20 minutes
+const HISTORY_MS: i64 = 60_000 * 20; // cap window at 20 minutes
 
 #[component]
 pub fn TelemetryDashboard() -> impl IntoView {
@@ -14,7 +14,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
     // Active sensor tab
     let (active_tab, set_active_tab) = signal("GYRO_DATA".to_string());
 
-    // Initial pull from DB (so refresh shows the same history)
+    // Initial pull from DB (keeps graph on refresh)
     Effect::new({
         let set_rows = set_rows.clone();
         move |_| {
@@ -32,15 +32,15 @@ pub fn TelemetryDashboard() -> impl IntoView {
     Effect::new({
         let set_rows = set_rows.clone();
         move |_| {
-            let ws = WebSocket::new("ws://localhost:3000/ws")
-                .expect("failed to create WebSocket");
+            let ws =
+                WebSocket::new("ws://localhost:3000/ws").expect("failed to create WebSocket");
 
             let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 if let Some(text) = event.data().as_string() {
                     if let Ok(row) = serde_json::from_str::<TelemetryRow>(&text) {
                         set_rows.update(|v| {
                             v.push(row);
-                            // keep ~20 minutes of history
+                            // keep at most 20 minutes of history
                             if let Some(last) = v.last() {
                                 let cutoff = last.timestamp_ms - HISTORY_MS;
                                 v.retain(|r| r.timestamp_ms >= cutoff);
@@ -55,19 +55,22 @@ pub fn TelemetryDashboard() -> impl IntoView {
         }
     });
 
-    // Rows for the selected sensor type
+    // Rows for the selected sensor type, sorted by time
     let tab_rows = Signal::derive(move || {
         let kind = active_tab.get();
-        rows.get()
+        let mut v: Vec<_> = rows
+            .get()
             .into_iter()
             .filter(|r| r.data_type == kind)
-            .collect::<Vec<_>>()
+            .collect();
+        v.sort_by_key(|r| r.timestamp_ms);
+        v
     });
 
     // Latest row for summary cards
     let latest_row = Signal::derive(move || tab_rows.get().last().cloned());
 
-    // Build SVG data: paths + y-scale
+    // Build SVG data: paths + y-scale + span in minutes
     let graph_data = Signal::derive(move || {
         let data = tab_rows.get();
         build_three_polyline(&data, 1200.0, 360.0)
@@ -76,14 +79,16 @@ pub fn TelemetryDashboard() -> impl IntoView {
     let v0_path = Signal::derive(move || graph_data.get().0.clone());
     let v1_path = Signal::derive(move || graph_data.get().1.clone());
     let v2_path = Signal::derive(move || graph_data.get().2.clone());
-    let y_min  = Signal::derive(move || graph_data.get().3);
-    let y_max  = Signal::derive(move || graph_data.get().4);
-    let y_mid  = Signal::derive(move || {
+    let y_min = Signal::derive(move || graph_data.get().3);
+    let y_max = Signal::derive(move || graph_data.get().4);
+    let span_min = Signal::derive(move || graph_data.get().5); // minutes
+    let y_mid = Signal::derive(move || {
         let (lo, hi) = (y_min.get(), y_max.get());
         (lo + hi) * 0.5
     });
 
-    let fmt_opt = |v: Option<f32>| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "-".to_string());
+    let fmt_opt =
+        |v: Option<f32>| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "-".to_string());
 
     view! {
         <div style="
@@ -117,7 +122,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
                     {sensor_tab("GPS_DATA", "GPS", Signal::from(active_tab), set_active_tab)}
                 </nav>
 
-                {/* Summary cards */}
+            {/* Summary cards */}
                 <Show
                     when=move || latest_row.get().is_some()
                     fallback=move || view! { <p style="color:#9ca3af; margin-left:1rem;">"Waiting for telemetry…"</p> }
@@ -174,10 +179,22 @@ pub fn TelemetryDashboard() -> impl IntoView {
                             {move || format!("{:.2}", y_min.get())}
                         </text>
 
-                        {/* X-axis labels (relative time) */}
-                        <text x="70"   y="355" fill="#9ca3af" font-size="10">"-20 min"</text>
-                        <text x="600"  y="355" fill="#9ca3af" font-size="10">"-10 min"</text>
-                        <text x="1120" y="355" fill="#9ca3af" font-size="10">"now"</text>
+                        {/* X-axis labels: dynamic span, capped at 20 min */}
+                        <text x="70"   y="355" fill="#9ca3af" font-size="10">
+                            {move || {
+                                let span = span_min.get(); // minutes, may be < 20
+                                format!("-{:.1} min", span)
+                            }}
+                        </text>
+                        <text x="600"  y="355" fill="#9ca3af" font-size="10">
+                            {move || {
+                                let span = span_min.get() / 2.0;
+                                format!("-{:.1} min", span)
+                            }}
+                        </text>
+                        <text x="1120" y="355" fill="#9ca3af" font-size="10">
+                            "now"
+                        </text>
 
                         {/* v0 = orange, v1 = cyan, v2 = lime */}
                         <path d=move || v0_path.get() stroke="#f97316" fill="none" stroke-width="2"/>
@@ -232,14 +249,18 @@ fn sensor_tab(
     }
 }
 
-/// Build three SVG path strings (v0, v1, v2) for a single graph, plus y-min/max.
+/// Build three SVG path strings (v0, v1, v2) for a single graph,
+/// plus y-min, y-max, and span_minutes (0–20).
+///
+/// X is based on timestamp_ms over a *dynamic* window whose size is:
+///   min(20 minutes, newest_ts - oldest_ts)
 fn build_three_polyline(
     rows: &[TelemetryRow],
     width: f32,
     height: f32,
-) -> (String, String, String, f32, f32) {
+) -> (String, String, String, f32, f32, f32) {
     if rows.is_empty() {
-        return (String::new(), String::new(), String::new(), 0.0, 1.0);
+        return (String::new(), String::new(), String::new(), 0.0, 1.0, 0.0);
     }
 
     // Find min/max across all v0/v1/v2
@@ -257,26 +278,33 @@ fn build_three_polyline(
 
     let (min_v, mut max_v) = match (min_v, max_v) {
         (Some(a), Some(b)) => (a, b),
-        _ => return (String::new(), String::new(), String::new(), 0.0, 1.0),
+        _ => return (String::new(), String::new(), String::new(), 0.0, 1.0, 0.0),
     };
 
     if (max_v - min_v).abs() < 1e-6 {
         max_v = min_v + 1.0;
     }
 
+    // Time window: dynamic span up to 20 minutes
+    let newest_ts = rows.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
+    let oldest_ts = rows.iter().map(|r| r.timestamp_ms).min().unwrap_or(newest_ts);
+    let raw_span_ms = (newest_ts - oldest_ts).max(1); // avoid zero
+    let effective_span_ms = raw_span_ms.min(HISTORY_MS); // cap at 20 minutes
+    let span_minutes = effective_span_ms as f32 / 60_000.0;
+
+    let window_start = newest_ts - effective_span_ms;
+    let denom_time = effective_span_ms as f32;
+
     // Plot margins inside the SVG
-    let left   = 60.0;
-    let right  = width - 20.0;
-    let top    = 20.0;
+    let left = 60.0;
+    let right = width - 20.0;
+    let top = 20.0;
     let bottom = height - 20.0;
 
-    let plot_width  = right - left;
+    let plot_width = right - left;
     let plot_height = bottom - top;
 
     let map_y = |v: f32| bottom - ((v - min_v) / (max_v - min_v)) * plot_height;
-
-    let n = rows.len().max(1) as f32;
-    let denom = (n - 1.0).max(1.0);
 
     let mut p0 = String::new();
     let mut p1 = String::new();
@@ -286,8 +314,12 @@ fn build_three_polyline(
     let mut started1 = false;
     let mut started2 = false;
 
-    for (i, r) in rows.iter().enumerate() {
-        let x = left + plot_width * (i as f32) / denom;
+    for r in rows {
+        // Clamp timestamp into [window_start, newest_ts]
+        let dt_ms = (r.timestamp_ms - window_start)
+            .clamp(0, effective_span_ms) as f32;
+        let t = dt_ms / denom_time; // 0.0 = left, 1.0 = now
+        let x = left + plot_width * t;
 
         if let Some(v) = r.v0 {
             let y = map_y(v);
@@ -320,5 +352,5 @@ fn build_three_polyline(
         }
     }
 
-    (p0, p1, p2, min_v, max_v)
+    (p0, p1, p2, min_v, max_v, span_minutes)
 }
