@@ -1,0 +1,23 @@
+name: Build Code
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*.*.*'     # tag like v1.2.3 to trigger a Release
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build (Build the project)
+        run: ./build.py
