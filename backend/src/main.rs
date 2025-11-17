@@ -15,7 +15,7 @@ use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
 use crate::radio::{DummyRadio, Radio, RadioDevice, RADIO_BAUDRATE, RADIO_PORT};
 use axum::Router;
-use sedsprintf_rs_2026::config::DataEndpoint::GroundStation;
+use sedsprintf_rs_2026::config::DataEndpoint::{GroundStation, Abort};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::EndpointHandler;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
@@ -72,15 +72,21 @@ async fn main() -> anyhow::Result<()> {
         db,
     });
 
-    let state_clone = state.clone();
+    let ground_station_handler_state_clone = state.clone();
 
-    let handler =
+
+    let ground_station_handler =
         EndpointHandler::new_packet_handler(GroundStation, move |pkt: &TelemetryPacket| {
-            let mut rb = state_clone.ring_buffer.lock().unwrap();
+            let mut rb = ground_station_handler_state_clone.ring_buffer.lock().unwrap();
             rb.push(pkt.clone());
             Ok(())
         });
-    let cfg = sedsprintf_rs_2026::router::BoardConfig::new([handler]);
+    let abort_handler =
+        EndpointHandler::new_packet_handler(Abort, move |_pkt: &TelemetryPacket| {
+            println!("Abort packet received!");
+            Ok(())
+        });
+    let cfg = sedsprintf_rs_2026::router::BoardConfig::new([ground_station_handler, abort_handler]);
     let radio: Arc<Mutex<Box<dyn RadioDevice>>> = match Radio::open(RADIO_PORT, RADIO_BAUDRATE) {
         Ok(r) => {
             tracing::info!("Radio online");

@@ -53,9 +53,9 @@ pub async fn telemetry_task(
                             println!("Disarm command sent");
                         }
                         TelemetryCommand::Abort => {
-                            router.log_queue(
-                                    DataType::MessageData,
-                                    "Abort".as_bytes()
+                            router.log(
+                                    DataType::Abort,
+                                    &[true as u8]
                                 ).expect("failed to log Abort command");
                             println!("Abort command sent");
                         }
