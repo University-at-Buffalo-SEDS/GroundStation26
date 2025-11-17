@@ -4,6 +4,16 @@ use sedsprintf_rs_2026::router::Router;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
+
+
+const ACCELERATION_X_MIN_THRESHOLD: f32 = -10.0; // m/s²
+const ACCELERATION_X_MAX_THRESHOLD: f32 = 10.0; // m/s²
+
+const ACCELERATION_Y_MIN_THRESHOLD: f32 = -10.0; // m/s²
+const ACCELERATION_Y_MAX_THRESHOLD: f32 = 10.0; // m/s²
+const ACCELERATION_Z_MIN_THRESHOLD: f32 = -2.0; // m/s²
+const ACCELERATION_Z_MAX_THRESHOLD: f32 = 100.0; // m/s²
+
 pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
     let mut abort = false;
     loop {
@@ -34,9 +44,25 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
             if pkt.data_type() == DataType::AccelData {
                 let values = crate::telemetry_decode::decode_f32_values(&pkt).unwrap_or_default();
                 if let Some(accel_x) = values.get(0) {
-                    if *accel_x > -10.0 {
+                    if (ACCELERATION_X_MIN_THRESHOLD > *accel_x ) || (*accel_x > ACCELERATION_X_MAX_THRESHOLD) {
                         abort = true;
                         println!("Safety: acceleration threshold exceeded (x = {})", accel_x);
+
+                        // TODO: maybe insert a safety event into DB here too
+                    }
+                }
+                if let Some(accel_y) = values.get(1) {
+                    if (ACCELERATION_Y_MIN_THRESHOLD > *accel_y ) || (*accel_y > ACCELERATION_Y_MAX_THRESHOLD) {
+                        abort = true;
+                        println!("Safety: acceleration threshold exceeded (y = {})", accel_y);
+
+                        // TODO: maybe insert a safety event into DB here too
+                    }
+                }
+                if let Some(accel_z) = values.get(2) {
+                    if (ACCELERATION_Z_MIN_THRESHOLD > *accel_z ) || (*accel_z > ACCELERATION_Z_MAX_THRESHOLD) {
+                        abort = true;
+                        println!("Safety: acceleration threshold exceeded (z = {})", accel_z);
 
                         // TODO: maybe insert a safety event into DB here too
                     }
