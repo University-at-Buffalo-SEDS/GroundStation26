@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::services::ServeDir;
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let static_dir = ServeDir::new("../frontend/dist");
+    let static_dir = ServeDir::new("./frontend/dist");
 
     Router::new()
         .route("/api/recent", get(get_recent))

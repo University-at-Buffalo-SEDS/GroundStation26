@@ -1,0 +1,9 @@
+services:
+  web:
+    build: .
+    ports:
+      - "3000:3000"
+    network_mode: bridge
+    volumes:
+      - ./data:/app/data
+    restart: always

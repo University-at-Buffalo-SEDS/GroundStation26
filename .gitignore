@@ -5,5 +5,5 @@
 
 /target
 Cargo.lock
-/backend/groundstation.db
+/data
 venv/

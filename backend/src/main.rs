@@ -33,7 +33,7 @@ fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // --- DB path ---
-    let db_path = "groundstation.db";
+    let db_path = "./data/groundstation.db";
 
     if !Path::new(db_path).exists() {
         // Create an empty file. That's it.

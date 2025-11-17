@@ -1,0 +1,5 @@
+data/
+target/
+venv/
+Dockerfile
+docker-compose.yml
