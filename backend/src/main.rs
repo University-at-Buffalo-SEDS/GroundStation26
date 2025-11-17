@@ -1,12 +1,11 @@
+mod dummy_packets;
+mod radio;
 mod ring_buffer;
 mod safety_task;
 mod state;
 mod telemetry_decode;
 mod telemetry_task;
 mod web;
-
-mod dummy_packets;
-mod radio;
 
 use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
@@ -15,7 +14,7 @@ use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
 use crate::radio::{DummyRadio, Radio, RadioDevice, RADIO_BAUDRATE, RADIO_PORT};
 use axum::Router;
-use sedsprintf_rs_2026::config::DataEndpoint::{GroundStation, Abort};
+use sedsprintf_rs_2026::config::DataEndpoint::{Abort, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::EndpointHandler;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
@@ -62,8 +61,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
     // --- Shared state ---
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(2048))),
@@ -74,10 +73,12 @@ async fn main() -> anyhow::Result<()> {
 
     let ground_station_handler_state_clone = state.clone();
 
-
     let ground_station_handler =
         EndpointHandler::new_packet_handler(GroundStation, move |pkt: &TelemetryPacket| {
-            let mut rb = ground_station_handler_state_clone.ring_buffer.lock().unwrap();
+            let mut rb = ground_station_handler_state_clone
+                .ring_buffer
+                .lock()
+                .unwrap();
             rb.push(pkt.clone());
             Ok(())
         });

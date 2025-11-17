@@ -38,10 +38,10 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",
     )
-    .bind(cutoff)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -148,10 +148,10 @@ async fn get_history(
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",
     )
-    .bind(cutoff)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()

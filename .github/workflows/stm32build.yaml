@@ -2,7 +2,7 @@ name: Build Code
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
     tags:
       - 'v*.*.*'     # tag like v1.2.3 to trigger a Release
   pull_request:

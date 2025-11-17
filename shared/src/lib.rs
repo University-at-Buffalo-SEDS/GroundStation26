@@ -22,5 +22,4 @@ pub struct TelemetryRow {
     pub v5: Option<f32>,
     pub v6: Option<f32>,
     pub v7: Option<f32>,
-    
 }

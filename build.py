@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+import multiprocessing as mp
 import subprocess
 import sys
 from pathlib import Path
-import multiprocessing as mp
 
 
 def run(cmd: list[str], cwd: Path) -> None:
@@ -45,6 +45,7 @@ def main() -> None:
     bbe.start()
     bfe.join()
     bbe.join()
+
 
 if __name__ == "__main__":
     main()

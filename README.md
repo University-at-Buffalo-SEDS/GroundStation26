@@ -3,7 +3,7 @@
 # Required Dependencies,
 
 - Rust
-    
+
 get it from https://rustup.rs/
 
 - wasm-pack

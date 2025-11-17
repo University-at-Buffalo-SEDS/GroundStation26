@@ -90,7 +90,7 @@ pub struct DummyRadio;
 
 impl DummyRadio {
     pub fn new() -> Self {
-        DummyRadio 
+        DummyRadio
     }
 }
 

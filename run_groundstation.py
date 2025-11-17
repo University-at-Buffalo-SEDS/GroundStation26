@@ -2,7 +2,9 @@
 import subprocess
 import sys
 from pathlib import Path
+
 import build
+
 
 def run(cmd: list[str], cwd: Path) -> None:
     print(f"Running: {' '.join(cmd)} (cwd={cwd})")

@@ -1,9 +1,9 @@
+use crate::telemetry_task::get_current_timestamp_ms;
 use rand::Rng;
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::TelemetryResult;
 use std::sync::Arc;
-use crate::telemetry_task::get_current_timestamp_ms;
 
 pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     use DataType::*;
@@ -18,7 +18,7 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
         BatteryCurrent,
         BarometerData,
         FuelFlow,
-        FuelTankPressure
+        FuelTankPressure,
     ];
     let dtype = choices[rng.random_range(0..choices.len())];
 
@@ -91,7 +91,7 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     TelemetryPacket::new(
         dtype,
         &[DataEndpoint::GroundStation],
-        "TEST",  // device ID
+        "TEST", // device ID
         get_current_timestamp_ms(),
         Arc::from(bytes.as_slice()),
     )

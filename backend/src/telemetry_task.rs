@@ -99,15 +99,14 @@ pub async fn handle_packet(state: &Arc<AppState>) {
     sqlx::query(
         "INSERT INTO telemetry (timestamp_ms, data_type, v0, v1, v2) VALUES (?, ?, ?, ?, ?)",
     )
-    .bind(ts_ms)
-    .bind(&data_type_str)
-    .bind(v0)
-    .bind(v1)
-    .bind(v2)
-        
-    .execute(&state.db)
-    .await
-    .expect("DB insert into telemetry failed");
+        .bind(ts_ms)
+        .bind(&data_type_str)
+        .bind(v0)
+        .bind(v1)
+        .bind(v2)
+        .execute(&state.db)
+        .await
+        .expect("DB insert into telemetry failed");
 
     // Build DTO to send to WebSocket listeners
     let row = TelemetryRow {
