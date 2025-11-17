@@ -1,11 +1,17 @@
+use gloo_net::http::Request;
 use groundstation_shared::TelemetryRow;
 use leptos::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{MessageEvent, WebSocket};
-use gloo_net::http::Request;
+use std::cell::RefCell;
 
 const HISTORY_MS: i64 = 60_000 * 20; // cap window at 20 minutes
+
+// Global per-thread storage for the WebSocket handle (WASM is single-threaded)
+thread_local! {
+    static WS_HANDLE: RefCell<Option<WebSocket>> = RefCell::new(None);
+}
 
 #[component]
 pub fn TelemetryDashboard() -> impl IntoView {
@@ -28,12 +34,18 @@ pub fn TelemetryDashboard() -> impl IntoView {
         }
     });
 
-    // Live WebSocket updates
+    // Live WebSocket updates + stash handle in thread-local
     Effect::new({
         let set_rows = set_rows.clone();
+
         move |_| {
-            let ws =
-                WebSocket::new("ws://localhost:3000/ws").expect("failed to create WebSocket");
+            let ws = WebSocket::new("ws://localhost:3000/ws")
+                .expect("failed to create WebSocket");
+
+            // store a clone so we can send commands from elsewhere
+            WS_HANDLE.with(|cell| {
+                *cell.borrow_mut() = Some(ws.clone());
+            });
 
             let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 if let Some(text) = event.data().as_string() {
@@ -54,6 +66,20 @@ pub fn TelemetryDashboard() -> impl IntoView {
             onmessage.forget();
         }
     });
+
+    // Helper closure to send commands over WebSocket
+    let send_cmd = move |cmd: &str| {
+        let msg = format!(r#"{{"cmd":"{}"}}"#, cmd);
+        WS_HANDLE.with(|cell| {
+            if let Some(ws) = cell.borrow().as_ref() {
+                if let Err(err) = ws.send_with_str(&msg) {
+                    web_sys::console::error_1(&err);
+                }
+            } else {
+                web_sys::console::log_1(&"WebSocket not connected yet".into());
+            }
+        });
+    };
 
     // Rows for the selected sensor type, sorted by time
     let tab_rows = Signal::derive(move || {
@@ -87,8 +113,10 @@ pub fn TelemetryDashboard() -> impl IntoView {
         (lo + hi) * 0.5
     });
 
-    let fmt_opt =
-        |v: Option<f32>| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "-".to_string());
+    let fmt_opt = |v: Option<f32>| {
+        v.map(|x| format!("{x:.2}"))
+            .unwrap_or_else(|| "-".to_string())
+    };
 
     view! {
         <div style="
@@ -104,7 +132,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
                 "Telemetry Dashboard"
             </h1>
 
-            {/* Top row: tabs + summary cards */}
+            {/* Top row: tabs + summary cards + command buttons */}
             <div style="
                 display:flex;
                 flex-wrap:wrap;
@@ -122,7 +150,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
                     {sensor_tab("GPS_DATA", "GPS", Signal::from(active_tab), set_active_tab)}
                 </nav>
 
-            {/* Summary cards */}
+                {/* Summary cards */}
                 <Show
                     when=move || latest_row.get().is_some()
                     fallback=move || view! { <p style="color:#9ca3af; margin-left:1rem;">"Waiting for telemetry…"</p> }
@@ -139,6 +167,36 @@ pub fn TelemetryDashboard() -> impl IntoView {
                         }).into_view()
                     }}
                 </Show>
+
+                {/* Command buttons */}
+                <div style="display:flex; gap:0.5rem; margin-left:1rem;">
+                    <button
+                        style="
+                            padding:0.4rem 0.8rem;
+                            border-radius:0.5rem;
+                            border:1px solid #22c55e;
+                            background:#022c22;
+                            color:#bbf7d0;
+                            cursor:pointer;
+                        "
+                        on:click=move |_| send_cmd("Arm")
+                    >
+                        "Arm"
+                    </button>
+                    <button
+                        style="
+                            padding:0.4rem 0.8rem;
+                            border-radius:0.5rem;
+                            border:1px solid #ef4444;
+                            background:#450a0a;
+                            color:#fecaca;
+                            cursor:pointer;
+                        "
+                        on:click=move |_| send_cmd("Disarm")
+                    >
+                        "Disarm"
+                    </button>
+                </div>
             </div>
 
             {/* BIG centered graph – main focus */}
@@ -287,7 +345,11 @@ fn build_three_polyline(
 
     // Time window: dynamic span up to 20 minutes
     let newest_ts = rows.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
-    let oldest_ts = rows.iter().map(|r| r.timestamp_ms).min().unwrap_or(newest_ts);
+    let oldest_ts = rows
+        .iter()
+        .map(|r| r.timestamp_ms)
+        .min()
+        .unwrap_or(newest_ts);
     let raw_span_ms = (newest_ts - oldest_ts).max(1); // avoid zero
     let effective_span_ms = raw_span_ms.min(HISTORY_MS); // cap at 20 minutes
     let span_minutes = effective_span_ms as f32 / 60_000.0;
@@ -316,8 +378,7 @@ fn build_three_polyline(
 
     for r in rows {
         // Clamp timestamp into [window_start, newest_ts]
-        let dt_ms = (r.timestamp_ms - window_start)
-            .clamp(0, effective_span_ms) as f32;
+        let dt_ms = (r.timestamp_ms - window_start).clamp(0, effective_span_ms) as f32;
         let t = dt_ms / denom_time; // 0.0 = left, 1.0 = now
         let x = left + plot_width * t;
 

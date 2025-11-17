@@ -2,105 +2,83 @@ use crate::state::AppState;
 use crate::telemetry_decode::decode_f32_values;
 use groundstation_shared::TelemetryCommand;
 use groundstation_shared::TelemetryRow;
-use sedsprintf_rs_2026::{
-    config::{DataEndpoint, DataType},
-    telemetry_packet::TelemetryPacket,
-};
+use sedsprintf_rs_2026::config::DataType;
 
-use rand;
-use std::sync::Arc;
+use crate::radio::RadioDevice;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{interval, Duration};
 
-pub async fn telemetry_task(state: Arc<AppState>, mut cmd_rx: mpsc::Receiver<TelemetryCommand>) {
+pub async fn telemetry_task(
+    state: Arc<AppState>,
+    router: Arc<sedsprintf_rs_2026::router::Router>,
+    radio: Arc<Mutex<Box<dyn RadioDevice>>>,
+    mut rx: mpsc::Receiver<TelemetryCommand>,
+) {
+    let mut radio_interval = interval(Duration::from_millis(10));
+    let mut handle_interval = interval(Duration::from_millis(2));
+    let mut router_interval = interval(Duration::from_millis(2));
+
     loop {
         tokio::select! {
-            Some(cmd) = cmd_rx.recv() => {
-                // TODO: encode + send command over radio
-                tracing::info!("TX command: {:?}", cmd);
-            }
+                _ = radio_interval.tick() => {
+                    match radio.lock().expect("failed to get lock").recv_packet(&*router){
+                        Ok(_) => {
+                            // Packet received and handled by router
+                        }
+                        Err(e) => {
+                            println!("radio_task exited with error: {}", e);
+                        }
+                    }
 
-            _ = sleep(Duration::from_millis(100)) => {
-                let value1:f32 = rand::random();
-                let value2:f32 = rand::random();
-                let value3:f32 = rand::random();
+                }
+            _= router_interval.tick() => {
+                    router.process_all_queues_with_timeout(20).expect("Failed to process all queues with timeout");
+                }
+                Some(cmd) = rx.recv() => {
+                    match cmd {
+                        TelemetryCommand::Arm => {
+                            router.log(
+                                    DataType::MessageData,
+                                    "Arm".as_bytes()
+                                ).expect("failed to log Arm command");
+                            println!("Arm command sent");
 
-                // For now: synthesize a fake packet of some type, e.g. GyroData
-                let gyro_pkt = TelemetryPacket::from_f32_slice(
-                    DataType::GyroData,
-                    &[value1, value2, value3],                        // x, y, z
-                    &[DataEndpoint::GroundStation],
-                    get_current_timestamp_ms(),                                       // timestamp ms
-                ).expect("failed to construct fake TelemetryPacket");
-
-                let value1:f32 = rand::random();
-                let value2:f32 = rand::random();
-                let value3:f32 = rand::random();
-                let accel_pkt = TelemetryPacket::from_f32_slice(
-                    DataType::AccelData,
-                    &[value1, value2, value3],                        // x, y, z
-                    &[DataEndpoint::GroundStation],
-                    get_current_timestamp_ms(),                                       // timestamp ms
-                ).expect("failed to construct fake TelemetryPacket");
-
-                let value1:f32 = rand::random();
-                let value2:f32 = rand::random();
-                let gps_pkt = TelemetryPacket::from_f32_slice(
-                    DataType::GpsData,
-                    &[value1, value2],                        // x, y, z
-                    &[DataEndpoint::GroundStation],
-                    get_current_timestamp_ms(),                                       // timestamp ms
-                ).expect("failed to construct fake TelemetryPacket");
-
-                let value1:f32 = rand::random();
-                let bat_volt_pkt = TelemetryPacket::from_f32_slice(
-                    DataType::BatteryVoltage,
-                    &[value1],                        // x, y, z
-                    &[DataEndpoint::GroundStation],
-                    get_current_timestamp_ms(),                                       // timestamp ms
-                ).expect("failed to construct fake TelemetryPacket");
-
-                let value1:f32 = rand::random();
-                let bat_curr_pkt = TelemetryPacket::from_f32_slice(
-                    DataType::BatteryCurrent,
-                    &[value1],                        // x, y, z
-                    &[DataEndpoint::GroundStation],
-                    get_current_timestamp_ms(),                                       // timestamp ms
-                ).expect("failed to construct fake TelemetryPacket");
-
-                let value1:f32 = rand::random();
-                let value2:f32 = rand::random();
-                let value3:f32 = rand::random();
-                let barr_pkt = TelemetryPacket::from_f32_slice(
-                    DataType::BarometerData,
-                    &[value1, value2, value3],                        // x, y, z
-                    &[DataEndpoint::GroundStation],
-                    get_current_timestamp_ms(),                                       // timestamp ms
-                ).expect("failed to construct fake TelemetryPacket");
-
-                handle_packet(&state, gyro_pkt).await;
-                handle_packet(&state, accel_pkt).await;
-                handle_packet(&state, gps_pkt).await;
-                handle_packet(&state, bat_volt_pkt).await;
-                handle_packet(&state, bat_curr_pkt).await;
-                handle_packet(&state, barr_pkt).await;
-
-            }
+                        }
+                        TelemetryCommand::Disarm => {
+                            router.log(
+                                    DataType::MessageData,
+                                    "Disarm".as_bytes()
+                                ).expect("failed to log Arm command");
+                            println!("Disarm command sent");
+                            },
+                        }
+                }
+                _ = handle_interval.tick() => {
+                    handle_packet(&state).await;
+                }
         }
     }
 }
 
-async fn handle_packet(state: &Arc<AppState>, pkt: TelemetryPacket) {
+pub async fn handle_packet(state: &Arc<AppState>) {
     // Keep raw packet in ring buffer if you still want it
-    {
+    let pkt = {
+        //get the most recent packet from the ring buffer
         let mut rb = state.ring_buffer.lock().unwrap();
-        rb.push(pkt.clone());
-    }
+        match rb.pop_oldest() {
+            Some(pkt) => pkt,
+            None => return, // No packet to process
+        }
+    };
 
     let ts_ms = pkt.timestamp() as i64;
     let data_type_str = pkt.data_type().as_str().to_string();
 
-    let values = decode_f32_values(&pkt).expect("died extracing data");
+    let values = match decode_f32_values(&pkt) {
+        Some(v) => v,
+        None => return,
+    };
     let v0 = values.get(0).copied();
     let v1 = values.get(1).copied();
     let v2 = values.get(2).copied();
@@ -130,8 +108,7 @@ async fn handle_packet(state: &Arc<AppState>, pkt: TelemetryPacket) {
     let _ = state.ws_tx.send(row);
 }
 
-
-fn get_current_timestamp_ms() -> u64 {
+pub fn get_current_timestamp_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now();
     let duration_since_epoch = now.duration_since(UNIX_EPOCH).unwrap();
