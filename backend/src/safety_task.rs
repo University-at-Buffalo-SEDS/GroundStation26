@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use sedsprintf_rs_2026::config::DataType;
-use std::sync::Arc;
 use sedsprintf_rs_2026::router::Router;
+use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
@@ -35,14 +35,10 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                 let values = crate::telemetry_decode::decode_f32_values(&pkt).unwrap_or_default();
                 if let Some(accel_x) = values.get(0) {
                     if *accel_x > -10.0 {
-                        tracing::warn!(
-                            "Safety: acceleration threshold exceeded (x = {} m/s^2)",
-                            accel_x
-                        );
                         abort = true;
                         println!("Safety: acceleration threshold exceeded (x = {})", accel_x);
 
-                        // TODO: maybe insert a safety event into DB here and start aborting
+                        // TODO: maybe insert a safety event into DB here too
                     }
                 }
             }
@@ -51,10 +47,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
         if abort {
             // Send abort command via router
             router
-                .log(
-                    DataType::MessageData,
-                    "Abort".as_bytes(),
-                )
+                .log(DataType::MessageData, "Abort".as_bytes())
                 .expect("failed to log Abort command");
             println!("Safety task: Abort command sent");
             // Once aborted, we can exit the loop
