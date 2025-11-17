@@ -279,7 +279,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
     };
 
     view! {
-            <div style="
+        <div style="
             min-height: 100vh;
             padding: 1.5rem;
             color: #e5e7eb;
@@ -288,79 +288,79 @@ pub fn TelemetryDashboard() -> impl IntoView {
             display: flex;
             flex-direction: column;
         ">
-                <h1 style="color:#f97316; margin-bottom:1rem;">
-                    "Rocket Dashboard"
-                </h1>
+            <h1 style="color:#f97316; margin-bottom:1rem;">
+                "Rocket Dashboard"
+            </h1>
 
-                {/* Top row: tabs + summary cards + command buttons */}
-                <div style="
+            {/* Top row: tabs + summary cards + command buttons */}
+            <div style="
                 display:flex;
                 flex-wrap:wrap;
                 gap:1rem;
                 align-items:flex-start;
                 margin-bottom: 1 rem;
             ">
-                    {/* Tabs */}
-                    <nav style="display:flex; flex-wrap:wrap; gap:0.5rem;">
-                        {sensor_tab("GYRO_DATA", "Gyro", Signal::from(active_tab), set_active_tab)}
-                        {sensor_tab("ACCEL_DATA", "Accel", Signal::from(active_tab), set_active_tab)}
-                        {sensor_tab("BAROMETER_DATA", "Barom", Signal::from(active_tab), set_active_tab)}
-                        {sensor_tab("BATTERY_VOLTAGE", "Batt V", Signal::from(active_tab), set_active_tab)}
-                        {sensor_tab("BATTERY_CURRENT", "Batt I", Signal::from(active_tab), set_active_tab)}
-                        {sensor_tab("GPS_DATA", "GPS", Signal::from(active_tab), set_active_tab)}
-                        {sensor_tab("FUEL_FLOW", "Fuel Flow", Signal::from(active_tab), set_active_tab)}
-                        {sensor_tab("FUEL_TANK_PRESSURE", "Fuel Press", Signal::from(active_tab), set_active_tab)}
-                    </nav>
+                {/* Tabs */}
+                <nav style="display:flex; flex-wrap:wrap; gap:0.5rem;">
+                    {sensor_tab("GYRO_DATA", "Gyro", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("ACCEL_DATA", "Accel", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("BAROMETER_DATA", "Barom", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("BATTERY_VOLTAGE", "Batt V", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("BATTERY_CURRENT", "Batt I", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("GPS_DATA", "GPS", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("FUEL_FLOW", "Fuel Flow", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("FUEL_TANK_PRESSURE", "Fuel Press", Signal::from(active_tab), set_active_tab)}
+                </nav>
 
-                    {/* Summary cards */}
-                    <Show
-                        when=move || latest_row.get().is_some()
-                        fallback=move || view! {
-                            <p style="color:#9ca3af; margin-left:1rem;">"Waiting for telemetry…"</p>
-                        }
-                    >
-                        {move || {
-                                latest_row.get().map(|row| {
-                                    // Define a static mapping of fields to labels + colors.
-                                    let fields: [(&str, Option<f32>, &str); 8] = [
-                                        ("v0", row.v0, "#f97316"),
-                                        ("v1", row.v1, "#22d3ee"),
-                                        ("v2", row.v2, "#a3e635"),
-                                        ("v3", row.v3, "#9ca3af"),
-                                        ("v4", row.v4, "#9ca3af"),
-                                        ("v5", row.v5, "#9ca3af"),
-                                        ("v6", row.v6, "#9ca3af"),
-                                        ("v7", row.v7, "#9ca3af"),
-                                    ];
+                {/* Summary cards */}
+                <Show
+                    when=move || latest_row.get().is_some()
+                    fallback=move || view! {
+                        <p style="color:#9ca3af; margin-left:1rem;">"Waiting for telemetry…"</p>
+                    }
+                >
+                    {move || {
+                            latest_row.get().map(|row| {
+                                // Define a static mapping of fields to labels + colors.
+                                let fields: [(&str, Option<f32>, &str); 8] = [
+                                    ("v0", row.v0, "#f97316"),
+                                    ("v1", row.v1, "#22d3ee"),
+                                    ("v2", row.v2, "#a3e635"),
+                                    ("v3", row.v3, "#9ca3af"),
+                                    ("v4", row.v4, "#9ca3af"),
+                                    ("v5", row.v5, "#9ca3af"),
+                                    ("v6", row.v6, "#9ca3af"),
+                                    ("v7", row.v7, "#9ca3af"),
+                                ];
 
-                                    let cards = fields
-                                        .iter()
-                                        .filter_map(|(label, value, color)| {
-                                            value.map(|v| {
-                                                view! {
-                                                    <SummaryCard
-                                                        label=*label
-                                                        value=fmt_opt(Some(v))
-                                                        color=*color
-                                                    />
-                                                }
-                                            })
+                                let cards = fields
+                                    .iter()
+                                    .filter_map(|(label, value, color)| {
+                                        value.map(|v| {
+                                            view! {
+                                                <SummaryCard
+                                                    label=*label
+                                                    value=fmt_opt(Some(v))
+                                                    color=*color
+                                                />
+                                            }
                                         })
-                                        .collect::<Vec<_>>();
+                                    })
+                                    .collect::<Vec<_>>();
 
-                                    view! {
-                                        <div style="display:flex; gap:0.75rem; margin-left:1rem;">
-                                            {cards}
-                                        </div>
-                                    }
-                                }).into_view()
-                            }}
-                    </Show>
+                                view! {
+                                    <div style="display:flex; gap:0.75rem; margin-left:1rem;">
+                                        {cards}
+                                    </div>
+                                }
+                            }).into_view()
+                        }}
+                </Show>
 
 
 
-                    {/* Command buttons (vertical on right side) */}
-    {
+                {/* Command buttons (vertical on right side) */}
+                {
                     // Define all command buttons in one array
                     let commands = [
                         (
@@ -383,128 +383,149 @@ pub fn TelemetryDashboard() -> impl IntoView {
                     view! {
                         <div
                             style="
-                            position:fixed;
-                            right:1rem;
-                            top:50%;
-                            transform:translateY(-50%);
-                            display:flex;
-                            flex-direction:column;
-                            gap:0.5rem;
-                            background:rgba(0,0,0,0.25);
-                            padding:0.75rem;
-                            border-radius:0.5rem;
-                            backdrop-filter:blur(6px);
-                        "
+                                    position:fixed;
+                                    right:1rem;
+                                    top:20%;
+                                    transform:translateY(-50%);
+                                    display:flex;
+                                    flex-direction:column;
+                                    gap:0.5rem;
+                                    background:#020617ee;
+                                    padding:0.85rem;
+                                    border-radius:0.75rem;
+                                    border:1px solid #4b5563;
+                                    box-shadow:0 10px 25px rgba(0,0,0,0.45);
+                                    backdrop-filter:blur(6px);
+                                    min-width: 9rem;
+                                "
                         >
+                            <div
+                                style="
+                                        font-size:0.75rem;
+                                        text-transform:uppercase;
+                                        letter-spacing:0.08em;
+                                        color:#9ca3af;
+                                        margin-bottom:0.5rem;
+                                        border-bottom:1px solid #4b5563;
+                                        padding-bottom:0.25rem;
+                                    "
+                            >
+                                "Actions"
+                            </div>
+
                             {
-                                commands.into_iter().map(|(label, cmd, style)| {
-                                    view! {
-                                        <button
-                                            style=format!(
-                                                "padding:0.4rem 0.8rem; border-radius:0.5rem; cursor:pointer; {}",
-                                                style
-                                            )
-                                            on:click=move |_| send_cmd(cmd)
-                                        >
-                                            {label}
-                                        </button>
-                                    }
-                                }).collect::<Vec<_>>()
+                                commands
+                                    .into_iter()
+                                    .map(|(label, cmd, style)| {
+                                        view! {
+                                            <button
+                                                style=format!(
+                                                    "padding:0.4rem 0.8rem; border-radius:0.5rem; cursor:pointer; width:100%; text-align:center; {}",
+                                                    style
+                                                )
+                                                on:click=move |_| send_cmd(cmd)
+                                            >
+                                                {label}
+                                            </button>
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
                             }
                         </div>
-        }}
-                    </div>
+                    }
+                }
+                </div>
 
-                {/* BIG centered graph – main focus */}
-                <div style="
+            {/* BIG centered graph – main focus */}
+            <div style="
                 flex: 1;
                 display:flex;
                 align-items:center;
                 justify-content:center;
                 margin-bottom: 1.5rem;
             ">
-                    <div style="
+                <div style="
                     width: 100%;
                     max-width: 1200px;
                 ">
-                        <svg
-                            viewBox="0 0 1200 360"
-                            width="100%"
-                            height="min(60vh, 420px)"
-                            style="
+                    <svg
+                        viewBox="0 0 1200 360"
+                        width="100%"
+                        height="min(60vh, 420px)"
+                        style="
                             display:block;
                             margin:0 auto;
                             border:1px solid #4b5563;
                             background:#020617;
                         "
-                        >
-                            {/* Axes */}
-                            <line x1="60" y1="20"  x2="60"  y2="340" stroke="#4b5563" stroke-width="1"/>
-                            <line x1="60" y1="340" x2="1180" y2="340" stroke="#4b5563" stroke-width="1"/>
+                    >
+                        {/* Axes */}
+                        <line x1="60" y1="20"  x2="60"  y2="340" stroke="#4b5563" stroke-width="1"/>
+                        <line x1="60" y1="340" x2="1180" y2="340" stroke="#4b5563" stroke-width="1"/>
 
-                            {/* Y-axis labels */}
-                            <text x="10" y="26"  fill="#9ca3af" font-size="10">
-                                {move || format!("{:.2}", y_max.get())}
-                            </text>
-                            <text x="10" y="184" fill="#9ca3af" font-size="10">
-                                {move || format!("{:.2}", y_mid.get())}
-                            </text>
-                            <text x="10" y="344" fill="#9ca3af" font-size="10">
-                                {move || format!("{:.2}", y_min.get())}
-                            </text>
+                        {/* Y-axis labels */}
+                        <text x="10" y="26"  fill="#9ca3af" font-size="10">
+                            {move || format!("{:.2}", y_max.get())}
+                        </text>
+                        <text x="10" y="184" fill="#9ca3af" font-size="10">
+                            {move || format!("{:.2}", y_mid.get())}
+                        </text>
+                        <text x="10" y="344" fill="#9ca3af" font-size="10">
+                            {move || format!("{:.2}", y_min.get())}
+                        </text>
 
-                            {/* X-axis labels: dynamic span, capped at 20 min */}
-                            <text x="70"   y="355" fill="#9ca3af" font-size="10">
-                                {move || {
-                                    let span = span_min.get(); // minutes, may be < 20
-                                    format!("-{:.1} min", span)
-                                }}
-                            </text>
-                            <text x="600"  y="355" fill="#9ca3af" font-size="10">
-                                {move || {
-                                    let span = span_min.get() / 2.0;
-                                    format!("-{:.1} min", span)
-                                }}
-                            </text>
-                            <text x="1120" y="355" fill="#9ca3af" font-size="10">
-                                "now"
-                            </text>
+                        {/* X-axis labels: dynamic span, capped at 20 min */}
+                        <text x="70"   y="355" fill="#9ca3af" font-size="10">
+                            {move || {
+                                let span = span_min.get(); // minutes, may be < 20
+                                format!("-{:.1} min", span)
+                            }}
+                        </text>
+                        <text x="600"  y="355" fill="#9ca3af" font-size="10">
+                            {move || {
+                                let span = span_min.get() / 2.0;
+                                format!("-{:.1} min", span)
+                            }}
+                        </text>
+                        <text x="1120" y="355" fill="#9ca3af" font-size="10">
+                            "now"
+                        </text>
 
-                            {
-                            let colors = [
-                                "#f97316", // v0
-                                "#22d3ee", // v1
-                                "#a3e635", // v2
-                                "#a3e635", // v3
-                                "#a3e635", // v4
-                                "#a3e635", // v5
-                                "#a3e635", // v6
-                                "#a3e547", // v7
-                            ];
+                        {
+                        let colors = [
+                            "#f97316", // v0
+                            "#22d3ee", // v1
+                            "#a3e635", // v2
+                            "#a3e635", // v3
+                            "#a3e635", // v4
+                            "#a3e635", // v5
+                            "#a3e635", // v6
+                            "#a3e547", // v7
+                        ];
 
-                            v_paths
-                                .iter()
-                                .enumerate()
-                                .map(|(i, path_sig)| {
-                                    let color = colors[i];
-                                    let sig = *path_sig; // deref & copy the Signal
+                        v_paths
+                            .iter()
+                            .enumerate()
+                            .map(|(i, path_sig)| {
+                                let color = colors[i];
+                                let sig = *path_sig; // deref & copy the Signal
 
-                                    view! {
-                                        <path
-                                            d=move || sig.get()
-                                            stroke=color
-                                            fill="none"
-                                            stroke-width="2"
-                                        />
-                                    }
-                                })
-                                .collect_view()
-                            }
-                        </svg>
-                    </div>
+                                view! {
+                                    <path
+                                        d=move || sig.get()
+                                        stroke=color
+                                        fill="none"
+                                        stroke-width="2"
+                                    />
+                                }
+                            })
+                            .collect_view()
+                        }
+                    </svg>
                 </div>
             </div>
-        }
+        </div>
+    }
 }
 
 #[component]
