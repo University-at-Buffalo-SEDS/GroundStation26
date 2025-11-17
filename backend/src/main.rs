@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Background tasks ---
     let _tt = tokio::spawn(telemetry_task(state.clone(), router.clone(), radio, cmd_rx));
-    let _st = tokio::spawn(safety_task(state.clone()));
+    let _st = tokio::spawn(safety_task(state.clone(), router.clone()));
 
     // --- Webserver ---
     let app: Router = web::router(state);

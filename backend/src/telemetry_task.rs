@@ -38,7 +38,7 @@ pub async fn telemetry_task(
                 Some(cmd) = rx.recv() => {
                     match cmd {
                         TelemetryCommand::Arm => {
-                            router.log(
+                            router.log_queue(
                                     DataType::MessageData,
                                     "Arm".as_bytes()
                                 ).expect("failed to log Arm command");
@@ -46,13 +46,20 @@ pub async fn telemetry_task(
 
                         }
                         TelemetryCommand::Disarm => {
-                            router.log(
+                            router.log_queue(
                                     DataType::MessageData,
                                     "Disarm".as_bytes()
                                 ).expect("failed to log Arm command");
                             println!("Disarm command sent");
-                            },
                         }
+                        TelemetryCommand::Abort => {
+                            router.log_queue(
+                                    DataType::MessageData,
+                                    "Abort".as_bytes()
+                                ).expect("failed to log Abort command");
+                            println!("Abort command sent");
+                        }
+                    }
                 }
                 _ = handle_interval.tick() => {
                     handle_packet(&state).await;

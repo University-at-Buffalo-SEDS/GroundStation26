@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum TelemetryCommand {
     Arm,
     Disarm,
+    Abort,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

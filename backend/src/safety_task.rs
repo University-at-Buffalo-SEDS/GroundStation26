@@ -1,9 +1,11 @@
 use crate::state::AppState;
 use sedsprintf_rs_2026::config::DataType;
 use std::sync::Arc;
+use sedsprintf_rs_2026::router::Router;
 use tokio::time::{sleep, Duration};
 
-pub async fn safety_task(state: Arc<AppState>) {
+pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
+    let mut abort = false;
     loop {
         sleep(Duration::from_millis(500)).await;
 
@@ -37,10 +39,26 @@ pub async fn safety_task(state: Arc<AppState>) {
                             "Safety: acceleration threshold exceeded (x = {} m/s^2)",
                             accel_x
                         );
+                        abort = true;
+                        println!("Safety: acceleration threshold exceeded (x = {})", accel_x);
+
                         // TODO: maybe insert a safety event into DB here and start aborting
                     }
                 }
             }
+        }
+
+        if abort {
+            // Send abort command via router
+            router
+                .log(
+                    DataType::MessageData,
+                    "Abort".as_bytes(),
+                )
+                .expect("failed to log Abort command");
+            println!("Safety task: Abort command sent");
+            // Once aborted, we can exit the loop
+            break;
         }
     }
 }

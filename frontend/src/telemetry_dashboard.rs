@@ -196,6 +196,19 @@ pub fn TelemetryDashboard() -> impl IntoView {
                     >
                         "Disarm"
                     </button>
+                    <button
+                        style="
+                            padding:0.4rem 0.8rem;
+                            border-radius:0.5rem;
+                            border:1px solid #ef4444;
+                            background:#450a0a;
+                            color:#fecaca;
+                            cursor:pointer;
+                        "
+                        on:click=move |_| send_cmd("Abort")
+                    >
+                        "Abort"
+                    </button>
                 </div>
             </div>
 
