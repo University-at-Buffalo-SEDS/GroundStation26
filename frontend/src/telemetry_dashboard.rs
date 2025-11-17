@@ -1,16 +1,32 @@
 use gloo_net::http::Request;
 use groundstation_shared::TelemetryRow;
 use leptos::prelude::*;
+use std::cell::RefCell;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{MessageEvent, WebSocket};
-use std::cell::RefCell;
 
 const HISTORY_MS: i64 = 60_000 * 20; // cap window at 20 minutes
 
 // Global per-thread storage for the WebSocket handle (WASM is single-threaded)
 thread_local! {
     static WS_HANDLE: RefCell<Option<WebSocket>> = RefCell::new(None);
+}
+
+// Build ws://host/ws or wss://host/ws based on current page location
+fn make_ws_url() -> String {
+    let window = web_sys::window().expect("no global `window`");
+    let location = window.location();
+
+    let protocol = location.protocol().unwrap_or_else(|_| "http:".to_string());
+
+    let host = location
+        .host()
+        .unwrap_or_else(|_| "localhost:3000".to_string());
+
+    let ws_scheme = if protocol == "https:" { "wss" } else { "ws" };
+
+    format!("{ws_scheme}://{host}/ws")
 }
 
 #[component]
@@ -39,8 +55,10 @@ pub fn TelemetryDashboard() -> impl IntoView {
         let set_rows = set_rows.clone();
 
         move |_| {
-            let ws = WebSocket::new("ws://localhost:3000/ws")
-                .expect("failed to create WebSocket");
+            let ws_url = make_ws_url();
+            web_sys::console::log_1(&format!("Connecting WebSocket to {ws_url}").into());
+
+            let ws = WebSocket::new(&ws_url).expect("failed to create WebSocket");
 
             // store a clone so we can send commands from elsewhere
             WS_HANDLE.with(|cell| {
@@ -138,7 +156,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
                 flex-wrap:wrap;
                 gap:1rem;
                 align-items:flex-start;
-                margin-bottom: 1rem;
+                margin-bottom: 1 rem;
             ">
                 {/* Tabs */}
                 <nav style="display:flex; flex-wrap:wrap; gap:0.5rem;">
@@ -153,20 +171,101 @@ pub fn TelemetryDashboard() -> impl IntoView {
                 {/* Summary cards */}
                 <Show
                     when=move || latest_row.get().is_some()
-                    fallback=move || view! { <p style="color:#9ca3af; margin-left:1rem;">"Waiting for telemetry…"</p> }
+                    fallback=move || view! {
+                        <p style="color:#9ca3af; margin-left:1rem;">"Waiting for telemetry…"</p>
+                    }
                 >
                     {move || {
                         latest_row.get().map(|row| {
+                            // Build a vector of cards to render only when a value exists
+                            let mut cards = Vec::new();
+
+                            if row.v0.is_some() {
+                                cards.push(view! {
+                                    <SummaryCard
+                                        label="v0"
+                                        value=fmt_opt(row.v0)
+                                        color="#f97316"   // matches v0 line color
+                                    />
+                                });
+                            }
+                            if row.v1.is_some() {
+                                cards.push(view! {
+                                    <SummaryCard
+                                        label="v1"
+                                        value=fmt_opt(row.v1)
+                                        color="#22d3ee"   // matches v1 line color
+                                    />
+                                });
+                            }
+                            if row.v2.is_some() {
+                                cards.push(view! {
+                                    <SummaryCard
+                                        label="v2"
+                                        value=fmt_opt(row.v2)
+                                        color="#a3e635"   // matches v2 line color
+                                    />
+                                });
+                            }
+
+                            // Optional: extra fields v3..v7 stay neutral gray,
+                            // since they don't have graph lines yet.
+                            if row.v3.is_some() {
+                                cards.push(view! {
+                                    <SummaryCard
+                                        label="v3"
+                                        value=fmt_opt(row.v3)
+                                        color="#9ca3af"
+                                    />
+                                });
+                            }
+                            if row.v4.is_some() {
+                                cards.push(view! {
+                                    <SummaryCard
+                                        label="v4"
+                                        value=fmt_opt(row.v4)
+                                        color="#9ca3af"
+                                    />
+                                });
+                            }
+                            if row.v5.is_some() {
+                                cards.push(view! {
+                                    <SummaryCard
+                                        label="v5"
+                                        value=fmt_opt(row.v5)
+                                        color="#9ca3af"
+                                    />
+                                });
+                            }
+                            if row.v6.is_some() {
+                                cards.push(view! {
+                                    <SummaryCard
+                                        label="v6"
+                                        value=fmt_opt(row.v6)
+                                        color="#9ca3af"
+                                    />
+                                });
+                            }
+                            if row.v7.is_some() {
+                                cards.push(view! {
+                                    <SummaryCard
+                                        label="v7"
+                                        value=fmt_opt(row.v7)
+                                        color="#9ca3af"
+                                    />
+                                });
+                            }
+
                             view! {
                                 <div style="display:flex; gap:0.75rem; margin-left:1rem;">
-                                    <SummaryCard label="v0" value=fmt_opt(row.v0) />
-                                    <SummaryCard label="v1" value=fmt_opt(row.v1) />
-                                    <SummaryCard label="v2" value=fmt_opt(row.v2) />
+                                    { cards }
                                 </div>
                             }
                         }).into_view()
                     }}
                 </Show>
+
+
 
                 {/* Command buttons */}
                 <div style="display:flex; gap:0.5rem; margin-left:1rem;">
@@ -279,7 +378,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
 }
 
 #[component]
-fn SummaryCard(label: &'static str, value: String) -> impl IntoView {
+fn SummaryCard(label: &'static str, value: String, color: &'static str) -> impl IntoView {
     view! {
         <div style="
             padding:0.75rem;
@@ -288,8 +387,12 @@ fn SummaryCard(label: &'static str, value: String) -> impl IntoView {
             border:1px solid #4b5563;
             min-width:90px;
         ">
-            <div style="font-size:0.75rem; color:#9ca3af;">{label}</div>
-            <div style="font-size:1.25rem;">{value}</div>
+            <div style=format!("font-size:0.75rem; color:{};", color)>
+                {label}
+            </div>
+            <div style="font-size:1.25rem;">
+                {value}
+            </div>
         </div>
     }
 }

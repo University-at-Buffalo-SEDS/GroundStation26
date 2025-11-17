@@ -89,6 +89,11 @@ pub async fn handle_packet(state: &Arc<AppState>) {
     let v0 = values.get(0).copied();
     let v1 = values.get(1).copied();
     let v2 = values.get(2).copied();
+    let v3 = values.get(3).copied();
+    let v4 = values.get(4).copied();
+    let v5 = values.get(5).copied();
+    let v6 = values.get(6).copied();
+    let v7 = values.get(7).copied();
 
     // Insert into DB
     sqlx::query(
@@ -99,6 +104,7 @@ pub async fn handle_packet(state: &Arc<AppState>) {
     .bind(v0)
     .bind(v1)
     .bind(v2)
+        
     .execute(&state.db)
     .await
     .expect("DB insert into telemetry failed");
@@ -110,6 +116,11 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         v0,
         v1,
         v2,
+        v3,
+        v4,
+        v5,
+        v6,
+        v7,
     };
 
     let _ = state.ws_tx.send(row);

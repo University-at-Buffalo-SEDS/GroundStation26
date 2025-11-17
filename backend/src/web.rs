@@ -33,7 +33,7 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cutoff = now_ms - 20 * 60 * 1000; // 20 minutes
 
     let rows_db = sqlx::query(
-        "SELECT timestamp_ms, data_type, v0, v1, v2 \
+        "SELECT timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7 \
          FROM telemetry \
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",
@@ -51,6 +51,11 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             v0: row.get::<Option<f32>, _>("v0"),
             v1: row.get::<Option<f32>, _>("v1"),
             v2: row.get::<Option<f32>, _>("v2"),
+            v3: row.get::<Option<f32>, _>("v3"),
+            v4: row.get::<Option<f32>, _>("v4"),
+            v5: row.get::<Option<f32>, _>("v5"),
+            v6: row.get::<Option<f32>, _>("v6"),
+            v7: row.get::<Option<f32>, _>("v7"),
         })
         .collect();
 
@@ -156,6 +161,11 @@ async fn get_history(
             v0: row.get::<Option<f32>, _>("v0"),
             v1: row.get::<Option<f32>, _>("v1"),
             v2: row.get::<Option<f32>, _>("v2"),
+            v3: row.get::<Option<f32>, _>("v3"),
+            v4: row.get::<Option<f32>, _>("v4"),
+            v5: row.get::<Option<f32>, _>("v5"),
+            v6: row.get::<Option<f32>, _>("v6"),
+            v7: row.get::<Option<f32>, _>("v7"),
         })
         .collect();
 

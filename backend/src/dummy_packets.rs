@@ -3,11 +3,11 @@ use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::TelemetryResult;
 use std::sync::Arc;
+use crate::telemetry_task::get_current_timestamp_ms;
 
-pub fn get_dummy_packet(counter: u64) -> TelemetryResult<TelemetryPacket> {
+pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     use DataType::*;
     let mut rng = rand::rng();
-
     // Choose one of the data-carrying types (NOT TelemetryError / GenericError / MessageData)
     let choices = [
         GpsData,
@@ -80,7 +80,7 @@ pub fn get_dummy_packet(counter: u64) -> TelemetryResult<TelemetryPacket> {
         dtype,
         &[DataEndpoint::GroundStation],
         "TEST",  // device ID
-        counter, // monotonic counter
+        get_current_timestamp_ms(),
         Arc::from(bytes.as_slice()),
     )
 }

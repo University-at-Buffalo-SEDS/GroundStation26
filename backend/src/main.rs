@@ -52,7 +52,13 @@ async fn main() -> anyhow::Result<()> {
             data_type    TEXT    NOT NULL,
             v0           REAL,
             v1           REAL,
-            v2           REAL
+            v2           REAL,
+            v3           REAL,
+            v4           REAL,
+            v5           REAL,
+            v6           REAL,
+            v7           REAL
+
         );
         "#,
     )

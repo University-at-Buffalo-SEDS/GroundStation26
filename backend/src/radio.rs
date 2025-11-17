@@ -86,20 +86,17 @@ impl RadioDevice for Radio {
 //  Dummy Radio (fallback when hardware missing)
 // ======================================================================
 #[derive(Debug, Default)]
-pub struct DummyRadio {
-    counter: u64,
-}
+pub struct DummyRadio;
 
 impl DummyRadio {
     pub fn new() -> Self {
-        DummyRadio { counter: 0 }
+        DummyRadio 
     }
 }
 
 impl RadioDevice for DummyRadio {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
-        let pkt = get_dummy_packet(self.counter)?;
-        self.counter += 1;
+        let pkt = get_dummy_packet()?;
 
         // No incoming packets in dummy mode
         router.rx_packet_to_queue(pkt)
