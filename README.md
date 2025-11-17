@@ -1,6 +1,6 @@
 # Ground Station 2026
 
-# Required Dependencies,
+## Required Dependencies,
 
 - Rust
 
