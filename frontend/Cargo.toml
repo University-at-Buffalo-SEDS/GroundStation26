@@ -15,4 +15,3 @@ gloo-net = { version = "0.6.0", features = ["http"] }
 
 # for WebSocket + DOM
 web-sys = { version = "0.3", features = ["Window", "WebSocket", "MessageEvent"] }
-wasm-bindgen-futures = "0.4.55"

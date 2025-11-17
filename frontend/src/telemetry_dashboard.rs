@@ -2,6 +2,7 @@ use gloo_net::http::Request;
 use groundstation_shared::TelemetryRow;
 use leptos::prelude::*;
 use std::cell::RefCell;
+use leptos::__reexports::wasm_bindgen_futures;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{MessageEvent, WebSocket};
@@ -147,7 +148,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
             flex-direction: column;
         ">
             <h1 style="color:#f97316; margin-bottom:1rem;">
-                "Telemetry Dashboard"
+                "Rocket Dashboard"
             </h1>
 
             {/* Top row: tabs + summary cards + command buttons */}
