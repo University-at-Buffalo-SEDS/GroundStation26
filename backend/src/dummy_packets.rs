@@ -17,6 +17,8 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
         BatteryVoltage,
         BatteryCurrent,
         BarometerData,
+        FuelFlow,
+        FuelTankPressure
     ];
     let dtype = choices[rng.random_range(0..choices.len())];
 
@@ -64,6 +66,16 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
             let altitude = rng.random_range(0.0..500.0);
             let temp = rng.random_range(-10.0..40.0);
             vec![pressure, altitude, temp]
+        }
+        FuelFlow => {
+            // Fuel flow rate (L/h)
+            let flow = rng.random_range(0.0..100.0);
+            vec![flow]
+        }
+        FuelTankPressure => {
+            // Fuel tank pressure (psi)
+            let pressure = rng.random_range(0.0..30.0);
+            vec![pressure]
         }
         _ => {
             // Should never happen

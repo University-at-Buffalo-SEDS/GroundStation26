@@ -166,6 +166,8 @@ pub fn TelemetryDashboard() -> impl IntoView {
                     {sensor_tab("BATTERY_VOLTAGE", "Batt V", Signal::from(active_tab), set_active_tab)}
                     {sensor_tab("BATTERY_CURRENT", "Batt I", Signal::from(active_tab), set_active_tab)}
                     {sensor_tab("GPS_DATA", "GPS", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("FUEL_FLOW", "Fuel Flow", Signal::from(active_tab), set_active_tab)}
+                    {sensor_tab("FUEL_TANK_PRESSURE", "Fuel Press", Signal::from(active_tab), set_active_tab)}
                 </nav>
 
                 {/* Summary cards */}
