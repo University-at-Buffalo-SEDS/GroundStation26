@@ -73,7 +73,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
         if abort {
             // Send abort command via router
             router
-                .log(DataType::MessageData, "Abort".as_bytes())
+                .log(DataType::Abort, &[true as u8])
                 .expect("failed to log Abort command");
             println!("Safety task: Abort command sent");
             // Once aborted, we can exit the loop

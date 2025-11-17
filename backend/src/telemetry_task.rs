@@ -15,9 +15,9 @@ pub async fn telemetry_task(
     radio: Arc<Mutex<Box<dyn RadioDevice>>>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
 ) {
-    let mut radio_interval = interval(Duration::from_millis(10));
+    let mut radio_interval = interval(Duration::from_millis(1));
     let mut handle_interval = interval(Duration::from_millis(2));
-    let mut router_interval = interval(Duration::from_millis(2));
+    let mut router_interval = interval(Duration::from_millis(10));
 
     loop {
         tokio::select! {
