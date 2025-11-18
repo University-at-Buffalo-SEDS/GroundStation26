@@ -40,7 +40,10 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
         for pkt in packets {
             // Example safety check: if accel X > threshold, warn
             if pkt.data_type() == DataType::AccelData {
-                let values = crate::telemetry_decode::decode_f32_values(&pkt).unwrap_or_default();
+                let values = pkt.data_as_f32();
+                let values = values.unwrap_or_else(|_| {
+                    vec![0f32; 3]
+                });
                 if let Some(accel_x) = values.get(0) {
                     if (ACCELERATION_X_MIN_THRESHOLD > *accel_x)
                         || (*accel_x > ACCELERATION_X_MAX_THRESHOLD)

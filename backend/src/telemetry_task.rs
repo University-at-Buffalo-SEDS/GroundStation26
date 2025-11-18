@@ -1,5 +1,4 @@
 use crate::state::AppState;
-use crate::telemetry_decode::decode_f32_values;
 use groundstation_shared::TelemetryCommand;
 use groundstation_shared::TelemetryRow;
 use sedsprintf_rs_2026::config::DataType;
@@ -82,9 +81,9 @@ pub async fn handle_packet(state: &Arc<AppState>) {
     let ts_ms = pkt.timestamp() as i64;
     let data_type_str = pkt.data_type().as_str().to_string();
 
-    let values = match decode_f32_values(&pkt) {
-        Some(v) => v,
-        None => return,
+    let values = match pkt.data_as_f32() {
+        Ok(v) => v,
+        Err(_) => return,
     };
     let v0 = values.get(0).copied();
     let v1 = values.get(1).copied();

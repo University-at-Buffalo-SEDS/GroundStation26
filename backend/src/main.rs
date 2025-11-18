@@ -3,7 +3,6 @@ mod radio;
 mod ring_buffer;
 mod safety_task;
 mod state;
-mod telemetry_decode;
 mod telemetry_task;
 mod web;
 
