@@ -4,8 +4,6 @@ LABEL authors="rylan"
 
 WORKDIR /app
 
-RUN curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
 COPY . .
 
 RUN ./build.py
