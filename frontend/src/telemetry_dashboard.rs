@@ -267,6 +267,28 @@ pub fn TelemetryDashboard() -> impl IntoView {
             .unwrap_or_else(|| "-".to_string())
     };
 
+    fn labels_for_datatype(dt: &str) -> [&'static str; 8] {
+        match dt {
+            "GYRO_DATA" => ["Roll", "Pitch", "Yaw", "", "", "", "", ""],
+            "ACCEL_DATA" => ["X Accel", "Y Accel", "Z Accel", "", "", "", "", ""],
+            "BAROMETER_DATA" => ["Pressure", "Temp", "Altitude", "", "", "", "", ""],
+            "BATTERY_VOLTAGE" => ["Voltage", "", "", "", "", "", "", ""],
+            "BATTERY_CURRENT" => ["Current", "", "", "", "", "", "", ""],
+            "GPS_DATA" => [
+                "Latitude",
+                "Longitude",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ],
+            "FUEL_FLOW" => ["Flow Rate", "", "", "", "", "", "", ""],
+            "FUEL_TANK_PRESSURE" => ["Pressure", "", "", "", "", "", "", ""],
+            _ => ["", "", "", "", "", "", "", ""],
+        }
+    }
     view! {
         <div style="
             min-height: 100vh;
@@ -311,15 +333,17 @@ pub fn TelemetryDashboard() -> impl IntoView {
                     {move || {
                             latest_row.get().map(|row| {
                                 // Define a static mapping of fields to labels + colors.
+                                let labels = labels_for_datatype(&active_tab.get());
+
                                 let fields: [(&str, Option<f32>, &str); 8] = [
-                                    ("v0", row.v0, "#f97316"),
-                                    ("v1", row.v1, "#22d3ee"),
-                                    ("v2", row.v2, "#a3e635"),
-                                    ("v3", row.v3, "#9ca3af"),
-                                    ("v4", row.v4, "#9ca3af"),
-                                    ("v5", row.v5, "#9ca3af"),
-                                    ("v6", row.v6, "#9ca3af"),
-                                    ("v7", row.v7, "#9ca3af"),
+                                    (labels[0], row.v0, "#f97316"),
+                                    (labels[1], row.v1, "#22d3ee"),
+                                    (labels[2], row.v2, "#a3e635"),
+                                    (labels[3], row.v3, "#9ca3af"),
+                                    (labels[4], row.v4, "#9ca3af"),
+                                    (labels[5], row.v5, "#9ca3af"),
+                                    (labels[6], row.v6, "#9ca3af"),
+                                    (labels[7], row.v7, "#9ca3af"),
                                 ];
 
                                 let cards = fields
