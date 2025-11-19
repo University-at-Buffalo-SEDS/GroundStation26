@@ -103,7 +103,7 @@ impl RadioDevice for DummyRadio {
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        tracing::warn!(
+        println!(
             "DummyRadio: dropping {} bytes of outgoing telemetry (no radio connected)",
             payload.len()
         );

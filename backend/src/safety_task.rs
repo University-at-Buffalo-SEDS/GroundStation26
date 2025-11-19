@@ -23,7 +23,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
             let len = rb.len();
 
             if len == 0 {
-                tracing::warn!("Safety: no recent telemetry packets!");
+                println!("Safety: no recent telemetry packets!");
                 Vec::new()
             } else {
                 // Most recent `len` packets, cloned so we can drop the lock

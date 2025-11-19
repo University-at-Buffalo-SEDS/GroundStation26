@@ -109,11 +109,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                     Ok(cmd) => {
                         // Forward to the same command channel used by /api/command
                         if let Err(e) = cmd_tx.send(cmd.cmd).await {
-                            tracing::warn!("Failed to forward WS command to cmd_tx: {e}");
+                            println!("Failed to forward WS command to cmd_tx: {e}");
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Invalid WS command JSON {text:?}: {e}");
+                        println!("Invalid WS command JSON {text:?}: {e}");
                     }
                 }
             }

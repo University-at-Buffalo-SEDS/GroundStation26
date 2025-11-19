@@ -22,7 +22,6 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
-use tracing_subscriber::EnvFilter;
 
 fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
     Box::new(|| get_current_timestamp_ms())
@@ -89,11 +88,11 @@ async fn main() -> anyhow::Result<()> {
     let cfg = sedsprintf_rs_2026::router::BoardConfig::new([ground_station_handler, abort_handler]);
     let radio: Arc<Mutex<Box<dyn RadioDevice>>> = match Radio::open(RADIO_PORT, RADIO_BAUDRATE) {
         Ok(r) => {
-            tracing::info!("Radio online");
+            println!("Radio online");
             Arc::new(Mutex::new(Box::new(r)))
         }
         Err(e) => {
-            tracing::warn!("Radio missing, using DummyRadio: {}", e);
+            println!("Radio missing, using DummyRadio: {}", e);
             Arc::new(Mutex::new(Box::new(DummyRadio::new())))
         }
     };
@@ -115,9 +114,6 @@ async fn main() -> anyhow::Result<()> {
         clock(),
     ));
     router.log_queue(DataType::MessageData, "hello".as_bytes())?;
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
 
     // --- Background tasks ---
     let _tt = tokio::spawn(telemetry_task(state.clone(), router.clone(), radio, cmd_rx));
