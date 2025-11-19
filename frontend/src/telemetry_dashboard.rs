@@ -1,3 +1,4 @@
+use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
 use groundstation_shared::TelemetryRow;
 use leptos::__reexports::wasm_bindgen_futures;
@@ -6,7 +7,6 @@ use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{MessageEvent, WebSocket};
-// add gloo_timers to Cargo.toml
 
 const HISTORY_MS: i64 = 60_000 * 20; // cap window at 20 minutes
 
@@ -49,8 +49,6 @@ pub fn TelemetryDashboard() -> impl IntoView {
         let set_rows = set_rows.clone();
         move |_| {
             wasm_bindgen_futures::spawn_local(async move {
-                use gloo_net::http::Request;
-
                 if let Ok(resp) = Request::get("/api/recent").send().await {
                     if let Ok(mut list) = resp.json::<Vec<TelemetryRow>>().await {
                         // Ensure sorted by timestamp
@@ -182,8 +180,8 @@ pub fn TelemetryDashboard() -> impl IntoView {
                     });
 
                     let frame_end = now_ms();
-                    let cost = frame_end - frame_start;
-                    web_sys::console::log_1(&format!("frame cost: {:.2} ms", cost).into());
+                    let _cost = frame_end - frame_start;
+                    // web_sys::console::log_1(&format!("frame cost: {:.2} ms", cost).into());
                 }
             });
         }
@@ -222,52 +220,43 @@ pub fn TelemetryDashboard() -> impl IntoView {
         build_polyline(&data, 1200.0, 360.0)
     });
 
-    // Create an array of Signals<String> for v0..v6
+    // v_paths: each signal only clones its one String
     let v_paths: [Signal<String>; 8] = std::array::from_fn(|i| {
         let graph_data = graph_data.clone();
         Signal::derive(move || {
-            let (p0, p1, p2, p3, p4, p5, p6, p7, _ymin, _ymax, _span) = graph_data.get();
-
-            match i {
-                0 => p0.clone(),
-                1 => p1.clone(),
-                2 => p2.clone(),
-                3 => p3.clone(),
-                4 => p4.clone(),
-                5 => p5.clone(),
-                6 => p6.clone(),
-                7 => p7.clone(),
-                _ => unreachable!(),
-            }
+            graph_data.with(
+                |(p0, p1, p2, p3, p4, p5, p6, p7, _ymin, _ymax, _span)| match i {
+                    0 => p0.clone(),
+                    1 => p1.clone(),
+                    2 => p2.clone(),
+                    3 => p3.clone(),
+                    4 => p4.clone(),
+                    5 => p5.clone(),
+                    6 => p6.clone(),
+                    7 => p7.clone(),
+                    _ => unreachable!(),
+                },
+            )
         })
     });
 
-    // Scaling values
+    // Scaling values: no String clones, just copy f32s
     let y_min = Signal::derive({
         let graph_data = graph_data.clone();
-        move || {
-            let (_, _, _, _, _, _, _, _, ymin, _, _) = graph_data.get();
-            ymin
-        }
+        move || graph_data.with(|(_, _, _, _, _, _, _, _, ymin, _, _)| *ymin)
     });
 
     let y_max = Signal::derive({
         let graph_data = graph_data.clone();
-        move || {
-            let (_, _, _, _, _, _, _, _, _, ymax, _) = graph_data.get();
-            ymax
-        }
+        move || graph_data.with(|(_, _, _, _, _, _, _, _, _, ymax, _)| *ymax)
     });
 
     let span_min = Signal::derive({
         let graph_data = graph_data.clone();
-        move || {
-            let (_, _, _, _, _, _, _, _, _, _, span) = graph_data.get();
-            span
-        }
+        move || graph_data.with(|(_, _, _, _, _, _, _, _, _, _, span)| *span)
     });
 
-    // Midpoint for Y-axis label
+    // y_mid still just uses the two f32 signals
     let y_mid = Signal::derive(move || {
         let (lo, hi) = (y_min.get(), y_max.get());
         (lo + hi) * 0.5
