@@ -96,13 +96,18 @@ pub async fn handle_packet(state: &Arc<AppState>) {
 
     // Insert into DB
     sqlx::query(
-        "INSERT INTO telemetry (timestamp_ms, data_type, v0, v1, v2) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO telemetry (timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
         .bind(ts_ms)
         .bind(&data_type_str)
         .bind(v0)
         .bind(v1)
         .bind(v2)
+        .bind(v3)
+        .bind(v4)
+        .bind(v5)
+        .bind(v6)
+        .bind(v7)
         .execute(&state.db)
         .await
         .expect("DB insert into telemetry failed");

@@ -143,7 +143,7 @@ async fn get_history(
     let cutoff = now_ms - (minutes as i64) * 60_000;
 
     let rows_db = sqlx::query(
-        "SELECT timestamp_ms, data_type, v0, v1, v2 \
+        "SELECT timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7 \
          FROM telemetry \
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",
