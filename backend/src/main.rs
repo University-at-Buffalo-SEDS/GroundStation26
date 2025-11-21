@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
                 &abort_handler_state_clone,
                 error_msg,
             );
-
+            println!("Sender: {:?}", pkt.sender());
             println!("Abort packet received!");
             Ok(())
         });
