@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use crate::state::AppState;
 use axum::{
     extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade}, extract::{Query, State},
@@ -13,7 +14,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use axum::http::header;
 use tower_http::services::ServeDir;
+use bytes::Bytes;
+use tokio::sync::OnceCell;
+
+static FAVICON_DATA: OnceCell<Bytes> = OnceCell::const_new();
 
 /// Public router constructor
 pub fn router(state: Arc<AppState>) -> Router {
@@ -23,7 +29,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/recent", get(get_recent))
         .route("/api/command", post(send_command))
         .route("/api/history", get(get_history))
-        .route("/api/alerts", get(get_alerts)) // <-- new route
+        .route("/api/alerts", get(get_alerts))
+        .route("/favicon", get(get_favicon))
         .route("/ws", get(ws_handler))
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
@@ -99,6 +106,28 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .collect();
 
     Json(rows)
+}
+
+
+async fn get_favicon() -> impl IntoResponse {
+    // Load the favicon into memory on first request, reuse later
+    let bytes = FAVICON_DATA
+        .get_or_init(|| async {
+            // Adjust this path if needed
+            let path: PathBuf = "./frontend/dist/favicon.png".into();
+            let data = tokio::fs::read(&path)
+                .await
+                .unwrap_or_else(|e| panic!("failed to read favicon at {:?}: {e}", path));
+            Bytes::from(data)
+        })
+        .await
+        .clone();
+
+    // Return as an image/png response
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        bytes,
+    )
 }
 
 async fn send_command(
