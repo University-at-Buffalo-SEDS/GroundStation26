@@ -33,6 +33,8 @@ async fn main() -> anyhow::Result<()> {
     let db_path = "./data/groundstation.db";
 
     if !Path::new(db_path).exists() {
+        //make sure the data directory exists
+        fs::create_dir_all("./data")?;
         // Create an empty file. That's it.
         fs::write(db_path, b"")?;
         println!("Created empty DB file.");
