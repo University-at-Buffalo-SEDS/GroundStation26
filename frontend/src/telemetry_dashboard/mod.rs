@@ -18,6 +18,8 @@ use serde::Deserialize;
 use warnings_tab::WarningsTab;
 
 pub const HISTORY_MS: i64 = 60_000 * 20; // 20 minutes
+const WARNING_ACK_STORAGE_KEY: &str = "gs_last_warning_ack_ts";
+const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
 
 // ------------------------------------------------------------------------------------------------
 // WebSocket handle (thread_local because WASM is single-threaded)
@@ -50,8 +52,7 @@ struct ErrorMsg {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Alerts from DB (/api/alerts) – expected backend JSON shape:
-//   [{ "timestamp_ms": i64, "severity": "warning"|"error", "message": "..." }, ...]
+// Alerts from DB (/api/alerts)
 // ------------------------------------------------------------------------------------------------
 #[derive(Deserialize)]
 struct AlertDto {
@@ -224,6 +225,32 @@ pub fn TelemetryDashboard() -> impl IntoView {
     let (warnings, set_warnings) = signal(Vec::<WarningRow>::new());
     let (errors, set_errors) = signal(Vec::<ErrorRow>::new());
 
+    // --- Last acknowledged timestamps (client-side) ---
+    let (ack_warning_ts, set_ack_warning_ts) = signal(0_i64);
+    let (ack_error_ts, set_ack_error_ts) = signal(0_i64);
+
+    // Load acknowledged timestamps from localStorage on mount
+    Effect::new({
+        let set_ack_warning_ts = set_ack_warning_ts.clone();
+        let set_ack_error_ts = set_ack_error_ts.clone();
+        move |_| {
+            if let Some(window) = web_sys::window() {
+                if let Ok(Some(storage)) = window.local_storage() {
+                    if let Ok(Some(val)) = storage.get_item(WARNING_ACK_STORAGE_KEY) {
+                        if let Ok(parsed) = val.parse::<i64>() {
+                            set_ack_warning_ts.set(parsed);
+                        }
+                    }
+                    if let Ok(Some(val)) = storage.get_item(ERROR_ACK_STORAGE_KEY) {
+                        if let Ok(parsed) = val.parse::<i64>() {
+                            set_ack_error_ts.set(parsed);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     // --------------------------------------------------------------------------------------------
     // INITIAL `/api/recent` TELEMETRY LOAD
     // --------------------------------------------------------------------------------------------
@@ -269,13 +296,33 @@ pub fn TelemetryDashboard() -> impl IntoView {
     Effect::new({
         let set_warnings = set_warnings.clone();
         let set_errors = set_errors.clone();
+        let ack_warning_ts = ack_warning_ts.clone();
+        let ack_error_ts = ack_error_ts.clone();
+        let set_ack_warning_ts = set_ack_warning_ts.clone();
+        let set_ack_error_ts = set_ack_error_ts.clone();
 
         move |_| {
             wasm_bindgen_futures::spawn_local(async move {
-                // adjust query params as needed; this matches a backend like:
-                // GET /api/alerts?minutes=20
                 if let Ok(resp) = Request::get("/api/alerts?minutes=20").send().await {
                     if let Ok(mut alerts) = resp.json::<Vec<AlertDto>>().await {
+                        // Detect backend reset using timestamps only:
+                        let max_ts = alerts.iter().map(|a| a.timestamp_ms).max().unwrap_or(0);
+
+                        let prev_warn = ack_warning_ts.get_untracked();
+                        let prev_err = ack_error_ts.get_untracked();
+                        let prev_ack = prev_warn.max(prev_err);
+
+                        if prev_ack > 0 && max_ts > 0 && max_ts < prev_ack - HISTORY_MS {
+                            set_ack_warning_ts.set(0);
+                            set_ack_error_ts.set(0);
+                            if let Some(window) = web_sys::window() {
+                                if let Ok(Some(storage)) = window.local_storage() {
+                                    let _ = storage.remove_item(WARNING_ACK_STORAGE_KEY);
+                                    let _ = storage.remove_item(ERROR_ACK_STORAGE_KEY);
+                                }
+                            }
+                        }
+
                         // newest first
                         alerts.sort_by_key(|a| -a.timestamp_ms);
 
@@ -413,13 +460,71 @@ pub fn TelemetryDashboard() -> impl IntoView {
     });
 
     // --------------------------------------------------------------------------------------------
-    // Flashing border state
+    // Flashing border + warning/error counts
     // --------------------------------------------------------------------------------------------
-    let warn_count = Signal::derive(move || warnings.get().len());
-    let err_count = Signal::derive(move || errors.get().len());
+    let warn_count = Signal::derive({
+        let warnings = warnings.clone();
+        move || warnings.get().len()
+    });
+    let err_count = Signal::derive({
+        let errors = errors.clone();
+        move || errors.get().len()
+    });
+    let has_warnings = Signal::derive({
+        let warn_count = warn_count.clone();
+        move || warn_count.get() > 0
+    });
+    // latest timestamps, for unacknowledged logic
+    let latest_warning_ts = Signal::derive({
+        let warnings = warnings.clone();
+        move || {
+            warnings
+                .get()
+                .iter()
+                .map(|w| w.timestamp_ms)
+                .max()
+                .unwrap_or(0)
+        }
+    });
 
-    let has_errors = Signal::derive(move || err_count.get() > 0);
-    let has_warnings = Signal::derive(move || warn_count.get() > 0);
+    let latest_error_ts = Signal::derive({
+        let errors = errors.clone();
+        move || {
+            errors
+                .get()
+                .iter()
+                .map(|e| e.timestamp_ms)
+                .max()
+                .unwrap_or(0)
+        }
+    });
+
+    let has_errors = Signal::derive({
+        let err_count = err_count.clone();
+        move || err_count.get() > 0
+    });
+
+    // unacknowledged warnings: there is at least one warning newer than the ack timestamp
+    let has_unacked_warnings = Signal::derive({
+        let latest_warning_ts = latest_warning_ts.clone();
+        let ack_warning_ts = ack_warning_ts.clone();
+        move || {
+            let latest = latest_warning_ts.get();
+            let ack = ack_warning_ts.get();
+            latest > 0 && latest > ack
+        }
+    });
+
+    // unacknowledged errors: same idea
+    let has_unacked_errors = Signal::derive({
+        let latest_error_ts = latest_error_ts.clone();
+        let ack_error_ts = ack_error_ts.clone();
+        move || {
+            let latest = latest_error_ts.get();
+            let ack = ack_error_ts.get();
+            latest > 0 && latest > ack
+        }
+    });
 
     let (flash_on, set_flash_on) = signal(false);
     Effect::new(move |_| {
@@ -431,13 +536,15 @@ pub fn TelemetryDashboard() -> impl IntoView {
         });
     });
 
+    // Border only flashes for *unacknowledged* errors
     let border_style = Signal::derive({
         let has_errors = has_errors.clone();
+        let has_unacked_errors = has_unacked_errors.clone();
         let flash_on = flash_on.clone();
         move || {
-            if has_errors.get() && flash_on.get() {
+            if has_unacked_errors.get() && flash_on.get() {
                 "2px solid #ef4444"
-            } else if has_errors.get() {
+            } else if has_errors.get() && has_unacked_errors.get() {
                 "1px solid #ef4444"
             } else {
                 "1px solid transparent"
@@ -509,10 +616,17 @@ pub fn TelemetryDashboard() -> impl IntoView {
                                 <Show when=move || has_warnings.get()>
                                     {move || {
                                         let flash = flash_on.get();
+                                        let unacked = has_unacked_warnings.get();
                                         view! {
                                             <span style=move || {
-                                                if flash { "color:#facc15; opacity:1;" }
-                                                else      { "color:#facc15; opacity:0.3;" }
+                                                if unacked && flash {
+                                                    "color:#facc15; opacity:1;"
+                                                } else if unacked {
+                                                    "color:#facc15; opacity:0.4;"
+                                                } else {
+                                                    // acknowledged warnings: no flashing, dimmer icon
+                                                    "color:#9ca3af; opacity:0.6;"
+                                                }
                                             }>
                                                 "⚠"
                                             </span>
@@ -541,10 +655,17 @@ pub fn TelemetryDashboard() -> impl IntoView {
                                 <Show when=move || has_errors.get()>
                                     {move || {
                                         let flash = flash_on.get();
+                                        let unacked = has_unacked_errors.get();
                                         view! {
                                             <span style=move || {
-                                                if flash { "color:#fecaca; opacity:1;" }
-                                                else      { "color:#fecaca; opacity:0.3;" }
+                                                if unacked && flash {
+                                                    "color:#fecaca; opacity:1;"
+                                                } else if unacked {
+                                                    "color:#fecaca; opacity:0.4;"
+                                                } else {
+                                                    // acknowledged errors: no flashing, dimmer icon
+                                                    "color:#9ca3af; opacity:0.6;"
+                                                }
                                             }>
                                                 "⛔"
                                             </span>
@@ -563,6 +684,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
                 <Show
                     when=move || warn_count.get() == 0 && err_count.get() == 0
                     fallback=move || {
+                        // Status pill + tab-specific acknowledge buttons
                         view! {
                             <div style="
                                 display:flex; align-items:center; gap:0.75rem;
@@ -583,6 +705,84 @@ pub fn TelemetryDashboard() -> impl IntoView {
                                         <span style="color:#facc15;">
                                             {format!("{} warning(s)", warn_count.get())}
                                         </span>
+                                    }}
+                                </Show>
+
+                                // Acknowledge warnings button – only in Warnings tab
+                                <Show
+                                    when=move || active_main_tab.get() == MainTab::Warnings
+                                        && has_warnings.get()
+                                >
+                                    {move || {
+                                        let latest_warning_ts = latest_warning_ts.clone();
+                                        let set_ack_warning_ts = set_ack_warning_ts.clone();
+                                        view! {
+                                            <button
+                                                style="
+                                                    margin-left:auto;
+                                                    padding:0.25rem 0.7rem;
+                                                    border-radius:999px;
+                                                    border:1px solid #4b5563;
+                                                    background:#020617;
+                                                    color:#e5e7eb;
+                                                    font-size:0.75rem;
+                                                    cursor:pointer;
+                                                "
+                                                on:click=move |_| {
+                                                    let ts = latest_warning_ts.get_untracked();
+                                                    set_ack_warning_ts.set(ts);
+                                                    if let Some(window) = web_sys::window() {
+                                                        if let Ok(Some(storage)) = window.local_storage() {
+                                                            let _ = storage.set_item(
+                                                                WARNING_ACK_STORAGE_KEY,
+                                                                &ts.to_string(),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            >
+                                                "Acknowledge warnings"
+                                            </button>
+                                        }
+                                    }}
+                                </Show>
+
+                                // Acknowledge errors button – only in Errors tab
+                                <Show
+                                    when=move || active_main_tab.get() == MainTab::Errors
+                                        && err_count.get() != 0
+                                >
+                                    {move || {
+                                        let latest_error_ts = latest_error_ts.clone();
+                                        let set_ack_error_ts = set_ack_error_ts.clone();
+                                        view! {
+                                            <button
+                                                style="
+                                                    margin-left:auto;
+                                                    padding:0.25rem 0.7rem;
+                                                    border-radius:999px;
+                                                    border:1px solid #4b5563;
+                                                    background:#020617;
+                                                    color:#e5e7eb;
+                                                    font-size:0.75rem;
+                                                    cursor:pointer;
+                                                "
+                                                on:click=move |_| {
+                                                    let ts = latest_error_ts.get_untracked();
+                                                    set_ack_error_ts.set(ts);
+                                                    if let Some(window) = web_sys::window() {
+                                                        if let Ok(Some(storage)) = window.local_storage() {
+                                                            let _ = storage.set_item(
+                                                                ERROR_ACK_STORAGE_KEY,
+                                                                &ts.to_string(),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            >
+                                                "Acknowledge errors"
+                                            </button>
+                                        }
                                     }}
                                 </Show>
                             </div>
