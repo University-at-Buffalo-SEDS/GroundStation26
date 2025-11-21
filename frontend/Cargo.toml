@@ -19,3 +19,4 @@ gloo-net = { version = "0.6.0", features = ["http"] }
 # for WebSocket + DOM
 web-sys = { version = "0.3", features = ["Window", "WebSocket", "MessageEvent", "Performance", "Storage"] }
 gloo-timers = { version = "0.3.0", features = ["futures"] }
+serde = "1.0.228"

@@ -4,6 +4,7 @@ use groundstation_shared::TelemetryRow;
 use sedsprintf_rs_2026::config::DataType;
 
 use crate::radio::RadioDevice;
+use crate::web::emit_warning;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
@@ -54,7 +55,7 @@ pub async fn telemetry_task(
                         TelemetryCommand::Abort => {
                             router.log::<u8>(
                                     DataType::Abort,
-                                    &[],
+                                    "Manual Abort Command Issued".as_bytes(),
                                 ).expect("failed to log Abort command");
                             println!("Abort command sent");
                         }
@@ -78,7 +79,17 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         }
     };
 
+    if pkt.data_type() == DataType::Warning {
+        if let Ok(msg) = std::str::from_utf8(pkt.payload()) {
+            emit_warning(&state, msg.to_string());
+        } else {
+            emit_warning(&state, "Warning packet with invalid UTF-8 payload");
+        }
+        return; // Ignore invalid packets
+    }
+
     let ts_ms = pkt.timestamp() as i64;
+
     let data_type_str = pkt.data_type().as_str().to_string();
 
     let values = match pkt.data_as_f32() {

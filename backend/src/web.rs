@@ -9,12 +9,13 @@ use axum::{
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use groundstation_shared::{TelemetryCommand, TelemetryRow};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::services::ServeDir;
 
+/// Public router constructor
 pub fn router(state: Arc<AppState>) -> Router {
     let static_dir = ServeDir::new("./frontend/dist");
 
@@ -22,10 +23,48 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/recent", get(get_recent))
         .route("/api/command", post(send_command))
         .route("/api/history", get(get_history))
+        .route("/api/alerts", get(get_alerts)) // <-- new route
         .route("/ws", get(ws_handler))
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
         .with_state(state)
+}
+
+/// Outgoing WebSocket messages to the frontend.
+/// This is what the frontend will deserialize:
+///   { "ty": "telemetry", "data": { ...TelemetryRow... } }
+///   { "ty": "warning",   "data": { ...WarningMsg... } }
+///   { "ty": "error",     "data": { ...ErrorMsg... } }
+#[derive(Serialize)]
+#[serde(tag = "ty", content = "data")]
+pub enum WsOutMsg {
+    Telemetry(TelemetryRow),
+    Warning(WarningMsg),
+    Error(ErrorMsg),
+}
+
+/// Warning row sent to frontend (and stored in AppState channel)
+#[derive(Clone, Serialize)]
+pub struct WarningMsg {
+    pub timestamp_ms: i64,
+    pub message: String,
+}
+
+/// Error row sent to frontend (and stored in AppState channel)
+#[derive(Clone, Serialize)]
+pub struct ErrorMsg {
+    pub timestamp_ms: i64,
+    pub message: String,
+}
+
+/// DTO returned by /api/alerts
+/// Frontend expects:
+///   [{ "timestamp_ms": i64, "severity": "warning"|"error", "message": "..." }, ...]
+#[derive(Serialize)]
+pub struct AlertDto {
+    pub timestamp_ms: i64,
+    pub severity: String,
+    pub message: String,
 }
 
 async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -82,21 +121,53 @@ struct WsCommand {
 }
 
 async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
-    let mut rx = state.ws_tx.subscribe();
-    let cmd_tx = state.cmd_tx.clone();
+    // Subscribe to all three broadcast channels
+    let mut telemetry_rx = state.ws_tx.subscribe();
+    let mut warnings_rx = state.warnings_tx.subscribe();
+    let mut errors_rx = state.errors_tx.subscribe();
 
+    let cmd_tx = state.cmd_tx.clone();
     let (mut sender, mut receiver) = socket.split();
 
-    // Task: server -> client (telemetry stream)
+    // Task: server -> client (all streams multiplexed)
     let send_task = async move {
-        while let Ok(pkt) = rx.recv().await {
-            let text = serde_json::to_string(&pkt).unwrap_or_default();
-            if sender
-                .send(Message::Text(Utf8Bytes::from(text)))
-                .await
-                .is_err()
-            {
-                break;
+        loop {
+            tokio::select! {
+                Ok(pkt) = telemetry_rx.recv() => {
+                    let msg = WsOutMsg::Telemetry(pkt);
+                    let text = serde_json::to_string(&msg).unwrap_or_default();
+                    if sender
+                        .send(Message::Text(Utf8Bytes::from(text)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+
+                Ok(warn) = warnings_rx.recv() => {
+                    let msg = WsOutMsg::Warning(warn);
+                    let text = serde_json::to_string(&msg).unwrap_or_default();
+                    if sender
+                        .send(Message::Text(Utf8Bytes::from(text)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+
+                Ok(err) = errors_rx.recv() => {
+                    let msg = WsOutMsg::Error(err);
+                    let text = serde_json::to_string(&msg).unwrap_or_default();
+                    if sender
+                        .send(Message::Text(Utf8Bytes::from(text)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
     };
@@ -107,7 +178,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             if let Message::Text(text) = msg {
                 match serde_json::from_str::<WsCommand>(&text) {
                     Ok(cmd) => {
-                        // Forward to the same command channel used by /api/command
                         if let Err(e) = cmd_tx.send(cmd.cmd).await {
                             println!("Failed to forward WS command to cmd_tx: {e}");
                         }
@@ -170,4 +240,107 @@ async fn get_history(
         .collect();
 
     Json(rows)
+}
+
+/// NEW: /api/alerts – returns warnings + errors from `alerts` table
+/// Query param: `minutes` (optional, defaults to 20)
+async fn get_alerts(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HistoryParams>,
+) -> impl IntoResponse {
+    let minutes = params.minutes.unwrap_or(20);
+    let cutoff = now_ms_i64() - (minutes as i64) * 60_000;
+
+    let alerts_db = sqlx::query(
+        r#"
+        SELECT timestamp_ms, severity, message
+        FROM alerts
+        WHERE timestamp_ms >= ?
+        ORDER BY timestamp_ms DESC
+        "#,
+    )
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+    let alerts: Vec<AlertDto> = alerts_db
+        .into_iter()
+        .map(|row| AlertDto {
+            timestamp_ms: row.get::<i64, _>("timestamp_ms"),
+            severity: row.get::<String, _>("severity"),
+            message: row.get::<String, _>("message"),
+        })
+        .collect();
+
+    Json(alerts)
+}
+
+/// Helper: current timestamp in ms (i64) for warnings/errors/etc.
+fn now_ms_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// PUBLIC HELPERS — can be called from *any thread* that has &AppState
+///
+/// Example usage from anywhere:
+///     emit_warning(&app_state, "GPS fix lost");
+///     emit_error(&app_state, "Main valve stuck closed");
+///
+/// If you only have Arc<AppState>, just pass `&*arc` or `arc.as_ref()`.
+pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
+    let msg_string = message.into();
+    let timestamp = now_ms_i64();
+
+    // 1) Broadcast to frontend immediately
+    let ws_msg = WarningMsg {
+        timestamp_ms: timestamp,
+        message: msg_string.clone(),
+    };
+    let _ = state.warnings_tx.send(ws_msg);
+
+    // 2) Insert into DB asynchronously
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO alerts (timestamp_ms, severity, message)
+            VALUES (?, 'warning', ?)
+            "#,
+        )
+            .bind(timestamp)
+            .bind(msg_string)
+            .execute(&db)
+            .await;
+    });
+}
+
+pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
+    let msg_string = message.into();
+    let timestamp = now_ms_i64();
+
+    // 1) Broadcast to frontend immediately
+    let ws_msg = ErrorMsg {
+        timestamp_ms: timestamp,
+        message: msg_string.clone(),
+    };
+    let _ = state.errors_tx.send(ws_msg);
+
+    // 2) Insert into DB asynchronously
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO alerts (timestamp_ms, severity, message)
+            VALUES (?, 'error', ?)
+            "#,
+        )
+            .bind(timestamp)
+            .bind(msg_string)
+            .execute(&db)
+            .await;
+    });
 }
