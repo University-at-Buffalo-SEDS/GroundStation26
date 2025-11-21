@@ -625,7 +625,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
                                                     "color:#facc15; opacity:0.4;"
                                                 } else {
                                                     // acknowledged warnings: no flashing, dimmer icon
-                                                    "color:#9ca3af; opacity:0.6;"
+                                                    "color:#9ca3af; opacity:1;"
                                                 }
                                             }>
                                                 "⚠"
@@ -664,7 +664,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
                                                     "color:#fecaca; opacity:0.4;"
                                                 } else {
                                                     // acknowledged errors: no flashing, dimmer icon
-                                                    "color:#9ca3af; opacity:0.6;"
+                                                    "color:#9ca3af; opacity:1;"
                                                 }
                                             }>
                                                 "⛔"
