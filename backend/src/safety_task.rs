@@ -15,6 +15,7 @@ const ACCELERATION_Z_MAX_THRESHOLD: f32 = 100.0; // m/s²
 
 pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
     let mut abort = false;
+    let mut count: u64 = 0;
     loop {
         sleep(Duration::from_millis(500)).await;
 
@@ -23,10 +24,21 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
             let rb = state.ring_buffer.lock().unwrap();
             let len = rb.len();
 
+
+            if count >= 20{
+                emit_warning(
+                    &state,
+                    "Warning: No telemetry packets received for 10 seconds!",
+                );
+                println!("Safety: No telemetry packets received for 20 iterations!");
+                count = 0;
+            }
+
             if len == 0 {
-                println!("Safety: no recent telemetry packets!");
+                count += 1;
                 Vec::new()
             } else {
+                count = 0;
                 // Most recent `len` packets, cloned so we can drop the lock
                 rb.recent(len).into_iter().cloned().collect::<Vec<_>>()
             }
