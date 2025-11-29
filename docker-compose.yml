@@ -1,8 +1,6 @@
 services:
   web:
     build: .
-    ports:
-      - "2222:3000"
     networks:
       - internal
     volumes:
@@ -26,7 +24,6 @@ services:
 
 networks:
     internal:
-      internal: true    # use default bridge driver but no external access
+      internal: true
     external:
-      external: true
       driver: bridge
