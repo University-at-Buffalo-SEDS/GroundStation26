@@ -1,5 +1,6 @@
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
+use groundstation_shared::FlightState;
 use groundstation_shared::TelemetryRow;
 use leptos::__reexports::wasm_bindgen_futures;
 use leptos::prelude::*;
@@ -35,6 +36,7 @@ thread_local! {
 #[serde(tag = "ty", content = "data")]
 enum WsInMsg {
     Telemetry(TelemetryRow),
+    FlightState(FlightStateMsg),
     Warning(WarningMsg),
     Error(ErrorMsg),
 }
@@ -43,6 +45,11 @@ enum WsInMsg {
 struct WarningMsg {
     pub timestamp_ms: i64,
     pub message: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct FlightStateMsg {
+    pub state: FlightState,
 }
 
 #[derive(Clone, Deserialize)]
@@ -229,6 +236,31 @@ pub fn TelemetryDashboard() -> impl IntoView {
     let (ack_warning_ts, set_ack_warning_ts) = signal(0_i64);
     let (ack_error_ts, set_ack_error_ts) = signal(0_i64);
 
+    // --- Current flight state ---
+    let (flight_state, set_flight_state) = signal(FlightState::Startup);
+    let flight_state_str = Signal::derive({
+        let flight_state = flight_state.clone();
+        move || flight_state.get().to_string()
+    });
+
+    // --------------------------------------------------------------------------------------------
+    // INITIAL `/flightstate` LOAD (current flight state from backend)
+    // --------------------------------------------------------------------------------------------
+    Effect::new({
+        let set_flight_state = set_flight_state.clone();
+        move |_| {
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(resp) = Request::get("/flightstate").send().await {
+                    if resp.ok() {
+                        if let Ok(state) = resp.json::<FlightState>().await {
+                            set_flight_state.set(state);
+                        }
+                    }
+                }
+            });
+        }
+    });
+
     // Load acknowledged timestamps from localStorage on mount
     Effect::new({
         let set_ack_warning_ts = set_ack_warning_ts.clone();
@@ -358,6 +390,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
         let set_rows = set_rows.clone();
         let set_warnings = set_warnings.clone();
         let set_errors = set_errors.clone();
+        let set_flight_state = set_flight_state.clone();
 
         move |_| {
             let ws_url = make_ws_url();
@@ -400,6 +433,9 @@ pub fn TelemetryDashboard() -> impl IntoView {
                                     },
                                 );
                             });
+                        }
+                        Ok(WsInMsg::FlightState(fs)) => {
+                            set_flight_state.set(fs.state);
                         }
                         Err(e) => {
                             web_sys::console::error_1(&format!("WS parse error: {e}").into());
@@ -681,117 +717,135 @@ pub fn TelemetryDashboard() -> impl IntoView {
             </div>
 
             <div style="margin-bottom:0.75rem; display:flex; gap:0.75rem; align-items:center;">
-                <Show
-                    when=move || warn_count.get() == 0 && err_count.get() == 0
-                    fallback=move || {
-                        // Status pill + tab-specific acknowledge buttons
-                        view! {
-                            <div style="
-                                display:flex; align-items:center; gap:0.75rem;
-                                padding:0.35rem 0.7rem; border-radius:999px;
-                                background:#111827; border:1px solid #4b5563;">
-                                <span style="color:#9ca3af;">"Status:"</span>
+                <div style="
+                    display:flex; align-items:center; gap:0.75rem;
+                    padding:0.35rem 0.7rem; border-radius:999px;
+                    background:#111827; border:1px solid #4b5563;">
+                    <span style="color:#9ca3af;">"Status:"</span>
 
-                                <Show when=move || has_errors.get()>
-                                    {move || view! {
-                                        <span style="color:#fecaca;">
-                                            {format!("{} error(s)", err_count.get())}
-                                        </span>
-                                    }}
-                                </Show>
+                    // --- Nominal case ---
+                    <Show
+                        when=move || warn_count.get() == 0 && err_count.get() == 0
+                        fallback=move || {
+                            // --- Non-nominal: show counts + buttons ---
+                            view! {
+                                <>
+                                    <Show when=move || has_errors.get()>
+                                        {move || view! {
+                                            <span style="color:#fecaca;">
+                                                {format!("{} error(s)", err_count.get())}
+                                            </span>
+                                        }}
+                                    </Show>
 
-                                <Show when=move || has_warnings.get()>
-                                    {move || view! {
-                                        <span style="color:#facc15;">
-                                            {format!("{} warning(s)", warn_count.get())}
-                                        </span>
-                                    }}
-                                </Show>
+                                    <Show when=move || has_warnings.get()>
+                                        {move || view! {
+                                            <span style="color:#facc15;">
+                                                {format!("{} warning(s)", warn_count.get())}
+                                            </span>
+                                        }}
+                                    </Show>
 
-                                // Acknowledge warnings button – only in Warnings tab
-                                <Show
-                                    when=move || active_main_tab.get() == MainTab::Warnings
-                                        && has_warnings.get()
-                                >
-                                    {move || {
-                                        let latest_warning_ts = latest_warning_ts.clone();
-                                        let set_ack_warning_ts = set_ack_warning_ts.clone();
-                                        view! {
-                                            <button
-                                                style="
-                                                    margin-left:auto;
-                                                    padding:0.25rem 0.7rem;
-                                                    border-radius:999px;
-                                                    border:1px solid #4b5563;
-                                                    background:#020617;
-                                                    color:#e5e7eb;
-                                                    font-size:0.75rem;
-                                                    cursor:pointer;
-                                                "
-                                                on:click=move |_| {
-                                                    let ts = latest_warning_ts.get_untracked();
-                                                    set_ack_warning_ts.set(ts);
-                                                    if let Some(window) = web_sys::window() {
-                                                        if let Ok(Some(storage)) = window.local_storage() {
-                                                            let _ = storage.set_item(
-                                                                WARNING_ACK_STORAGE_KEY,
-                                                                &ts.to_string(),
-                                                            );
+                                    <span style="color:#93c5fd; margin-left:0.75rem;">
+                                        {move || format!("(Flight state: {})", flight_state_str.get())}
+                                    </span>
+
+                                    // Acknowledge warnings button – only in Warnings tab
+                                    <Show
+                                        when=move || active_main_tab.get() == MainTab::Warnings
+                                            && has_warnings.get()
+                                    >
+                                        {move || {
+                                            let latest_warning_ts = latest_warning_ts.clone();
+                                            let set_ack_warning_ts = set_ack_warning_ts.clone();
+                                            view! {
+                                                <button
+                                                    style="
+                                                        margin-left:auto;
+                                                        padding:0.25rem 0.7rem;
+                                                        border-radius:999px;
+                                                        border:1px solid #4b5563;
+                                                        background:#020617;
+                                                        color:#e5e7eb;
+                                                        font-size:0.75rem;
+                                                        cursor:pointer;
+                                                    "
+                                                    on:click=move |_| {
+                                                        let ts = latest_warning_ts.get_untracked();
+                                                        set_ack_warning_ts.set(ts);
+                                                        if let Some(window) = web_sys::window() {
+                                                            if let Ok(Some(storage)) = window.local_storage() {
+                                                                let _ = storage.set_item(
+                                                                    WARNING_ACK_STORAGE_KEY,
+                                                                    &ts.to_string(),
+                                                                );
+                                                            }
                                                         }
                                                     }
-                                                }
-                                            >
-                                                "Acknowledge warnings"
-                                            </button>
-                                        }
-                                    }}
-                                </Show>
+                                                >
+                                                    "Acknowledge warnings"
+                                                </button>
+                                            }
+                                        }}
+                                    </Show>
 
-                                // Acknowledge errors button – only in Errors tab
-                                <Show
-                                    when=move || active_main_tab.get() == MainTab::Errors
-                                        && err_count.get() != 0
-                                >
-                                    {move || {
-                                        let latest_error_ts = latest_error_ts.clone();
-                                        let set_ack_error_ts = set_ack_error_ts.clone();
-                                        view! {
-                                            <button
-                                                style="
-                                                    margin-left:auto;
-                                                    padding:0.25rem 0.7rem;
-                                                    border-radius:999px;
-                                                    border:1px solid #4b5563;
-                                                    background:#020617;
-                                                    color:#e5e7eb;
-                                                    font-size:0.75rem;
-                                                    cursor:pointer;
-                                                "
-                                                on:click=move |_| {
-                                                    let ts = latest_error_ts.get_untracked();
-                                                    set_ack_error_ts.set(ts);
-                                                    if let Some(window) = web_sys::window() {
-                                                        if let Ok(Some(storage)) = window.local_storage() {
-                                                            let _ = storage.set_item(
-                                                                ERROR_ACK_STORAGE_KEY,
-                                                                &ts.to_string(),
-                                                            );
+                                    // Acknowledge errors button – only in Errors tab
+                                    <Show
+                                        when=move || active_main_tab.get() == MainTab::Errors
+                                            && err_count.get() != 0
+                                    >
+                                        {move || {
+                                            let latest_error_ts = latest_error_ts.clone();
+                                            let set_ack_error_ts = set_ack_error_ts.clone();
+                                            view! {
+                                                <button
+                                                    style="
+                                                        margin-left:auto;
+                                                        padding:0.25rem 0.7rem;
+                                                        border-radius:999px;
+                                                        border:1px solid #4b5563;
+                                                        background:#020617;
+                                                        color:#e5e7eb;
+                                                        font-size:0.75rem;
+                                                        cursor:pointer;
+                                                    "
+                                                    on:click=move |_| {
+                                                        let ts = latest_error_ts.get_untracked();
+                                                        set_ack_error_ts.set(ts);
+                                                        if let Some(window) = web_sys::window() {
+                                                            if let Ok(Some(storage)) = window.local_storage() {
+                                                                let _ = storage.set_item(
+                                                                    ERROR_ACK_STORAGE_KEY,
+                                                                    &ts.to_string(),
+                                                                );
+                                                            }
                                                         }
                                                     }
-                                                }
-                                            >
-                                                "Acknowledge errors"
-                                            </button>
-                                        }
-                                    }}
-                                </Show>
-                            </div>
+                                                >
+                                                    "Acknowledge errors"
+                                                </button>
+                                            }
+                                        }}
+                                    </Show>
+                                </>
+                            }
                         }
-                    }
-                >
-                    <span style="color:#9ca3af;">"Status: All systems nominal."</span>
-                </Show>
+                    >
+                        // Nominal content (no errors/warnings)
+                        {move || view! {
+                        <>
+                            <span style="color:#22c55e; font-weight:600;">
+                                "Nominal"
+                            </span>
+                            <span style="color:#93c5fd; margin-left:0.75rem;">
+                                {format!("(Flight state: {})", flight_state_str.get())}
+                            </span>
+                        </>
+                    }}
+                    </Show>
+                </div>
             </div>
+
 
             <ActionsPanel />
 

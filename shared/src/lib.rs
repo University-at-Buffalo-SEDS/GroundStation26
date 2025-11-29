@@ -10,6 +10,68 @@ pub enum TelemetryCommand {
     Abort,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum FlightState {
+    Startup,
+    Idle,
+    PreFill,
+    FillTest,
+    Fill,
+    Armed,
+    Launch,
+    Ascent,
+    Coast,
+    Apogee,
+    ParachuteDeploy,
+    Descent,
+    Landed,
+    Recovery,
+    Aborted,
+}
+
+impl FlightState{
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            FlightState::Startup => "Startup",
+            FlightState::Idle => "Idle",
+            FlightState::PreFill => "PreFill",
+            FlightState::FillTest => "FillTest",
+            FlightState::Fill => "Fill",
+            FlightState::Armed => "Armed",
+            FlightState::Launch => "Launch",
+            FlightState::Ascent => "Ascent",
+            FlightState::Coast => "Coast",
+            FlightState::Apogee => "Apogee",
+            FlightState::ParachuteDeploy => "ParachuteDeploy",
+            FlightState::Descent => "Descent",
+            FlightState::Landed => "Landed",
+            FlightState::Recovery => "Recovery",
+            FlightState::Aborted => "Aborted",
+        }
+    }
+}
+pub fn u8_to_flight_state(value: u8) -> Option<FlightState> {
+    match value {
+        0 => Some(FlightState::Startup),
+        1 => Some(FlightState::Idle),
+        2 => Some(FlightState::PreFill),
+        3 => Some(FlightState::FillTest),
+        4 => Some(FlightState::Fill),
+        5 => Some(FlightState::Armed),
+        6 => Some(FlightState::Launch),
+        7 => Some(FlightState::Ascent),
+        8 => Some(FlightState::Coast),
+        9 => Some(FlightState::Apogee),
+        10 => Some(FlightState::ParachuteDeploy),
+        11 => Some(FlightState::Descent),
+        12 => Some(FlightState::Landed),
+        13 => Some(FlightState::Recovery),
+        14 => Some(FlightState::Aborted),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TelemetryRow {
     pub timestamp_ms: i64,

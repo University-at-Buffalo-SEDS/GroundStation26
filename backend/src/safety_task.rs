@@ -62,7 +62,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                         {
                             emit_warning(
                                 &state,
-                                "Critical: Acceleration X threshold exceeded, aborting mission!",
+                                "Critical: Acceleration X threshold exceeded!",
                             );
                         }
                     }
@@ -72,7 +72,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                         {
                             emit_warning(
                                 &state,
-                                "Critical: Acceleration Y threshold exceeded, aborting mission!",
+                                "Critical: Acceleration Y threshold exceeded!",
                             );
                         }
                     }
@@ -82,7 +82,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                         {
                             emit_warning(
                                 &state,
-                                "Critical: Acceleration Z threshold exceeded, aborting mission!",
+                                "Critical: Acceleration Z threshold exceeded!",
                             );
                         }
                     }
@@ -91,7 +91,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     abort = true;
                     emit_warning(
                         &state,
-                        "Critical: Generic Error received from vehicle, aborting mission!",
+                        "Generic Error received from vehicle!",
                     );
                     println!("Safety: Generic Error packet received");
                 }

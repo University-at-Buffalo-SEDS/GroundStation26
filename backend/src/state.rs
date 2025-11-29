@@ -1,11 +1,11 @@
+use crate::gpio::GpioPins;
 use crate::ring_buffer::RingBuffer;
-use groundstation_shared::{TelemetryCommand, TelemetryRow};
+use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
+use groundstation_shared::{FlightState, TelemetryCommand, TelemetryRow};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sqlx::SqlitePool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
-
-use crate::web::{ErrorMsg, WarningMsg};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -26,4 +26,13 @@ pub struct AppState {
 
     /// SQLite database
     pub db: SqlitePool,
+
+    /// Current flight state
+    pub state: Arc<Mutex<FlightState>>,
+
+    /// Flight state updates → frontend
+    pub state_tx: broadcast::Sender<FlightStateMsg>,
+
+    /// GPIO interface
+    pub gpio: Arc<GpioPins>,
 }

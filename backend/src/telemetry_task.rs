@@ -1,10 +1,11 @@
 use crate::state::AppState;
-use groundstation_shared::TelemetryCommand;
 use groundstation_shared::TelemetryRow;
+use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
 use sedsprintf_rs_2026::config::DataType;
 
 use crate::radio::RadioDevice;
-use crate::web::emit_warning;
+use crate::web::{emit_warning, FlightStateMsg};
+use crate::GPIO_IGNITION_PIN;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
@@ -15,8 +16,8 @@ pub async fn telemetry_task(
     radio: Arc<Mutex<Box<dyn RadioDevice>>>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
 ) {
-    let mut radio_interval = interval(Duration::from_millis(1));
-    let mut handle_interval = interval(Duration::from_millis(2));
+    let mut radio_interval = interval(Duration::from_millis(2));
+    let mut handle_interval = interval(Duration::from_millis(1));
     let mut router_interval = interval(Duration::from_millis(10));
 
     loop {
@@ -42,6 +43,8 @@ pub async fn telemetry_task(
                                     DataType::MessageData,
                                     "Arm".as_bytes()
                                 ).expect("failed to log Arm command");
+                            let gpio = &state.gpio;
+                            gpio.write_output_pin(GPIO_IGNITION_PIN, true).expect("failed to set gpio output");
                             println!("Arm command sent");
 
                         }
@@ -50,6 +53,10 @@ pub async fn telemetry_task(
                                     DataType::MessageData,
                                     "Disarm".as_bytes()
                                 ).expect("failed to log Arm command");
+                            {
+                                let gpio = &state.gpio;
+                                gpio.write_output_pin(GPIO_IGNITION_PIN, false).expect("failed to set gpio output");
+                            }
                             println!("Disarm command sent");
                         }
                         TelemetryCommand::Abort => {
@@ -79,13 +86,40 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         }
     };
 
+
     if pkt.data_type() == DataType::Warning {
-        if let Ok(msg) = std::str::from_utf8(pkt.payload()) {
+        if let Ok(msg) = pkt.data_as_string() {
             emit_warning(&state, msg.to_string());
         } else {
             emit_warning(&state, "Warning packet with invalid UTF-8 payload");
         }
         return; // Ignore invalid packets
+    }
+
+    if pkt.data_type() == DataType::FlightState {
+        let pkt_data = match pkt.data_as_u8() {
+            Ok(data) => *data.get(0).expect("index 0 does not exist"),
+            Err(_) => return,
+        };
+        let new_flight_state = match u8_to_flight_state(pkt_data) {
+            Some(flight_state) => flight_state,
+            None => return,
+        };
+        {
+            let mut fs = state.state.lock().unwrap();
+            *fs = new_flight_state.clone();
+        }
+        sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
+            .bind(get_current_timestamp_ms() as i64)
+            .bind(pkt_data as i64)
+            .execute(&state.db)
+            .await
+            .expect("DB insert into flight_state failed");
+
+        let _ = state.state_tx.send(FlightStateMsg {
+            state: new_flight_state,
+        });
+        return;
     }
 
     let ts_ms = pkt.timestamp() as i64;

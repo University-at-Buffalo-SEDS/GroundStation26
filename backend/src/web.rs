@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use crate::state::AppState;
+use axum::http::header;
 use axum::{
     extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade}, extract::{Query, State},
     response::IntoResponse,
@@ -7,17 +7,17 @@ use axum::{
     Json,
     Router,
 };
+use bytes::Bytes;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
-use groundstation_shared::{TelemetryCommand, TelemetryRow};
+use groundstation_shared::{FlightState, TelemetryCommand, TelemetryRow};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use axum::http::header;
-use tower_http::services::ServeDir;
-use bytes::Bytes;
 use tokio::sync::OnceCell;
+use tower_http::services::ServeDir;
 
 static FAVICON_DATA: OnceCell<Bytes> = OnceCell::const_new();
 
@@ -31,6 +31,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/history", get(get_history))
         .route("/api/alerts", get(get_alerts))
         .route("/favicon", get(get_favicon))
+        .route("/flightstate", get(get_flight_state))
         .route("/ws", get(ws_handler))
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
@@ -47,9 +48,14 @@ pub fn router(state: Arc<AppState>) -> Router {
 pub enum WsOutMsg {
     Telemetry(TelemetryRow),
     Warning(WarningMsg),
+    FlightState(FlightStateMsg),
     Error(ErrorMsg),
 }
 
+#[derive(Clone, Serialize)]
+pub struct FlightStateMsg {
+    pub state: FlightState,
+}
 /// Warning row sent to frontend (and stored in AppState channel)
 #[derive(Clone, Serialize)]
 pub struct WarningMsg {
@@ -84,10 +90,10 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",
     )
-        .bind(cutoff)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -108,7 +114,6 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(rows)
 }
 
-
 async fn get_favicon() -> impl IntoResponse {
     // Load the favicon into memory on first request, reuse later
     let bytes = FAVICON_DATA
@@ -124,12 +129,19 @@ async fn get_favicon() -> impl IntoResponse {
         .clone();
 
     // Return as an image/png response
-    (
-        [(header::CONTENT_TYPE, "image/png")],
-        bytes,
-    )
+    ([(header::CONTENT_TYPE, "image/png")], bytes)
 }
-
+async fn get_flight_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // get the state from the db
+    let data = sqlx::query("SELECT f_state FROM flight_state ORDER BY timestamp_ms DESC LIMIT 1")
+        .fetch_one(&state.db)
+        .await
+        .expect("failed to fetch flight state");
+    let flight_state: i64 = data.get::<i64, _>("f_state");
+    let flight_state = groundstation_shared::u8_to_flight_state(flight_state as u8)
+        .unwrap_or(groundstation_shared::FlightState::Startup);
+    Json(flight_state)
+}
 async fn send_command(
     State(state): State<Arc<AppState>>,
     Json(cmd): Json<TelemetryCommand>,
@@ -154,6 +166,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let mut telemetry_rx = state.ws_tx.subscribe();
     let mut warnings_rx = state.warnings_tx.subscribe();
     let mut errors_rx = state.errors_tx.subscribe();
+    let mut state_rx = state.state_tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
     let (mut sender, mut receiver) = socket.split();
@@ -170,6 +183,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         .await
                         .is_err()
                     {
+                        break;
+                    }
+                }
+
+                Ok(fs) = state_rx.recv() => {
+                    let msg  = WsOutMsg::FlightState(fs);
+                    let text = serde_json::to_string(&msg).unwrap_or_default();
+                    if sender.send(Message::Text(Utf8Bytes::from(text))).await.is_err() {
                         break;
                     }
                 }
@@ -247,10 +268,10 @@ async fn get_history(
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",
     )
-        .bind(cutoff)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -288,10 +309,10 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-        .bind(cutoff)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -340,10 +361,10 @@ pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
             VALUES (?, 'warning', ?)
             "#,
         )
-            .bind(timestamp)
-            .bind(msg_string)
-            .execute(&db)
-            .await;
+        .bind(timestamp)
+        .bind(msg_string)
+        .execute(&db)
+        .await;
     });
 }
 
@@ -367,9 +388,9 @@ pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
             VALUES (?, 'error', ?)
             "#,
         )
-            .bind(timestamp)
-            .bind(msg_string)
-            .execute(&db)
-            .await;
+        .bind(timestamp)
+        .bind(msg_string)
+        .execute(&db)
+        .await;
     });
 }
