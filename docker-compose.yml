@@ -2,8 +2,31 @@ services:
   web:
     build: .
     ports:
-      - "3000:3000"
-    network_mode: bridge
+      - "2222:3000"
+    networks:
+      - internal
     volumes:
       - ./data:/app/data
     restart: always
+
+  nginx:
+    build: ./nginx
+    ports:
+      - "3000:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/nginx_certs:/etc/nginx/ssl
+    depends_on:
+      - web
+    networks:
+        - internal
+        - external
+    restart: always
+
+
+networks:
+    internal:
+      internal: true    # use default bridge driver but no external access
+    external:
+      external: true
+      driver: bridge

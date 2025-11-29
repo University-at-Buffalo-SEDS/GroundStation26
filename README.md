@@ -13,3 +13,6 @@ get it from https://rustwasm.github.io/wasm-pack/installer/
 
 ## Setting up the DEVICE_IDENTIFIER
 - The device name can be set in the `.cargo/config.toml` file in the root directory of the project.
+
+## Usage
+After building, the backend needs to be behind a reverse proxy with ssl enabled for geolocation to work properly.
