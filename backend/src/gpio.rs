@@ -109,16 +109,13 @@ mod real {
                 .get_mut(&pin_number)
                 .ok_or_else(|| format!("input pin {} not configured", pin_number))?;
 
-            let mut last_fire = Instant::now() - debounce;
             let user_callback = callback;
             let pi_trigger = Self::to_pi_trigger(trigger);
 
-            pin.set_async_interrupt(pi_trigger, move |level: Level| {
-                let now = Instant::now();
-                if now.duration_since(last_fire) >= debounce {
-                    last_fire = now;
+            pin.set_async_interrupt(pi_trigger, duration, move |level: Level| {
+
                     user_callback(level == Level::High);
-                }
+
             })?;
 
             Ok(())
