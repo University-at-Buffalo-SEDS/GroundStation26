@@ -113,7 +113,7 @@ mod real {
 
             pin.set_async_interrupt(pi_trigger, Some(debounce), move |event: rppal::gpio::Event| {
                     let level = event.trigger;
-                    callback(level == Trigger::RisingEdge);
+                    callback(level == rppal::gpio::Trigger::RisingEdge);
 
             })?;
 
