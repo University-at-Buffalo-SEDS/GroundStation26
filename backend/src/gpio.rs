@@ -10,7 +10,7 @@ pub enum Trigger {
 #[cfg(feature = "raspberry_pi")]
 mod real {
     use super::Trigger;
-    use rppal::gpio::{Gpio, InputPin, Level, OutputPin, Trigger as PiTrigger};
+    use rppal::gpio::{Gpio, InputPin, OutputPin, Trigger as PiTrigger};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration};
