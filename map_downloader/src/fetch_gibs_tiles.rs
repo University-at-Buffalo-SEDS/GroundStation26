@@ -214,11 +214,11 @@ async fn fetch_tiles_for_zoom_async(
                             );
                         }
 
-                        Err(e) => {
-                            eprintln!(
-                                "fetch_gibs_tiles_async: network error fetching {}: {} (attempt {}/{})",
-                                url, e, attempts, MAX_ATTEMPTS
-                            );
+                        Err(_e) => {
+                            // eprintln!(
+                            //     "fetch_gibs_tiles_async: network error fetching {}: {} (attempt {}/{})",
+                            //     url, _e, attempts, MAX_ATTEMPTS
+                            // );
                         }
                     }
 
