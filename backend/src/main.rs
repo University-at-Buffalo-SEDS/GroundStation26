@@ -6,7 +6,9 @@ mod safety_task;
 mod state;
 mod telemetry_task;
 mod web;
+mod map;
 
+use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
 use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::state::AppState;
@@ -45,6 +47,12 @@ async fn main() -> anyhow::Result<()> {
     gpio.setup_output_pin(GPIO_IGNITION_PIN)
         .expect("failed to setup gpio pin");
     let gpio_clone = gpio.clone();
+
+    if let Err(e) = ensure_map_data(DEFAULT_MAP_REGION).await {
+        eprintln!("WARNING: failed to ensure map tiles: {e:#}");
+        // you can choose to return Err(e) instead if tiles are mandatory
+    }
+
     // --- DB path ---
     let db_path = "./data/groundstation.db";
 
@@ -113,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Shared state ---
     let state = Arc::new(AppState {
-        ring_buffer: Arc::new(Mutex::new(RingBuffer::new(10000))),
+        ring_buffer: Arc::new(Mutex::new(RingBuffer::new(1024))),
         cmd_tx,
         ws_tx,
         warnings_tx: broadcast::channel(256).0,

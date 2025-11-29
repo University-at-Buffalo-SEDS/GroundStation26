@@ -13,6 +13,12 @@ mod data_tab;
 mod errors_tab;
 mod warnings_tab;
 
+mod map_tab;
+mod state_tab;
+
+use map_tab::MapTab;
+use state_tab::StateTab;
+
 use data_tab::DataTab;
 use errors_tab::ErrorsTab;
 use serde::Deserialize;
@@ -21,6 +27,8 @@ use warnings_tab::WarningsTab;
 pub const HISTORY_MS: i64 = 60_000 * 20; // 20 minutes
 const WARNING_ACK_STORAGE_KEY: &str = "gs_last_warning_ack_ts";
 const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
+const MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
+const DATA_TAB_STORAGE_KEY: &str = "gs_data_tab";
 
 // ------------------------------------------------------------------------------------------------
 // WebSocket handle (thread_local because WASM is single-threaded)
@@ -66,6 +74,45 @@ struct AlertDto {
     pub timestamp_ms: i64,
     pub severity: String, // "warning" or "error"
     pub message: String,
+}
+
+// ------------------------------------------------------------------------------------------------
+// GPS API response (/api/gps) – adjust to match your backend
+// ------------------------------------------------------------------------------------------------
+#[derive(Clone, Deserialize)]
+struct GpsResponse {
+    pub rocket_lat: f64,
+    pub rocket_lon: f64,
+    pub user_lat: f64,
+    pub user_lon: f64,
+}
+
+#[derive(Clone, Copy)]
+struct GpsPoint {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// Extract rocket GPS from a TelemetryRow, if this row represents GPS data.
+///
+/// Assumes:
+/// - `data_type` is something like "GPS" or "GPS_DATA"
+/// - `v0 = latitude (deg)`, `v1 = longitude (deg)`
+fn row_to_gps(row: &TelemetryRow) -> Option<GpsPoint> {
+    // Adjust these matches to whatever you actually use in the backend
+    let is_gps_type = matches!(row.data_type.as_str(), "GPS" | "GPS_DATA" | "ROCKET_GPS");
+
+    if !is_gps_type {
+        return None;
+    }
+
+    let lat = row.v0?;
+    let lon = row.v1?;
+
+    Some(GpsPoint {
+        lat: lat as f64,
+        lon: lon as f64,
+    })
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -209,9 +256,33 @@ pub struct ErrorRow {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MainTab {
-    Data,
+    State,
+    Map,
     Warnings,
     Errors,
+    Data,
+}
+
+// helpers for localStorage <-> MainTab
+fn main_tab_to_str(tab: MainTab) -> &'static str {
+    match tab {
+        MainTab::State => "state",
+        MainTab::Map => "map",
+        MainTab::Warnings => "warnings",
+        MainTab::Errors => "errors",
+        MainTab::Data => "data",
+    }
+}
+
+fn main_tab_from_str(s: &str) -> MainTab {
+    match s {
+        "state" => MainTab::State,
+        "map" => MainTab::Map,
+        "warnings" => MainTab::Warnings,
+        "errors" => MainTab::Errors,
+        "data" => MainTab::Data,
+        _ => MainTab::State,
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -222,11 +293,11 @@ pub fn TelemetryDashboard() -> impl IntoView {
     // --- telemetry data ---
     let (rows, set_rows) = signal(Vec::<TelemetryRow>::new());
 
-    // --- tab selection inside the DataTab ---
+    // --- tab selection inside the DataTab (GYRO_DATA, etc.) ---
     let (active_tab, set_active_tab) = signal("GYRO_DATA".to_string());
 
-    // --- MAIN TABS (Data / Warnings / Errors) ---
-    let (active_main_tab, set_active_main_tab) = signal(MainTab::Data);
+    // --- MAIN TABS (State / Map / Warnings / Errors / Data) ---
+    let (active_main_tab, set_active_main_tab) = signal(MainTab::State);
 
     // --- ALL warnings + errors (newest first) ---
     let (warnings, set_warnings) = signal(Vec::<WarningRow>::new());
@@ -242,6 +313,10 @@ pub fn TelemetryDashboard() -> impl IntoView {
         let flight_state = flight_state.clone();
         move || flight_state.get().to_string()
     });
+
+    // --- GPS positions ---
+    let (rocket_gps, set_rocket_gps) = signal(None::<GpsPoint>);
+    let (user_gps, set_user_gps) = signal(None::<GpsPoint>);
 
     // --------------------------------------------------------------------------------------------
     // INITIAL `/flightstate` LOAD (current flight state from backend)
@@ -283,11 +358,69 @@ pub fn TelemetryDashboard() -> impl IntoView {
         }
     });
 
+    // Restore active main tab from localStorage on mount
+    Effect::new({
+        let set_active_main_tab = set_active_main_tab.clone();
+        move |_| {
+            if let Some(window) = web_sys::window() {
+                if let Ok(Some(storage)) = window.local_storage() {
+                    if let Ok(Some(tab_str)) = storage.get_item(MAIN_TAB_STORAGE_KEY) {
+                        let tab = main_tab_from_str(&tab_str);
+                        set_active_main_tab.set(tab);
+                    }
+                }
+            }
+        }
+    });
+
+    // Persist active main tab to localStorage whenever it changes
+    Effect::new({
+        let active_main_tab = active_main_tab.clone();
+        move |_| {
+            let tab = active_main_tab.get();
+            if let Some(window) = web_sys::window() {
+                if let Ok(Some(storage)) = window.local_storage() {
+                    let _ = storage.set_item(MAIN_TAB_STORAGE_KEY, main_tab_to_str(tab));
+                }
+            }
+        }
+    });
+
+    // Restore inner data tab (active_tab) from localStorage on mount
+    Effect::new({
+        let set_active_tab = set_active_tab.clone();
+        move |_| {
+            if let Some(window) = web_sys::window() {
+                if let Ok(Some(storage)) = window.local_storage() {
+                    if let Ok(Some(tab_str)) = storage.get_item(DATA_TAB_STORAGE_KEY) {
+                        if !tab_str.is_empty() {
+                            set_active_tab.set(tab_str);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Persist inner data tab whenever it changes
+    Effect::new({
+        let active_tab = active_tab.clone();
+        move |_| {
+            let tab = active_tab.get();
+            if let Some(window) = web_sys::window() {
+                if let Ok(Some(storage)) = window.local_storage() {
+                    let _ = storage.set_item(DATA_TAB_STORAGE_KEY, &tab);
+                }
+            }
+        }
+    });
+
     // --------------------------------------------------------------------------------------------
     // INITIAL `/api/recent` TELEMETRY LOAD
     // --------------------------------------------------------------------------------------------
     Effect::new({
         let set_rows = set_rows.clone();
+        let set_rocket_gps = set_rocket_gps.clone();
         move |_| {
             wasm_bindgen_futures::spawn_local(async move {
                 if let Ok(resp) = Request::get("/api/recent").send().await {
@@ -302,6 +435,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
                             }
                         }
 
+                        // downsample for plotting
                         const MAX_INIT_POINTS: usize = 5000;
                         let n = list.len();
                         if n > MAX_INIT_POINTS {
@@ -313,6 +447,11 @@ pub fn TelemetryDashboard() -> impl IntoView {
                                     |(i, row)| if i % stride == 0 { Some(row) } else { None },
                                 )
                                 .collect();
+                        }
+
+                        // Seed rocket_gps from the most recent GPS row in the history
+                        if let Some(gps) = list.iter().rev().find_map(|row| row_to_gps(row)) {
+                            set_rocket_gps.set(Some(gps));
                         }
 
                         set_rows.set(list);
@@ -384,6 +523,32 @@ pub fn TelemetryDashboard() -> impl IntoView {
     });
 
     // --------------------------------------------------------------------------------------------
+    // GPS seed on reload (/api/gps) – one-shot, not a loop
+    // --------------------------------------------------------------------------------------------
+    Effect::new({
+        let set_rocket_gps = set_rocket_gps.clone();
+        let set_user_gps = set_user_gps.clone();
+        move |_| {
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(resp) = Request::get("/api/gps").send().await {
+                    if resp.ok() {
+                        if let Ok(gps) = resp.json::<GpsResponse>().await {
+                            set_rocket_gps.set(Some(GpsPoint {
+                                lat: gps.rocket_lat,
+                                lon: gps.rocket_lon,
+                            }));
+                            set_user_gps.set(Some(GpsPoint {
+                                lat: gps.user_lat,
+                                lon: gps.user_lon,
+                            }));
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // --------------------------------------------------------------------------------------------
     // WEBSOCKET LIVE UPDATES (Telemetry + Warning + Error)
     // --------------------------------------------------------------------------------------------
     Effect::new({
@@ -391,6 +556,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
         let set_warnings = set_warnings.clone();
         let set_errors = set_errors.clone();
         let set_flight_state = set_flight_state.clone();
+        let set_rocket_gps = set_rocket_gps.clone();
 
         move |_| {
             let ws_url = make_ws_url();
@@ -406,48 +572,56 @@ pub fn TelemetryDashboard() -> impl IntoView {
             let pending: Rc<RefCell<Vec<TelemetryRow>>> = Rc::new(RefCell::new(Vec::new()));
 
             let pending_for_ws = pending.clone();
-            let handler = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                if let Some(text) = event.data().as_string() {
-                    match serde_json::from_str::<WsInMsg>(&text) {
-                        Ok(WsInMsg::Telemetry(row)) => {
-                            pending_for_ws.borrow_mut().push(row);
-                        }
-                        Ok(WsInMsg::Warning(w)) => {
-                            set_warnings.update(|v| {
-                                v.insert(
-                                    0,
-                                    WarningRow {
-                                        timestamp_ms: w.timestamp_ms,
-                                        message: w.message,
-                                    },
-                                );
-                            });
-                        }
-                        Ok(WsInMsg::Error(e)) => {
-                            set_errors.update(|v| {
-                                v.insert(
-                                    0,
-                                    ErrorRow {
-                                        timestamp_ms: e.timestamp_ms,
-                                        message: e.message,
-                                    },
-                                );
-                            });
-                        }
-                        Ok(WsInMsg::FlightState(fs)) => {
-                            set_flight_state.set(fs.state);
-                        }
-                        Err(e) => {
-                            web_sys::console::error_1(&format!("WS parse error: {e}").into());
+            let handler = {
+                let set_rocket_gps = set_rocket_gps.clone();
+                Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+                    if let Some(text) = event.data().as_string() {
+                        match serde_json::from_str::<WsInMsg>(&text) {
+                            Ok(WsInMsg::Telemetry(row)) => {
+                                // Update rocket_gps if this row is GPS
+                                if let Some(gps) = row_to_gps(&row) {
+                                    set_rocket_gps.set(Some(gps));
+                                }
+
+                                pending_for_ws.borrow_mut().push(row);
+                            }
+                            Ok(WsInMsg::Warning(w)) => {
+                                set_warnings.update(|v| {
+                                    v.insert(
+                                        0,
+                                        WarningRow {
+                                            timestamp_ms: w.timestamp_ms,
+                                            message: w.message,
+                                        },
+                                    );
+                                });
+                            }
+                            Ok(WsInMsg::Error(e)) => {
+                                set_errors.update(|v| {
+                                    v.insert(
+                                        0,
+                                        ErrorRow {
+                                            timestamp_ms: e.timestamp_ms,
+                                            message: e.message,
+                                        },
+                                    );
+                                });
+                            }
+                            Ok(WsInMsg::FlightState(fs)) => {
+                                set_flight_state.set(fs.state);
+                            }
+                            Err(e) => {
+                                web_sys::console::error_1(&format!("WS parse error: {e}").into());
+                            }
                         }
                     }
-                }
-            });
+                })
+            };
 
             ws.set_onmessage(Some(handler.as_ref().unchecked_ref()));
             handler.forget();
 
-            // tick loop for telemetry
+            // tick loop for telemetry (unchanged)
             let pending_for_tick = pending.clone();
             let set_rows_for_tick = set_rows.clone();
 
@@ -615,23 +789,43 @@ pub fn TelemetryDashboard() -> impl IntoView {
                         min-width:12rem;">
                         <nav style="display:flex; gap:0.5rem; flex-wrap:wrap;">
 
+                            // --- Flight / State tab ---
                             <button
                                 style=move || {
-                                    if active_main_tab.get() == MainTab::Data {
+                                    if active_main_tab.get() == MainTab::State {
                                         "padding:0.4rem 0.8rem; border-radius:0.5rem;\
-                                         border:1px solid #f97316; background:#111827;\
-                                         color:#f97316; cursor:pointer;"
+                                         border:1px solid #38bdf8; background:#111827;\
+                                         color:#38bdf8; cursor:pointer;"
                                     } else {
                                         "padding:0.4rem 0.8rem; border-radius:0.5rem;\
                                          border:1px solid #4b5563; background:#020617;\
                                          color:#e5e7eb; cursor:pointer;"
                                     }
                                 }
-                                on:click=move |_| set_active_main_tab.set(MainTab::Data)
+                                on:click=move |_| set_active_main_tab.set(MainTab::State)
                             >
-                                "Data"
+                                "Flight"
                             </button>
 
+                            // --- Map tab (new) ---
+                            <button
+                                style=move || {
+                                    if active_main_tab.get() == MainTab::Map {
+                                        "padding:0.4rem 0.8rem; border-radius:0.5rem;\
+                                         border:1px solid #22c55e; background:#111827;\
+                                         color:#22c55e; cursor:pointer;"
+                                    } else {
+                                        "padding:0.4rem 0.8rem; border-radius:0.5rem;\
+                                         border:1px solid #4b5563; background:#020617;\
+                                         color:#e5e7eb; cursor:pointer;"
+                                    }
+                                }
+                                on:click=move |_| set_active_main_tab.set(MainTab::Map)
+                            >
+                                "Map"
+                            </button>
+
+                            // --- Warnings tab ---
                             <button
                                 style=move || {
                                     if active_main_tab.get() == MainTab::Warnings {
@@ -671,6 +865,7 @@ pub fn TelemetryDashboard() -> impl IntoView {
                                 </Show>
                             </button>
 
+                            // --- Errors tab ---
                             <button
                                 style=move || {
                                     if active_main_tab.get() == MainTab::Errors {
@@ -708,6 +903,24 @@ pub fn TelemetryDashboard() -> impl IntoView {
                                         }
                                     }}
                                 </Show>
+                            </button>
+
+                            // --- Data tab (last) ---
+                            <button
+                                style=move || {
+                                    if active_main_tab.get() == MainTab::Data {
+                                        "padding:0.4rem 0.8rem; border-radius:0.5rem;\
+                                         border:1px solid #f97316; background:#111827;\
+                                         color:#f97316; cursor:pointer;"
+                                    } else {
+                                        "padding:0.4rem 0.8rem; border-radius:0.5rem;\
+                                         border:1px solid #4b5563; background:#020617;\
+                                         color:#e5e7eb; cursor:pointer;"
+                                    }
+                                }
+                                on:click=move |_| set_active_main_tab.set(MainTab::Data)
+                            >
+                                "Data"
                             </button>
                         </nav>
                     </div>
@@ -846,13 +1059,15 @@ pub fn TelemetryDashboard() -> impl IntoView {
                 </div>
             </div>
 
-
             <ActionsPanel />
 
             {
                 let rows_sig = Signal::from(rows);
                 let warnings_sig = Signal::from(warnings);
                 let errors_sig = Signal::from(errors);
+                let flight_state_sig = flight_state.clone();
+                let rocket_gps_sig = rocket_gps.clone();
+                let user_gps_sig = user_gps.clone();
 
                 move || match active_main_tab.get() {
                     MainTab::Data => view! {
@@ -869,6 +1084,22 @@ pub fn TelemetryDashboard() -> impl IntoView {
 
                     MainTab::Errors => view! {
                         <ErrorsTab rows=errors_sig />
+                    }.into_any(),
+                    MainTab::State => view! {
+                        <StateTab flight_state=flight_state_sig />
+                    }.into_any(),
+
+                    MainTab::Map => view! {
+                        <MapTab
+                            rocket_gps=Signal::derive({
+                                let rocket_gps_sig = rocket_gps_sig.clone(); // your existing signal
+                                move || rocket_gps_sig.get()
+                            })
+                            user_gps=Signal::derive({
+                                let user_gps_sig = user_gps_sig.clone();
+                                move || user_gps_sig.get()
+                            })
+                        />
                     }.into_any(),
                 }
             }

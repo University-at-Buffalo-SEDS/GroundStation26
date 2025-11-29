@@ -18,6 +18,8 @@ COPY --from=builder /app/target/release/groundstation_backend /app
 
 COPY --from=builder /app/frontend/dist /app/frontend/dist
 
+COPY --from=builder /app/backend/data /app/backend/data
+
 EXPOSE 3000
 
 ENTRYPOINT ["/app/groundstation_backend"]

@@ -18,12 +18,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
 use tower_http::services::ServeDir;
+use crate::map::{DEFAULT_MAP_REGION, tile_service}; // NEW
 
 static FAVICON_DATA: OnceCell<Bytes> = OnceCell::const_new();
 
 /// Public router constructor
 pub fn router(state: Arc<AppState>) -> Router {
     let static_dir = ServeDir::new("./frontend/dist");
+    let tiles_dir = tile_service(DEFAULT_MAP_REGION); // NEW
 
     Router::new()
         .route("/api/recent", get(get_recent))
@@ -32,7 +34,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alerts", get(get_alerts))
         .route("/favicon", get(get_favicon))
         .route("/flightstate", get(get_flight_state))
+        .route("/api/gps", get(get_gps))
         .route("/ws", get(ws_handler))
+        .nest_service("/tiles", tiles_dir)
+
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
         .with_state(state)
@@ -79,6 +84,52 @@ pub struct AlertDto {
     pub severity: String,
     pub message: String,
 }
+
+
+
+#[derive(Serialize)]
+pub struct GpsPoint {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+#[derive(Serialize)]
+pub struct GpsResponse {
+    pub rocket: Option<GpsPoint>,
+}
+
+async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Latest GPS row: assumes `data_type = 'GPS'`
+    // and v0 = lat, v1 = lon (adjust if needed)
+    let row = sqlx::query(
+        r#"
+        SELECT v0, v1
+        FROM telemetry
+        WHERE data_type = 'GPS'
+        ORDER BY timestamp_ms DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    let rocket = row.and_then(|r| {
+        let lat: Option<f32> = r.get::<Option<f32>, _>("v0");
+        let lon: Option<f32> = r.get::<Option<f32>, _>("v1");
+
+        match (lat, lon) {
+            (Some(lat), Some(lon)) => Some(GpsPoint {
+                lat: lat as f64,
+                lon: lon as f64,
+            }),
+            _ => None,
+        }
+    });
+
+    Json(GpsResponse { rocket })
+}
+
 
 async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let now_ms = Utc::now().timestamp_millis();
