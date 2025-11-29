@@ -149,8 +149,6 @@ async fn main() -> anyhow::Result<()> {
             .data_as_string()
             .expect("Abort packet with invalid UTF-8");
         emit_error(&abort_handler_state_clone, error_msg);
-        println!("Sender: {:?}", pkt.sender());
-        println!("Abort packet received!");
         Ok(())
     });
 
