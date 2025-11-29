@@ -6,7 +6,11 @@ WORKDIR /app
 
 COPY . .
 
+RUN ./download_map.py
+
 RUN ./build.py
+
+
 
 FROM debian:stable-slim
 

@@ -1,7 +1,7 @@
 use crate::telemetry_task::get_current_timestamp_ms;
 use groundstation_shared::FlightState;
 use rand::Rng;
-use sedsprintf_rs_2026::config::{DataEndpoint};
+use sedsprintf_rs_2026::config::DataEndpoint;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::TelemetryResult;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -64,9 +64,7 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     let now_ms = get_current_timestamp_ms();
 
     // Decide whether we should emit a flight-state packet on this call.
-    let mut state_guard = dummy_state()
-        .lock()
-        .expect("dummy_state mutex poisoned");
+    let mut state_guard = dummy_state().lock().expect("dummy_state mutex poisoned");
 
     let mut emit_flightstate = false;
     if now_ms as i64 - state_guard.last_flightstate_ms >= FLIGHTSTATE_INTERVAL_MS {
@@ -114,12 +112,16 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     ];
 
     let dtype = choices[rng.random_range(0..choices.len())];
-
+    const BASE_LAT: f32 = 31.7619;
+    const BASE_LON: f32 = -106.4850;
     let values: Vec<f32> = match dtype {
         GpsData => {
             // (lat, lon)
-            let lat = rng.random_range(-90.0..90.0);
-            let lon = rng.random_range(-180.0..180.0);
+            let margin = 0.01; // ≈1 km movement radius
+
+            // Random offset within ±margin
+            let lat = BASE_LAT + rng.random_range(-margin..margin);
+            let lon = BASE_LON + rng.random_range(-margin..margin);
             vec![lat, lon]
         }
         KalmanFilterData => {

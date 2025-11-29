@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend", "frontend", "shared"]
+members = ["backend", "frontend", "shared", "map_downloader"]
 resolver = "3"
 
 [workspace.package]

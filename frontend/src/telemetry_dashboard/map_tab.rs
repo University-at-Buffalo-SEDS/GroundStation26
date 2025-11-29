@@ -93,7 +93,7 @@ pub fn MapTab(
     // Initialize the map once. JS side will guard against duplicate init.
     Effect::new(|_| {
         // Initial center is just a default; it will get recentered to user once GPS arrives.
-        init_ground_map("/tiles/{z}/{x}/{y}.jpeg", 31.0, -99.0, 7.0);
+        init_ground_map("/tiles/{z}/{x}/{y}.jpg", 31.0, -99.0, 7.0);
     });
 
     // Update markers whenever rocket or user GPS changes
