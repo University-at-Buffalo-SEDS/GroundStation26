@@ -109,52 +109,10 @@
             return ranges;
         }
 
-        const NA_TILE_RANGES = buildNaTileRanges();
-
         // Custom tile layer:
         // - If coords are outside NA_TILE_RANGES for that zoom, return a black DIV (no network).
         // - Otherwise, load the tile image as normal.
-        const NaTileLayer = L.TileLayer.extend({
-            createTile: function (coords, done) {
-                const range = NA_TILE_RANGES[coords.z];
-                const size = this.getTileSize();
-                let tile;
-
-                // Outside known tile range -> black tile, no HTTP request
-                if (
-                    !range ||
-                    coords.x < range.xMin || coords.x > range.xMax ||
-                    coords.y < range.yMin || coords.y > range.yMax
-                ) {
-                    tile = document.createElement("div");
-                    tile.style.width = size.x + "px";
-                    tile.style.height = size.y + "px";
-                    tile.style.background = "#000"; // black
-                    done(null, tile);
-                    return tile;
-                }
-
-                // Inside range -> normal <img> tile
-                tile = document.createElement("img");
-                tile.alt = "";
-                tile.setAttribute("role", "presentation");
-                tile.style.width = size.x + "px";
-                tile.style.height = size.y + "px";
-
-                const onLoad = () => done(null, tile);
-                const onError = () => {
-                    // If fetch fails, fall back to black
-                    tile.style.background = "#000";
-                    done(null, tile);
-                };
-
-                tile.onload = onLoad;
-                tile.onerror = onError;
-                tile.src = this.getTileUrl(coords);
-
-                return tile;
-            },
-        });
+        const NaTileLayer = L.TileLayer;
 
         function createNaTileLayer(tilesUrl) {
             const naBoundsLatLng = L.latLngBounds(
@@ -186,6 +144,11 @@
         const ROCKET_ICON = makeEmojiIcon("🚀", "rocket-marker");
         const USER_ICON = makeEmojiIcon("🧍", "user-marker");
 
+        function centerGroundMapOn(lat, lon) {
+            if (!groundMap) return;
+            const zoom = groundMap.getZoom() ?? 7;
+            groundMap.setView([lat, lon], zoom);
+        }
 
         // tilesUrl example: "/tiles/{z}/{x}/{y}.jpeg"
         function initGroundMap(tilesUrl, centerLat, centerLon, zoom) {

@@ -11,6 +11,10 @@ extern "C" {
 
     #[wasm_bindgen(js_name = updateGroundMapMarkers)]
     fn update_ground_map_markers(rocket_lat: f64, rocket_lon: f64, user_lat: f64, user_lon: f64);
+
+    // NEW: JS helper that recenters the Leaflet map on a given lat/lon
+    #[wasm_bindgen(js_name = centerGroundMapOn)]
+    fn center_ground_map_on(lat: f64, lon: f64);
 }
 
 #[component]
@@ -23,50 +27,53 @@ pub fn MapTab(
     // Local signal for browser-derived user location
     let (browser_user_gps, set_browser_user_gps) = signal(None::<GpsPoint>);
 
+    // Track whether we've already auto-centered the map on the user
+    let (has_centered_on_user, set_has_centered_on_user) = signal(false);
+
     // Start geolocation watch when the component mounts
     Effect::new({
         let set_browser_user_gps = set_browser_user_gps.clone();
+        let has_centered_on_user = has_centered_on_user.clone();
+        let set_has_centered_on_user = set_has_centered_on_user.clone();
+
         move |_| {
             if let Some(window) = web_sys::window() {
                 let navigator = window.navigator();
 
                 if let Ok(geo) = navigator.geolocation() {
-                    // success callback: Position -> update browser_user_gps
-                    let success_cb =
-                        wasm_bindgen::closure::Closure::<dyn FnMut(Position)>::new(
-                            move |pos: Position| {
-                                // In web-sys, Position::coords() returns Coordinates directly
-                                let coords = pos.coords();
-                                let lat = coords.latitude();
-                                let lon = coords.longitude();
+                    // success callback: Position -> update browser_user_gps and maybe center map
+                    let success_cb = wasm_bindgen::closure::Closure::<dyn FnMut(Position)>::new(
+                        move |pos: Position| {
+                            let coords = pos.coords();
+                            let lat = coords.latitude();
+                            let lon = coords.longitude();
 
-                                set_browser_user_gps.set(Some(GpsPoint { lat, lon }));
-                            },
-                        );
+                            set_browser_user_gps.set(Some(GpsPoint { lat, lon }));
+
+                            // Center map on user *once* (first fix only)
+                            if !has_centered_on_user.get_untracked() {
+                                center_ground_map_on(lat, lon);
+                                set_has_centered_on_user.set(true);
+                            }
+                        },
+                    );
 
                     // error callback: PositionError -> log to console
-                    let error_cb =
-                        wasm_bindgen::closure::Closure::<dyn FnMut(PositionError)>::new(
-                            move |err: PositionError| {
-                                let msg = format!(
-                                    "geolocation error (code {}): {}",
-                                    err.code(),
-                                    err.message()
-                                );
-                                console::error_1(&msg.into());
-                            },
-                        );
+                    let error_cb = wasm_bindgen::closure::Closure::<dyn FnMut(PositionError)>::new(
+                        move |err: PositionError| {
+                            let msg = format!(
+                                "geolocation error (code {}): {}",
+                                err.code(),
+                                err.message()
+                            );
+                            console::error_1(&msg.into());
+                        },
+                    );
 
-                    // Cast closures to `&js_sys::Function` and call watch_position_with_error_callback
+                    // Watch position with both callbacks
                     let _ = geo.watch_position_with_error_callback(
-                        success_cb
-                            .as_ref()
-                            .unchecked_ref::<js_sys::Function>(),
-                        Some(
-                            error_cb
-                                .as_ref()
-                                .unchecked_ref::<js_sys::Function>(),
-                        ),
+                        success_cb.as_ref().unchecked_ref::<js_sys::Function>(),
+                        Some(error_cb.as_ref().unchecked_ref::<js_sys::Function>()),
                     );
 
                     // Leak closures so they stay alive for page lifetime
@@ -85,6 +92,7 @@ pub fn MapTab(
 
     // Initialize the map once. JS side will guard against duplicate init.
     Effect::new(|_| {
+        // Initial center is just a default; it will get recentered to user once GPS arrives.
         init_ground_map("/tiles/{z}/{x}/{y}.jpeg", 31.0, -99.0, 7.0);
     });
 
@@ -96,9 +104,7 @@ pub fn MapTab(
         let (r_lat, r_lon) = rocket
             .map(|p| (p.lat, p.lon))
             .unwrap_or((f64::NAN, f64::NAN));
-        let (u_lat, u_lon) = user
-            .map(|p| (p.lat, p.lon))
-            .unwrap_or((f64::NAN, f64::NAN));
+        let (u_lat, u_lon) = user.map(|p| (p.lat, p.lon)).unwrap_or((f64::NAN, f64::NAN));
 
         update_ground_map_markers(r_lat, r_lon, u_lat, u_lon);
     });
