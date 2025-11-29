@@ -205,13 +205,13 @@ async fn fetch_tiles_for_zoom_async(
                                 break;
                             }
 
-                            eprintln!(
-                                "fetch_gibs_tiles_async: HTTP {} for {} (attempt {}/{})",
-                                status.as_u16(),
-                                url,
-                                attempts,
-                                MAX_ATTEMPTS
-                            );
+                            // eprintln!(
+                            //     "fetch_gibs_tiles_async: HTTP {} for {} (attempt {}/{})",
+                            //     status.as_u16(),
+                            //     url,
+                            //     attempts,
+                            //     MAX_ATTEMPTS
+                            // );
                         }
 
                         Err(_e) => {

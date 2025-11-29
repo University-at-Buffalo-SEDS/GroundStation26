@@ -2,7 +2,7 @@ use crate::telemetry_dashboard::GpsPoint;
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{console, js_sys, Position, PositionError};
+use web_sys::{console, Position, PositionError};
 
 #[wasm_bindgen]
 extern "C" {
@@ -12,9 +12,13 @@ extern "C" {
     #[wasm_bindgen(js_name = updateGroundMapMarkers)]
     fn update_ground_map_markers(rocket_lat: f64, rocket_lon: f64, user_lat: f64, user_lon: f64);
 
-    // NEW: JS helper that recenters the Leaflet map on a given lat/lon
+    // JS helper that recenters the Leaflet map on a given lat/lon
     #[wasm_bindgen(js_name = centerGroundMapOn)]
     fn center_ground_map_on(lat: f64, lon: f64);
+
+    // JS helper that returns last user position as { lat, lon } or null
+    #[wasm_bindgen(js_name = getLastUserLatLng)]
+    fn get_last_user_lat_lng() -> JsValue;
 }
 
 #[component]
@@ -30,7 +34,45 @@ pub fn MapTab(
     // Track whether we've already auto-centered the map on the user
     let (has_centered_on_user, set_has_centered_on_user) = signal(false);
 
-    // Start geolocation watch when the component mounts
+    // -------------------------------------------------------------------------
+    // 1) Hydrate from JS cached position, if any (runs once on mount)
+    // -------------------------------------------------------------------------
+    Effect::new({
+        let set_browser_user_gps = set_browser_user_gps.clone();
+        let has_centered_on_user = has_centered_on_user.clone();
+        let set_has_centered_on_user = set_has_centered_on_user.clone();
+
+        move |_| {
+            let js_val = get_last_user_lat_lng();
+            if js_val.is_null() || js_val.is_undefined() {
+                return;
+            }
+
+            if let Some(obj) = js_val.dyn_ref::<js_sys::Object>() {
+                use js_sys::Reflect;
+                let lat = Reflect::get(obj, &"lat".into())
+                    .ok()
+                    .and_then(|v| v.as_f64());
+                let lon = Reflect::get(obj, &"lon".into())
+                    .ok()
+                    .and_then(|v| v.as_f64());
+
+                if let (Some(lat), Some(lon)) = (lat, lon) {
+                    set_browser_user_gps.set(Some(GpsPoint { lat, lon }));
+
+                    // Optional: also recenter once on cached position
+                    if !has_centered_on_user.get_untracked() {
+                        center_ground_map_on(lat, lon);
+                        set_has_centered_on_user.set(true);
+                    }
+                }
+            }
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // 2) Start geolocation watch when the component mounts
+    // -------------------------------------------------------------------------
     Effect::new({
         let set_browser_user_gps = set_browser_user_gps.clone();
         let has_centered_on_user = has_centered_on_user.clone();
@@ -124,6 +166,30 @@ pub fn MapTab(
             <p style="margin:0; color:#9ca3af; font-size:0.85rem;">
                 "Interactive map showing the rocket (🚀) and your location (🧍)."
             </p>
+
+
+            <button
+                style="
+                    align-self:flex-start;
+                    margin:0.25rem 0 0.5rem 0;
+                    padding:0.35rem 0.75rem;
+                    border-radius:999px;
+                    border:1px solid #22c55e;
+                    background:#022c22;
+                    color:#bbf7d0;
+                    font-size:0.8rem;
+                    cursor:pointer;
+                "
+                on:click=move |_| {
+                    if let Some(pt) = effective_user_gps.get_untracked() {
+                        center_ground_map_on(pt.lat, pt.lon);
+                    } else {
+                        console::warn_1(&"No user location yet; cannot center.".into());
+                    }
+                }
+            >
+                "Center on Me"
+            </button>
 
             <div
                 id="ground-map"
