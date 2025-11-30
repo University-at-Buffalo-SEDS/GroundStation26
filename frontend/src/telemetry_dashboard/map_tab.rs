@@ -153,25 +153,31 @@ pub fn MapTab(
 
     view! {
         <div style="
+        display:flex;
+        flex-direction:column;
+        gap:0.75rem;
+        padding:1rem;
+        border-radius:0.75rem;
+        background:#020617ee;
+        border:1px solid #4b5563;
+        box-shadow:0 10px 25px rgba(0,0,0,0.45);
+    ">
+
+            <div style="
             display:flex;
-            flex-direction:column;
-            gap:0.75rem;
-            padding:1rem;
-            border-radius:0.75rem;
-            background:#020617ee;
-            border:1px solid #4b5563;
-            box-shadow:0 10px 25px rgba(0,0,0,0.45);
+            flex-direction:row;
+            align-items:center;
+            gap:1rem;
+            flex-wrap:wrap;
         ">
-            <h2 style="margin:0; color:#22c55e;">"Launch Site Map"</h2>
-            <p style="margin:0; color:#9ca3af; font-size:0.85rem;">
-                "Interactive map showing the rocket (🚀) and your location (🧍)."
-            </p>
+                <h2 style="margin:0; color:#22c55e;">"Launch Site Map"</h2>
 
+                <p style="margin:0; color:#9ca3af; font-size:0.85rem;">
+                    "Interactive map showing the rocket (🚀) and your location (🧍)."
+                </p>
 
-            <button
-                style="
-                    align-self:flex-start;
-                    margin:0.25rem 0 0.5rem 0;
+                <button
+                    style="
                     padding:0.35rem 0.75rem;
                     border-radius:999px;
                     border:1px solid #22c55e;
@@ -180,26 +186,27 @@ pub fn MapTab(
                     font-size:0.8rem;
                     cursor:pointer;
                 "
-                on:click=move |_| {
-                    if let Some(pt) = effective_user_gps.get_untracked() {
-                        center_ground_map_on(pt.lat, pt.lon);
-                    } else {
-                        console::warn_1(&"No user location yet; cannot center.".into());
+                    on:click=move |_| {
+                        if let Some(pt) = effective_user_gps.get_untracked() {
+                            center_ground_map_on(pt.lat, pt.lon);
+                        } else {
+                            console::warn_1(&"No user location yet; cannot center.".into());
+                        }
                     }
-                }
-            >
-                "Center on Me"
-            </button>
+                >
+                    "Center on Me"
+                </button>
+            </div>
 
             <div
                 id="ground-map"
                 style="
-                    width:100%;
-                    height:60vh;
-                    border-radius:0.75rem;
-                    overflow:hidden;
-                    border:1px solid #4b5563;
-                "
+                width:100%;
+                height:70vh;
+                border-radius:0.75rem;
+                overflow:hidden;
+                border:1px solid #4b5563;
+            "
             ></div>
 
             <div style="display:flex; gap:1rem; font-size:0.8rem; color:#9ca3af;">
@@ -225,6 +232,7 @@ pub fn MapTab(
                     }}
                 </Show>
             </div>
+
         </div>
     }
 }
