@@ -295,6 +295,8 @@ fn sensor_tab(
 
 /// Build eight SVG path strings (v0..v7) for a single graph,
 /// plus y-min, y-max, and span_minutes (0–20).
+/// Build eight SVG path strings (v0..v7) for a single graph,
+/// plus y-min, y-max, and span_minutes (0–20).
 fn build_polyline(
     rows: &[TelemetryRow],
     width: f32,
@@ -328,7 +330,7 @@ fn build_polyline(
         );
     }
 
-    // Find min/max across all v0..v7
+    // ---------- 1. Global min/max across all channels (same as before) ----------
     let mut min_v: Option<f32> = None;
     let mut max_v: Option<f32> = None;
 
@@ -364,21 +366,22 @@ fn build_polyline(
         max_v = min_v + 1.0;
     }
 
-    // Time window: dynamic span up to 20 minutes
+    // ---------- 2. Time window & span (unchanged semantics) ----------
     let newest_ts = rows.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
     let oldest_ts = rows
         .iter()
         .map(|r| r.timestamp_ms)
         .min()
         .unwrap_or(newest_ts);
-    let raw_span_ms = (newest_ts - oldest_ts).max(1); // avoid zero
-    let effective_span_ms = raw_span_ms.min(HISTORY_MS); // cap at 20 minutes
+
+    let raw_span_ms = (newest_ts - oldest_ts).max(1);
+    let effective_span_ms = raw_span_ms.min(HISTORY_MS);
     let span_minutes = effective_span_ms as f32 / 60_000.0;
 
-    let window_start = newest_ts - effective_span_ms;
+    let window_start = newest_ts.saturating_sub(effective_span_ms);
     let denom_time = effective_span_ms as f32;
 
-    // Plot margins inside the SVG
+    // ---------- 3. Plot geometry ----------
     let left = 60.0;
     let right = width - 20.0;
     let top = 20.0;
@@ -389,6 +392,106 @@ fn build_polyline(
 
     let map_y = |v: f32| bottom - ((v - min_v) / (max_v - min_v)) * plot_height;
 
+    // ---------- 4. Collect only rows in the current window ----------
+    let mut window_rows: Vec<&TelemetryRow> = rows
+        .iter()
+        .filter(|r| r.timestamp_ms >= window_start)
+        .collect();
+
+    if window_rows.is_empty() {
+        return (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            min_v,
+            max_v,
+            span_minutes,
+        );
+    }
+
+    // Ensure chronological order
+    window_rows.sort_by_key(|r| r.timestamp_ms);
+
+    let n = window_rows.len();
+    let max_points: usize = 2000; // tweak to taste
+
+    // ---------- 5. Choose representation: raw vs averaged ----------
+    // We'll produce a list of (ts, [v0..v7]) to actually plot.
+    #[derive(Clone, Default)]
+    struct Point {
+        ts: u64,
+        vals: [Option<f32>; 8],
+    }
+
+    let mut points: Vec<Point> = Vec::new();
+
+    if n <= max_points {
+        // CASE A: below limit → use every row as-is (no averaging).
+        points.reserve(n);
+        for r in &window_rows {
+            points.push(Point {
+                ts: r.timestamp_ms as u64,
+                vals: [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7],
+            });
+        }
+    } else {
+        // CASE B: above limit → compress into exactly max_points index-buckets.
+        // All rows contribute to some bucket; nothing is discarded.
+        #[derive(Default, Clone)]
+        struct BucketAcc {
+            ts_sum: u64,
+            ts_count: u64,
+            v_sum: [f64; 8],
+            v_count: [u64; 8],
+        }
+
+        let mut buckets = vec![BucketAcc::default(); max_points];
+
+        for (i, r) in window_rows.iter().enumerate() {
+            // Map index 0..n-1 → bucket 0..max_points-1
+            let bi = i * max_points / n; // integer division; covers full range
+            let b = &mut buckets[bi];
+
+            b.ts_sum += r.timestamp_ms as u64;
+            b.ts_count += 1;
+
+            let vals = [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7];
+            for (j, opt) in vals.iter().enumerate() {
+                if let Some(x) = opt {
+                    b.v_sum[j] += *x as f64;
+                    b.v_count[j] += 1;
+                }
+            }
+        }
+
+        // Turn non-empty buckets into averaged points
+        for b in &buckets {
+            if b.ts_count == 0 {
+                continue;
+            }
+
+            let ts_avg = b.ts_sum / b.ts_count;
+            let mut vals: [Option<f32>; 8] = [None; 8];
+
+            for j in 0..8 {
+                if b.v_count[j] > 0 {
+                    vals[j] = Some((b.v_sum[j] / b.v_count[j] as f64) as f32);
+                }
+            }
+
+            points.push(Point { ts: ts_avg, vals });
+        }
+
+        // Keep them sorted by time (they already should be, but just in case)
+        points.sort_by_key(|p| p.ts);
+    }
+
+    // ---------- 6. Build SVG paths from final point list ----------
     let mut p0 = String::new();
     let mut p1 = String::new();
     let mut p2 = String::new();
@@ -398,114 +501,49 @@ fn build_polyline(
     let mut p6 = String::new();
     let mut p7 = String::new();
 
-    let mut started0 = false;
-    let mut started1 = false;
-    let mut started2 = false;
-    let mut started3 = false;
-    let mut started4 = false;
-    let mut started5 = false;
-    let mut started6 = false;
-    let mut started7 = false;
+    let mut started = [false; 8];
 
-    // Downsample: limit number of points
-    let n = rows.len();
-    let max_points = 2000; // tweak to taste
-    let stride = if n > max_points {
-        (n as f32 / max_points as f32).ceil() as usize
-    } else {
-        1
+    let add = |path: &mut String, started: &mut bool, x: f32, v: f32| {
+        let y = map_y(v);
+        if !*started {
+            path.push_str(&format!("M {:.2} {:.2}", x, y));
+            *started = true;
+        } else {
+            path.push_str(&format!(" L {:.2} {:.2}", x, y));
+        }
     };
 
-    for (idx, r) in rows.iter().enumerate() {
-        if idx % stride != 0 {
-            continue; // skip to thin data
-        }
-
-        // Clamp timestamp into [window_start, newest_ts]
-        let dt_ms = (r.timestamp_ms - window_start).clamp(0, effective_span_ms) as f32;
-        let t = dt_ms / denom_time; // 0.0 = left, 1.0 = now
+    for p in points {
+        let dt_ms = (p.ts.saturating_sub(window_start as u64)).min(effective_span_ms as u64) as f32;
+        let t = dt_ms / denom_time; // 0 = left, 1 = now
         let x = left + plot_width * t;
 
-        if let Some(v) = r.v0 {
-            let y = map_y(v);
-            if !started0 {
-                p0.push_str(&format!("M {:.2} {:.2}", x, y));
-                started0 = true;
-            } else {
-                p0.push_str(&format!(" L {:.2} {:.2}", x, y));
-            }
+        if let Some(v) = p.vals[0] {
+            add(&mut p0, &mut started[0], x, v);
         }
-
-        if let Some(v) = r.v1 {
-            let y = map_y(v);
-            if !started1 {
-                p1.push_str(&format!("M {:.2} {:.2}", x, y));
-                started1 = true;
-            } else {
-                p1.push_str(&format!(" L {:.2} {:.2}", x, y));
-            }
+        if let Some(v) = p.vals[1] {
+            add(&mut p1, &mut started[1], x, v);
         }
-
-        if let Some(v) = r.v2 {
-            let y = map_y(v);
-            if !started2 {
-                p2.push_str(&format!("M {:.2} {:.2}", x, y));
-                started2 = true;
-            } else {
-                p2.push_str(&format!(" L {:.2} {:.2}", x, y));
-            }
+        if let Some(v) = p.vals[2] {
+            add(&mut p2, &mut started[2], x, v);
         }
-
-        if let Some(v) = r.v3 {
-            let y = map_y(v);
-            if !started3 {
-                p3.push_str(&format!("M {:.2} {:.2}", x, y));
-                started3 = true;
-            } else {
-                p3.push_str(&format!(" L {:.2} {:.2}", x, y));
-            }
+        if let Some(v) = p.vals[3] {
+            add(&mut p3, &mut started[3], x, v);
         }
-
-        if let Some(v) = r.v4 {
-            let y = map_y(v);
-            if !started4 {
-                p4.push_str(&format!("M {:.2} {:.2}", x, y));
-                started4 = true;
-            } else {
-                p4.push_str(&format!(" L {:.2} {:.2}", x, y));
-            }
+        if let Some(v) = p.vals[4] {
+            add(&mut p4, &mut started[4], x, v);
         }
-
-        if let Some(v) = r.v5 {
-            let y = map_y(v);
-            if !started5 {
-                p5.push_str(&format!("M {:.2} {:.2}", x, y));
-                started5 = true;
-            } else {
-                p5.push_str(&format!(" L {:.2} {:.2}", x, y));
-            }
+        if let Some(v) = p.vals[5] {
+            add(&mut p5, &mut started[5], x, v);
         }
-
-        if let Some(v) = r.v6 {
-            let y = map_y(v);
-            if !started6 {
-                p6.push_str(&format!("M {:.2} {:.2}", x, y));
-                started6 = true;
-            } else {
-                p6.push_str(&format!(" L {:.2} {:.2}", x, y));
-            }
+        if let Some(v) = p.vals[6] {
+            add(&mut p6, &mut started[6], x, v);
         }
-
-        if let Some(v) = r.v7 {
-            let y = map_y(v);
-            if !started7 {
-                p7.push_str(&format!("M {:.2} {:.2}", x, y));
-                started7 = true;
-            } else {
-                p7.push_str(&format!(" L {:.2} {:.2}", x, y));
-            }
+        if let Some(v) = p.vals[7] {
+            add(&mut p7, &mut started[7], x, v);
         }
     }
 
     (p0, p1, p2, p3, p4, p5, p6, p7, min_v, max_v, span_minutes)
 }
+

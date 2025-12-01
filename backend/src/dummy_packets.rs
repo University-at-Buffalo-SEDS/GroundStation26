@@ -117,7 +117,7 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     let values: Vec<f32> = match dtype {
         GpsData => {
             // (lat, lon)
-            let margin = 0.01; // ≈1 km movement radius
+            let margin = 0.001;
 
             // Random offset within ±margin
             let lat = BASE_LAT + rng.random_range(-margin..margin);

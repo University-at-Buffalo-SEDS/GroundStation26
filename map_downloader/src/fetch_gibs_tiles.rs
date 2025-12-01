@@ -204,21 +204,10 @@ async fn fetch_tiles_for_zoom_async(
                                 // fine: no tile for this location (e.g. ocean)
                                 break;
                             }
-
-                            // eprintln!(
-                            //     "fetch_gibs_tiles_async: HTTP {} for {} (attempt {}/{})",
-                            //     status.as_u16(),
-                            //     url,
-                            //     attempts,
-                            //     MAX_ATTEMPTS
-                            // );
+                            
                         }
 
                         Err(_e) => {
-                            // eprintln!(
-                            //     "fetch_gibs_tiles_async: network error fetching {}: {} (attempt {}/{})",
-                            //     url, _e, attempts, MAX_ATTEMPTS
-                            // );
                         }
                     }
 

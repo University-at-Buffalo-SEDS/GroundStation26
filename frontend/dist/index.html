@@ -49,6 +49,30 @@
             transition: transform 0.1s linear;
         }
 
+        .user-marker-wrapper {
+            position: relative;
+            width: 32px;
+            height: 32px;
+        }
+
+        .user-marker-wrapper .user-base {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+        }
+
+        .user-marker-wrapper .user-heading-indicator {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform-origin: 50% 50%;
+            /* start pointing north, offset outward */
+            transform: translate(-50%, -50%) translateY(-14px);
+            transition: transform 0.15s linear;
+            font-size: 16px;
+        }
+
 
     </style>
 
@@ -158,7 +182,18 @@
         }
 
         const ROCKET_ICON = makeEmojiIcon("🚀", "rocket-marker");
-        const USER_ICON = makeEmojiIcon("🧍", "user-marker");
+        const USER_ICON = L.divIcon({
+            html: `
+        <div class="user-marker-wrapper">
+            <span class="emoji-marker user-base">🧍</span>
+            <span class="emoji-marker user-heading-indicator">▲</span>
+        </div>
+    `,
+            className: "",
+            iconSize: [32, 32],
+            iconAnchor: [16, 16],
+        });
+
 
         function centerGroundMapOn(lat, lon) {
             if (!groundMap) return;
@@ -282,13 +317,15 @@
             const el = userMarker.getElement();
             if (!el) return;
 
-            const span = el.querySelector(".user-marker");
-            if (!span) return;
+            const indicator = el.querySelector(".user-heading-indicator");
+            if (!indicator) return;
 
-            // Rotate around center of the emoji
-            span.style.transform = `rotate(${userHeadingDeg}deg)`;
-            span.style.transformOrigin = "50% 50%";
+            // Rotate around the user and push outward to form an orbit
+            const radius = 14; // distance in px from center
+            indicator.style.transform =
+                `translate(-50%, -50%) rotate(${userHeadingDeg}deg) translateY(-${radius}px)`;
         }
+
 
         // Handle device orientation events
         function handleOrientation(event) {
@@ -298,9 +335,7 @@
 
             // Convert to compass heading (clockwise from north).
             // Often alpha is already that, but we normalize it anyway.
-            const heading = (360 - event.alpha) % 360;
-
-            userHeadingDeg = heading;
+            userHeadingDeg = (360 - event.alpha) % 360;
             updateUserMarkerRotation();
         }
 
