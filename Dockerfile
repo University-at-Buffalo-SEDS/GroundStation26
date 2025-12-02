@@ -22,6 +22,8 @@ COPY --from=builder /app/frontend/dist /app/frontend/dist
 
 COPY --from=builder /app/entrypoint.sh /app
 
+COPY download_map.py /app
+
 EXPOSE 3000
 
 ENTRYPOINT ["/app/entrypoint.sh"]
