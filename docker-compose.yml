@@ -5,6 +5,7 @@ services:
       - internal
     volumes:
       - ./data:/app/data
+      - ./backend/data:/app/backend/data
     restart: always
 
   nginx:

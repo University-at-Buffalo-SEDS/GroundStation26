@@ -6,11 +6,9 @@ WORKDIR /app
 
 COPY . .
 
-RUN ./download_map.py
+RUN chmod +x entrypoint.sh
 
 RUN ./build.py
-
-
 
 FROM debian:stable-slim
 
@@ -22,8 +20,8 @@ COPY --from=builder /app/target/release/groundstation_backend /app
 
 COPY --from=builder /app/frontend/dist /app/frontend/dist
 
-COPY --from=builder /app/backend/data /app/backend/data
+COPY --from=builder /app/entrypoint.sh /app
 
 EXPOSE 3000
 
-ENTRYPOINT ["/app/groundstation_backend"]
+ENTRYPOINT ["/app/entrypoint.sh"]
