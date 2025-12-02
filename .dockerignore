@@ -4,5 +4,5 @@ venv/
 Dockerfile
 docker-compose.yml
 README.md
-backend/data
+backend/data/*
 map_downloader/
