@@ -34,10 +34,7 @@ RUN mkdir -p shared/src
 COPY shared/Cargo.toml shared/
 COPY shared/src shared/src
 
-# Other needed files
-COPY entrypoint.sh build.py ./
-
-RUN chmod +x entrypoint.sh
+COPY build.py ./
 
 # If PI_BUILD is non-empty (or equals "pi_build"), force pi_build; otherwise normal build.
 RUN if [ -n "${PI_BUILD}" ] && [ "${PI_BUILD}" = "pi_build" ]; then \
@@ -50,6 +47,9 @@ RUN if [ -n "${PI_BUILD}" ] && [ "${PI_BUILD}" = "pi_build" ]; then \
 
 RUN cargo build --release -p map_downloader
 
+COPY entrypoint.sh ./
+
+RUN chmod +x entrypoint.sh
 
 FROM debian:stable-slim
 
