@@ -18,7 +18,7 @@ RUN mkdir -p map_downloader/src
 COPY map_downloader/Cargo.toml map_downloader/
 COPY map_downloader/src map_downloader/src
 
-# Frontend (adjust these to match your actual structure)
+# Frontend
 RUN mkdir -p frontend/dist
 COPY frontend/src frontend/src
 COPY frontend/build.rs frontend/
@@ -26,6 +26,12 @@ COPY frontend/Cargo.toml frontend/
 COPY frontend/dist/favicon.png frontend/dist
 COPY frontend/dist/index.html frontend/dist
 COPY frontend/dist/LICENSE frontend/dist
+
+
+# Shared
+RUN mkdir -p shared/src
+COPY shared/Cargo.toml shared/
+COPY shared/src shared/src
 
 # Other needed files
 COPY entrypoint.sh build.py ./
