@@ -8,7 +8,7 @@ get it from https://rustup.rs/
 
 - wasm-pack
 
-get it from https://rustwasm.github.io/wasm-pack/installer/
+get it by running `cargo install wasm-pack`
 
 
 ## Setting up the DEVICE_IDENTIFIER
@@ -16,3 +16,12 @@ get it from https://rustwasm.github.io/wasm-pack/installer/
 
 ## Usage
 After building, the backend needs to be behind a reverse proxy with ssl enabled for geolocation to work properly.
+If using docker compose,
+the provided `docker-compose.yml` file already generates a self-signed certificate for testing purposes.
+
+To download the map data run the provided python script:
+```bash
+python3 download_map.py
+```
+
+
