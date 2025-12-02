@@ -330,7 +330,7 @@ fn build_polyline(
         );
     }
 
-    // ---------- 1. Global min/max across all channels (same as before) ----------
+    // ---------- 1. Global min/max across all channels ----------
     let mut min_v: Option<f32> = None;
     let mut max_v: Option<f32> = None;
 
@@ -366,7 +366,7 @@ fn build_polyline(
         max_v = min_v + 1.0;
     }
 
-    // ---------- 2. Time window & span (unchanged semantics) ----------
+    // ---------- 2. Time window & span ----------
     let newest_ts = rows.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
     let oldest_ts = rows
         .iter()
@@ -379,7 +379,6 @@ fn build_polyline(
     let span_minutes = effective_span_ms as f32 / 60_000.0;
 
     let window_start = newest_ts.saturating_sub(effective_span_ms);
-    let denom_time = effective_span_ms as f32;
 
     // ---------- 3. Plot geometry ----------
     let left = 60.0;
@@ -420,8 +419,6 @@ fn build_polyline(
     let n = window_rows.len();
     let max_points: usize = 2000; // tweak to taste
 
-    // ---------- 5. Choose representation: raw vs averaged ----------
-    // We'll produce a list of (ts, [v0..v7]) to actually plot.
     #[derive(Clone, Default)]
     struct Point {
         ts: u64,
@@ -440,8 +437,10 @@ fn build_polyline(
             });
         }
     } else {
-        // CASE B: above limit → compress into exactly max_points index-buckets.
-        // All rows contribute to some bucket; nothing is discarded.
+        // CASE B: above limit -> compress into max_points buckets by INDEX,
+        // averaging rows in each bucket.
+        // This preserves all data but caps
+        // the number of plotted points.
         #[derive(Default, Clone)]
         struct BucketAcc {
             ts_sum: u64,
@@ -453,8 +452,7 @@ fn build_polyline(
         let mut buckets = vec![BucketAcc::default(); max_points];
 
         for (i, r) in window_rows.iter().enumerate() {
-            // Map index 0..n-1 → bucket 0..max_points-1
-            let bi = i * max_points / n; // integer division; covers full range
+            let bi = i * max_points / n; // 0..max_points-1
             let b = &mut buckets[bi];
 
             b.ts_sum += r.timestamp_ms as u64;
@@ -469,7 +467,6 @@ fn build_polyline(
             }
         }
 
-        // Turn non-empty buckets into averaged points
         for b in &buckets {
             if b.ts_count == 0 {
                 continue;
@@ -487,11 +484,10 @@ fn build_polyline(
             points.push(Point { ts: ts_avg, vals });
         }
 
-        // Keep them sorted by time (they already should be, but just in case)
         points.sort_by_key(|p| p.ts);
     }
 
-    // ---------- 6. Build SVG paths from final point list ----------
+    // ---------- 5. Build SVG paths with EVEN X-SPACING ----------
     let mut p0 = String::new();
     let mut p1 = String::new();
     let mut p2 = String::new();
@@ -513,9 +509,30 @@ fn build_polyline(
         }
     };
 
-    for p in points {
-        let dt_ms = (p.ts.saturating_sub(window_start as u64)).min(effective_span_ms as u64) as f32;
-        let t = dt_ms / denom_time; // 0 = left, 1 = now
+    let len = points.len();
+    if len == 0 {
+        return (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            min_v,
+            max_v,
+            span_minutes,
+        );
+    }
+
+    for (idx, p) in points.into_iter().enumerate() {
+        // Uniform spacing by index, 0..len-1 → [left, right]
+        let t = if len > 1 {
+            idx as f32 / (len as f32 - 1.0)
+        } else {
+            0.0
+        };
         let x = left + plot_width * t;
 
         if let Some(v) = p.vals[0] {
@@ -546,4 +563,3 @@ fn build_polyline(
 
     (p0, p1, p2, p3, p4, p5, p6, p7, min_v, max_v, span_minutes)
 }
-
