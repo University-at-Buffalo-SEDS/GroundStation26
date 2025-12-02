@@ -166,6 +166,7 @@ pub fn ActionsPanel() -> impl IntoView {
                 box-shadow:0 10px 25px rgba(0,0,0,0.45);
                 backdrop-filter:blur(6px);
                 min-width: 9rem;
+                z-index: 9999;
             "
         >
             <div

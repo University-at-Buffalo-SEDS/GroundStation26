@@ -67,9 +67,8 @@
             left: 50%;
             top: 50%;
             transform-origin: 50% 50%;
-            /* start pointing north, offset outward */
             transform: translate(-50%, -50%) translateY(-14px);
-            transition: transform 0.15s linear;
+            transition: transform 0.25s linear; /* was 0.15s */
             font-size: 16px;
         }
 
@@ -98,6 +97,25 @@
             lonMax: -50.0,
             latMax: 83.0,
         };
+
+        // Raw + filtered heading (0..360, 0 = North, clockwise)
+        let userHeadingDegRaw = null;
+        let userHeadingDeg = null;
+
+        // Normalize angle to [0, 360)
+        function normalizeAngle(deg) {
+            let d = deg % 360;
+            if (d < 0) d += 360;
+            return d;
+        }
+
+        // Smallest signed angle difference from a -> b (in degrees, -180..180)
+        function shortestAngleDiff(a, b) {
+            let diff = normalizeAngle(b) - normalizeAngle(a);
+            if (diff > 180) diff -= 360;
+            if (diff < -180) diff += 360;
+            return diff;
+        }
 
         // ---- lon/lat -> tile index, same logic as Rust build.rs ----
         function lonLatToTile(lonDeg, latDeg, zoom) {
@@ -309,7 +327,6 @@
             }
         }
 
-        let userHeadingDeg = null; // 0..360, where 0 = facing north
 
         function updateUserMarkerRotation() {
             if (!userMarker || userHeadingDeg == null) return;
@@ -320,7 +337,6 @@
             const indicator = el.querySelector(".user-heading-indicator");
             if (!indicator) return;
 
-            // Rotate around the user and push outward to form an orbit
             const radius = 14; // distance in px from center
             indicator.style.transform =
                 `translate(-50%, -50%) rotate(${userHeadingDeg}deg) translateY(-${radius}px)`;
@@ -329,15 +345,52 @@
 
         // Handle device orientation events
         function handleOrientation(event) {
-            // event.alpha is the compass-like heading (0–360deg), but device-frame.
-            // For many browsers, alpha=0 is facing north; we can treat it as such.
-            if (event.alpha == null) return;
+            let heading = null;
 
-            // Convert to compass heading (clockwise from north).
-            // Often alpha is already that, but we normalize it anyway.
-            userHeadingDeg = (360 - event.alpha) % 360;
+            // 1) iOS Safari / WKWebView: use the proper compass heading if available
+            if (typeof event.webkitCompassHeading === "number" && !Number.isNaN(event.webkitCompassHeading)) {
+                // webkitCompassHeading: 0 = North, 90 = East, clockwise
+                heading = normalizeAngle(event.webkitCompassHeading);
+            } else if (event.absolute === true && typeof event.alpha === "number") {
+                // 2) Absolute orientation: alpha is often compass-like (0 = North, clockwise)
+                heading = normalizeAngle(event.alpha);
+            } else if (typeof event.alpha === "number") {
+                // 3) Fallback: treat alpha as compass and flip if necessary
+                // Many examples use (360 - alpha) to convert device-frame to compass-like.
+                heading = normalizeAngle(360 - event.alpha);
+            }
+
+            if (heading == null) {
+                return; // nothing usable
+            }
+
+            userHeadingDegRaw = heading;
+
+            // ---- Smoothing & de-jitter ----
+            if (userHeadingDeg == null) {
+                // First reading: snap directly
+                userHeadingDeg = heading;
+            } else {
+                // Only react if movement exceeds a small threshold (e.g. 2–3 degrees)
+                const diff = shortestAngleDiff(userHeadingDeg, heading);
+                const absDiff = Math.abs(diff);
+
+                const MIN_CHANGE = 2;     // ignore sub-2° noise completely
+                const SMOOTHING = 0.15;   // 0..1; smaller = smoother but laggier
+
+                if (absDiff < MIN_CHANGE) {
+                    // ignore tiny jitter
+                    return;
+                }
+
+                // Exponential smoothing along the shortest rotation direction
+                const delta = diff * SMOOTHING;
+                userHeadingDeg = normalizeAngle(userHeadingDeg + delta);
+            }
+
             updateUserMarkerRotation();
         }
+
 
         // Try to subscribe to orientation events
         function initCompass() {
