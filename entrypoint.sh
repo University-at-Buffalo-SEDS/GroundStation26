@@ -8,6 +8,16 @@ set -m
 export DEBIAN_FRONTEND=noninteractive
 export TZ=Etc/Eastern
 
-/app/map_downloader
+# Default to "false" if not set
+ENSURE_MAP_DATA="${ENSURE_MAP_DATA:-false}"
 
-/app/groundstation_backend
+# Only run the downloader if ENSURE_MAP_DATA is truthy
+if [[ "$ENSURE_MAP_DATA" == "true" ]] || [[ "$ENSURE_MAP_DATA" == "1" ]]; then
+    echo "[entrypoint] ENSURE_MAP_DATA is enabled. Running map_downloader..."
+    /app/map_downloader
+else
+    echo "[entrypoint] ENSURE_MAP_DATA is disabled. Skipping map_downloader."
+fi
+
+echo "[entrypoint] Starting groundstation_backend..."
+exec /app/groundstation_backend     # exec is important for proper signal handling

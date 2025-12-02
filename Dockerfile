@@ -1,4 +1,5 @@
 FROM registry.gitlab.rylanswebsite.com/rylan-meilutis/rust-docker-builder:latest AS builder
+ARG PI_BUILD=""
 
 LABEL authors="rylan"
 
@@ -38,7 +39,14 @@ COPY entrypoint.sh build.py ./
 
 RUN chmod +x entrypoint.sh
 
-RUN ./build.py
+# If PI_BUILD is non-empty (or equals "pi_build"), force pi_build; otherwise normal build.
+RUN if [ -n "${PI_BUILD}" ] && [ "${PI_BUILD}" = "pi_build" ]; then \
+        echo "PI_BUILD='${PI_BUILD}' → ./build.py pi_build"; \
+        ./build.py pi_build; \
+    else \
+        echo "PI_BUILD not set to 'pi_build' → ./build.py"; \
+        ./build.py; \
+    fi
 
 RUN cargo build --release -p map_downloader
 

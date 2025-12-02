@@ -1,30 +1,15 @@
 services:
   web:
-    build: .
+    build:
+      context: .
+      args:
+        # Default value; build.py/docker path will override this when needed
+        PI_BUILD: ""
     networks:
       - internal
+    environment:
+      ENSURE_MAP_DATA: "true"
     volumes:
       - ./data:/app/data
       - ./backend/data:/app/backend/data
     restart: always
-
-  nginx:
-    build: ./nginx
-    ports:
-      - "3000:443"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/nginx_certs:/etc/nginx/ssl
-    depends_on:
-      - web
-    networks:
-        - internal
-        - external
-    restart: always
-
-
-networks:
-    internal:
-      internal: true
-    external:
-      driver: bridge
