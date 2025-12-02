@@ -1,8 +1,36 @@
-data/
-target/
-venv/
 Dockerfile
 docker-compose.yml
 README.md
+# Big data dirs
 backend/data/
-map_downloader/
+backend/data/**
+
+data/
+data/**
+
+# Rust build output
+target/
+**/target/
+
+# Python venv
+venv/
+.venv/
+
+# Node deps
+node_modules/
+**/node_modules/
+dist/
+build/
+
+# Git repo
+.git/
+.git/**
+
+# IDE / misc
+.idea/
+.vscode/
+*.iml
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
