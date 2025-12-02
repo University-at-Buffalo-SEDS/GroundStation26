@@ -10,6 +10,8 @@ RUN chmod +x entrypoint.sh
 
 RUN ./build.py
 
+RUN cargo build --release -p map_downloader
+
 FROM debian:stable-slim
 
 LABEL authors="rylan"
@@ -18,11 +20,12 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/groundstation_backend /app
 
+COPY --from=builder /app/target/release/map_downloader /app
+
 COPY --from=builder /app/frontend/dist /app/frontend/dist
 
 COPY --from=builder /app/entrypoint.sh /app
 
-COPY download_map.py /app
 
 EXPOSE 3000
 

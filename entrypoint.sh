@@ -8,5 +8,6 @@ set -m
 export DEBIAN_FRONTEND=noninteractive
 export TZ=Etc/Eastern
 
-python3 /app/download_map.py
+/app/map_downloader
+
 /app/groundstation_backend
