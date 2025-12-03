@@ -1,4 +1,4 @@
-use std::{env, fs, io::Write, path::PathBuf};
+use std::{env, fs, io::Write, path::Path, path::PathBuf};
 
 fn main() {
     // Re-run if this file changes
@@ -28,7 +28,7 @@ fn main() {
 }
 
 fn download_leaflet_file(
-    leaflet_dir: &PathBuf,
+    leaflet_dir: &Path,
     version: &str,
     kind: &str, // "css" or "js"
 ) -> Result<(), Box<dyn std::error::Error>> {

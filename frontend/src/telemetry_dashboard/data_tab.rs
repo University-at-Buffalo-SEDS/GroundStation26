@@ -29,7 +29,6 @@ pub fn DataTab(
 
     // v_paths: each signal only clones its one String
     let v_paths: [Signal<String>; 8] = std::array::from_fn(|i| {
-        let graph_data = graph_data.clone();
         Signal::derive(move || {
             graph_data.with(
                 |(p0, p1, p2, p3, p4, p5, p6, p7, _ymin, _ymax, _span)| match i {
@@ -48,20 +47,14 @@ pub fn DataTab(
     });
 
     // Scaling values: no String clones, just copy f32s
-    let y_min = Signal::derive({
-        let graph_data = graph_data.clone();
-        move || graph_data.with(|(_, _, _, _, _, _, _, _, ymin, _, _)| *ymin)
-    });
+    let y_min =
+        Signal::derive(move || graph_data.with(|(_, _, _, _, _, _, _, _, ymin, _, _)| *ymin) );
 
-    let y_max = Signal::derive({
-        let graph_data = graph_data.clone();
-        move || graph_data.with(|(_, _, _, _, _, _, _, _, _, ymax, _)| *ymax)
-    });
+    let y_max =
+        Signal::derive( move || graph_data.with(|(_, _, _, _, _, _, _, _, _, ymax, _)| *ymax) );
 
-    let span_min = Signal::derive({
-        let graph_data = graph_data.clone();
-        move || graph_data.with(|(_, _, _, _, _, _, _, _, _, _, span)| *span)
-    });
+    let span_min =
+        Signal::derive(move || graph_data.with(|(_, _, _, _, _, _, _, _, _, _, span)| *span) );
 
     // y_mid still just uses the two f32 signals
     let y_mid = Signal::derive(move || {
@@ -335,11 +328,12 @@ fn build_polyline(
     let mut max_v: Option<f32> = None;
 
     for r in rows {
-        for v in [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7] {
-            if let Some(x) = v {
-                min_v = Some(min_v.map(|m| m.min(x)).unwrap_or(x));
-                max_v = Some(max_v.map(|m| m.max(x)).unwrap_or(x));
-            }
+        for x in [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7]
+            .into_iter()
+            .flatten()
+        {
+            min_v = Some(min_v.map(|m| m.min(x)).unwrap_or(x));
+            max_v = Some(max_v.map(|m| m.max(x)).unwrap_or(x));
         }
     }
 
@@ -475,9 +469,9 @@ fn build_polyline(
             let ts_avg = b.ts_sum / b.ts_count;
             let mut vals: [Option<f32>; 8] = [None; 8];
 
-            for j in 0..8 {
+            for (j, val) in vals.iter_mut().enumerate() {
                 if b.v_count[j] > 0 {
-                    vals[j] = Some((b.v_sum[j] / b.v_count[j] as f64) as f32);
+                    *val = Some((b.v_sum[j] / b.v_count[j] as f64) as f32);
                 }
             }
 

@@ -62,7 +62,7 @@ impl RadioDevice for Radio {
         let mut payload = vec![0u8; frame_len];
         self.inner.read_exact(&mut payload)?;
 
-        router.rx_serialized_packet_to_queue(&*payload)
+        router.rx_serialized_packet_to_queue(&payload)
     }
 
     /// Blocking send of serialized bytes (length-prefixed).

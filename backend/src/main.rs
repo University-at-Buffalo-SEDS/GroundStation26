@@ -31,7 +31,7 @@ use tokio::sync::{broadcast, mpsc};
 use groundstation_shared::FlightState;
 
 fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
-    Box::new(|| get_current_timestamp_ms())
+    Box::new(get_current_timestamp_ms)
 }
 
 const GPIO_IGNITION_PIN: u8 = 5;
@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
         warnings_tx: broadcast::channel(256).0,
         errors_tx: broadcast::channel(256).0,
         db,
-        state: Arc::new(Mutex::new(groundstation_shared::FlightState::Startup)),
+        state: Arc::new(Mutex::new(FlightState::Startup)),
         state_tx: broadcast::channel(16).0,
         gpio,
     });

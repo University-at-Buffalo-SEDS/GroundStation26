@@ -24,8 +24,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
             let rb = state.ring_buffer.lock().unwrap();
             let len = rb.len();
 
-
-            if count >= 20{
+            if count >= 20 {
                 emit_warning(
                     &state,
                     "Warning: No telemetry packets received for 10 seconds!",
@@ -54,45 +53,35 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
             // Example safety check: if accel X > threshold, warn
             match pkt.data_type() {
                 DataType::AccelData => {
-                    let values = pkt.data_as_f32();
-                    let values = values.unwrap_or_else(|_| vec![0f32; 3]);
-                    if let Some(accel_x) = values.get(0) {
-                        if (ACCELERATION_X_MIN_THRESHOLD > *accel_x)
-                            || (*accel_x > ACCELERATION_X_MAX_THRESHOLD)
-                        {
-                            emit_warning(
-                                &state,
-                                "Critical: Acceleration X threshold exceeded!",
-                            );
-                        }
+                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
+
+                    // X axis: use `first()` and collapse the nested if
+                    if let Some(accel_x) = values.first()
+                        && ((ACCELERATION_X_MIN_THRESHOLD > *accel_x)
+                            || (*accel_x > ACCELERATION_X_MAX_THRESHOLD))
+                    {
+                        emit_warning(&state, "Critical: Acceleration X threshold exceeded!");
                     }
-                    if let Some(accel_y) = values.get(1) {
-                        if (ACCELERATION_Y_MIN_THRESHOLD > *accel_y)
-                            || (*accel_y > ACCELERATION_Y_MAX_THRESHOLD)
-                        {
-                            emit_warning(
-                                &state,
-                                "Critical: Acceleration Y threshold exceeded!",
-                            );
-                        }
+
+                    // Y axis: collapse nested if
+                    if let Some(accel_y) = values.get(1)
+                        && ((ACCELERATION_Y_MIN_THRESHOLD > *accel_y)
+                            || (*accel_y > ACCELERATION_Y_MAX_THRESHOLD))
+                    {
+                        emit_warning(&state, "Critical: Acceleration Y threshold exceeded!");
                     }
-                    if let Some(accel_z) = values.get(2) {
-                        if (ACCELERATION_Z_MIN_THRESHOLD > *accel_z)
-                            || (*accel_z > ACCELERATION_Z_MAX_THRESHOLD)
-                        {
-                            emit_warning(
-                                &state,
-                                "Critical: Acceleration Z threshold exceeded!",
-                            );
-                        }
+
+                    // Z axis: collapse nested if
+                    if let Some(accel_z) = values.get(2)
+                        && ((ACCELERATION_Z_MIN_THRESHOLD > *accel_z)
+                            || (*accel_z > ACCELERATION_Z_MAX_THRESHOLD))
+                    {
+                        emit_warning(&state, "Critical: Acceleration Z threshold exceeded!");
                     }
                 }
                 DataType::GenericError => {
                     abort = true;
-                    emit_warning(
-                        &state,
-                        "Generic Error received from vehicle!",
-                    );
+                    emit_warning(&state, "Generic Error received from vehicle!");
                     println!("Safety: Generic Error packet received");
                 }
                 _ => {}

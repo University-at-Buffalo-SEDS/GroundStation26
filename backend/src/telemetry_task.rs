@@ -23,7 +23,7 @@ pub async fn telemetry_task(
     loop {
         tokio::select! {
                 _ = radio_interval.tick() => {
-                    match radio.lock().expect("failed to get lock").recv_packet(&*router){
+                    match radio.lock().expect("failed to get lock").recv_packet(&router){
                         Ok(_) => {
                             // Packet received and handled by router
                         }
@@ -89,16 +89,16 @@ pub async fn handle_packet(state: &Arc<AppState>) {
 
     if pkt.data_type() == DataType::Warning {
         if let Ok(msg) = pkt.data_as_string() {
-            emit_warning(&state, msg.to_string());
+            emit_warning(state, msg.to_string());
         } else {
-            emit_warning(&state, "Warning packet with invalid UTF-8 payload");
+            emit_warning(state, "Warning packet with invalid UTF-8 payload");
         }
         return; // Ignore invalid packets
     }
 
     if pkt.data_type() == DataType::FlightState {
         let pkt_data = match pkt.data_as_u8() {
-            Ok(data) => *data.get(0).expect("index 0 does not exist"),
+            Ok(data) => *data.first().expect("index 0 does not exist"),
             Err(_) => return,
         };
         let new_flight_state = match u8_to_flight_state(pkt_data) {
@@ -107,7 +107,7 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         };
         {
             let mut fs = state.state.lock().unwrap();
-            *fs = new_flight_state.clone();
+            *fs = new_flight_state;
         }
         sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
             .bind(get_current_timestamp_ms() as i64)
@@ -130,7 +130,7 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         Ok(v) => v,
         Err(_) => return,
     };
-    let v0 = values.get(0).copied();
+    let v0 = values.first().copied();
     let v1 = values.get(1).copied();
     let v2 = values.get(2).copied();
     let v3 = values.get(3).copied();

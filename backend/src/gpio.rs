@@ -137,7 +137,6 @@ mod dummy {
         output_pins: Arc<Mutex<HashMap<u8, bool>>>,
     }
     #[allow(dead_code)]
-
     impl GpioPins {
         /// Global singleton instance (dummy).
         pub fn new() -> Arc<GpioPins> {

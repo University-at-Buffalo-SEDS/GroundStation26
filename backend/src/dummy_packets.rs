@@ -113,7 +113,7 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
 
     let dtype = choices[rng.random_range(0..choices.len())];
     const BASE_LAT: f32 = 31.7619;
-    const BASE_LON: f32 = -106.4850;
+    const BASE_LON: f32 = -106.485;
     let values: Vec<f32> = match dtype {
         GpsData => {
             // (lat, lon)

@@ -7,7 +7,6 @@ use leptos::prelude::*;
 pub fn StateTab(flight_state: ReadSignal<FlightState>) -> impl IntoView {
     // Local string version of the state (this replaces `flight_state_str_sig`)
     let flight_state_str_sig = Signal::derive({
-        let flight_state = flight_state;
         move || flight_state.get().to_string()
     });
 

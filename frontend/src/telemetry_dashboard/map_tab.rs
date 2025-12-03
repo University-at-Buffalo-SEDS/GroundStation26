@@ -38,10 +38,6 @@ pub fn MapTab(
     // 1) Hydrate from JS cached position, if any (runs once on mount)
     // -------------------------------------------------------------------------
     Effect::new({
-        let set_browser_user_gps = set_browser_user_gps.clone();
-        let has_centered_on_user = has_centered_on_user.clone();
-        let set_has_centered_on_user = set_has_centered_on_user.clone();
-
         move |_| {
             let js_val = get_last_user_lat_lng();
             if js_val.is_null() || js_val.is_undefined() {
@@ -74,17 +70,13 @@ pub fn MapTab(
     // 2) Start geolocation watch when the component mounts
     // -------------------------------------------------------------------------
     Effect::new({
-        let set_browser_user_gps = set_browser_user_gps.clone();
-        let has_centered_on_user = has_centered_on_user.clone();
-        let set_has_centered_on_user = set_has_centered_on_user.clone();
-
         move |_| {
             if let Some(window) = web_sys::window() {
                 let navigator = window.navigator();
 
                 if let Ok(geo) = navigator.geolocation() {
                     // success callback: Position -> update browser_user_gps and maybe center map
-                    let success_cb = wasm_bindgen::closure::Closure::<dyn FnMut(Position)>::new(
+                    let success_cb = Closure::<dyn FnMut(Position)>::new(
                         move |pos: Position| {
                             let coords = pos.coords();
                             let lat = coords.latitude();
@@ -101,7 +93,7 @@ pub fn MapTab(
                     );
 
                     // error callback: PositionError -> log to console
-                    let error_cb = wasm_bindgen::closure::Closure::<dyn FnMut(PositionError)>::new(
+                    let error_cb = Closure::<dyn FnMut(PositionError)>::new(
                         move |err: PositionError| {
                             let msg = format!(
                                 "geolocation error (code {}): {}",
@@ -127,10 +119,8 @@ pub fn MapTab(
     });
 
     // Effective user GPS = browser location if available, otherwise parent-provided
-    let effective_user_gps = Signal::derive({
-        let browser_user_gps = browser_user_gps.clone();
-        move || browser_user_gps.get().or_else(|| user_gps.get())
-    });
+    let effective_user_gps =
+        Signal::derive( move || browser_user_gps.get().or_else(|| user_gps.get()) );
 
     // Initialize the map once. JS side will guard against duplicate init.
     Effect::new(|_| {
