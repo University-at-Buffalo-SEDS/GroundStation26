@@ -126,23 +126,23 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
         }
         KalmanFilterData => {
             // Example: filtered accel XYZ
-            let ax = rng.random_range(-2.0..2.0);
-            let ay = rng.random_range(-2.0..2.0);
-            let az = rng.random_range(-2.0..2.0);
+            let ax = rng.random_range(-20.0..20.0);
+            let ay = rng.random_range(-20.0..20.0);
+            let az = rng.random_range(-20.0..20.0);
             vec![ax, ay, az]
         }
         GyroData => {
             // Gyro [°/s]
-            let gx = rng.random_range(-300.0..300.0);
-            let gy = rng.random_range(-300.0..300.0);
-            let gz = rng.random_range(-300.0..300.0);
+            let gx = rng.random_range(-5.0..5.0);
+            let gy = rng.random_range(-5.0..5.0);
+            let gz = rng.random_range(-360.0..360.0);
             vec![gx, gy, gz]
         }
         AccelData => {
             // Accel [m/s^2]
-            let ax = rng.random_range(-10.0..10.0);
-            let ay = rng.random_range(-10.0..10.0);
-            let az = rng.random_range(-10.0..10.0);
+            let ax = rng.random_range(-2.0..2.0);
+            let ay = rng.random_range(-2.0..2.0);
+            let az = rng.random_range(-30.0..2.0);
             vec![ax, ay, az]
         }
         BatteryVoltage => {
@@ -157,10 +157,10 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
         }
         BarometerData => {
             // Pressure (hPa), Altitude (m), Temperature (C)
-            let pressure = rng.random_range(950.0..1050.0);
-            let altitude = rng.random_range(0.0..500.0);
-            let temp = rng.random_range(-10.0..40.0);
-            vec![pressure, altitude, temp]
+            let pressure = rng.random_range(30000.0..110000.0);
+            let altitude = rng.random_range(-3.4..11000.0);
+            let temp = rng.random_range(5.0..40.0);
+            vec![pressure, temp, altitude]
         }
         FuelFlow => {
             // Fuel flow rate (L/h)

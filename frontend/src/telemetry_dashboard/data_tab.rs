@@ -74,6 +74,7 @@ pub fn DataTab(
             "BAROMETER_DATA" => ["Pressure", "Temp", "Altitude", "", "", "", "", ""],
             "BATTERY_VOLTAGE" => ["Voltage", "", "", "", "", "", "", ""],
             "BATTERY_CURRENT" => ["Current", "", "", "", "", "", "", ""],
+            "KALMAN_FILTER_DATA" => ["X", "Y", "Z", "", "", "", "", ""],
             "GPS_DATA" => ["Latitude", "Longitude", "", "", "", "", "", ""],
             "FUEL_FLOW" => ["Flow Rate", "", "", "", "", "", "", ""],
             "FUEL_TANK_PRESSURE" => ["Pressure", "", "", "", "", "", "", ""],
@@ -97,6 +98,7 @@ pub fn DataTab(
                 {sensor_tab("BAROMETER_DATA", "Barom", active_tab, set_active_tab)}
                 {sensor_tab("BATTERY_VOLTAGE", "Batt V", active_tab, set_active_tab)}
                 {sensor_tab("BATTERY_CURRENT", "Batt I", active_tab, set_active_tab)}
+                {sensor_tab("KALMAN_FILTER_DATA", "Kalman", active_tab, set_active_tab)}
                 {sensor_tab("GPS_DATA", "GPS", active_tab, set_active_tab)}
                 {sensor_tab("FUEL_FLOW", "Fuel Flow", active_tab, set_active_tab)}
                 {sensor_tab("FUEL_TANK_PRESSURE", "Fuel Press", active_tab, set_active_tab)}
