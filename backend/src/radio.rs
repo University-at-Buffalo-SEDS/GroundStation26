@@ -8,7 +8,8 @@ use std::error::Error;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-pub const RADIO_PORT: &str = "/dev/ttyUSB1";
+pub const ROCKET_RADIO_PORT: &str = "/dev/ttyUSB1";
+pub const UMBILICAL_RADIO_PORT: &str = "/dev/ttyUSB2";
 pub const RADIO_BAUDRATE: usize = 57_600;
 pub const MAX_PACKET_SIZE: usize = 256;
 
@@ -88,13 +89,15 @@ impl RadioDevice for Radio {
 // ======================================================================
 #[cfg(feature = "testing")]
 #[derive(Debug, Default)]
-pub struct DummyRadio;
+pub struct DummyRadio {
+    name: &'static str,
+}
 
 #[cfg(feature = "testing")]
 
 impl DummyRadio {
-    pub fn new() -> Self {
-        DummyRadio
+    pub fn new(name: &'static str) -> Self {
+        DummyRadio { name }
     }
 }
 
@@ -109,8 +112,9 @@ impl RadioDevice for DummyRadio {
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         println!(
-            "DummyRadio: dropping {} bytes of outgoing telemetry (no radio connected)",
-            payload.len()
+            "DummyRadio: dropping {} bytes of outgoing telemetry send from {}",
+            payload.len(),
+            self.name
         );
         Ok(())
     }

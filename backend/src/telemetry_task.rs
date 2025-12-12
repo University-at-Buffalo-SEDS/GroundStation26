@@ -13,7 +13,7 @@ use tokio::time::{interval, Duration};
 pub async fn telemetry_task(
     state: Arc<AppState>,
     router: Arc<sedsprintf_rs_2026::router::Router>,
-    radio: Arc<Mutex<Box<dyn RadioDevice>>>,
+    radio: Vec<Arc<Mutex<Box<dyn RadioDevice>>>>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
 ) {
     let mut radio_interval = interval(Duration::from_millis(2));
@@ -23,15 +23,16 @@ pub async fn telemetry_task(
     loop {
         tokio::select! {
                 _ = radio_interval.tick() => {
-                    match radio.lock().expect("failed to get lock").recv_packet(&router){
-                        Ok(_) => {
-                            // Packet received and handled by router
-                        }
-                        Err(e) => {
-                            println!("radio_task exited with error: {}", e);
+                    for radio in &radio {
+                        match radio.lock().expect("failed to get lock").recv_packet(&router){
+                            Ok(_) => {
+                                // Packet received and handled by router
+                            }
+                            Err(e) => {
+                                println!("radio_task exited with error: {}", e);
+                            }
                         }
                     }
-
                 }
             _= router_interval.tick() => {
                     router.process_all_queues_with_timeout(20).expect("Failed to process all queues with timeout");
@@ -86,14 +87,13 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         }
     };
 
-
     if pkt.data_type() == DataType::Warning {
         if let Ok(msg) = pkt.data_as_string() {
             emit_warning(state, msg.to_string());
         } else {
             emit_warning(state, "Warning packet with invalid UTF-8 payload");
         }
-        return; // Ignore invalid packets
+        return;
     }
 
     if pkt.data_type() == DataType::FlightState {
@@ -123,7 +123,6 @@ pub async fn handle_packet(state: &Arc<AppState>) {
     }
 
     let ts_ms = pkt.timestamp() as i64;
-
     let data_type_str = pkt.data_type().as_str().to_string();
 
     let values = match pkt.data_as_f32() {
@@ -139,7 +138,6 @@ pub async fn handle_packet(state: &Arc<AppState>) {
     let v6 = values.get(6).copied();
     let v7 = values.get(7).copied();
 
-    // Insert into DB
     sqlx::query(
         "INSERT INTO telemetry (timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
@@ -157,7 +155,6 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         .await
         .expect("DB insert into telemetry failed");
 
-    // Build DTO to send to WebSocket listeners
     let row = TelemetryRow {
         timestamp_ms: ts_ms,
         data_type: data_type_str,

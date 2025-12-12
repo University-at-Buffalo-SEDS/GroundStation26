@@ -1,3 +1,5 @@
+// main.rs
+
 #[cfg(feature = "testing")]
 mod dummy_packets;
 mod gpio;
@@ -18,7 +20,7 @@ use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 use crate::gpio::Trigger::RisingEdge;
 #[cfg(feature = "testing")]
 use crate::radio::DummyRadio;
-use crate::radio::{Radio, RadioDevice, RADIO_BAUDRATE, RADIO_PORT};
+use crate::radio::{Radio, RadioDevice, RADIO_BAUDRATE, ROCKET_RADIO_PORT, UMBILICAL_RADIO_PORT};
 use crate::web::emit_error;
 use axum::Router;
 use groundstation_shared::FlightState;
@@ -31,6 +33,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
 use tokio::sync::{broadcast, mpsc};
 
 fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
@@ -52,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
 
     let gpio_clone = gpio.clone();
 
+    // Ensure offline map tiles
     if let Err(e) = ensure_map_data(DEFAULT_MAP_REGION).await {
         eprintln!("WARNING: failed to ensure map tiles: {e:#}");
         // you can choose to return Err(e) instead if tiles are mandatory
@@ -59,11 +63,8 @@ async fn main() -> anyhow::Result<()> {
 
     // --- DB path ---
     let db_path = "./data/groundstation.db";
-
     if !Path::new(db_path).exists() {
-        // make sure the data directory exists
         fs::create_dir_all("./data")?;
-        // Create an empty file. SQLite will initialize it.
         fs::write(db_path, b"")?;
         println!("Created empty DB file.");
     }
@@ -71,7 +72,6 @@ async fn main() -> anyhow::Result<()> {
     let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path)).await?;
 
     // --- Tables ---
-    // Telemetry time-series
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS telemetry (
@@ -92,7 +92,6 @@ async fn main() -> anyhow::Result<()> {
     .execute(&db)
     .await?;
 
-    // Alerts (warnings + errors)
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS alerts (
@@ -106,13 +105,12 @@ async fn main() -> anyhow::Result<()> {
     .execute(&db)
     .await?;
 
-    // flight state
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS flight_state (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp_ms INTEGER NOT NULL,
-            f_state     INTEGER    NOT NULL -- 'warning' or 'error'
+            f_state      INTEGER NOT NULL
         );
         "#,
     )
@@ -136,8 +134,10 @@ async fn main() -> anyhow::Result<()> {
         gpio,
     });
 
+    // --- Router endpoint handlers ---
     let ground_station_handler_state_clone = state.clone();
     let abort_handler_state_clone = state.clone();
+
     let ground_station_handler =
         EndpointHandler::new_packet_handler(GroundStation, move |pkt: &TelemetryPacket| {
             let mut rb = ground_station_handler_state_clone
@@ -158,27 +158,53 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = sedsprintf_rs_2026::router::BoardConfig::new([ground_station_handler, abort_handler]);
 
-    let radio: Arc<Mutex<Box<dyn RadioDevice>>> = match Radio::open(RADIO_PORT, RADIO_BAUDRATE) {
-        Ok(r) => {
-            println!("Radio online");
-            Arc::new(Mutex::new(Box::new(r)))
-        }
-        Err(e) => {
-            println!("Radio missing, using DummyRadio: {}", e);
-            #[cfg(feature = "testing")]
-            {
-                Arc::new(Mutex::new(Box::new(DummyRadio::new())))
+    // --- Radios ---
+    let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
+        match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUDRATE) {
+            Ok(r) => {
+                println!("Rocket radio online");
+                Arc::new(Mutex::new(Box::new(r)))
             }
-            #[cfg(not(feature = "testing"))]
-            panic!("Radio missing and testing mode not enabled")
-        }
-    };
+            Err(e) => {
+                println!("Rocket radio missing, using DummyRadio: {}", e);
+                #[cfg(feature = "testing")]
+                {
+                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio"))))
+                }
+                #[cfg(not(feature = "testing"))]
+                panic!("Rocket radio missing and testing mode not enabled")
+            }
+        };
+
+    let umbilical_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
+        match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUDRATE) {
+            Ok(r) => {
+                println!("Umbilical radio online");
+                Arc::new(Mutex::new(Box::new(r)))
+            }
+            Err(e) => {
+                println!("Umbilical radio missing, using DummyRadio: {}", e);
+                #[cfg(feature = "testing")]
+                {
+                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio"))))
+                }
+                #[cfg(not(feature = "testing"))]
+                panic!("Umbilical radio missing and testing mode not enabled")
+            }
+        };
 
     let serialized_handler = {
-        let radio: Arc<Mutex<Box<dyn RadioDevice>>> = Arc::clone(&radio);
-
+        let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> = Arc::clone(&rocket_radio);
+        let umbilical_radio: Arc<Mutex<Box<dyn RadioDevice>>> = Arc::clone(&umbilical_radio);
         Some(move |pkt: &[u8]| -> TelemetryResult<()> {
-            let mut guard = radio
+            let mut guard = rocket_radio
+                .lock()
+                .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
+            guard
+                .send_data(pkt)
+                .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
+            
+            let mut guard = umbilical_radio
                 .lock()
                 .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
             guard
@@ -196,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Clone what you need for the callback
     let router_for_cb = router.clone();
-    let state_for_cb = state.clone(); // or whatever type `state` is
+    let state_for_cb = state.clone();
 
     gpio_clone
         .setup_callback_input_pin(
@@ -220,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
     router.log_queue(DataType::FlightState, &[FlightState::Startup as u8])?;
 
     // --- Background tasks ---
-    let _tt = tokio::spawn(telemetry_task(state.clone(), router.clone(), radio, cmd_rx));
+    let _tt = tokio::spawn(telemetry_task(state.clone(), router.clone(), vec!(rocket_radio, umbilical_radio), cmd_rx));
     let _st = tokio::spawn(safety_task(state.clone(), router.clone()));
 
     // --- Webserver ---
