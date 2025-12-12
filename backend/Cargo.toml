@@ -8,6 +8,7 @@ repository.workspace = true
 
 [features]
 raspberry_pi = ["rppal"]
+testing = []
 
 [dependencies]
 axum = { workspace = true, features = ["ws"] }

@@ -1,3 +1,4 @@
+#[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
 use sedsprintf_rs_2026::router::Router;
@@ -85,8 +86,11 @@ impl RadioDevice for Radio {
 // ======================================================================
 //  Dummy Radio (fallback when hardware missing)
 // ======================================================================
+#[cfg(feature = "testing")]
 #[derive(Debug, Default)]
 pub struct DummyRadio;
+
+#[cfg(feature = "testing")]
 
 impl DummyRadio {
     pub fn new() -> Self {
@@ -94,12 +98,13 @@ impl DummyRadio {
     }
 }
 
+#[cfg(feature = "testing")]
 impl RadioDevice for DummyRadio {
-    fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
+    fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
         let pkt = get_dummy_packet()?;
+        return _router.rx_packet_to_queue(pkt);
 
         // No incoming packets in dummy mode
-        router.rx_packet_to_queue(pkt)
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {

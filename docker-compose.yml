@@ -5,6 +5,7 @@ services:
       args:
         # Default value; build.py/docker path will override this when needed
         PI_BUILD: ""
+        TESTING: ""
     networks:
       - internal
     environment:

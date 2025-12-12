@@ -290,7 +290,7 @@ fn main_tab_from_str(s: &str) -> MainTab {
 // MAIN UI COMPONENT
 // ------------------------------------------------------------------------------------------------
 #[component]
-pub fn TelemetryDashboard() -> impl IntoView {
+pub fn TelemetryDashboard() -> impl IntoView + 'static {
     // --- telemetry data ---
     let (rows, set_rows) = signal(Vec::<TelemetryRow>::new());
 

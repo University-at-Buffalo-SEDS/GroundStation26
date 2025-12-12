@@ -1,12 +1,13 @@
+#[cfg(feature = "testing")]
 mod dummy_packets;
 mod gpio;
+mod map;
 mod radio;
 mod ring_buffer;
 mod safety_task;
 mod state;
 mod telemetry_task;
 mod web;
-mod map;
 
 use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
 use crate::ring_buffer::RingBuffer;
@@ -15,9 +16,12 @@ use crate::state::AppState;
 use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
 use crate::gpio::Trigger::RisingEdge;
-use crate::radio::{DummyRadio, Radio, RadioDevice, RADIO_BAUDRATE, RADIO_PORT};
+#[cfg(feature = "testing")]
+use crate::radio::DummyRadio;
+use crate::radio::{Radio, RadioDevice, RADIO_BAUDRATE, RADIO_PORT};
 use crate::web::emit_error;
 use axum::Router;
+use groundstation_shared::FlightState;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::EndpointHandler;
@@ -28,7 +32,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
-use groundstation_shared::FlightState;
 
 fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
     Box::new(get_current_timestamp_ms)
@@ -46,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to setup gpio pin");
     gpio.setup_output_pin(GPIO_IGNITION_PIN)
         .expect("failed to setup gpio pin");
+
     let gpio_clone = gpio.clone();
 
     if let Err(e) = ensure_map_data(DEFAULT_MAP_REGION).await {
@@ -161,12 +165,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => {
             println!("Radio missing, using DummyRadio: {}", e);
-            Arc::new(Mutex::new(Box::new(DummyRadio::new())))
+            #[cfg(feature = "testing")]
+            {
+                Arc::new(Mutex::new(Box::new(DummyRadio::new())))
+            }
+            #[cfg(not(feature = "testing"))]
+            panic!("Radio missing and testing mode not enabled")
         }
     };
 
     let serialized_handler = {
-        let radio = Arc::clone(&radio);
+        let radio: Arc<Mutex<Box<dyn RadioDevice>>> = Arc::clone(&radio);
+
         Some(move |pkt: &[u8]| -> TelemetryResult<()> {
             let mut guard = radio
                 .lock()

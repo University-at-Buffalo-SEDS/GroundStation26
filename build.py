@@ -103,7 +103,7 @@ def build_frontend(frontend_dir: Path) -> None:
         sys.exit(e.returncode)
 
 
-def build_backend(backend_dir: Path, force_pi: bool, force_no_pi: bool) -> None:
+def build_backend(backend_dir: Path, force_pi: bool, force_no_pi: bool, testing_mode: bool) -> None:
     cmd = ["cargo", "build", "--release", "-p", "groundstation_backend"]
 
     if force_pi and force_no_pi:
@@ -124,6 +124,12 @@ def build_backend(backend_dir: Path, force_pi: bool, force_no_pi: bool) -> None:
             print(
                 "Not running on Raspberry Pi → building without `raspberry_pi` feature."
             )
+    if testing_mode:
+        print("Testing mode enabled → adding `testing` feature.")
+        if "--features" in cmd:
+            cmd[cmd.index("--features") + 1] += ",testing"
+        else:
+            cmd.extend(["--features", "testing"])
 
     try:
         run(cmd, cwd=backend_dir)
@@ -140,6 +146,12 @@ def print_usage() -> None:
     print("  ./build.py docker")
     print("  ./build.py docker pi_build")
     print("  ./build.py docker no_pi")
+    print("  ./build.py testing")
+    print("  ./build.py pi_build testing")
+    print("  ./build.py no_pi testing")
+    print("  ./build.py docker testing")
+    print("  ./build.py docker pi_build testing")
+    print("  ./build.py docker no_pi testing")
     sys.exit(1)
 
 
@@ -150,11 +162,12 @@ def main() -> None:
     force_pi = False
     force_no_pi = False
     docker_mode = False
+    testing_mode = False
 
     # Accept 0, 1, or 2 args (script name + up to 2 extra)
     args = [a.strip().lower() for a in sys.argv[1:]]
 
-    if len(args) > 2:
+    if len(args) > 3:
         print("Error: Too many arguments.", file=sys.stderr)
         print_usage()
 
@@ -165,6 +178,8 @@ def main() -> None:
             force_no_pi = True
         elif arg == "docker":
             docker_mode = True
+        elif arg == "testing":
+            testing_mode = True
         else:
             print(f"Error: Invalid argument '{arg}'.", file=sys.stderr)
             print_usage()
@@ -215,7 +230,7 @@ def main() -> None:
     # ----------------------
     # Run frontend & backend in parallel
     bfe = mp.Process(target=build_frontend, args=(frontend_dir,))
-    bbe = mp.Process(target=build_backend, args=(backend_dir, force_pi, force_no_pi))
+    bbe = mp.Process(target=build_backend, args=(backend_dir, force_pi, force_no_pi, testing_mode))
 
     bfe.start()
     bbe.start()

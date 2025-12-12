@@ -190,7 +190,7 @@ async fn get_flight_state(State(state): State<Arc<AppState>>) -> impl IntoRespon
         .expect("failed to fetch flight state");
     let flight_state: i64 = data.get::<i64, _>("f_state");
     let flight_state = groundstation_shared::u8_to_flight_state(flight_state as u8)
-        .unwrap_or(groundstation_shared::FlightState::Startup);
+        .unwrap_or(FlightState::Startup);
     Json(flight_state)
 }
 async fn send_command(
