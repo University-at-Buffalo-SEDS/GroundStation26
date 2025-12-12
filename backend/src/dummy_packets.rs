@@ -186,7 +186,7 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
 
     TelemetryPacket::new(
         dtype,
-        &[DataEndpoint::GroundStation, DataEndpoint::FlightController],
+        &[DataEndpoint::GroundStation],
         "TEST", // device ID
         now_ms,
         Arc::from(bytes.as_slice()),
