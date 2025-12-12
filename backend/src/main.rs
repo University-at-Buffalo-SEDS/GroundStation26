@@ -26,7 +26,7 @@ use axum::Router;
 use groundstation_shared::FlightState;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
-use sedsprintf_rs_2026::router::EndpointHandler;
+use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::{TelemetryError, TelemetryResult};
 use std::fs;
@@ -156,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     });
 
-    let cfg = sedsprintf_rs_2026::router::BoardConfig::new([ground_station_handler, abort_handler]);
+    let cfg = sedsprintf_rs_2026::router::RouterConfig::new([ground_station_handler, abort_handler]);
 
     // --- Radios ---
     let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
@@ -203,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
             guard
                 .send_data(pkt)
                 .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
-            
+
             let mut guard = umbilical_radio
                 .lock()
                 .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
@@ -216,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
 
     let router = Arc::new(sedsprintf_rs_2026::router::Router::new(
         serialized_handler,
+        RouterMode::Relay,
         cfg,
         clock(),
     ));
