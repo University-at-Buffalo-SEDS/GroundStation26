@@ -1,7 +1,7 @@
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
-use sedsprintf_rs_2026::router::Router;
+use sedsprintf_rs_2026::router::{LinkId, Router};
 use sedsprintf_rs_2026::{TelemetryError, TelemetryResult};
 use serial::{SerialPort, SystemPort};
 use std::error::Error;
@@ -26,10 +26,11 @@ pub trait RadioDevice: Send {
 // ======================================================================
 pub struct Radio {
     inner: SystemPort,
+    id: LinkId
 }
 
 impl Radio {
-    pub fn open(path: &str, baud: usize) -> anyhow::Result<Self> {
+    pub fn open(path: &str, baud: usize, id: LinkId) -> anyhow::Result<Self> {
         let mut inner = serial::open(path)?;
         inner
             .reconfigure(&|settings| {
@@ -42,7 +43,7 @@ impl Radio {
             })
             .context("failed to configure serial port")?;
         inner.set_timeout(Duration::from_millis(200))?;
-        Ok(Self { inner })
+        Ok(Self { inner, id})
     }
 }
 
@@ -64,7 +65,7 @@ impl RadioDevice for Radio {
         let mut payload = vec![0u8; frame_len];
         self.inner.read_exact(&mut payload)?;
 
-        router.rx_serialized_packet_to_queue(&payload)
+        router.rx_serialized_queue_from(&payload, self.id)
     }
 
     /// Blocking send of serialized bytes (length-prefixed).
@@ -88,16 +89,17 @@ impl RadioDevice for Radio {
 //  Dummy Radio (fallback when hardware missing)
 // ======================================================================
 #[cfg(feature = "testing")]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DummyRadio {
     name: &'static str,
+    id: LinkId
 }
 
 #[cfg(feature = "testing")]
 
 impl DummyRadio {
-    pub fn new(name: &'static str) -> Self {
-        DummyRadio { name }
+    pub fn new(name: &'static str, id: LinkId) -> Self {
+        DummyRadio { name, id}
     }
 }
 
@@ -105,7 +107,7 @@ impl DummyRadio {
 impl RadioDevice for DummyRadio {
     fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
         let pkt = get_dummy_packet()?;
-        return _router.rx_packet_to_queue(pkt);
+        return _router.rx_queue_from(pkt, self.id);
 
         // No incoming packets in dummy mode
     }

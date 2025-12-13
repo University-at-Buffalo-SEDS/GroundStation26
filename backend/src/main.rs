@@ -26,7 +26,7 @@ use axum::Router;
 use groundstation_shared::FlightState;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
-use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
+use sedsprintf_rs_2026::router::{EndpointHandler, LinkId, RouterMode};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::{TelemetryError, TelemetryResult};
 use std::fs;
@@ -42,6 +42,9 @@ fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
 
 const GPIO_IGNITION_PIN: u8 = 5;
 const GPIO_ABORT_PIN: u8 = 9;
+
+const ROCKET_RADIO_ID: LinkId = LinkId { 0: 10 };
+const UMBILICAL_RADIO_ID: LinkId = LinkId { 0: 10 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -138,29 +141,33 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler_state_clone = state.clone();
     let abort_handler_state_clone = state.clone();
 
-    let ground_station_handler =
-        EndpointHandler::new_packet_handler(GroundStation, move |pkt: &TelemetryPacket| {
+    let ground_station_handler = EndpointHandler::new_packet_handler(
+        GroundStation,
+        move |pkt: &TelemetryPacket, _sender| {
             let mut rb = ground_station_handler_state_clone
                 .ring_buffer
                 .lock()
                 .unwrap();
             rb.push(pkt.clone());
             Ok(())
+        },
+    );
+
+    let abort_handler =
+        EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket, _sender| {
+            let error_msg = pkt
+                .data_as_string()
+                .expect("Abort packet with invalid UTF-8");
+            emit_error(&abort_handler_state_clone, error_msg);
+            Ok(())
         });
 
-    let abort_handler = EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket| {
-        let error_msg = pkt
-            .data_as_string()
-            .expect("Abort packet with invalid UTF-8");
-        emit_error(&abort_handler_state_clone, error_msg);
-        Ok(())
-    });
-
-    let cfg = sedsprintf_rs_2026::router::RouterConfig::new([ground_station_handler, abort_handler]);
+    let cfg =
+        sedsprintf_rs_2026::router::RouterConfig::new([ground_station_handler, abort_handler]);
 
     // --- Radios ---
     let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
-        match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUDRATE) {
+        match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUDRATE, ROCKET_RADIO_ID) {
             Ok(r) => {
                 println!("Rocket radio online");
                 Arc::new(Mutex::new(Box::new(r)))
@@ -169,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Rocket radio missing, using DummyRadio: {}", e);
                 #[cfg(feature = "testing")]
                 {
-                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio"))))
+                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio", ROCKET_RADIO_ID))))
                 }
                 #[cfg(not(feature = "testing"))]
                 panic!("Rocket radio missing and testing mode not enabled")
@@ -177,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
     let umbilical_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
-        match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUDRATE) {
+        match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUDRATE, UMBILICAL_RADIO_ID) {
             Ok(r) => {
                 println!("Umbilical radio online");
                 Arc::new(Mutex::new(Box::new(r)))
@@ -186,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Umbilical radio missing, using DummyRadio: {}", e);
                 #[cfg(feature = "testing")]
                 {
-                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio"))))
+                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio", UMBILICAL_RADIO_ID))))
                 }
                 #[cfg(not(feature = "testing"))]
                 panic!("Umbilical radio missing and testing mode not enabled")
@@ -196,20 +203,24 @@ async fn main() -> anyhow::Result<()> {
     let serialized_handler = {
         let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> = Arc::clone(&rocket_radio);
         let umbilical_radio: Arc<Mutex<Box<dyn RadioDevice>>> = Arc::clone(&umbilical_radio);
-        Some(move |pkt: &[u8]| -> TelemetryResult<()> {
-            let mut guard = rocket_radio
-                .lock()
-                .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
-            guard
-                .send_data(pkt)
-                .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
 
-            let mut guard = umbilical_radio
-                .lock()
-                .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
-            guard
-                .send_data(pkt)
-                .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
+        Some(move |pkt: &[u8], sender: &LinkId| -> TelemetryResult<()> {
+            if *sender != ROCKET_RADIO_ID {
+                let mut guard = rocket_radio
+                    .lock()
+                    .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
+                guard
+                    .send_data(pkt)
+                    .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
+            }
+            if *sender != UMBILICAL_RADIO_ID {
+                let mut guard = umbilical_radio
+                    .lock()
+                    .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
+                guard
+                    .send_data(pkt)
+                    .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
+            }
             Ok(())
         })
     };
@@ -247,7 +258,12 @@ async fn main() -> anyhow::Result<()> {
     router.log_queue(DataType::FlightState, &[FlightState::Startup as u8])?;
 
     // --- Background tasks ---
-    let _tt = tokio::spawn(telemetry_task(state.clone(), router.clone(), vec!(rocket_radio, umbilical_radio), cmd_rx));
+    let _tt = tokio::spawn(telemetry_task(
+        state.clone(),
+        router.clone(),
+        vec![rocket_radio, umbilical_radio],
+        cmd_rx,
+    ));
     let _st = tokio::spawn(safety_task(state.clone(), router.clone()));
 
     // --- Webserver ---
