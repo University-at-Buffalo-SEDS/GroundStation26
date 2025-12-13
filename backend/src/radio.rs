@@ -10,7 +10,7 @@ use std::time::Duration;
 
 pub const ROCKET_RADIO_PORT: &str = "/dev/ttyUSB1";
 pub const UMBILICAL_RADIO_PORT: &str = "/dev/ttyUSB2";
-pub const RADIO_BAUDRATE: usize = 57_600;
+pub const RADIO_BAUD_RATE: usize = 57_600;
 pub const MAX_PACKET_SIZE: usize = 256;
 
 // ======================================================================

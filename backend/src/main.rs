@@ -20,7 +20,7 @@ use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 use crate::gpio::Trigger::RisingEdge;
 #[cfg(feature = "testing")]
 use crate::radio::DummyRadio;
-use crate::radio::{Radio, RadioDevice, RADIO_BAUDRATE, ROCKET_RADIO_PORT, UMBILICAL_RADIO_PORT};
+use crate::radio::{Radio, RadioDevice, RADIO_BAUD_RATE, ROCKET_RADIO_PORT, UMBILICAL_RADIO_PORT};
 use crate::web::emit_error;
 use axum::Router;
 use groundstation_shared::FlightState;
@@ -167,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Radios ---
     let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
-        match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUDRATE, ROCKET_RADIO_ID) {
+        match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUD_RATE, ROCKET_RADIO_ID) {
             Ok(r) => {
                 println!("Rocket radio online");
                 Arc::new(Mutex::new(Box::new(r)))
@@ -184,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
     let umbilical_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
-        match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUDRATE, UMBILICAL_RADIO_ID) {
+        match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUD_RATE, UMBILICAL_RADIO_ID) {
             Ok(r) => {
                 println!("Umbilical radio online");
                 Arc::new(Mutex::new(Box::new(r)))
