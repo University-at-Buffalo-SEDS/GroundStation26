@@ -43,8 +43,8 @@ fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
 const GPIO_IGNITION_PIN: u8 = 5;
 const GPIO_ABORT_PIN: u8 = 9;
 
-const ROCKET_RADIO_ID: LinkId = LinkId { 0: 10 };
-const UMBILICAL_RADIO_ID: LinkId = LinkId { 0: 10 };
+const ROCKET_RADIO_ID: TelemetryResult<LinkId> = LinkId::new(10 );
+const UMBILICAL_RADIO_ID: TelemetryResult<LinkId> = LinkId::new(5 );
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -167,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Radios ---
     let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
-        match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUD_RATE, ROCKET_RADIO_ID) {
+        match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUD_RATE, ROCKET_RADIO_ID.expect("Failed to Initialize Const value Rocket Radio ID")) {
             Ok(r) => {
                 println!("Rocket radio online");
                 Arc::new(Mutex::new(Box::new(r)))
@@ -176,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Rocket radio missing, using DummyRadio: {}", e);
                 #[cfg(feature = "testing")]
                 {
-                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio", ROCKET_RADIO_ID))))
+                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio", ROCKET_RADIO_ID.expect("Failed to Initialize Const value Rocket Radio ID")))))
                 }
                 #[cfg(not(feature = "testing"))]
                 panic!("Rocket radio missing and testing mode not enabled")
@@ -184,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
     let umbilical_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
-        match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUD_RATE, UMBILICAL_RADIO_ID) {
+        match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUD_RATE, UMBILICAL_RADIO_ID.expect("Failed to Initialize Const value Umbilical Radio ID")) {
             Ok(r) => {
                 println!("Umbilical radio online");
                 Arc::new(Mutex::new(Box::new(r)))
@@ -193,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Umbilical radio missing, using DummyRadio: {}", e);
                 #[cfg(feature = "testing")]
                 {
-                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio", UMBILICAL_RADIO_ID))))
+                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio", UMBILICAL_RADIO_ID.expect("Failed to Initialize Const value Umbilical Radio ID")))))
                 }
                 #[cfg(not(feature = "testing"))]
                 panic!("Umbilical radio missing and testing mode not enabled")
@@ -205,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
         let umbilical_radio: Arc<Mutex<Box<dyn RadioDevice>>> = Arc::clone(&umbilical_radio);
 
         Some(move |pkt: &[u8], sender: &LinkId| -> TelemetryResult<()> {
-            if *sender != ROCKET_RADIO_ID {
+            if *sender != ROCKET_RADIO_ID.expect("Failed to Initialize Const value Rocket Radio ID") {
                 let mut guard = rocket_radio
                     .lock()
                     .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
@@ -213,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
                     .send_data(pkt)
                     .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
             }
-            if *sender != UMBILICAL_RADIO_ID {
+            if *sender != UMBILICAL_RADIO_ID.expect("Failed to Initialize Const value Umbilical Radio ID") {
                 let mut guard = umbilical_radio
                     .lock()
                     .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
