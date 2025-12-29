@@ -1,12 +1,89 @@
 // frontend/src/telemetry_dashboard/data_tab.rs
 use dioxus::prelude::*;
-use dioxus_signals::{ReadableExt, Signal};
+use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use groundstation_shared::TelemetryRow;
 
 use super::HISTORY_MS;
 
+const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
+
+#[cfg(target_arch = "wasm32")]
+fn localstorage_get(key: &str) -> Option<String> {
+    use web_sys::window;
+    let w = window()?;
+    let ls = w.local_storage().ok()??;
+    ls.get_item(key).ok().flatten()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn localstorage_set(key: &str, value: &str) {
+    use web_sys::window;
+    if let Some(w) = window() {
+        if let Ok(Some(ls)) = w.local_storage() {
+            let _ = ls.set_item(key, value);
+        }
+    }
+}
+
 #[component]
 pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> Element {
+    // -------- Restore + persist active tab --------
+    let did_restore = use_signal(|| false);
+    let last_saved = use_signal(|| String::new());
+
+    // Restore ONCE
+    use_effect({
+        let rows = rows;
+        let mut active_tab = active_tab;
+        let mut did_restore = did_restore;
+
+        move || {
+            if *did_restore.read() {
+                return;
+            }
+            did_restore.set(true);
+
+            // 1) Try localStorage
+            #[cfg(target_arch = "wasm32")]
+            if let Some(saved) = localstorage_get(_ACTIVE_TAB_STORAGE_KEY) {
+                if !saved.is_empty() {
+                    active_tab.set(saved);
+                    return;
+                }
+            }
+
+            // 2) Fallback: if empty, pick first observed datatype
+            if active_tab.read().is_empty() {
+                let mut types: Vec<String> = rows.read().iter().map(|r| r.data_type.clone()).collect();
+                types.sort();
+                types.dedup();
+                if let Some(first) = types.first() {
+                    active_tab.set(first.clone());
+                }
+            }
+        }
+    });
+
+    // Persist whenever it changes (and avoid rewriting same value)
+    use_effect({
+        let active_tab = active_tab;
+        let mut last_saved = last_saved;
+
+        move || {
+            let cur = active_tab.read().clone();
+            if cur.is_empty() {
+                return;
+            }
+            if cur == *last_saved.read() {
+                return;
+            }
+            last_saved.set(cur.clone());
+
+            #[cfg(target_arch = "wasm32")]
+            localstorage_set(_ACTIVE_TAB_STORAGE_KEY, &cur);
+        }
+    });
+
     // Collect unique data types (for buttons)
     let mut types: Vec<String> = rows.read().iter().map(|r| r.data_type.clone()).collect();
     types.sort();
@@ -32,9 +109,6 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
 
     // Labels for cards
     let labels = labels_for_datatype(&current);
-
-    // Table rows (newest first)
-    let table_rows: Vec<TelemetryRow> = tab_rows.iter().rev().take(300).cloned().collect();
 
     rsx! {
         div { style: "padding:16px; height:100%; display:flex; flex-direction:column; gap:12px;",
@@ -67,7 +141,6 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         div { style: "color:#94a3b8; align-self:center;", "Waiting for telemetry…" }
                     },
                     Some(row) => {
-                        // NOTE: these `let`s are outside rsx loop bodies, so they're fine
                         let vals = [row.v0, row.v1, row.v2, row.v3, row.v4, row.v5, row.v6, row.v7];
 
                         rsx! {

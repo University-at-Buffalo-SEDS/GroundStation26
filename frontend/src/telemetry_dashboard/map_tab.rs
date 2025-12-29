@@ -171,15 +171,13 @@ pub fn MapTab(
     let effective_user = move || -> Option<(f64, f64)> {
         browser_user_gps
             .read()
-            .clone()
-            .or_else(|| user_gps.read().clone())
+            .or_else(|| *user_gps.read())
     };
 
     // --- 4) Update markers whenever rocket/user changes ---
     {
-        let rocket_gps = rocket_gps.clone();
         use_effect(move || {
-            let r = rocket_gps.read().clone();
+            let r = *rocket_gps.read();
             let u = effective_user();
 
             let (r_lat, r_lon) = r.unwrap_or((f64::NAN, f64::NAN));

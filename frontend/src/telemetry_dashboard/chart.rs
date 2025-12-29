@@ -15,7 +15,7 @@ use dioxus::prelude::*;
 
 /// Monotonic-enough “now” for feedback timing.
 /// In wasm this is wall-clock-ish, but fine for relative ms thresholds.
-fn now_ms() -> f64 {
+fn _now_ms() -> f64 {
     js_sys::Date::now()
 }
 
@@ -51,20 +51,18 @@ pub fn LineChart(points: Vec<(i64, f64)>, height: i32, title: String) -> Element
     let h = height.max(120) as f64;
 
     // ---- Begin timed build section ----
-    let t0 = now_ms();
+    let t0 = _now_ms();
 
     // 1) Sort by time and (optionally) window it
     let mut pts = points;
     pts.sort_by_key(|(t, _)| *t);
 
-    if let Some(win) = WINDOW_MS {
-        if let Some(&(newest, _)) = pts.last() {
-            let start = newest.saturating_sub(win);
-            let first_in = pts.partition_point(|(t, _)| *t < start);
-            if first_in > 0 {
-                pts.drain(0..first_in);
-            }
-        }
+    if let Some(win) = WINDOW_MS
+        && let Some(&(newest, _)) = pts.last()
+    {
+        let start = newest.saturating_sub(win);
+        let first_in = pts.partition_point(|(t, _)| *t < start);
+        pts.drain(0..first_in);
     }
 
     if pts.len() < 2 {
@@ -77,20 +75,21 @@ pub fn LineChart(points: Vec<(i64, f64)>, height: i32, title: String) -> Element
     }
 
     // 2) Baseline bucket count depends on timestamps + span + width
-    let baseline = choose_bucket_count(&pts, width)
-        .clamp(MIN_BUCKETS, MAX_BUCKETS);
+    let baseline = _choose_bucket_count(&pts, width).clamp(MIN_BUCKETS, MAX_BUCKETS);
 
     // 3) Combine baseline with machine-speed buckets
     let cur_adaptive = *adaptive_buckets.read();
     let use_buckets = baseline.min(cur_adaptive).clamp(MIN_BUCKETS, MAX_BUCKETS);
 
     // 4) Timestamp-based bucketing
-    let pts_ds = bucket_by_time(&pts, use_buckets);
+    let pts_ds = _bucket_by_time(&pts, use_buckets);
 
     // 5) Compute ranges on downsampled points
-    let (t_min, t_max) = pts_ds.iter().fold((i64::MAX, i64::MIN), |(mn, mx), (t, _)| {
-        (mn.min(*t), mx.max(*t))
-    });
+    let (t_min, t_max) = pts_ds
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(mn, mx), (t, _)| {
+            (mn.min(*t), mx.max(*t))
+        });
     let (y_min, y_max) = pts_ds
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), (_, y)| {
@@ -131,7 +130,7 @@ pub fn LineChart(points: Vec<(i64, f64)>, height: i32, title: String) -> Element
     }
 
     // ---- End timed build section ----
-    let dt = now_ms() - t0;
+    let dt = _now_ms() - t0;
 
     // 7) Feedback loop: adjust adaptive buckets for next render
     let next = if dt > TARGET_SLOW_MS {
@@ -190,7 +189,7 @@ pub fn LineChart(points: Vec<(i64, f64)>, height: i32, title: String) -> Element
 /// Baseline bucket count based on time span + inferred sample rate + width.
 /// This makes “powerful system shows more points” possible when combined
 /// with the feedback loop (adaptive_buckets).
-fn choose_bucket_count(points: &[(i64, f64)], width_px: f64) -> usize {
+fn _choose_bucket_count(points: &[(i64, f64)], width_px: f64) -> usize {
     if points.len() < 2 {
         return 200;
     }
@@ -221,7 +220,7 @@ fn choose_bucket_count(points: &[(i64, f64)], width_px: f64) -> usize {
 
 /// Timestamp-based time bucketing over [t_min, t_max].
 /// Each bucket yields (avg_t, avg_y). Ensures newest point is included.
-fn bucket_by_time(points: &[(i64, f64)], bucket_count: usize) -> Vec<(i64, f64)> {
+fn _bucket_by_time(points: &[(i64, f64)], bucket_count: usize) -> Vec<(i64, f64)> {
     if points.len() <= 2 || bucket_count < 2 {
         return points.to_vec();
     }
@@ -245,8 +244,8 @@ fn bucket_by_time(points: &[(i64, f64)], bucket_count: usize) -> Vec<(i64, f64)>
             continue;
         }
         let rel = (t - t_min) as i128;
-        let bi = ((rel * bucket_count as i128) / span as i128)
-            .clamp(0, bucket_count as i128 - 1) as usize;
+        let bi = ((rel * bucket_count as i128) / span as i128).clamp(0, bucket_count as i128 - 1)
+            as usize;
 
         let b = &mut buckets[bi];
         b.t_sum += t as i128;
@@ -268,11 +267,10 @@ fn bucket_by_time(points: &[(i64, f64)], bucket_count: usize) -> Vec<(i64, f64)>
     out.sort_by_key(|(t, _)| *t);
 
     // Ensure newest point is present (helps “near now” feel)
-    if let Some(&(t_last, y_last)) = points.last() {
-        if out.last().map(|p| p.0) != Some(t_last) {
-            out.push((t_last, y_last));
-        }
+    if let Some(&(t_last, y_last)) = points.last()
+        && out.last().map(|p| p.0) != Some(t_last)
+    {
+        out.push((t_last, y_last));
     }
-
     out
 }

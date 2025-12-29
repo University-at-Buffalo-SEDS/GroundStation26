@@ -41,6 +41,27 @@ pub struct AlertMsg {
     pub message: String,
 }
 
+// --------------------------
+// DB alert DTO (/api/alerts)
+// --------------------------
+#[derive(Deserialize, Debug, Clone)]
+struct AlertDto {
+    pub timestamp_ms: i64,
+    pub severity: String, // "warning" | "error"
+    pub message: String,
+}
+
+// --------------------------
+// GPS DTO (/api/gps)
+// --------------------------
+#[derive(Deserialize, Debug, Clone)]
+struct GpsResponse {
+    pub rocket_lat: f64,
+    pub rocket_lon: f64,
+    pub user_lat: f64,
+    pub user_lon: f64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MainTab {
     State,
@@ -224,22 +245,16 @@ pub fn TelemetryDashboard() -> Element {
     // gps extracted from telemetry rows
     let rocket_gps = use_signal(|| None::<(f64, f64)>);
     let user_gps = use_signal(|| None::<(f64, f64)>);
+
+    // Start GPS updates only once JS is ready (your existing logic)
     use_effect({
         move || {
-            // Everything inside the effect must be sync, so spawn.
             spawn(async move {
-                // Wait up to ~5s for your JS bundle to be present.
-                // (Tune count/delay as you like.)
                 for _ in 0..100 {
-                    // Compute readiness in JS and store it in a window temp.
-
                     if js_is_ground_map_ready() {
-                        // JS is loaded; safe to start any JS-driven GPS bridging.
                         gps::start_gps_updates(user_gps);
                         return;
                     }
-
-                    // Yield so scripts can load / event loop can run
                     #[cfg(target_arch = "wasm32")]
                     gloo_timers::future::TimeoutFuture::new(50).await;
 
@@ -314,6 +329,44 @@ pub fn TelemetryDashboard() -> Element {
     }
 
     // ----------------------------------------
+    // NEW: Seed telemetry + alerts + gps from DB (HTTP) on mount
+    // ----------------------------------------
+    {
+        let mut did_seed = use_signal(|| false);
+
+        let mut rows_s = rows;
+        let mut warnings_s = warnings;
+        let mut errors_s = errors;
+        let mut rocket_gps_s = rocket_gps;
+        let mut user_gps_s = user_gps;
+        let mut ack_warning_ts_s = ack_warning_ts;
+        let mut ack_error_ts_s = ack_error_ts;
+
+        use_effect(move || {
+            if *did_seed.read() {
+                return;
+            }
+            did_seed.set(true);
+
+            spawn(async move {
+                if let Err(e) = seed_from_db(
+                    &mut rows_s,
+                    &mut warnings_s,
+                    &mut errors_s,
+                    &mut rocket_gps_s,
+                    &mut user_gps_s,
+                    &mut ack_warning_ts_s,
+                    &mut ack_error_ts_s,
+                )
+                .await
+                {
+                    log!("seed_from_db failed: {e}");
+                }
+            });
+        });
+    }
+
+    // ----------------------------------------
     // Flash loop (both web + native)
     // ----------------------------------------
     {
@@ -321,15 +374,12 @@ pub fn TelemetryDashboard() -> Element {
         use_effect(move || {
             spawn(async move {
                 loop {
-                    // dioxus::prelude::sleep is available in modern dioxus; if you don't have it,
-                    // replace with tokio::time::sleep on native and gloo_timers on wasm.
                     #[cfg(target_arch = "wasm32")]
-                    use gloo_timers::future::TimeoutFuture;
+                    gloo_timers::future::TimeoutFuture::new(500).await;
 
-                    #[cfg(target_arch = "wasm32")]
-                    TimeoutFuture::new(500).await;
                     #[cfg(not(target_arch = "wasm32"))]
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
                     let next = !*flash_on.read();
                     flash_on.set(next);
                 }
@@ -435,11 +485,10 @@ pub fn TelemetryDashboard() -> Element {
             // Header row: title (left) + centered nav card
             div { style: "display:flex; align-items:center; width:100%; margin-bottom:12px;",
                 div { style: "flex:0; min-width:200px; display:flex; align-items:center; gap:10px;",
-                h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "Rocket Dashboard" }
+                    h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "Rocket Dashboard" }
 
-                // Always-available ABORT
-                button {
-                    style: "
+                    button {
+                        style: "
                             padding:0.45rem 0.85rem;
                             border-radius:0.75rem;
                             border:1px solid #ef4444;
@@ -448,12 +497,11 @@ pub fn TelemetryDashboard() -> Element {
                             font-weight:900;
                             cursor:pointer;
                         ",
-                    onclick: move |_| send_cmd("Abort"),
-                    "ABORT"
+                        onclick: move |_| send_cmd("Abort"),
+                        "ABORT"
+                    }
                 }
-            }
 
-                // centered nav card
                 div { style: "flex:1; display:flex; justify-content:center;",
                     div { style: "
                         display:flex; align-items:center; gap:0.5rem;
@@ -463,7 +511,6 @@ pub fn TelemetryDashboard() -> Element {
                         min-width:12rem;
                     ",
                         nav { style: "display:flex; gap:0.5rem; flex-wrap:wrap;",
-
                             button {
                                 style: if *active_main_tab.read() == MainTab::State { tab_style_active("#38bdf8") } else { tab_style_inactive.to_string() },
                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::State) },
@@ -474,21 +521,13 @@ pub fn TelemetryDashboard() -> Element {
                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Map) },
                                 "Map"
                             }
-
                             button {
                                 style: if *active_main_tab.read() == MainTab::Actions { tab_style_active("#a78bfa") } else { tab_style_inactive.to_string() },
                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Actions) },
                                 "Actions"
                             }
-
                             button {
-                                style: if *active_main_tab.read() == MainTab::Warnings {
-                                    // yellow when active
-                                    tab_style_active("#facc15")
-                                } else {
-                                    // inactive, but we still show icon if warnings exist
-                                    tab_style_inactive.to_string()
-                                },
+                                style: if *active_main_tab.read() == MainTab::Warnings { tab_style_active("#facc15") } else { tab_style_inactive.to_string() },
                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Warnings) },
                                 span { "Warnings" }
                                 if has_warnings {
@@ -506,13 +545,8 @@ pub fn TelemetryDashboard() -> Element {
                                     }
                                 }
                             }
-
                             button {
-                                style: if *active_main_tab.read() == MainTab::Errors {
-                                    tab_style_active("#ef4444")
-                                } else {
-                                    tab_style_inactive.to_string()
-                                },
+                                style: if *active_main_tab.read() == MainTab::Errors { tab_style_active("#ef4444") } else { tab_style_inactive.to_string() },
                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Errors) },
                                 span { "Errors" }
                                 if has_errors {
@@ -530,7 +564,6 @@ pub fn TelemetryDashboard() -> Element {
                                     }
                                 }
                             }
-
                             button {
                                 style: if *active_main_tab.read() == MainTab::Data { tab_style_active("#f97316") } else { tab_style_inactive.to_string() },
                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Data) },
@@ -540,7 +573,6 @@ pub fn TelemetryDashboard() -> Element {
                     }
                 }
 
-                // right spacer (keeps nav centered)
                 div { style: "flex:0; min-width:200px;" }
             }
 
@@ -574,7 +606,6 @@ pub fn TelemetryDashboard() -> Element {
                             ")"
                         }
 
-                        // Ack buttons only when you're on that tab (old behavior)
                         if *active_main_tab.read() == MainTab::Warnings && has_warnings {
                             button {
                                 style: "
@@ -631,26 +662,13 @@ pub fn TelemetryDashboard() -> Element {
             // Main body
             div { style: "flex:1; min-height:0;",
                 match *active_main_tab.read() {
-                    MainTab::State => rsx! {
-                        StateTab { flight_state: flight_state }
-                    },
-                    MainTab::Map => rsx! {
-                        MapTab { rocket_gps: rocket_gps, user_gps: user_gps }
-                    },
-                    MainTab::Actions => rsx! {
-                        ActionsTab {}
-                    },
-                    MainTab::Warnings => rsx! {
-                        WarningsTab { warnings: warnings }
-                    },
-                    MainTab::Errors => rsx! {
-                        ErrorsTab { errors: errors }
-                    },
+                    MainTab::State => rsx! { StateTab { flight_state: flight_state } },
+                    MainTab::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
+                    MainTab::Actions => rsx! { ActionsTab {} },
+                    MainTab::Warnings => rsx! { WarningsTab { warnings: warnings } },
+                    MainTab::Errors => rsx! { ErrorsTab { errors: errors } },
                     MainTab::Data => rsx! {
-                        DataTab {
-                            rows: rows,
-                            active_tab: active_data_tab
-                        }
+                        DataTab { rows: rows, active_tab: active_data_tab }
                     },
                 }
             }
@@ -715,6 +733,102 @@ async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, St
         .json::<T>()
         .await
         .map_err(|e| e.to_string())
+}
+
+// ------------------------------
+// NEW: seed telemetry/alerts/gps
+// ------------------------------
+async fn seed_from_db(
+    rows: &mut Signal<Vec<TelemetryRow>>,
+    warnings: &mut Signal<Vec<AlertMsg>>,
+    errors: &mut Signal<Vec<AlertMsg>>,
+    rocket_gps: &mut Signal<Option<(f64, f64)>>,
+    user_gps: &mut Signal<Option<(f64, f64)>>,
+    ack_warning_ts: &mut Signal<i64>,
+    ack_error_ts: &mut Signal<i64>,
+) -> Result<(), String> {
+    // ---- Telemetry history (/api/recent) ----
+    if let Ok(mut list) = http_get_json::<Vec<TelemetryRow>>("/api/recent").await {
+        list.sort_by_key(|r| r.timestamp_ms);
+
+        if let Some(last) = list.last() {
+            let cutoff = last.timestamp_ms - HISTORY_MS;
+            let start = list.partition_point(|r| r.timestamp_ms < cutoff);
+            if start > 0 {
+                list.drain(0..start);
+            }
+        }
+
+        // downsample for plotting safety
+        const MAX_INIT_POINTS: usize = 5000;
+        let n = list.len();
+        if n > MAX_INIT_POINTS {
+            let stride = (n as f32 / MAX_INIT_POINTS as f32).ceil() as usize;
+            list = list
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, row)| (i % stride == 0).then_some(row))
+                .collect();
+        }
+
+        // seed rocket gps from most recent GPS row in history
+        if let Some(gps) = list.iter().rev().find_map(row_to_gps) {
+            rocket_gps.set(Some(gps));
+        }
+
+        rows.set(list);
+    }
+
+    // ---- Alerts history (/api/alerts) ----
+    if let Ok(mut alerts) = http_get_json::<Vec<AlertDto>>("/api/alerts?minutes=20").await {
+        // backend-reset detection (timestamps rewind)
+        let max_ts = alerts.iter().map(|a| a.timestamp_ms).max().unwrap_or(0);
+        let prev_ack = (*ack_warning_ts.read()).max(*ack_error_ts.read());
+        if prev_ack > 0 && max_ts > 0 && max_ts < prev_ack - HISTORY_MS {
+            ack_warning_ts.set(0);
+            ack_error_ts.set(0);
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some(window) = web_sys::window()
+                    && let Ok(Some(storage)) = window.local_storage()
+                {
+                    let _ = storage.remove_item(_WARNING_ACK_STORAGE_KEY);
+                    let _ = storage.remove_item(_ERROR_ACK_STORAGE_KEY);
+                }
+            }
+        }
+
+        // newest first
+        alerts.sort_by_key(|a| -a.timestamp_ms);
+
+        let mut w = Vec::<AlertMsg>::new();
+        let mut e = Vec::<AlertMsg>::new();
+        for a in alerts {
+            match a.severity.as_str() {
+                "warning" => w.push(AlertMsg {
+                    timestamp_ms: a.timestamp_ms,
+                    message: a.message,
+                }),
+                "error" => e.push(AlertMsg {
+                    timestamp_ms: a.timestamp_ms,
+                    message: a.message,
+                }),
+                _ => {}
+            }
+        }
+
+        warnings.set(w);
+        errors.set(e);
+    }
+
+    // ---- Optional GPS seed (/api/gps) ----
+    if let Ok(gps) = http_get_json::<GpsResponse>("/api/gps").await {
+        rocket_gps.set(Some((gps.rocket_lat, gps.rocket_lon)));
+        user_gps.set(Some((gps.user_lat, gps.user_lon)));
+    }
+
+    Ok(())
 }
 
 // ---------- WebSocket loop ----------
@@ -881,7 +995,9 @@ fn handle_ws_message(
     }
 }
 
-
+// --------------------------------------------------------------------------------------------
+// JS helpers (unchanged from your current file)
+// --------------------------------------------------------------------------------------------
 fn js_read_window_string(key: &str) -> Option<String> {
     js_eval(&format!(
         r#"
@@ -900,10 +1016,6 @@ fn js_read_window_string(key: &str) -> Option<String> {
     js_get_tmp_str()
 }
 
-/* ================================================================================================
- * Cross-platform "eval JS"
- * ============================================================================================== */
-
 #[cfg(target_arch = "wasm32")]
 fn js_eval(js: &str) {
     let _ = js_sys::eval(js);
@@ -911,12 +1023,6 @@ fn js_eval(js: &str) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn js_eval(js: &str) {
-    // Works on desktop + iOS because you’re running via dioxus-desktop (tao/wry webview).
-    // If your renderer changes, this is the one function you’ll adjust.
-    // use dioxus_desktop::use_window;
-
-    // NOTE: hooks can't be called here; but use_window() is a hook.
-    // So: we avoid calling it here directly.
     dioxus::document::eval(js);
 }
 
@@ -929,15 +1035,6 @@ fn js_get_tmp_str() -> Option<String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn js_get_tmp_str() -> Option<String> {
-    // On native we can still read window.__gs26_tmp_str by asking JS to copy it to a known place
-    // and then returning it isn't directly possible without a return channel.
-    //
-    // The simplest: avoid relying on return values for native by using only window vars.
-    //
-    // For cached user lat/lon we already set window.__gs26_user_lat/lon from localStorage in JS,
-    // so native can skip parsing JSON here.
-    //
-    // Therefore, for native we just return None, and the caller will fall back to window vars.
     None
 }
 
@@ -951,7 +1048,6 @@ fn js_is_ground_map_ready() -> bool {
               (typeof window.updateGroundMapMarkers === "function") &&
               (typeof window.initGroundMap === "function");
 
-            // IMPORTANT: store STRING so js_read_window_string can read it
             window.__gs26_tmp_ready = ok ? "true" : "false";
           } catch (e) {
             window.__gs26_tmp_ready = "false";
