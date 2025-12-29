@@ -1,0 +1,5 @@
+<key>NSLocalNetworkUsageDescription</key>
+<string>This app connects to devices on your local network to get data from the ground station.</string>
+
+<key>NSLocationWhenInUseUsageDescription</key>
+<string>This app requires location access to help you locate your rocket.</string>

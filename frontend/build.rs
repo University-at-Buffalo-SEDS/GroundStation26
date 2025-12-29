@@ -11,7 +11,7 @@ fn main() {
 
     // Path to frontend/dist/vendor/leaflet relative to this crate
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let leaflet_dir = manifest_dir.join("dist").join("vendor").join("leaflet");
+    let leaflet_dir = manifest_dir.join("web").join("vendor").join("leaflet");
 
     if let Err(e) = fs::create_dir_all(&leaflet_dir) {
         eprintln!("Failed to create Leaflet vendor dir {leaflet_dir:?}: {e}");

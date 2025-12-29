@@ -6,36 +6,75 @@ description.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
-[lib]
-crate-type = ["cdylib"]
 
 [dependencies]
-leptos = { version = "0.8.12", default-features = false, features = ["csr"] }
-groundstation_shared = { path = "../shared" }
-serde_json.workspace = true
-wasm-bindgen = "0.2"
-gloo-net = { version = "0.6.0", features = ["http"] }
+# Dioxus core + router
+dioxus = { version = "0.7", default-features = false }
+dioxus-router = "0.7"
 
-# for WebSocket + DOM
+groundstation_shared = { path = "../shared" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cross-platform time helpers
+web-sys = "0.3.83"
+gloo-net = "0.6.0"
+wasm-bindgen = "0.2.106"
+js-sys = "0.3.83"
+console_error_panic_hook = "0.1.7"
+gloo-timers = "0.3.0"
+dioxus-sdk = { version = "0.7.0", features = ["geolocation"] }
+
+# ---------- Web (wasm32) ----------
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+dioxus = { version = "0.7", features = ["web", "macro"] }
+dioxus-signals = "0.7.2"
+
+gloo-net = { version = "0.6", features = ["http"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+wasm-bindgen = "0.2"
+
+wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "Window",
+    "Location",
     "WebSocket",
     "MessageEvent",
-    "Performance",
     "Storage",
+    "console",
     "Navigator",
     "Geolocation",
     "Position",
     "PositionError",
     "Coordinates",
-    "Permissions",        # Optional (for permission queries)
-    "PermissionStatus",   # Optional",
-    "console",
+    "Permissions", # Optional (for permission queries)
+    "PermissionStatus", # Optional",
 ] }
-gloo-timers = { version = "0.3.0", features = ["futures"] }
-serde = "1.0.228"
-wasm-bindgen-futures = "0.4.56"
-js-sys = "0.3.83"
+
+# ---------- Native (desktop/mobile) ----------
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dioxus = { version = "0.7", features = ["desktop", "macro"] }
+# For mobile builds we still compile the same code; `dx` selects the right platform features.
+# If you want to be explicit, you can swap to features=["mobile"] in a mobile-only profile.
+dioxus-signals = "0.7.2"
+dioxus-desktop = "0.7.0"
+tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = true, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+url = "2.5"
+
+
+
+[features]
+# Dioxus CLI uses these conventions. :contentReference[oaicite:3]{index=3}
+default = ["web"]
+web = ["dioxus/web"]
+desktop = ["dioxus/desktop"]
+mobile = ["dioxus/mobile"]
+
 
 [build-dependencies]
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }

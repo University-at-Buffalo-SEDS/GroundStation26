@@ -75,6 +75,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/groundstation_backend /app/
 COPY --from=builder /app/target/release/map_downloader /app/map_downloader/
 COPY --from=builder /app/frontend/dist /app/frontend/dist/
+COPY --from=builder /app/frontend/web /app/frontend/web
 COPY --from=builder /app/entrypoint.sh /app/
 
 EXPOSE 3000

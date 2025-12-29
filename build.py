@@ -86,15 +86,26 @@ def build_docker(repo_root: Path, pi_build: bool) -> None:
 
 def build_frontend(frontend_dir: Path) -> None:
     try:
+        # run(
+        #     [
+        #         "wasm-pack",
+        #         "build",
+        #         "--target",
+        #         "web",
+        #         "--release",
+        #         "--out-dir",
+        #         "dist/pkg",
+        #     ],
+        #     cwd=frontend_dir,
+        # )
+
+
         run(
-            [
-                "wasm-pack",
-                "build",
-                "--target",
-                "web",
-                "--release",
-                "--out-dir",
-                "dist/pkg",
+        [
+            "dx",
+            "bundle",
+            "--web",
+            "--release",
             ],
             cwd=frontend_dir,
         )

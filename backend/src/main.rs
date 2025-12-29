@@ -41,8 +41,8 @@ fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
 }
 const GPIO_IGNITION_PIN: u8 = 5;
 const GPIO_ABORT_PIN: u8 = 9;
-const ROCKET_RADIO_ID: LinkId = unsafe{LinkId::new_unchecked(3)};
-const UMBILICAL_RADIO_ID: LinkId = unsafe{LinkId::new_unchecked(4)};
+const ROCKET_RADIO_ID: LinkId = unsafe { LinkId::new_unchecked(3) };
+const UMBILICAL_RADIO_ID: LinkId = unsafe { LinkId::new_unchecked(4) };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -176,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
                 {
                     Arc::new(Mutex::new(Box::new(DummyRadio::new(
                         "Rocket Radio",
-                         ROCKET_RADIO_ID,
+                        ROCKET_RADIO_ID,
                     ))))
                 }
                 #[cfg(not(feature = "testing"))]
@@ -196,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
                 {
                     Arc::new(Mutex::new(Box::new(DummyRadio::new(
                         "Umbilical Radio",
-                         UMBILICAL_RADIO_ID,
+                        UMBILICAL_RADIO_ID,
                     ))))
                 }
                 #[cfg(not(feature = "testing"))]

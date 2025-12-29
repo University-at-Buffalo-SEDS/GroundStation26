@@ -24,7 +24,8 @@ static FAVICON_DATA: OnceCell<Bytes> = OnceCell::const_new();
 
 /// Public router constructor
 pub fn router(state: Arc<AppState>) -> Router {
-    let static_dir = ServeDir::new("./frontend/dist");
+    let static_dir = ServeDir::new("./frontend/dist/public");
+    let vendor_dir = ServeDir::new("./frontend/web/vendor/leaflet");
     let tiles_dir = tile_service(DEFAULT_MAP_REGION); // NEW
 
     Router::new()
@@ -37,6 +38,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/gps", get(get_gps))
         .route("/ws", get(ws_handler))
         .nest_service("/tiles", tiles_dir)
+        .nest_service("/vendor/leaflet", vendor_dir)
+        .route("/ground_map.js", get(|| async {
+            // Serve the ground_map.js file
+            let path: PathBuf = "./frontend/web/ground_map.js".into();
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => ([(header::CONTENT_TYPE, "application/javascript")], content).into_response(),
+                Err(_) => (axum::http::StatusCode::NOT_FOUND, "Not Found").into_response(),
+            }
+        }))
+        .route("/favicon.ico", get(get_favicon))
+        
 
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
@@ -170,7 +182,7 @@ async fn get_favicon() -> impl IntoResponse {
     let bytes = FAVICON_DATA
         .get_or_init(|| async {
             // Adjust this path if needed
-            let path: PathBuf = "./frontend/dist/favicon.png".into();
+            let path: PathBuf = "./frontend/web/favicon.png".into();
             let data = tokio::fs::read(&path)
                 .await
                 .unwrap_or_else(|e| panic!("failed to read favicon at {:?}: {e}", path));
