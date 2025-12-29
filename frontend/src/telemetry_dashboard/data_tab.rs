@@ -54,7 +54,8 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
 
             // 2) Fallback: if empty, pick first observed datatype
             if active_tab.read().is_empty() {
-                let mut types: Vec<String> = rows.read().iter().map(|r| r.data_type.clone()).collect();
+                let mut types: Vec<String> =
+                    rows.read().iter().map(|r| r.data_type.clone()).collect();
                 types.sort();
                 types.dedup();
                 if let Some(first) = types.first() {
@@ -64,17 +65,14 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
         }
     });
 
-    // Persist whenever it changes (and avoid rewriting same value)
+    // Persist whenever it changes (avoid rewriting same value)
     use_effect({
         let active_tab = active_tab;
         let mut last_saved = last_saved;
 
         move || {
             let cur = active_tab.read().clone();
-            if cur.is_empty() {
-                return;
-            }
-            if cur == *last_saved.read() {
+            if cur.is_empty() || cur == *last_saved.read() {
                 return;
             }
             last_saved.set(cur.clone());
@@ -113,11 +111,11 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     rsx! {
         div { style: "padding:16px; height:100%; display:flex; flex-direction:column; gap:12px;",
 
-            // -------- Top row: tabs + summary cards --------
-            div { style: "display:flex; flex-wrap:wrap; gap:12px; align-items:flex-start;",
+            // -------- Top area: Tabs row THEN cards row (always below) --------
+            div { style: "display:flex; flex-direction:column; gap:10px;",
 
-                // type selector
-                div { style: "display:flex; gap:8px; flex-wrap:wrap;",
+                // Tabs row
+                div { style: "display:flex; gap:8px; flex-wrap:wrap; align-items:center;",
                     for t in types.iter().take(32) {
                         button {
                             style: if *t == current {
@@ -135,16 +133,16 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                     }
                 }
 
-                // summary cards or placeholder
+                // Cards row (ALWAYS below tabs)
                 match latest_row {
                     None => rsx! {
-                        div { style: "color:#94a3b8; align-self:center;", "Waiting for telemetry…" }
+                        div { style: "color:#94a3b8; padding:2px 2px;", "Waiting for telemetry…" }
                     },
                     Some(row) => {
                         let vals = [row.v0, row.v1, row.v2, row.v3, row.v4, row.v5, row.v6, row.v7];
 
                         rsx! {
-                            div { style: "display:flex; gap:10px; flex-wrap:wrap;",
+                            div { style: "display:flex; gap:10px; flex-wrap:wrap; align-items:flex-start;",
                                 for i in 0..8usize {
                                     if !labels[i].is_empty() && vals[i].is_some() {
                                         SummaryCard {
@@ -172,23 +170,13 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         line { x1:"60", y1:"340", x2:"1180", y2:"340", stroke:"#334155", stroke_width:"1" }
 
                         // y labels
-                        text { x:"10", y:"26", fill:"#94a3b8", "font-size":"10",
-                            {format!("{:.2}", y_max)}
-                        }
-                        text { x:"10", y:"184", fill:"#94a3b8", "font-size":"10",
-                            {format!("{:.2}", y_mid)}
-                        }
-                        text { x:"10", y:"344", fill:"#94a3b8", "font-size":"10",
-                            {format!("{:.2}", y_min)}
-                        }
+                        text { x:"10", y:"26", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
+                        text { x:"10", y:"184", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
+                        text { x:"10", y:"344", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
 
                         // x labels (span in minutes)
-                        text { x:"70",   y:"355", fill:"#94a3b8", "font-size":"10",
-                            {format!("-{:.1} min", span_min)}
-                        }
-                        text { x:"600",  y:"355", fill:"#94a3b8", "font-size":"10",
-                            {format!("-{:.1} min", span_min * 0.5)}
-                        }
+                        text { x:"70",   y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
+                        text { x:"600",  y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
                         text { x:"1120", y:"355", fill:"#94a3b8", "font-size":"10", "now" }
 
                         // series
