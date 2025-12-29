@@ -1,7 +1,9 @@
 // frontend/src/telemetry_dashboard/data_tab.rs
 use dioxus::prelude::*;
-use dioxus_signals::{ReadableExt, Signal, WritableExt};
+use dioxus_signals::{ReadableExt, Signal};
 use groundstation_shared::TelemetryRow;
+
+use super::HISTORY_MS;
 
 #[component]
 pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> Element {
@@ -9,67 +11,124 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     let mut types: Vec<String> = rows.read().iter().map(|r| r.data_type.clone()).collect();
     types.sort();
     types.dedup();
-    //
 
     let current = active_tab.read().clone();
 
-    let filtered: Vec<TelemetryRow> = rows
+    // Filter rows for selected datatype, chronological (oldest..newest)
+    let mut tab_rows: Vec<TelemetryRow> = rows
         .read()
         .iter()
-        .rev() // newest first
         .filter(|r| r.data_type == current)
-        .take(300)
         .cloned()
         .collect();
+    tab_rows.sort_by_key(|r| r.timestamp_ms);
+
+    // Latest row for summary cards
+    let latest_row = tab_rows.last().cloned();
+
+    // Build graph polylines (8 series) + y-range + span
+    let (paths, y_min, y_max, span_min) = build_polylines(&tab_rows, 1200.0, 360.0);
+    let y_mid = (y_min + y_max) * 0.5;
+
+    // Labels for cards
+    let labels = labels_for_datatype(&current);
+
+    // Table rows (newest first)
+    let table_rows: Vec<TelemetryRow> = tab_rows.iter().rev().take(300).cloned().collect();
 
     rsx! {
         div { style: "padding:16px; height:100%; display:flex; flex-direction:column; gap:12px;",
-            h2 { style: "margin:0;", "Data" }
 
-            // type selector
-            div { style: "display:flex; gap:8px; flex-wrap:wrap;",
-                for t in types.iter().take(24) {
-                    button {
-                        style: if *t == current {
-                            "padding:6px 10px; border-radius:999px; border:1px solid #60a5fa; background:#0b2a55; color:#dbeafe; cursor:pointer;"
-                        } else {
-                            "padding:6px 10px; border-radius:999px; border:1px solid #334155; background:#0b1220; color:#e5e7eb; cursor:pointer;"
-                        },
-                        onclick: {
-                            let t = t.clone();
-                            let mut active_tab2 = active_tab;
-                            move |_| active_tab2.set(t.clone())
-                        },
-                        "{t}"
+            // -------- Top row: tabs + summary cards --------
+            div { style: "display:flex; flex-wrap:wrap; gap:12px; align-items:flex-start;",
+
+                // type selector
+                div { style: "display:flex; gap:8px; flex-wrap:wrap;",
+                    for t in types.iter().take(32) {
+                        button {
+                            style: if *t == current {
+                                "padding:6px 10px; border-radius:999px; border:1px solid #f97316; background:#111827; color:#f97316; cursor:pointer;"
+                            } else {
+                                "padding:6px 10px; border-radius:999px; border:1px solid #334155; background:#0b1220; color:#e5e7eb; cursor:pointer;"
+                            },
+                            onclick: {
+                                let t = t.clone();
+                                let mut active_tab2 = active_tab;
+                                move |_| active_tab2.set(t.clone())
+                            },
+                            "{t}"
+                        }
+                    }
+                }
+
+                // summary cards or placeholder
+                match latest_row {
+                    None => rsx! {
+                        div { style: "color:#94a3b8; align-self:center;", "Waiting for telemetry…" }
+                    },
+                    Some(row) => {
+                        // NOTE: these `let`s are outside rsx loop bodies, so they're fine
+                        let vals = [row.v0, row.v1, row.v2, row.v3, row.v4, row.v5, row.v6, row.v7];
+
+                        rsx! {
+                            div { style: "display:flex; gap:10px; flex-wrap:wrap;",
+                                for i in 0..8usize {
+                                    if !labels[i].is_empty() && vals[i].is_some() {
+                                        SummaryCard {
+                                            label: labels[i],
+                                            value: fmt_opt(vals[i]),
+                                            color: summary_color(i),
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            // table
-            div { style: "flex:1; overflow:auto; border:1px solid #334155; border-radius:14px; background:#0b1220;",
-                table { style: "width:100%; border-collapse:collapse; font-size:12px;",
-                    thead {
-                        tr {
-                            th { style: "text-align:left; padding:10px; border-bottom:1px solid #334155; color:#94a3b8;", "ts" }
-                            th { style: "text-align:left; padding:10px; border-bottom:1px solid #334155; color:#94a3b8;", "v0" }
-                            th { style: "text-align:left; padding:10px; border-bottom:1px solid #334155; color:#94a3b8;", "v1" }
-                            th { style: "text-align:left; padding:10px; border-bottom:1px solid #334155; color:#94a3b8;", "v2" }
-                            th { style: "text-align:left; padding:10px; border-bottom:1px solid #334155; color:#94a3b8;", "v3" }
+            // -------- Big centered graph --------
+            div { style: "flex:0; display:flex; align-items:center; justify-content:center; margin-top:6px;",
+                div { style: "width:100%; max-width:1200px;",
+                    svg {
+                        style: "width:100%; height:auto; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
+                        view_box: "0 0 1200 360",
+
+                        // axes
+                        line { x1:"60", y1:"20",  x2:"60",   y2:"340", stroke:"#334155", stroke_width:"1" }
+                        line { x1:"60", y1:"340", x2:"1180", y2:"340", stroke:"#334155", stroke_width:"1" }
+
+                        // y labels
+                        text { x:"10", y:"26", fill:"#94a3b8", "font-size":"10",
+                            {format!("{:.2}", y_max)}
                         }
-                    }
-                    tbody {
-                        for r in filtered.iter() {
-                            tr {
-                                td { style: "padding:8px 10px; border-bottom:1px solid #1f2937; white-space:nowrap;", "{r.timestamp_ms}" }
-                                td { style: "padding:8px 10px; border-bottom:1px solid #1f2937;", "{fmt_opt(r.v0)}" }
-                                td { style: "padding:8px 10px; border-bottom:1px solid #1f2937;", "{fmt_opt(r.v1)}" }
-                                td { style: "padding:8px 10px; border-bottom:1px solid #1f2937;", "{fmt_opt(r.v2)}" }
-                                td { style: "padding:8px 10px; border-bottom:1px solid #1f2937;", "{fmt_opt(r.v3)}" }
-                            }
+                        text { x:"10", y:"184", fill:"#94a3b8", "font-size":"10",
+                            {format!("{:.2}", y_mid)}
                         }
-                        if filtered.is_empty() {
-                            tr {
-                                td { colspan: "5", style: "padding:14px; color:#94a3b8;", "No rows for this data type yet." }
+                        text { x:"10", y:"344", fill:"#94a3b8", "font-size":"10",
+                            {format!("{:.2}", y_min)}
+                        }
+
+                        // x labels (span in minutes)
+                        text { x:"70",   y:"355", fill:"#94a3b8", "font-size":"10",
+                            {format!("-{:.1} min", span_min)}
+                        }
+                        text { x:"600",  y:"355", fill:"#94a3b8", "font-size":"10",
+                            {format!("-{:.1} min", span_min * 0.5)}
+                        }
+                        text { x:"1120", y:"355", fill:"#94a3b8", "font-size":"10", "now" }
+
+                        // series
+                        for (i, pts) in paths.iter().enumerate() {
+                            if !pts.is_empty() {
+                                polyline {
+                                    points: "{pts}",
+                                    fill: "none",
+                                    stroke: "{series_color(i)}",
+                                    stroke_width: "2",
+                                    stroke_linejoin: "round",
+                                    stroke_linecap: "round",
+                                }
                             }
                         }
                     }
@@ -79,9 +138,193 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     }
 }
 
+fn series_color(i: usize) -> &'static str {
+    match i {
+        0 => "#f97316",
+        1 => "#22d3ee",
+        2 => "#a3e635",
+        _ => "#9ca3af",
+    }
+}
+
+fn summary_color(i: usize) -> &'static str {
+    match i {
+        0 => "#f97316",
+        1 => "#22d3ee",
+        2 => "#a3e635",
+        _ => "#9ca3af",
+    }
+}
+
+#[component]
+fn SummaryCard(label: &'static str, value: String, color: &'static str) -> Element {
+    rsx! {
+        div { style: "padding:10px; border-radius:12px; background:#0f172a; border:1px solid #334155; min-width:92px;",
+            div { style: "font-size:12px; color:{color};", "{label}" }
+            div { style: "font-size:18px; color:#e5e7eb;", "{value}" }
+        }
+    }
+}
+
 fn fmt_opt(v: Option<f32>) -> String {
     match v {
         Some(x) => format!("{x:.4}"),
         None => "-".to_string(),
     }
+}
+
+fn labels_for_datatype(dt: &str) -> [&'static str; 8] {
+    match dt {
+        "GYRO_DATA" => ["Roll", "Pitch", "Yaw", "", "", "", "", ""],
+        "ACCEL_DATA" => ["X Accel", "Y Accel", "Z Accel", "", "", "", "", ""],
+        "BAROMETER_DATA" => ["Pressure", "Temp", "Altitude", "", "", "", "", ""],
+        "BATTERY_VOLTAGE" => ["Voltage", "", "", "", "", "", "", ""],
+        "BATTERY_CURRENT" => ["Current", "", "", "", "", "", "", ""],
+        "KALMAN_FILTER_DATA" => ["X", "Y", "Z", "", "", "", "", ""],
+        "GPS_DATA" => ["Latitude", "Longitude", "", "", "", "", "", ""],
+        "FUEL_FLOW" => ["Flow Rate", "", "", "", "", "", "", ""],
+        "FUEL_TANK_PRESSURE" => ["Pressure", "", "", "", "", "", "", ""],
+        _ => ["", "", "", "", "", "", "", ""],
+    }
+}
+
+/// Build eight SVG polyline point strings (v0..v7),
+/// plus y-min, y-max, and span_minutes (0–HISTORY_MS).
+///
+/// `paths[i]` is `"x,y x,y x,y ..."`, suitable for `<polyline points=... />`.
+fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 8], f32, f32, f32) {
+    if rows.is_empty() {
+        return (std::array::from_fn(|_| String::new()), 0.0, 1.0, 0.0);
+    }
+
+    // 1) global min/max across all channels
+    let mut min_v: Option<f32> = None;
+    let mut max_v: Option<f32> = None;
+
+    for r in rows {
+        for x in [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7]
+            .into_iter()
+            .flatten()
+        {
+            min_v = Some(min_v.map(|m| m.min(x)).unwrap_or(x));
+            max_v = Some(max_v.map(|m| m.max(x)).unwrap_or(x));
+        }
+    }
+
+    let (min_v, mut max_v) = match (min_v, max_v) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return (std::array::from_fn(|_| String::new()), 0.0, 1.0, 0.0),
+    };
+
+    if (max_v - min_v).abs() < 1e-6 {
+        max_v = min_v + 1.0;
+    }
+
+    // 2) time window & span
+    let newest_ts = rows.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
+    let oldest_ts = rows.iter().map(|r| r.timestamp_ms).min().unwrap_or(newest_ts);
+
+    let raw_span_ms = (newest_ts - oldest_ts).max(1);
+    let effective_span_ms = raw_span_ms.min(HISTORY_MS);
+    let span_minutes = effective_span_ms as f32 / 60_000.0;
+
+    let window_start = newest_ts.saturating_sub(effective_span_ms);
+
+    // 3) plot geometry
+    let left = 60.0;
+    let right = width - 20.0;
+    let top = 20.0;
+    let bottom = height - 20.0;
+
+    let plot_w = right - left;
+    let plot_h = bottom - top;
+
+    let map_y = |v: f32| bottom - ((v - min_v) / (max_v - min_v)) * plot_h;
+
+    // 4) rows in window
+    let mut window_rows: Vec<&TelemetryRow> = rows
+        .iter()
+        .filter(|r| r.timestamp_ms >= window_start)
+        .collect();
+    if window_rows.is_empty() {
+        return (std::array::from_fn(|_| String::new()), min_v, max_v, span_minutes);
+    }
+    window_rows.sort_by_key(|r| r.timestamp_ms);
+
+    // 5) downsample into <= max_points buckets by index
+    let n = window_rows.len();
+    let max_points: usize = 2000;
+
+    #[derive(Clone, Default)]
+    struct Point {
+        vals: [Option<f32>; 8],
+    }
+
+    let mut points: Vec<Point> = Vec::new();
+
+    if n <= max_points {
+        points.reserve(n);
+        for r in &window_rows {
+            points.push(Point {
+                vals: [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7],
+            });
+        }
+    } else {
+        #[derive(Default, Clone)]
+        struct BucketAcc {
+            v_sum: [f64; 8],
+            v_count: [u64; 8],
+        }
+
+        let mut buckets = vec![BucketAcc::default(); max_points];
+
+        for (i, r) in window_rows.iter().enumerate() {
+            let bi = i * max_points / n;
+            let b = &mut buckets[bi];
+
+            let vals = [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7];
+            for (j, opt) in vals.iter().enumerate() {
+                if let Some(x) = opt {
+                    b.v_sum[j] += *x as f64;
+                    b.v_count[j] += 1;
+                }
+            }
+        }
+
+        for b in &buckets {
+            let mut vals: [Option<f32>; 8] = [None; 8];
+            for j in 0..8 {
+                if b.v_count[j] > 0 {
+                    vals[j] = Some((b.v_sum[j] / b.v_count[j] as f64) as f32);
+                }
+            }
+            points.push(Point { vals });
+        }
+    }
+
+    // 6) build polyline strings with even x-spacing
+    let len = points.len().max(1);
+    let mut out: [String; 8] = std::array::from_fn(|_| String::new());
+
+    for (idx, p) in points.into_iter().enumerate() {
+        let t = if len > 1 {
+            idx as f32 / (len as f32 - 1.0)
+        } else {
+            0.0
+        };
+        let x = left + plot_w * t;
+
+        for ch in 0..8usize {
+            if let Some(v) = p.vals[ch] {
+                let y = map_y(v);
+                let s = &mut out[ch];
+                if !s.is_empty() {
+                    s.push(' ');
+                }
+                s.push_str(&format!("{x:.2},{y:.2}"));
+            }
+        }
+    }
+
+    (out, min_v, max_v, span_minutes)
 }

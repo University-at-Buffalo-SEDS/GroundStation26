@@ -8,6 +8,9 @@ pub enum TelemetryCommand {
     Arm,
     Disarm,
     Abort,
+    Tanks,
+    Pilot,
+    Igniter,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

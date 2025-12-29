@@ -61,11 +61,32 @@ pub async fn telemetry_task(
                             println!("Disarm command sent");
                         }
                         TelemetryCommand::Abort => {
-                            router.log::<u8>(
+                            router.log(
                                     DataType::Abort,
-                                    "Manual Abort Command Issued".as_bytes(),
+                                    "Manual Abort Command Issued".as_ref(),
                                 ).expect("failed to log Abort command");
                             println!("Abort command sent");
+                        }
+                        TelemetryCommand::Igniter => {
+                            router.log_queue(
+                                    DataType::ValveCommand,
+                                    &[1u8],
+                                ).expect("failed to log Igniter command");
+                            println!("Igniter command sent");
+                        }
+                    TelemetryCommand::Pilot => {
+                            router.log_queue(
+                                    DataType::ValveCommand,
+                                    &[2u8],
+                                ).expect("failed to log Igniter command");
+                            println!("Pilot command sent");
+                        }
+                    TelemetryCommand::Tanks => {
+                            router.log_queue(
+                                    DataType::ValveCommand,
+                                    &[3u8],
+                                ).expect("failed to log Igniter command");
+                            println!("Tanks command sent");
                         }
                     }
                 }
