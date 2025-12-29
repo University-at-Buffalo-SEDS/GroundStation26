@@ -225,9 +225,32 @@ pub fn TelemetryDashboard() -> Element {
     let rocket_gps = use_signal(|| None::<(f64, f64)>);
     let user_gps = use_signal(|| None::<(f64, f64)>);
     use_effect({
-        let user_gps = user_gps.clone();
         move || {
-            gps::start_gps_updates(user_gps);
+            // Everything inside the effect must be sync, so spawn.
+            spawn(async move {
+                // Wait up to ~5s for your JS bundle to be present.
+                // (Tune count/delay as you like.)
+                for _ in 0..100 {
+                    // Compute readiness in JS and store it in a window temp.
+
+                    if js_is_ground_map_ready() {
+                        // JS is loaded; safe to start any JS-driven GPS bridging.
+                        gps::start_gps_updates(user_gps);
+                        return;
+                    }
+
+                    // Yield so scripts can load / event loop can run
+                    #[cfg(target_arch = "wasm32")]
+                    gloo_timers::future::TimeoutFuture::new(50).await;
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+
+                js_eval(
+                    r#"console.warn("[GS26] JS not ready; skipped gps::start_gps_updates (timeout)");"#,
+                );
+            });
         }
     });
 
@@ -856,4 +879,88 @@ fn handle_ws_message(
             errors.set(v);
         }
     }
+}
+
+
+fn js_read_window_string(key: &str) -> Option<String> {
+    js_eval(&format!(
+        r#"
+        (function() {{
+          try {{
+            const v = window[{key:?}];
+            window.__gs26_tmp_str = (typeof v === "string") ? v : "";
+          }} catch (e) {{
+            window.__gs26_tmp_str = "";
+          }}
+        }})();
+        "#,
+        key = key
+    ));
+
+    js_get_tmp_str()
+}
+
+/* ================================================================================================
+ * Cross-platform "eval JS"
+ * ============================================================================================== */
+
+#[cfg(target_arch = "wasm32")]
+fn js_eval(js: &str) {
+    let _ = js_sys::eval(js);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn js_eval(js: &str) {
+    // Works on desktop + iOS because you’re running via dioxus-desktop (tao/wry webview).
+    // If your renderer changes, this is the one function you’ll adjust.
+    // use dioxus_desktop::use_window;
+
+    // NOTE: hooks can't be called here; but use_window() is a hook.
+    // So: we avoid calling it here directly.
+    dioxus::document::eval(js);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_get_tmp_str() -> Option<String> {
+    let win = web_sys::window()?;
+    let v = js_sys::Reflect::get(&win, &wasm_bindgen::JsValue::from_str("__gs26_tmp_str")).ok()?;
+    v.as_string()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn js_get_tmp_str() -> Option<String> {
+    // On native we can still read window.__gs26_tmp_str by asking JS to copy it to a known place
+    // and then returning it isn't directly possible without a return channel.
+    //
+    // The simplest: avoid relying on return values for native by using only window vars.
+    //
+    // For cached user lat/lon we already set window.__gs26_user_lat/lon from localStorage in JS,
+    // so native can skip parsing JSON here.
+    //
+    // Therefore, for native we just return None, and the caller will fall back to window vars.
+    None
+}
+
+fn js_is_ground_map_ready() -> bool {
+    js_eval(
+        r#"
+        (function() {
+          try {
+            const ok =
+              (window.__gs26_ground_station_loaded === true) &&
+              (typeof window.updateGroundMapMarkers === "function") &&
+              (typeof window.initGroundMap === "function");
+
+            // IMPORTANT: store STRING so js_read_window_string can read it
+            window.__gs26_tmp_ready = ok ? "true" : "false";
+          } catch (e) {
+            window.__gs26_tmp_ready = "false";
+          }
+        })();
+        "#,
+    );
+
+    js_read_window_string("__gs26_tmp_ready")
+        .unwrap_or_else(|| "false".to_string())
+        .eq_ignore_ascii_case("true")
 }

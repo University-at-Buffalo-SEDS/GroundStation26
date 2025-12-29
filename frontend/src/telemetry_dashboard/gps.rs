@@ -1,15 +1,6 @@
 // frontend/src/telemetry_dashboard/gps.rs
 //
 // Dioxus GPS/location module using dioxus-sdk geolocation.
-//
-// Goal:
-// - Expose ONE API you can call from your app to continuously update a
-//   `Signal<Option<(lat, lon)>>`.
-// - Uses dioxus-sdk's geolocation instead of manual web-sys bindings.
-// - Safe to call multiple times; subsequent calls are ignored.
-//
-// Cargo.toml:
-//   dioxus-sdk = { version = "0.7", features = ["geolocation"] }
 
 #![allow(dead_code)]
 

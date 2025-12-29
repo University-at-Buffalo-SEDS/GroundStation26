@@ -1,34 +1,8 @@
 // frontend/src/telemetry_dashboard/map_tab.rs
-//
-// One Leaflet map implementation for BOTH:
-//   - web (wasm32)
-//   - native (desktop + iOS via dioxus-desktop/tao webview)
-//
-// Key idea:
-//   ✅ Do NOT use wasm-bindgen imports at all.
-//   ✅ Call your JS functions (initGroundMap/updateGroundMapMarkers/centerGroundMapOn/getLastUserLatLng)
-//      by evaluating JS strings.
-//      - wasm32: js_sys::eval(...)
-//      - native: window.eval(...)
-//
-// Requirements:
-//   1) Your app must load Leaflet + /web/ground_map.js so these functions exist on `window`.
-//      For example, in your web index.html (or equivalent dioxus head injection), ensure you include:
-//        - Leaflet CSS/JS
-//        - /web/ground_map.js (or bundle it into the page)
-//   2) ground_map.js must attach functions to `window`:
-//        window.initGroundMap = ...
-//        window.updateGroundMapMarkers = ...
-//        window.centerGroundMapOn = ...
-//        window.getLastUserLatLng = ...
-//
-// Note:
-//   - This file also starts a browser-style watchPosition inside the webview on native.
-//     On iOS, WKWebView supports navigator.geolocation (subject to permissions/capabilities).
 
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
-use crate::telemetry_dashboard::UrlConfig;
+use crate::telemetry_dashboard::{js_eval, js_is_ground_map_ready, js_read_window_string, UrlConfig};
 // #[cfg(target_arch = "wasm32")]
 // use gloo_timers::future::TimeoutFuture;
 
@@ -252,6 +226,11 @@ pub fn MapTab(
  * ============================================================================================== */
 
 fn js_update_markers(r_lat: f64, r_lon: f64, u_lat: f64, u_lon: f64) {
+
+        if !js_is_ground_map_ready() {
+        // Don't spam every render tick
+        return;
+    }
     js_eval(&format!(
         r#"
         (function() {{
@@ -353,79 +332,4 @@ fn js_read_window_f64(key: &str) -> Option<f64> {
     }
 }
 
-fn js_read_window_string(key: &str) -> Option<String> {
-    js_eval(&format!(
-        r#"
-        (function() {{
-          try {{
-            const v = window[{key:?}];
-            window.__gs26_tmp_str = (typeof v === "string") ? v : "";
-          }} catch (e) {{
-            window.__gs26_tmp_str = "";
-          }}
-        }})();
-        "#,
-        key = key
-    ));
 
-    js_get_tmp_str()
-}
-
-/* ================================================================================================
- * Cross-platform "eval JS"
- * ============================================================================================== */
-
-#[cfg(target_arch = "wasm32")]
-fn js_eval(js: &str) {
-    let _ = js_sys::eval(js);
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn js_eval(js: &str) {
-    // Works on desktop + iOS because you’re running via dioxus-desktop (tao/wry webview).
-    // If your renderer changes, this is the one function you’ll adjust.
-    // use dioxus_desktop::use_window;
-
-    // NOTE: hooks can't be called here; but use_window() is a hook.
-    // So: we avoid calling it here directly.
-    //
-    // Instead we stash the JS into a global queue and have a component effect flush it.
-    // To keep this file "complete" and working without more plumbing, we implement a
-    // minimal global "last script" mechanism and execute it from an effect inside MapTab.
-    //
-    // HOWEVER: MapTab already calls js_eval from effects/tasks, so we need a direct eval.
-    //
-    // If your dioxus-desktop version exposes a non-hook global eval, use it.
-    // Most builds expose `dioxus_desktop::window()` OR you can do this:
-    //
-    //   let window = dioxus_desktop::use_window();
-    //   window.eval(js);
-    //
-    // But `use_window()` is a hook and must be called in the component body.
-    //
-    // ✅ So on native we rely on `document::eval`, which dioxus-desktop provides.
-    // If you don’t have it, replace this with a hook-based `let window = use_window(); window.eval(...)`
-    // by moving js_eval calls into closures that capture `window`.
-    dioxus::document::eval(js);
-}
-
-#[cfg(target_arch = "wasm32")]
-fn js_get_tmp_str() -> Option<String> {
-    let win = web_sys::window()?;
-    let v = js_sys::Reflect::get(&win, &wasm_bindgen::JsValue::from_str("__gs26_tmp_str")).ok()?;
-    v.as_string()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn js_get_tmp_str() -> Option<String> {
-    // On native we can still read window.__gs26_tmp_str by asking JS to copy it to a known place
-    // and then returning it isn't directly possible without a return channel.
-    //
-    // The simplest: avoid relying on return values for native by using only window vars.
-    //
-    // For cached user lat/lon we already set window.__gs26_user_lat/lon from localStorage in JS,
-    // so native can skip parsing JSON here.
-    //
-    // Therefore, for native we just return None, and the caller will fall back to window vars.
-    None
-}
