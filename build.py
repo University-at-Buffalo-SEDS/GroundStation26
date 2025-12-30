@@ -113,13 +113,14 @@ def build_frontend(frontend_dir: Path, platform_name: Optional[str] = None) -> N
 
         cmd = ["dx", "bundle", "--assets", "--release"]
         if platform_name:
-            cmd.remove("--assets")  # Not needed for platform-specific builds
             cmd.extend(["--platform", platform_name])
+        else :
+            cmd.extend(["--platform", "web"])
 
         run(cmd, cwd=frontend_dir)
-
-        if platform_name in ("ios"):
-            patch_plist(frontend_dir)
+        if platform_name:
+            if platform_name in "ios":
+                patch_plist(frontend_dir)
     except subprocess.CalledProcessError as e:
         print("Frontend build failed.", file=sys.stderr)
         sys.exit(e.returncode)

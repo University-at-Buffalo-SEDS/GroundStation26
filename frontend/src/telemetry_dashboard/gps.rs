@@ -15,38 +15,40 @@ pub fn start_gps_updates(user_gps: Signal<Option<(f64, f64)>>) {
     imp::start(user_gps);
 }
 
+//
+// WASM / Web: use the hook-based SDK approach (NO globals, NO OnceLock).
+//
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use super::*;
     use dioxus_signals::WritableExt;
-    use wasm_bindgen::JsCast;
-    use web_sys::{window, GeolocationPosition};
+
+    // OLD WORKING STYLE: hook-based geolocation (must be called from component context).
+    //
+    // IMPORTANT:
+    // - This requires the crate/path you used before.
+    // - If your dependency is now `dioxus_sdk_geolocation`, see the note below.
+    use dioxus_sdk_geolocation::use_geolocation;
 
     pub fn start(mut user_gps: Signal<Option<(f64, f64)>>) {
-        let geo = window().unwrap().navigator().geolocation().unwrap();
+        let geo = use_geolocation();
 
-        let success = Closure::<dyn FnMut(GeolocationPosition)>::new(move |pos| {
-            let coords = pos.coords();
-            let lat = coords.latitude();
-            let lon = coords.longitude();
-            user_gps.set(Some((lat, lon)));
+        use_effect(move || {
+            if let Ok(pos) = geo() {
+                let lat = pos.latitude;
+                let lon = pos.longitude;
+
+                if lat.is_finite() && lon.is_finite() {
+                    user_gps.set(Some((lat, lon)));
+                }
+            }
         });
-
-        let error = Closure::<dyn FnMut(web_sys::GeolocationPositionError)>::new(move |_e| {
-            // ignore / log
-        });
-
-        geo.watch_position_with_error_callback(
-            success.as_ref().unchecked_ref(),
-            error.as_ref().unchecked_ref(),
-        )
-        .ok();
-
-        success.forget();
-        error.forget();
     }
 }
 
+//
+// Windows
+//
 #[cfg(target_os = "windows")]
 mod imp {
     use super::*;
@@ -55,6 +57,9 @@ mod imp {
     }
 }
 
+//
+// Apple platforms
+//
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod imp {
     use super::*;
@@ -63,6 +68,9 @@ mod imp {
     }
 }
 
+//
+// Android
+//
 #[cfg(target_os = "android")]
 mod imp {
     use super::*;
@@ -71,7 +79,9 @@ mod imp {
     }
 }
 
-// Optional: for linux/etc either stub or add another backend
+//
+// Everything else: no-op.
+//
 #[cfg(not(any(
     target_arch = "wasm32",
     target_os = "windows",

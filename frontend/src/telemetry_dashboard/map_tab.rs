@@ -1,16 +1,13 @@
 // frontend/src/telemetry_dashboard/map_tab.rs
 
-use crate::telemetry_dashboard::{
-    js_eval, js_is_ground_map_ready, js_read_window_string, UrlConfig,
-};
+use crate::telemetry_dashboard::{js_eval, js_is_ground_map_ready, js_read_window_string,abs_http};
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 // #[cfg(target_arch = "wasm32")]
 // use gloo_timers::future::TimeoutFuture;
 
 fn tiles_url() -> String {
-    let base = UrlConfig::_get_base_url().unwrap_or_else(|| "http://localhost:3000".to_string());
-    format!("{}/tiles/{{z}}/{{x}}/{{y}}.jpg", base.trim_end_matches('/'))
+    abs_http("/tiles/{z}/{x}/{y}.jpg")
 }
 
 #[component]

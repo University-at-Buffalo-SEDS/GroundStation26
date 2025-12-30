@@ -33,3 +33,7 @@ icon = ["assets/icon.png"]
 info_plist_path = "platform/macos/Info.plist"
 minimum_system_version = "13.0"
 hardened_runtime = true
+
+
+[bundle.ios]
+icon = "assets/icon.png"

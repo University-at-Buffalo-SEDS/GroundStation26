@@ -5,11 +5,16 @@ mod chart;
 pub mod data_tab;
 pub mod errors_tab;
 mod gps;
+mod gps_android;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod gps_apple;
 pub mod map_tab;
 pub mod state_tab;
 pub mod warnings_tab;
-mod gps_apple;
-mod gps_android;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::app::Route;
 
 use crate::telemetry_dashboard::actions_tab::ActionsTab;
 use data_tab::DataTab;
@@ -21,6 +26,122 @@ use map_tab::MapTab;
 use serde::Deserialize;
 use state_tab::StateTab;
 use warnings_tab::WarningsTab;
+
+// ----------------------------
+// Cross-platform persistence
+//  - wasm32: localStorage
+//  - native: JSON file in app data dir
+// ----------------------------
+mod persist {
+    pub fn get_string(key: &str) -> Option<String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            use web_sys::window;
+            let w = window()?;
+            let ls = w.local_storage().ok()??;
+            return ls.get_item(key).ok().flatten();
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            native::get_string(key).ok().flatten()
+        }
+    }
+
+    pub fn set_string(key: &str, value: &str) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            use web_sys::window;
+            if let Some(w) = window() {
+                if let Ok(Some(ls)) = w.local_storage() {
+                    let _ = ls.set_item(key, value);
+                }
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = native::set_string(key, value);
+        }
+    }
+
+    pub fn _remove(key: &str) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            use web_sys::window;
+            if let Some(w) = window() {
+                if let Ok(Some(ls)) = w.local_storage() {
+                    let _ = ls.remove_item(key);
+                }
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = native::_remove(key);
+        }
+    }
+
+    pub fn get_or(key: &str, default: &str) -> String {
+        get_string(key).unwrap_or_else(|| default.to_string())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod native {
+        use std::collections::HashMap;
+        use std::io;
+
+        fn storage_path() -> std::path::PathBuf {
+            let mut base = dirs::data_local_dir()
+                .or_else(dirs::data_dir)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+            base.push("gs26");
+            base.push("storage.json");
+            base
+        }
+
+        fn load_map() -> Result<HashMap<String, String>, io::Error> {
+            let path = storage_path();
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+                Err(e) => return Err(e),
+            };
+
+            let map = serde_json::from_slice::<HashMap<String, String>>(&bytes).unwrap_or_default();
+            Ok(map)
+        }
+
+        fn save_map(map: &HashMap<String, String>) -> Result<(), io::Error> {
+            let path = storage_path();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let bytes = serde_json::to_vec_pretty(map).unwrap_or_else(|_| b"{}".to_vec());
+            std::fs::write(path, bytes)?;
+            Ok(())
+        }
+
+        pub fn get_string(key: &str) -> Result<Option<String>, io::Error> {
+            let map = load_map()?;
+            Ok(map.get(key).cloned())
+        }
+
+        pub fn set_string(key: &str, value: &str) -> Result<(), io::Error> {
+            let mut map = load_map()?;
+            map.insert(key.to_string(), value.to_string());
+            save_map(&map)?;
+            Ok(())
+        }
+
+        pub fn _remove(key: &str) -> Result<(), io::Error> {
+            let mut map = load_map()?;
+            map.remove(key);
+            save_map(&map)?;
+            Ok(())
+        }
+    }
+}
 
 // Matches your existing schema. (ty + data)
 #[derive(Deserialize, Debug)]
@@ -82,47 +203,71 @@ macro_rules! log {
 }
 
 pub const HISTORY_MS: i64 = 60_000 * 20; // 20 minutes
-const _WARNING_ACK_STORAGE_KEY: &str = "gs_last_warning_ack_ts";
-const _ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
-const _MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
-const _DATA_TAB_STORAGE_KEY: &str = "gs_data_tab";
 
-// --------------------------
-// localStorage helpers (assets)
-// --------------------------
+// unified storage keys (same as old wasm localStorage)
+const WARNING_ACK_STORAGE_KEY: &str = "gs_last_warning_ack_ts";
+const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
+const MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
+const DATA_TAB_STORAGE_KEY: &str = "gs_data_tab";
+const BASE_URL_STORAGE_KEY: &str = "gs_base_url";
+
+// When this number changes, we tear down and rebuild the websocket connection.
+static WS_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
+
 #[cfg(target_arch = "wasm32")]
-fn storage_get_i64(key: &str) -> Option<i64> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok().flatten()?;
-    let s = storage.get_item(key).ok().flatten()?;
-    s.parse().ok()
+static WS_RAW: GlobalSignal<Option<web_sys::WebSocket>> = Signal::global(|| None);
+
+fn normalize_base_url(mut url: String) -> String {
+    // Strip fragment (#...)
+    if let Some(idx) = url.find('#') {
+        url.truncate(idx);
+    }
+
+    // Strip path (/something) but keep scheme + host[:port]
+    if let Some(scheme_end) = url.find("://") {
+        let rest = &url[scheme_end + 3..];
+        if let Some(slash) = rest.find('/') {
+            url.truncate(scheme_end + 3 + slash);
+        }
+    }
+
+    url.trim_end_matches('/').to_string()
 }
 
-#[cfg(target_arch = "wasm32")]
-fn storage_set_i64(key: &str, val: i64) {
-    if let Some(window) = web_sys::window()
-        && let Ok(Some(storage)) = window.local_storage()
-    {
-        let _ = storage.set_item(key, &val.to_string());
+pub fn abs_http(path: &str) -> String {
+    let base = UrlConfig::base_http();
+
+    // Ensure we always join as base + "/path"
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+
+    if base.is_empty() {
+        // wasm can still work with relative (origin), but we keep it absolute-ish
+        // by just returning "/path"
+        path
+    } else {
+        format!("{base}{path}")
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn storage_get_string(key: &str) -> Option<String> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok().flatten()?;
-    storage.get_item(key).ok().flatten()
-}
+fn bump_ws_epoch() {
+    // Tear down any existing connection immediately, then bump the epoch to trigger a fresh connect.
+    *WS_SENDER.write() = None;
 
-#[cfg(target_arch = "wasm32")]
-fn storage_set_string(key: &str, val: &str) {
-    if let Some(window) = web_sys::window()
-        && let Ok(Some(storage)) = window.local_storage()
+    #[cfg(target_arch = "wasm32")]
     {
-        let _ = storage.set_item(key, val);
+        if let Some(ws) = WS_RAW.write().take() {
+            let _ = ws.close();
+        }
     }
+
+    *WS_EPOCH.write() += 1;
 }
 
+// tab <-> string
 fn _main_tab_to_str(tab: MainTab) -> &'static str {
     match tab {
         MainTab::State => "state",
@@ -133,7 +278,6 @@ fn _main_tab_to_str(tab: MainTab) -> &'static str {
         MainTab::Data => "data",
     }
 }
-
 fn _main_tab_from_str(s: &str) -> MainTab {
     match s {
         "state" => MainTab::State,
@@ -150,49 +294,72 @@ fn _main_tab_from_str(s: &str) -> MainTab {
 pub struct UrlConfig;
 
 impl UrlConfig {
-    pub fn set_base_url(url: String) {
-        *BASE_URL.write() = url;
+    pub fn set_base_url_and_persist(url: String) {
+        let clean = normalize_base_url(url);
+        *BASE_URL.write() = clean.clone();
+        persist::set_string(BASE_URL_STORAGE_KEY, &clean);
     }
 
-    pub fn _get_base_url() -> Option<String> {
-        let v = BASE_URL.read().clone();
-        if v.is_empty() { None } else { Some(v) }
-    }
-
-    pub fn base_http() -> String {
-        // "" means same-origin for assets; native should store full url
+    pub fn _get_base_url() -> String {
         BASE_URL.read().clone()
     }
 
-    pub fn base_ws() -> String {
+    pub fn base_http() -> String {
         let base = BASE_URL.read().clone();
 
-        // Web: compute from window.location if base is empty
-        #[cfg(target_arch = "wasm32")]
+        // Native default
+        #[cfg(not(target_arch = "wasm32"))]
         if base.is_empty() {
-            if let Some(window) = web_sys::window() {
-                let loc = window.location();
-                let protocol = loc.protocol().unwrap_or_else(|_| "http:".to_string());
-                let host = loc.host().unwrap_or_else(|_| "localhost:3000".to_string());
-                let ws_scheme = if protocol == "https:" { "wss" } else { "ws" };
-                return format!("{ws_scheme}://{host}");
+            return "http://localhost:3000".to_string();
+        }
+
+        // Web: allow empty (we’ll use window.location in http_get_json)
+        base
+    }
+
+    /// Returns the websocket *origin* (scheme://host[:port]) with ws/wss,
+    /// NOT including "/ws" (callers append the path).
+    pub fn base_ws() -> String {
+        // Web: if user didn't set a base URL, derive from window.location.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let base_http = BASE_URL.read().clone();
+            if base_http.is_empty() {
+                if let Some(window) = web_sys::window() {
+                    let loc = window.location();
+                    let protocol = loc.protocol().unwrap_or_else(|_| "http:".to_string());
+                    let host = loc.host().unwrap_or_else(|_| "localhost:3000".to_string());
+                    let ws_scheme = if protocol == "https:" { "wss" } else { "ws" };
+                    return format!("{ws_scheme}://{host}");
+                }
+                return "ws://localhost:3000".to_string();
             }
         }
 
-        // Native (or assets with explicit URL):
-        // accept http(s)://host:port and convert to ws(s)://host:port
-        if base.starts_with("https://") {
-            base.replacen("https://", "wss://", 1)
-        } else if base.starts_with("http://") {
-            base.replacen("http://", "ws://", 1)
+        // If we have an explicit base URL, normalize it.
+        let base_http = UrlConfig::base_http();
+
+        // Strip any trailing slash to avoid //ws
+        let base_http = base_http.trim_end_matches('/').to_string();
+
+        if base_http.starts_with("https://") {
+            base_http.replacen("https://", "wss://", 1)
+        } else if base_http.starts_with("http://") {
+            base_http.replacen("http://", "ws://", 1)
+        } else if base_http.starts_with("wss://") || base_http.starts_with("ws://") {
+            base_http
         } else {
-            // fallback: assume user typed host:port
-            format!("ws://{base}")
+            format!("ws://{base_http}")
         }
     }
 }
 
 static BASE_URL: GlobalSignal<String> = Signal::global(String::new);
+
+// -----------------------------
+// Soft UI remount key
+// -----------------------------
+static UI_RELOAD_KEY: GlobalSignal<u64> = Signal::global(|| 0);
 
 // ---------- Cross-platform WS handle ----------
 #[derive(Clone)]
@@ -225,28 +392,88 @@ static WS_SENDER: GlobalSignal<Option<WsSender>> = Signal::global(|| None::<WsSe
 // ---------- Public root component ----------
 #[component]
 pub fn TelemetryDashboard() -> Element {
-    // data
-    let rows = use_signal(Vec::<TelemetryRow>::new);
-    let active_data_tab = use_signal(|| "GYRO_DATA".to_string());
+    // ----------------------------
+    // Persistent values (strings)
+    // ----------------------------
+    let st_warn_ack = use_signal(|| persist::get_or(WARNING_ACK_STORAGE_KEY, "0"));
+    let st_err_ack = use_signal(|| persist::get_or(ERROR_ACK_STORAGE_KEY, "0"));
+    let st_main_tab = use_signal(|| persist::get_or(MAIN_TAB_STORAGE_KEY, "state"));
+    let st_data_tab = use_signal(|| persist::get_or(DATA_TAB_STORAGE_KEY, "GYRO_DATA"));
+    let st_base_url = use_signal(|| persist::get_or(BASE_URL_STORAGE_KEY, ""));
 
+    let parse_i64 = |s: &str| s.parse::<i64>().unwrap_or(0);
+
+    // ----------------------------
+    // Live app state
+    // ----------------------------
+    let rows = use_signal(Vec::<TelemetryRow>::new);
+
+    let active_data_tab = use_signal(|| st_data_tab.read().clone());
     let warnings = use_signal(Vec::<AlertMsg>::new);
     let errors = use_signal(Vec::<AlertMsg>::new);
-
     let flight_state = use_signal(|| FlightState::Startup);
 
-    // main tabs
-    let active_main_tab = use_signal(|| MainTab::State);
+    let active_main_tab = use_signal(|| _main_tab_from_str(st_main_tab.read().as_str()));
 
-    // ack timestamps
-    let ack_warning_ts = use_signal(|| 0_i64);
-    let ack_error_ts = use_signal(|| 0_i64);
+    let ack_warning_ts = use_signal(|| parse_i64(st_warn_ack.read().as_str()));
+    let ack_error_ts = use_signal(|| parse_i64(st_err_ack.read().as_str()));
 
-    // flashing indicator
     let flash_on = use_signal(|| false);
 
-    // gps extracted from telemetry rows
     let rocket_gps = use_signal(|| None::<(f64, f64)>);
     let user_gps = use_signal(|| None::<(f64, f64)>);
+
+    // ---------------------------------------------------------
+    // Base URL: keep UrlConfig in sync with persisted signal.
+    // When it changes, reconnect websocket on BOTH platforms.
+    // ---------------------------------------------------------
+    {
+        use_effect(move || {
+            let base = st_base_url.read().clone();
+            UrlConfig::set_base_url_and_persist(base);
+            bump_ws_epoch();
+        });
+    }
+
+    // Persist UI state changes (localStorage on wasm, file on native)
+    {
+        let mut st_main_tab = st_main_tab;
+        use_effect(move || {
+            let s = _main_tab_to_str(*active_main_tab.read()).to_string();
+            st_main_tab.set(s.clone());
+            persist::set_string(MAIN_TAB_STORAGE_KEY, &s);
+        });
+    }
+    {
+        let mut st_data_tab = st_data_tab;
+        use_effect(move || {
+            let v = active_data_tab.read().clone();
+            st_data_tab.set(v.clone());
+            persist::set_string(DATA_TAB_STORAGE_KEY, &v);
+        });
+    }
+    {
+        let mut st_warn_ack = st_warn_ack;
+        use_effect(move || {
+            let v = ack_warning_ts.read().to_string();
+            st_warn_ack.set(v.clone());
+            persist::set_string(WARNING_ACK_STORAGE_KEY, &v);
+        });
+    }
+    {
+        let mut st_err_ack = st_err_ack;
+        use_effect(move || {
+            let v = ack_error_ts.read().to_string();
+            st_err_ack.set(v.clone());
+            persist::set_string(ERROR_ACK_STORAGE_KEY, &v);
+        });
+    }
+    {
+        use_effect(move || {
+            let v = st_base_url.read().clone();
+            persist::set_string(BASE_URL_STORAGE_KEY, &v);
+        });
+    }
 
     // Start GPS updates only once JS is ready (your existing logic)
     use_effect({
@@ -271,68 +498,7 @@ pub fn TelemetryDashboard() -> Element {
         }
     });
 
-    // ----------------------------------------
-    // Web-only: restore persisted UI state
-    // ----------------------------------------
-    #[cfg(target_arch = "wasm32")]
-    {
-        // restore ack timestamps
-        {
-            let mut ack_warning_ts = ack_warning_ts;
-            let mut ack_error_ts = ack_error_ts;
-            use_effect(move || {
-                if let Some(v) = storage_get_i64(_WARNING_ACK_STORAGE_KEY) {
-                    ack_warning_ts.set(v);
-                }
-                if let Some(v) = storage_get_i64(_ERROR_ACK_STORAGE_KEY) {
-                    ack_error_ts.set(v);
-                }
-            });
-        }
-
-        // restore active main tab
-        {
-            let mut active_main_tab = active_main_tab;
-            use_effect(move || {
-                if let Some(s) = storage_get_string(_MAIN_TAB_STORAGE_KEY) {
-                    active_main_tab.set(_main_tab_from_str(&s));
-                }
-            });
-        }
-
-        // persist active main tab when it changes
-        {
-            let active_main_tab = active_main_tab;
-            use_effect(move || {
-                let s = _main_tab_to_str(*active_main_tab.read());
-                storage_set_string(_MAIN_TAB_STORAGE_KEY, s);
-            });
-        }
-
-        // restore inner data tab
-        {
-            let mut active_data_tab = active_data_tab;
-            use_effect(move || {
-                if let Some(s) = storage_get_string(_DATA_TAB_STORAGE_KEY)
-                    && !s.is_empty()
-                {
-                    active_data_tab.set(s);
-                }
-            });
-        }
-
-        // persist inner data tab
-        {
-            let active_data_tab = active_data_tab;
-            use_effect(move || {
-                storage_set_string(_DATA_TAB_STORAGE_KEY, &active_data_tab.read());
-            });
-        }
-    }
-
-    // ----------------------------------------
-    // NEW: Seed telemetry + alerts + gps from DB (HTTP) on mount
-    // ----------------------------------------
+    // Seed telemetry + alerts + gps from DB (HTTP) on mount
     {
         let mut did_seed = use_signal(|| false);
 
@@ -368,9 +534,7 @@ pub fn TelemetryDashboard() -> Element {
         });
     }
 
-    // ----------------------------------------
-    // Flash loop (both assets + native)
-    // ----------------------------------------
+    // Flash loop
     {
         let mut flash_on = flash_on;
         use_effect(move || {
@@ -389,9 +553,7 @@ pub fn TelemetryDashboard() -> Element {
         });
     }
 
-    // ----------------------------------------
     // Derived state: counts + unacked + border
-    // ----------------------------------------
     let warn_count = warnings.read().len();
     let err_count = errors.read().len();
 
@@ -401,7 +563,6 @@ pub fn TelemetryDashboard() -> Element {
         .map(|w| w.timestamp_ms)
         .max()
         .unwrap_or(0);
-
     let latest_error_ts = errors
         .read()
         .iter()
@@ -423,9 +584,7 @@ pub fn TelemetryDashboard() -> Element {
         "1px solid transparent"
     };
 
-    // ----------------------------------------
     // Initial flightstate (HTTP)
-    // ----------------------------------------
     {
         let mut flight_state = flight_state;
         use_effect(move || {
@@ -437,25 +596,34 @@ pub fn TelemetryDashboard() -> Element {
         });
     }
 
-    // ----------------------------------------
-    // WebSocket connect once
-    // ----------------------------------------
+    // ---------------------------------------------------------
+    // WebSocket supervisor:
+    // - runs on BOTH platforms
+    // - reconnects whenever WS_EPOCH changes
+    // - native behavior now matches wasm (loop + backoff)
+    // ---------------------------------------------------------
     {
         use_effect(move || {
+            let epoch = *WS_EPOCH.read();
             spawn(async move {
-                if let Err(e) =
-                    connect_ws_loop(rows, warnings, errors, flight_state, rocket_gps, user_gps)
-                        .await
+                if let Err(e) = connect_ws_supervisor(
+                    epoch,
+                    rows,
+                    warnings,
+                    errors,
+                    flight_state,
+                    rocket_gps,
+                    user_gps,
+                )
+                .await
                 {
-                    log!("ws loop ended: {e:?}");
+                    log!("ws supervisor ended: {e}");
                 }
             });
         });
     }
 
-    // ----------------------------------------
-    // Top nav button styles (old vibe)
-    // ----------------------------------------
+    // Top nav button styles
     let tab_style_active = |color: &str| {
         format!(
             "padding:0.4rem 0.8rem; border-radius:0.5rem;\
@@ -467,51 +635,136 @@ pub fn TelemetryDashboard() -> Element {
                              border:1px solid #4b5563; background:#020617;\
                              color:#e5e7eb; cursor:pointer;";
 
+    // -------------------------
+    // Native-only GO-TO-CONNECT button
+    // -------------------------
+    let connect_button: Element = {
+        #[cfg(not(target_arch = "wasm32"))]
+        use dioxus_router::use_navigator;
+        #[cfg(not(target_arch = "wasm32"))]
+        let nav = use_navigator();
+        #[cfg(not(target_arch = "wasm32"))]
+        rsx! {
+            button {
+                style: "
+                    padding:0.45rem 0.85rem;
+                    border-radius:0.75rem;
+                    border:1px solid #334155;
+                    background:#111827;
+                    color:#e5e7eb;
+                    font-weight:800;
+                    cursor:pointer;
+                ",
+                onclick: move |_| {
+                    let _ = nav.push(Route::Connect {});
+                },
+                "CONNECT"
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            rsx! { div {} }
+        }
+    };
+
+    // -------------------------
+    // RECONNECT button (both)
+    // -------------------------
+    let reload_button: Element = rsx! {
+        button {
+            style: "
+                padding:0.45rem 0.85rem;
+                border-radius:0.75rem;
+                border:1px solid #334155;
+                background:#111827;
+                color:#e5e7eb;
+                font-weight:800;
+                cursor:pointer;
+            ",
+            onclick: move |_| {
+                bump_ws_epoch();
+                *UI_RELOAD_KEY.write() += 1;
+            },
+            "RECONNECT"
+        }
+    };
+
     // ----------------------------------------
-    // MAIN UI (Leptos-like shell)
+    // MAIN UI
     // ----------------------------------------
     rsx! {
-        div {
-            style: "
-                min-height:100vh;
-                padding:24px;
-                color:#e5e7eb;
-                font-family:system-ui, -apple-system, BlinkMacSystemFont;
-                background:#020617;
-                display:flex;
-                flex-direction:column;
-                border:{border_style};
-                box-sizing:border-box;
-            ",
+        div { key: "{*UI_RELOAD_KEY.read()}",
+            div {
+                style: "
+                    min-height:100vh;
+                    padding:24px;
+                    color:#e5e7eb;
+                    font-family:system-ui, -apple-system, BlinkMacSystemFont;
+                    background:#020617;
+                    display:flex;
+                    flex-direction:column;
+                    border:{border_style};
+                    box-sizing:border-box;
+                ",
 
-            // Header row: title (left) + centered nav card
-            div { style: "display:flex; align-items:center; width:100%; margin-bottom:12px;",
-                div { style: "flex:0; min-width:200px; display:flex; align-items:center; gap:10px;",
+                // Header row 1: Title + buttons
+                div {
+                    style: "
+                        display:flex;
+                        align-items:center;
+                        justify-content:space-between;
+                        gap:16px;
+                        width:100%;
+                        margin-bottom:12px;
+                        flex-wrap:wrap;
+                    ",
                     h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "Rocket Dashboard" }
 
-                    button {
-                        style: "
-                            padding:0.45rem 0.85rem;
-                            border-radius:0.75rem;
-                            border:1px solid #ef4444;
-                            background:#450a0a;
-                            color:#fecaca;
-                            font-weight:900;
-                            cursor:pointer;
-                        ",
-                        onclick: move |_| send_cmd("Abort"),
-                        "ABORT"
+                    div { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
+                        button {
+                            style: "
+                                padding:0.45rem 0.85rem;
+                                border-radius:0.75rem;
+                                border:1px solid #ef4444;
+                                background:#450a0a;
+                                color:#fecaca;
+                                font-weight:900;
+                                cursor:pointer;
+                            ",
+                            onclick: move |_| send_cmd("Abort"),
+                            "ABORT"
+                        }
+
+                        {reload_button}
+                        {connect_button}
                     }
                 }
 
-                div { style: "flex:1; display:flex; justify-content:center;",
-                    div { style: "
-                        display:flex; align-items:center; gap:0.5rem;
-                        padding:0.85rem; border-radius:0.75rem;
-                        background:#020617ee; border:1px solid #4b5563;
-                        box-shadow:0 10px 25px rgba(0,0,0,0.45);
-                        min-width:12rem;
+                // Header row 2: Tabs + Status
+                div {
+                    style: "
+                        display:flex;
+                        align-items:center;
+                        gap:12px;
+                        width:100%;
+                        margin-bottom:12px;
+                        flex-wrap:wrap;
                     ",
+
+                    // Tabs panel
+                    div {
+                        style: "
+                            flex:1 1 520px;
+                            display:flex;
+                            align-items:center;
+                            padding:0.85rem;
+                            border-radius:0.75rem;
+                            background:#020617ee;
+                            border:1px solid #4b5563;
+                            box-shadow:0 10px 25px rgba(0,0,0,0.45);
+                            min-width:420px;
+                        ",
                         nav { style: "display:flex; gap:0.5rem; flex-wrap:wrap;",
                             button {
                                 style: if *active_main_tab.read() == MainTab::State { tab_style_active("#38bdf8") } else { tab_style_inactive.to_string() },
@@ -573,105 +826,96 @@ pub fn TelemetryDashboard() -> Element {
                             }
                         }
                     }
-                }
 
-                div { style: "flex:0; min-width:200px;" }
-            }
+                    // Status pill next to tabs
+                    div {
+                        style: "
+                            flex:0 1 420px;
+                            display:flex;
+                            align-items:center;
+                            gap:0.75rem;
+                            padding:0.35rem 0.7rem;
+                            border-radius:999px;
+                            background:#111827;
+                            border:1px solid #4b5563;
+                            white-space:nowrap;
+                        ",
+                        span { style: "color:#9ca3af;", "Status:" }
 
-            // Status pill row
-            div { style: "margin-bottom:12px; display:flex; gap:12px; align-items:center;",
-                div { style: "
-                    display:flex; align-items:center; gap:0.75rem;
-                    padding:0.35rem 0.7rem; border-radius:999px;
-                    background:#111827; border:1px solid #4b5563;
-                ",
-                    span { style: "color:#9ca3af;", "Status:" }
-
-                    if !has_warnings && !has_errors {
-                        span { style: "color:#22c55e; font-weight:600;", "Nominal" }
-                        span { style: "color:#93c5fd; margin-left:0.75rem;",
-                            "(Flight state: ",
-                            "{flight_state.read().to_string()}",
-                            ")"
-                        }
-                    } else {
-                        if has_errors {
-                            span { style: "color:#fecaca;", {format!("{err_count} error(s)")} }
-                        }
-                        if has_warnings {
-                            span { style: "color:#fecaca;", {format!("{warn_count} warnings(s)")} }
-                        }
-
-                        span { style: "color:#93c5fd; margin-left:0.75rem;",
-                            "(Flight state: ",
-                            "{flight_state.read().to_string()}",
-                            ")"
-                        }
-
-                        if *active_main_tab.read() == MainTab::Warnings && has_warnings {
-                            button {
-                                style: "
-                                    margin-left:auto;
-                                    padding:0.25rem 0.7rem;
-                                    border-radius:999px;
-                                    border:1px solid #4b5563;
-                                    background:#020617;
-                                    color:#e5e7eb;
-                                    font-size:0.75rem;
-                                    cursor:pointer;
-                                ",
-                                onclick: {
-                                    let mut ack_warning_ts = ack_warning_ts;
-                                    move |_| {
-                                        let ts = latest_warning_ts;
-                                        ack_warning_ts.set(ts);
-                                        #[cfg(target_arch = "wasm32")]
-                                        storage_set_i64(_WARNING_ACK_STORAGE_KEY, ts);
-                                    }
-                                },
-                                "Acknowledge warnings"
+                        if !has_warnings && !has_errors {
+                            span { style: "color:#22c55e; font-weight:600;", "Nominal" }
+                            span { style: "color:#93c5fd; margin-left:0.75rem;",
+                                "(Flight state: ",
+                                "{flight_state.read().to_string()}",
+                                ")"
                             }
-                        }
+                        } else {
+                            if has_errors {
+                                span { style: "color:#fecaca;", {format!("{err_count} error(s)")} }
+                            }
+                            if has_warnings {
+                                span { style: "color:#fecaca;", {format!("{warn_count} warnings(s)")} }
+                            }
 
-                        if *active_main_tab.read() == MainTab::Errors && has_errors {
-                            button {
-                                style: "
-                                    margin-left:auto;
-                                    padding:0.25rem 0.7rem;
-                                    border-radius:999px;
-                                    border:1px solid #4b5563;
-                                    background:#020617;
-                                    color:#e5e7eb;
-                                    font-size:0.75rem;
-                                    cursor:pointer;
-                                ",
-                                onclick: {
-                                    let mut ack_error_ts = ack_error_ts;
-                                    move |_| {
-                                        let ts = latest_error_ts;
-                                        ack_error_ts.set(ts);
-                                        #[cfg(target_arch = "wasm32")]
-                                        storage_set_i64(_ERROR_ACK_STORAGE_KEY, ts);
-                                    }
-                                },
-                                "Acknowledge errors"
+                            span { style: "color:#93c5fd; margin-left:0.75rem;",
+                                "(Flight state: ",
+                                "{flight_state.read().to_string()}",
+                                ")"
+                            }
+
+                            if *active_main_tab.read() == MainTab::Warnings && has_warnings {
+                                button {
+                                    style: "
+                                        margin-left:auto;
+                                        padding:0.25rem 0.7rem;
+                                        border-radius:999px;
+                                        border:1px solid #4b5563;
+                                        background:#020617;
+                                        color:#e5e7eb;
+                                        font-size:0.75rem;
+                                        cursor:pointer;
+                                    ",
+                                    onclick: {
+                                        let mut ack_warning_ts = ack_warning_ts;
+                                        move |_| ack_warning_ts.set(latest_warning_ts)
+                                    },
+                                    "Acknowledge warnings"
+                                }
+                            }
+
+                            if *active_main_tab.read() == MainTab::Errors && has_errors {
+                                button {
+                                    style: "
+                                        margin-left:auto;
+                                        padding:0.25rem 0.7rem;
+                                        border-radius:999px;
+                                        border:1px solid #4b5563;
+                                        background:#020617;
+                                        color:#e5e7eb;
+                                        font-size:0.75rem;
+                                        cursor:pointer;
+                                    ",
+                                    onclick: {
+                                        let mut ack_error_ts = ack_error_ts;
+                                        move |_| ack_error_ts.set(latest_error_ts)
+                                    },
+                                    "Acknowledge errors"
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Main body
-            div { style: "flex:1; min-height:0;",
-                match *active_main_tab.read() {
-                    MainTab::State => rsx! { StateTab { flight_state: flight_state } },
-                    MainTab::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
-                    MainTab::Actions => rsx! { ActionsTab {} },
-                    MainTab::Warnings => rsx! { WarningsTab { warnings: warnings } },
-                    MainTab::Errors => rsx! { ErrorsTab { errors: errors } },
-                    MainTab::Data => rsx! {
-                        DataTab { rows: rows, active_tab: active_data_tab }
-                    },
+                // Main body
+                div { style: "flex:1; min-height:0;",
+                    match *active_main_tab.read() {
+                        MainTab::State => rsx! { StateTab { flight_state: flight_state } },
+                        MainTab::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
+                        MainTab::Actions => rsx! { ActionsTab {} },
+                        MainTab::Warnings => rsx! { WarningsTab { warnings: warnings } },
+                        MainTab::Errors => rsx! { ErrorsTab { errors: errors } },
+                        MainTab::Data => rsx! { DataTab { rows: rows, active_tab: active_data_tab } },
+                    }
                 }
             }
         }
@@ -706,12 +950,26 @@ fn log(msg: &str) {
 #[cfg(target_arch = "wasm32")]
 async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, String> {
     use gloo_net::http::Request;
-    let base = UrlConfig::base_http();
-    let url = if base.is_empty() {
+
+    let path = if path.starts_with('/') {
         path.to_string()
+    } else {
+        format!("/{path}")
+    };
+
+    let base = UrlConfig::base_http();
+
+    let url = if base.is_empty() {
+        let w = web_sys::window().ok_or("no window".to_string())?;
+        let origin = w
+            .location()
+            .origin()
+            .map_err(|_| "failed to read window.location.origin".to_string())?;
+        format!("{origin}{path}")
     } else {
         format!("{base}{path}")
     };
+
     Request::get(&url)
         .send()
         .await
@@ -723,12 +981,19 @@ async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, St
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, String> {
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+
     let base = UrlConfig::base_http();
     let url = if base.is_empty() {
         format!("http://localhost:3000{path}")
     } else {
         format!("{base}{path}")
     };
+
     reqwest::get(url)
         .await
         .map_err(|e| e.to_string())?
@@ -738,7 +1003,7 @@ async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, St
 }
 
 // ------------------------------
-// NEW: seed telemetry/alerts/gps
+// Seed telemetry/alerts/gps
 // ------------------------------
 async fn seed_from_db(
     rows: &mut Signal<Vec<TelemetryRow>>,
@@ -761,7 +1026,6 @@ async fn seed_from_db(
             }
         }
 
-        // downsample for plotting safety
         const MAX_INIT_POINTS: usize = 5000;
         let n = list.len();
         if n > MAX_INIT_POINTS {
@@ -773,7 +1037,6 @@ async fn seed_from_db(
                 .collect();
         }
 
-        // seed rocket gps from most recent GPS row in history
         if let Some(gps) = list.iter().rev().find_map(row_to_gps) {
             rocket_gps.set(Some(gps));
         }
@@ -783,25 +1046,13 @@ async fn seed_from_db(
 
     // ---- Alerts history (/api/alerts) ----
     if let Ok(mut alerts) = http_get_json::<Vec<AlertDto>>("/api/alerts?minutes=20").await {
-        // backend-reset detection (timestamps rewind)
         let max_ts = alerts.iter().map(|a| a.timestamp_ms).max().unwrap_or(0);
         let prev_ack = (*ack_warning_ts.read()).max(*ack_error_ts.read());
         if prev_ack > 0 && max_ts > 0 && max_ts < prev_ack - HISTORY_MS {
             ack_warning_ts.set(0);
             ack_error_ts.set(0);
-
-            #[cfg(target_arch = "wasm32")]
-            {
-                if let Some(window) = web_sys::window()
-                    && let Ok(Some(storage)) = window.local_storage()
-                {
-                    let _ = storage.remove_item(_WARNING_ACK_STORAGE_KEY);
-                    let _ = storage.remove_item(_ERROR_ACK_STORAGE_KEY);
-                }
-            }
         }
 
-        // newest first
         alerts.sort_by_key(|a| -a.timestamp_ms);
 
         let mut w = Vec::<AlertMsg>::new();
@@ -833,8 +1084,11 @@ async fn seed_from_db(
     Ok(())
 }
 
-// ---------- WebSocket loop ----------
-async fn connect_ws_loop(
+// ---------------------------------------------------------
+// WebSocket supervisor (reconnect loop) — both platforms
+// ---------------------------------------------------------
+async fn connect_ws_supervisor(
+    epoch: u64,
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
@@ -842,82 +1096,219 @@ async fn connect_ws_loop(
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
 ) -> Result<(), String> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        use wasm_bindgen::JsCast;
-        use wasm_bindgen::closure::Closure;
-        use web_sys::{MessageEvent, WebSocket};
-
-        let base_ws = UrlConfig::base_ws();
-        let ws_url = format!("{base_ws}/ws");
-
-        let ws = WebSocket::new(&ws_url).map_err(|_| "failed to create websocket".to_string())?;
-        *WS_SENDER.write() = Some(WsSender { ws: ws.clone() });
-
-        let onmessage = Closure::<dyn FnMut(_)>::new(move |e: MessageEvent| {
-            if let Some(s) = e.data().as_string() {
-                handle_ws_message(
-                    &s,
-                    rows,
-                    warnings,
-                    errors,
-                    flight_state,
-                    rocket_gps,
-                    user_gps,
-                );
-            }
-        });
-
-        ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-        onmessage.forget();
-
-        Ok(())
+    // If a newer epoch exists, do nothing.
+    if *WS_EPOCH.read() != epoch {
+        return Ok(());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use futures_util::{SinkExt, StreamExt};
-
-        let base_ws = UrlConfig::base_ws();
-        let ws_url = format!("{base_ws}/ws");
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        *WS_SENDER.write() = Some(WsSender { tx });
-
-        let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url.as_str())
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let (mut write, mut read) = ws_stream.split();
-
-        // writer task
-        let writer = tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                let _ = write
-                    .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
-                    .await;
-            }
-        });
-
-        // reader loop
-        while let Some(item) = read.next().await {
-            let msg = item.map_err(|e| e.to_string())?;
-            if let tokio_tungstenite::tungstenite::Message::Text(s) = msg {
-                handle_ws_message(
-                    &s,
-                    rows,
-                    warnings,
-                    errors,
-                    flight_state,
-                    rocket_gps,
-                    user_gps,
-                );
-            }
+    loop {
+        if *WS_EPOCH.read() != epoch {
+            break;
         }
 
-        let _ = writer.await;
-        Ok(())
+        let res = {
+            #[cfg(target_arch = "wasm32")]
+            {
+                connect_ws_once_wasm(
+                    epoch, rows, warnings, errors, flight_state, rocket_gps, user_gps,
+                )
+                .await
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                connect_ws_once_native(
+                    epoch, rows, warnings, errors, flight_state, rocket_gps, user_gps,
+                )
+                .await
+            }
+        };
+
+        if *WS_EPOCH.read() != epoch {
+            break;
+        }
+
+        if let Err(e) = res {
+            log!("ws connect error: {e}");
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        gloo_timers::future::TimeoutFuture::new(800).await;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn connect_ws_once_wasm(
+    epoch: u64,
+    rows: Signal<Vec<TelemetryRow>>,
+    warnings: Signal<Vec<AlertMsg>>,
+    errors: Signal<Vec<AlertMsg>>,
+    flight_state: Signal<FlightState>,
+    rocket_gps: Signal<Option<(f64, f64)>>,
+    user_gps: Signal<Option<(f64, f64)>>,
+) -> Result<(), String> {
+    use futures_channel::oneshot;
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::JsCast;
+    use web_sys::{CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
+
+    let base_ws = UrlConfig::base_ws();
+    let ws_url = format!("{base_ws}/ws");
+
+    log!("[WS] connecting to {ws_url} (epoch={epoch})");
+
+    let ws = WebSocket::new(&ws_url).map_err(|_| "failed to create websocket".to_string())?;
+
+    // store raw ws so bump_ws_epoch() can close it immediately
+    *WS_RAW.write() = Some(ws.clone());
+    *WS_SENDER.write() = Some(WsSender { ws: ws.clone() });
+
+    let (closed_tx, closed_rx) = oneshot::channel::<()>();
+    let closed_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(closed_tx)));
+
+    // onopen
+    {
+        let onopen: Closure<dyn FnMut(Event)> = Closure::new(move |_e: Event| {
+            log!("[WS] open");
+        });
+        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+        onopen.forget();
+    }
+
+    // onmessage
+    {
+        let onmessage: Closure<dyn FnMut(MessageEvent)> = Closure::new(move |e: MessageEvent| {
+            if let Some(s) = e.data().as_string() {
+                handle_ws_message(&s, rows, warnings, errors, flight_state, rocket_gps, user_gps);
+            }
+        });
+        ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        onmessage.forget();
+    }
+
+    // onerror
+    {
+        let closed_tx = closed_tx.clone();
+        let onerror: Closure<dyn FnMut(ErrorEvent)> = Closure::new(move |e: ErrorEvent| {
+            log!("[WS] error: {}", e.message());
+            if let Some(tx) = closed_tx.borrow_mut().take() {
+                let _ = tx.send(());
+            }
+        });
+        ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        onerror.forget();
+    }
+
+    // onclose
+    {
+        let closed_tx = closed_tx.clone();
+        let onclose: Closure<dyn FnMut(CloseEvent)> = Closure::new(move |e: CloseEvent| {
+            log!("[WS] close code={} reason='{}'", e.code(), e.reason());
+            if let Some(tx) = closed_tx.borrow_mut().take() {
+                let _ = tx.send(());
+            }
+        });
+        ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+        onclose.forget();
+    }
+
+    // Wait until close/error OR epoch changes.
+    futures_util::pin_mut!(closed_rx);
+
+    loop {
+        if *WS_EPOCH.read() != epoch {
+            let _ = ws.close();
+            break;
+        }
+
+        let done = futures_util::future::select(
+            &mut closed_rx,
+            gloo_timers::future::TimeoutFuture::new(150),
+        )
+        .await;
+
+        match done {
+            futures_util::future::Either::Left((_closed, _timeout)) => break,
+            futures_util::future::Either::Right((_timeout, _closed)) => {}
+        }
+    }
+
+    // cleanup sender if still pointing to this epoch's ws
+    if *WS_EPOCH.read() == epoch {
+        *WS_SENDER.write() = None;
+        *WS_RAW.write() = None;
+    }
+
+    Err("websocket closed".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn connect_ws_once_native(
+    epoch: u64,
+    rows: Signal<Vec<TelemetryRow>>,
+    warnings: Signal<Vec<AlertMsg>>,
+    errors: Signal<Vec<AlertMsg>>,
+    flight_state: Signal<FlightState>,
+    rocket_gps: Signal<Option<(f64, f64)>>,
+    user_gps: Signal<Option<(f64, f64)>>,
+) -> Result<(), String> {
+    use futures_util::{SinkExt, StreamExt};
+
+    if *WS_EPOCH.read() != epoch {
+        return Ok(());
+    }
+
+    let base_ws = UrlConfig::base_ws();
+    let ws_url = format!("{base_ws}/ws");
+
+    log!("[WS] connecting to {ws_url} (epoch={epoch})");
+
+    // command TX for UI -> socket writer
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    *WS_SENDER.write() = Some(WsSender { tx });
+
+    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url.as_str())
+        .await
+        .map_err(|e| format!("[WS] connect failed: {e}"))?;
+
+    let (mut write, mut read) = ws_stream.split();
+
+    // writer task
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let _ = write
+                .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                .await;
+        }
+    });
+
+    // read loop
+    while *WS_EPOCH.read() == epoch {
+        let Some(item) = read.next().await else { break };
+
+        let msg = match item {
+            Ok(m) => m,
+            Err(e) => {
+                log!("[WS] read error: {e}");
+                break;
+            }
+        };
+
+        if let tokio_tungstenite::tungstenite::Message::Text(s) = msg {
+            handle_ws_message(&s, rows, warnings, errors, flight_state, rocket_gps, user_gps);
+        }
+    }
+
+    // stop writer + clear sender
+    writer.abort();
+    *WS_SENDER.write() = None;
+
+    Err("websocket closed".to_string())
 }
 
 fn handle_ws_message(
@@ -949,7 +1340,6 @@ fn handle_ws_message(
             let mut v = rows.read().clone();
             v.push(row);
 
-            // Time-window trim (prefer timestamp-based)
             if let Some(last) = v.last() {
                 let cutoff = last.timestamp_ms - HISTORY_MS;
                 let split = v.partition_point(|r| r.timestamp_ms < cutoff);
@@ -958,7 +1348,6 @@ fn handle_ws_message(
                 }
             }
 
-            // cheap cap as safety
             const MAX_SAMPLES: usize = 10_000;
             if v.len() > MAX_SAMPLES {
                 let n = v.len();
@@ -998,7 +1387,7 @@ fn handle_ws_message(
 }
 
 // --------------------------------------------------------------------------------------------
-// JS helpers (unchanged from your current file)
+// JS helpers
 // --------------------------------------------------------------------------------------------
 fn js_read_window_string(key: &str) -> Option<String> {
     js_eval(&format!(
@@ -1011,8 +1400,7 @@ fn js_read_window_string(key: &str) -> Option<String> {
             window.__gs26_tmp_str = "";
           }}
         }})();
-        "#,
-        key = key
+        "#
     ));
 
     js_get_tmp_str()
@@ -1043,7 +1431,9 @@ fn js_get_tmp_str() -> Option<String> {
 fn js_is_ground_map_ready() -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     return true;
-    #[cfg(target_arch = "wasm32")]{
+
+    #[cfg(target_arch = "wasm32")]
+    {
         js_eval(
             r#"
         (function() {
