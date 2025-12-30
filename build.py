@@ -111,7 +111,7 @@ def build_frontend(frontend_dir: Path, platform_name: Optional[str] = None) -> N
     try:
         # Ensure any plist changes are applied before bundling.
 
-        cmd = ["dx", "bundle", "--assets", "--release"]
+        cmd = ["dx", "bundle", "--release"]
         if platform_name:
             cmd.extend(["--platform", platform_name])
         else :
