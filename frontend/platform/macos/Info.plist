@@ -1,5 +1,44 @@
-<key>NSLocalNetworkUsageDescription</key>
-<string>This app connects to devices on your local network to get data from the ground station.</string>
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+	<dict>
+		<key>CFBundleDisplayName</key>
+		<string>GroundstationFrontend</string>
 
-<key>NSLocationWhenInUseUsageDescription</key>
-<string>This app requires location access to help you locate your rocket.</string>
+        <key>NSLocalNetworkUsageDescription</key>
+        <string>This app connects to devices on your local network to get data from the ground station.</string>
+
+        <key>NSLocationUsageDescription</key>
+        <string>This app requires location access to help you locate your rocket.</string>
+
+        <key>NSLocationWhenInUseUsageDescription</key>
+        <string>This app requires location access to help you locate your rocket.</string>
+
+		<key>CFBundleExecutable</key>
+		<string>groundstation_frontend</string>
+
+		<key>CFBundleIdentifier</key>
+		<string>com.UBSEDS.GROUNDSTATION26</string>
+
+		<key>CFBundleName</key>
+		<string>GroundstationFrontend</string>
+
+		<key>CFBundleInfoDictionaryVersion</key>
+		<string>6.0</string>
+
+		<key>CFBundlePackageType</key>
+		<string>APPL</string>
+
+		<key>CFBundleShortVersionString</key>
+		<string>7.4.0</string>
+
+		<key>CFBundleVersion</key>
+		<string>1</string>
+
+		<key>LSApplicationCategoryType</key>
+		<string>public.app-category.social-networking</string>
+
+		<key>LSMinimumSystemVersion</key>
+		<string>10.15</string>
+	</dict>
+</plist>

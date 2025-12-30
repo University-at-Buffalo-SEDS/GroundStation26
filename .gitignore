@@ -14,3 +14,6 @@ __pycache__/
 
 .DS_Store
 /frontend/dist/public/
+/frontend/objc-build/
+/frontend/dist/
+/frontend/target/

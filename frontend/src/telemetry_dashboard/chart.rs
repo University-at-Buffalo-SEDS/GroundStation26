@@ -9,7 +9,7 @@
 //      * if fast -> increase bucket count
 //
 // This version avoids web_sys Window::performance() so it compiles
-// without enabling extra web-sys features.
+// without enabling extra assets-sys features.
 
 use dioxus::prelude::*;
 

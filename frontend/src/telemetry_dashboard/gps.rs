@@ -1,7 +1,4 @@
 // frontend/src/telemetry_dashboard/gps.rs
-//
-// Dioxus GPS/location module using dioxus-sdk geolocation.
-
 #![allow(dead_code)]
 
 use dioxus::prelude::*;
@@ -10,53 +7,81 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Start continuously updating `user_gps` with the best available platform
-/// location provider (via dioxus-sdk).
-///
-/// Call this from a component (recommended: App root) so it can spawn tasks
-/// and react to lifecycle properly.
-///
-/// Example:
-///   let user_gps = use_signal(|| None::<(f64, f64)>);
-///   gps::start_gps_updates(cx, user_gps);
 pub fn start_gps_updates(user_gps: Signal<Option<(f64, f64)>>) {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    // Run the SDK-based watcher.
-    sdk::start(user_gps);
+
+    imp::start(user_gps);
 }
 
-mod sdk {
+#[cfg(target_arch = "wasm32")]
+mod imp {
     use super::*;
     use dioxus_signals::WritableExt;
+    use wasm_bindgen::JsCast;
+    use web_sys::{window, GeolocationPosition};
 
-    // dioxus-sdk geolocation hook
-    use dioxus_sdk::geolocation::{use_geolocation};
+    pub fn start(mut user_gps: Signal<Option<(f64, f64)>>) {
+        let geo = window().unwrap().navigator().geolocation().unwrap();
 
-    /// Must be called from a component scope.
-    pub fn start(user_gps: Signal<Option<(f64, f64)>>) {
-        // dioxus-sdk hook: manages permissions + watching internally
-        let geo = use_geolocation();
-
-        // We need a mutable handle to call `.set()`
-        let mut user_gps = user_gps;
-
-        // React whenever the status changes and write into the signal.
-        use_effect(move || {
-            match geo() {
-                Ok(pos) => {
-                    let lat = pos.latitude;
-                    let lon = pos.longitude;
-                    if lat.is_finite() && lon.is_finite() {
-                        user_gps.set(Some((lat, lon)));
-                    }
-                }
-
-                Err(_) => {
-                    // leave last value
-                }
-            }
+        let success = Closure::<dyn FnMut(GeolocationPosition)>::new(move |pos| {
+            let coords = pos.coords();
+            let lat = coords.latitude();
+            let lon = coords.longitude();
+            user_gps.set(Some((lat, lon)));
         });
+
+        let error = Closure::<dyn FnMut(web_sys::GeolocationPositionError)>::new(move |_e| {
+            // ignore / log
+        });
+
+        geo.watch_position_with_error_callback(
+            success.as_ref().unchecked_ref(),
+            error.as_ref().unchecked_ref(),
+        )
+        .ok();
+
+        success.forget();
+        error.forget();
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod imp {
+    use super::*;
+    pub fn start(user_gps: Signal<Option<(f64, f64)>>) {
+        crate::telemetry_dashboard::gps_windows::start(user_gps);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod imp {
+    use super::*;
+    pub fn start(user_gps: Signal<Option<(f64, f64)>>) {
+        crate::telemetry_dashboard::gps_apple::start(user_gps);
+    }
+}
+
+#[cfg(target_os = "android")]
+mod imp {
+    use super::*;
+    pub fn start(user_gps: Signal<Option<(f64, f64)>>) {
+        crate::telemetry_dashboard::gps_android::start(user_gps);
+    }
+}
+
+// Optional: for linux/etc either stub or add another backend
+#[cfg(not(any(
+    target_arch = "wasm32",
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android"
+)))]
+mod imp {
+    use super::*;
+    pub fn start(_user_gps: Signal<Option<(f64, f64)>>) {
+        // no-op
     }
 }

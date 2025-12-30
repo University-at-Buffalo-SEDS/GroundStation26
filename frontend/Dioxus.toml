@@ -3,9 +3,9 @@ name = "groundstation_frontend"
 default_platform = "web"
 out_dir = "dist"
 # This folder is copied into the output dir after build/serve
-asset_dir = "web"
-icon = "web/favicon.png"
-
+asset_dir = "assets"
+icon = "assets/icon.png"
+category = "public.app-category.utilities"
 # If this is a workspace, uncomment and set:
 # sub_package = "groundstation_frontend"
 
@@ -13,18 +13,23 @@ icon = "web/favicon.png"
 title = "GroundStation 26"
 
 [web.watcher]
-watch_path = ["src", "web"]
+watch_path = ["src", "assets"]
 reload_html = true
 index_on_404 = true
 
 # If wasm-opt keeps crashing on your machine, disable it
-# (In 0.7, wasm-opt is configured under [web.wasm_opt])
+# (In 0.7, wasm-opt is configured under [assets.wasm_opt])
 [web.wasm_opt]
 level = "3"
 debug = false
 
-[bundle.macos]
-info_plist_path = "platform/macos/Info.plist"
+[bundle]
+identifier = "com.UBSEDS.GROUNDSTATION26"
+publisher = "UBSEDS"
+icon = ["assets/icon.png"]
 
-[bundle.ios]
-info_plist_path = "platform/ios/Info.plist"
+[bundle.macos]
+# Used for BOTH macOS and iOS bundles
+info_plist_path = "platform/macos/Info.plist"
+minimum_system_version = "13.0"
+hardened_runtime = true

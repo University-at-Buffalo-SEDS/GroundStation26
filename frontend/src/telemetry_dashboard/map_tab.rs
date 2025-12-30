@@ -1,8 +1,10 @@
 // frontend/src/telemetry_dashboard/map_tab.rs
 
+use crate::telemetry_dashboard::{
+    js_eval, js_is_ground_map_ready, js_read_window_string, UrlConfig,
+};
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
-use crate::telemetry_dashboard::{js_eval, js_is_ground_map_ready, js_read_window_string, UrlConfig};
 // #[cfg(target_arch = "wasm32")]
 // use gloo_timers::future::TimeoutFuture;
 
@@ -29,19 +31,27 @@ pub fn MapTab(
                 // It will do nothing until ground_station.js is loaded AND the map div exists.
                 js_eval(&format!(
                     r#"
-                (function() {{
-                  try {{
-                    if (window.__gs26_ground_station_loaded === true &&
-                        typeof window.initGroundMap === "function") {{
-                      window.initGroundMap({tiles:?}, 31.0, -99.0, 7.0);
-                      // once this succeeds, your JS initGroundMap() already guards duplicates
-                      return;
-                    }}
-                  }} catch (e) {{
-                    // swallow and retry
-                  }}
-                }})();
-                "#,
+                    (function() {{
+                      try {{
+                        if (window.__gs26_ground_station_loaded === true &&
+                            typeof window.initGroundMap === "function") {{
+
+                          window.initGroundMap({tiles:?}, 31.0, -99.0, 7.0);
+
+                          if (typeof window.updateGroundMapMarkers === "function") {{
+                            window.updateGroundMapMarkers(
+                              window.__gs26_pending_r_lat,
+                              window.__gs26_pending_r_lon,
+                              window.__gs26_pending_u_lat,
+                              window.__gs26_pending_u_lon
+                            );
+                          }}
+
+                          return;
+                        }}
+                      }} catch (e) {{}}
+                    }})();
+                    "#,
                     tiles = tiles_url(),
                 ));
 
@@ -168,11 +178,8 @@ pub fn MapTab(
     }
 
     // Effective user GPS: browser > parent
-    let effective_user = move || -> Option<(f64, f64)> {
-        browser_user_gps
-            .read()
-            .or_else(|| *user_gps.read())
-    };
+    let effective_user =
+        move || -> Option<(f64, f64)> { browser_user_gps.read().or_else(|| *user_gps.read()) };
 
     // --- 4) Update markers whenever rocket/user changes ---
     {
@@ -224,30 +231,48 @@ pub fn MapTab(
  * ============================================================================================== */
 
 fn js_update_markers(r_lat: f64, r_lon: f64, u_lat: f64, u_lon: f64) {
-
-        if !js_is_ground_map_ready() {
-        // Don't spam every render tick
-        return;
-    }
+    // Always cache the most recent values so the JS side can apply them later.
     js_eval(&format!(
         r#"
         (function() {{
           try {{
-            if (typeof window.updateGroundMapMarkers === "function") {{
-              window.updateGroundMapMarkers({r_lat}, {r_lon}, {u_lat}, {u_lon});
-            }} else {{
-              console.warn("updateGroundMapMarkers not found on window");
-            }}
-          }} catch (e) {{
-            console.warn("updateGroundMapMarkers threw:", e);
-          }}
+            window.__gs26_pending_r_lat = {r_lat};
+            window.__gs26_pending_r_lon = {r_lon};
+            window.__gs26_pending_u_lat = {u_lat};
+            window.__gs26_pending_u_lon = {u_lon};
+          }} catch (e) {{}}
         }})();
         "#,
         r_lat = r_lat,
         r_lon = r_lon,
         u_lat = u_lat,
-        u_lon = u_lon
+        u_lon = u_lon,
     ));
+
+    // If map isn't ready yet, don't drop the data—just return.
+    if !js_is_ground_map_ready() {
+        return;
+    }
+
+    // If ready, apply immediately.
+    js_eval(
+        r#"
+        (function() {
+          try {
+            if (typeof window.updateGroundMapMarkers === "function") {
+              window.updateGroundMapMarkers(
+                window.__gs26_pending_r_lat,
+                window.__gs26_pending_r_lon,
+                window.__gs26_pending_u_lat,
+                window.__gs26_pending_u_lon
+              );
+            }
+          } catch (e) {
+            console.warn("updateGroundMapMarkers threw:", e);
+          }
+        })();
+        "#,
+    );
 }
 
 fn js_center_on(lat: f64, lon: f64) {
@@ -330,4 +355,27 @@ fn js_read_window_f64(key: &str) -> Option<f64> {
     }
 }
 
+fn _js_apply_cached_markers_if_ready() {
+    if !js_is_ground_map_ready() {
+        return;
+    }
 
+    js_eval(
+        r#"
+        (function() {
+          try {
+            if (typeof window.updateGroundMapMarkers === "function") {
+              window.updateGroundMapMarkers(
+                window.__gs26_pending_r_lat,
+                window.__gs26_pending_r_lon,
+                window.__gs26_pending_u_lat,
+                window.__gs26_pending_u_lon
+              );
+            }
+          } catch (e) {
+            console.warn("apply cached markers failed:", e);
+          }
+        })();
+        "#,
+    );
+}

@@ -8,6 +8,8 @@ mod gps;
 pub mod map_tab;
 pub mod state_tab;
 pub mod warnings_tab;
+mod gps_apple;
+mod gps_android;
 
 use crate::telemetry_dashboard::actions_tab::ActionsTab;
 use data_tab::DataTab;
@@ -86,7 +88,7 @@ const _MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
 const _DATA_TAB_STORAGE_KEY: &str = "gs_data_tab";
 
 // --------------------------
-// localStorage helpers (web)
+// localStorage helpers (assets)
 // --------------------------
 #[cfg(target_arch = "wasm32")]
 fn storage_get_i64(key: &str) -> Option<i64> {
@@ -158,7 +160,7 @@ impl UrlConfig {
     }
 
     pub fn base_http() -> String {
-        // "" means same-origin for web; native should store full url
+        // "" means same-origin for assets; native should store full url
         BASE_URL.read().clone()
     }
 
@@ -177,7 +179,7 @@ impl UrlConfig {
             }
         }
 
-        // Native (or web with explicit URL):
+        // Native (or assets with explicit URL):
         // accept http(s)://host:port and convert to ws(s)://host:port
         if base.starts_with("https://") {
             base.replacen("https://", "wss://", 1)
@@ -250,7 +252,7 @@ pub fn TelemetryDashboard() -> Element {
     use_effect({
         move || {
             spawn(async move {
-                for _ in 0..100 {
+                for _ in 0..2000 {
                     if js_is_ground_map_ready() {
                         gps::start_gps_updates(user_gps);
                         return;
@@ -367,7 +369,7 @@ pub fn TelemetryDashboard() -> Element {
     }
 
     // ----------------------------------------
-    // Flash loop (both web + native)
+    // Flash loop (both assets + native)
     // ----------------------------------------
     {
         let mut flash_on = flash_on;
@@ -1039,8 +1041,11 @@ fn js_get_tmp_str() -> Option<String> {
 }
 
 fn js_is_ground_map_ready() -> bool {
-    js_eval(
-        r#"
+    #[cfg(not(target_arch = "wasm32"))]
+    return true;
+    #[cfg(target_arch = "wasm32")]{
+        js_eval(
+            r#"
         (function() {
           try {
             const ok =
@@ -1054,9 +1059,10 @@ fn js_is_ground_map_ready() -> bool {
           }
         })();
         "#,
-    );
+        );
 
-    js_read_window_string("__gs26_tmp_ready")
-        .unwrap_or_else(|| "false".to_string())
-        .eq_ignore_ascii_case("true")
+        js_read_window_string("__gs26_tmp_ready")
+            .unwrap_or_else(|| "false".to_string())
+            .eq_ignore_ascii_case("true")
+    }
 }
