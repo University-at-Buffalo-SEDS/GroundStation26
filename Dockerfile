@@ -24,9 +24,11 @@ RUN mkdir -p frontend/dist
 COPY frontend/src frontend/src
 COPY frontend/build.rs frontend/
 COPY frontend/Cargo.toml frontend/
-COPY frontend/dist/favicon.png frontend/dist
-COPY frontend/dist/index.html frontend/dist
-COPY frontend/dist/LICENSE frontend/dist
+COPY frontend/assets frontend/
+COPY frontend/platform frontend/
+COPY frontend/scripts frontend/
+COPY frontend/static frontend/
+COPY frontend/Dioxus.toml frontend/
 
 # Shared
 RUN mkdir -p shared/src
