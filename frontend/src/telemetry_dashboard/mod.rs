@@ -486,6 +486,7 @@ pub fn TelemetryDashboard() -> Element {
             last_applied_base.set(base.clone());
 
             UrlConfig::set_base_url_and_persist(base);
+            log!("[GS26] Base URL changed; reconnecting websockets.");
             bump_ws_epoch(); // only when base changes
         });
     }
@@ -693,6 +694,7 @@ pub fn TelemetryDashboard() -> Element {
     // ---------------------------------------------------------
     {
         let alive = alive.clone();
+        log!("ws supervisor starting");
 
         use_effect(move || {
             let epoch = *WS_EPOCH.read();
