@@ -34,18 +34,6 @@ use std::sync::{
     Arc,
 };
 
-#[derive(Clone)]
-struct AliveGuard {
-    alive: Arc<AtomicBool>,
-}
-impl Drop for AliveGuard {
-    fn drop(&mut self) {
-        self.alive.store(false, Ordering::Relaxed);
-        // ensure websocket tears down when leaving dashboard
-        bump_ws_epoch();
-    }
-}
-
 // ----------------------------
 // Cross-platform persistence
 //  - wasm32: localStorage
@@ -432,10 +420,28 @@ pub fn TelemetryDashboard() -> Element {
     // - when TelemetryDashboard unmounts, tasks stop cleanly
     // ---------------------------------------------------------
     let alive: Arc<AtomicBool> = use_hook(|| Arc::new(AtomicBool::new(true)));
-    let _alive_guard = use_hook(|| AliveGuard {
-        alive: alive.clone(),
-    });
+    // When TelemetryDashboard unmounts, mark tasks dead + bump epoch
+    {
+        let alive = alive.clone();
+        let _unmount_guard = use_hook(|| {
+            #[derive(Clone)]
+            struct Guard {
+                alive: Arc<AtomicBool>,
+            }
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.alive.store(false, Ordering::Relaxed);
+                    bump_ws_epoch();
+                    log!("[UI] TelemetryDashboard unmounted -> alive=false + bump epoch");
+                }
+            }
 
+            log!("[UI] TelemetryDashboard mounted (alive=true)");
+            Guard {
+                alive: alive.clone(),
+            }
+        });
+    }
     // ----------------------------
     // Persistent values (strings)
     // ----------------------------
@@ -701,6 +707,7 @@ pub fn TelemetryDashboard() -> Element {
             let alive = alive.clone();
             spawn(async move {
                 if !alive.load(Ordering::Relaxed) {
+                    log!("early exit from ws supervisor");
                     return;
                 }
 
@@ -1231,7 +1238,7 @@ async fn connect_ws_supervisor(
     if *WS_EPOCH.read() != epoch {
         return Ok(());
     }
-
+    log!("ws supervisor starting connection");
     loop {
         if !alive.load(Ordering::Relaxed) {
             break;
