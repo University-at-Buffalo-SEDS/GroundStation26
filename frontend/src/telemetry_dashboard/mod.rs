@@ -28,11 +28,42 @@ use serde::Deserialize;
 use state_tab::StateTab;
 use warnings_tab::WarningsTab;
 
-// NEW: stop background tasks when the dashboard unmounts
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+
+// ============================================================================
+// Dashboard lifetime: STATIC + ALWAYS PRESENT (never Option)
+// - Solves: Inner reads before Outer writes -> false Arc -> tasks early-exit
+// ============================================================================
+#[derive(Clone)]
+struct DashboardLife {
+    alive: Arc<AtomicBool>,
+    // bumps on every REAL mount of outer dashboard
+    r#gen: u64,
+}
+
+impl DashboardLife {
+    fn new_dead() -> Self {
+        Self {
+            alive: Arc::new(AtomicBool::new(false)),
+            r#gen: 0,
+        }
+    }
+}
+
+static DASHBOARD_LIFE: GlobalSignal<DashboardLife> = Signal::global(DashboardLife::new_dead);
+
+#[inline]
+fn dashboard_alive() -> Arc<AtomicBool> {
+    DASHBOARD_LIFE.read().alive.clone()
+}
+
+#[inline]
+fn dashboard_gen() -> u64 {
+    DASHBOARD_LIFE.read().r#gen
+}
 
 // ----------------------------
 // Cross-platform persistence
@@ -211,7 +242,7 @@ macro_rules! log {
 
 pub const HISTORY_MS: i64 = 60_000 * 20; // 20 minutes
 
-// unified storage keys (same as old wasm localStorage)
+// unified storage keys
 const WARNING_ACK_STORAGE_KEY: &str = "gs_last_warning_ack_ts";
 const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
 const MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
@@ -224,27 +255,26 @@ static WS_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 #[cfg(target_arch = "wasm32")]
 static WS_RAW: GlobalSignal<Option<web_sys::WebSocket>> = Signal::global(|| None);
 
+// Native “reload UI” remount key.
+// IMPORTANT: this key is applied ONLY to the INNER component, so it does NOT
+// trigger TelemetryDashboard’s unmount guard.
+static UI_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
+
 fn normalize_base_url(mut url: String) -> String {
-    // Strip fragment (#...)
     if let Some(idx) = url.find('#') {
         url.truncate(idx);
     }
-
-    // Strip path (/something) but keep scheme + host[:port]
     if let Some(scheme_end) = url.find("://") {
         let rest = &url[scheme_end + 3..];
         if let Some(slash) = rest.find('/') {
             url.truncate(scheme_end + 3 + slash);
         }
     }
-
     url.trim_end_matches('/').to_string()
 }
 
 pub fn abs_http(path: &str) -> String {
     let base = UrlConfig::base_http();
-
-    // Ensure we always join as base + "/path"
     let path = if path.starts_with('/') {
         path.to_string()
     } else {
@@ -259,7 +289,6 @@ pub fn abs_http(path: &str) -> String {
 }
 
 fn bump_ws_epoch() {
-    // Tear down any existing connection immediately, then bump the epoch to trigger a fresh connect.
     *WS_SENDER.write() = None;
 
     #[cfg(target_arch = "wasm32")]
@@ -270,6 +299,10 @@ fn bump_ws_epoch() {
     }
 
     *WS_EPOCH.write() += 1;
+}
+
+fn bump_ui_epoch() {
+    *UI_EPOCH.write() += 1;
 }
 
 // tab <-> string
@@ -295,7 +328,7 @@ fn _main_tab_from_str(s: &str) -> MainTab {
     }
 }
 
-// ---------- Base URL config (global, simple) ----------
+// ---------- Base URL config ----------
 pub struct UrlConfig;
 
 impl UrlConfig {
@@ -305,27 +338,19 @@ impl UrlConfig {
         persist::set_string(BASE_URL_STORAGE_KEY, &clean);
     }
 
-    pub fn _get_base_url() -> String {
-        BASE_URL.read().clone()
-    }
-
     pub fn base_http() -> String {
         let base = BASE_URL.read().clone();
 
-        // Native default
         #[cfg(not(target_arch = "wasm32"))]
         if base.is_empty() {
             return "http://localhost:3000".to_string();
         }
 
-        // Web: allow empty (we’ll use window.location in http_get_json)
         base
     }
 
-    /// Returns the websocket *origin* (scheme://host[:port]) with ws/wss,
-    /// NOT including "/ws" (callers append the path).
+    /// Returns ws/wss scheme + host[:port] (no path).
     pub fn base_ws() -> String {
-        // Web: if user didn't set a base URL, derive from window.location.
         #[cfg(target_arch = "wasm32")]
         {
             let base_http = BASE_URL.read().clone();
@@ -341,11 +366,7 @@ impl UrlConfig {
             }
         }
 
-        // If we have an explicit base URL, normalize it.
-        let base_http = UrlConfig::base_http();
-
-        // Strip any trailing slash to avoid //ws
-        let base_http = base_http.trim_end_matches('/').to_string();
+        let base_http = UrlConfig::base_http().trim_end_matches('/').to_string();
 
         if base_http.starts_with("https://") {
             base_http.replacen("https://", "wss://", 1)
@@ -361,11 +382,6 @@ impl UrlConfig {
 
 static BASE_URL: GlobalSignal<String> = Signal::global(String::new);
 
-// -----------------------------
-// Soft UI remount key
-// -----------------------------
-static UI_RELOAD_KEY: GlobalSignal<u64> = Signal::global(|| 0);
-
 #[cfg(target_arch = "wasm32")]
 fn hard_reload_app_web() {
     if let Some(w) = web_sys::window() {
@@ -374,13 +390,19 @@ fn hard_reload_app_web() {
 }
 
 fn reconnect_and_reload_ui() {
+    // Always restart websockets/tasks
     bump_ws_epoch();
-    *UI_RELOAD_KEY.write() += 1;
 
+    // Web: real reload
     #[cfg(target_arch = "wasm32")]
     {
-        // true full reload in the browser
         hard_reload_app_web();
+    }
+
+    // Native: soft “reload” by remounting ONLY the inner dashboard subtree
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        bump_ui_epoch();
     }
 }
 
@@ -412,36 +434,69 @@ impl WsSender {
 
 static WS_SENDER: GlobalSignal<Option<WsSender>> = Signal::global(|| None::<WsSender>);
 
-// ---------- Public root component ----------
+// ============================================================================
+// OUTER component: owns “real mount” lifetime & publishes it into DASHBOARD_LIFE
+// INNER component is keyed for native “reload UI” without tripping outer Drop.
+// ============================================================================
 #[component]
 pub fn TelemetryDashboard() -> Element {
-    // ---------------------------------------------------------
-    // Lifetime cancellation token:
-    // - when TelemetryDashboard unmounts, tasks stop cleanly
-    // ---------------------------------------------------------
+    // Create once per real mount
     let alive: Arc<AtomicBool> = use_hook(|| Arc::new(AtomicBool::new(true)));
-    // When TelemetryDashboard unmounts, mark tasks dead + bump epoch
-    {
+
+    // Mount + unmount guard
+    let _guard = use_hook({
         let alive = alive.clone();
-        let _unmount_guard = use_hook(|| {
+        move || {
             #[derive(Clone)]
             struct Guard {
                 alive: Arc<AtomicBool>,
             }
+
             impl Drop for Guard {
                 fn drop(&mut self) {
                     self.alive.store(false, Ordering::Relaxed);
+
+                    // Only clear if we're still the published dashboard
+                    let cur = DASHBOARD_LIFE.read().alive.clone();
+                    if Arc::ptr_eq(&cur, &self.alive) {
+                        *DASHBOARD_LIFE.write() = DashboardLife::new_dead();
+                    }
+
                     bump_ws_epoch();
                     log!("[UI] TelemetryDashboard unmounted -> alive=false + bump epoch");
                 }
             }
 
-            log!("[UI] TelemetryDashboard mounted (alive=true)");
-            Guard {
-                alive: alive.clone(),
+            // Publish global life (never Option)
+            {
+                let mut st = DASHBOARD_LIFE.write();
+                let next_gen = st.r#gen.wrapping_add(1);
+                *st = DashboardLife {
+                    alive: alive.clone(),
+                    r#gen: next_gen,
+                };
             }
-        });
+
+            log!(
+                "[UI] TelemetryDashboard mounted (alive=true, gen={})",
+                dashboard_gen()
+            );
+
+            Guard { alive }
+        }
+    });
+
+    rsx! {
+        TelemetryDashboardInner { key: "{*UI_EPOCH.read()}" }
     }
+}
+
+// ---------- INNER dashboard (this is what we remount on native reload) ----------
+#[component]
+fn TelemetryDashboardInner() -> Element {
+    // Always valid; becomes “real” once outer publishes it.
+    let alive = dashboard_alive();
+
     // ----------------------------
     // Persistent values (strings)
     // ----------------------------
@@ -474,17 +529,13 @@ pub fn TelemetryDashboard() -> Element {
     let user_gps = use_signal(|| None::<(f64, f64)>);
 
     // ---------------------------------------------------------
-    // Base URL: keep UrlConfig in sync with persisted signal.
-    // When it changes, reconnect websocket on BOTH platforms.
+    // Base URL sync
     // ---------------------------------------------------------
     {
-        // Track the last base we applied so we don't bump epoch every render.
         let mut last_applied_base = use_signal(String::new);
 
         use_effect(move || {
             let base = st_base_url.read().clone();
-
-            // Only act when the value actually changes.
             if *last_applied_base.read() == base {
                 return;
             }
@@ -492,12 +543,12 @@ pub fn TelemetryDashboard() -> Element {
             last_applied_base.set(base.clone());
 
             UrlConfig::set_base_url_and_persist(base);
-            log!("[GS26] Base URL changed; reconnecting websockets.");
-            bump_ws_epoch(); // only when base changes
+            log!("[GS26] Base URL changed; bumping ws epoch.");
+            bump_ws_epoch();
         });
     }
 
-    // Persist UI state changes (localStorage on wasm, file on native)
+    // Persist UI state changes
     {
         let mut st_main_tab = st_main_tab;
         use_effect(move || {
@@ -537,14 +588,16 @@ pub fn TelemetryDashboard() -> Element {
         });
     }
 
-    // Start GPS updates only once JS is ready (your existing logic)
+    // Start GPS updates only once JS is ready
     use_effect({
         let alive = alive.clone();
+        let user_gps = user_gps;
         move || {
             let alive = alive.clone();
+            let epoch = *WS_EPOCH.read();
             spawn(async move {
                 for _ in 0..2000 {
-                    if !alive.load(Ordering::Relaxed) {
+                    if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
                         return;
                     }
 
@@ -560,7 +613,7 @@ pub fn TelemetryDashboard() -> Element {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
 
-                if alive.load(Ordering::Relaxed) {
+                if alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
                     js_eval(
                         r#"console.warn("[GS26] JS not ready; skipped gps::start_gps_updates (timeout)");"#,
                     );
@@ -569,7 +622,7 @@ pub fn TelemetryDashboard() -> Element {
         }
     });
 
-    // Seed telemetry + alerts + gps from DB (HTTP) on mount
+    // Seed from DB (HTTP) on mount
     {
         let mut did_seed = use_signal(|| false);
 
@@ -588,9 +641,11 @@ pub fn TelemetryDashboard() -> Element {
                 return;
             }
             did_seed.set(true);
+
             let alive = alive.clone();
+            let epoch = *WS_EPOCH.read();
             spawn(async move {
-                if !alive.load(Ordering::Relaxed) {
+                if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
                     return;
                 }
 
@@ -606,7 +661,7 @@ pub fn TelemetryDashboard() -> Element {
                 )
                 .await
                 {
-                    if alive.load(Ordering::Relaxed) {
+                    if alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
                         log!("seed_from_db failed: {e}");
                     }
                 }
@@ -614,22 +669,23 @@ pub fn TelemetryDashboard() -> Element {
         });
     }
 
-    // Flash loop (STOPs when dashboard unmounts)
+    // Flash loop
     {
         let mut flash_on = flash_on;
         let alive = alive.clone();
 
         use_effect(move || {
             let alive = alive.clone();
+            let epoch = *WS_EPOCH.read();
             spawn(async move {
-                while alive.load(Ordering::Relaxed) {
+                while alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
                     #[cfg(target_arch = "wasm32")]
                     gloo_timers::future::TimeoutFuture::new(500).await;
 
                     #[cfg(not(target_arch = "wasm32"))]
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                    if !alive.load(Ordering::Relaxed) {
+                    if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
                         break;
                     }
 
@@ -640,7 +696,7 @@ pub fn TelemetryDashboard() -> Element {
         });
     }
 
-    // Derived state: counts + unacked + border
+    // Derived state
     let warn_count = warnings.read().len();
     let err_count = errors.read().len();
 
@@ -678,13 +734,14 @@ pub fn TelemetryDashboard() -> Element {
 
         use_effect(move || {
             let alive = alive.clone();
+            let epoch = *WS_EPOCH.read();
             spawn(async move {
-                if !alive.load(Ordering::Relaxed) {
+                if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
                     return;
                 }
 
                 if let Ok(state) = http_get_json::<FlightState>("/flightstate").await {
-                    if alive.load(Ordering::Relaxed) {
+                    if alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
                         flight_state.set(state);
                     }
                 }
@@ -692,22 +749,24 @@ pub fn TelemetryDashboard() -> Element {
         });
     }
 
-    // ---------------------------------------------------------
-    // WebSocket supervisor:
-    // - runs on BOTH platforms
-    // - reconnects whenever WS_EPOCH changes
-    // - stops when dashboard unmounts
-    // ---------------------------------------------------------
+    // WebSocket supervisor (spawn ONCE per epoch)
     {
         let alive = alive.clone();
-        log!("ws supervisor starting");
+        let mut last_started_epoch = use_signal(|| None::<u64>);
 
         use_effect(move || {
             let epoch = *WS_EPOCH.read();
+
+            if last_started_epoch.read().as_ref() == Some(&epoch) {
+                return;
+            }
+            last_started_epoch.set(Some(epoch));
+
+            log!("[WS] supervisor spawn (epoch={epoch})");
             let alive = alive.clone();
             spawn(async move {
                 if !alive.load(Ordering::Relaxed) {
-                    log!("early exit from ws supervisor");
+                    log!("[WS] early exit (alive=false) epoch={epoch}");
                     return;
                 }
 
@@ -724,14 +783,14 @@ pub fn TelemetryDashboard() -> Element {
                 .await
                 {
                     if alive.load(Ordering::Relaxed) {
-                        log!("ws supervisor ended: {e}");
+                        log!("[WS] supervisor ended: {e}");
                     }
                 }
             });
         });
     }
 
-    // Top nav button styles
+    // Button styles
     let tab_style_active = |color: &str| {
         format!(
             "padding:0.4rem 0.8rem; border-radius:0.5rem;\
@@ -743,15 +802,13 @@ pub fn TelemetryDashboard() -> Element {
                              border:1px solid #4b5563; background:#020617;\
                              color:#e5e7eb; cursor:pointer;";
 
-    // -------------------------
-    // Native-only GO-TO-CONNECT button
-    // (IMPORTANT: tear down WS + remount key before navigating)
-    // -------------------------
+    // Native-only CONNECT button
     let connect_button: Element = {
         #[cfg(not(target_arch = "wasm32"))]
         use dioxus_router::use_navigator;
         #[cfg(not(target_arch = "wasm32"))]
         let nav = use_navigator();
+
         #[cfg(not(target_arch = "wasm32"))]
         rsx! {
             button {
@@ -765,10 +822,7 @@ pub fn TelemetryDashboard() -> Element {
                     cursor:pointer;
                 ",
                 onclick: move |_| {
-                    // stop background work before leaving dashboard
                     bump_ws_epoch();
-                    *UI_RELOAD_KEY.write() += 1;
-
                     let _ = nav.push(Route::Connect {});
                 },
                 "CONNECT"
@@ -781,11 +835,7 @@ pub fn TelemetryDashboard() -> Element {
         }
     };
 
-    // -------------------------
-    // RECONNECT button (both)
-    // - native: bump epoch + UI remount (safe, no crash)
-    // - web: also full page reload (forces a full re-init from URL)
-    // -------------------------
+    // Reload button (web: full reload, native: remount inner UI)
     let reload_button: Element = rsx! {
         button {
             style: "
@@ -800,236 +850,229 @@ pub fn TelemetryDashboard() -> Element {
             onclick: move |_| {
                 reconnect_and_reload_ui();
             },
-            "RECONNECT"
+            "RELOAD"
         }
     };
 
-    // ----------------------------------------
     // MAIN UI
-    // ----------------------------------------
     rsx! {
-        div { key: "{*UI_RELOAD_KEY.read()}",
+        div {
+            style: "
+                min-height:100vh;
+                padding:24px;
+                color:#e5e7eb;
+                font-family:system-ui, -apple-system, BlinkMacSystemFont;
+                background:#020617;
+                display:flex;
+                flex-direction:column;
+                border:{border_style};
+                box-sizing:border-box;
+            ",
+
+            // Header row 1
             div {
                 style: "
-                    min-height:100vh;
-                    padding:24px;
-                    color:#e5e7eb;
-                    font-family:system-ui, -apple-system, BlinkMacSystemFont;
-                    background:#020617;
                     display:flex;
-                    flex-direction:column;
-                    border:{border_style};
-                    box-sizing:border-box;
+                    align-items:center;
+                    justify-content:space-between;
+                    gap:16px;
+                    width:100%;
+                    margin-bottom:12px;
+                    flex-wrap:wrap;
+                ",
+                h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "Rocket Dashboard" }
+
+                div { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
+                    button {
+                        style: "
+                            padding:0.45rem 0.85rem;
+                            border-radius:0.75rem;
+                            border:1px solid #ef4444;
+                            background:#450a0a;
+                            color:#fecaca;
+                            font-weight:900;
+                            cursor:pointer;
+                        ",
+                        onclick: move |_| send_cmd("Abort"),
+                        "ABORT"
+                    }
+
+                    {reload_button}
+                    {connect_button}
+                }
+            }
+
+            // Header row 2
+            div {
+                style: "
+                    display:flex;
+                    align-items:center;
+                    gap:12px;
+                    width:100%;
+                    margin-bottom:12px;
+                    flex-wrap:wrap;
                 ",
 
-                // Header row 1: Title + buttons
                 div {
                     style: "
+                        flex:1 1 520px;
                         display:flex;
                         align-items:center;
-                        justify-content:space-between;
-                        gap:16px;
-                        width:100%;
-                        margin-bottom:12px;
-                        flex-wrap:wrap;
+                        padding:0.85rem;
+                        border-radius:0.75rem;
+                        background:#020617ee;
+                        border:1px solid #4b5563;
+                        box-shadow:0 10e0px 25px rgba(0,0,0,0.45);
+                        min-width:420px;
                     ",
-                    h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "Rocket Dashboard" }
-
-                    div { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
+                    nav { style: "display:flex; gap:0.5rem; flex-wrap:wrap;",
                         button {
-                            style: "
-                                padding:0.45rem 0.85rem;
-                                border-radius:0.75rem;
-                                border:1px solid #ef4444;
-                                background:#450a0a;
-                                color:#fecaca;
-                                font-weight:900;
-                                cursor:pointer;
-                            ",
-                            onclick: move |_| send_cmd("Abort"),
-                            "ABORT"
+                            style: if *active_main_tab.read() == MainTab::State { tab_style_active("#38bdf8") } else { tab_style_inactive.to_string() },
+                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::State) },
+                            "Flight"
                         }
-
-                        {reload_button}
-                        {connect_button}
+                        button {
+                            style: if *active_main_tab.read() == MainTab::Map { tab_style_active("#22c55e") } else { tab_style_inactive.to_string() },
+                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Map) },
+                            "Map"
+                        }
+                        button {
+                            style: if *active_main_tab.read() == MainTab::Actions { tab_style_active("#a78bfa") } else { tab_style_inactive.to_string() },
+                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Actions) },
+                            "Actions"
+                        }
+                        button {
+                            style: if *active_main_tab.read() == MainTab::Warnings { tab_style_active("#facc15") } else { tab_style_inactive.to_string() },
+                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Warnings) },
+                            span { "Warnings" }
+                            if has_warnings {
+                                span {
+                                    style: {
+                                        if has_unacked_warnings && *flash_on.read() {
+                                            "margin-left:6px; color:#facc15; opacity:1;".to_string()
+                                        } else if has_unacked_warnings {
+                                            "margin-left:6px; color:#facc15; opacity:0.4;".to_string()
+                                        } else {
+                                            "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                                        }
+                                    },
+                                    "⚠"
+                                }
+                            }
+                        }
+                        button {
+                            style: if *active_main_tab.read() == MainTab::Errors { tab_style_active("#ef4444") } else { tab_style_inactive.to_string() },
+                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Errors) },
+                            span { "Errors" }
+                            if has_errors {
+                                span {
+                                    style: {
+                                        if has_unacked_errors && *flash_on.read() {
+                                            "margin-left:6px; color:#fecaca; opacity:1;".to_string()
+                                        } else if has_unacked_errors {
+                                            "margin-left:6px; color:#fecaca; opacity:0.4;".to_string()
+                                        } else {
+                                            "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                                        }
+                                    },
+                                    "⛔"
+                                }
+                            }
+                        }
+                        button {
+                            style: if *active_main_tab.read() == MainTab::Data { tab_style_active("#f97316") } else { tab_style_inactive.to_string() },
+                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Data) },
+                            "Data"
+                        }
                     }
                 }
 
-                // Header row 2: Tabs + Status
                 div {
                     style: "
+                        flex:0 1 420px;
                         display:flex;
                         align-items:center;
-                        gap:12px;
-                        width:100%;
-                        margin-bottom:12px;
-                        flex-wrap:wrap;
+                        gap:0.75rem;
+                        padding:0.35rem 0.7rem;
+                        border-radius:999px;
+                        background:#111827;
+                        border:1px solid #4b5563;
+                        white-space:nowrap;
                     ",
+                    span { style: "color:#9ca3af;", "Status:" }
 
-                    // Tabs panel
-                    div {
-                        style: "
-                            flex:1 1 520px;
-                            display:flex;
-                            align-items:center;
-                            padding:0.85rem;
-                            border-radius:0.75rem;
-                            background:#020617ee;
-                            border:1px solid #4b5563;
-                            box-shadow:0 10px 25px rgba(0,0,0,0.45);
-                            min-width:420px;
-                        ",
-                        nav { style: "display:flex; gap:0.5rem; flex-wrap:wrap;",
+                    if !has_warnings && !has_errors {
+                        span { style: "color:#22c55e; font-weight:600;", "Nominal" }
+                        span { style: "color:#93c5fd; margin-left:0.75rem;",
+                            "(Flight state: ",
+                            "{flight_state.read().to_string()}",
+                            ")"
+                        }
+                    } else {
+                        if has_errors {
+                            span { style: "color:#fecaca;", {format!("{err_count} error(s)")} }
+                        }
+                        if has_warnings {
+                            span { style: "color:#fecaca;", {format!("{warn_count} warnings(s)")} }
+                        }
+                        span { style: "color:#93c5fd; margin-left:0.75rem;",
+                            "(Flight state: ",
+                            "{flight_state.read().to_string()}",
+                            ")"
+                        }
+
+                        if *active_main_tab.read() == MainTab::Warnings && has_warnings {
                             button {
-                                style: if *active_main_tab.read() == MainTab::State { tab_style_active("#38bdf8") } else { tab_style_inactive.to_string() },
-                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::State) },
-                                "Flight"
-                            }
-                            button {
-                                style: if *active_main_tab.read() == MainTab::Map { tab_style_active("#22c55e") } else { tab_style_inactive.to_string() },
-                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Map) },
-                                "Map"
-                            }
-                            button {
-                                style: if *active_main_tab.read() == MainTab::Actions { tab_style_active("#a78bfa") } else { tab_style_inactive.to_string() },
-                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Actions) },
-                                "Actions"
-                            }
-                            button {
-                                style: if *active_main_tab.read() == MainTab::Warnings { tab_style_active("#facc15") } else { tab_style_inactive.to_string() },
-                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Warnings) },
-                                span { "Warnings" }
-                                if has_warnings {
-                                    span {
-                                        style: {
-                                            if has_unacked_warnings && *flash_on.read() {
-                                                "margin-left:6px; color:#facc15; opacity:1;".to_string()
-                                            } else if has_unacked_warnings {
-                                                "margin-left:6px; color:#facc15; opacity:0.4;".to_string()
-                                            } else {
-                                                "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
-                                            }
-                                        },
-                                        "⚠"
-                                    }
-                                }
-                            }
-                            button {
-                                style: if *active_main_tab.read() == MainTab::Errors { tab_style_active("#ef4444") } else { tab_style_inactive.to_string() },
-                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Errors) },
-                                span { "Errors" }
-                                if has_errors {
-                                    span {
-                                        style: {
-                                            if has_unacked_errors && *flash_on.read() {
-                                                "margin-left:6px; color:#fecaca; opacity:1;".to_string()
-                                            } else if has_unacked_errors {
-                                                "margin-left:6px; color:#fecaca; opacity:0.4;".to_string()
-                                            } else {
-                                                "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
-                                            }
-                                        },
-                                        "⛔"
-                                    }
-                                }
-                            }
-                            button {
-                                style: if *active_main_tab.read() == MainTab::Data { tab_style_active("#f97316") } else { tab_style_inactive.to_string() },
-                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Data) },
-                                "Data"
+                                style: "
+                                    margin-left:auto;
+                                    padding:0.25rem 0.7rem;
+                                    border-radius:999px;
+                                    border:1px solid #4b5563;
+                                    background:#020617;
+                                    color:#e5e7eb;
+                                    font-size:0.75rem;
+                                    cursor:pointer;
+                                ",
+                                onclick: {
+                                    let mut ack_warning_ts = ack_warning_ts;
+                                    move |_| ack_warning_ts.set(latest_warning_ts)
+                                },
+                                "Acknowledge warnings"
                             }
                         }
-                    }
 
-                    // Status pill next to tabs
-                    div {
-                        style: "
-                            flex:0 1 420px;
-                            display:flex;
-                            align-items:center;
-                            gap:0.75rem;
-                            padding:0.35rem 0.7rem;
-                            border-radius:999px;
-                            background:#111827;
-                            border:1px solid #4b5563;
-                            white-space:nowrap;
-                        ",
-                        span { style: "color:#9ca3af;", "Status:" }
-
-                        if !has_warnings && !has_errors {
-                            span { style: "color:#22c55e; font-weight:600;", "Nominal" }
-                            span { style: "color:#93c5fd; margin-left:0.75rem;",
-                                "(Flight state: ",
-                                "{flight_state.read().to_string()}",
-                                ")"
-                            }
-                        } else {
-                            if has_errors {
-                                span { style: "color:#fecaca;", {format!("{err_count} error(s)")} }
-                            }
-                            if has_warnings {
-                                span { style: "color:#fecaca;", {format!("{warn_count} warnings(s)")} }
-                            }
-
-                            span { style: "color:#93c5fd; margin-left:0.75rem;",
-                                "(Flight state: ",
-                                "{flight_state.read().to_string()}",
-                                ")"
-                            }
-
-                            if *active_main_tab.read() == MainTab::Warnings && has_warnings {
-                                button {
-                                    style: "
-                                        margin-left:auto;
-                                        padding:0.25rem 0.7rem;
-                                        border-radius:999px;
-                                        border:1px solid #4b5563;
-                                        background:#020617;
-                                        color:#e5e7eb;
-                                        font-size:0.75rem;
-                                        cursor:pointer;
-                                    ",
-                                    onclick: {
-                                        let mut ack_warning_ts = ack_warning_ts;
-                                        move |_| ack_warning_ts.set(latest_warning_ts)
-                                    },
-                                    "Acknowledge warnings"
-                                }
-                            }
-
-                            if *active_main_tab.read() == MainTab::Errors && has_errors {
-                                button {
-                                    style: "
-                                        margin-left:auto;
-                                        padding:0.25rem 0.7rem;
-                                        border-radius:999px;
-                                        border:1px solid #4b5563;
-                                        background:#020617;
-                                        color:#e5e7eb;
-                                        font-size:0.75rem;
-                                        cursor:pointer;
-                                    ",
-                                    onclick: {
-                                        let mut ack_error_ts = ack_error_ts;
-                                        move |_| ack_error_ts.set(latest_error_ts)
-                                    },
-                                    "Acknowledge errors"
-                                }
+                        if *active_main_tab.read() == MainTab::Errors && has_errors {
+                            button {
+                                style: "
+                                    margin-left:auto;
+                                    padding:0.25rem 0.7rem;
+                                    border-radius:999px;
+                                    border:1px solid #4b5563;
+                                    background:#020617;
+                                    color:#e5e7eb;
+                                    font-size:0.75rem;
+                                    cursor:pointer;
+                                ",
+                                onclick: {
+                                    let mut ack_error_ts = ack_error_ts;
+                                    move |_| ack_error_ts.set(latest_error_ts)
+                                },
+                                "Acknowledge errors"
                             }
                         }
                     }
                 }
+            }
 
-                // Main body
-                div { style: "flex:1; min-height:0;",
-                    match *active_main_tab.read() {
-                        MainTab::State => rsx! { StateTab { flight_state: flight_state } },
-                        MainTab::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
-                        MainTab::Actions => rsx! { ActionsTab {} },
-                        MainTab::Warnings => rsx! { WarningsTab { warnings: warnings } },
-                        MainTab::Errors => rsx! { ErrorsTab { errors: errors } },
-                        MainTab::Data => rsx! { DataTab { rows: rows, active_tab: active_data_tab } },
-                    }
+            // Main body
+            div { style: "flex:1; min-height:0;",
+                match *active_main_tab.read() {
+                    MainTab::State => rsx! { StateTab { flight_state: flight_state } },
+                    MainTab::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
+                    MainTab::Actions => rsx! { ActionsTab {} },
+                    MainTab::Warnings => rsx! { WarningsTab { warnings: warnings } },
+                    MainTab::Errors => rsx! { ErrorsTab { errors: errors } },
+                    MainTab::Data => rsx! { DataTab { rows: rows, active_tab: active_data_tab } },
                 }
             }
         }
@@ -1042,7 +1085,6 @@ fn send_cmd(cmd: &str) {
     }
 }
 
-// --------- Extract GPS points ----------
 fn row_to_gps(row: &TelemetryRow) -> Option<(f64, f64)> {
     let is_gps_type = matches!(row.data_type.as_str(), "GPS" | "GPS_DATA" | "ROCKET_GPS");
     if !is_gps_type {
@@ -1234,11 +1276,12 @@ async fn connect_ws_supervisor(
     user_gps: Signal<Option<(f64, f64)>>,
     alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    // If a newer epoch exists, do nothing.
     if *WS_EPOCH.read() != epoch {
         return Ok(());
     }
-    log!("ws supervisor starting connection");
+
+    log!("[WS] supervisor starting connection (epoch={epoch})");
+
     loop {
         if !alive.load(Ordering::Relaxed) {
             break;
@@ -1288,7 +1331,7 @@ async fn connect_ws_supervisor(
 
         if let Err(e) = res {
             if alive.load(Ordering::Relaxed) {
-                log!("ws connect error: {e}");
+                log!("[WS] connect error: {e}");
             }
         }
 
@@ -1329,14 +1372,12 @@ async fn connect_ws_once_wasm(
 
     let ws = WebSocket::new(&ws_url).map_err(|_| "failed to create websocket".to_string())?;
 
-    // store raw ws so bump_ws_epoch() can close it immediately
     *WS_RAW.write() = Some(ws.clone());
     *WS_SENDER.write() = Some(WsSender { ws: ws.clone() });
 
     let (closed_tx, closed_rx) = oneshot::channel::<()>();
     let closed_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(closed_tx)));
 
-    // onopen
     {
         let onopen: Closure<dyn FnMut(Event)> = Closure::new(move |_e: Event| {
             log!("[WS] open");
@@ -1345,7 +1386,6 @@ async fn connect_ws_once_wasm(
         onopen.forget();
     }
 
-    // onmessage
     {
         let onmessage: Closure<dyn FnMut(MessageEvent)> = Closure::new(move |e: MessageEvent| {
             if let Some(s) = e.data().as_string() {
@@ -1364,7 +1404,6 @@ async fn connect_ws_once_wasm(
         onmessage.forget();
     }
 
-    // onerror
     {
         let closed_tx = closed_tx.clone();
         let onerror: Closure<dyn FnMut(ErrorEvent)> = Closure::new(move |e: ErrorEvent| {
@@ -1377,7 +1416,6 @@ async fn connect_ws_once_wasm(
         onerror.forget();
     }
 
-    // onclose
     {
         let closed_tx = closed_tx.clone();
         let onclose: Closure<dyn FnMut(CloseEvent)> = Closure::new(move |e: CloseEvent| {
@@ -1390,7 +1428,6 @@ async fn connect_ws_once_wasm(
         onclose.forget();
     }
 
-    // Wait until close/error OR epoch changes OR dashboard unmounts.
     futures_util::pin_mut!(closed_rx);
 
     loop {
@@ -1415,7 +1452,6 @@ async fn connect_ws_once_wasm(
         }
     }
 
-    // cleanup sender if still pointing to this epoch's ws
     if *WS_EPOCH.read() == epoch {
         *WS_SENDER.write() = None;
         *WS_RAW.write() = None;
@@ -1449,7 +1485,6 @@ async fn connect_ws_once_native(
 
     log!("[WS] connecting to {ws_url} (epoch={epoch})");
 
-    // command TX for UI -> socket writer
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     *WS_SENDER.write() = Some(WsSender { tx });
 
@@ -1459,7 +1494,6 @@ async fn connect_ws_once_native(
 
     let (mut write, mut read) = ws_stream.split();
 
-    // writer task
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             let _ = write
@@ -1468,7 +1502,6 @@ async fn connect_ws_once_native(
         }
     });
 
-    // read loop (STOPs if unmounted or epoch changes)
     while alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
         let Some(item) = read.next().await else { break };
 
@@ -1493,7 +1526,6 @@ async fn connect_ws_once_native(
         }
     }
 
-    // stop writer + clear sender
     writer.abort();
     *WS_SENDER.write() = None;
 
