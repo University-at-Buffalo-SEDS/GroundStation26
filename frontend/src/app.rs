@@ -467,7 +467,7 @@ pub fn Connect() -> Element {
 
     let initial = persist::read_base_url()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "http://jetbrains-vm.com:3000".to_string());
+        .unwrap_or_else(|| "http://localhost:3000".to_string());
 
     let mut url_edit = use_signal(|| initial);
 
@@ -484,7 +484,7 @@ pub fn Connect() -> Element {
 
                 p { style: "margin:0 0 16px 0; color:#94a3b8;",
                     "Enter the backend URL (including http:// or https://). Example: ",
-                    code { "http://jetbrains-vm.com:3000" }
+                    code { "http://localhost:3000" }
                 }
 
                 input {
