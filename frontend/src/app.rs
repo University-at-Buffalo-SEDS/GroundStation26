@@ -34,8 +34,8 @@ html, body {
 * { box-sizing: border-box; }
 "#;
 
-const _BASE_URL_KEY: &str = "gs26_base_url";
-const _CONNECT_SHOWN_KEY: &str = "gs26_connect_shown";
+const _BASE_URL_KEY: &str = "gs_base_url";
+const _CONNECT_SHOWN_KEY: &str = "gs_connect_shown";
 
 #[derive(Clone, Routable, PartialEq)]
 pub enum Route {
@@ -72,46 +72,6 @@ mod objc_poke {
 // -------------------------
 // Persistence helpers
 // -------------------------
-#[cfg(target_arch = "wasm32")]
-mod persist {
-    use super::{_BASE_URL_KEY, _CONNECT_SHOWN_KEY};
-
-    fn read_key(key: &str) -> Option<String> {
-        use web_sys::window;
-        let w = window()?;
-        let ls = w.local_storage().ok()??;
-        ls.get_item(key).ok().flatten()
-    }
-
-    fn write_key(key: &str, v: &str) {
-        use web_sys::window;
-        if let Some(w) = window() {
-            if let Ok(Some(ls)) = w.local_storage() {
-                let _ = ls.set_item(key, v);
-            }
-        }
-    }
-
-    pub fn read_base_url() -> Option<String> {
-        read_key(_BASE_URL_KEY)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-
-    pub fn write_base_url(v: &str) {
-        write_key(_BASE_URL_KEY, v);
-    }
-
-    pub fn read_connect_shown() -> bool {
-        read_key(_CONNECT_SHOWN_KEY)
-            .map(|s| s.trim().eq_ignore_ascii_case("true") || s.trim() == "1")
-            .unwrap_or(false)
-    }
-
-    pub fn write_connect_shown(v: bool) {
-        write_key(_CONNECT_SHOWN_KEY, if v { "true" } else { "false" });
-    }
-}
 
 #[cfg(not(target_arch = "wasm32"))]
 mod persist {
@@ -131,7 +91,9 @@ mod persist {
 
     fn read_key(key: &str) -> Option<String> {
         let path = path_for(key);
-        std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
     }
 
     fn write_key(key: &str, v: &str) -> Result<(), io::Error> {
@@ -156,7 +118,7 @@ mod persist {
 // -------------------------
 // URL parsing / normalization
 // -------------------------
-
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug)]
 struct ParsedBaseUrl {
     scheme: String, // "http" or "https"
@@ -164,6 +126,7 @@ struct ParsedBaseUrl {
     port: u16,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn normalize_base_url(mut base: String) -> String {
     // strip fragment
     if let Some(i) = base.find('#') {
@@ -181,12 +144,14 @@ fn normalize_base_url(mut base: String) -> String {
     base.trim_end_matches('/').trim().to_string()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn join_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     let path = if path.starts_with('/') { path } else { "/" };
     format!("{base}{path}")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_base_url(url: &str) -> Result<ParsedBaseUrl, String> {
     let u = url.trim();
     let (scheme, rest) = if let Some(x) = u.strip_prefix("http://") {
@@ -213,12 +178,18 @@ fn parse_base_url(url: &str) -> Result<ParsedBaseUrl, String> {
     Ok(ParsedBaseUrl { scheme, host, port })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn ws_origin_for_base(parsed: &ParsedBaseUrl) -> String {
     // Use explicit port if non-default, keep it always (simpler + matches your base)
-    let ws_scheme = if parsed.scheme == "https" { "wss" } else { "ws" };
+    let ws_scheme = if parsed.scheme == "https" {
+        "wss"
+    } else {
+        "ws"
+    };
     format!("{ws_scheme}://{}:{}", parsed.host, parsed.port)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn snip(mut s: String, max: usize) -> String {
     s = s.replace('\r', "");
     if s.len() > max {
@@ -231,7 +202,7 @@ fn snip(mut s: String, max: usize) -> String {
 // -------------------------
 // Route probing (actual backend routes)
 // -------------------------
-
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 struct RouteCheck {
     path: &'static str,
@@ -243,6 +214,7 @@ struct RouteCheck {
     err: Option<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn status_ok_for_path(path: &str, status: u16) -> (bool, &'static str) {
     match path {
         "/api/recent" | "/api/history" | "/api/alerts" | "/flightstate" | "/api/gps" => {
@@ -252,7 +224,7 @@ fn status_ok_for_path(path: &str, status: u16) -> (bool, &'static str) {
             101 | 400 | 426 => (true, "reachable (ws upgrade required)"),
             _ => (false, "unexpected status for ws route"),
         },
-        "/tiles/" => match status {
+        "/tiles" => match status {
             200 | 403 | 404 => (true, "reachable (tile may not exist)"),
             _ => (false, "unexpected status for tiles"),
         },
@@ -301,25 +273,14 @@ async fn http_probe(url: String) -> Result<(u16, String), String> {
         .map_err(|e| format!("send failed: {} | kind={}", e, classify_reqwest_error(&e)))?;
 
     let status = resp.status().as_u16();
-    let body = resp.text().await.map_err(|e| format!("read body failed: {e}"))?;
-
-    Ok((status, snip(body, 300)))
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn http_probe(url: String) -> Result<(u16, String), String> {
-    use gloo_net::http::Request;
-
-    let resp = Request::get(&url)
-        .send()
+    let body = resp
+        .text()
         .await
-        .map_err(|e| format!("fetch failed: {e}"))?;
+        .map_err(|e| format!("read body failed: {e}"))?;
 
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_else(|_| "".to_string());
     Ok((status, snip(body, 300)))
 }
-
+#[cfg(not(target_arch = "wasm32"))]
 async fn test_routes_host_only(base: &str) -> Vec<RouteCheck> {
     let probes: &[&str] = &[
         "/api/recent",
@@ -327,7 +288,7 @@ async fn test_routes_host_only(base: &str) -> Vec<RouteCheck> {
         "/api/alerts",
         "/flightstate",
         "/api/gps",
-        "/tiles/7/29/51.jpg",
+        "/tiles",
         "/ws",
     ];
 
@@ -388,6 +349,7 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl) -> Result<String, String> {
         )),
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 
 fn format_route_report_host_only(
     original_base: &str,
@@ -407,7 +369,10 @@ fn format_route_report_host_only(
 
     for c in checks {
         let icon = if c.ok { "✅" } else { "❌" };
-        let status_str = c.status.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
+        let status_str = c
+            .status
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "—".into());
 
         s.push_str(&format!(
             "{icon} {:30} status {:>3}  {}\n    URL: {}\n",
@@ -578,7 +543,7 @@ pub fn Connect() -> Element {
                             };
 
                             testing.set(true);
-                            test_status.set("Testing (host only)...".to_string());
+                            test_status.set("Testing connection...".to_string());
 
                             // Hostname-only poke (keeps your original behavior)
                             objc_poke::poke_url(&u_norm);
