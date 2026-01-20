@@ -401,9 +401,6 @@ async fn test_routes(label: &str, base: &str, host_header: Option<String>) -> Ve
         "/api/alerts",
         "/flightstate",
         "/api/gps",
-        "/ground_map.js",
-        "/vendor/leaflet/leaflet.js",
-        "/vendor/leaflet/leaflet.css",
         "/tiles/",
         "/ws",
     ];

@@ -38,15 +38,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/gps", get(get_gps))
         .route("/ws", get(ws_handler))
         .nest_service("/tiles", tiles_dir)
-        .nest_service("/vendor/leaflet", vendor_dir)
-        .route("/ground_map.js", get(|| async {
-            // Serve the ground_map.js file
-            let path: PathBuf = "./frontend/assets/ground_map.js".into();
-            match tokio::fs::read_to_string(&path).await {
-                Ok(content) => ([(header::CONTENT_TYPE, "application/javascript")], content).into_response(),
-                Err(_) => (axum::http::StatusCode::NOT_FOUND, "Not Found").into_response(),
-            }
-        }))
+        // .nest_service("/vendor/leaflet", vendor_dir)
+        // .route("/ground_map.js", get(|| async {
+        //     // Serve the ground_map.js file
+        //     let path: PathBuf = "./frontend/assets/ground_map.js".into();
+        //     match tokio::fs::read_to_string(&path).await {
+        //         Ok(content) => ([(header::CONTENT_TYPE, "application/javascript")], content).into_response(),
+        //         Err(_) => (axum::http::StatusCode::NOT_FOUND, "Not Found").into_response(),
+        //     }
+        // }))
         .route("/favicon.ico", get(get_favicon))
         
 
