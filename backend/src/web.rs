@@ -25,7 +25,7 @@ static FAVICON_DATA: OnceCell<Bytes> = OnceCell::const_new();
 /// Public router constructor
 pub fn router(state: Arc<AppState>) -> Router {
     let static_dir = ServeDir::new("./frontend/dist/public");
-    let vendor_dir = ServeDir::new("../../frontend/assets/vendor/leaflet");
+    let vendor_dir = ServeDir::new("../../frontend/static/vendor/leaflet");
     let tiles_dir = tile_service(DEFAULT_MAP_REGION); // NEW
 
     Router::new()
