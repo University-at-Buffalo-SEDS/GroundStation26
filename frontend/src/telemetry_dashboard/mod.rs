@@ -36,6 +36,10 @@ use std::sync::{
 // ============================================================================
 // Dashboard lifetime: STATIC + ALWAYS PRESENT (never Option)
 // - Solves: Inner reads before Outer writes -> false Arc -> tasks early-exit
+//
+// CHANGE: we make "unmount" idempotent (swap) and we also let the CONNECT button
+//         explicitly flip alive=false *before* bumping WS_EPOCH, so the WS
+//         supervisor won't spawn a new epoch while we're leaving the dashboard.
 // ============================================================================
 #[derive(Clone)]
 struct DashboardLife {
@@ -454,7 +458,11 @@ pub fn TelemetryDashboard() -> Element {
 
             impl Drop for Guard {
                 fn drop(&mut self) {
-                    self.alive.store(false, Ordering::Relaxed);
+                    // Idempotent drop (prevents double-unmount spam / double-epoch bumps)
+                    let was_alive = self.alive.swap(false, Ordering::Relaxed);
+                    if !was_alive {
+                        return;
+                    }
 
                     // Only clear if we're still the published dashboard
                     let cur = DASHBOARD_LIFE.read().alive.clone();
@@ -757,6 +765,12 @@ fn TelemetryDashboardInner() -> Element {
         use_effect(move || {
             let epoch = *WS_EPOCH.read();
 
+            // IMPORTANT: if dashboard has been "logically" disabled (CONNECT pressed),
+            // do not spawn a supervisor for the new epoch.
+            if !alive.load(Ordering::Relaxed) {
+                return;
+            }
+
             if last_started_epoch.read().as_ref() == Some(&epoch) {
                 return;
             }
@@ -810,22 +824,35 @@ fn TelemetryDashboardInner() -> Element {
         let nav = use_navigator();
 
         #[cfg(not(target_arch = "wasm32"))]
-        rsx! {
-            button {
-                style: "
-                    padding:0.45rem 0.85rem;
-                    border-radius:0.75rem;
-                    border:1px solid #334155;
-                    background:#111827;
-                    color:#e5e7eb;
-                    font-weight:800;
-                    cursor:pointer;
-                ",
-                onclick: move |_| {
-                    bump_ws_epoch();
-                    let _ = nav.push(Route::Connect {});
-                },
-                "CONNECT"
+        {
+            let alive_for_click = alive.clone();
+
+            rsx! {
+                button {
+                    style: "
+                        padding:0.45rem 0.85rem;
+                        border-radius:0.75rem;
+                        border:1px solid #334155;
+                        background:#111827;
+                        color:#e5e7eb;
+                        font-weight:800;
+                        cursor:pointer;
+                    ",
+                    onclick: move |_| {
+                        // KEY CHANGE:
+                        // Mark dashboard "not alive" *before* bumping WS_EPOCH.
+                        // That prevents the dashboard's WS supervisor effect from spawning
+                        // a new epoch while we're navigating away.
+                        let was_alive = alive_for_click.swap(false, Ordering::Relaxed);
+                        if was_alive {
+                            bump_ws_epoch();
+                            log!("[UI] CONNECT pressed -> alive=false + bump epoch");
+                        }
+
+                        let _ = nav.push(Route::Connect {});
+                    },
+                    "CONNECT"
+                }
             }
         }
 
