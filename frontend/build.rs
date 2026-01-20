@@ -125,9 +125,7 @@ fn log(msg: &str) {
         .open(&log_file_path)
         .unwrap();
 
-    log_file
-        .write_all(msg.as_ref())
-        .unwrap();
+    log_file.write_all(msg.as_ref()).unwrap();
 }
 fn main() {
     let target = env::var("TARGET").unwrap();
@@ -135,9 +133,7 @@ fn main() {
     let log_file_path = env::var("CARGO_MANIFEST_DIR").unwrap().to_string() + "/build.log";
     let _ = fs::remove_file(&log_file_path);
 
-    log
-        (format!("target: {}", target).as_ref())
-        ;
+    log(format!("target: {}", target).as_ref());
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
@@ -151,24 +147,20 @@ fn main() {
     let version = env::var("LEAFLET_VERSION").unwrap_or_else(|_| "1.9.4".to_string());
 
     // Path to frontend/dist/vendor/leaflet relative to this crate
-    let leaflet_dir = manifest_dir.join("assets").join("vendor").join("leaflet");
+    let leaflet_dir = manifest_dir.join("static").join("vendor").join("leaflet");
 
     if let Err(e) = fs::create_dir_all(&leaflet_dir) {
-        log(format!("Failed to create Leaflet vendor dir {leaflet_dir:?}: {e}").as_ref())
-            ;
+        log(format!("Failed to create Leaflet vendor dir {leaflet_dir:?}: {e}").as_ref());
 
         return;
     }
 
     // Download CSS and JS
     if let Err(e) = download_leaflet_file(&leaflet_dir, &version, "css", log) {
-        log
-            (format!("Failed to download Leaflet CSS: {e}").as_ref());
+        log(format!("Failed to download Leaflet CSS: {e}").as_ref());
     }
     if let Err(e) = download_leaflet_file(&leaflet_dir, &version, "js", log) {
-        log
-            (format!("Failed to download Leaflet JS: {e}").as_ref())
-            ;
+        log(format!("Failed to download Leaflet JS: {e}").as_ref());
     }
 }
 
