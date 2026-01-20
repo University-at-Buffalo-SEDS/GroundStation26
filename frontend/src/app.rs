@@ -352,7 +352,6 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl) -> Result<String, String> {
     }
 }
 #[cfg(not(target_arch = "wasm32"))]
-
 fn format_route_report_host_only(
     original_base: &str,
     parsed: &ParsedBaseUrl,

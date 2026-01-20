@@ -2,11 +2,17 @@
 import multiprocessing as mp
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from subprocess import DEVNULL
 from typing import Optional
+
+
+APP_NAME = "GroundstationFrontend"
+DIST_DIRNAME = "dist"
+APP_BUNDLE_NAME = f"{APP_NAME}.app"
 
 
 def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None:
@@ -105,6 +111,24 @@ def patch_plist(frontend_dir: Path) -> None:
     run_script(script, cwd=frontend_dir)
 
 
+def dist_dir(frontend_dir: Path) -> Path:
+    return frontend_dir / DIST_DIRNAME
+
+
+def app_bundle_path(frontend_dir: Path) -> Path:
+    return dist_dir(frontend_dir) / APP_BUNDLE_NAME
+
+
+def clear_app_bundle(frontend_dir: Path) -> None:
+    """
+    Clear out the dist/*.app bundle before building so old artifacts don't linger.
+    """
+    bundle = app_bundle_path(frontend_dir)
+    if bundle.exists():
+        print(f"Removing existing app bundle: {bundle}")
+        shutil.rmtree(bundle)
+
+
 def build_frontend(
     frontend_dir: Path,
     platform_name: Optional[str] = None,
@@ -118,6 +142,9 @@ def build_frontend(
     - rust_target: passed to dx --target (e.g. "aarch64-apple-ios")
     """
     try:
+        # Always clear out the .app dir before building (if present).
+        clear_app_bundle(frontend_dir)
+
         cmd = ["dx", "bundle", "--release"]
 
         if platform_name:
@@ -137,6 +164,41 @@ def build_frontend(
     except subprocess.CalledProcessError as e:
         print("Frontend build failed.", file=sys.stderr)
         sys.exit(e.returncode)
+
+
+def deploy_ios(frontend_dir: Path) -> None:
+    """
+    Deploy an already-built iOS .app to a connected device using ios-deploy.
+    """
+    bundle = app_bundle_path(frontend_dir)
+    if not bundle.exists():
+        print(f"Error: iOS app bundle not found at: {bundle}", file=sys.stderr)
+        print("Build it first with: ./build.py ios (or ./build.py ios_deploy)", file=sys.stderr)
+        sys.exit(1)
+
+    run(["ios-deploy", "--bundle", str(bundle)], cwd=frontend_dir)
+
+
+def deploy_macos(frontend_dir: Path) -> None:
+    """
+    Copy the built macOS .app bundle into the user's Applications folder (~/Applications).
+    """
+    src = app_bundle_path(frontend_dir)
+    if not src.exists():
+        print(f"Error: macOS app bundle not found at: {src}", file=sys.stderr)
+        print("Build it first with: ./build.py macos (or ./build.py macos_deploy)", file=sys.stderr)
+        sys.exit(1)
+
+    user_apps = Path.home() / "Applications"
+    user_apps.mkdir(parents=True, exist_ok=True)
+
+    dst = user_apps / APP_BUNDLE_NAME
+    if dst.exists():
+        print(f"Removing existing installed app: {dst}")
+        shutil.rmtree(dst)
+
+    print(f"Copying app bundle to: {dst}")
+    shutil.copytree(src, dst)
 
 
 def build_backend(backend_dir: Path, force_pi: bool, force_no_pi: bool, testing_mode: bool) -> None:
@@ -187,6 +249,10 @@ def print_usage() -> None:
     print("  ./build.py windows")
     print("  ./build.py android")
     print("  ./build.py linux")
+    print("")
+    print("Frontend deploy actions:")
+    print("  ./build.py ios_deploy              # build ios + deploy to device via ios-deploy")
+    print("  ./build.py macos_deploy            # build macos + copy .app to ~/Applications")
     sys.exit(1)
 
 
@@ -198,6 +264,7 @@ def main() -> None:
 
     frontend_only_platform: Optional[str] = None
     frontend_rust_target: Optional[str] = None
+    frontend_deploy_action: Optional[str] = None  # "ios" | "macos"
 
     args = [a.strip().lower() for a in sys.argv[1:]]
 
@@ -215,6 +282,11 @@ def main() -> None:
         "linux": ("linux", None),
     }
 
+    deploy_map = {
+        "ios_deploy": "ios",
+        "macos_deploy": "macos",
+    }
+
     for arg in args:
         if arg == "pi_build":
             force_pi = True
@@ -224,9 +296,14 @@ def main() -> None:
             docker_mode = True
         elif arg == "testing":
             testing_mode = True
+        elif arg in deploy_map:
+            if frontend_deploy_action is not None or frontend_only_platform is not None:
+                print("Error: Only one frontend action (build OR deploy) may be specified.", file=sys.stderr)
+                print_usage()
+            frontend_deploy_action = deploy_map[arg]
         elif arg in frontend_platform_map:
-            if frontend_only_platform is not None:
-                print("Error: Only one frontend-only platform may be specified.", file=sys.stderr)
+            if frontend_only_platform is not None or frontend_deploy_action is not None:
+                print("Error: Only one frontend action (build OR deploy) may be specified.", file=sys.stderr)
                 print_usage()
             frontend_only_platform, frontend_rust_target = frontend_platform_map[arg]
         else:
@@ -237,7 +314,34 @@ def main() -> None:
         print("Error: Cannot specify both 'pi_build' and 'no_pi'.", file=sys.stderr)
         sys.exit(1)
 
-    # If user picked a frontend-only platform, forbid mixing with backend/docker flags.
+    repo_root = Path(__file__).resolve().parent
+    frontend_dir = repo_root / "frontend"
+    backend_dir = repo_root / "backend"
+
+    # Frontend deploy mode (build + deploy)
+    if frontend_deploy_action is not None:
+        if docker_mode or force_pi or force_no_pi or testing_mode:
+            print(
+                "Error: Frontend deploy actions (ios_deploy/macos_deploy) cannot be combined "
+                "with docker/pi_build/no_pi/testing.",
+                file=sys.stderr,
+            )
+            print_usage()
+
+        if frontend_deploy_action == "ios":
+            build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
+            deploy_ios(frontend_dir)
+            return
+
+        if frontend_deploy_action == "macos":
+            build_frontend(frontend_dir, platform_name="macos", rust_target=None)
+            deploy_macos(frontend_dir)
+            return
+
+        print("Error: Unknown deploy action.", file=sys.stderr)
+        sys.exit(1)
+
+    # Frontend-only build mode
     if frontend_only_platform is not None:
         if docker_mode or force_pi or force_no_pi or testing_mode:
             print(
@@ -246,13 +350,6 @@ def main() -> None:
                 file=sys.stderr,
             )
             print_usage()
-
-    repo_root = Path(__file__).resolve().parent
-    frontend_dir = repo_root / "frontend"
-    backend_dir = repo_root / "backend"
-
-    # Frontend-only build mode
-    if frontend_only_platform is not None:
         build_frontend(frontend_dir, platform_name=frontend_only_platform, rust_target=frontend_rust_target)
         return
 
