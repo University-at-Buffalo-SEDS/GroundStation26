@@ -28,7 +28,6 @@ COPY frontend/assets frontend/
 COPY frontend/platform frontend/
 COPY frontend/scripts frontend/
 COPY frontend/static frontend/
-COPY frontend/assets frontend/
 COPY frontend/Dioxus.toml frontend/
 
 # Shared
@@ -79,7 +78,7 @@ COPY --from=builder /app/target/release/groundstation_backend /app/
 COPY --from=builder /app/target/release/map_downloader /app/map_downloader/
 COPY --from=builder /app/frontend/dist /app/frontend/dist/
 COPY --from=builder /app/frontend/static /app/frontend/static/
-COPY --from=builder /app/frontend/assets /app/frontend/assets/
+COPY /app/frontend/assets /app/frontend/assets/
 COPY --from=builder /app/entrypoint.sh /app/
 
 EXPOSE 3000

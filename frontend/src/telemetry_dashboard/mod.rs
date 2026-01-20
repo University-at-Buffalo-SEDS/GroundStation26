@@ -9,6 +9,7 @@ mod gps_android;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod gps_apple;
+
 pub mod map_tab;
 pub mod state_tab;
 pub mod warnings_tab;
@@ -26,6 +27,24 @@ use map_tab::MapTab;
 use serde::Deserialize;
 use state_tab::StateTab;
 use warnings_tab::WarningsTab;
+
+// NEW: stop background tasks when the dashboard unmounts
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+#[derive(Clone)]
+struct AliveGuard {
+    alive: Arc<AtomicBool>,
+}
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
+        // ensure websocket tears down when leaving dashboard
+        bump_ws_epoch();
+    }
+}
 
 // ----------------------------
 // Cross-platform persistence
@@ -245,8 +264,6 @@ pub fn abs_http(path: &str) -> String {
     };
 
     if base.is_empty() {
-        // wasm can still work with relative (origin), but we keep it absolute-ish
-        // by just returning "/path"
         path
     } else {
         format!("{base}{path}")
@@ -361,6 +378,24 @@ static BASE_URL: GlobalSignal<String> = Signal::global(String::new);
 // -----------------------------
 static UI_RELOAD_KEY: GlobalSignal<u64> = Signal::global(|| 0);
 
+#[cfg(target_arch = "wasm32")]
+fn hard_reload_app_web() {
+    if let Some(w) = web_sys::window() {
+        let _ = w.location().reload();
+    }
+}
+
+fn reconnect_and_reload_ui() {
+    bump_ws_epoch();
+    *UI_RELOAD_KEY.write() += 1;
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        // true full reload in the browser
+        hard_reload_app_web();
+    }
+}
+
 // ---------- Cross-platform WS handle ----------
 #[derive(Clone)]
 struct WsSender {
@@ -392,6 +427,13 @@ static WS_SENDER: GlobalSignal<Option<WsSender>> = Signal::global(|| None::<WsSe
 // ---------- Public root component ----------
 #[component]
 pub fn TelemetryDashboard() -> Element {
+    // ---------------------------------------------------------
+    // Lifetime cancellation token:
+    // - when TelemetryDashboard unmounts, tasks stop cleanly
+    // ---------------------------------------------------------
+    let alive: Arc<AtomicBool> = use_hook(|| Arc::new(AtomicBool::new(true)));
+    let _alive_guard = use_hook(|| AliveGuard { alive: alive.clone() });
+
     // ----------------------------
     // Persistent values (strings)
     // ----------------------------
@@ -477,13 +519,20 @@ pub fn TelemetryDashboard() -> Element {
 
     // Start GPS updates only once JS is ready (your existing logic)
     use_effect({
+        let alive = alive.clone();
         move || {
+            let alive = alive.clone();
             spawn(async move {
                 for _ in 0..2000 {
+                    if !alive.load(Ordering::Relaxed) {
+                        return;
+                    }
+
                     if js_is_ground_map_ready() {
                         gps::start_gps_updates(user_gps);
                         return;
                     }
+
                     #[cfg(target_arch = "wasm32")]
                     gloo_timers::future::TimeoutFuture::new(50).await;
 
@@ -491,9 +540,11 @@ pub fn TelemetryDashboard() -> Element {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
 
-                js_eval(
-                    r#"console.warn("[GS26] JS not ready; skipped gps::start_gps_updates (timeout)");"#,
-                );
+                if alive.load(Ordering::Relaxed) {
+                    js_eval(
+                        r#"console.warn("[GS26] JS not ready; skipped gps::start_gps_updates (timeout)");"#,
+                    );
+                }
             });
         }
     });
@@ -510,13 +561,19 @@ pub fn TelemetryDashboard() -> Element {
         let mut ack_warning_ts_s = ack_warning_ts;
         let mut ack_error_ts_s = ack_error_ts;
 
+        let alive = alive.clone();
+
         use_effect(move || {
             if *did_seed.read() {
                 return;
             }
             did_seed.set(true);
-
+            let alive = alive.clone();
             spawn(async move {
+                if !alive.load(Ordering::Relaxed) {
+                    return;
+                }
+
                 if let Err(e) = seed_from_db(
                     &mut rows_s,
                     &mut warnings_s,
@@ -525,26 +582,36 @@ pub fn TelemetryDashboard() -> Element {
                     &mut user_gps_s,
                     &mut ack_warning_ts_s,
                     &mut ack_error_ts_s,
+                    alive.clone(),
                 )
                 .await
                 {
-                    log!("seed_from_db failed: {e}");
+                    if alive.load(Ordering::Relaxed) {
+                        log!("seed_from_db failed: {e}");
+                    }
                 }
             });
         });
     }
 
-    // Flash loop
+    // Flash loop (STOPs when dashboard unmounts)
     {
         let mut flash_on = flash_on;
+        let alive = alive.clone();
+
         use_effect(move || {
+            let alive = alive.clone();
             spawn(async move {
-                loop {
+                while alive.load(Ordering::Relaxed) {
                     #[cfg(target_arch = "wasm32")]
                     gloo_timers::future::TimeoutFuture::new(500).await;
 
                     #[cfg(not(target_arch = "wasm32"))]
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                    if !alive.load(Ordering::Relaxed) {
+                        break;
+                    }
 
                     let next = !*flash_on.read();
                     flash_on.set(next);
@@ -587,10 +654,19 @@ pub fn TelemetryDashboard() -> Element {
     // Initial flightstate (HTTP)
     {
         let mut flight_state = flight_state;
+        let alive = alive.clone();
+
         use_effect(move || {
+            let alive = alive.clone();
             spawn(async move {
+                if !alive.load(Ordering::Relaxed) {
+                    return;
+                }
+
                 if let Ok(state) = http_get_json::<FlightState>("/flightstate").await {
-                    flight_state.set(state);
+                    if alive.load(Ordering::Relaxed) {
+                        flight_state.set(state);
+                    }
                 }
             });
         });
@@ -600,12 +676,19 @@ pub fn TelemetryDashboard() -> Element {
     // WebSocket supervisor:
     // - runs on BOTH platforms
     // - reconnects whenever WS_EPOCH changes
-    // - native behavior now matches wasm (loop + backoff)
+    // - stops when dashboard unmounts
     // ---------------------------------------------------------
     {
+        let alive = alive.clone();
+
         use_effect(move || {
             let epoch = *WS_EPOCH.read();
+            let alive = alive.clone();
             spawn(async move {
+                if !alive.load(Ordering::Relaxed) {
+                    return;
+                }
+
                 if let Err(e) = connect_ws_supervisor(
                     epoch,
                     rows,
@@ -614,10 +697,13 @@ pub fn TelemetryDashboard() -> Element {
                     flight_state,
                     rocket_gps,
                     user_gps,
+                    alive.clone(),
                 )
                 .await
                 {
-                    log!("ws supervisor ended: {e}");
+                    if alive.load(Ordering::Relaxed) {
+                        log!("ws supervisor ended: {e}");
+                    }
                 }
             });
         });
@@ -637,6 +723,7 @@ pub fn TelemetryDashboard() -> Element {
 
     // -------------------------
     // Native-only GO-TO-CONNECT button
+    // (IMPORTANT: tear down WS + remount key before navigating)
     // -------------------------
     let connect_button: Element = {
         #[cfg(not(target_arch = "wasm32"))]
@@ -656,6 +743,10 @@ pub fn TelemetryDashboard() -> Element {
                     cursor:pointer;
                 ",
                 onclick: move |_| {
+                    // stop background work before leaving dashboard
+                    bump_ws_epoch();
+                    *UI_RELOAD_KEY.write() += 1;
+
                     let _ = nav.push(Route::Connect {});
                 },
                 "CONNECT"
@@ -670,6 +761,8 @@ pub fn TelemetryDashboard() -> Element {
 
     // -------------------------
     // RECONNECT button (both)
+    // - native: bump epoch + UI remount (safe, no crash)
+    // - web: also full page reload (forces a full re-init from URL)
     // -------------------------
     let reload_button: Element = rsx! {
         button {
@@ -683,8 +776,7 @@ pub fn TelemetryDashboard() -> Element {
                 cursor:pointer;
             ",
             onclick: move |_| {
-                bump_ws_epoch();
-                *UI_RELOAD_KEY.write() += 1;
+                reconnect_and_reload_ui();
             },
             "RECONNECT"
         }
@@ -1013,9 +1105,18 @@ async fn seed_from_db(
     user_gps: &mut Signal<Option<(f64, f64)>>,
     ack_warning_ts: &mut Signal<i64>,
     ack_error_ts: &mut Signal<i64>,
+    alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    if !alive.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
     // ---- Telemetry history (/api/recent) ----
     if let Ok(mut list) = http_get_json::<Vec<TelemetryRow>>("/api/recent").await {
+        if !alive.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
         list.sort_by_key(|r| r.timestamp_ms);
 
         if let Some(last) = list.last() {
@@ -1044,8 +1145,16 @@ async fn seed_from_db(
         rows.set(list);
     }
 
+    if !alive.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
     // ---- Alerts history (/api/alerts) ----
     if let Ok(mut alerts) = http_get_json::<Vec<AlertDto>>("/api/alerts?minutes=20").await {
+        if !alive.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
         let max_ts = alerts.iter().map(|a| a.timestamp_ms).max().unwrap_or(0);
         let prev_ack = (*ack_warning_ts.read()).max(*ack_error_ts.read());
         if prev_ack > 0 && max_ts > 0 && max_ts < prev_ack - HISTORY_MS {
@@ -1075,10 +1184,16 @@ async fn seed_from_db(
         errors.set(e);
     }
 
+    if !alive.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
     // ---- Optional GPS seed (/api/gps) ----
     if let Ok(gps) = http_get_json::<GpsResponse>("/api/gps").await {
-        rocket_gps.set(Some((gps.rocket_lat, gps.rocket_lon)));
-        user_gps.set(Some((gps.user_lat, gps.user_lon)));
+        if alive.load(Ordering::Relaxed) {
+            rocket_gps.set(Some((gps.rocket_lat, gps.rocket_lon)));
+            user_gps.set(Some((gps.user_lat, gps.user_lon)));
+        }
     }
 
     Ok(())
@@ -1095,6 +1210,7 @@ async fn connect_ws_supervisor(
     flight_state: Signal<FlightState>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
+    alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
     // If a newer epoch exists, do nothing.
     if *WS_EPOCH.read() != epoch {
@@ -1102,6 +1218,9 @@ async fn connect_ws_supervisor(
     }
 
     loop {
+        if !alive.load(Ordering::Relaxed) {
+            break;
+        }
         if *WS_EPOCH.read() != epoch {
             break;
         }
@@ -1110,7 +1229,14 @@ async fn connect_ws_supervisor(
             #[cfg(target_arch = "wasm32")]
             {
                 connect_ws_once_wasm(
-                    epoch, rows, warnings, errors, flight_state, rocket_gps, user_gps,
+                    epoch,
+                    rows,
+                    warnings,
+                    errors,
+                    flight_state,
+                    rocket_gps,
+                    user_gps,
+                    alive.clone(),
                 )
                 .await
             }
@@ -1118,18 +1244,30 @@ async fn connect_ws_supervisor(
             #[cfg(not(target_arch = "wasm32"))]
             {
                 connect_ws_once_native(
-                    epoch, rows, warnings, errors, flight_state, rocket_gps, user_gps,
+                    epoch,
+                    rows,
+                    warnings,
+                    errors,
+                    flight_state,
+                    rocket_gps,
+                    user_gps,
+                    alive.clone(),
                 )
                 .await
             }
         };
 
+        if !alive.load(Ordering::Relaxed) {
+            break;
+        }
         if *WS_EPOCH.read() != epoch {
             break;
         }
 
         if let Err(e) = res {
-            log!("ws connect error: {e}");
+            if alive.load(Ordering::Relaxed) {
+                log!("ws connect error: {e}");
+            }
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -1151,11 +1289,16 @@ async fn connect_ws_once_wasm(
     flight_state: Signal<FlightState>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
+    alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
     use futures_channel::oneshot;
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::JsCast;
     use web_sys::{CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
+
+    if !alive.load(Ordering::Relaxed) {
+        return Ok(());
+    }
 
     let base_ws = UrlConfig::base_ws();
     let ws_url = format!("{base_ws}/ws");
@@ -1217,10 +1360,14 @@ async fn connect_ws_once_wasm(
         onclose.forget();
     }
 
-    // Wait until close/error OR epoch changes.
+    // Wait until close/error OR epoch changes OR dashboard unmounts.
     futures_util::pin_mut!(closed_rx);
 
     loop {
+        if !alive.load(Ordering::Relaxed) {
+            let _ = ws.close();
+            break;
+        }
         if *WS_EPOCH.read() != epoch {
             let _ = ws.close();
             break;
@@ -1256,9 +1403,13 @@ async fn connect_ws_once_native(
     flight_state: Signal<FlightState>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
+    alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
     use futures_util::{SinkExt, StreamExt};
 
+    if !alive.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     if *WS_EPOCH.read() != epoch {
         return Ok(());
     }
@@ -1287,8 +1438,8 @@ async fn connect_ws_once_native(
         }
     });
 
-    // read loop
-    while *WS_EPOCH.read() == epoch {
+    // read loop (STOPs if unmounted or epoch changes)
+    while alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
         let Some(item) = read.next().await else { break };
 
         let msg = match item {

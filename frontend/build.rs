@@ -90,6 +90,7 @@ fn build_apple_objc(manifest_dir: &PathBuf, target: &str) {
     // frameworks used
     println!("cargo:rustc-link-lib=framework=CoreLocation");
     println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=Network");
     println!("cargo:rustc-link-lib=objc");
 }
 

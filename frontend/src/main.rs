@@ -20,6 +20,7 @@ fn main() {
     launch(app::App);
 }
 
+
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
     init_panic_hook();
