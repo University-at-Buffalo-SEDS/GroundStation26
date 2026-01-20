@@ -13,6 +13,8 @@ use dioxus_router::{Routable, Router};
 
 #[cfg(not(target_arch = "wasm32"))]
 use dioxus_router::use_navigator;
+#[allow(unused_imports)]
+use crate::telemetry_dashboard::UrlConfig;
 
 // --- global css ---
 const GLOBAL_CSS: &str = r#"
@@ -106,7 +108,7 @@ mod persist {
         read_key(_BASE_URL_KEY).filter(|s| !s.trim().is_empty())
     }
 
-    pub fn write_base_url(v: &str) -> Result<(), io::Error> {
+    pub fn _write_base_url(v: &str) -> Result<(), io::Error> {
         write_key(_BASE_URL_KEY, v)
     }
 
@@ -587,7 +589,7 @@ pub fn Connect() -> Element {
 
                             objc_poke::poke_url(&u_norm);
 
-                            let _ = persist::write_base_url(&u_norm);
+                            UrlConfig::set_base_url_and_persist(u_norm.to_string());
                             let _ = persist::write_connect_shown(true);
                             let _ = nav.replace(Route::Dashboard {});
                         },

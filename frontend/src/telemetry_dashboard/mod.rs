@@ -71,7 +71,7 @@ fn dashboard_alive() -> Arc<AtomicBool> {
 }
 
 #[inline]
-fn set_dashboard_alive(alive: bool) {
+fn _set_dashboard_alive(alive: bool) {
     let alive = Arc::new(AtomicBool::new(alive));
     *DASHBOARD_LIFE.write() = DashboardLife {
         alive,
@@ -320,7 +320,7 @@ fn bump_ws_epoch() {
     *WS_EPOCH.write() += 1;
 }
 
-fn bump_ui_epoch() {
+fn _bump_ui_epoch() {
     *UI_EPOCH.write() += 1;
 }
 
@@ -358,7 +358,10 @@ impl UrlConfig {
     }
 
     pub fn base_http() -> String {
-        let base = BASE_URL.read().clone();
+        // load from storage key if present
+       let base = persist::get_string(BASE_URL_STORAGE_KEY)
+            .map(normalize_base_url)
+            .unwrap_or_else(|| BASE_URL.read().clone());
 
         #[cfg(not(target_arch = "wasm32"))]
         if base.is_empty() {
@@ -421,7 +424,7 @@ fn reconnect_and_reload_ui() {
     // Native: soft “reload” by remounting ONLY the inner dashboard subtree
     #[cfg(not(target_arch = "wasm32"))]
     {
-        bump_ui_epoch();
+        _bump_ui_epoch();
     }
 }
 
@@ -570,38 +573,38 @@ fn TelemetryDashboardInner() -> Element {
     }
 
     // Start GPS updates only once JS is ready
-    use_effect({
-        let alive = alive.clone();
-        let user_gps = user_gps;
-        move || {
-            let alive = alive.clone();
-            let epoch = *WS_EPOCH.read();
-            spawn(async move {
-                for _ in 0..2000 {
-                    if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
-                        return;
-                    }
-
-                    if js_is_ground_map_ready() {
-                        gps::start_gps_updates(user_gps);
-                        return;
-                    }
-
-                    #[cfg(target_arch = "wasm32")]
-                    gloo_timers::future::TimeoutFuture::new(50).await;
-
-                    #[cfg(not(target_arch = "wasm32"))]
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-
-                if alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
-                    js_eval(
-                        r#"console.warn("[GS26] JS not ready; skipped gps::start_gps_updates (timeout)");"#,
-                    );
-                }
-            });
-        }
-    });
+    // use_effect({
+    //     let alive = alive.clone();
+    //     let user_gps = user_gps;
+    //     move || {
+    //         let alive = alive.clone();
+    //         let epoch = *WS_EPOCH.read();
+    //         spawn(async move {
+    //             for _ in 0..2000 {
+    //                 if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
+    //                     return;
+    //                 }
+    //
+    //                 if js_is_ground_map_ready() {
+    //                     gps::start_gps_updates(user_gps);
+    //                     return;
+    //                 }
+    //
+    //                 #[cfg(target_arch = "wasm32")]
+    //                 gloo_timers::future::TimeoutFuture::new(50).await;
+    //
+    //                 #[cfg(not(target_arch = "wasm32"))]
+    //                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    //             }
+    //
+    //             if alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
+    //                 js_eval(
+    //                     r#"console.warn("[GS26] JS not ready; skipped gps::start_gps_updates (timeout)");"#,
+    //                 );
+    //             }
+    //         });
+    //     }
+    // });
 
     // Seed from DB (HTTP) on mount
     {
@@ -801,6 +804,7 @@ fn TelemetryDashboardInner() -> Element {
             let alive_for_click = alive.clone();
 
             rsx! {
+
                 button {
                     style: "
                         padding:0.45rem 0.85rem;
@@ -817,7 +821,9 @@ fn TelemetryDashboardInner() -> Element {
                         // That prevents the dashboard's WS supervisor effect from spawning
                         // a new epoch while we're navigating away.
                         let was_alive = alive_for_click.swap(false, Ordering::Relaxed);
-                        set_dashboard_alive(false);
+                        #[cfg(any(target_os = "macos", target_os = "ios"))]
+                        gps::stop_gps_updates();
+                        _set_dashboard_alive(false);
                         if was_alive {
                             bump_ws_epoch();
                             log!("[UI] CONNECT pressed -> alive=false + bump epoch");
@@ -855,9 +861,25 @@ fn TelemetryDashboardInner() -> Element {
         }
     };
 
+    fn start_gps_js() -> bool {
+        // Only needed if you want to gate geolocation until the JS is ready on wasm:
+        #[cfg(target_arch = "wasm32")]
+        return js_is_ground_map_ready();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        true
+
+    }
+
     // MAIN UI
     rsx! {
+    gps::GpsDriver {
+        user_gps: user_gps,
+        // Only needed if you want to gate geolocation until the JS is ready on wasm:
+        js_ready: Some(start_gps_js()),
+    }
         div {
+
             style: "
                 min-height:100vh;
                 padding:24px;
