@@ -432,7 +432,9 @@ pub fn TelemetryDashboard() -> Element {
     // - when TelemetryDashboard unmounts, tasks stop cleanly
     // ---------------------------------------------------------
     let alive: Arc<AtomicBool> = use_hook(|| Arc::new(AtomicBool::new(true)));
-    let _alive_guard = use_hook(|| AliveGuard { alive: alive.clone() });
+    let _alive_guard = use_hook(|| AliveGuard {
+        alive: alive.clone(),
+    });
 
     // ----------------------------
     // Persistent values (strings)
@@ -470,10 +472,21 @@ pub fn TelemetryDashboard() -> Element {
     // When it changes, reconnect websocket on BOTH platforms.
     // ---------------------------------------------------------
     {
+        // Track the last base we applied so we don't bump epoch every render.
+        let mut last_applied_base = use_signal(String::new);
+
         use_effect(move || {
             let base = st_base_url.read().clone();
+
+            // Only act when the value actually changes.
+            if *last_applied_base.read() == base {
+                return;
+            }
+
+            last_applied_base.set(base.clone());
+
             UrlConfig::set_base_url_and_persist(base);
-            bump_ws_epoch();
+            bump_ws_epoch(); // only when base changes
         });
     }
 
@@ -1292,8 +1305,8 @@ async fn connect_ws_once_wasm(
     alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
     use futures_channel::oneshot;
-    use wasm_bindgen::closure::Closure;
     use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
     use web_sys::{CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
 
     if !alive.load(Ordering::Relaxed) {
@@ -1327,7 +1340,15 @@ async fn connect_ws_once_wasm(
     {
         let onmessage: Closure<dyn FnMut(MessageEvent)> = Closure::new(move |e: MessageEvent| {
             if let Some(s) = e.data().as_string() {
-                handle_ws_message(&s, rows, warnings, errors, flight_state, rocket_gps, user_gps);
+                handle_ws_message(
+                    &s,
+                    rows,
+                    warnings,
+                    errors,
+                    flight_state,
+                    rocket_gps,
+                    user_gps,
+                );
             }
         });
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
@@ -1451,7 +1472,15 @@ async fn connect_ws_once_native(
         };
 
         if let tokio_tungstenite::tungstenite::Message::Text(s) = msg {
-            handle_ws_message(&s, rows, warnings, errors, flight_state, rocket_gps, user_gps);
+            handle_ws_message(
+                &s,
+                rows,
+                warnings,
+                errors,
+                flight_state,
+                rocket_gps,
+                user_gps,
+            );
         }
     }
 

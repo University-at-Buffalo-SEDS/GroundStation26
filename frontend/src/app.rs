@@ -2,18 +2,12 @@
 //
 // COMPLETE REPLACEMENT FILE
 //
-// Native improvements:
-// - Resolve hostname (std::net::ToSocketAddrs) before testing
-// - Poke each resolved IP via Objective-C shim to trigger Local Network prompt (if LAN)
-// - Probe routes on:
-//    1) original hostname base URL
-//    2) first-resolved-IP base URL (with Host header set to original hostname)
-// - Report resolution results + which base URL was tested
-//
-// WASM:
-// - Same behavior as before (no hostname resolution in browser)
+// Changes:
+// - Removed IP-based resolve/poke/tests (hostname only)
+// - Added REAL WebSocket connect probe (ws:// or wss://) and prints why it fails
+// - Kept native ObjC poke for Local Network prompt (hostname only)
+// - WASM behavior unchanged (no Connect screen)
 
-// --- imports ---
 use dioxus::prelude::*;
 use dioxus_router::{Routable, Router};
 
@@ -66,18 +60,11 @@ mod objc_poke {
 
     unsafe extern "C" {
         fn gs26_localnet_poke_url(url: *const c_char);
-        fn gs26_localnet_poke_host_port(host: *const c_char, port: u16);
     }
 
     pub fn poke_url(url: &str) {
         if let Ok(c) = CString::new(url) {
             unsafe { gs26_localnet_poke_url(c.as_ptr()) };
-        }
-    }
-
-    pub fn poke_host_port(host: &str, port: u16) {
-        if let Ok(c) = CString::new(host) {
-            unsafe { gs26_localnet_poke_host_port(c.as_ptr(), port) };
         }
     }
 }
@@ -212,11 +199,7 @@ fn parse_base_url(url: &str) -> Result<ParsedBaseUrl, String> {
 
     let hostport = rest.split('/').next().unwrap_or(rest);
     let mut parts = hostport.split(':');
-    let host = parts
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let host = parts.next().unwrap_or("").trim().to_string();
 
     if host.is_empty() {
         return Err("Missing host in URL".to_string());
@@ -230,58 +213,19 @@ fn parse_base_url(url: &str) -> Result<ParsedBaseUrl, String> {
     Ok(ParsedBaseUrl { scheme, host, port })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn rewrite_base_to_ip(parsed: &ParsedBaseUrl, ip: &std::net::IpAddr) -> String {
-    // For IPv6 in URLs: https://[::1]:3000
-    match ip {
-        std::net::IpAddr::V4(v4) => format!("{}://{}:{}", parsed.scheme, v4, parsed.port),
-        std::net::IpAddr::V6(v6) => format!("{}://[{}]:{}", parsed.scheme, v6, parsed.port),
-    }
+fn ws_origin_for_base(parsed: &ParsedBaseUrl) -> String {
+    // Use explicit port if non-default, keep it always (simpler + matches your base)
+    let ws_scheme = if parsed.scheme == "https" { "wss" } else { "ws" };
+    format!("{ws_scheme}://{}:{}", parsed.host, parsed.port)
 }
 
-// -------------------------
-// Native-only: resolve host -> IPs and poke them
-// -------------------------
-
-#[cfg(not(target_arch = "wasm32"))]
-fn resolve_host_ips(host: &str, port: u16) -> Result<Vec<std::net::IpAddr>, String> {
-    use std::net::ToSocketAddrs;
-
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS resolve failed: {e}"))?;
-
-    let mut ips: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
-    ips.sort();
-    ips.dedup();
-    Ok(ips)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn is_private_lan_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            let o = v4.octets();
-            // 10.0.0.0/8
-            if o[0] == 10 {
-                return true;
-            }
-            // 172.16.0.0/12
-            if o[0] == 172 && (16..=31).contains(&o[1]) {
-                return true;
-            }
-            // 192.168.0.0/16
-            if o[0] == 192 && o[1] == 168 {
-                return true;
-            }
-            false
-        }
-        // For completeness: treat IPv6 ULA (fc00::/7) as LAN-ish
-        std::net::IpAddr::V6(v6) => {
-            let seg0 = v6.segments()[0];
-            (seg0 & 0xfe00) == 0xfc00
-        }
+fn snip(mut s: String, max: usize) -> String {
+    s = s.replace('\r', "");
+    if s.len() > max {
+        s.truncate(max);
+        s.push('…');
     }
+    s
 }
 
 // -------------------------
@@ -290,7 +234,6 @@ fn is_private_lan_ip(ip: &std::net::IpAddr) -> bool {
 
 #[derive(Clone)]
 struct RouteCheck {
-    label: String,       // "host" or "ip"
     path: &'static str,
     url: String,
     ok: bool,
@@ -305,9 +248,6 @@ fn status_ok_for_path(path: &str, status: u16) -> (bool, &'static str) {
         "/api/recent" | "/api/history" | "/api/alerts" | "/flightstate" | "/api/gps" => {
             (status == 200, "expected 200")
         }
-        "/ground_map.js" | "/vendor/leaflet/leaflet.js" | "/vendor/leaflet/leaflet.css" => {
-            (status == 200, "expected 200")
-        }
         "/ws" => match status {
             101 | 400 | 426 => (true, "reachable (ws upgrade required)"),
             _ => (false, "unexpected status for ws route"),
@@ -318,15 +258,6 @@ fn status_ok_for_path(path: &str, status: u16) -> (bool, &'static str) {
         },
         _ => ((200..400).contains(&status), "ok"),
     }
-}
-
-fn snip(mut s: String, max: usize) -> String {
-    s = s.replace('\r', "");
-    if s.len() > max {
-        s.truncate(max);
-        s.push('…');
-    }
-    s
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -357,19 +288,14 @@ fn classify_reqwest_error(e: &reqwest::Error) -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn http_probe(url: String, host_header: Option<String>) -> Result<(u16, String), String> {
+async fn http_probe(url: String) -> Result<(u16, String), String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1800))
+        .timeout(std::time::Duration::from_millis(18000))
         .build()
         .map_err(|e| format!("build client failed: {e}"))?;
 
-    let mut req = client.get(&url);
-    if let Some(h) = host_header {
-        // Helps when we connect by IP but the server uses vhosts / routing by Host.
-        req = req.header(reqwest::header::HOST, h);
-    }
-
-    let resp = req
+    let resp = client
+        .get(&url)
         .send()
         .await
         .map_err(|e| format!("send failed: {} | kind={}", e, classify_reqwest_error(&e)))?;
@@ -381,7 +307,7 @@ async fn http_probe(url: String, host_header: Option<String>) -> Result<(u16, St
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn http_probe(url: String, _host_header: Option<String>) -> Result<(u16, String), String> {
+async fn http_probe(url: String) -> Result<(u16, String), String> {
     use gloo_net::http::Request;
 
     let resp = Request::get(&url)
@@ -394,14 +320,14 @@ async fn http_probe(url: String, _host_header: Option<String>) -> Result<(u16, S
     Ok((status, snip(body, 300)))
 }
 
-async fn test_routes(label: &str, base: &str, host_header: Option<String>) -> Vec<RouteCheck> {
+async fn test_routes_host_only(base: &str) -> Vec<RouteCheck> {
     let probes: &[&str] = &[
         "/api/recent",
         "/api/history",
         "/api/alerts",
         "/flightstate",
         "/api/gps",
-        "/tiles/",
+        "/tiles/7/29/51.jpg",
         "/ws",
     ];
 
@@ -410,11 +336,10 @@ async fn test_routes(label: &str, base: &str, host_header: Option<String>) -> Ve
     for path in probes {
         let url = join_url(base, path);
 
-        match http_probe(url.clone(), host_header.clone()).await {
+        match http_probe(url.clone()).await {
             Ok((status, body_snip)) => {
                 let (ok, note) = status_ok_for_path(path, status);
                 out.push(RouteCheck {
-                    label: label.to_string(),
                     path,
                     url,
                     ok,
@@ -426,7 +351,6 @@ async fn test_routes(label: &str, base: &str, host_header: Option<String>) -> Ve
             }
             Err(e) => {
                 out.push(RouteCheck {
-                    label: label.to_string(),
                     path,
                     url,
                     ok: false,
@@ -442,29 +366,46 @@ async fn test_routes(label: &str, base: &str, host_header: Option<String>) -> Ve
     out
 }
 
-fn format_route_report(original_base: &str, parsed: &ParsedBaseUrl, resolved_ips: &[String], checks: &[RouteCheck]) -> String {
+#[cfg(not(target_arch = "wasm32"))]
+async fn ws_connect_probe(parsed: &ParsedBaseUrl) -> Result<String, String> {
+    use tokio_tungstenite::connect_async;
+
+    let ws_origin = ws_origin_for_base(parsed);
+    let ws_url = format!("{ws_origin}/ws");
+
+    // This is a REAL websocket handshake. If wss fails due to cert/trust/SNI, you’ll see it here.
+    let res = connect_async(ws_url.clone()).await;
+
+    match res {
+        Ok((_stream, resp)) => Ok(format!(
+            "✅ WebSocket handshake OK\n    URL: {}\n    HTTP: {}",
+            ws_url,
+            resp.status()
+        )),
+        Err(e) => Err(format!(
+            "❌ WebSocket connect FAILED\n    URL: {}\n    ERROR: {}",
+            ws_url, e
+        )),
+    }
+}
+
+fn format_route_report_host_only(
+    original_base: &str,
+    parsed: &ParsedBaseUrl,
+    checks: &[RouteCheck],
+    ws_probe: Option<Result<String, String>>,
+) -> String {
     let mut s = String::new();
 
     s.push_str(&format!("Original base: {original_base}\n"));
-    s.push_str(&format!("Parsed host: {}  port: {}  scheme: {}\n", parsed.host, parsed.port, parsed.scheme));
+    s.push_str(&format!(
+        "Parsed host: {}  port: {}  scheme: {}\n\n",
+        parsed.host, parsed.port, parsed.scheme
+    ));
 
-    if resolved_ips.is_empty() {
-        s.push_str("Resolved IPs: (none / resolve failed)\n\n");
-    } else {
-        s.push_str("Resolved IPs:\n");
-        for ip in resolved_ips {
-            s.push_str(&format!("  - {ip}\n"));
-        }
-        s.push('\n');
-    }
+    s.push_str("=== Probing via host ===\n\n");
 
-    let mut last_label = "";
     for c in checks {
-        if c.label != last_label {
-            s.push_str(&format!("=== Probing via {} ===\n\n", c.label));
-            last_label = &c.label;
-        }
-
         let icon = if c.ok { "✅" } else { "❌" };
         let status_str = c.status.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
 
@@ -482,10 +423,25 @@ fn format_route_report(original_base: &str, parsed: &ParsedBaseUrl, resolved_ips
         s.push('\n');
     }
 
-    s.push_str("Notes:\n");
-    s.push_str("- If HOST probes fail but IP probes succeed: DNS, vhost, SNI, or split-horizon issues.\n");
-    s.push_str("- If both fail with connect/TLS errors but Safari works: likely certificate trust/chain issues for native clients.\n");
-    s.push_str("- Local Network prompt only triggers for LAN destinations (e.g. 192.168.x.x / 10.x.x.x / 172.16-31.x.x).\n");
+    s.push_str("=== WebSocket probe ===\n\n");
+    match ws_probe {
+        Some(Ok(msg)) => {
+            s.push_str(&msg);
+            s.push('\n');
+        }
+        Some(Err(e)) => {
+            s.push_str(&e);
+            s.push('\n');
+        }
+        None => {
+            s.push_str("(not run)\n");
+        }
+    }
+
+    s.push_str("\nNotes:\n");
+    s.push_str("- If HTTP routes are OK but WebSocket fails: likely TLS/cert/SNI issue for wss, or WS is blocked by server/proxy.\n");
+    s.push_str("- If /ws HTTP probe shows 400/426 but WS probe fails: server is reachable, handshake is failing.\n");
+    s.push_str("- Local Network prompt on iOS triggers only for LAN access; this test uses hostname only.\n");
 
     s
 }
@@ -544,7 +500,7 @@ pub fn Connect() -> Element {
 
     let initial = persist::read_base_url()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "http://192.168.1.50:3000".to_string());
+        .unwrap_or_else(|| "http://jetbrains-vm.com:3000".to_string());
 
     let mut url_edit = use_signal(|| initial);
 
@@ -561,7 +517,7 @@ pub fn Connect() -> Element {
 
                 p { style: "margin:0 0 16px 0; color:#94a3b8;",
                     "Enter the backend URL (including http:// or https://). Example: ",
-                    code { "http://10.0.0.42:3000" }
+                    code { "http://jetbrains-vm.com:3000" }
                 }
 
                 input {
@@ -595,7 +551,7 @@ pub fn Connect() -> Element {
 
                 div { style: "display:flex; gap:12px; margin-top:16px; justify-content:flex-end; flex-wrap:wrap;",
 
-                    // TEST ROUTES
+                    // TEST ROUTES (HOSTNAME ONLY)
                     button {
                         style: "
                             padding:10px 14px;
@@ -622,60 +578,19 @@ pub fn Connect() -> Element {
                             };
 
                             testing.set(true);
-                            test_status.set("Resolving host...".to_string());
+                            test_status.set("Testing (host only)...".to_string());
 
-                            // Keep your original URL poke (hostname path)
+                            // Hostname-only poke (keeps your original behavior)
                             objc_poke::poke_url(&u_norm);
 
                             spawn(async move {
-                                // Resolve on a blocking thread
-                                let host = parsed.host.clone();
-                                let port = parsed.port;
+                                // 1) HTTP probes
+                                let checks = test_routes_host_only(&u_norm).await;
 
-                                let res = std::thread::spawn(move || resolve_host_ips(&host, port))
-                                    .join()
-                                    .unwrap_or_else(|_| Err("resolver panicked".to_string()));
+                                // 2) REAL websocket probe (ws/wss)
+                                let ws_probe = Some(ws_connect_probe(&parsed).await);
 
-                                let mut resolved_ips: Vec<std::net::IpAddr> = Vec::new();
-                                let mut resolved_lines: Vec<String> = Vec::new();
-
-                                match res {
-                                    Ok(ips) => {
-                                        resolved_ips = ips;
-                                        for ip in &resolved_ips {
-                                            let lan = if is_private_lan_ip(ip) { " (LAN)" } else { "\"\"" };
-                                            resolved_lines.push(format!("{}{}", ip, lan));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        resolved_lines.push(format!("(resolve failed) {e}"));
-                                    }
-                                }
-
-                                // Poke every resolved IP (this is the "LAN trigger" path)
-                                for ip in &resolved_ips {
-                                    let ip_s = ip.to_string();
-                                    // Only poke if it looks LAN-ish (still safe to poke all, but this keeps noise down)
-                                    if is_private_lan_ip(ip) {
-                                        objc_poke::poke_host_port(&ip_s, parsed.port);
-                                    }
-                                }
-
-                                // Probe routes:
-                                // 1) by hostname base
-                                let mut all_checks = Vec::new();
-                                let host_checks = test_routes("host", &u_norm, None).await;
-                                all_checks.extend(host_checks);
-
-                                // 2) by first resolved IP base (if we have one)
-                                if let Some(first_ip) = resolved_ips.first() {
-                                    let ip_base = rewrite_base_to_ip(&parsed, first_ip);
-                                    // Force Host header to original hostname (helps vhost routing)
-                                    let ip_checks = test_routes("ip", &ip_base, Some(parsed.host.clone())).await;
-                                    all_checks.extend(ip_checks);
-                                }
-
-                                let report = format_route_report(&u_norm, &parsed, &resolved_lines, &all_checks);
+                                let report = format_route_report_host_only(&u_norm, &parsed, &checks, ws_probe);
 
                                 testing.set(false);
                                 test_status.set(report);
@@ -705,7 +620,6 @@ pub fn Connect() -> Element {
                                 return;
                             }
 
-                            // Poke hostname + save
                             objc_poke::poke_url(&u_norm);
 
                             let _ = persist::write_base_url(&u_norm);
