@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import multiprocessing as mp
+import os
 import platform
 import subprocess
 import sys
@@ -8,19 +9,20 @@ from subprocess import DEVNULL
 from typing import Optional
 
 
-def run(cmd: list[str], cwd: Path) -> None:
+def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None:
     print(f"Running: {' '.join(cmd)} (cwd={cwd})")
-    subprocess.run(cmd, cwd=cwd, check=True)
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+    subprocess.run(cmd, cwd=cwd, check=True, env=merged)
 
 
-def run_script(path: Path, cwd: Path) -> None:
+def run_script(path: Path, cwd: Path, env: Optional[dict[str, str]] = None) -> None:
     if not path.exists():
         raise FileNotFoundError(f"Script not found: {path}")
     if not path.is_file():
         raise FileNotFoundError(f"Not a file: {path}")
-
-    # Run via bash for portability of shebang + executable bit.
-    run(["bash", str(path)], cwd=cwd)
+    run(["bash", str(path)], cwd=cwd, env=env)
 
 
 def is_raspberry_pi() -> bool:
@@ -103,24 +105,35 @@ def patch_plist(frontend_dir: Path) -> None:
     run_script(script, cwd=frontend_dir)
 
 
-def build_frontend(frontend_dir: Path, platform_name: Optional[str] = None) -> None:
+def build_frontend(
+    frontend_dir: Path,
+    platform_name: Optional[str] = None,
+    *,
+    rust_target: Optional[str] = None,
+) -> None:
     """
-    Build the frontend. If platform_name is provided, build only for that platform.
-    Always runs scripts/patch_plist.sh first (no-op if your script chooses).
+    Build the frontend.
+
+    - platform_name: passed to dx --platform (e.g. "ios", "web", "macos")
+    - rust_target: passed to dx --target (e.g. "aarch64-apple-ios")
     """
     try:
-        # Ensure any plist changes are applied before bundling.
-
         cmd = ["dx", "bundle", "--release"]
+
         if platform_name:
             cmd.extend(["--platform", platform_name])
-        else :
+        else:
             cmd.extend(["--platform", "web"])
 
+        if rust_target:
+            cmd.extend(["--target", rust_target])
+
         run(cmd, cwd=frontend_dir)
-        if platform_name:
-            if platform_name in "ios":
-                patch_plist(frontend_dir)
+
+        # Patch plist only for iOS bundles (device or sim).
+        if platform_name == "ios":
+            patch_plist(frontend_dir)
+
     except subprocess.CalledProcessError as e:
         print("Frontend build failed.", file=sys.stderr)
         sys.exit(e.returncode)
@@ -138,7 +151,6 @@ def build_backend(backend_dir: Path, force_pi: bool, force_no_pi: bool, testing_
         cmd.extend(["--features", "raspberry_pi"])
     elif force_no_pi:
         print("no_pi argument supplied → forcing build WITHOUT `raspberry_pi` feature, even on a Pi.")
-        # No feature added, even if running on Pi.
     else:
         if is_raspberry_pi():
             print("Detected Raspberry Pi → enabling `raspberry_pi` feature.")
@@ -169,7 +181,8 @@ def print_usage() -> None:
     print("  ./build.py docker [pi_build|no_pi] [testing]")
     print("")
     print("Frontend-only OS builds:")
-    print("  ./build.py ios")
+    print("  ./build.py ios                     # iPhoneOS device build (aarch64-apple-ios)")
+    print("  ./build.py ios_sim                 # iOS simulator build (aarch64-apple-ios-sim)")
     print("  ./build.py macos")
     print("  ./build.py windows")
     print("  ./build.py android")
@@ -178,29 +191,28 @@ def print_usage() -> None:
 
 
 def main() -> None:
-    # ----------------------
-    # Argument parsing logic
-    # ----------------------
     force_pi = False
     force_no_pi = False
     docker_mode = False
     testing_mode = False
-    frontend_only_platform: Optional[str] = None
 
-    # Accept 0..N args (we'll validate)
+    frontend_only_platform: Optional[str] = None
+    frontend_rust_target: Optional[str] = None
+
     args = [a.strip().lower() for a in sys.argv[1:]]
 
     if len(args) > 4:
         print("Error: Too many arguments.", file=sys.stderr)
         print_usage()
 
-    # Frontend-only modes map directly to dx --platform
+    # Frontend-only modes map to dx --platform; ios_sim is still platform ios but different rust target.
     frontend_platform_map = {
-        "ios": "ios",
-        "macos": "macos",
-        "windows": "windows",
-        "android": "android",
-        "linux": "linux",
+        "ios": ("ios", "aarch64-apple-ios"),
+        "ios_sim": ("ios", "aarch64-apple-ios-sim"),
+        "macos": ("macos", None),
+        "windows": ("windows", None),
+        "android": ("android", None),
+        "linux": ("linux", None),
     }
 
     for arg in args:
@@ -216,7 +228,7 @@ def main() -> None:
             if frontend_only_platform is not None:
                 print("Error: Only one frontend-only platform may be specified.", file=sys.stderr)
                 print_usage()
-            frontend_only_platform = frontend_platform_map[arg]
+            frontend_only_platform, frontend_rust_target = frontend_platform_map[arg]
         else:
             print(f"Error: Invalid argument '{arg}'.", file=sys.stderr)
             print_usage()
@@ -229,7 +241,7 @@ def main() -> None:
     if frontend_only_platform is not None:
         if docker_mode or force_pi or force_no_pi or testing_mode:
             print(
-                "Error: Frontend-only builds (ios/macos/windows/android/linux) cannot be combined "
+                "Error: Frontend-only builds (ios/ios_sim/macos/windows/android/linux) cannot be combined "
                 "with docker/pi_build/no_pi/testing.",
                 file=sys.stderr,
             )
@@ -239,16 +251,12 @@ def main() -> None:
     frontend_dir = repo_root / "frontend"
     backend_dir = repo_root / "backend"
 
-    # ----------------------
     # Frontend-only build mode
-    # ----------------------
     if frontend_only_platform is not None:
-        build_frontend(frontend_dir, platform_name=frontend_only_platform)
+        build_frontend(frontend_dir, platform_name=frontend_only_platform, rust_target=frontend_rust_target)
         return
 
-    # ----------------------
     # Docker mode
-    # ----------------------
     if docker_mode:
         if force_pi and force_no_pi:
             print("Error: Cannot specify both 'pi_build' and 'no_pi' in docker mode.", file=sys.stderr)
@@ -270,10 +278,7 @@ def main() -> None:
         build_docker(repo_root, pi_build=pi_build_flag)
         return
 
-    # ----------------------
-    # Normal local build mode
-    # ----------------------
-    # Run frontend & backend in parallel
+    # Normal local build mode: frontend & backend in parallel
     bfe = mp.Process(target=build_frontend, args=(frontend_dir, None))
     bbe = mp.Process(target=build_backend, args=(backend_dir, force_pi, force_no_pi, testing_mode))
 

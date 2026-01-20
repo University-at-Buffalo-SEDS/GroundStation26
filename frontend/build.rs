@@ -117,8 +117,28 @@ fn run(mut cmd: Command) {
     }
 }
 
+fn log(msg: &str) {
+    let log_file_path = env::var("CARGO_MANIFEST_DIR").unwrap().to_string() + "/build.log";
+    let mut log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .unwrap();
+
+    log_file
+        .write_all(msg.as_ref())
+        .unwrap();
+}
 fn main() {
     let target = env::var("TARGET").unwrap();
+    use fs;
+    let log_file_path = env::var("CARGO_MANIFEST_DIR").unwrap().to_string() + "/build.log";
+    let _ = fs::remove_file(&log_file_path);
+
+    log
+        (format!("target: {}", target).as_ref())
+        ;
+
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     build_apple_objc(&manifest_dir, &target);
@@ -134,16 +154,21 @@ fn main() {
     let leaflet_dir = manifest_dir.join("assets").join("vendor").join("leaflet");
 
     if let Err(e) = fs::create_dir_all(&leaflet_dir) {
-        eprintln!("Failed to create Leaflet vendor dir {leaflet_dir:?}: {e}");
+        log(format!("Failed to create Leaflet vendor dir {leaflet_dir:?}: {e}").as_ref())
+            ;
+
         return;
     }
 
     // Download CSS and JS
-    if let Err(e) = download_leaflet_file(&leaflet_dir, &version, "css") {
-        eprintln!("Failed to download Leaflet CSS: {e}");
+    if let Err(e) = download_leaflet_file(&leaflet_dir, &version, "css", log) {
+        log
+            (format!("Failed to download Leaflet CSS: {e}").as_ref());
     }
-    if let Err(e) = download_leaflet_file(&leaflet_dir, &version, "js") {
-        eprintln!("Failed to download Leaflet JS: {e}");
+    if let Err(e) = download_leaflet_file(&leaflet_dir, &version, "js", log) {
+        log
+            (format!("Failed to download Leaflet JS: {e}").as_ref())
+            ;
     }
 }
 
@@ -151,6 +176,7 @@ fn download_leaflet_file(
     leaflet_dir: &Path,
     version: &str,
     kind: &str, // "css" or "js"
+    log: impl Fn(&str),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let filename = format!("leaflet.{kind}");
     let out_path = leaflet_dir.join(&filename);
@@ -161,7 +187,7 @@ fn download_leaflet_file(
     }
 
     let url = format!("https://unpkg.com/leaflet@{version}/dist/leaflet.{kind}",);
-    println!("Downloading {url} -> {}", out_path.display());
+    log(format!("Downloading {url} -> {}", out_path.display()).as_ref());
 
     let resp = reqwest::blocking::get(&url)?;
     if !resp.status().is_success() {
