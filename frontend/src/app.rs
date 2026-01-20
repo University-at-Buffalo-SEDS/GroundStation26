@@ -563,7 +563,7 @@ pub fn Connect() -> Element {
                                 test_status.set(report);
                             });
                         },
-                        if testing() { "Testing..." } else { "Test routes" }
+                        if testing() { "Testing..." } else { "Test Connection" }
                     }
 
                     // CONNECT
