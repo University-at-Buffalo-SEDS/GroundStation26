@@ -49,19 +49,34 @@ struct DashboardLife {
 }
 
 impl DashboardLife {
-    fn new_dead() -> Self {
+    fn _new_dead() -> Self {
         Self {
             alive: Arc::new(AtomicBool::new(false)),
             r#gen: 0,
         }
     }
+    fn new_alive() -> Self {
+        Self {
+            alive: Arc::new(AtomicBool::new(true)),
+            r#gen: 0,
+        }
+    }
 }
 
-static DASHBOARD_LIFE: GlobalSignal<DashboardLife> = Signal::global(DashboardLife::new_dead);
+static DASHBOARD_LIFE: GlobalSignal<DashboardLife> = Signal::global(DashboardLife::new_alive);
 
 #[inline]
 fn dashboard_alive() -> Arc<AtomicBool> {
     DASHBOARD_LIFE.read().alive.clone()
+}
+
+#[inline]
+fn set_dashboard_alive(alive: bool) {
+    let alive = Arc::new(AtomicBool::new(alive));
+    *DASHBOARD_LIFE.write() = DashboardLife {
+        alive,
+        r#gen: dashboard_gen() + 1,
+    };
 }
 
 #[inline]
@@ -445,54 +460,12 @@ static WS_SENDER: GlobalSignal<Option<WsSender>> = Signal::global(|| None::<WsSe
 #[component]
 pub fn TelemetryDashboard() -> Element {
     // Create once per real mount
-    let alive: Arc<AtomicBool> = use_hook(|| Arc::new(AtomicBool::new(true)));
+    *DASHBOARD_LIFE.write() = DashboardLife::new_alive();
 
-    // Mount + unmount guard
-    let _guard = use_hook({
-        let alive = alive.clone();
-        move || {
-            #[derive(Clone)]
-            struct Guard {
-                alive: Arc<AtomicBool>,
-            }
-
-            impl Drop for Guard {
-                fn drop(&mut self) {
-                    // Idempotent drop (prevents double-unmount spam / double-epoch bumps)
-                    let was_alive = self.alive.swap(false, Ordering::Relaxed);
-                    if !was_alive {
-                        return;
-                    }
-
-                    // Only clear if we're still the published dashboard
-                    let cur = DASHBOARD_LIFE.read().alive.clone();
-                    if Arc::ptr_eq(&cur, &self.alive) {
-                        *DASHBOARD_LIFE.write() = DashboardLife::new_dead();
-                    }
-
-                    bump_ws_epoch();
-                    log!("[UI] TelemetryDashboard unmounted -> alive=false + bump epoch");
-                }
-            }
-
-            // Publish global life (never Option)
-            {
-                let mut st = DASHBOARD_LIFE.write();
-                let next_gen = st.r#gen.wrapping_add(1);
-                *st = DashboardLife {
-                    alive: alive.clone(),
-                    r#gen: next_gen,
-                };
-            }
-
-            log!(
-                "[UI] TelemetryDashboard mounted (alive=true, gen={})",
-                dashboard_gen()
-            );
-
-            Guard { alive }
-        }
-    });
+    log!(
+        "[UI] TelemetryDashboard mounted (alive=true, gen={})",
+        dashboard_gen()
+    );
 
     rsx! {
         TelemetryDashboardInner { key: "{*UI_EPOCH.read()}" }
@@ -844,6 +817,7 @@ fn TelemetryDashboardInner() -> Element {
                         // That prevents the dashboard's WS supervisor effect from spawning
                         // a new epoch while we're navigating away.
                         let was_alive = alive_for_click.swap(false, Ordering::Relaxed);
+                        set_dashboard_alive(false);
                         if was_alive {
                             bump_ws_epoch();
                             log!("[UI] CONNECT pressed -> alive=false + bump epoch");
