@@ -2,6 +2,7 @@
 import multiprocessing as mp
 import os
 import platform
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,12 @@ def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None
     if env:
         merged.update(env)
     subprocess.run(cmd, cwd=cwd, check=True, env=merged)
+
+
+def run_capture(cmd: list[str], cwd: Path) -> str:
+    print(f"Running: {' '.join(cmd)} (cwd={cwd})")
+    out = subprocess.check_output(cmd, cwd=cwd)
+    return out.decode("utf-8", errors="replace")
 
 
 def run_script(path: Path, cwd: Path, env: Optional[dict[str, str]] = None) -> None:
@@ -58,7 +65,6 @@ def get_compose_base_cmd() -> list[str]:
     but falling back to `docker-compose` if needed.
     Exits with an error if neither is available.
     """
-    # Try `docker compose`
     try:
         subprocess.run(
             ["docker", "compose", "version"],
@@ -70,7 +76,6 @@ def get_compose_base_cmd() -> list[str]:
     except (FileNotFoundError, subprocess.CalledProcessError):
         pass
 
-    # Try legacy `docker-compose`
     try:
         subprocess.run(
             ["docker-compose", "version"],
@@ -96,7 +101,6 @@ def build_docker(repo_root: Path, pi_build: bool) -> None:
     cmd: list[str] = [*compose_cmd, "build"]
 
     if pi_build:
-        # Presence of PI_BUILD is the signal for a Pi build in the Dockerfile.
         print("Pi build (docker) → passing --build-arg PI_BUILD=")
         cmd.extend(["--build-arg", "PI_BUILD="])
 
@@ -142,7 +146,6 @@ def build_frontend(
     - rust_target: passed to dx --target (e.g. "aarch64-apple-ios")
     """
     try:
-        # Always clear out the .app dir before building (if present).
         clear_app_bundle(frontend_dir)
 
         cmd = ["dx", "bundle", "--release"]
@@ -157,7 +160,7 @@ def build_frontend(
 
         run(cmd, cwd=frontend_dir)
 
-        # Patch plist only for iOS bundles (device or sim).
+        # Patch plist for iOS bundles (device or sim)
         if platform_name == "ios":
             patch_plist(frontend_dir)
 
@@ -177,6 +180,138 @@ def deploy_ios(frontend_dir: Path) -> None:
         sys.exit(1)
 
     run(["ios-deploy", "--bundle", str(bundle)], cwd=frontend_dir)
+
+
+def _read_bundle_identifier(app_bundle: Path) -> Optional[str]:
+    plist_path = app_bundle / "Info.plist"
+    try:
+        with plist_path.open("rb") as f:
+            info = plistlib.load(f)
+        bid = info.get("CFBundleIdentifier")
+        if isinstance(bid, str) and bid.strip():
+            return bid.strip()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    return None
+
+
+def _open_simulator_app(frontend_dir: Path) -> None:
+    if platform.system() != "Darwin":
+        return
+    try:
+        run(["open", "-a", "Simulator"], cwd=frontend_dir)
+    except Exception:
+        pass
+
+
+def _pick_or_boot_simulator_udid(frontend_dir: Path) -> str:
+    """
+    Returns a UDID of a booted simulator. If none are booted, best-effort boots
+    the first available iPhone simulator device.
+    """
+    if platform.system() != "Darwin":
+        print("Error: iOS simulator install requires macOS (xcrun).", file=sys.stderr)
+        sys.exit(1)
+
+    # Prefer an already-booted device
+    try:
+        out = run_capture(["xcrun", "simctl", "list", "devices", "booted"], cwd=frontend_dir)
+        # Typical line: "    iPhone 15 (SOME-UDID) (Booted)"
+        for line in out.splitlines():
+            line = line.strip()
+            if "(Booted)" in line and "(" in line and ")" in line:
+                # grab the last (...) before (Booted)
+                parts = line.split("(")
+                # find something that looks like a UDID
+                for p in parts:
+                    cand = p.split(")")[0].strip()
+                    if "-" in cand and len(cand) >= 20:
+                        return cand
+    except subprocess.CalledProcessError:
+        pass
+
+    # None booted: boot first available iPhone
+    try:
+        out = run_capture(["xcrun", "simctl", "list", "devices"], cwd=frontend_dir)
+    except subprocess.CalledProcessError as e:
+        print("Error: failed to list simulators via xcrun simctl.", file=sys.stderr)
+        sys.exit(e.returncode)
+
+    chosen: Optional[str] = None
+    for line in out.splitlines():
+        t = line.strip()
+        # Look for iPhone lines in Shutdown state, e.g.: "iPhone 15 (UDID) (Shutdown)"
+        if t.startswith("iPhone ") and "(Shutdown)" in t and "(" in t and ")" in t:
+            parts = t.split("(")
+            for p in parts:
+                cand = p.split(")")[0].strip()
+                if "-" in cand and len(cand) >= 20:
+                    chosen = cand
+                    break
+        if chosen:
+            break
+
+    if not chosen:
+        print(
+            "Error: no booted simulator found and couldn't find a Shutdown iPhone simulator to boot.\n"
+            "Open Simulator.app and create/boot a device, then re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    _open_simulator_app(frontend_dir)
+    try:
+        run(["xcrun", "simctl", "boot", chosen], cwd=frontend_dir)
+    except subprocess.CalledProcessError:
+        # If it's already booting/booted, continue.
+        pass
+
+    return chosen
+
+
+def deploy_ios_sim(frontend_dir: Path) -> None:
+    """
+    Install the built iOS simulator .app into the current simulator (booted),
+    and auto-launch it.
+
+    This is the "install step for the simulator that autoloads it into the sim".
+    """
+    bundle = app_bundle_path(frontend_dir)
+    if not bundle.exists():
+        print(f"Error: iOS sim app bundle not found at: {bundle}", file=sys.stderr)
+        print("Build it first with: ./build.py ios_sim (or ./build.py ios_sim_install)", file=sys.stderr)
+        sys.exit(1)
+
+    udid = _pick_or_boot_simulator_udid(frontend_dir)
+
+    # Install
+    try:
+        run(["xcrun", "simctl", "install", udid, str(bundle)], cwd=frontend_dir)
+    except subprocess.CalledProcessError as e:
+        print("Error: failed to install app into simulator.", file=sys.stderr)
+        sys.exit(e.returncode)
+
+    # Launch (autoload)
+    bundle_id = _read_bundle_identifier(bundle)
+    if not bundle_id:
+        print(
+            "Installed into simulator, but could not read CFBundleIdentifier to auto-launch.\n"
+            f"Tip: ensure {bundle / 'Info.plist'} has CFBundleIdentifier, or launch manually in Simulator.",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        run(["xcrun", "simctl", "launch", udid, bundle_id], cwd=frontend_dir)
+    except subprocess.CalledProcessError as e:
+        print(
+            "Installed into simulator, but auto-launch failed.\n"
+            f"Try launching manually, or run: xcrun simctl launch {udid} {bundle_id}",
+            file=sys.stderr,
+        )
+        sys.exit(e.returncode)
 
 
 def deploy_macos(frontend_dir: Path) -> None:
@@ -252,6 +387,7 @@ def print_usage() -> None:
     print("")
     print("Frontend deploy actions:")
     print("  ./build.py ios_deploy              # build ios + deploy to device via ios-deploy")
+    print("  ./build.py ios_sim_install         # build ios_sim + install into Simulator + auto-launch")
     print("  ./build.py macos_deploy            # build macos + copy .app to ~/Applications")
     sys.exit(1)
 
@@ -264,7 +400,7 @@ def main() -> None:
 
     frontend_only_platform: Optional[str] = None
     frontend_rust_target: Optional[str] = None
-    frontend_deploy_action: Optional[str] = None  # "ios" | "macos"
+    frontend_deploy_action: Optional[str] = None  # "ios" | "macos" | "ios_sim_install"
 
     args = [a.strip().lower() for a in sys.argv[1:]]
 
@@ -272,7 +408,6 @@ def main() -> None:
         print("Error: Too many arguments.", file=sys.stderr)
         print_usage()
 
-    # Frontend-only modes map to dx --platform; ios_sim is still platform ios but different rust target.
     frontend_platform_map = {
         "ios": ("ios", "aarch64-apple-ios"),
         "ios_sim": ("ios", "aarch64-apple-ios-sim"),
@@ -284,6 +419,7 @@ def main() -> None:
 
     deploy_map = {
         "ios_deploy": "ios",
+        "ios_sim_install": "ios_sim_install",
         "macos_deploy": "macos",
     }
 
@@ -322,8 +458,7 @@ def main() -> None:
     if frontend_deploy_action is not None:
         if docker_mode or force_pi or force_no_pi or testing_mode:
             print(
-                "Error: Frontend deploy actions (ios_deploy/macos_deploy) cannot be combined "
-                "with docker/pi_build/no_pi/testing.",
+                "Error: Frontend deploy actions cannot be combined with docker/pi_build/no_pi/testing.",
                 file=sys.stderr,
             )
             print_usage()
@@ -331,6 +466,11 @@ def main() -> None:
         if frontend_deploy_action == "ios":
             build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
             deploy_ios(frontend_dir)
+            return
+
+        if frontend_deploy_action == "ios_sim_install":
+            build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios-sim")
+            deploy_ios_sim(frontend_dir)
             return
 
         if frontend_deploy_action == "macos":
@@ -345,8 +485,7 @@ def main() -> None:
     if frontend_only_platform is not None:
         if docker_mode or force_pi or force_no_pi or testing_mode:
             print(
-                "Error: Frontend-only builds (ios/ios_sim/macos/windows/android/linux) cannot be combined "
-                "with docker/pi_build/no_pi/testing.",
+                "Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing.",
                 file=sys.stderr,
             )
             print_usage()
