@@ -23,8 +23,8 @@ use crate::radio::DummyRadio;
 use crate::radio::{Radio, RadioDevice, RADIO_BAUD_RATE, ROCKET_RADIO_PORT, UMBILICAL_RADIO_PORT};
 use crate::web::emit_error;
 use axum::Router;
-use groundstation_shared::FlightState;
-use sedsprintf_rs_2026::config::DataEndpoint::{Abort, GroundStation};
+use groundstation_shared::FlightState as FlightStateMode;
+use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::{EndpointHandler, LinkId, RouterMode};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
         warnings_tx: broadcast::channel(256).0,
         errors_tx: broadcast::channel(256).0,
         db,
-        state: Arc::new(Mutex::new(FlightState::Startup)),
+        state: Arc::new(Mutex::new(FlightStateMode::Startup)),
         state_tx: broadcast::channel(16).0,
         gpio,
     });
@@ -138,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
     // --- Router endpoint handlers ---
     let ground_station_handler_state_clone = state.clone();
     let abort_handler_state_clone = state.clone();
+    let flight_state_handler_state_clone = state.clone();
 
     let ground_station_handler = EndpointHandler::new_packet_handler(
         GroundStation,
@@ -151,6 +152,18 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
+    let flight_state_handler = EndpointHandler::new_packet_handler(
+        FlightState,
+        move |pkt: &TelemetryPacket, _sender| {
+            let mut rb = flight_state_handler_state_clone
+                .ring_buffer
+                .lock()
+                .unwrap();
+            rb.push(pkt.clone());
+            Ok(())
+        }
+    );
+
     let abort_handler =
         EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket, _sender| {
             let error_msg = pkt
@@ -161,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
         });
 
     let cfg =
-        sedsprintf_rs_2026::router::RouterConfig::new([ground_station_handler, abort_handler]);
+        sedsprintf_rs_2026::router::RouterConfig::new([ground_station_handler, abort_handler, flight_state_handler]);
 
     // --- Radios ---
     let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
@@ -259,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to setup gpio callback input");
 
     router.log_queue(DataType::MessageData, "hello".as_bytes())?;
-    router.log_queue(DataType::FlightState, &[FlightState::Startup as u8])?;
+    router.log_queue(DataType::FlightState, &[FlightStateMode::Startup as u8])?;
 
     // --- Background tasks ---
     let _tt = tokio::spawn(telemetry_task(
