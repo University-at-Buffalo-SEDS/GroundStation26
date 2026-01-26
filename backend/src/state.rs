@@ -1,11 +1,18 @@
 use crate::gpio::GpioPins;
 use crate::ring_buffer::RingBuffer;
 use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
-use groundstation_shared::{FlightState, TelemetryCommand, TelemetryRow};
+use groundstation_shared::{Board, FlightState, TelemetryCommand, TelemetryRow};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
+
+#[derive(Debug, Clone)]
+pub struct BoardStatus {
+    pub last_seen_ms: Option<u64>,
+    pub warned: bool,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -35,4 +42,7 @@ pub struct AppState {
 
     /// GPIO interface
     pub gpio: Arc<GpioPins>,
+
+    /// Board heartbeat status
+    pub board_status: Arc<Mutex<HashMap<Board, BoardStatus>>>,
 }

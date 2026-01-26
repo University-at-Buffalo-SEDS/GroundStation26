@@ -92,21 +92,22 @@ impl RadioDevice for Radio {
 #[derive(Debug)]
 pub struct DummyRadio {
     name: &'static str,
+    sender: &'static str,
     id: LinkId
 }
 
 #[cfg(feature = "testing")]
 
 impl DummyRadio {
-    pub fn new(name: &'static str, id: LinkId) -> Self {
-        DummyRadio { name, id}
+    pub fn new(name: &'static str, sender: &'static str, id: LinkId) -> Self {
+        DummyRadio { name, sender, id }
     }
 }
 
 #[cfg(feature = "testing")]
 impl RadioDevice for DummyRadio {
     fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
-        let pkt = get_dummy_packet()?;
+        let pkt = get_dummy_packet(self.sender)?;
         return _router.rx_queue_from(pkt, self.id);
 
         // No incoming packets in dummy mode

@@ -58,7 +58,7 @@ fn dummy_state() -> &'static Mutex<DummyState> {
 /// - Normally: a random packet from `choices` (GPS / gyro / etc.).
 /// - Once every 5 seconds: on the first call after the interval has elapsed,
 ///   return a *flight-state* packet with the next FlightState (wrapping).
-pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
+pub fn get_dummy_packet(sender: &str) -> TelemetryResult<TelemetryPacket> {
     use crate::DataType::*;
 
     let now_ms = get_current_timestamp_ms();
@@ -87,7 +87,7 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
         return TelemetryPacket::new(
             FlightState, // <- make sure this matches your DataType variant name
             &[DataEndpoint::GroundStation],
-            "TEST",
+            sender,
             now_ms,
             Arc::from([state_code]),
         );
@@ -187,7 +187,7 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     TelemetryPacket::new(
         dtype,
         &[DataEndpoint::GroundStation],
-        "TEST", // device ID
+        sender,
         now_ms,
         Arc::from(bytes.as_slice()),
     )

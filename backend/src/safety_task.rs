@@ -1,5 +1,7 @@
 use crate::state::AppState;
+use crate::telemetry_task::get_current_timestamp_ms;
 use crate::web::emit_warning;
+use groundstation_shared::FlightState;
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
 use std::sync::Arc;
@@ -59,11 +61,60 @@ const KALMAN_Y_MAX_THRESHOLD: f32 = 1000.0; // arbitrary units
 const KALMAN_Z_MIN_THRESHOLD: f32 = -1000.0; // arbitrary units
 const KALMAN_Z_MAX_THRESHOLD: f32 = 1000.0; // arbitrary units
 
+const BOARD_TIMEOUT_MS: u64 = 500;
+
 pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
     let mut abort = false;
     let mut count: u64 = 0;
     loop {
         sleep(Duration::from_millis(500)).await;
+
+        let current_state = { *state.state.lock().unwrap() };
+        let now_ms = get_current_timestamp_ms();
+        let mut board_warnings = Vec::new();
+        let all_boards_seen = {
+            let mut board_status = state.board_status.lock().unwrap();
+            for (board, status) in board_status.iter_mut() {
+                let offline = match status.last_seen_ms {
+                    Some(last_seen_ms) => now_ms.saturating_sub(last_seen_ms) > BOARD_TIMEOUT_MS,
+                    None => true,
+                };
+
+                if offline {
+                    if current_state != FlightState::Startup && !status.warned {
+                        board_warnings.push(format!(
+                            "Warning: No messages from {} in >{}ms",
+                            board.as_str(),
+                            BOARD_TIMEOUT_MS
+                        ));
+                        status.warned = true;
+                    }
+                } else {
+                    status.warned = false;
+                }
+            }
+            board_status.values().all(|status| status.last_seen_ms.is_some())
+        };
+
+        for warning in board_warnings {
+            emit_warning(&state, warning);
+        }
+
+        if current_state == FlightState::Startup && all_boards_seen {
+            {
+                let mut fs = state.state.lock().unwrap();
+                *fs = FlightState::Idle;
+            }
+            sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
+                .bind(get_current_timestamp_ms() as i64)
+                .bind(FlightState::Idle as i64)
+                .execute(&state.db)
+                .await
+                .expect("DB insert into flight_state failed");
+            let _ = state.state_tx.send(crate::web::FlightStateMsg {
+                state: FlightState::Idle,
+            });
+        }
 
         // Snapshot current packets from the ring buffer
         let packets = {

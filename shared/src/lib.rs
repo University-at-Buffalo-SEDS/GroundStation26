@@ -13,7 +13,7 @@ pub enum TelemetryCommand {
     Igniter,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[repr(u8)]
 pub enum FlightState {
     Startup,
@@ -32,6 +32,35 @@ pub enum FlightState {
     Landed,
     Recovery,
     Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Board {
+    Rocket,
+    Umbilical,
+}
+
+impl Board {
+    pub const ALL: &'static [Board] = &[Board::Rocket, Board::Umbilical];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Board::Rocket => "Rocket",
+            Board::Umbilical => "Umbilical",
+        }
+    }
+
+    pub fn sender_id(&self) -> &'static str {
+        match self {
+            Board::Rocket => "ROCKET",
+            Board::Umbilical => "UMBILICAL",
+        }
+    }
+
+    pub fn from_sender_id(sender: &str) -> Option<Board> {
+        Self::ALL.iter().copied().find(|board| board.sender_id() == sender)
+    }
 }
 
 impl FlightState{

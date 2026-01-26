@@ -14,7 +14,7 @@ mod web;
 use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
 use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
-use crate::state::AppState;
+use crate::state::{AppState, BoardStatus};
 use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
 use crate::gpio::Trigger::RisingEdge;
@@ -23,7 +23,7 @@ use crate::radio::DummyRadio;
 use crate::radio::{Radio, RadioDevice, RADIO_BAUD_RATE, ROCKET_RADIO_PORT, UMBILICAL_RADIO_PORT};
 use crate::web::emit_error;
 use axum::Router;
-use groundstation_shared::FlightState as FlightStateMode;
+use groundstation_shared::{Board, FlightState as FlightStateMode};
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::{EndpointHandler, LinkId, RouterMode};
@@ -31,6 +31,7 @@ use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::{TelemetryError, TelemetryResult};
 use std::fs;
 use std::path::Path;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,6 +44,17 @@ const GPIO_IGNITION_PIN: u8 = 5;
 const GPIO_ABORT_PIN: u8 = 9;
 const ROCKET_RADIO_ID: LinkId = unsafe { LinkId::new_unchecked(3) };
 const UMBILICAL_RADIO_ID: LinkId = unsafe { LinkId::new_unchecked(4) };
+
+fn mark_board_seen_from_sender(state: &AppState, sender: &str, timestamp_ms: u64) {
+    let Some(board) = Board::from_sender_id(sender) else {
+        return;
+    };
+    let mut map = state.board_status.lock().unwrap();
+    if let Some(status) = map.get_mut(&board) {
+        status.last_seen_ms = Some(timestamp_ms);
+        status.warned = false;
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -123,6 +135,17 @@ async fn main() -> anyhow::Result<()> {
     let (ws_tx, _ws_rx) = broadcast::channel(512);
 
     // --- Shared state ---
+    let mut board_status = HashMap::new();
+    for board in Board::ALL {
+        board_status.insert(
+            *board,
+            BoardStatus {
+                last_seen_ms: None,
+                warned: false,
+            },
+        );
+    }
+
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(1024))),
         cmd_tx,
@@ -133,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
         state: Arc::new(Mutex::new(FlightStateMode::Startup)),
         state_tx: broadcast::channel(16).0,
         gpio,
+        board_status: Arc::new(Mutex::new(board_status)),
     });
 
     // --- Router endpoint handlers ---
@@ -143,6 +167,11 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler = EndpointHandler::new_packet_handler(
         GroundStation,
         move |pkt: &TelemetryPacket, _sender| {
+            mark_board_seen_from_sender(
+                &ground_station_handler_state_clone,
+                pkt.sender(),
+                pkt.timestamp(),
+            );
             let mut rb = ground_station_handler_state_clone
                 .ring_buffer
                 .lock()
@@ -155,6 +184,11 @@ async fn main() -> anyhow::Result<()> {
     let flight_state_handler = EndpointHandler::new_packet_handler(
         FlightState,
         move |pkt: &TelemetryPacket, _sender| {
+            mark_board_seen_from_sender(
+                &flight_state_handler_state_clone,
+                pkt.sender(),
+                pkt.timestamp(),
+            );
             let mut rb = flight_state_handler_state_clone
                 .ring_buffer
                 .lock()
@@ -166,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
 
     let abort_handler =
         EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket, _sender| {
+            mark_board_seen_from_sender(&abort_handler_state_clone, pkt.sender(), pkt.timestamp());
             let error_msg = pkt
                 .data_as_string()
                 .expect("Abort packet with invalid UTF-8");
@@ -189,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
                 {
                     Arc::new(Mutex::new(Box::new(DummyRadio::new(
                         "Rocket Radio",
+                        Board::Rocket.sender_id(),
                         ROCKET_RADIO_ID,
                     ))))
                 }
@@ -209,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
                 {
                     Arc::new(Mutex::new(Box::new(DummyRadio::new(
                         "Umbilical Radio",
+                        Board::Umbilical.sender_id(),
                         UMBILICAL_RADIO_ID,
                     ))))
                 }
