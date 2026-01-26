@@ -59,16 +59,14 @@ def is_raspberry_pi() -> bool:
     return False
 
 
-def in_docker_build() -> bool:
+def is_container() -> bool:
     """
-    Best-effort detection that we're running inside a Docker build/container.
-    We treat this as a signal to avoid multiprocessing.
-    """
-    # Explicit override
-    if os.environ.get("GROUNDSTATION_NO_PARALLEL", "").strip() in {"1", "true", "yes", "on"}:
-        return True
+    Detect if we are actually inside a container.
 
-    # Common container markers
+    IMPORTANT:
+    - This is intentionally NOT the same as "no parallel requested".
+    - Used to decide whether to run cargo prefetch/build before dx bundle.
+    """
     if Path("/.dockerenv").exists():
         return True
 
@@ -76,13 +74,38 @@ def in_docker_build() -> bool:
         cgroup = Path("/proc/1/cgroup")
         if cgroup.exists():
             txt = cgroup.read_text(errors="ignore").lower()
-            # Matches docker/containerd/k8s-ish environments
             if "docker" in txt or "containerd" in txt or "kubepods" in txt:
                 return True
     except Exception:
         pass
 
     return False
+
+
+def no_parallel_requested() -> bool:
+    """
+    User override: force sequential build even on host.
+
+    This should NOT imply "we are in docker".
+    """
+    return os.environ.get("GROUNDSTATION_NO_PARALLEL", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def in_docker_build() -> bool:
+    """
+    Best-effort detection that we're running inside a Docker build/container
+    OR the user forced single-thread mode.
+
+    Existing behavior preserved (sequential build when forced).
+    """
+    if no_parallel_requested():
+        return True
+    return is_container()
 
 
 def get_compose_base_cmd() -> list[str]:
@@ -162,6 +185,21 @@ def clear_app_bundle(frontend_dir: Path) -> None:
         shutil.rmtree(bundle)
 
 
+def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
+    """
+    When running inside a container (Docker build/container), dx bundle can stall
+    at `cargo metadata` if the network/index isn't ready.
+    Prime cargo first (network allowed) then run dx bundle.
+
+    NOTE: This is ONLY for real containers, NOT for host single-thread mode.
+    """
+    print("Container detected → priming cargo for frontend before dx bundle")
+    # fetch is a cheap way to force index/network setup
+    run(["cargo", "fetch"], cwd=frontend_dir)
+    # build the frontend crate so metadata/deps are definitely warm
+    run(["cargo", "build", "--release", "-p", "groundstation_frontend"], cwd=frontend_dir)
+
+
 def build_frontend(
     frontend_dir: Path,
     platform_name: Optional[str] = None,
@@ -173,9 +211,16 @@ def build_frontend(
 
     - platform_name: passed to dx --platform (e.g. "ios", "web", "macos")
     - rust_target: passed to dx --target (e.g. "aarch64-apple-ios")
+
+    New behavior:
+    - If inside a REAL container, run cargo fetch + cargo build(frontend) first, then dx bundle.
+    - Host builds (even sequential forced via GROUNDSTATION_NO_PARALLEL) are unchanged.
     """
     try:
         clear_app_bundle(frontend_dir)
+
+        if is_container():
+            _prebuild_frontend_for_container(frontend_dir)
 
         cmd = ["dx", "bundle", "--release"]
 
