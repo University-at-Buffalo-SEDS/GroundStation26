@@ -43,24 +43,24 @@ COPY build.py ./
 # - both set           -> ./build.py pi_build testing
 RUN set -e; \
     args=""; \
-    if [ -n "${PI_BUILD}" ] && [ "${PI_BUILD}" = "true" ]; then \
+    if [ -n "${PI_BUILD}" ] && [ "${PI_BUILD}" = "TRUE" ]; then \
         echo "PI_BUILD='${PI_BUILD}' → enabling pi_build"; \
         args="$args pi_build"; \
     else \
-        echo "PI_BUILD not set to 'pi_build'"; \
+        echo "PI_BUILD not set to 'TRUE'"; \
     fi; \
-    if [ -n "${TESTING}" ] && [ "${TESTING}" = "true" ]; then \
+    if [ -n "${TESTING}" ] && [ "${TESTING}" = "TRUE" ]; then \
         echo "TESTING='${TESTING}' → enabling testing"; \
         args="$args testing"; \
     else \
-        echo "TESTING not set to 'testing'"; \
+        echo "TESTING not set to 'TRUE'"; \
     fi; \
     if [ -n "$args" ]; then \
-        echo "→ GROUNDSTATION_NO_PARALLEL=1 ./build.py$args"; \
-        ./build.py $args; \
+        echo "→ ./build.py$args"; \
+        GROUNDSTATION_NO_PARALLEL=1 ./build.py $args; \
     else \
-        echo "→ GROUNDSTATION_NO_PARALLEL=1 ./build.py"; \
-        ./build.py; \
+        echo "→ ./build.py"; \
+        GROUNDSTATION_NO_PARALLEL=1 ./build.py; \
     fi
 
 RUN cargo build --release -p map_downloader
