@@ -1,11 +1,10 @@
 use crate::telemetry_task::get_current_timestamp_ms;
-use groundstation_shared::FlightState;
+use groundstation_shared::{Board, FlightState};
 use rand::Rng;
 use sedsprintf_rs_2026::config::DataEndpoint;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::TelemetryResult;
 use std::sync::{Arc, Mutex, OnceLock};
-use crate::state::AppState;
 // ---------------------------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------------------------
@@ -37,6 +36,7 @@ struct DummyState {
 }
 
 static DUMMY_STATE: OnceLock<Mutex<DummyState>> = OnceLock::new();
+static SENDER_INDEX: OnceLock<Mutex<usize>> = OnceLock::new();
 
 fn dummy_state() -> &'static Mutex<DummyState> {
     DUMMY_STATE.get_or_init(|| {
@@ -49,6 +49,17 @@ fn dummy_state() -> &'static Mutex<DummyState> {
     })
 }
 
+fn next_dummy_sender() -> &'static str {
+    if Board::ALL.is_empty() {
+        return "TEST";
+    }
+
+    let mut idx = SENDER_INDEX.get_or_init(|| Mutex::new(0)).lock().unwrap();
+    let sender = Board::ALL[*idx % Board::ALL.len()].sender_id();
+    *idx = (*idx + 1) % Board::ALL.len();
+    sender
+}
+
 // ---------------------------------------------------------------------------------------------
 // Public API: get_dummy_packet
 // ---------------------------------------------------------------------------------------------
@@ -58,8 +69,10 @@ fn dummy_state() -> &'static Mutex<DummyState> {
 /// - Normally: a random packet from `choices` (GPS / gyro / etc.).
 /// - Once every 5 seconds: on the first call after the interval has elapsed,
 ///   return a *flight-state* packet with the next FlightState (wrapping).
-pub fn get_dummy_packet(sender: &str, state: Arc<AppState>) -> TelemetryResult<TelemetryPacket> {
+pub fn get_dummy_packet(sender: Option<&'static str>) -> TelemetryResult<TelemetryPacket> {
     use crate::DataType::*;
+
+    let sender = sender.unwrap_or_else(next_dummy_sender);
 
     let now_ms = get_current_timestamp_ms();
 

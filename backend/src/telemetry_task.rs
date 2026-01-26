@@ -120,6 +120,13 @@ pub async fn handle_packet(state: &Arc<AppState>) {
     }
 
     if pkt.data_type() == DataType::FlightState {
+        let current_state = { *state.state.lock().unwrap() };
+        if current_state == groundstation_shared::FlightState::Startup {
+            return;
+        }
+        if !state.all_boards_seen() {
+            return;
+        }
         let pkt_data = match pkt.data_as_u8() {
             Ok(data) => *data.first().expect("index 0 does not exist"),
             Err(_) => return,

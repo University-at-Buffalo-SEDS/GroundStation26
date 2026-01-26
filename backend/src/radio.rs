@@ -7,7 +7,6 @@ use serial::{SerialPort, SystemPort};
 use std::error::Error;
 use std::io::{Read, Write};
 use std::time::Duration;
-use crate::state::AppState;
 
 pub const ROCKET_RADIO_PORT: &str = "/dev/ttyUSB1";
 pub const UMBILICAL_RADIO_PORT: &str = "/dev/ttyUSB2";
@@ -93,23 +92,22 @@ impl RadioDevice for Radio {
 #[derive(Debug)]
 pub struct DummyRadio {
     name: &'static str,
-    sender: &'static str,
+    sender: Option<&'static str>,
     id: LinkId,
-    state: Arc<AppState>
 }
 
 #[cfg(feature = "testing")]
 
 impl DummyRadio {
-    pub fn new(name: &'static str, sender: &'static str, id: LinkId, state: Arc<AppState>) -> Self {
-        DummyRadio { name, sender, id, state}
+    pub fn new(name: &'static str, sender: Option<&'static str>, id: LinkId) -> Self {
+        DummyRadio { name, sender, id }
     }
 }
 
 #[cfg(feature = "testing")]
 impl RadioDevice for DummyRadio {
     fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
-        let pkt = get_dummy_packet(self.sender, state)?;
+        let pkt = get_dummy_packet(self.sender)?;
         return _router.rx_queue_from(pkt, self.id);
 
         // No incoming packets in dummy mode

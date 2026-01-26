@@ -214,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
                 {
                     Arc::new(Mutex::new(Box::new(DummyRadio::new(
                         "Rocket Radio",
-                        Board::GroundStation.sender_id(),
+                        None,
                         ROCKET_RADIO_ID,
                     ))))
                 }
@@ -235,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
                 {
                     Arc::new(Mutex::new(Box::new(DummyRadio::new(
                         "Umbilical Radio",
-                        Board::GroundStation.sender_id(),
+                        None,
                         UMBILICAL_RADIO_ID,
                     ))))
                 }

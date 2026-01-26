@@ -62,6 +62,11 @@ impl AppState {
         }
     }
 
+    pub fn all_boards_seen(&self) -> bool {
+        let map = self.board_status.lock().unwrap();
+        map.values().all(|status| status.last_seen_ms.is_some())
+    }
+
     pub fn board_status_snapshot(&self, now_ms: u64) -> BoardStatusMsg {
         let map = self.board_status.lock().unwrap();
         let mut boards = Vec::with_capacity(Board::ALL.len());
