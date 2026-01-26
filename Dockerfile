@@ -24,16 +24,17 @@ RUN mkdir -p frontend/dist
 COPY frontend/src frontend/src
 COPY frontend/build.rs frontend/
 COPY frontend/Cargo.toml frontend/
-COPY frontend/assets frontend/
-COPY frontend/platform frontend/
-COPY frontend/scripts frontend/
-COPY frontend/static frontend/
+COPY frontend/assets frontend/assets
+COPY frontend/platform frontend/platform
+COPY frontend/scripts frontend/scripts
+COPY frontend/static frontend/static
 COPY frontend/Dioxus.toml frontend/
 
 # Shared
 RUN mkdir -p shared/src
 COPY shared/Cargo.toml shared/
 COPY shared/src shared/src
+RUN cd frontend && cargo update && cargo fetch && cd ..
 
 COPY build.py ./
 
@@ -78,7 +79,7 @@ COPY --from=builder /app/target/release/groundstation_backend /app/
 COPY --from=builder /app/target/release/map_downloader /app/map_downloader/
 COPY --from=builder /app/frontend/dist /app/frontend/dist/
 COPY --from=builder /app/frontend/static /app/frontend/static/
-COPY frontend/assets /app/frontend/assets/
+COPY --from=builder /app/frontend/assets /app/frontend/assets/
 COPY --from=builder /app/entrypoint.sh /app/
 
 EXPOSE 3000
