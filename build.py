@@ -119,7 +119,7 @@ def get_compose_base_cmd() -> list[str]:
         sys.exit(1)
 
 
-def build_docker(repo_root: Path, pi_build: bool) -> None:
+def build_docker(repo_root: Path, pi_build: bool, testing: bool) -> None:
     """
     Build using docker compose. If pi_build is True, pass PI_BUILD as a build-arg.
     """
@@ -128,7 +128,10 @@ def build_docker(repo_root: Path, pi_build: bool) -> None:
 
     if pi_build:
         print("Pi build (docker) → passing --build-arg PI_BUILD=")
-        cmd.extend(["--build-arg", "PI_BUILD="])
+        cmd.extend(["--build-arg", "PI_BUILD=TRUE"])
+    if testing:
+        print("Testing mode (docker) → passing --build-arg TESTING=")
+        cmd.extend(["--build-arg", "TESTING=TRUE"])
 
     run(cmd, cwd=repo_root)
 
@@ -531,7 +534,7 @@ def main() -> None:
                 print("Docker mode: not on Raspberry Pi and no pi_build override → PI_BUILD will not be set.")
             pi_build_flag = force_pi
 
-        build_docker(repo_root, pi_build=pi_build_flag)
+        build_docker(repo_root=repo_root, pi_build=pi_build_flag, testing=testing_mode)
         return
 
     # Normal local build mode:
