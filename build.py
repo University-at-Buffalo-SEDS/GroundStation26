@@ -538,7 +538,7 @@ def main() -> None:
     # - parallel on host
     # - sequential when running inside docker build/container (avoids cargo/dx contention)
     if in_docker_build():
-        print("Detected container/Docker build environment → running sequential (no multiprocessing).")
+        print("Sequential build")
         build_frontend(frontend_dir, None)
         build_backend(backend_dir, force_pi, force_no_pi, testing_mode)
         return

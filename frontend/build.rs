@@ -150,6 +150,23 @@ fn main() {
     // Path to frontend/dist/vendor/leaflet relative to this crate
     let leaflet_dir = manifest_dir.join("static").join("vendor").join("leaflet");
 
+    // Always watch these outputs (if they exist, Cargo will track changes)
+    println!(
+        "cargo:rerun-if-changed={}",
+        leaflet_dir.join("leaflet.css").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        leaflet_dir.join("leaflet.js").display()
+    );
+
+    // Add a sentinel file that we *ensure exists*; Cargo can reliably watch it.
+    let stamp = leaflet_dir.join(".leaflet-stamp");
+    println!("cargo:rerun-if-changed={}", stamp.display());
+
+    // Create the dir + stamp (dir creation doesn't help Cargo, stamp does)
+    fs::create_dir_all(&leaflet_dir).unwrap();
+    fs::write(&stamp, format!("version={}\n", version)).unwrap();
     if let Err(e) = fs::create_dir_all(&leaflet_dir) {
         log(format!("Failed to create Leaflet vendor dir {leaflet_dir:?}: {e}").as_ref());
 
