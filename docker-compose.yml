@@ -6,7 +6,6 @@ services:
         # Default value; build.py/docker path will override this when needed
         PI_BUILD: ""
         TESTING: ""
-        GROUNDSTATION_NO_PARALLEL: 1
     networks:
       - internal
     environment:

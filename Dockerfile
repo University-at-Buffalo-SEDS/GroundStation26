@@ -1,7 +1,6 @@
 FROM registry.gitlab.rylanswebsite.com/rylan-meilutis/rust-docker-builder:latest AS builder
 ARG PI_BUILD=""
 ARG TESTING=""
-ENV GROUNDSTATION_NO_PARALLEL=1
 
 LABEL authors="rylan"
 
@@ -44,23 +43,23 @@ COPY build.py ./
 # - both set           -> ./build.py pi_build testing
 RUN set -e; \
     args=""; \
-    if [ -n "${PI_BUILD}" ] && [ "${PI_BUILD}" = "pi_build" ]; then \
+    if [ -n "${PI_BUILD}" ] && [ "${PI_BUILD}" = "true" ]; then \
         echo "PI_BUILD='${PI_BUILD}' → enabling pi_build"; \
         args="$args pi_build"; \
     else \
         echo "PI_BUILD not set to 'pi_build'"; \
     fi; \
-    if [ -n "${TESTING}" ] && [ "${TESTING}" = "testing" ]; then \
+    if [ -n "${TESTING}" ] && [ "${TESTING}" = "true" ]; then \
         echo "TESTING='${TESTING}' → enabling testing"; \
         args="$args testing"; \
     else \
         echo "TESTING not set to 'testing'"; \
     fi; \
     if [ -n "$args" ]; then \
-        echo "→ ./build.py$args"; \
+        echo "→ GROUNDSTATION_NO_PARALLEL=1 ./build.py$args"; \
         ./build.py $args; \
     else \
-        echo "→ ./build.py"; \
+        echo "→ GROUNDSTATION_NO_PARALLEL=1 ./build.py"; \
         ./build.py; \
     fi
 

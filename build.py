@@ -132,7 +132,7 @@ def build_docker(repo_root: Path, pi_build: bool, testing: bool) -> None:
     if testing:
         print("Testing mode (docker) → passing --build-arg TESTING=")
         cmd.extend(["--build-arg", "TESTING=TRUE"])
-
+    print(cmd)
     run(cmd, cwd=repo_root)
 
 
