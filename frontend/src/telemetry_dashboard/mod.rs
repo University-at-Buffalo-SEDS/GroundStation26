@@ -22,7 +22,7 @@ use data_tab::DataTab;
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 use errors_tab::ErrorsTab;
-use groundstation_shared::{FlightState, TelemetryRow};
+use groundstation_shared::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
 use map_tab::MapTab;
 use serde::Deserialize;
 use state_tab::StateTab;
@@ -208,6 +208,7 @@ enum WsInMsg {
     FlightState(FlightStateMsg),
     Warning(AlertMsg),
     Error(AlertMsg),
+    BoardStatus(BoardStatusMsg),
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -501,6 +502,7 @@ fn TelemetryDashboardInner() -> Element {
     let warnings = use_signal(Vec::<AlertMsg>::new);
     let errors = use_signal(Vec::<AlertMsg>::new);
     let flight_state = use_signal(|| FlightState::Startup);
+    let board_status = use_signal(Vec::<BoardStatusEntry>::new);
 
     let active_main_tab = use_signal(|| _main_tab_from_str(st_main_tab.read().as_str()));
 
@@ -613,6 +615,7 @@ fn TelemetryDashboardInner() -> Element {
         let mut rows_s = rows;
         let mut warnings_s = warnings;
         let mut errors_s = errors;
+        let mut board_status_s = board_status;
         let mut rocket_gps_s = rocket_gps;
         let mut user_gps_s = user_gps;
         let mut ack_warning_ts_s = ack_warning_ts;
@@ -637,6 +640,7 @@ fn TelemetryDashboardInner() -> Element {
                     &mut rows_s,
                     &mut warnings_s,
                     &mut errors_s,
+                    &mut board_status_s,
                     &mut rocket_gps_s,
                     &mut user_gps_s,
                     &mut ack_warning_ts_s,
@@ -766,6 +770,7 @@ fn TelemetryDashboardInner() -> Element {
                     warnings,
                     errors,
                     flight_state,
+                    board_status,
                     rocket_gps,
                     user_gps,
                     alive.clone(),
@@ -1090,7 +1095,7 @@ fn TelemetryDashboardInner() -> Element {
             // Main body
             div { style: "flex:1; min-height:0;",
                 match *active_main_tab.read() {
-                    MainTab::State => rsx! { StateTab { flight_state: flight_state } },
+                    MainTab::State => rsx! { StateTab { flight_state: flight_state, boards: board_status } },
                     MainTab::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
                     MainTab::Actions => rsx! { ActionsTab {} },
                     MainTab::Warnings => rsx! { WarningsTab { warnings: warnings } },
@@ -1188,6 +1193,7 @@ async fn seed_from_db(
     rows: &mut Signal<Vec<TelemetryRow>>,
     warnings: &mut Signal<Vec<AlertMsg>>,
     errors: &mut Signal<Vec<AlertMsg>>,
+    board_status: &mut Signal<Vec<BoardStatusEntry>>,
     rocket_gps: &mut Signal<Option<(f64, f64)>>,
     user_gps: &mut Signal<Option<(f64, f64)>>,
     ack_warning_ts: &mut Signal<i64>,
@@ -1275,6 +1281,17 @@ async fn seed_from_db(
         return Ok(());
     }
 
+    // ---- Board status (/api/boards) ----
+    if let Ok(status) = http_get_json::<BoardStatusMsg>("/api/boards").await {
+        if alive.load(Ordering::Relaxed) {
+            board_status.set(status.boards);
+        }
+    }
+
+    if !alive.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
     // ---- Optional GPS seed (/api/gps) ----
     if let Ok(gps) = http_get_json::<GpsResponse>("/api/gps").await {
         if alive.load(Ordering::Relaxed) {
@@ -1295,6 +1312,7 @@ async fn connect_ws_supervisor(
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     flight_state: Signal<FlightState>,
+    board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
     alive: Arc<AtomicBool>,
@@ -1322,6 +1340,7 @@ async fn connect_ws_supervisor(
                     warnings,
                     errors,
                     flight_state,
+                    board_status,
                     rocket_gps,
                     user_gps,
                     alive.clone(),
@@ -1337,6 +1356,7 @@ async fn connect_ws_supervisor(
                     warnings,
                     errors,
                     flight_state,
+                    board_status,
                     rocket_gps,
                     user_gps,
                     alive.clone(),
@@ -1375,6 +1395,7 @@ async fn connect_ws_once_wasm(
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     flight_state: Signal<FlightState>,
+    board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
     alive: Arc<AtomicBool>,
@@ -1418,6 +1439,7 @@ async fn connect_ws_once_wasm(
                     warnings,
                     errors,
                     flight_state,
+                    board_status,
                     rocket_gps,
                     user_gps,
                 );
@@ -1490,6 +1512,7 @@ async fn connect_ws_once_native(
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     flight_state: Signal<FlightState>,
+    board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
     alive: Arc<AtomicBool>,
@@ -1543,6 +1566,7 @@ async fn connect_ws_once_native(
                 warnings,
                 errors,
                 flight_state,
+                board_status,
                 rocket_gps,
                 user_gps,
             );
@@ -1561,6 +1585,7 @@ fn handle_ws_message(
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     flight_state: Signal<FlightState>,
+    board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
 ) {
@@ -1568,6 +1593,7 @@ fn handle_ws_message(
     let mut warnings = warnings;
     let mut errors = errors;
     let mut flight_state = flight_state;
+    let mut board_status = board_status;
     let mut rocket_gps = rocket_gps;
     let _user_gps = user_gps;
 
@@ -1626,6 +1652,10 @@ fn handle_ws_message(
                 v.truncate(500);
             }
             errors.set(v);
+        }
+
+        WsInMsg::BoardStatus(status) => {
+            board_status.set(status.boards);
         }
     }
 }

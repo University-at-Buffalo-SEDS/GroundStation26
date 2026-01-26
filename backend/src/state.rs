@@ -1,7 +1,7 @@
 use crate::gpio::GpioPins;
 use crate::ring_buffer::RingBuffer;
 use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
-use groundstation_shared::{Board, FlightState, TelemetryCommand, TelemetryRow};
+use groundstation_shared::{Board, BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -45,4 +45,31 @@ pub struct AppState {
 
     /// Board heartbeat status
     pub board_status: Arc<Mutex<HashMap<Board, BoardStatus>>>,
+
+    /// Board status updates → frontend
+    pub board_status_tx: broadcast::Sender<BoardStatusMsg>,
+}
+
+impl AppState {
+    pub fn board_status_snapshot(&self, now_ms: u64) -> BoardStatusMsg {
+        let map = self.board_status.lock().unwrap();
+        let mut boards = Vec::with_capacity(Board::ALL.len());
+
+        for board in Board::ALL {
+            let status = map.get(board);
+            let last_seen_ms = status.and_then(|s| s.last_seen_ms);
+            let age_ms = last_seen_ms.map(|ts| now_ms.saturating_sub(ts));
+            let seen = last_seen_ms.is_some();
+
+            boards.push(BoardStatusEntry {
+                board: *board,
+                sender_id: board.sender_id().to_string(),
+                seen,
+                last_seen_ms,
+                age_ms,
+            });
+        }
+
+        BoardStatusMsg { boards }
+    }
 }

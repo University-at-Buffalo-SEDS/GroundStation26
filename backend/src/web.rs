@@ -10,7 +10,7 @@ use axum::{
 use bytes::Bytes;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
-use groundstation_shared::{FlightState, TelemetryCommand, TelemetryRow};
+use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::path::PathBuf;
@@ -33,6 +33,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/command", post(send_command))
         .route("/api/history", get(get_history))
         .route("/api/alerts", get(get_alerts))
+        .route("/api/boards", get(get_boards))
         .route("/favicon", get(get_favicon))
         .route("/flightstate", get(get_flight_state))
         .route("/api/gps", get(get_gps))
@@ -67,6 +68,7 @@ pub enum WsOutMsg {
     Warning(WarningMsg),
     FlightState(FlightStateMsg),
     Error(ErrorMsg),
+    BoardStatus(BoardStatusMsg),
 }
 
 #[derive(Clone, Serialize)]
@@ -230,6 +232,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let mut warnings_rx = state.warnings_tx.subscribe();
     let mut errors_rx = state.errors_tx.subscribe();
     let mut state_rx = state.state_tx.subscribe();
+    let mut board_status_rx = state.board_status_tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
     let (mut sender, mut receiver) = socket.split();
@@ -272,6 +275,18 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
                 Ok(err) = errors_rx.recv() => {
                     let msg = WsOutMsg::Error(err);
+                    let text = serde_json::to_string(&msg).unwrap_or_default();
+                    if sender
+                        .send(Message::Text(Utf8Bytes::from(text)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+
+                Ok(status) = board_status_rx.recv() => {
+                    let msg = WsOutMsg::BoardStatus(status);
                     let text = serde_json::to_string(&msg).unwrap_or_default();
                     if sender
                         .send(Message::Text(Utf8Bytes::from(text)))
@@ -387,6 +402,12 @@ async fn get_alerts(
         .collect();
 
     Json(alerts)
+}
+
+async fn get_boards(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let now_ms = now_ms_i64().max(0) as u64;
+    let msg = state.board_status_snapshot(now_ms);
+    Json(msg)
 }
 
 /// Helper: current timestamp in ms (i64) for warnings/errors/etc.

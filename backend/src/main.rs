@@ -133,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (ws_tx, _ws_rx) = broadcast::channel(512);
+    let (board_status_tx, _board_status_rx) = broadcast::channel(64);
 
     // --- Shared state ---
     let mut board_status = HashMap::new();
@@ -157,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
         state_tx: broadcast::channel(16).0,
         gpio,
         board_status: Arc::new(Mutex::new(board_status)),
+        board_status_tx,
     });
 
     // --- Router endpoint handlers ---

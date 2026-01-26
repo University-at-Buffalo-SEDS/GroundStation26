@@ -37,33 +37,65 @@ pub enum FlightState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Board {
-    Rocket,
-    Umbilical,
+    GroundStation,
+    FlightComputer,
+    RFBoard,
+    PowerBoard,
+    ValveBoard,
+    PressureBoard,
 }
 
 impl Board {
-    pub const ALL: &'static [Board] = &[Board::Rocket, Board::Umbilical];
+
+    pub const ALL: &'static [Board] = &[Board::GroundStation, Board::FlightComputer, Board::RFBoard,
+    Board::PowerBoard, Board::ValveBoard, Board::PressureBoard
+    ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Board::Rocket => "Rocket",
-            Board::Umbilical => "Umbilical",
+            Board::GroundStation => "Ground Station",
+            Board::FlightComputer => "Flight Computer",
+            Board::RFBoard => "RF Board",
+            Board::PowerBoard => "Power Board",
+            Board::ValveBoard => "Valve Board",
+            Board::PressureBoard => "Pressure Board",
         }
     }
 
     pub fn sender_id(&self) -> &'static str {
         match self {
-            Board::Rocket => "ROCKET",
-            Board::Umbilical => "UMBILICAL",
+            Board::GroundStation => "GS",
+            Board::FlightComputer => "FC",
+            Board::RFBoard => "RF",
+            Board::PowerBoard => "PB",
+            Board::ValveBoard => "VB",
+            Board::PressureBoard => "PRB",
         }
     }
 
     pub fn from_sender_id(sender: &str) -> Option<Board> {
-        Self::ALL.iter().copied().find(|board| board.sender_id() == sender)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|board| board.sender_id() == sender)
     }
 }
 
-impl FlightState{
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardStatusEntry {
+    pub board: Board,
+    pub sender_id: String,
+    pub seen: bool,
+    pub last_seen_ms: Option<u64>,
+    pub age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardStatusMsg {
+    pub boards: Vec<BoardStatusEntry>,
+}
+
+impl FlightState {
     pub fn to_string(&self) -> &'static str {
         match self {
             FlightState::Startup => "Startup",

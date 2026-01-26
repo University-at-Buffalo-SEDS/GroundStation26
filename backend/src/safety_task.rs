@@ -100,6 +100,10 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
             emit_warning(&state, warning);
         }
 
+        let _ = state
+            .board_status_tx
+            .send(state.board_status_snapshot(now_ms));
+
         if current_state == FlightState::Startup && all_boards_seen {
             {
                 let mut fs = state.state.lock().unwrap();
