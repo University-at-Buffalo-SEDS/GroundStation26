@@ -1,6 +1,7 @@
 FROM registry.gitlab.rylanswebsite.com/rylan-meilutis/rust-docker-builder:latest AS builder
 ARG PI_BUILD=""
 ARG TESTING=""
+ENV GROUNDSTATION_NO_PARALLEL=1
 
 LABEL authors="rylan"
 

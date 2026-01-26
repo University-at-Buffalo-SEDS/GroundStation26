@@ -59,6 +59,32 @@ def is_raspberry_pi() -> bool:
     return False
 
 
+def in_docker_build() -> bool:
+    """
+    Best-effort detection that we're running inside a Docker build/container.
+    We treat this as a signal to avoid multiprocessing.
+    """
+    # Explicit override
+    if os.environ.get("GROUNDSTATION_NO_PARALLEL", "").strip() in {"1", "true", "yes", "on"}:
+        return True
+
+    # Common container markers
+    if Path("/.dockerenv").exists():
+        return True
+
+    try:
+        cgroup = Path("/proc/1/cgroup")
+        if cgroup.exists():
+            txt = cgroup.read_text(errors="ignore").lower()
+            # Matches docker/containerd/k8s-ish environments
+            if "docker" in txt or "containerd" in txt or "kubepods" in txt:
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
 def get_compose_base_cmd() -> list[str]:
     """
     Return the base command for docker compose, preferring `docker compose`
@@ -218,13 +244,10 @@ def _pick_or_boot_simulator_udid(frontend_dir: Path) -> str:
     # Prefer an already-booted device
     try:
         out = run_capture(["xcrun", "simctl", "list", "devices", "booted"], cwd=frontend_dir)
-        # Typical line: "    iPhone 15 (SOME-UDID) (Booted)"
         for line in out.splitlines():
             line = line.strip()
             if "(Booted)" in line and "(" in line and ")" in line:
-                # grab the last (...) before (Booted)
                 parts = line.split("(")
-                # find something that looks like a UDID
                 for p in parts:
                     cand = p.split(")")[0].strip()
                     if "-" in cand and len(cand) >= 20:
@@ -242,7 +265,6 @@ def _pick_or_boot_simulator_udid(frontend_dir: Path) -> str:
     chosen: Optional[str] = None
     for line in out.splitlines():
         t = line.strip()
-        # Look for iPhone lines in Shutdown state, e.g.: "iPhone 15 (UDID) (Shutdown)"
         if t.startswith("iPhone ") and "(Shutdown)" in t and "(" in t and ")" in t:
             parts = t.split("(")
             for p in parts:
@@ -265,7 +287,6 @@ def _pick_or_boot_simulator_udid(frontend_dir: Path) -> str:
     try:
         run(["xcrun", "simctl", "boot", chosen], cwd=frontend_dir)
     except subprocess.CalledProcessError:
-        # If it's already booting/booted, continue.
         pass
 
     return chosen
@@ -275,8 +296,6 @@ def deploy_ios_sim(frontend_dir: Path) -> None:
     """
     Install the built iOS simulator .app into the current simulator (booted),
     and auto-launch it.
-
-    This is the "install step for the simulator that autoloads it into the sim".
     """
     bundle = app_bundle_path(frontend_dir)
     if not bundle.exists():
@@ -286,14 +305,12 @@ def deploy_ios_sim(frontend_dir: Path) -> None:
 
     udid = _pick_or_boot_simulator_udid(frontend_dir)
 
-    # Install
     try:
         run(["xcrun", "simctl", "install", udid, str(bundle)], cwd=frontend_dir)
     except subprocess.CalledProcessError as e:
         print("Error: failed to install app into simulator.", file=sys.stderr)
         sys.exit(e.returncode)
 
-    # Launch (autoload)
     bundle_id = _read_bundle_identifier(bundle)
     if not bundle_id:
         print(
@@ -389,6 +406,9 @@ def print_usage() -> None:
     print("  ./build.py ios_deploy              # build ios + deploy to device via ios-deploy")
     print("  ./build.py ios_sim_install         # build ios_sim + install into Simulator + auto-launch")
     print("  ./build.py macos_deploy            # build macos + copy .app to ~/Applications")
+    print("")
+    print("Environment overrides:")
+    print("  GROUNDSTATION_NO_PARALLEL=1         # force sequential builds (useful in Docker)")
     sys.exit(1)
 
 
@@ -492,7 +512,7 @@ def main() -> None:
         build_frontend(frontend_dir, platform_name=frontend_only_platform, rust_target=frontend_rust_target)
         return
 
-    # Docker mode
+    # Docker mode (compose build) - already single-threaded here
     if docker_mode:
         if force_pi and force_no_pi:
             print("Error: Cannot specify both 'pi_build' and 'no_pi' in docker mode.", file=sys.stderr)
@@ -514,7 +534,16 @@ def main() -> None:
         build_docker(repo_root, pi_build=pi_build_flag)
         return
 
-    # Normal local build mode: frontend & backend in parallel
+    # Normal local build mode:
+    # - parallel on host
+    # - sequential when running inside docker build/container (avoids cargo/dx contention)
+    if in_docker_build():
+        print("Detected container/Docker build environment → running sequential (no multiprocessing).")
+        build_frontend(frontend_dir, None)
+        build_backend(backend_dir, force_pi, force_no_pi, testing_mode)
+        return
+
+    # Parallel host build
     bfe = mp.Process(target=build_frontend, args=(frontend_dir, None))
     bbe = mp.Process(target=build_backend, args=(backend_dir, force_pi, force_no_pi, testing_mode))
 
