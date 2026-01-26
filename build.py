@@ -127,10 +127,10 @@ def build_docker(repo_root: Path, pi_build: bool, testing: bool) -> None:
     cmd: list[str] = [*compose_cmd, "build"]
 
     if pi_build:
-        print("Pi build (docker) → passing --build-arg PI_BUILD=")
+        print("Pi build (docker) → passing --build-arg PI_BUILD=TRUE")
         cmd.extend(["--build-arg", "PI_BUILD=TRUE"])
     if testing:
-        print("Testing mode (docker) → passing --build-arg TESTING=")
+        print("Testing mode (docker) → passing --build-arg TESTING=TRUE")
         cmd.extend(["--build-arg", "TESTING=TRUE"])
 
     run(cmd, cwd=repo_root)
