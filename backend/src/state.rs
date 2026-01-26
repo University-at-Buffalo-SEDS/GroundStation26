@@ -51,6 +51,17 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn mark_board_seen(&self, sender: &str, timestamp_ms: u64) {
+        let Some(board) = Board::from_sender_id(sender) else {
+            return;
+        };
+        let mut map = self.board_status.lock().unwrap();
+        if let Some(status) = map.get_mut(&board) {
+            status.last_seen_ms = Some(timestamp_ms);
+            status.warned = false;
+        }
+    }
+
     pub fn board_status_snapshot(&self, now_ms: u64) -> BoardStatusMsg {
         let map = self.board_status.lock().unwrap();
         let mut boards = Vec::with_capacity(Board::ALL.len());

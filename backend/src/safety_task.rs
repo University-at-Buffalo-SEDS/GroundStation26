@@ -105,19 +105,27 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
             .send(state.board_status_snapshot(now_ms));
 
         if current_state == FlightState::Startup && all_boards_seen {
-            {
+            let should_advance = {
                 let mut fs = state.state.lock().unwrap();
-                *fs = FlightState::Idle;
+                if *fs == FlightState::Startup {
+                    *fs = FlightState::Idle;
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if should_advance {
+                sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
+                    .bind(get_current_timestamp_ms() as i64)
+                    .bind(FlightState::Idle as i64)
+                    .execute(&state.db)
+                    .await
+                    .expect("DB insert into flight_state failed");
+                let _ = state.state_tx.send(crate::web::FlightStateMsg {
+                    state: FlightState::Idle,
+                });
             }
-            sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
-                .bind(get_current_timestamp_ms() as i64)
-                .bind(FlightState::Idle as i64)
-                .execute(&state.db)
-                .await
-                .expect("DB insert into flight_state failed");
-            let _ = state.state_tx.send(crate::web::FlightStateMsg {
-                state: FlightState::Idle,
-            });
         }
 
         // Snapshot current packets from the ring buffer

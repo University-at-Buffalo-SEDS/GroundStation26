@@ -2,6 +2,7 @@
 
 mod actions_tab;
 mod chart;
+mod connection_status_tab;
 pub mod data_tab;
 pub mod errors_tab;
 mod gps;
@@ -18,6 +19,7 @@ pub mod warnings_tab;
 use crate::app::Route;
 
 use crate::telemetry_dashboard::actions_tab::ActionsTab;
+use connection_status_tab::ConnectionStatusTab;
 use data_tab::DataTab;
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
@@ -246,6 +248,7 @@ struct GpsResponse {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MainTab {
     State,
+    ConnectionStatus,
     Map,
     Actions,
     Warnings,
@@ -329,6 +332,7 @@ fn _bump_ui_epoch() {
 fn _main_tab_to_str(tab: MainTab) -> &'static str {
     match tab {
         MainTab::State => "state",
+        MainTab::ConnectionStatus => "connection-status",
         MainTab::Map => "map",
         MainTab::Actions => "actions",
         MainTab::Warnings => "warnings",
@@ -339,6 +343,7 @@ fn _main_tab_to_str(tab: MainTab) -> &'static str {
 fn _main_tab_from_str(s: &str) -> MainTab {
     match s {
         "state" => MainTab::State,
+        "connection-status" => MainTab::ConnectionStatus,
         "map" => MainTab::Map,
         "actions" => MainTab::Actions,
         "warnings" => MainTab::Warnings,
@@ -960,6 +965,11 @@ fn TelemetryDashboardInner() -> Element {
                             "Flight"
                         }
                         button {
+                            style: if *active_main_tab.read() == MainTab::ConnectionStatus { tab_style_active("#06b6d4") } else { tab_style_inactive.to_string() },
+                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::ConnectionStatus) },
+                            "Connection Status"
+                        }
+                        button {
                             style: if *active_main_tab.read() == MainTab::Map { tab_style_active("#22c55e") } else { tab_style_inactive.to_string() },
                             onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Map) },
                             "Map"
@@ -1095,7 +1105,8 @@ fn TelemetryDashboardInner() -> Element {
             // Main body
             div { style: "flex:1; min-height:0;",
                 match *active_main_tab.read() {
-                    MainTab::State => rsx! { StateTab { flight_state: flight_state, boards: board_status } },
+                    MainTab::State => rsx! { StateTab { flight_state: flight_state } },
+                    MainTab::ConnectionStatus => rsx! { ConnectionStatusTab { boards: board_status } },
                     MainTab::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
                     MainTab::Actions => rsx! { ActionsTab {} },
                     MainTab::Warnings => rsx! { WarningsTab { warnings: warnings } },

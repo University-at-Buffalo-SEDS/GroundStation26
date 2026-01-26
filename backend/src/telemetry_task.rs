@@ -108,6 +108,8 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         }
     };
 
+    state.mark_board_seen(pkt.sender(), pkt.timestamp());
+
     if pkt.data_type() == DataType::Warning {
         if let Ok(msg) = pkt.data_as_string() {
             emit_warning(state, msg.to_string());

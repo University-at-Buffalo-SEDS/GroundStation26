@@ -5,7 +5,7 @@ use sedsprintf_rs_2026::config::DataEndpoint;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::TelemetryResult;
 use std::sync::{Arc, Mutex, OnceLock};
-
+use crate::state::AppState;
 // ---------------------------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------------------------
@@ -58,7 +58,7 @@ fn dummy_state() -> &'static Mutex<DummyState> {
 /// - Normally: a random packet from `choices` (GPS / gyro / etc.).
 /// - Once every 5 seconds: on the first call after the interval has elapsed,
 ///   return a *flight-state* packet with the next FlightState (wrapping).
-pub fn get_dummy_packet(sender: &str) -> TelemetryResult<TelemetryPacket> {
+pub fn get_dummy_packet(sender: &str, state: Arc<AppState>) -> TelemetryResult<TelemetryPacket> {
     use crate::DataType::*;
 
     let now_ms = get_current_timestamp_ms();
