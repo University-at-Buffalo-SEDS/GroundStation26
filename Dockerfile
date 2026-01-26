@@ -78,7 +78,7 @@ COPY --from=builder /app/target/release/groundstation_backend /app/
 COPY --from=builder /app/target/release/map_downloader /app/map_downloader/
 COPY --from=builder /app/frontend/dist /app/frontend/dist/
 COPY --from=builder /app/frontend/static /app/frontend/static/
-COPY /app/frontend/assets frontend/assets/
+COPY frontend/assets /app/frontend/assets/
 COPY --from=builder /app/entrypoint.sh /app/
 
 EXPOSE 3000
