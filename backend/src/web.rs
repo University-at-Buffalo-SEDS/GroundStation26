@@ -452,6 +452,26 @@ pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
     });
 }
 
+/// Log a warning to the DB without sending it to the frontend.
+pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
+    let msg_string = message.into();
+    let timestamp = now_ms_i64();
+
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO alerts (timestamp_ms, severity, message)
+            VALUES (?, 'warning', ?)
+            "#,
+        )
+        .bind(timestamp)
+        .bind(msg_string)
+        .execute(&db)
+        .await;
+    });
+}
+
 pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
     let msg_string = message.into();
     let timestamp = now_ms_i64();

@@ -42,12 +42,14 @@ pub enum Board {
     RFBoard,
     PowerBoard,
     ValveBoard,
-    PressureBoard,
+    GatewayBoard,
+    ActuatorBoard,
+    DaqBoard,
 }
 
 impl Board {
     pub const ALL: &'static [Board] = &[Board::GroundStation, Board::FlightComputer, Board::RFBoard,
-        Board::PowerBoard, Board::ValveBoard, Board::PressureBoard
+        Board::PowerBoard, Board::ValveBoard, Board::GatewayBoard, Board::ActuatorBoard, Board::DaqBoard
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -57,7 +59,9 @@ impl Board {
             Board::RFBoard => "RF Board",
             Board::PowerBoard => "Power Board",
             Board::ValveBoard => "Valve Board",
-            Board::PressureBoard => "Pressure Board",
+            Board::GatewayBoard => "Gateway Board",
+            Board::ActuatorBoard => "Actuator Board",
+            Board::DaqBoard => "DAQ Board",
         }
     }
 
@@ -68,7 +72,10 @@ impl Board {
             Board::RFBoard => "RF",
             Board::PowerBoard => "PB",
             Board::ValveBoard => "VB",
-            Board::PressureBoard => "PRB",
+            Board::GatewayBoard => "GW",
+            Board::ActuatorBoard => "AB",
+            Board::DaqBoard => "DAQ",
+
         }
     }
 

@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use crate::telemetry_task::get_current_timestamp_ms;
-use crate::web::emit_warning;
+use crate::web::{emit_warning, emit_warning_db_only};
 use groundstation_shared::{Board, FlightState};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
@@ -64,6 +64,8 @@ const KALMAN_Z_MAX_THRESHOLD: f32 = 1000.0; // arbitrary units
 
 #[cfg(not(feature = "testing"))]
 const BOARD_TIMEOUT_MS: u64 = 500;
+#[cfg(not(feature = "testing"))]
+const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 3000;
 const FLIGHT_STATE_DB_RETRIES: usize = 5;
 const FLIGHT_STATE_DB_RETRY_DELAY_MS: u64 = 50;
 
@@ -95,6 +97,8 @@ async fn insert_flight_state_with_retry(
 }
 #[cfg(feature = "testing")]
 const BOARD_TIMEOUT_MS: u64 = 3000;
+#[cfg(feature = "testing")]
+const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 6000;
 
 pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
     let mut abort = false;
@@ -103,8 +107,19 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
         sleep(Duration::from_millis(500)).await;
 
         let current_state = { *state.state.lock().unwrap() };
+        let on_ground = matches!(
+            current_state,
+            FlightState::Startup
+                | FlightState::Idle
+                | FlightState::PreFill
+                | FlightState::FillTest
+                | FlightState::NitrogenFill
+                | FlightState::NitrousFill
+                | FlightState::Armed
+        );
         let now_ms = get_current_timestamp_ms();
         let mut board_warnings = Vec::new();
+        let mut board_log_only = Vec::new();
         let all_boards_seen = {
             let mut board_status = state.board_status.lock().unwrap();
             for (board, status) in board_status.iter_mut() {
@@ -112,29 +127,40 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     Some(last_seen_ms) => now_ms.saturating_sub(last_seen_ms) > BOARD_TIMEOUT_MS,
                     None => true,
                 };
-                let valve_required_on_ground = matches!(
-                    current_state,
-                    FlightState::Startup
-                        | FlightState::Idle
-                        | FlightState::PreFill
-                        | FlightState::FillTest
-                        | FlightState::NitrogenFill
-                        | FlightState::NitrousFill
-                        | FlightState::Armed
+                let is_ground_board = matches!(
+                    board,
+                    Board::ValveBoard
+                        | Board::ActuatorBoard
+                        | Board::DaqBoard
+                        | Board::GatewayBoard
                 );
-
-                if offline && *board == Board::ValveBoard && !valve_required_on_ground {
-                    offline = false;
-                }
+                let in_flight_ignored_board = !on_ground && is_ground_board;
 
                 if offline {
-                    if current_state != FlightState::Startup && !status.warned {
-                        board_warnings.push(format!(
+                    if !status.warned {
+                        let msg = format!(
                             "Warning: No messages from {} in >{}ms",
                             board.as_str(),
                             BOARD_TIMEOUT_MS
-                        ));
+                        );
+                        if current_state != FlightState::Startup {
+                            if on_ground {
+                                board_warnings.push(msg);
+                            } else {
+                                board_log_only.push(msg);
+                            }
+                        }
                         status.warned = true;
+                    }
+
+                    let abort_eligible = *board != Board::ValveBoard && (on_ground || !is_ground_board);
+                    if abort_eligible && !in_flight_ignored_board {
+                        if let Some(last_seen_ms) = status.last_seen_ms {
+                            let offline_ms = now_ms.saturating_sub(last_seen_ms);
+                            if offline_ms >= BOARD_OFFLINE_ABORT_TRIGGER_MS && !abort {
+                                abort = true;
+                            }
+                        }
                     }
                 } else {
                     status.warned = false;
@@ -147,6 +173,9 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
 
         for warning in board_warnings {
             emit_warning(&state, warning);
+        }
+        for warning in board_log_only {
+            emit_warning_db_only(&state, warning);
         }
 
         let _ = state

@@ -4,7 +4,8 @@ use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
 use sedsprintf_rs_2026::config::DataType;
 
 use crate::radio::RadioDevice;
-use crate::web::{emit_warning, FlightStateMsg};
+use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
+use groundstation_shared::Board;
 use crate::GPIO_IGNITION_PIN;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -19,6 +20,8 @@ pub async fn telemetry_task(
     let mut radio_interval = interval(Duration::from_millis(2));
     let mut handle_interval = interval(Duration::from_millis(1));
     let mut router_interval = interval(Duration::from_millis(10));
+    let mut heartbeat_interval = interval(Duration::from_millis(500));
+    let mut heartbeat_failed = false;
 
     loop {
         tokio::select! {
@@ -88,6 +91,22 @@ pub async fn telemetry_task(
                                 ).expect("failed to log Igniter command");
                             println!("Tanks command sent");
                         }
+                    }
+                }
+                _ = heartbeat_interval.tick() => {
+                    if router.log_queue::<u8>(DataType::Heartbeat, &[]).is_ok() {
+                        state.mark_board_seen(
+                            Board::GroundStation.sender_id(),
+                            get_current_timestamp_ms(),
+                        );
+                        heartbeat_failed = false;
+                    } else if !heartbeat_failed {
+                            emit_warning_db_only(
+                                &state,
+                                "Warning: Ground Station heartbeat send failed",
+                            );
+                            heartbeat_failed = true;
+                
                     }
                 }
                 _ = handle_interval.tick() => {
