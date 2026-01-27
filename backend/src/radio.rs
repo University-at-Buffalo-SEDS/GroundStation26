@@ -113,6 +113,8 @@ impl RadioDevice for DummyRadio {
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        use sedsprintf_rs_2026::DataType;
+        use sedsprintf_rs_2026::serialize::peek_envelope;
         if peek_envelope(payload).unwrap().ty == DataType::Heartbeat {
             return Ok(());
         }
