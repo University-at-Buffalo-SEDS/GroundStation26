@@ -113,6 +113,9 @@ impl RadioDevice for DummyRadio {
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if peek_envelope(payload).unwrap().ty == DataType::Heartbeat {
+            return Ok(());
+        }
         println!(
             "DummyRadio: dropping {} bytes of outgoing telemetry send from {}",
             payload.len(),
