@@ -739,6 +739,10 @@ fn TelemetryDashboardInner() -> Element {
         "2px solid #ef4444"
     } else if has_unacked_errors && has_errors {
         "1px solid #ef4444"
+    } else if has_unacked_warnings && *flash_on.read() {
+        "2px solid #facc15"
+    } else if has_unacked_warnings && has_warnings {
+        "1px solid #facc15"
     } else {
         "1px solid transparent"
     };
@@ -798,6 +802,8 @@ fn TelemetryDashboardInner() -> Element {
                     rows,
                     warnings,
                     errors,
+                    ack_warning_ts,
+                    ack_error_ts,
                     flight_state,
                     board_status,
                     rocket_gps,
@@ -1364,6 +1370,8 @@ async fn connect_ws_supervisor(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
+    ack_warning_ts: Signal<i64>,
+    ack_error_ts: Signal<i64>,
     flight_state: Signal<FlightState>,
     board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
@@ -1392,6 +1400,8 @@ async fn connect_ws_supervisor(
                     rows,
                     warnings,
                     errors,
+                    ack_warning_ts,
+                    ack_error_ts,
                     flight_state,
                     board_status,
                     rocket_gps,
@@ -1408,6 +1418,8 @@ async fn connect_ws_supervisor(
                     rows,
                     warnings,
                     errors,
+                    ack_warning_ts,
+                    ack_error_ts,
                     flight_state,
                     board_status,
                     rocket_gps,
@@ -1447,6 +1459,8 @@ async fn connect_ws_once_wasm(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
+    ack_warning_ts: Signal<i64>,
+    ack_error_ts: Signal<i64>,
     flight_state: Signal<FlightState>,
     board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
@@ -1491,6 +1505,8 @@ async fn connect_ws_once_wasm(
                     rows,
                     warnings,
                     errors,
+                    ack_warning_ts,
+                    ack_error_ts,
                     flight_state,
                     board_status,
                     rocket_gps,
@@ -1565,6 +1581,8 @@ async fn connect_ws_once_native(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
+    ack_warning_ts: Signal<i64>,
+    ack_error_ts: Signal<i64>,
     flight_state: Signal<FlightState>,
     board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
@@ -1619,6 +1637,8 @@ async fn connect_ws_once_native(
                 rows,
                 warnings,
                 errors,
+                ack_warning_ts,
+                ack_error_ts,
                 flight_state,
                 board_status,
                 rocket_gps,
@@ -1639,6 +1659,8 @@ fn handle_ws_message(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
+    ack_warning_ts: Signal<i64>,
+    ack_error_ts: Signal<i64>,
     flight_state: Signal<FlightState>,
     board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
@@ -1647,6 +1669,8 @@ fn handle_ws_message(
     let mut rows = rows;
     let mut warnings = warnings;
     let mut errors = errors;
+    let mut ack_warning_ts = ack_warning_ts;
+    let mut ack_error_ts = ack_error_ts;
     let mut flight_state = flight_state;
     let mut board_status = board_status;
     let mut rocket_gps = rocket_gps;
@@ -1693,20 +1717,30 @@ fn handle_ws_message(
 
         WsInMsg::Warning(w) => {
             let mut v = warnings.read().clone();
-            v.insert(0, w);
+            v.insert(0, w.clone());
             if v.len() > 500 {
                 v.truncate(500);
             }
             warnings.set(v);
+
+            let last_ack = *ack_warning_ts.read();
+            if last_ack > 0 && w.timestamp_ms <= last_ack {
+                ack_warning_ts.set(w.timestamp_ms.saturating_sub(1));
+            }
         }
 
         WsInMsg::Error(e) => {
             let mut v = errors.read().clone();
-            v.insert(0, e);
+            v.insert(0, e.clone());
             if v.len() > 500 {
                 v.truncate(500);
             }
             errors.set(v);
+
+            let last_ack = *ack_error_ts.read();
+            if last_ack > 0 && e.timestamp_ms <= last_ack {
+                ack_error_ts.set(e.timestamp_ms.saturating_sub(1));
+            }
         }
 
         WsInMsg::BoardStatus(status) => {
