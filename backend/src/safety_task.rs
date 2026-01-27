@@ -61,7 +61,11 @@ const KALMAN_Y_MAX_THRESHOLD: f32 = 1000.0; // arbitrary units
 const KALMAN_Z_MIN_THRESHOLD: f32 = -1000.0; // arbitrary units
 const KALMAN_Z_MAX_THRESHOLD: f32 = 1000.0; // arbitrary units
 
+#[cfg(not(feature = "testing"))]
 const BOARD_TIMEOUT_MS: u64 = 500;
+#[cfg(feature = "testing")]
+const BOARD_TIMEOUT_MS: u64 = 3000;
+
 
 pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
     let mut abort = false;
