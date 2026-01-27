@@ -28,6 +28,7 @@ fn localstorage_set(key: &str, value: &str) {
 #[component]
 pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> Element {
     let mut is_fullscreen = use_signal(|| false);
+    let mut show_chart = use_signal(|| true);
     // -------- Restore + persist active tab --------
     let did_restore = use_signal(|| false);
     let last_saved = use_signal(|| String::new());
@@ -113,6 +114,10 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
         let next = !*is_fullscreen.read();
         is_fullscreen.set(next);
     };
+    let on_toggle_chart = move |_| {
+        let next = !*show_chart.read();
+        show_chart.set(next);
+    };
 
     rsx! {
         div { style: "padding:16px; height:100%; display:flex; flex-direction:column; gap:12px;",
@@ -167,41 +172,64 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
             // -------- Big centered graph --------
             div { style: "flex:0; display:flex; align-items:center; justify-content:center; margin-top:6px;",
                 div { style: "width:100%; max-width:1200px;",
-                    div { style: "display:flex; justify-content:flex-end; margin-bottom:6px;",
+                    div { style: "display:flex; justify-content:flex-end; gap:8px; margin-bottom:6px;",
+                        button {
+                            style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                            onclick: on_toggle_chart,
+                            if *show_chart.read() { "Collapse" } else { "Expand" }
+                        }
                         button {
                             style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
                             onclick: on_toggle_fullscreen,
                             "Fullscreen"
                         }
                     }
-                    svg {
-                        style: "width:100%; height:auto; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
-                        view_box: "0 0 1200 360",
+                    if *show_chart.read() {
+                        svg {
+                            style: "width:100%; height:auto; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
+                            view_box: "0 0 1200 360",
 
-                        // axes
-                        line { x1:"60", y1:"20",  x2:"60",   y2:"340", stroke:"#334155", stroke_width:"1" }
-                        line { x1:"60", y1:"340", x2:"1180", y2:"340", stroke:"#334155", stroke_width:"1" }
+                            // gridlines
+                            for i in 1..=5 {
+                                line {
+                                    x1:"60", y1:"{20.0 + (320.0 / 6.0) * (i as f64)}",
+                                    x2:"1180", y2:"{20.0 + (320.0 / 6.0) * (i as f64)}",
+                                    stroke:"#1f2937", "stroke-width":"1"
+                                }
+                            }
+                            for i in 1..=5 {
+                                line {
+                                    x1:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y1:"20",
+                                    x2:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y2:"340",
+                                    stroke:"#1f2937", "stroke-width":"1"
+                                }
+                            }
 
-                        // y labels
-                        text { x:"10", y:"26", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
-                        text { x:"10", y:"184", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
-                        text { x:"10", y:"344", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
+                            // axes
+                            line { x1:"60", y1:"20",  x2:"60",   y2:"340", stroke:"#334155", stroke_width:"1" }
+                            line { x1:"60", y1:"340", x2:"1180", y2:"340", stroke:"#334155", stroke_width:"1" }
 
-                        // x labels (span in minutes)
-                        text { x:"70",   y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
-                        text { x:"600",  y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
-                        text { x:"1120", y:"355", fill:"#94a3b8", "font-size":"10", "now" }
+                            // y labels
+                            text { x:"10", y:"26", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
+                            text { x:"10", y:"184", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
+                            text { x:"10", y:"344", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
 
-                        // series
-                        for (i, pts) in paths.iter().enumerate() {
-                            if !pts.is_empty() {
-                                polyline {
-                                    points: "{pts}",
-                                    fill: "none",
-                                    stroke: "{series_color(i)}",
-                                    stroke_width: "2",
-                                    stroke_linejoin: "round",
-                                    stroke_linecap: "round",
+                            // x labels (span in minutes)
+                            text { x:"70",   y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
+                            text { x:"600",  y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
+                            text { x:"1120", y:"355", fill:"#94a3b8", "font-size":"10", "now" }
+
+                            // series
+                            for (i, pts) in paths.iter().enumerate() {
+                                if !pts.is_empty() {
+                                    polyline {
+                                        points: "{pts}",
+                                        fill: "none",
+                                        stroke: "{series_color(i)}",
+                                        stroke_width: "2",
+                                        stroke_linejoin: "round",
+                                        stroke_linecap: "round",
+                                    }
                                 }
                             }
                         }
@@ -224,6 +252,22 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                     svg {
                         style: "width:100%; height:100%; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
                         view_box: "0 0 1200 360",
+
+                        // gridlines
+                        for i in 1..=5 {
+                            line {
+                                x1:"60", y1:"{20.0 + (320.0 / 6.0) * (i as f64)}",
+                                x2:"1180", y2:"{20.0 + (320.0 / 6.0) * (i as f64)}",
+                                stroke:"#1f2937", "stroke-width":"1"
+                            }
+                        }
+                        for i in 1..=5 {
+                            line {
+                                x1:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y1:"20",
+                                x2:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y2:"340",
+                                stroke:"#1f2937", "stroke-width":"1"
+                            }
+                        }
 
                         // axes
                         line { x1:"60", y1:"20",  x2:"60",   y2:"340", stroke:"#334155", stroke_width:"1" }

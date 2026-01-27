@@ -72,7 +72,7 @@ fn next_dummy_sender() -> &'static str {
 pub fn get_dummy_packet(sender: Option<&'static str>) -> TelemetryResult<TelemetryPacket> {
     use crate::DataType::*;
 
-    let sender = sender.unwrap_or_else(next_dummy_sender);
+    let sender = next_dummy_sender();
 
     let now_ms = get_current_timestamp_ms();
 
