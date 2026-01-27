@@ -103,7 +103,7 @@ const DB_RETRY_DELAY_MS: u64 = 50;
 async fn insert_with_retry<F, Fut>(mut f: F) -> Result<(), sqlx::Error>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
+    Fut: Future<Output=Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
 {
     let mut delay = DB_RETRY_DELAY_MS;
     let mut last_err: Option<sqlx::Error> = None;
@@ -171,7 +171,7 @@ pub async fn handle_packet(state: &Arc<AppState>) {
                 .bind(pkt_data as i64)
                 .execute(&state.db)
         })
-        .await
+            .await
         {
             eprintln!("DB insert into flight_state failed after retry: {e}");
         }
@@ -202,19 +202,19 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         sqlx::query(
             "INSERT INTO telemetry (timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(ts_ms)
-        .bind(&data_type_str)
-        .bind(v0)
-        .bind(v1)
-        .bind(v2)
-        .bind(v3)
-        .bind(v4)
-        .bind(v5)
-        .bind(v6)
-        .bind(v7)
-        .execute(&state.db)
+            .bind(ts_ms)
+            .bind(&data_type_str)
+            .bind(v0)
+            .bind(v1)
+            .bind(v2)
+            .bind(v3)
+            .bind(v4)
+            .bind(v5)
+            .bind(v6)
+            .bind(v7)
+            .execute(&state.db)
     })
-    .await
+        .await
     {
         eprintln!("DB insert into telemetry failed after retry: {e}");
     }

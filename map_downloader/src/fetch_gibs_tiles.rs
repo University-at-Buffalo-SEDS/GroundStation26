@@ -4,7 +4,7 @@ use std::{env, fs};
 
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle, ProgressDrawTarget};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::Client;
 use tokio::fs as async_fs;
 use tokio::time::{sleep, Duration};
@@ -127,7 +127,7 @@ async fn fetch_tiles_for_zoom_async(
         ProgressStyle::with_template(
             "{prefix} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) ETA {eta}",
         )?
-        .progress_chars("##-"),
+            .progress_chars("##-"),
     );
     pb.set_draw_target(ProgressDrawTarget::stdout_with_hz(10));
 
@@ -204,11 +204,9 @@ async fn fetch_tiles_for_zoom_async(
                                 // fine: no tile for this location (e.g. ocean)
                                 break;
                             }
-                            
                         }
 
-                        Err(_e) => {
-                        }
+                        Err(_e) => {}
                     }
 
                     if attempts >= MAX_ATTEMPTS {

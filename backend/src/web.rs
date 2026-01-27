@@ -1,3 +1,4 @@
+use crate::map::{tile_service, DEFAULT_MAP_REGION};
 use crate::state::AppState;
 use axum::http::header;
 use axum::{
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
 use tower_http::services::ServeDir;
-use crate::map::{DEFAULT_MAP_REGION, tile_service}; // NEW
+// NEW
 
 static FAVICON_DATA: OnceCell<Bytes> = OnceCell::const_new();
 
@@ -49,7 +50,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         //     }
         // }))
         .route("/favicon.ico", get(get_favicon))
-        
+
 
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
@@ -100,7 +101,6 @@ pub struct AlertDto {
 }
 
 
-
 #[derive(Serialize)]
 pub struct GpsPoint {
     pub lat: f64,
@@ -124,9 +124,9 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
         let lat: Option<f32> = r.get::<Option<f32>, _>("v0");
@@ -155,10 +155,10 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",
     )
-    .bind(cutoff)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -346,10 +346,10 @@ async fn get_history(
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",
     )
-    .bind(cutoff)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -387,10 +387,10 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-    .bind(cutoff)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -445,10 +445,10 @@ pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
             VALUES (?, 'warning', ?)
             "#,
         )
-        .bind(timestamp)
-        .bind(msg_string)
-        .execute(&db)
-        .await;
+            .bind(timestamp)
+            .bind(msg_string)
+            .execute(&db)
+            .await;
     });
 }
 
@@ -472,9 +472,9 @@ pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
             VALUES (?, 'error', ?)
             "#,
         )
-        .bind(timestamp)
-        .bind(msg_string)
-        .execute(&db)
-        .await;
+            .bind(timestamp)
+            .bind(msg_string)
+            .execute(&db)
+            .await;
     });
 }

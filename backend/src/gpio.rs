@@ -13,7 +13,7 @@ mod real {
     use rppal::gpio::{Gpio, InputPin, OutputPin, Trigger as PiTrigger};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::{Duration};
+    use std::time::Duration;
 
     pub struct GpioPins {
         input_pins: Arc<Mutex<HashMap<u8, InputPin>>>,
@@ -112,9 +112,8 @@ mod real {
             let pi_trigger = Self::to_pi_trigger(trigger);
 
             pin.set_async_interrupt(pi_trigger, Some(debounce), move |event: rppal::gpio::Event| {
-                    let level = event.trigger;
-                    callback(level == rppal::gpio::Trigger::RisingEdge);
-
+                let level = event.trigger;
+                callback(level == rppal::gpio::Trigger::RisingEdge);
             })?;
 
             Ok(())

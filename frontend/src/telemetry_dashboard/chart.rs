@@ -47,11 +47,9 @@ pub fn _build_time_polyline(
         return (String::new(), 0.0, 0.0, 0.0);
     }
 
-    let (t_min, t_max) = pts
-        .iter()
-        .fold((i64::MAX, i64::MIN), |(mn, mx), (t, _)| {
-            (mn.min(*t), mx.max(*t))
-        });
+    let (t_min, t_max) = pts.iter().fold((i64::MAX, i64::MIN), |(mn, mx), (t, _)| {
+        (mn.min(*t), mx.max(*t))
+    });
     let (y_min, y_max) = pts
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), (_, y)| {

@@ -15,6 +15,7 @@ def print_usage() -> None:
     print("Usage: run_groundstation.py [testing]")
     sys.exit(1)
 
+
 def main() -> None:
 
     testing_mode = False

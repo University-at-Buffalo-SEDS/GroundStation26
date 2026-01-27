@@ -25,13 +25,13 @@ services:
     depends_on:
       - web
     networks:
-        - internal
-        - external
+      - internal
+      - external
     restart: always
 
 
 networks:
-    internal:
-      internal: true
-    external:
-      driver: bridge
+  internal:
+    internal: true
+  external:
+    driver: bridge

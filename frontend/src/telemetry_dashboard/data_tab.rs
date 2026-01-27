@@ -119,8 +119,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     let grid_y_step = inner_h / 6.0_f64;
     let grid_y_step_full = inner_h_full / 6.0_f64;
 
-    let (paths, y_min, y_max, span_min) =
-        build_polylines(&tab_rows, view_w as f32, view_h as f32);
+    let (paths, y_min, y_max, span_min) = build_polylines(&tab_rows, view_w as f32, view_h as f32);
     let (paths_full, _, _, _) = build_polylines(&tab_rows, view_w as f32, view_h_full as f32);
     let y_mid = (y_min + y_max) * 0.5;
 
@@ -131,18 +130,8 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
         .enumerate()
         .filter_map(|(i, l)| if l.is_empty() { None } else { Some((i, *l)) })
         .collect();
-    let legend_w = 280.0_f64;
-    let legend_row_h = 14.0_f64;
-    let legend_h = (legend_items.len() as f64 * legend_row_h + 10.0)
-        .min(140.0_f64)
-        .max(24.0_f64);
-    let legend_x = view_w - 20.0_f64 - legend_w;
-    let legend_y = 20.0_f64;
-    let legend_rows: Vec<(usize, &'static str, f64)> = legend_items
-        .iter()
-        .enumerate()
-        .map(|(row, (i, label))| (*i, *label, legend_y + 10.0 + (row as f64) * legend_row_h))
-        .collect();
+    let legend_rows: Vec<(usize, &'static str)> =
+        legend_items.iter().map(|(i, label)| (*i, *label)).collect();
 
     let on_toggle_fullscreen = move |_| {
         let next = !*is_fullscreen.read();
@@ -219,9 +208,10 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         }
                     }
                     if *show_chart.read() {
-                        svg {
-                            style: "width:100%; height:auto; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
-                            view_box: "0 0 {view_w} {view_h}",
+                        div { style: "position:relative; width:100%;",
+                            svg {
+                                style: "width:100%; height:auto; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
+                                view_box: "0 0 {view_w} {view_h}",
 
                             // gridlines
                             for i in 1..=5 {
@@ -266,26 +256,23 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                                     }
                                 }
                             }
+                        }
 
-                            // Legend (inside graph box)
-                            if !legend_items.is_empty() {
-                                g {
-                                    rect { x:"{legend_x}", y:"{legend_y}", width:"{legend_w}", height:"{legend_h}",
-                                        rx:"6", ry:"6", fill:"#0b1220", stroke:"#1f2937"
-                                    }
-                                    for (i, label, y) in legend_rows.iter() {
-                                        line { x1:"{legend_x + 10.0}", y1:"{y}", x2:"{legend_x + 46.0}", y2:"{y}",
-                                            stroke:"{series_color(*i)}", stroke_width:"2", stroke_linecap:"round"
+                        if !legend_rows.is_empty() {
+                            div { style: "position:absolute; bottom:12px; left:12px; right:12px; display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
+                                for (i, label) in legend_rows.iter() {
+                                    div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
+                                        svg { width:"26", height:"8", view_box:"0 0 26 8",
+                                            line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", stroke_width:"2", stroke_linecap:"round" }
                                         }
-                                        text { x:"{legend_x + 54.0}", y:"{y + 4.0}", fill:"#cbd5f5", "font-size":"12",
-                                            "{label}"
-                                        }
-                                    }
+                                        "{label}"
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
             }
         }
 
@@ -299,7 +286,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         "Exit Fullscreen"
                     }
                 }
-                div { style: "flex:1; min-height:0; width:100%;",
+                div { style: "flex:1; min-height:0; width:100%; position:relative;",
                     svg {
                         style: "width:100%; height:100%; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
                         view_box: "0 0 {view_w} {view_h_full}",
@@ -348,19 +335,15 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                             }
                         }
 
-                        // Legend (inside graph box)
-                        if !legend_items.is_empty() {
-                            g {
-                                rect { x:"{legend_x}", y:"{legend_y}", width:"{legend_w}", height:"{legend_h}",
-                                    rx:"6", ry:"6", fill:"#0b1220", stroke:"#1f2937"
-                                }
-                                for (i, label, y) in legend_rows.iter() {
-                                    line { x1:"{legend_x + 10.0}", y1:"{y}", x2:"{legend_x + 46.0}", y2:"{y}",
-                                        stroke:"{series_color(*i)}", stroke_width:"2", stroke_linecap:"round"
+                    }
+                    if !legend_rows.is_empty() {
+                        div { style: "position:absolute; bottom:12px; left:12px; right:12px; display:flex; flex-wrap:wrap; gap:8px; padding:8px 12px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
+                            for (i, label) in legend_rows.iter() {
+                                div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
+                                    svg { width:"26", height:"8", view_box:"0 0 26 8",
+                                        line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", stroke_width:"2", stroke_linecap:"round" }
                                     }
-                                    text { x:"{legend_x + 54.0}", y:"{y + 4.0}", fill:"#cbd5f5", "font-size":"12",
-                                        "{label}"
-                                    }
+                                    "{label}"
                                 }
                             }
                         }
@@ -432,7 +415,11 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
 
     // 1) time window & span
     let newest_ts = rows.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
-    let oldest_ts = rows.iter().map(|r| r.timestamp_ms).min().unwrap_or(newest_ts);
+    let oldest_ts = rows
+        .iter()
+        .map(|r| r.timestamp_ms)
+        .min()
+        .unwrap_or(newest_ts);
 
     let raw_span_ms = (newest_ts - oldest_ts).max(1);
     let effective_span_ms = raw_span_ms.min(HISTORY_MS);
@@ -447,7 +434,12 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
         .filter(|r| r.timestamp_ms >= window_start)
         .collect();
     if window_rows.is_empty() {
-        return (std::array::from_fn(|_| String::new()), 0.0, 1.0, span_minutes);
+        return (
+            std::array::from_fn(|_| String::new()),
+            0.0,
+            1.0,
+            span_minutes,
+        );
     }
     window_rows.sort_by_key(|r| r.timestamp_ms);
 
@@ -467,7 +459,14 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
 
     let (min_v, mut max_v) = match (min_v, max_v) {
         (Some(a), Some(b)) => (a, b),
-        _ => return (std::array::from_fn(|_| String::new()), 0.0, 1.0, span_minutes),
+        _ => {
+            return (
+                std::array::from_fn(|_| String::new()),
+                0.0,
+                1.0,
+                span_minutes,
+            );
+        }
     };
 
     if (max_v - min_v).abs() < 1e-6 {

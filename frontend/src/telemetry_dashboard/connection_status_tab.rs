@@ -227,75 +227,82 @@ fn render_latency_chart(points: Option<&Vec<(i64, f64)>>, height: f64) -> Elemen
     }
 
     rsx! {
-        svg {
-            style: "width:100%; height:auto; display:block; background:#020617; border-radius:10px; border:1px solid #1f2937;",
-            view_box: "0 0 {width} {height}",
+        div { style: "display:flex; flex-direction:column;",
+            svg {
+                style: "width:100%; height:auto; display:block; background:#020617; border-radius:10px; border:1px solid #1f2937;",
+                view_box: "0 0 {width} {height}",
 
-            // gridlines
-            for i in 1..=5 {
-                line {
-                    x1:"{left}", y1:"{pad_top + grid_y_step * (i as f64)}",
-                    x2:"{right}", y2:"{pad_top + grid_y_step * (i as f64)}",
-                    stroke: "#1f2937",
-                    "stroke-width": "1"
+                // gridlines
+                for i in 1..=5 {
+                    line {
+                        x1:"{left}", y1:"{pad_top + grid_y_step * (i as f64)}",
+                        x2:"{right}", y2:"{pad_top + grid_y_step * (i as f64)}",
+                        stroke: "#1f2937",
+                        "stroke-width": "1"
+                    }
                 }
-            }
-            for i in 1..=5 {
-                line {
-                    x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
-                    x2:"{left + grid_x_step * (i as f64)}", y2:"{height - pad_bottom}",
-                    stroke: "#1f2937",
-                    "stroke-width": "1"
+                for i in 1..=5 {
+                    line {
+                        x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
+                        x2:"{left + grid_x_step * (i as f64)}", y2:"{height - pad_bottom}",
+                        stroke: "#1f2937",
+                        "stroke-width": "1"
+                    }
                 }
-            }
 
-            // axes
-            line { x1:"{left}", y1:"{height - pad_bottom}", x2:"{right}", y2:"{height - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
-            line { x1:"{left}", y1:"{pad_top}",  x2:"{left}",   y2:"{height - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
+                // axes
+                line { x1:"{left}", y1:"{height - pad_bottom}", x2:"{right}", y2:"{height - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
+                line { x1:"{left}", y1:"{pad_top}",  x2:"{left}",   y2:"{height - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
 
-            // y labels
-            text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{y_max}")} }
-            text { x:"10", y:"{pad_top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{}", (y_min + y_max) / 2f64)} }
-            text { x:"10", y:"{height - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{y_min}")} }
+                // y labels
+                text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{y_max}")} }
+                text { x:"10", y:"{pad_top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{}", (y_min + y_max) / 2f64)} }
+                text { x:"10", y:"{height - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{y_min}")} }
 
-            // x labels (span in minutes)
-            text { x:"{left + 10.0}",   y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
-            text { x:"{width * 0.5}",  y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
-            text { x:"{right - 60.0}", y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
+                // x labels (span in minutes)
+                text { x:"{left + 10.0}",   y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
+                text { x:"{width * 0.5}",  y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
+                text { x:"{right - 60.0}", y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
 
-            for pts in solid.iter() {
-                if !pts.is_empty() {
-                    polyline {
-                        points: "{pts}",
-                        fill: "none",
-                        stroke: "#22d3ee",
-                        "stroke-width": "2",
-                        "stroke-linejoin": "round",
-                        "stroke-linecap": "round",
+                for pts in solid.iter() {
+                    if !pts.is_empty() {
+                        polyline {
+                            points: "{pts}",
+                            fill: "none",
+                            stroke: "#22d3ee",
+                            "stroke-width": "2",
+                            "stroke-linejoin": "round",
+                            "stroke-linecap": "round",
+                        }
+                    }
+                }
+                for pts in dotted.iter() {
+                    if !pts.is_empty() {
+                        polyline {
+                            points: "{pts}",
+                            fill: "none",
+                            stroke: "#fbbf24",
+                            "stroke-width": "2",
+                            stroke_dasharray: "4 4",
+                            "stroke-linejoin": "round",
+                            "stroke-linecap": "round",
+                        }
                     }
                 }
             }
-            for pts in dotted.iter() {
-                if !pts.is_empty() {
-                    polyline {
-                        points: "{pts}",
-                        fill: "none",
-                    stroke: "#fbbf24",
-                    "stroke-width": "2",
-                    stroke_dasharray: "4 4",
-                    "stroke-linejoin": "round",
-                    "stroke-linecap": "round",
+            div { style: "margin-top:8px; display:flex; gap:12px; align-items:center; font-size:12px; color:#cbd5f5;",
+                div { style: "display:flex; align-items:center; gap:6px;",
+                    svg { width:"26", height:"8", view_box:"0 0 26 8",
+                        line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"#22d3ee", stroke_width:"2", stroke_linecap:"round" }
+                    }
+                    "Actual"
                 }
-            }
-            }
-
-            // Legend (inside graph box)
-            g {
-                rect { x:"{right - 350.0}", y:"{pad_top + 6.0}", width:"350", height:"32", rx:"6", ry:"6", fill:"#0b1220", stroke:"#1f2937" }
-                line { x1:"{right - 338.0}", y1:"{pad_top + 22.0}", x2:"{right - 296.0}", y2:"{pad_top + 22.0}", stroke:"#22d3ee", "stroke-width":"2", "stroke-linecap":"round" }
-                text { x:"{right - 288.0}", y:"{pad_top + 26.0}", fill:"#cbd5f5", "font-size":"12", "Actual" }
-                line { x1:"{right - 210.0}", y1:"{pad_top + 22.0}", x2:"{right - 168.0}", y2:"{pad_top + 22.0}", stroke:"#fbbf24", "stroke-width":"2", stroke_dasharray:"4 4", "stroke-linecap":"round" }
-                text { x:"{right - 160.0}", y:"{pad_top + 26.0}", fill:"#cbd5f5", "font-size":"12", "Interpolated" }
+                div { style: "display:flex; align-items:center; gap:6px;",
+                    svg { width:"26", height:"8", view_box:"0 0 26 8",
+                        line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"#fbbf24", stroke_width:"2", stroke_dasharray:"4 4", stroke_linecap:"round" }
+                    }
+                    "Interpolated"
+                }
             }
         }
     }
@@ -348,11 +355,9 @@ fn build_latency_polylines(
         return (Vec::new(), Vec::new(), 0.0, 0.0, 0.0);
     }
 
-    let (t_min, t_max) = pts
-        .iter()
-        .fold((i64::MAX, i64::MIN), |(mn, mx), (t, _)| {
-            (mn.min(*t), mx.max(*t))
-        });
+    let (t_min, t_max) = pts.iter().fold((i64::MAX, i64::MIN), |(mn, mx), (t, _)| {
+        (mn.min(*t), mx.max(*t))
+    });
     let (y_min, y_max) = pts
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), (_, y)| {
@@ -380,10 +385,7 @@ fn build_latency_polylines(
     };
 
     // Detect large gaps (scroll pauses) and only interpolate those.
-    let mut deltas: Vec<i64> = pts
-        .windows(2)
-        .map(|w| (w[1].0 - w[0].0).max(0))
-        .collect();
+    let mut deltas: Vec<i64> = pts.windows(2).map(|w| (w[1].0 - w[0].0).max(0)).collect();
     deltas.sort_unstable();
     let median_dt = if deltas.is_empty() {
         0

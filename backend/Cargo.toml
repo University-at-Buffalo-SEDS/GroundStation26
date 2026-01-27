@@ -15,7 +15,7 @@ axum = { workspace = true, features = ["ws"] }
 tokio.workspace = true
 serde_json.workspace = true
 sedsprintf_rs_2026.workspace = true
-rppal = { git = "https://gitlab.rylanswebsite.com/rylan-meilutis/rppal.git", branch = "main", optional = true}
+rppal = { git = "https://gitlab.rylanswebsite.com/rylan-meilutis/rppal.git", branch = "main", optional = true }
 
 groundstation_shared = { path = "../shared" }
 

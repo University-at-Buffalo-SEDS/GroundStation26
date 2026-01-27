@@ -1,6 +1,6 @@
+use super::AlertMsg;
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
-use super::AlertMsg;
 
 #[component]
 pub fn ErrorsTab(errors: Signal<Vec<AlertMsg>>) -> Element {

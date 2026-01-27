@@ -11,10 +11,10 @@
 use dioxus::prelude::*;
 use dioxus_router::{Routable, Router};
 
-#[cfg(not(target_arch = "wasm32"))]
-use dioxus_router::use_navigator;
 #[allow(unused_imports)]
 use crate::telemetry_dashboard::UrlConfig;
+#[cfg(not(target_arch = "wasm32"))]
+use dioxus_router::use_navigator;
 
 // --- global css ---
 const GLOBAL_CSS: &str = r#"

@@ -1,5 +1,5 @@
-use dioxus::prelude::*;
 use super::AlertMsg;
+use dioxus::prelude::*;
 
 #[component]
 pub fn WarningsTab(warnings: Signal<Vec<AlertMsg>>) -> Element {

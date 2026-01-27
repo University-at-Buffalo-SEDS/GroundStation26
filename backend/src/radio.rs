@@ -26,7 +26,7 @@ pub trait RadioDevice: Send {
 // ======================================================================
 pub struct Radio {
     inner: SystemPort,
-    id: LinkId
+    id: LinkId,
 }
 
 impl Radio {
@@ -43,7 +43,7 @@ impl Radio {
             })
             .context("failed to configure serial port")?;
         inner.set_timeout(Duration::from_millis(200))?;
-        Ok(Self { inner, id})
+        Ok(Self { inner, id })
     }
 }
 

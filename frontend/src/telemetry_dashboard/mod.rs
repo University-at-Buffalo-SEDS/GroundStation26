@@ -371,7 +371,7 @@ impl UrlConfig {
 
     pub fn base_http() -> String {
         // load from storage key if present
-       let base = persist::get_string(BASE_URL_STORAGE_KEY)
+        let base = persist::get_string(BASE_URL_STORAGE_KEY)
             .map(normalize_base_url)
             .unwrap_or_else(|| BASE_URL.read().clone());
 
@@ -901,7 +901,6 @@ fn TelemetryDashboardInner() -> Element {
 
         #[cfg(not(target_arch = "wasm32"))]
         true
-
     }
 
     // MAIN UI

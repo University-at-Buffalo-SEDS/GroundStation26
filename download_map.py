@@ -3,6 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+
 def run(cmd: list[str], cwd: Path) -> None:
     print(f"Running: {' '.join(cmd)} (cwd={cwd})")
     subprocess.run(cmd, cwd=cwd, check=True)
