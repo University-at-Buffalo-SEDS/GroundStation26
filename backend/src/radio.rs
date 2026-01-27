@@ -107,7 +107,7 @@ impl DummyRadio {
 #[cfg(feature = "testing")]
 impl RadioDevice for DummyRadio {
     fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
-        let pkt = get_dummy_packet(self.sender)?;
+        let pkt = get_dummy_packet()?; //self.sender)?;
         return _router.rx_queue_from(pkt, self.id);
 
         // No incoming packets in dummy mode
