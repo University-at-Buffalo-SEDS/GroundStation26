@@ -64,7 +64,7 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
     };
 
     rsx! {
-        div { style: "padding:16px;",
+        div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden;",
             h2 { style: "margin:0 0 12px 0;", "Connection Status" }
             div { style: "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;",
                 div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
@@ -266,7 +266,7 @@ fn render_board_table(boards: &Vec<BoardStatusEntry>) -> Element {
                     div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;", "{entry.sender_id}" }
                     div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;", if entry.seen { "yes" } else { "no" } }
                     div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;",
-                        if let Some(ts) = entry.last_seen_ms { "{ts}" } else { "—" }
+                        "{format_last_seen(entry.last_seen_ms)}"
                     }
                     div { style: "padding:8px; border-bottom:1px solid #1f2937;",
                         if let Some(age) = entry.age_ms { "{age}" } else { "—" }
@@ -275,4 +275,27 @@ fn render_board_table(boards: &Vec<BoardStatusEntry>) -> Element {
             }
         }
     }
+}
+
+fn format_last_seen(last_seen_ms: Option<u64>) -> String {
+    let Some(ts) = last_seen_ms else {
+        return "—".to_string();
+    };
+
+    // Heuristic: if it's Unix-epoch ms (>= ~2017-07-14), render human time.
+    if ts >= 1_500_000_000_000 {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ts as f64));
+            return d.to_string().into();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::time::{Duration, UNIX_EPOCH};
+            let t = UNIX_EPOCH + Duration::from_millis(ts);
+            return format!("{:?}", t);
+        }
+    }
+
+    format!("{ts} ms")
 }

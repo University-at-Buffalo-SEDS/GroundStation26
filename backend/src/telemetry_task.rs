@@ -133,7 +133,7 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         }
     };
 
-    state.mark_board_seen(pkt.sender(), pkt.timestamp());
+    state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
 
     if pkt.data_type() == DataType::Warning {
         if let Ok(msg) = pkt.data_as_string() {

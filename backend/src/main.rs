@@ -158,7 +158,8 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler = EndpointHandler::new_packet_handler(
         GroundStation,
         move |pkt: &TelemetryPacket, _sender| {
-            ground_station_handler_state_clone.mark_board_seen(pkt.sender(), pkt.timestamp());
+            ground_station_handler_state_clone
+                .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             let mut rb = ground_station_handler_state_clone
                 .ring_buffer
                 .lock()
@@ -170,7 +171,8 @@ async fn main() -> anyhow::Result<()> {
 
     let flight_state_handler =
         EndpointHandler::new_packet_handler(FlightState, move |pkt: &TelemetryPacket, _sender| {
-            flight_state_handler_state_clone.mark_board_seen(pkt.sender(), pkt.timestamp());
+            flight_state_handler_state_clone
+                .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             let mut rb = flight_state_handler_state_clone.ring_buffer.lock().unwrap();
             rb.push(pkt.clone());
             Ok(())
@@ -178,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
 
     let abort_handler =
         EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket, _sender| {
-            abort_handler_state_clone.mark_board_seen(pkt.sender(), pkt.timestamp());
+            abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             let error_msg = pkt
                 .data_as_string()
                 .expect("Abort packet with invalid UTF-8");
