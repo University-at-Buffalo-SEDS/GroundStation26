@@ -25,10 +25,10 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
                 loop {
                     if !*show_latency.read() && !*latency_fullscreen.read() {
                         #[cfg(target_arch = "wasm32")]
-                        gloo_timers::future::TimeoutFuture::new(500).await;
+                        gloo_timers::future::TimeoutFuture::new(50).await;
 
                         #[cfg(not(target_arch = "wasm32"))]
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         continue;
                     }
 
@@ -58,10 +58,10 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
                     history.set(map);
 
                     #[cfg(target_arch = "wasm32")]
-                    gloo_timers::future::TimeoutFuture::new(500).await;
+                    gloo_timers::future::TimeoutFuture::new(50).await;
 
                     #[cfg(not(target_arch = "wasm32"))]
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             });
         });
