@@ -36,7 +36,6 @@ html, body {
 * { box-sizing: border-box; }
 "#;
 
-const _BASE_URL_KEY: &str = "gs_base_url";
 const _CONNECT_SHOWN_KEY: &str = "gs_connect_shown";
 
 #[derive(Clone, Routable, PartialEq)]
@@ -77,7 +76,7 @@ mod objc_poke {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod persist {
-    use super::{_BASE_URL_KEY, _CONNECT_SHOWN_KEY};
+    use super::_CONNECT_SHOWN_KEY;
     use std::io;
 
     fn storage_dir() -> std::path::PathBuf {
@@ -91,7 +90,7 @@ mod persist {
         storage_dir().join(format!("{key}.txt"))
     }
 
-    fn read_key(key: &str) -> Option<String> {
+    fn _read_key(key: &str) -> Option<String> {
         let path = path_for(key);
         std::fs::read_to_string(path)
             .ok()
@@ -102,14 +101,6 @@ mod persist {
         let dir = storage_dir();
         std::fs::create_dir_all(&dir)?;
         std::fs::write(path_for(key), v.as_bytes())
-    }
-
-    pub fn read_base_url() -> Option<String> {
-        read_key(_BASE_URL_KEY).filter(|s| !s.trim().is_empty())
-    }
-
-    pub fn _write_base_url(v: &str) -> Result<(), io::Error> {
-        write_key(_BASE_URL_KEY, v)
     }
 
     pub fn write_connect_shown(v: bool) -> Result<(), io::Error> {
@@ -447,11 +438,10 @@ pub fn Root() -> Element {
         let nav = use_navigator();
 
         use_effect(move || {
-            let u = persist::read_base_url().unwrap_or_default();
-            if u.trim().is_empty() {
-                let _ = nav.replace(Route::Connect {});
-            } else {
+            if UrlConfig::stored_base_url().is_some() {
                 let _ = nav.replace(Route::Dashboard {});
+            } else {
+                let _ = nav.replace(Route::Connect {});
             }
         });
 
@@ -464,8 +454,7 @@ pub fn Root() -> Element {
 pub fn Connect() -> Element {
     let nav = use_navigator();
 
-    let initial = persist::read_base_url()
-        .filter(|s| !s.trim().is_empty())
+    let initial = UrlConfig::stored_base_url()
         .unwrap_or_else(|| "http://localhost:3000".to_string());
 
     let mut url_edit = use_signal(|| initial);
@@ -604,8 +593,7 @@ pub fn Connect() -> Element {
 pub fn Dashboard() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let u = persist::read_base_url().unwrap_or_default();
-        if u.trim().is_empty() {
+        if UrlConfig::stored_base_url().is_none() {
             return rsx! {
                 div {
                     style: "height:100vh; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",

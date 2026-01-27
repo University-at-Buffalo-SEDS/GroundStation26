@@ -363,6 +363,12 @@ impl UrlConfig {
         persist::set_string(BASE_URL_STORAGE_KEY, &clean);
     }
 
+    pub fn stored_base_url() -> Option<String> {
+        persist::get_string(BASE_URL_STORAGE_KEY)
+            .map(normalize_base_url)
+            .filter(|s| !s.trim().is_empty())
+    }
+
     pub fn base_http() -> String {
         // load from storage key if present
        let base = persist::get_string(BASE_URL_STORAGE_KEY)
