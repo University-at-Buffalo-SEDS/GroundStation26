@@ -394,7 +394,7 @@ fn build_latency_polylines(
     } else {
         deltas[deltas.len() / 2]
     };
-    let gap_threshold_ms = (median_dt.saturating_mul(5)).max(SCROLL_TRIGGER_THRESHOLD_MS);
+    let gap_threshold_ms = median_dt.saturating_mul(5).max(SCROLL_TRIGGER_THRESHOLD_MS);
 
     let mut solid: Vec<String> = Vec::new();
     let mut dotted: Vec<String> = Vec::new();

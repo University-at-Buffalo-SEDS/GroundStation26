@@ -1,7 +1,7 @@
 use std::process::Output;
 use std::{env, fs, io::Write, path::Path, path::PathBuf, process::Command};
 
-fn build_apple_objc(manifest_dir: &PathBuf, target: &str) {
+fn build_apple_objc(manifest_dir: &Path, target: &str) {
     if !target.contains("apple-") {
         return;
     }

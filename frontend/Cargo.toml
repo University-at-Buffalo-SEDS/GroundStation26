@@ -63,7 +63,7 @@ dioxus-signals = "0.7.2"
 dioxus-desktop = "0.7.0"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "time"] }
-reqwest = { version = "0.12", default-features = true, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = true, features = ["json", "rustls"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 url = "2.5"
@@ -83,4 +83,4 @@ mobile = ["dioxus/mobile"]
 
 
 [build-dependencies]
-reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.13.1", features = ["blocking", "rustls"] }

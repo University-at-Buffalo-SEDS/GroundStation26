@@ -31,7 +31,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     let mut show_chart = use_signal(|| true);
     // -------- Restore + persist active tab --------
     let did_restore = use_signal(|| false);
-    let last_saved = use_signal(|| String::new());
+    let last_saved = use_signal(String::new);
 
     // Restore ONCE
     use_effect({
@@ -546,13 +546,8 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
     let mut out: [String; 8] = std::array::from_fn(|_| String::new());
 
     let map_x = |t: f64| -> f32 {
-        let mut tt = if span_ms > 0.0 { t / span_ms } else { 0.0 };
-        if tt < 0.0 {
-            tt = 0.0;
-        }
-        if tt > 1.0 {
-            tt = 1.0;
-        }
+        let tt = if span_ms > 0.0 { t / span_ms } else { 0.0 };
+        let tt = tt.clamp(0.0, 1.0);
         left + plot_w * tt as f32
     };
 

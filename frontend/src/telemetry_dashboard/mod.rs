@@ -676,10 +676,10 @@ fn TelemetryDashboardInner() -> Element {
                     alive.clone(),
                 )
                 .await
+                    && alive.load(Ordering::Relaxed)
+                    && *WS_EPOCH.read() == epoch
                 {
-                    if alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
-                        log!("seed_from_db failed: {e}");
-                    }
+                    log!("seed_from_db failed: {e}");
                 }
             });
         });
@@ -756,10 +756,11 @@ fn TelemetryDashboardInner() -> Element {
                     return;
                 }
 
-                if let Ok(state) = http_get_json::<FlightState>("/flightstate").await {
-                    if alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
-                        flight_state.set(state);
-                    }
+                if let Ok(state) = http_get_json::<FlightState>("/flightstate").await
+                    && alive.load(Ordering::Relaxed)
+                    && *WS_EPOCH.read() == epoch
+                {
+                    flight_state.set(state);
                 }
             });
         });
@@ -804,10 +805,9 @@ fn TelemetryDashboardInner() -> Element {
                     alive.clone(),
                 )
                 .await
+                    && alive.load(Ordering::Relaxed)
                 {
-                    if alive.load(Ordering::Relaxed) {
-                        log!("[WS] supervisor ended: {e}");
-                    }
+                    log!("[WS] supervisor ended: {e}");
                 }
             });
         });
@@ -831,6 +831,11 @@ fn TelemetryDashboardInner() -> Element {
         use dioxus_router::use_navigator;
         #[cfg(not(target_arch = "wasm32"))]
         let nav = use_navigator();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            rsx! { div {} }
+        }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -867,11 +872,6 @@ fn TelemetryDashboardInner() -> Element {
                     "CONNECT"
                 }
             }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            rsx! { div {} }
         }
     };
 
@@ -1239,6 +1239,7 @@ async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, St
 // ------------------------------
 // Seed telemetry/alerts/gps
 // ------------------------------
+#[allow(clippy::too_many_arguments)]
 async fn seed_from_db(
     rows: &mut Signal<Vec<TelemetryRow>>,
     warnings: &mut Signal<Vec<AlertMsg>>,
@@ -1332,10 +1333,10 @@ async fn seed_from_db(
     }
 
     // ---- Board status (/api/boards) ----
-    if let Ok(status) = http_get_json::<BoardStatusMsg>("/api/boards").await {
-        if alive.load(Ordering::Relaxed) {
-            board_status.set(status.boards);
-        }
+    if let Ok(status) = http_get_json::<BoardStatusMsg>("/api/boards").await
+        && alive.load(Ordering::Relaxed)
+    {
+        board_status.set(status.boards);
     }
 
     if !alive.load(Ordering::Relaxed) {
@@ -1343,11 +1344,11 @@ async fn seed_from_db(
     }
 
     // ---- Optional GPS seed (/api/gps) ----
-    if let Ok(gps) = http_get_json::<GpsResponse>("/api/gps").await {
-        if alive.load(Ordering::Relaxed) {
-            rocket_gps.set(Some((gps.rocket_lat, gps.rocket_lon)));
-            user_gps.set(Some((gps.user_lat, gps.user_lon)));
-        }
+    if let Ok(gps) = http_get_json::<GpsResponse>("/api/gps").await
+        && alive.load(Ordering::Relaxed)
+    {
+        rocket_gps.set(Some((gps.rocket_lat, gps.rocket_lon)));
+        user_gps.set(Some((gps.user_lat, gps.user_lon)));
     }
 
     Ok(())
@@ -1356,6 +1357,7 @@ async fn seed_from_db(
 // ---------------------------------------------------------
 // WebSocket supervisor (reconnect loop) — both platforms
 // ---------------------------------------------------------
+#[allow(clippy::too_many_arguments)]
 async fn connect_ws_supervisor(
     epoch: u64,
     rows: Signal<Vec<TelemetryRow>>,
@@ -1422,10 +1424,10 @@ async fn connect_ws_supervisor(
             break;
         }
 
-        if let Err(e) = res {
-            if alive.load(Ordering::Relaxed) {
-                log!("[WS] connect error: {e}");
-            }
+        if let Err(e) = res
+            && alive.load(Ordering::Relaxed)
+        {
+            log!("[WS] connect error: {e}");
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -1556,6 +1558,7 @@ async fn connect_ws_once_wasm(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 async fn connect_ws_once_native(
     epoch: u64,
     rows: Signal<Vec<TelemetryRow>>,
@@ -1629,6 +1632,7 @@ async fn connect_ws_once_native(
     Err("websocket closed".to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_ws_message(
     s: &str,
     rows: Signal<Vec<TelemetryRow>>,

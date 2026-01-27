@@ -123,7 +123,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
         let all_boards_seen = {
             let mut board_status = state.board_status.lock().unwrap();
             for (board, status) in board_status.iter_mut() {
-                let mut offline = match status.last_seen_ms {
+                let offline = match status.last_seen_ms {
                     Some(last_seen_ms) => now_ms.saturating_sub(last_seen_ms) > BOARD_TIMEOUT_MS,
                     None => true,
                 };
@@ -153,13 +153,15 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                         status.warned = true;
                     }
 
-                    let abort_eligible = *board != Board::ValveBoard && (on_ground || !is_ground_board);
-                    if abort_eligible && !in_flight_ignored_board {
-                        if let Some(last_seen_ms) = status.last_seen_ms {
-                            let offline_ms = now_ms.saturating_sub(last_seen_ms);
-                            if offline_ms >= BOARD_OFFLINE_ABORT_TRIGGER_MS && !abort {
-                                abort = true;
-                            }
+                    let abort_eligible =
+                        *board != Board::ValveBoard && (on_ground || !is_ground_board);
+                    if abort_eligible
+                        && !in_flight_ignored_board
+                        && let Some(last_seen_ms) = status.last_seen_ms
+                    {
+                        let offline_ms = now_ms.saturating_sub(last_seen_ms);
+                        if offline_ms >= BOARD_OFFLINE_ABORT_TRIGGER_MS && !abort {
+                            abort = true;
                         }
                     }
                 } else {

@@ -9,7 +9,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "time", "fs"] }
-reqwest = { version = "0.12", features = ["rustls-tls"] }
+reqwest = { version = "0.13", features = ["rustls"] }
 indicatif = "0.18.3"
 futures = "0.3"
 
