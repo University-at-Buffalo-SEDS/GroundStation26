@@ -106,7 +106,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     // Build graph polylines (8 series) + y-range + span
     let view_w = 1200.0_f64;
     let view_h = 360.0_f64;
-    let view_h_full = 600.0_f64;
+    let view_h_full = fullscreen_view_height().max(260.0);
     let left = 60.0_f64;
     let right = view_w - 20.0_f64;
     let pad_top = 20.0_f64;
@@ -542,4 +542,20 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
     }
 
     (out, min_v, max_v, span_minutes)
+}
+
+fn fullscreen_view_height() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let h = web_sys::window()
+            .and_then(|w| w.inner_height().ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(700.0);
+        // Account for padding + header row in fullscreen overlay.
+        (h - 140.0).max(360.0)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        600.0
+    }
 }

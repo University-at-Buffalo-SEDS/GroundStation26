@@ -51,9 +51,12 @@ def _list_connected_ios_device_ids(frontend_dir: Path) -> list[str]:
 
     try:
         out = run_capture(["ios-deploy", "--detect"], cwd=frontend_dir)
-    except subprocess.CalledProcessError as e:
-        print("Error: failed to run `ios-deploy --detect`.", file=sys.stderr)
-        sys.exit(e.returncode)
+    except subprocess.CalledProcessError:
+        print(
+            "Warning: failed to run `ios-deploy --detect`; falling back to single-device deploy.",
+            file=sys.stderr,
+        )
+        return []
     except FileNotFoundError:
         print("Error: ios-deploy not found. Install it first (e.g. `brew install ios-deploy`).", file=sys.stderr)
         sys.exit(1)
@@ -325,10 +328,13 @@ def deploy_ios(frontend_dir: Path) -> None:
     device_ids = _list_connected_ios_device_ids(frontend_dir)
 
     # If we couldn't detect devices (or ios-deploy output format changed),
-    # fall back to the old behavior (ios-deploy picks a device).
+    # fall back to the old behavior (ios-deploy picks a device, waiting if needed).
     if not device_ids:
-        print("No device IDs detected via `ios-deploy --detect`; falling back to default deploy behavior.")
-        run(["ios-deploy", "--bundle", str(bundle)], cwd=frontend_dir)
+        print(
+            "No device IDs detected via `ios-deploy --detect`; falling back to single-device deploy.",
+            file=sys.stderr,
+        )
+        _deploy_ios_single(frontend_dir, bundle)
         return
 
     print(f"Deploying to {len(device_ids)} connected iOS device(s): {', '.join(device_ids)}")
@@ -346,6 +352,20 @@ def deploy_ios(frontend_dir: Path) -> None:
         for udid, code in failures:
             print(f"  - {udid}: exit code {code}", file=sys.stderr)
         sys.exit(1)
+
+
+def _deploy_ios_single(frontend_dir: Path, bundle: Path) -> None:
+    """
+    Single-device deploy that waits for a device to be connected.
+    """
+    try:
+        run(["ios-deploy", "--bundle", str(bundle), "--wait-for-device"], cwd=frontend_dir)
+    except subprocess.CalledProcessError:
+        print(
+            "Warning: `ios-deploy --wait-for-device` failed; retrying without the flag.",
+            file=sys.stderr,
+        )
+        run(["ios-deploy", "--bundle", str(bundle)], cwd=frontend_dir)
 
 
 def _read_bundle_identifier(app_bundle: Path) -> Optional[str]:

@@ -131,7 +131,7 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
                                 div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
                                     "{entry.board.as_str()} ({entry.sender_id})"
                                 }
-                                {render_latency_chart(history.read().get(&entry.sender_id), false)}
+                                {render_latency_chart(history.read().get(&entry.sender_id), 360.0_f64)}
                             }
                         }
                     }
@@ -169,7 +169,10 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
                             div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
                                 "{entry.board.as_str()} ({entry.sender_id})"
                             }
-                            {render_latency_chart(history.read().get(&entry.sender_id), true)}
+                            {render_latency_chart(
+                                history.read().get(&entry.sender_id),
+                                fullscreen_latency_height(boards.read().len()),
+                            )}
                         }
                     }
                 }
@@ -193,7 +196,7 @@ fn js_now_ms() -> i64 {
     }
 }
 
-fn render_latency_chart(points: Option<&Vec<(i64, f64)>>, is_fullscreen: bool) -> Element {
+fn render_latency_chart(points: Option<&Vec<(i64, f64)>>, height: f64) -> Element {
     let Some(points) = points else {
         return rsx! {
             div { style: "color:#64748b; font-size:12px;", "No data yet" }
@@ -207,7 +210,6 @@ fn render_latency_chart(points: Option<&Vec<(i64, f64)>>, is_fullscreen: bool) -
     }
 
     let width = 1200.0_f64;
-    let height = if is_fullscreen { 600.0_f64 } else { 360.0_f64 };
     let left = 60.0_f64;
     let right = width - 20.0_f64;
     let pad_top = 20.0_f64;
@@ -296,6 +298,26 @@ fn render_latency_chart(points: Option<&Vec<(i64, f64)>>, is_fullscreen: bool) -
                 text { x:"{right - 160.0}", y:"{pad_top + 26.0}", fill:"#cbd5f5", "font-size":"12", "Interpolated" }
             }
         }
+    }
+}
+
+fn fullscreen_latency_height(_count: usize) -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let h = web_sys::window()
+            .and_then(|w| w.inner_height().ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(700.0);
+        let header = 80.0;
+        let padding = 32.0;
+        let gap = 10.0;
+        let n = _count.max(1) as f64;
+        let available = (h - header - padding - gap * (n - 1.0)).max(260.0);
+        (available / n).max(220.0)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        360.0
     }
 }
 
