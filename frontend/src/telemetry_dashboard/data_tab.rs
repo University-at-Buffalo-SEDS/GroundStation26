@@ -104,11 +104,45 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     let latest_row = tab_rows.last().cloned();
 
     // Build graph polylines (8 series) + y-range + span
-    let (paths, y_min, y_max, span_min) = build_polylines(&tab_rows, 1200.0, 360.0);
+    let view_w = 1200.0_f64;
+    let view_h = 360.0_f64;
+    let view_h_full = 600.0_f64;
+    let left = 60.0_f64;
+    let right = view_w - 20.0_f64;
+    let pad_top = 20.0_f64;
+    let pad_bottom = 20.0_f64;
+    let inner_w = right - left;
+    let grid_x_step = inner_w / 6.0_f64;
+
+    let inner_h = view_h - pad_top - pad_bottom;
+    let inner_h_full = view_h_full - pad_top - pad_bottom;
+    let grid_y_step = inner_h / 6.0_f64;
+    let grid_y_step_full = inner_h_full / 6.0_f64;
+
+    let (paths, y_min, y_max, span_min) =
+        build_polylines(&tab_rows, view_w as f32, view_h as f32);
+    let (paths_full, _, _, _) = build_polylines(&tab_rows, view_w as f32, view_h_full as f32);
     let y_mid = (y_min + y_max) * 0.5;
 
-    // Labels for cards
+    // Labels for cards and legend
     let labels = labels_for_datatype(&current);
+    let legend_items: Vec<(usize, &'static str)> = labels
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| if l.is_empty() { None } else { Some((i, *l)) })
+        .collect();
+    let legend_w = 280.0_f64;
+    let legend_row_h = 14.0_f64;
+    let legend_h = (legend_items.len() as f64 * legend_row_h + 10.0)
+        .min(140.0_f64)
+        .max(24.0_f64);
+    let legend_x = view_w - 20.0_f64 - legend_w;
+    let legend_y = 20.0_f64;
+    let legend_rows: Vec<(usize, &'static str, f64)> = legend_items
+        .iter()
+        .enumerate()
+        .map(|(row, (i, label))| (*i, *label, legend_y + 10.0 + (row as f64) * legend_row_h))
+        .collect();
 
     let on_toggle_fullscreen = move |_| {
         let next = !*is_fullscreen.read();
@@ -187,37 +221,37 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                     if *show_chart.read() {
                         svg {
                             style: "width:100%; height:auto; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
-                            view_box: "0 0 1200 360",
+                            view_box: "0 0 {view_w} {view_h}",
 
                             // gridlines
                             for i in 1..=5 {
                                 line {
-                                    x1:"60", y1:"{20.0 + (320.0 / 6.0) * (i as f64)}",
-                                    x2:"1180", y2:"{20.0 + (320.0 / 6.0) * (i as f64)}",
+                                    x1:"{left}", y1:"{pad_top + grid_y_step * (i as f64)}",
+                                    x2:"{right}", y2:"{pad_top + grid_y_step * (i as f64)}",
                                     stroke:"#1f2937", "stroke-width":"1"
                                 }
                             }
                             for i in 1..=5 {
                                 line {
-                                    x1:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y1:"20",
-                                    x2:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y2:"340",
+                                    x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
+                                    x2:"{left + grid_x_step * (i as f64)}", y2:"{view_h - pad_bottom}",
                                     stroke:"#1f2937", "stroke-width":"1"
                                 }
                             }
 
                             // axes
-                            line { x1:"60", y1:"20",  x2:"60",   y2:"340", stroke:"#334155", stroke_width:"1" }
-                            line { x1:"60", y1:"340", x2:"1180", y2:"340", stroke:"#334155", stroke_width:"1" }
+                            line { x1:"{left}", y1:"{pad_top}",  x2:"{left}",   y2:"{view_h - pad_bottom}", stroke:"#334155", stroke_width:"1" }
+                            line { x1:"{left}", y1:"{view_h - pad_bottom}", x2:"{right}", y2:"{view_h - pad_bottom}", stroke:"#334155", stroke_width:"1" }
 
                             // y labels
-                            text { x:"10", y:"26", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
-                            text { x:"10", y:"184", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
-                            text { x:"10", y:"344", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
+                            text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
+                            text { x:"10", y:"{pad_top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
+                            text { x:"10", y:"{view_h - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
 
                             // x labels (span in minutes)
-                            text { x:"70",   y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
-                            text { x:"600",  y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
-                            text { x:"1120", y:"355", fill:"#94a3b8", "font-size":"10", "now" }
+                            text { x:"{left + 10.0}",   y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
+                            text { x:"{view_w * 0.5}",  y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
+                            text { x:"{right - 60.0}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
 
                             // series
                             for (i, pts) in paths.iter().enumerate() {
@@ -229,6 +263,23 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                                         stroke_width: "2",
                                         stroke_linejoin: "round",
                                         stroke_linecap: "round",
+                                    }
+                                }
+                            }
+
+                            // Legend (inside graph box)
+                            if !legend_items.is_empty() {
+                                g {
+                                    rect { x:"{legend_x}", y:"{legend_y}", width:"{legend_w}", height:"{legend_h}",
+                                        rx:"6", ry:"6", fill:"#0b1220", stroke:"#1f2937"
+                                    }
+                                    for (i, label, y) in legend_rows.iter() {
+                                        line { x1:"{legend_x + 10.0}", y1:"{y}", x2:"{legend_x + 46.0}", y2:"{y}",
+                                            stroke:"{series_color(*i)}", stroke_width:"2", stroke_linecap:"round"
+                                        }
+                                        text { x:"{legend_x + 54.0}", y:"{y + 4.0}", fill:"#cbd5f5", "font-size":"12",
+                                            "{label}"
+                                        }
                                     }
                                 }
                             }
@@ -251,40 +302,40 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                 div { style: "flex:1; min-height:0; width:100%;",
                     svg {
                         style: "width:100%; height:100%; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
-                        view_box: "0 0 1200 360",
+                        view_box: "0 0 {view_w} {view_h_full}",
 
                         // gridlines
                         for i in 1..=5 {
                             line {
-                                x1:"60", y1:"{20.0 + (320.0 / 6.0) * (i as f64)}",
-                                x2:"1180", y2:"{20.0 + (320.0 / 6.0) * (i as f64)}",
+                                x1:"{left}", y1:"{pad_top + grid_y_step_full * (i as f64)}",
+                                x2:"{right}", y2:"{pad_top + grid_y_step_full * (i as f64)}",
                                 stroke:"#1f2937", "stroke-width":"1"
                             }
                         }
                         for i in 1..=5 {
                             line {
-                                x1:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y1:"20",
-                                x2:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y2:"340",
+                                x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
+                                x2:"{left + grid_x_step * (i as f64)}", y2:"{view_h_full - pad_bottom}",
                                 stroke:"#1f2937", "stroke-width":"1"
                             }
                         }
 
                         // axes
-                        line { x1:"60", y1:"20",  x2:"60",   y2:"340", stroke:"#334155", stroke_width:"1" }
-                        line { x1:"60", y1:"340", x2:"1180", y2:"340", stroke:"#334155", stroke_width:"1" }
+                        line { x1:"{left}", y1:"{pad_top}",  x2:"{left}",   y2:"{view_h_full - pad_bottom}", stroke:"#334155", stroke_width:"1" }
+                        line { x1:"{left}", y1:"{view_h_full - pad_bottom}", x2:"{right}", y2:"{view_h_full - pad_bottom}", stroke:"#334155", stroke_width:"1" }
 
                         // y labels
-                        text { x:"10", y:"26", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
-                        text { x:"10", y:"184", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
-                        text { x:"10", y:"344", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
+                        text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
+                        text { x:"10", y:"{pad_top + inner_h_full / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
+                        text { x:"10", y:"{view_h_full - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
 
                         // x labels (span in minutes)
-                        text { x:"70",   y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
-                        text { x:"600",  y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
-                        text { x:"1120", y:"355", fill:"#94a3b8", "font-size":"10", "now" }
+                        text { x:"{left + 10.0}",   y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
+                        text { x:"{view_w * 0.5}",  y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
+                        text { x:"{right - 60.0}", y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
 
                         // series
-                        for (i, pts) in paths.iter().enumerate() {
+                        for (i, pts) in paths_full.iter().enumerate() {
                             if !pts.is_empty() {
                                 polyline {
                                     points: "{pts}",
@@ -293,6 +344,23 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                                     stroke_width: "2",
                                     stroke_linejoin: "round",
                                     stroke_linecap: "round",
+                                }
+                            }
+                        }
+
+                        // Legend (inside graph box)
+                        if !legend_items.is_empty() {
+                            g {
+                                rect { x:"{legend_x}", y:"{legend_y}", width:"{legend_w}", height:"{legend_h}",
+                                    rx:"6", ry:"6", fill:"#0b1220", stroke:"#1f2937"
+                                }
+                                for (i, label, y) in legend_rows.iter() {
+                                    line { x1:"{legend_x + 10.0}", y1:"{y}", x2:"{legend_x + 46.0}", y2:"{y}",
+                                        stroke:"{series_color(*i)}", stroke_width:"2", stroke_linecap:"round"
+                                    }
+                                    text { x:"{legend_x + 54.0}", y:"{y + 4.0}", fill:"#cbd5f5", "font-size":"12",
+                                        "{label}"
+                                    }
                                 }
                             }
                         }
@@ -362,11 +430,32 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
         return (std::array::from_fn(|_| String::new()), 0.0, 1.0, 0.0);
     }
 
-    // 1) global min/max across all channels
+    // 1) time window & span
+    let newest_ts = rows.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
+    let oldest_ts = rows.iter().map(|r| r.timestamp_ms).min().unwrap_or(newest_ts);
+
+    let raw_span_ms = (newest_ts - oldest_ts).max(1);
+    let effective_span_ms = raw_span_ms.min(HISTORY_MS);
+    let span_minutes = effective_span_ms as f32 / 60_000.0;
+
+    let window_start = newest_ts.saturating_sub(effective_span_ms);
+    let window_end = newest_ts;
+
+    // 2) rows in window
+    let mut window_rows: Vec<&TelemetryRow> = rows
+        .iter()
+        .filter(|r| r.timestamp_ms >= window_start)
+        .collect();
+    if window_rows.is_empty() {
+        return (std::array::from_fn(|_| String::new()), 0.0, 1.0, span_minutes);
+    }
+    window_rows.sort_by_key(|r| r.timestamp_ms);
+
+    // 3) min/max across windowed rows
     let mut min_v: Option<f32> = None;
     let mut max_v: Option<f32> = None;
 
-    for r in rows {
+    for r in &window_rows {
         for x in [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7]
             .into_iter()
             .flatten()
@@ -378,24 +467,14 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
 
     let (min_v, mut max_v) = match (min_v, max_v) {
         (Some(a), Some(b)) => (a, b),
-        _ => return (std::array::from_fn(|_| String::new()), 0.0, 1.0, 0.0),
+        _ => return (std::array::from_fn(|_| String::new()), 0.0, 1.0, span_minutes),
     };
 
     if (max_v - min_v).abs() < 1e-6 {
         max_v = min_v + 1.0;
     }
 
-    // 2) time window & span
-    let newest_ts = rows.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
-    let oldest_ts = rows.iter().map(|r| r.timestamp_ms).min().unwrap_or(newest_ts);
-
-    let raw_span_ms = (newest_ts - oldest_ts).max(1);
-    let effective_span_ms = raw_span_ms.min(HISTORY_MS);
-    let span_minutes = effective_span_ms as f32 / 60_000.0;
-
-    let window_start = newest_ts.saturating_sub(effective_span_ms);
-
-    // 3) plot geometry
+    // 4) plot geometry
     let left = 60.0;
     let right = width - 20.0;
     let top = 20.0;
@@ -406,81 +485,52 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
 
     let map_y = |v: f32| bottom - ((v - min_v) / (max_v - min_v)) * plot_h;
 
-    // 4) rows in window
-    let mut window_rows: Vec<&TelemetryRow> = rows
-        .iter()
-        .filter(|r| r.timestamp_ms >= window_start)
-        .collect();
-    if window_rows.is_empty() {
-        return (std::array::from_fn(|_| String::new()), min_v, max_v, span_minutes);
-    }
-    window_rows.sort_by_key(|r| r.timestamp_ms);
-
-    // 5) downsample into <= max_points buckets by index
-    let n = window_rows.len();
+    // 5) downsample into time buckets (stable across scroll pauses)
     let max_points: usize = 2000;
 
-    #[derive(Clone, Default)]
-    struct Point {
-        vals: [Option<f32>; 8],
+    #[derive(Default, Clone)]
+    struct BucketAcc {
+        v_sum: [f64; 8],
+        v_count: [u64; 8],
     }
 
-    let mut points: Vec<Point> = Vec::new();
+    let mut buckets = vec![BucketAcc::default(); max_points];
+    let span_ms = (window_end - window_start).max(1) as f64;
 
-    if n <= max_points {
-        points.reserve(n);
-        for r in &window_rows {
-            points.push(Point {
-                vals: [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7],
-            });
+    for r in &window_rows {
+        let t = (r.timestamp_ms - window_start) as f64;
+        let mut bi = ((t / span_ms) * (max_points as f64 - 1.0)).floor() as isize;
+        if bi < 0 {
+            bi = 0;
         }
-    } else {
-        #[derive(Default, Clone)]
-        struct BucketAcc {
-            v_sum: [f64; 8],
-            v_count: [u64; 8],
+        if bi as usize >= max_points {
+            bi = (max_points - 1) as isize;
         }
+        let b = &mut buckets[bi as usize];
 
-        let mut buckets = vec![BucketAcc::default(); max_points];
-
-        for (i, r) in window_rows.iter().enumerate() {
-            let bi = i * max_points / n;
-            let b = &mut buckets[bi];
-
-            let vals = [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7];
-            for (j, opt) in vals.iter().enumerate() {
-                if let Some(x) = opt {
-                    b.v_sum[j] += *x as f64;
-                    b.v_count[j] += 1;
-                }
+        let vals = [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7];
+        for (j, opt) in vals.iter().enumerate() {
+            if let Some(x) = opt {
+                b.v_sum[j] += *x as f64;
+                b.v_count[j] += 1;
             }
-        }
-
-        for b in &buckets {
-            let mut vals: [Option<f32>; 8] = [None; 8];
-            for j in 0..8 {
-                if b.v_count[j] > 0 {
-                    vals[j] = Some((b.v_sum[j] / b.v_count[j] as f64) as f32);
-                }
-            }
-            points.push(Point { vals });
         }
     }
 
-    // 6) build polyline strings with even x-spacing
-    let len = points.len().max(1);
+    // 6) build polyline strings with time-based x-spacing
     let mut out: [String; 8] = std::array::from_fn(|_| String::new());
 
-    for (idx, p) in points.into_iter().enumerate() {
-        let t = if len > 1 {
-            idx as f32 / (len as f32 - 1.0)
+    for (idx, b) in buckets.iter().enumerate() {
+        let t = if max_points > 1 {
+            idx as f32 / (max_points as f32 - 1.0)
         } else {
             0.0
         };
         let x = left + plot_w * t;
 
         for ch in 0..8usize {
-            if let Some(v) = p.vals[ch] {
+            if b.v_count[ch] > 0 {
+                let v = (b.v_sum[ch] / b.v_count[ch] as f64) as f32;
                 let y = map_y(v);
                 let s = &mut out[ch];
                 if !s.is_empty() {

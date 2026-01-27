@@ -1,7 +1,6 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 use groundstation_shared::BoardStatusEntry;
-use crate::telemetry_dashboard::chart::build_time_polyline;
 use std::collections::HashMap;
 
 const LATENCY_WINDOW_MS: i64 = 20 * 60_000;
@@ -132,7 +131,7 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
                                 div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
                                     "{entry.board.as_str()} ({entry.sender_id})"
                                 }
-                                {render_latency_chart(history.read().get(&entry.sender_id))}
+                                {render_latency_chart(history.read().get(&entry.sender_id), false)}
                             }
                         }
                     }
@@ -170,7 +169,7 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
                             div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
                                 "{entry.board.as_str()} ({entry.sender_id})"
                             }
-                            {render_latency_chart(history.read().get(&entry.sender_id))}
+                            {render_latency_chart(history.read().get(&entry.sender_id), true)}
                         }
                     }
                 }
@@ -194,7 +193,7 @@ fn js_now_ms() -> i64 {
     }
 }
 
-fn render_latency_chart(points: Option<&Vec<(i64, f64)>>) -> Element {
+fn render_latency_chart(points: Option<&Vec<(i64, f64)>>, is_fullscreen: bool) -> Element {
     let Some(points) = points else {
         return rsx! {
             div { style: "color:#64748b; font-size:12px;", "No data yet" }
@@ -208,10 +207,18 @@ fn render_latency_chart(points: Option<&Vec<(i64, f64)>>) -> Element {
     }
 
     let width = 1200.0_f64;
-    let height = 360.0_f64;
-    let (poly, y_min, y_max, span_min) =
-        build_time_polyline(points.as_slice(), width, height, Some(LATENCY_WINDOW_MS));
-    if poly.is_empty() {
+    let height = if is_fullscreen { 600.0_f64 } else { 360.0_f64 };
+    let left = 60.0_f64;
+    let right = width - 20.0_f64;
+    let pad_top = 20.0_f64;
+    let pad_bottom = 20.0_f64;
+    let inner_w = right - left;
+    let inner_h = height - pad_top - pad_bottom;
+    let grid_x_step = inner_w / 6.0_f64;
+    let grid_y_step = inner_h / 6.0_f64;
+    let (solid, dotted, y_min, y_max, span_min) =
+        build_latency_polylines(points.as_slice(), width, height, Some(LATENCY_WINDOW_MS));
+    if solid.is_empty() && dotted.is_empty() {
         return rsx! {
             div { style: "color:#64748b; font-size:12px;", "Collecting…" }
         };
@@ -225,45 +232,174 @@ fn render_latency_chart(points: Option<&Vec<(i64, f64)>>) -> Element {
             // gridlines
             for i in 1..=5 {
                 line {
-                    x1:"60", y1:"{20.0 + (320.0 / 6.0) * (i as f64)}",
-                    x2:"1180", y2:"{20.0 + (320.0 / 6.0) * (i as f64)}",
+                    x1:"{left}", y1:"{pad_top + grid_y_step * (i as f64)}",
+                    x2:"{right}", y2:"{pad_top + grid_y_step * (i as f64)}",
                     stroke: "#1f2937",
                     "stroke-width": "1"
                 }
             }
             for i in 1..=5 {
                 line {
-                    x1:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y1:"20",
-                    x2:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y2:"340",
+                    x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
+                    x2:"{left + grid_x_step * (i as f64)}", y2:"{height - pad_bottom}",
                     stroke: "#1f2937",
                     "stroke-width": "1"
                 }
             }
 
             // axes
-            line { x1:"60", y1:"340", x2:"1180", y2:"340", stroke:"#334155", "stroke-width":"1" }
-            line { x1:"60", y1:"20",  x2:"60",   y2:"340", stroke:"#334155", "stroke-width":"1" }
+            line { x1:"{left}", y1:"{height - pad_bottom}", x2:"{right}", y2:"{height - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
+            line { x1:"{left}", y1:"{pad_top}",  x2:"{left}",   y2:"{height - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
 
             // y labels
-            text { x:"10", y:"26", fill:"#94a3b8", "font-size":"10", {format!("{y_max}")} }
-            text { x:"10", y:"184", fill:"#94a3b8", "font-size":"10", {format!("{}", (y_min + y_max) / 2f64)} }
-            text { x:"10", y:"344", fill:"#94a3b8", "font-size":"10", {format!("{y_min}")} }
+            text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{y_max}")} }
+            text { x:"10", y:"{pad_top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{}", (y_min + y_max) / 2f64)} }
+            text { x:"10", y:"{height - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{y_min}")} }
 
             // x labels (span in minutes)
-            text { x:"70",   y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
-            text { x:"600",  y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
-            text { x:"1120", y:"355", fill:"#94a3b8", "font-size":"10", "now" }
+            text { x:"{left + 10.0}",   y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
+            text { x:"{width * 0.5}",  y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
+            text { x:"{right - 60.0}", y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
 
-            polyline {
-                points: "{poly}",
-                fill: "none",
-                stroke: "#22d3ee",
-                "stroke-width": "2",
-                "stroke-linejoin": "round",
-                "stroke-linecap": "round",
+            for pts in solid.iter() {
+                if !pts.is_empty() {
+                    polyline {
+                        points: "{pts}",
+                        fill: "none",
+                        stroke: "#22d3ee",
+                        "stroke-width": "2",
+                        "stroke-linejoin": "round",
+                        "stroke-linecap": "round",
+                    }
+                }
+            }
+            for pts in dotted.iter() {
+                if !pts.is_empty() {
+                    polyline {
+                        points: "{pts}",
+                        fill: "none",
+                    stroke: "#fbbf24",
+                    "stroke-width": "2",
+                    stroke_dasharray: "4 4",
+                    "stroke-linejoin": "round",
+                    "stroke-linecap": "round",
+                }
+            }
+            }
+
+            // Legend (inside graph box)
+            g {
+                rect { x:"{right - 350.0}", y:"{pad_top + 6.0}", width:"350", height:"32", rx:"6", ry:"6", fill:"#0b1220", stroke:"#1f2937" }
+                line { x1:"{right - 338.0}", y1:"{pad_top + 22.0}", x2:"{right - 296.0}", y2:"{pad_top + 22.0}", stroke:"#22d3ee", "stroke-width":"2", "stroke-linecap":"round" }
+                text { x:"{right - 288.0}", y:"{pad_top + 26.0}", fill:"#cbd5f5", "font-size":"12", "Actual" }
+                line { x1:"{right - 210.0}", y1:"{pad_top + 22.0}", x2:"{right - 168.0}", y2:"{pad_top + 22.0}", stroke:"#fbbf24", "stroke-width":"2", stroke_dasharray:"4 4", "stroke-linecap":"round" }
+                text { x:"{right - 160.0}", y:"{pad_top + 26.0}", fill:"#cbd5f5", "font-size":"12", "Interpolated" }
             }
         }
     }
+}
+
+fn build_latency_polylines(
+    points: &[(i64, f64)],
+    width: f64,
+    height: f64,
+    window_ms: Option<i64>,
+) -> (Vec<String>, Vec<String>, f64, f64, f64) {
+    if points.len() < 2 {
+        return (Vec::new(), Vec::new(), 0.0, 0.0, 0.0);
+    }
+
+    let mut pts: Vec<(i64, f64)> = points.to_vec();
+    pts.sort_by_key(|(t, _)| *t);
+
+    if let Some(win) = window_ms
+        && let Some(&(newest, _)) = pts.last()
+    {
+        let start = newest.saturating_sub(win);
+        let first_in = pts.partition_point(|(t, _)| *t < start);
+        if first_in > 0 {
+            pts.drain(0..first_in);
+        }
+    }
+
+    if pts.len() < 2 {
+        return (Vec::new(), Vec::new(), 0.0, 0.0, 0.0);
+    }
+
+    let (t_min, t_max) = pts
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(mn, mx), (t, _)| {
+            (mn.min(*t), mx.max(*t))
+        });
+    let (y_min, y_max) = pts
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), (_, y)| {
+            (mn.min(*y), mx.max(*y))
+        });
+
+    let t_span = (t_max - t_min).max(1) as f64;
+    let mut y_span = y_max - y_min;
+    if !y_span.is_finite() || y_span.abs() < 1e-9 {
+        y_span = 1.0;
+    }
+
+    let pad_l = 60.0;
+    let pad_r = 20.0;
+    let pad_t = 20.0;
+    let pad_b = 20.0;
+    let inner_w = width - pad_l - pad_r;
+    let inner_h = height - pad_t - pad_b;
+
+    let to_xy = |t: i64, y: f64| -> (f64, f64) {
+        let x = pad_l + ((t - t_min) as f64 / t_span) * inner_w;
+        let y_norm = (y - y_min) / y_span;
+        let y_px = pad_t + (1.0 - y_norm) * inner_h;
+        (x, y_px)
+    };
+
+    // Detect large gaps (scroll pauses) and only interpolate those.
+    let mut deltas: Vec<i64> = pts
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0).max(0))
+        .collect();
+    deltas.sort_unstable();
+    let median_dt = if deltas.is_empty() {
+        0
+    } else {
+        deltas[deltas.len() / 2]
+    };
+    let gap_threshold_ms = (median_dt.saturating_mul(5)).max(750);
+
+    let mut solid: Vec<String> = Vec::new();
+    let mut dotted: Vec<String> = Vec::new();
+    let mut cur_solid = String::new();
+
+    for (idx, (t, y)) in pts.iter().enumerate() {
+        let (x, yy) = to_xy(*t, *y);
+        if idx > 0 {
+            let (pt, py) = pts[idx - 1];
+            let dt = (*t - pt).max(0);
+            if dt > gap_threshold_ms {
+                if !cur_solid.is_empty() {
+                    solid.push(std::mem::take(&mut cur_solid));
+                }
+                let (x0, y0) = to_xy(pt, py);
+                dotted.push(format!("{x0:.2},{y0:.2} {x:.2},{yy:.2}"));
+            }
+        }
+
+        if !cur_solid.is_empty() {
+            cur_solid.push(' ');
+        }
+        cur_solid.push_str(&format!("{x:.2},{yy:.2}"));
+    }
+
+    if !cur_solid.is_empty() {
+        solid.push(cur_solid);
+    }
+
+    let span_min = t_span / 60_000.0;
+    (solid, dotted, y_min, y_max, span_min)
 }
 
 fn render_board_table(boards: &[BoardStatusEntry]) -> Element {

@@ -20,7 +20,7 @@ fn _now_ms() -> f64 {
 }
 
 /// Build a single-series polyline with optional sliding window trimming.
-pub fn build_time_polyline(
+pub fn _build_time_polyline(
     points: &[(i64, f64)],
     width: f64,
     height: f64,
