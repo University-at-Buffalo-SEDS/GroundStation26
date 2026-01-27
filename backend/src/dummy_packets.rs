@@ -69,7 +69,7 @@ fn next_dummy_sender() -> &'static str {
 /// - Normally: a random packet from `choices` (GPS / gyro / etc.).
 /// - Once every 5 seconds: on the first call after the interval has elapsed,
 ///   return a *flight-state* packet with the next FlightState (wrapping).
-pub fn get_dummy_packet(sender: Option<&'static str>) -> TelemetryResult<TelemetryPacket> {
+pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     use crate::DataType::*;
 
     let sender = next_dummy_sender();
