@@ -484,15 +484,14 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
 
     let map_y = |v: f32| bottom - ((v - min_v) / (max_v - min_v)) * plot_h;
 
-    // 5) downsample into time buckets (stable density while preserving extrema)
+    // 5) downsample into fixed buckets (constant x-density while preserving extrema)
     let max_points: usize = 1200;
 
     #[derive(Clone)]
     struct BucketAcc {
         min_v: [f64; 8],
         max_v: [f64; 8],
-        min_ts: [f64; 8],
-        max_ts: [f64; 8],
+        last_v: [f64; 8],
         has: [bool; 8],
     }
 
@@ -501,8 +500,7 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
             Self {
                 min_v: [0.0; 8],
                 max_v: [0.0; 8],
-                min_ts: [0.0; 8],
-                max_ts: [0.0; 8],
+                last_v: [0.0; 8],
                 has: [false; 8],
             }
         }
@@ -530,17 +528,15 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
                     b.has[j] = true;
                     b.min_v[j] = xf;
                     b.max_v[j] = xf;
-                    b.min_ts[j] = t;
-                    b.max_ts[j] = t;
+                    b.last_v[j] = xf;
                 } else {
                     if xf < b.min_v[j] {
                         b.min_v[j] = xf;
-                        b.min_ts[j] = t;
                     }
                     if xf > b.max_v[j] {
                         b.max_v[j] = xf;
-                        b.max_ts[j] = t;
                     }
+                    b.last_v[j] = xf;
                 }
             }
         }
@@ -568,6 +564,7 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
         } else {
             0.0
         };
+        let center_x = map_x(center_t);
         for ch in 0..8usize {
             let s = &mut out[ch];
 
@@ -579,30 +576,19 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
             };
 
             if b.has[ch] {
-                let min_ts = b.min_ts[ch];
-                let max_ts = b.max_ts[ch];
                 let min_v = b.min_v[ch] as f32;
                 let max_v = b.max_v[ch] as f32;
 
-                if min_ts == max_ts {
-                    let x = map_x(min_ts);
-                    if (min_v - max_v).abs() < f32::EPSILON {
-                        push_point(x, map_y(min_v));
-                    } else {
-                        push_point(x, map_y(min_v));
-                        push_point(x, map_y(max_v));
-                    }
-                } else if min_ts < max_ts {
-                    push_point(map_x(min_ts), map_y(min_v));
-                    push_point(map_x(max_ts), map_y(max_v));
+                if (min_v - max_v).abs() < f32::EPSILON {
+                    push_point(center_x, map_y(min_v));
                 } else {
-                    push_point(map_x(max_ts), map_y(max_v));
-                    push_point(map_x(min_ts), map_y(min_v));
+                    push_point(center_x, map_y(min_v));
+                    push_point(center_x, map_y(max_v));
                 }
 
-                last_seen[ch] = Some(max_v);
+                last_seen[ch] = Some(b.last_v[ch] as f32);
             } else if let Some(v) = last_seen[ch] {
-                push_point(map_x(center_t), map_y(v));
+                push_point(center_x, map_y(v));
             }
         }
     }

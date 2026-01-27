@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use crate::telemetry_task::get_current_timestamp_ms;
 use crate::web::emit_warning;
-use groundstation_shared::FlightState;
+use groundstation_shared::{Board, FlightState};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
 use sqlx::SqlitePool;
@@ -96,7 +96,6 @@ async fn insert_flight_state_with_retry(
 #[cfg(feature = "testing")]
 const BOARD_TIMEOUT_MS: u64 = 3000;
 
-
 pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
     let mut abort = false;
     let mut count: u64 = 0;
@@ -109,10 +108,24 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
         let all_boards_seen = {
             let mut board_status = state.board_status.lock().unwrap();
             for (board, status) in board_status.iter_mut() {
-                let offline = match status.last_seen_ms {
+                let mut offline = match status.last_seen_ms {
                     Some(last_seen_ms) => now_ms.saturating_sub(last_seen_ms) > BOARD_TIMEOUT_MS,
                     None => true,
                 };
+                let valve_required_on_ground = matches!(
+                    current_state,
+                    FlightState::Startup
+                        | FlightState::Idle
+                        | FlightState::PreFill
+                        | FlightState::FillTest
+                        | FlightState::NitrogenFill
+                        | FlightState::NitrousFill
+                        | FlightState::Armed
+                );
+
+                if offline && *board == Board::ValveBoard && !valve_required_on_ground {
+                    offline = false;
+                }
 
                 if offline {
                     if current_state != FlightState::Startup && !status.warned {
@@ -127,7 +140,9 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     status.warned = false;
                 }
             }
-            board_status.values().all(|status| status.last_seen_ms.is_some())
+            board_status
+                .values()
+                .all(|status| status.last_seen_ms.is_some())
         };
 
         for warning in board_warnings {
@@ -197,7 +212,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     // X axis
                     if let Some(accel_x) = values.first()
                         && ((ACCELERATION_X_MIN_THRESHOLD > *accel_x)
-                        || (*accel_x > ACCELERATION_X_MAX_THRESHOLD))
+                            || (*accel_x > ACCELERATION_X_MAX_THRESHOLD))
                     {
                         emit_warning(&state, "Critical: Acceleration X threshold exceeded!");
                     }
@@ -205,7 +220,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     // Y axis
                     if let Some(accel_y) = values.get(1)
                         && ((ACCELERATION_Y_MIN_THRESHOLD > *accel_y)
-                        || (*accel_y > ACCELERATION_Y_MAX_THRESHOLD))
+                            || (*accel_y > ACCELERATION_Y_MAX_THRESHOLD))
                     {
                         emit_warning(&state, "Critical: Acceleration Y threshold exceeded!");
                     }
@@ -213,7 +228,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     // Z axis
                     if let Some(accel_z) = values.get(2)
                         && ((ACCELERATION_Z_MIN_THRESHOLD > *accel_z)
-                        || (*accel_z > ACCELERATION_Z_MAX_THRESHOLD))
+                            || (*accel_z > ACCELERATION_Z_MAX_THRESHOLD))
                     {
                         emit_warning(&state, "Critical: Acceleration Z threshold exceeded!");
                     }
@@ -251,7 +266,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     // Pressure
                     if let Some(pressure) = values.first()
                         && ((BARO_PRESSURE_MIN_THRESHOLD > *pressure)
-                        || (*pressure > BARO_PRESSURE_MAX_THRESHOLD))
+                            || (*pressure > BARO_PRESSURE_MAX_THRESHOLD))
                     {
                         emit_warning(&state, "Critical: Barometer pressure threshold exceeded!");
                     }
@@ -259,7 +274,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     // Temperature
                     if let Some(temp) = values.get(1)
                         && ((BARO_TEMPERATURE_MIN_THRESHOLD > *temp)
-                        || (*temp > BARO_TEMPERATURE_MAX_THRESHOLD))
+                            || (*temp > BARO_TEMPERATURE_MAX_THRESHOLD))
                     {
                         emit_warning(
                             &state,
@@ -270,7 +285,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     // Altitude
                     if let Some(alt) = values.get(2)
                         && ((BARO_ALTITUDE_MIN_THRESHOLD > *alt)
-                        || (*alt > BARO_ALTITUDE_MAX_THRESHOLD))
+                            || (*alt > BARO_ALTITUDE_MAX_THRESHOLD))
                     {
                         emit_warning(&state, "Critical: Barometer altitude threshold exceeded!");
                     }
@@ -283,7 +298,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     // Latitude (x)
                     if let Some(lat) = values.first()
                         && ((GPS_LATITUDE_MIN_THRESHOLD > *lat)
-                        || (*lat > GPS_LATITUDE_MAX_THRESHOLD))
+                            || (*lat > GPS_LATITUDE_MAX_THRESHOLD))
                     {
                         emit_warning(
                             &state,
@@ -294,7 +309,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     // Longitude (y)
                     if let Some(lon) = values.get(1)
                         && ((GPS_LONGITUDE_MIN_THRESHOLD > *lon)
-                        || (*lon > GPS_LONGITUDE_MAX_THRESHOLD))
+                            || (*lon > GPS_LONGITUDE_MAX_THRESHOLD))
                     {
                         emit_warning(
                             &state,
@@ -309,7 +324,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     // Current
                     if let Some(current) = values.get(1)
                         && ((BATTERY_CURRENT_MIN_THRESHOLD > *current)
-                        || (*current > BATTERY_CURRENT_MAX_THRESHOLD))
+                            || (*current > BATTERY_CURRENT_MAX_THRESHOLD))
                     {
                         emit_warning(&state, "Critical: Battery current out of range!");
                     }
@@ -320,7 +335,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     // Voltage
                     if let Some(voltage) = values.first()
                         && ((BATTERY_VOLTAGE_MIN_THRESHOLD > *voltage)
-                        || (*voltage > BATTERY_VOLTAGE_MAX_THRESHOLD))
+                            || (*voltage > BATTERY_VOLTAGE_MAX_THRESHOLD))
                     {
                         emit_warning(&state, "Critical: Battery voltage out of range!");
                     }
@@ -343,7 +358,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
 
                     if let Some(pressure) = values.first()
                         && ((FUEL_TANK_PRESSURE_MIN_THRESHOLD > *pressure)
-                        || (*pressure > FUEL_TANK_PRESSURE_MAX_THRESHOLD))
+                            || (*pressure > FUEL_TANK_PRESSURE_MAX_THRESHOLD))
                     {
                         emit_warning(&state, "Critical: Fuel tank pressure out of range!");
                     }
