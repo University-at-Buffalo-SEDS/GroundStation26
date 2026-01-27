@@ -205,6 +205,8 @@ pub fn MapTab(
     {
         use_effect(move || {
             js_invalidate_map();
+            js_setup_map_touch_guard();
+            js_setup_map_size_guard();
         });
     }
 
@@ -212,6 +214,22 @@ pub fn MapTab(
         let next = !*is_fullscreen.read();
         is_fullscreen.set(next);
     };
+
+    {
+        let is_fullscreen = is_fullscreen;
+        use_effect(move || {
+            let is_fullscreen = *is_fullscreen.read();
+            spawn(async move {
+                #[cfg(target_arch = "wasm32")]
+                gloo_timers::future::TimeoutFuture::new(60).await;
+
+                #[cfg(not(target_arch = "wasm32"))]
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+                js_reinit_map(is_fullscreen);
+            });
+        });
+    }
 
     rsx! {
         if *is_fullscreen.read() {
@@ -234,13 +252,22 @@ pub fn MapTab(
                 div { style: "flex:1; min-height:0; width:100%;",
                     div {
                         id: "ground-map",
-                        style: "width:100%; height:100%; border-radius:12px; overflow:hidden; background:#000; border:1px solid #4b5563;",
+                        style: "width:100%; height:100%; border-radius:12px; overflow:hidden; background:#000; border:1px solid #4b5563; touch-action:manipulation; overscroll-behavior:contain;",
+                        ontouchstart: move |e| {
+                            let touches = e.touches();
+                            if touches.len() > 1 {
+                                e.prevent_default();
+                                e.stop_propagation();
+                            }
+                        },
                     }
                 }
             }
         } else {
             div {
-                style: "display:flex; flex-direction:column; gap:12px; width:100%; padding:12px; \
+                id: "map-card",
+                style: "display:flex; flex-direction:column; gap:12px; width:100%; height:var(--gs26-map-max, 60vh); \
+                        max-height:var(--gs26-map-max, 60vh); \
                         border-radius:12px; background:#020617ee; border:1px solid #4b5563; \
                         box-shadow:0 10px 25px rgba(0,0,0,0.45);",
                 div {
@@ -259,10 +286,17 @@ pub fn MapTab(
                 }
 
                 div {
-                    style: "height: clamp(180px, 45vh, 520px); width:100%;",
+                    style: "flex:1; min-height:0; width:100%;",
                     div {
                         id: "ground-map",
-                        style: "width:100%; height:100%; border-radius:12px; overflow:hidden; background:#000; border:1px solid #4b5563;",
+                        style: "width:100%; height:100%; border-radius:12px; overflow:hidden; background:#000; border:1px solid #4b5563; touch-action:manipulation; overscroll-behavior:contain;",
+                        ontouchstart: move |e| {
+                            let touches = e.touches();
+                            if touches.len() > 1 {
+                                e.prevent_default();
+                                e.stop_propagation();
+                            }
+                        },
                     }
                 }
             }
@@ -349,6 +383,76 @@ fn js_invalidate_map() {
               setTimeout(() => { try { m.invalidateSize(); } catch (e) {} }, 50);
             }
           } catch (e) {}
+        })();
+        "#,
+    );
+}
+
+fn js_setup_map_touch_guard() {
+    js_eval(
+        r#"
+        (function() {
+          const el = document.getElementById("ground-map");
+          if (!el || el.__gs26_touch_guard) return;
+          el.__gs26_touch_guard = true;
+          let last = 0;
+          el.addEventListener('touchstart', function(e) {
+            if (e.touches && e.touches.length > 1) {
+              e.preventDefault();
+              e.stopPropagation();
+              return;
+            }
+          }, { passive: false });
+          el.addEventListener('touchend', function(e) {
+            const now = Date.now();
+            if (now - last <= 300) {
+              e.preventDefault();
+              e.stopPropagation();
+            }
+            last = now;
+          }, { passive: false });
+        })();
+        "#,
+    );
+}
+
+fn js_reinit_map(_fullscreen: bool) {
+    js_eval(&format!(
+        r#"
+        (function() {{
+          try {{
+            if (window.__gs26_ground_station_loaded === true &&
+                typeof window.initGroundMap === "function") {{
+              window.initGroundMap({tiles:?}, 31.0, -99.0, 7.0);
+            }}
+          }} catch (e) {{}}
+        }})();
+        "#,
+        tiles = tiles_url(),
+    ));
+}
+
+fn js_setup_map_size_guard() {
+    js_eval(
+        r#"
+        (function() {
+          if (window.__gs26_map_size_hook) return;
+          window.__gs26_map_size_hook = true;
+
+          function updateSize() {
+            try {
+              const card = document.getElementById("map-card");
+              if (!card) return;
+              const rect = card.getBoundingClientRect();
+              const h = window.innerHeight || 800;
+              const max = Math.max(220, h - rect.top - 24);
+              card.style.setProperty('--gs26-map-max', max + 'px');
+            } catch (e) {}
+          }
+
+          updateSize();
+          window.addEventListener('resize', updateSize);
+          window.addEventListener('orientationchange', updateSize);
         })();
         "#,
     );

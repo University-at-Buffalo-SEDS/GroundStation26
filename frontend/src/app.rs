@@ -411,6 +411,7 @@ fn format_route_report_host_only(
 pub fn App() -> Element {
     rsx! {
         document::Style { "{GLOBAL_CSS}" }
+        document::Meta { name: "viewport", content: "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" }
 
         document::Link {
             rel: "stylesheet",
