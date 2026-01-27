@@ -29,9 +29,9 @@ use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::{EndpointHandler, LinkId, RouterMode};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::{TelemetryError, TelemetryResult};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,7 +44,6 @@ const GPIO_IGNITION_PIN: u8 = 5;
 const GPIO_ABORT_PIN: u8 = 9;
 const ROCKET_RADIO_ID: LinkId = unsafe { LinkId::new_unchecked(3) };
 const UMBILICAL_RADIO_ID: LinkId = unsafe { LinkId::new_unchecked(4) };
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -159,10 +158,7 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler = EndpointHandler::new_packet_handler(
         GroundStation,
         move |pkt: &TelemetryPacket, _sender| {
-            ground_station_handler_state_clone.mark_board_seen(
-                pkt.sender(),
-                pkt.timestamp(),
-            );
+            ground_station_handler_state_clone.mark_board_seen(pkt.sender(), pkt.timestamp());
             let mut rb = ground_station_handler_state_clone
                 .ring_buffer
                 .lock()
@@ -172,21 +168,13 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
-    let flight_state_handler = EndpointHandler::new_packet_handler(
-        FlightState,
-        move |pkt: &TelemetryPacket, _sender| {
-            flight_state_handler_state_clone.mark_board_seen(
-                pkt.sender(),
-                pkt.timestamp(),
-            );
-            let mut rb = flight_state_handler_state_clone
-                .ring_buffer
-                .lock()
-                .unwrap();
+    let flight_state_handler =
+        EndpointHandler::new_packet_handler(FlightState, move |pkt: &TelemetryPacket, _sender| {
+            flight_state_handler_state_clone.mark_board_seen(pkt.sender(), pkt.timestamp());
+            let mut rb = flight_state_handler_state_clone.ring_buffer.lock().unwrap();
             rb.push(pkt.clone());
             Ok(())
-        }
-    );
+        });
 
     let abort_handler =
         EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket, _sender| {
@@ -198,8 +186,11 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         });
 
-    let cfg =
-        sedsprintf_rs_2026::router::RouterConfig::new([ground_station_handler, abort_handler, flight_state_handler]);
+    let cfg = sedsprintf_rs_2026::router::RouterConfig::new([
+        ground_station_handler,
+        abort_handler,
+        flight_state_handler,
+    ]);
 
     // --- Radios ---
     let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
@@ -214,7 +205,6 @@ async fn main() -> anyhow::Result<()> {
                 {
                     Arc::new(Mutex::new(Box::new(DummyRadio::new(
                         "Rocket Radio",
-                        None,
                         ROCKET_RADIO_ID,
                     ))))
                 }
@@ -235,7 +225,6 @@ async fn main() -> anyhow::Result<()> {
                 {
                     Arc::new(Mutex::new(Box::new(DummyRadio::new(
                         "Umbilical Radio",
-                        None,
                         UMBILICAL_RADIO_ID,
                     ))))
                 }

@@ -3,13 +3,13 @@ import multiprocessing as mp
 import os
 import platform
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from subprocess import DEVNULL
 from typing import Optional
-
 
 APP_NAME = "GroundstationFrontend"
 DIST_DIRNAME = "dist"
@@ -36,6 +36,75 @@ def run_script(path: Path, cwd: Path, env: Optional[dict[str, str]] = None) -> N
     if not path.is_file():
         raise FileNotFoundError(f"Not a file: {path}")
     run(["bash", str(path)], cwd=cwd, env=env)
+
+
+def _list_connected_ios_device_ids(frontend_dir: Path) -> list[str]:
+    """
+    Return a list of connected iPhone/iPad UDIDs as reported by ios-deploy --detect.
+
+    ios-deploy sometimes prints iPads as "unknownos". We'll include those as long as
+    they are NOT watches and look like a real iOS/iPadOS device entry.
+    """
+    if platform.system() != "Darwin":
+        print("Error: iOS device deploy requires macOS.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        out = run_capture(["ios-deploy", "--detect"], cwd=frontend_dir)
+    except subprocess.CalledProcessError as e:
+        print("Error: failed to run `ios-deploy --detect`.", file=sys.stderr)
+        sys.exit(e.returncode)
+    except FileNotFoundError:
+        print("Error: ios-deploy not found. Install it first (e.g. `brew install ios-deploy`).", file=sys.stderr)
+        sys.exit(1)
+
+    ids: list[str] = []
+
+    # Example:
+    # [....] Found <UDID> (D74AP, iPhone 14 Pro Max, iphoneos, arm64e, 26.2, 23C55) a.k.a. 'Rylan’s iPhone' ...
+    # [....] Found <UDID> (..., unknownos, ...) a.k.a. 'Rylan’s iPad' ...
+    pat = re.compile(r"\bFound\s+([0-9A-Fa-f-]+)\s+\(([^)]*)\)(.*)$")
+
+    for line in out.splitlines():
+        m = pat.search(line)
+        if not m:
+            continue
+
+        udid = m.group(1).strip()
+        meta = m.group(2).lower()
+        tail = m.group(3).lower()
+
+        # Always ignore watches / companion proxy entries
+        if "watch" in meta or "watch" in tail or "companion" in tail:
+            continue
+
+        # Preferred: explicit iphoneos/ipados
+        if "iphoneos" in meta or "ipados" in meta:
+            ids.append(udid)
+            continue
+
+        # Fallback: ios-deploy sometimes prints "unknownos" for iPads
+        # Include it if there's an alias and it smells like a phone/tablet entry.
+        if "unknownos" in meta or "uknownos" in meta:
+            # If the alias contains ipad/iphone, accept
+            if "a.k.a." in tail and ("ipad" in tail or "iphone" in tail):
+                ids.append(udid)
+                continue
+
+            # Or accept if it's connected through USB and NOT a watch
+            if "connected through usb" in tail and "a.k.a." in tail:
+                ids.append(udid)
+                continue
+
+    # Dedup while preserving order
+    seen = set()
+    deduped: list[str] = []
+    for d in ids:
+        if d not in seen:
+            seen.add(d)
+            deduped.append(d)
+
+    return deduped
 
 
 def is_raspberry_pi() -> bool:
@@ -201,10 +270,10 @@ def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
 
 
 def build_frontend(
-    frontend_dir: Path,
-    platform_name: Optional[str] = None,
-    *,
-    rust_target: Optional[str] = None,
+        frontend_dir: Path,
+        platform_name: Optional[str] = None,
+        *,
+        rust_target: Optional[str] = None,
 ) -> None:
     """
     Build the frontend.
@@ -245,7 +314,7 @@ def build_frontend(
 
 def deploy_ios(frontend_dir: Path) -> None:
     """
-    Deploy an already-built iOS .app to a connected device using ios-deploy.
+    Deploy an already-built iOS .app to ALL connected devices using ios-deploy.
     """
     bundle = app_bundle_path(frontend_dir)
     if not bundle.exists():
@@ -253,7 +322,30 @@ def deploy_ios(frontend_dir: Path) -> None:
         print("Build it first with: ./build.py ios (or ./build.py ios_deploy)", file=sys.stderr)
         sys.exit(1)
 
-    run(["ios-deploy", "--bundle", str(bundle)], cwd=frontend_dir)
+    device_ids = _list_connected_ios_device_ids(frontend_dir)
+
+    # If we couldn't detect devices (or ios-deploy output format changed),
+    # fall back to the old behavior (ios-deploy picks a device).
+    if not device_ids:
+        print("No device IDs detected via `ios-deploy --detect`; falling back to default deploy behavior.")
+        run(["ios-deploy", "--bundle", str(bundle)], cwd=frontend_dir)
+        return
+
+    print(f"Deploying to {len(device_ids)} connected iOS device(s): {', '.join(device_ids)}")
+
+    failures: list[tuple[str, int]] = []
+    for udid in device_ids:
+        print(f"\n=== Deploying to device {udid} ===")
+        try:
+            run(["ios-deploy", "--id", udid, "--bundle", str(bundle)], cwd=frontend_dir)
+        except subprocess.CalledProcessError as e:
+            failures.append((udid, e.returncode))
+
+    if failures:
+        print("\nOne or more device deploys failed:", file=sys.stderr)
+        for udid, code in failures:
+            print(f"  - {udid}: exit code {code}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _read_bundle_identifier(app_bundle: Path) -> Optional[str]:

@@ -1,13 +1,11 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 use groundstation_shared::BoardStatusEntry;
+use crate::telemetry_dashboard::chart::build_time_polyline;
 use std::collections::HashMap;
 
-#[derive(Clone)]
-struct LatencyPoint {
-    t_ms: i64,
-    age_ms: i64,
-}
+const LATENCY_WINDOW_MS: i64 = 20 * 60_000;
+const LATENCY_MAX_POINTS: usize = 2000;
 
 #[component]
 pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
@@ -15,7 +13,7 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
     let mut board_fullscreen = use_signal(|| false);
     let mut show_latency = use_signal(|| true);
     let mut latency_fullscreen = use_signal(|| false);
-    let history = use_signal(HashMap::<String, Vec<LatencyPoint>>::new);
+    let history = use_signal(HashMap::<String, Vec<(i64, f64)>>::new);
 
     {
         let boards = boards;
@@ -30,12 +28,16 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
                 };
                 let key = entry.sender_id.clone();
                 let list = map.entry(key).or_default();
-                list.push(LatencyPoint {
-                    t_ms: now_ms,
-                    age_ms: age_ms as i64,
-                });
-                if list.len() > 240 {
-                    let drain = list.len() - 240;
+                list.push((now_ms, age_ms as f64));
+                if let Some(&(newest, _)) = list.last() {
+                    let cutoff = newest.saturating_sub(LATENCY_WINDOW_MS);
+                    let split = list.partition_point(|(t, _)| *t < cutoff);
+                    if split > 0 {
+                        list.drain(0..split);
+                    }
+                }
+                if list.len() > LATENCY_MAX_POINTS {
+                    let drain = list.len() - LATENCY_MAX_POINTS;
                     list.drain(0..drain);
                 }
             }
@@ -171,7 +173,7 @@ fn js_now_ms() -> i64 {
     }
 }
 
-fn render_latency_chart(points: Option<&Vec<LatencyPoint>>) -> Element {
+fn render_latency_chart(points: Option<&Vec<(i64, f64)>>) -> Element {
     let Some(points) = points else {
         return rsx! {
             div { style: "color:#64748b; font-size:12px;", "No data yet" }
@@ -186,43 +188,13 @@ fn render_latency_chart(points: Option<&Vec<LatencyPoint>>) -> Element {
 
     let width = 1200.0_f64;
     let height = 360.0_f64;
-    let pad_l = 60.0;
-    let pad_r = 20.0;
-    let pad_t = 20.0;
-    let pad_b = 20.0;
-
-    let t_min = points.first().unwrap().t_ms;
-    let t_max = points.last().unwrap().t_ms;
-    let t_span = (t_max - t_min).max(1) as f64;
-    let (y_min, y_max) = points.iter().fold((i64::MAX, i64::MIN), |(mn, mx), p| {
-        (mn.min(p.age_ms), mx.max(p.age_ms))
-    });
-    let mut y_span = (y_max - y_min) as f64;
-    if y_span < 1.0 {
-        y_span = 1.0;
+    let (poly, y_min, y_max, span_min) =
+        build_time_polyline(points.as_slice(), width, height, Some(LATENCY_WINDOW_MS));
+    if poly.is_empty() {
+        return rsx! {
+            div { style: "color:#64748b; font-size:12px;", "Collecting…" }
+        };
     }
-
-    let inner_w = width - pad_l - pad_r;
-    let inner_h = height - pad_t - pad_b;
-
-    let to_xy = |t: i64, y: i64| -> (f64, f64) {
-        let x = pad_l + ((t - t_min) as f64 / t_span) * inner_w;
-        let y_norm = (y - y_min) as f64 / y_span;
-        let y_px = pad_t + (1.0 - y_norm) * inner_h;
-        (x, y_px)
-    };
-
-    let mut poly = String::new();
-    for (i, p) in points.iter().enumerate() {
-        let (x, y) = to_xy(p.t_ms, p.age_ms);
-        if i == 0 {
-            poly.push_str(&format!("{x:.2},{y:.2}"));
-        } else {
-            poly.push_str(&format!(" {x:.2},{y:.2}"));
-        }
-    }
-
-    let span_min = (t_span / 60_000.0).max(0.0);
 
     rsx! {
         svg {
@@ -232,32 +204,28 @@ fn render_latency_chart(points: Option<&Vec<LatencyPoint>>) -> Element {
             // gridlines
             for i in 1..=5 {
                 line {
-                    x1: "{pad_l}",
-                    y1: "{pad_t + (inner_h / 6.0) * (i as f64)}",
-                    x2: "{width - pad_r}",
-                    y2: "{pad_t + (inner_h / 6.0) * (i as f64)}",
+                    x1:"60", y1:"{20.0 + (320.0 / 6.0) * (i as f64)}",
+                    x2:"1180", y2:"{20.0 + (320.0 / 6.0) * (i as f64)}",
                     stroke: "#1f2937",
                     "stroke-width": "1"
                 }
             }
             for i in 1..=5 {
                 line {
-                    x1: "{pad_l + (inner_w / 6.0) * (i as f64)}",
-                    y1: "{pad_t}",
-                    x2: "{pad_l + (inner_w / 6.0) * (i as f64)}",
-                    y2: "{height - pad_b}",
+                    x1:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y1:"20",
+                    x2:"{60.0 + (1120.0 / 6.0) * (i as f64)}", y2:"340",
                     stroke: "#1f2937",
                     "stroke-width": "1"
                 }
             }
 
             // axes
-            line { x1:"{pad_l}", y1:"{height - pad_b}", x2:"{width - pad_r}", y2:"{height - pad_b}", stroke:"#334155", "stroke-width":"1" }
-            line { x1:"{pad_l}", y1:"{pad_t}", x2:"{pad_l}", y2:"{height - pad_b}", stroke:"#334155", "stroke-width":"1" }
+            line { x1:"60", y1:"340", x2:"1180", y2:"340", stroke:"#334155", "stroke-width":"1" }
+            line { x1:"60", y1:"20",  x2:"60",   y2:"340", stroke:"#334155", "stroke-width":"1" }
 
             // y labels
             text { x:"10", y:"26", fill:"#94a3b8", "font-size":"10", {format!("{y_max}")} }
-            text { x:"10", y:"184", fill:"#94a3b8", "font-size":"10", {format!("{}", (y_min + y_max) / 2)} }
+            text { x:"10", y:"184", fill:"#94a3b8", "font-size":"10", {format!("{}", (y_min + y_max) / 2f64)} }
             text { x:"10", y:"344", fill:"#94a3b8", "font-size":"10", {format!("{y_min}")} }
 
             // x labels (span in minutes)

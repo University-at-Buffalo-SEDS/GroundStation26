@@ -19,6 +19,79 @@ fn _now_ms() -> f64 {
     js_sys::Date::now()
 }
 
+/// Build a single-series polyline with optional sliding window trimming.
+pub fn build_time_polyline(
+    points: &[(i64, f64)],
+    width: f64,
+    height: f64,
+    window_ms: Option<i64>,
+) -> (String, f64, f64, f64) {
+    if points.len() < 2 {
+        return (String::new(), 0.0, 0.0, 0.0);
+    }
+
+    let mut pts: Vec<(i64, f64)> = points.to_vec();
+    pts.sort_by_key(|(t, _)| *t);
+
+    if let Some(win) = window_ms
+        && let Some(&(newest, _)) = pts.last()
+    {
+        let start = newest.saturating_sub(win);
+        let first_in = pts.partition_point(|(t, _)| *t < start);
+        if first_in > 0 {
+            pts.drain(0..first_in);
+        }
+    }
+
+    if pts.len() < 2 {
+        return (String::new(), 0.0, 0.0, 0.0);
+    }
+
+    let (t_min, t_max) = pts
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(mn, mx), (t, _)| {
+            (mn.min(*t), mx.max(*t))
+        });
+    let (y_min, y_max) = pts
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), (_, y)| {
+            (mn.min(*y), mx.max(*y))
+        });
+
+    let t_span = (t_max - t_min).max(1) as f64;
+    let mut y_span = y_max - y_min;
+    if !y_span.is_finite() || y_span.abs() < 1e-9 {
+        y_span = 1.0;
+    }
+
+    let pad_l = 60.0;
+    let pad_r = 20.0;
+    let pad_t = 20.0;
+    let pad_b = 20.0;
+    let inner_w = width - pad_l - pad_r;
+    let inner_h = height - pad_t - pad_b;
+
+    let to_xy = |t: i64, y: f64| -> (f64, f64) {
+        let x = pad_l + ((t - t_min) as f64 / t_span) * inner_w;
+        let y_norm = (y - y_min) / y_span;
+        let y_px = pad_t + (1.0 - y_norm) * inner_h;
+        (x, y_px)
+    };
+
+    let mut poly = String::new();
+    for (i, (t, y)) in pts.iter().enumerate() {
+        let (x, yy) = to_xy(*t, *y);
+        if i == 0 {
+            poly.push_str(&format!("{x:.2},{yy:.2}"));
+        } else {
+            poly.push_str(&format!(" {x:.2},{yy:.2}"));
+        }
+    }
+
+    let span_min = t_span / 60_000.0;
+    (poly, y_min, y_max, span_min)
+}
+
 /// Simple SVG line chart (polyline) for timeseries.
 /// `points`: Vec of (t_ms, y)
 #[component]
