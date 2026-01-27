@@ -1112,12 +1112,28 @@ fn TelemetryDashboardInner() -> Element {
             // Main body
             div { style: "flex:1; min-height:0; overflow:hidden;",
                 match *active_main_tab.read() {
-                    MainTab::State => rsx! { StateTab { flight_state: flight_state } },
+                    MainTab::State => rsx! {
+                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                            StateTab { flight_state: flight_state }
+                        }
+                    },
                     MainTab::ConnectionStatus => rsx! { ConnectionStatusTab { boards: board_status } },
                     MainTab::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
-                    MainTab::Actions => rsx! { ActionsTab {} },
-                    MainTab::Warnings => rsx! { WarningsTab { warnings: warnings } },
-                    MainTab::Errors => rsx! { ErrorsTab { errors: errors } },
+                    MainTab::Actions => rsx! {
+                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                            ActionsTab {}
+                        }
+                    },
+                    MainTab::Warnings => rsx! {
+                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                            WarningsTab { warnings: warnings }
+                        }
+                    },
+                    MainTab::Errors => rsx! {
+                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                            ErrorsTab { errors: errors }
+                        }
+                    },
                     MainTab::Data => rsx! { DataTab { rows: rows, active_tab: active_data_tab } },
                 }
             }
