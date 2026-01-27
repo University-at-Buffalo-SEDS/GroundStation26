@@ -27,6 +27,10 @@ html, body {
     overflow: hidden;
 }
 
+:root, html {
+    color-scheme: dark;
+}
+
 #main {
     width: 100%;
     height: 100%;
