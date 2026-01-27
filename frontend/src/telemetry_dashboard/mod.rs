@@ -519,6 +519,10 @@ fn TelemetryDashboardInner() -> Element {
 
     let ack_warning_ts = use_signal(|| parse_i64(st_warn_ack.read().as_str()));
     let ack_error_ts = use_signal(|| parse_i64(st_err_ack.read().as_str()));
+    let warning_event_counter = use_signal(|| 0u64);
+    let error_event_counter = use_signal(|| 0u64);
+    let ack_warning_count = use_signal(|| 0u64);
+    let ack_error_count = use_signal(|| 0u64);
 
     let flash_on = use_signal(|| false);
 
@@ -732,8 +736,12 @@ fn TelemetryDashboardInner() -> Element {
     let has_warnings = warn_count > 0;
     let has_errors = err_count > 0;
 
-    let has_unacked_warnings = latest_warning_ts > 0 && latest_warning_ts > *ack_warning_ts.read();
-    let has_unacked_errors = latest_error_ts > 0 && latest_error_ts > *ack_error_ts.read();
+    let has_unacked_warnings = latest_warning_ts > 0
+        && (latest_warning_ts > *ack_warning_ts.read()
+            || *warning_event_counter.read() > *ack_warning_count.read());
+    let has_unacked_errors = latest_error_ts > 0
+        && (latest_error_ts > *ack_error_ts.read()
+            || *error_event_counter.read() > *ack_error_count.read());
 
     let border_style = if has_unacked_errors && *flash_on.read() {
         "2px solid #ef4444"
@@ -802,8 +810,8 @@ fn TelemetryDashboardInner() -> Element {
                     rows,
                     warnings,
                     errors,
-                    ack_warning_ts,
-                    ack_error_ts,
+                    warning_event_counter,
+                    error_event_counter,
                     flight_state,
                     board_status,
                     rocket_gps,
@@ -1103,7 +1111,12 @@ fn TelemetryDashboardInner() -> Element {
                                 ",
                                 onclick: {
                                     let mut ack_warning_ts = ack_warning_ts;
-                                    move |_| ack_warning_ts.set(latest_warning_ts)
+                                    let mut ack_warning_count = ack_warning_count;
+                                    let warning_event_counter = warning_event_counter;
+                                    move |_| {
+                                        ack_warning_ts.set(latest_warning_ts);
+                                        ack_warning_count.set(*warning_event_counter.read());
+                                    }
                                 },
                                 "Acknowledge warnings"
                             }
@@ -1123,7 +1136,12 @@ fn TelemetryDashboardInner() -> Element {
                                 ",
                                 onclick: {
                                     let mut ack_error_ts = ack_error_ts;
-                                    move |_| ack_error_ts.set(latest_error_ts)
+                                    let mut ack_error_count = ack_error_count;
+                                    let error_event_counter = error_event_counter;
+                                    move |_| {
+                                        ack_error_ts.set(latest_error_ts);
+                                        ack_error_count.set(*error_event_counter.read());
+                                    }
                                 },
                                 "Acknowledge errors"
                             }
@@ -1370,8 +1388,8 @@ async fn connect_ws_supervisor(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
-    ack_warning_ts: Signal<i64>,
-    ack_error_ts: Signal<i64>,
+    warning_event_counter: Signal<u64>,
+    error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
     board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
@@ -1400,8 +1418,8 @@ async fn connect_ws_supervisor(
                     rows,
                     warnings,
                     errors,
-                    ack_warning_ts,
-                    ack_error_ts,
+                    warning_event_counter,
+                    error_event_counter,
                     flight_state,
                     board_status,
                     rocket_gps,
@@ -1418,8 +1436,8 @@ async fn connect_ws_supervisor(
                     rows,
                     warnings,
                     errors,
-                    ack_warning_ts,
-                    ack_error_ts,
+                    warning_event_counter,
+                    error_event_counter,
                     flight_state,
                     board_status,
                     rocket_gps,
@@ -1459,8 +1477,8 @@ async fn connect_ws_once_wasm(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
-    ack_warning_ts: Signal<i64>,
-    ack_error_ts: Signal<i64>,
+    warning_event_counter: Signal<u64>,
+    error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
     board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
@@ -1505,8 +1523,8 @@ async fn connect_ws_once_wasm(
                     rows,
                     warnings,
                     errors,
-                    ack_warning_ts,
-                    ack_error_ts,
+                    warning_event_counter,
+                    error_event_counter,
                     flight_state,
                     board_status,
                     rocket_gps,
@@ -1581,8 +1599,8 @@ async fn connect_ws_once_native(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
-    ack_warning_ts: Signal<i64>,
-    ack_error_ts: Signal<i64>,
+    warning_event_counter: Signal<u64>,
+    error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
     board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
@@ -1637,8 +1655,8 @@ async fn connect_ws_once_native(
                 rows,
                 warnings,
                 errors,
-                ack_warning_ts,
-                ack_error_ts,
+                warning_event_counter,
+                error_event_counter,
                 flight_state,
                 board_status,
                 rocket_gps,
@@ -1659,8 +1677,8 @@ fn handle_ws_message(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
-    ack_warning_ts: Signal<i64>,
-    ack_error_ts: Signal<i64>,
+    warning_event_counter: Signal<u64>,
+    error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
     board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
@@ -1669,8 +1687,8 @@ fn handle_ws_message(
     let mut rows = rows;
     let mut warnings = warnings;
     let mut errors = errors;
-    let mut ack_warning_ts = ack_warning_ts;
-    let mut ack_error_ts = ack_error_ts;
+    let mut warning_event_counter = warning_event_counter;
+    let mut error_event_counter = error_event_counter;
     let mut flight_state = flight_state;
     let mut board_status = board_status;
     let mut rocket_gps = rocket_gps;
@@ -1722,11 +1740,8 @@ fn handle_ws_message(
                 v.truncate(500);
             }
             warnings.set(v);
-
-            let last_ack = *ack_warning_ts.read();
-            if last_ack > 0 && w.timestamp_ms <= last_ack {
-                ack_warning_ts.set(w.timestamp_ms.saturating_sub(1));
-            }
+            let next = warning_event_counter.read().saturating_add(1);
+            warning_event_counter.set(next);
         }
 
         WsInMsg::Error(e) => {
@@ -1736,11 +1751,8 @@ fn handle_ws_message(
                 v.truncate(500);
             }
             errors.set(v);
-
-            let last_ack = *ack_error_ts.read();
-            if last_ack > 0 && e.timestamp_ms <= last_ack {
-                ack_error_ts.set(e.timestamp_ms.saturating_sub(1));
-            }
+            let next = error_event_counter.read().saturating_add(1);
+            error_event_counter.set(next);
         }
 
         WsInMsg::BoardStatus(status) => {
