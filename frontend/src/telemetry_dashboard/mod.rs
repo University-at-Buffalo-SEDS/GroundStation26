@@ -897,7 +897,7 @@ fn TelemetryDashboardInner() -> Element {
         div {
 
             style: "
-                min-height:100vh;
+                height:100vh;
                 padding:24px;
                 color:#e5e7eb;
                 font-family:system-ui, -apple-system, BlinkMacSystemFont;
@@ -906,6 +906,7 @@ fn TelemetryDashboardInner() -> Element {
                 flex-direction:column;
                 border:{border_style};
                 box-sizing:border-box;
+                overflow:hidden;
             ",
 
             // Header row 1
@@ -1109,7 +1110,7 @@ fn TelemetryDashboardInner() -> Element {
             }
 
             // Main body
-            div { style: "flex:1; min-height:0;",
+            div { style: "flex:1; min-height:0; overflow:hidden;",
                 match *active_main_tab.read() {
                     MainTab::State => rsx! { StateTab { flight_state: flight_state } },
                     MainTab::ConnectionStatus => rsx! { ConnectionStatusTab { boards: board_status } },

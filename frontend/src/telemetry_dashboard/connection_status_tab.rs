@@ -18,31 +18,52 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
     {
         let boards = boards;
         let mut history = history;
+        let show_latency = show_latency;
+        let latency_fullscreen = latency_fullscreen;
         use_effect(move || {
-            let now_ms = js_now_ms();
-            let mut map = history.read().clone();
+            spawn(async move {
+                loop {
+                    if !*show_latency.read() && !*latency_fullscreen.read() {
+                        #[cfg(target_arch = "wasm32")]
+                        gloo_timers::future::TimeoutFuture::new(500).await;
 
-            for entry in boards.read().iter() {
-                let Some(age_ms) = entry.age_ms else {
-                    continue;
-                };
-                let key = entry.sender_id.clone();
-                let list = map.entry(key).or_default();
-                list.push((now_ms, age_ms as f64));
-                if let Some(&(newest, _)) = list.last() {
-                    let cutoff = newest.saturating_sub(LATENCY_WINDOW_MS);
-                    let split = list.partition_point(|(t, _)| *t < cutoff);
-                    if split > 0 {
-                        list.drain(0..split);
+                        #[cfg(not(target_arch = "wasm32"))]
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
                     }
-                }
-                if list.len() > LATENCY_MAX_POINTS {
-                    let drain = list.len() - LATENCY_MAX_POINTS;
-                    list.drain(0..drain);
-                }
-            }
 
-            history.set(map);
+                    let now_ms = js_now_ms();
+                    let mut map = history.read().clone();
+
+                    for entry in boards.read().iter() {
+                        let Some(age_ms) = entry.age_ms else {
+                            continue;
+                        };
+                        let key = entry.sender_id.clone();
+                        let list = map.entry(key).or_default();
+                        list.push((now_ms, age_ms as f64));
+                        if let Some(&(newest, _)) = list.last() {
+                            let cutoff = newest.saturating_sub(LATENCY_WINDOW_MS);
+                            let split = list.partition_point(|(t, _)| *t < cutoff);
+                            if split > 0 {
+                                list.drain(0..split);
+                            }
+                        }
+                        if list.len() > LATENCY_MAX_POINTS {
+                            let drain = list.len() - LATENCY_MAX_POINTS;
+                            list.drain(0..drain);
+                        }
+                    }
+
+                    history.set(map);
+
+                    #[cfg(target_arch = "wasm32")]
+                    gloo_timers::future::TimeoutFuture::new(500).await;
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            });
         });
     }
 
