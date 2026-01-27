@@ -63,8 +63,40 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
         latency_fullscreen.set(next);
     };
 
+    let on_scroll = {
+        let boards = boards;
+        let mut history = history;
+        move |_| {
+            let now_ms = js_now_ms();
+            let mut map = history.read().clone();
+
+            for entry in boards.read().iter() {
+                let Some(age_ms) = entry.age_ms else {
+                    continue;
+                };
+                let key = entry.sender_id.clone();
+                let list = map.entry(key).or_default();
+                list.push((now_ms, age_ms as f64));
+                if let Some(&(newest, _)) = list.last() {
+                    let cutoff = newest.saturating_sub(LATENCY_WINDOW_MS);
+                    let split = list.partition_point(|(t, _)| *t < cutoff);
+                    if split > 0 {
+                        list.drain(0..split);
+                    }
+                }
+                if list.len() > LATENCY_MAX_POINTS {
+                    let drain = list.len() - LATENCY_MAX_POINTS;
+                    list.drain(0..drain);
+                }
+            }
+
+            history.set(map);
+        }
+    };
+
     rsx! {
-        div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden;",
+        div { style: "padding:16px; flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:touch;",
+            onscroll: on_scroll,
             h2 { style: "margin:0 0 12px 0;", "Connection Status" }
             div { style: "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;",
                 div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
@@ -121,6 +153,7 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
 
         if *board_fullscreen.read() {
             div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px; overflow:auto;",
+                onscroll: on_scroll,
                 div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
                     h2 { style: "margin:0; color:#e2e8f0;", "Board Status" }
                     button {
@@ -135,6 +168,7 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
 
         if *latency_fullscreen.read() {
             div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px; overflow:auto;",
+                onscroll: on_scroll,
                 div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
                     h2 { style: "margin:0; color:#e2e8f0;", "Packet Age (ms)" }
                     button {
@@ -293,7 +327,8 @@ fn format_last_seen(last_seen_ms: Option<u64>) -> String {
         {
             use std::time::{Duration, UNIX_EPOCH};
             let t = UNIX_EPOCH + Duration::from_millis(ts);
-            return format!("{:?}", t);
+            let dt: chrono::DateTime<chrono::Local> = t.into();
+            return dt.format("%Y-%m-%d %H:%M:%S").to_string();
         }
     }
 

@@ -61,6 +61,7 @@ dioxus = { version = "0.7", features = ["desktop", "macro"] }
 # If you want to be explicit, you can swap to features=["mobile"] in a mobile-only profile.
 dioxus-signals = "0.7.2"
 dioxus-desktop = "0.7.0"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "time"] }
 reqwest = { version = "0.12", default-features = true, features = ["json", "rustls-tls"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
