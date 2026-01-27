@@ -208,9 +208,9 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         }
                     }
                     if *show_chart.read() {
-                        div { style: "position:relative; width:100%;",
+                        div { style: "width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
                             svg {
-                                style: "width:100%; height:auto; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
+                                style: "width:100%; height:auto; display:block;",
                                 view_box: "0 0 {view_w} {view_h}",
 
                             // gridlines
@@ -259,7 +259,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         }
 
                         if !legend_rows.is_empty() {
-                            div { style: "position:absolute; bottom:12px; left:12px; right:12px; display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
+                            div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
                                 for (i, label) in legend_rows.iter() {
                                     div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
                                         svg { width:"26", height:"8", view_box:"0 0 26 8",
@@ -286,9 +286,9 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         "Exit Fullscreen"
                     }
                 }
-                div { style: "flex:1; min-height:0; width:100%; position:relative;",
+                div { style: "flex:1; min-height:0; width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
                     svg {
-                        style: "width:100%; height:100%; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
+                        style: "width:100%; flex:1; min-height:0; display:block;",
                         view_box: "0 0 {view_w} {view_h_full}",
 
                         // gridlines
@@ -337,7 +337,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
 
                     }
                     if !legend_rows.is_empty() {
-                        div { style: "position:absolute; bottom:12px; left:12px; right:12px; display:flex; flex-wrap:wrap; gap:8px; padding:8px 12px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
+                        div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:8px 12px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
                             for (i, label) in legend_rows.iter() {
                                 div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
                                     svg { width:"26", height:"8", view_box:"0 0 26 8",
@@ -484,13 +484,28 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
 
     let map_y = |v: f32| bottom - ((v - min_v) / (max_v - min_v)) * plot_h;
 
-    // 5) downsample into time buckets (stable across scroll pauses)
-    let max_points: usize = 2000;
+    // 5) downsample into time buckets (stable density while preserving extrema)
+    let max_points: usize = 1200;
 
-    #[derive(Default, Clone)]
+    #[derive(Clone)]
     struct BucketAcc {
-        v_sum: [f64; 8],
-        v_count: [u64; 8],
+        min_v: [f64; 8],
+        max_v: [f64; 8],
+        min_ts: [f64; 8],
+        max_ts: [f64; 8],
+        has: [bool; 8],
+    }
+
+    impl Default for BucketAcc {
+        fn default() -> Self {
+            Self {
+                min_v: [0.0; 8],
+                max_v: [0.0; 8],
+                min_ts: [0.0; 8],
+                max_ts: [0.0; 8],
+                has: [false; 8],
+            }
+        }
     }
 
     let mut buckets = vec![BucketAcc::default(); max_points];
@@ -510,8 +525,23 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
         let vals = [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7];
         for (j, opt) in vals.iter().enumerate() {
             if let Some(x) = opt {
-                b.v_sum[j] += *x as f64;
-                b.v_count[j] += 1;
+                let xf = *x as f64;
+                if !b.has[j] {
+                    b.has[j] = true;
+                    b.min_v[j] = xf;
+                    b.max_v[j] = xf;
+                    b.min_ts[j] = t;
+                    b.max_ts[j] = t;
+                } else {
+                    if xf < b.min_v[j] {
+                        b.min_v[j] = xf;
+                        b.min_ts[j] = t;
+                    }
+                    if xf > b.max_v[j] {
+                        b.max_v[j] = xf;
+                        b.max_ts[j] = t;
+                    }
+                }
             }
         }
     }
@@ -519,23 +549,60 @@ fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 
     // 6) build polyline strings with time-based x-spacing
     let mut out: [String; 8] = std::array::from_fn(|_| String::new());
 
+    let map_x = |t: f64| -> f32 {
+        let mut tt = if span_ms > 0.0 { t / span_ms } else { 0.0 };
+        if tt < 0.0 {
+            tt = 0.0;
+        }
+        if tt > 1.0 {
+            tt = 1.0;
+        }
+        left + plot_w * tt as f32
+    };
+
+    let mut last_seen: [Option<f32>; 8] = [None, None, None, None, None, None, None, None];
+
     for (idx, b) in buckets.iter().enumerate() {
-        let t = if max_points > 1 {
-            idx as f32 / (max_points as f32 - 1.0)
+        let center_t = if max_points > 0 {
+            ((idx as f64 + 0.5) / max_points as f64) * span_ms
         } else {
             0.0
         };
-        let x = left + plot_w * t;
-
         for ch in 0..8usize {
-            if b.v_count[ch] > 0 {
-                let v = (b.v_sum[ch] / b.v_count[ch] as f64) as f32;
-                let y = map_y(v);
-                let s = &mut out[ch];
+            let s = &mut out[ch];
+
+            let mut push_point = |x: f32, y: f32| {
                 if !s.is_empty() {
                     s.push(' ');
                 }
                 s.push_str(&format!("{x:.2},{y:.2}"));
+            };
+
+            if b.has[ch] {
+                let min_ts = b.min_ts[ch];
+                let max_ts = b.max_ts[ch];
+                let min_v = b.min_v[ch] as f32;
+                let max_v = b.max_v[ch] as f32;
+
+                if min_ts == max_ts {
+                    let x = map_x(min_ts);
+                    if (min_v - max_v).abs() < f32::EPSILON {
+                        push_point(x, map_y(min_v));
+                    } else {
+                        push_point(x, map_y(min_v));
+                        push_point(x, map_y(max_v));
+                    }
+                } else if min_ts < max_ts {
+                    push_point(map_x(min_ts), map_y(min_v));
+                    push_point(map_x(max_ts), map_y(max_v));
+                } else {
+                    push_point(map_x(max_ts), map_y(max_v));
+                    push_point(map_x(min_ts), map_y(min_v));
+                }
+
+                last_seen[ch] = Some(max_v);
+            } else if let Some(v) = last_seen[ch] {
+                push_point(map_x(center_t), map_y(v));
             }
         }
     }

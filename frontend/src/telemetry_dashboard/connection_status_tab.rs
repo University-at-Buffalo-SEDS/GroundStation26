@@ -6,6 +6,8 @@ use std::collections::HashMap;
 const LATENCY_WINDOW_MS: i64 = 20 * 60_000;
 const LATENCY_MAX_POINTS: usize = 2000;
 
+const SCROLL_TRIGGER_THRESHOLD_MS: i64 = 200;
+
 #[component]
 pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
     let mut show_board = use_signal(|| true);
@@ -392,7 +394,7 @@ fn build_latency_polylines(
     } else {
         deltas[deltas.len() / 2]
     };
-    let gap_threshold_ms = (median_dt.saturating_mul(5)).max(750);
+    let gap_threshold_ms = (median_dt.saturating_mul(5)).max(SCROLL_TRIGGER_THRESHOLD_MS);
 
     let mut solid: Vec<String> = Vec::new();
     let mut dotted: Vec<String> = Vec::new();
