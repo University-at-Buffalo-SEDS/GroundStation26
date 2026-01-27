@@ -117,6 +117,10 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                 | FlightState::NitrousFill
                 | FlightState::Armed
         );
+        let suppress_disconnect_warnings = matches!(
+            current_state,
+            FlightState::Descent | FlightState::Landed | FlightState::Recovery | FlightState::Aborted
+        );
         let now_ms = get_current_timestamp_ms();
         let mut board_warnings = Vec::new();
         let mut board_log_only = Vec::new();
@@ -137,7 +141,7 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                 let in_flight_ignored_board = !on_ground && is_ground_board;
 
                 if offline {
-                    if !status.warned {
+                    if !status.warned && !suppress_disconnect_warnings {
                         let msg = format!(
                             "Warning: No messages from {} in >{}ms",
                             board.as_str(),
@@ -153,8 +157,9 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                         status.warned = true;
                     }
 
-                    let abort_eligible =
-                        *board != Board::ValveBoard && (on_ground || !is_ground_board);
+                    let abort_eligible = *board != Board::ValveBoard
+                        && !suppress_disconnect_warnings
+                        && (on_ground || !is_ground_board);
                     if abort_eligible
                         && !in_flight_ignored_board
                         && let Some(last_seen_ms) = status.last_seen_ms
