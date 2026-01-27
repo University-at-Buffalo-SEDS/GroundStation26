@@ -555,6 +555,23 @@ fn TelemetryDashboardInner() -> Element {
         });
     }
     {
+        use_effect(move || {
+            if *active_main_tab.read() == MainTab::Map {
+                js_eval(
+                    r#"
+                    (function() {
+                      try {
+                        if (typeof window.__gs26_map_size_hook_update === "function") {
+                          window.__gs26_map_size_hook_update();
+                        }
+                      } catch (e) {}
+                    })();
+                    "#,
+                );
+            }
+        });
+    }
+    {
         let mut st_data_tab = st_data_tab;
         use_effect(move || {
             let v = active_data_tab.read().clone();

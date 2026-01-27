@@ -227,6 +227,19 @@ pub fn MapTab(
                 tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
                 js_reinit_map(is_fullscreen);
+                if !is_fullscreen {
+                    js_eval(
+                        r#"
+                        (function() {
+                          try {
+                            if (typeof window.__gs26_map_size_hook_update === "function") {
+                              window.__gs26_map_size_hook_update();
+                            }
+                          } catch (e) {}
+                        })();
+                        "#,
+                    );
+                }
             });
         });
     }
@@ -450,6 +463,7 @@ fn js_setup_map_size_guard() {
             } catch (e) {}
           }
 
+          window.__gs26_map_size_hook_update = updateSize;
           updateSize();
           window.addEventListener('resize', updateSize);
           window.addEventListener('orientationchange', updateSize);
