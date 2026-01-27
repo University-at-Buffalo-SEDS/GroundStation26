@@ -82,7 +82,7 @@ pub fn GpsDriver(
             stop_gps_updates();
         });
 
-        return rsx!(div {});
+        rsx!(div {})
     }
 }
 

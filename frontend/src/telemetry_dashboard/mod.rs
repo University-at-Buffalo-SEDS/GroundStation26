@@ -1130,7 +1130,7 @@ fn TelemetryDashboardInner() -> Element {
             div { style: "flex:1; min-height:0; overflow:hidden;",
                 match *active_main_tab.read() {
                     MainTab::State => rsx! {
-                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto;",
                             StateTab { flight_state: flight_state }
                         }
                     },

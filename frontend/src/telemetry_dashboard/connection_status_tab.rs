@@ -85,7 +85,7 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
     };
 
     rsx! {
-        div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:touch;",
+        div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto;",
             h2 { style: "margin:0 0 12px 0;", "Connection Status" }
             div { style: "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;",
                 div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
@@ -187,10 +187,10 @@ fn js_now_ms() -> i64 {
     #[cfg(not(target_arch = "wasm32"))]
     {
         use std::time::{SystemTime, UNIX_EPOCH};
-        return SystemTime::now()
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+            .unwrap_or(0)
     }
 }
 
@@ -266,7 +266,7 @@ fn render_latency_chart(points: Option<&Vec<(i64, f64)>>) -> Element {
     }
 }
 
-fn render_board_table(boards: &Vec<BoardStatusEntry>) -> Element {
+fn render_board_table(boards: &[BoardStatusEntry]) -> Element {
     if boards.is_empty() {
         return rsx! {
             div { style: "color:#94a3b8;", "No board status yet." }

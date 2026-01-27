@@ -120,7 +120,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     };
 
     rsx! {
-        div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; gap:12px;",
+        div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto; display:flex; flex-direction:column; gap:12px;",
 
             // -------- Top area: Tabs row THEN cards row (always below) --------
             div { style: "display:flex; flex-direction:column; gap:10px;",
