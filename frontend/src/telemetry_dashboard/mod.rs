@@ -979,7 +979,7 @@ fn TelemetryDashboardInner() -> Element {
                         background:#020617ee;
                         border:1px solid #4b5563;
                         box-shadow:0 10e0px 25px rgba(0,0,0,0.45);
-                        min-width:420px;
+                        min-width:260px;
                     ",
                     nav { style: "display:flex; gap:0.5rem; flex-wrap:wrap;",
                         button {
@@ -1050,15 +1050,16 @@ fn TelemetryDashboardInner() -> Element {
 
                 div {
                     style: "
-                        flex:0 1 420px;
+                        flex:1 1 320px;
                         display:flex;
                         align-items:center;
-                        gap:0.75rem;
+                        flex-wrap:wrap;
+                        gap:0.5rem;
                         padding:0.35rem 0.7rem;
-                        border-radius:999px;
+                        border-radius:1rem;
                         background:#111827;
                         border:1px solid #4b5563;
-                        white-space:nowrap;
+                        min-width:260px;
                     ",
                     span { style: "color:#9ca3af;", "Status:" }
 
