@@ -438,7 +438,7 @@ pub fn Root() -> Element {
         let nav = use_navigator();
 
         use_effect(move || {
-            if UrlConfig::stored_base_url().is_some() {
+            if UrlConfig::_stored_base_url().is_some() {
                 let _ = nav.replace(Route::Dashboard {});
             } else {
                 let _ = nav.replace(Route::Connect {});
@@ -454,7 +454,7 @@ pub fn Root() -> Element {
 pub fn Connect() -> Element {
     let nav = use_navigator();
 
-    let initial = UrlConfig::stored_base_url()
+    let initial = UrlConfig::_stored_base_url()
         .unwrap_or_else(|| "http://localhost:3000".to_string());
 
     let mut url_edit = use_signal(|| initial);
@@ -593,7 +593,7 @@ pub fn Connect() -> Element {
 pub fn Dashboard() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if UrlConfig::stored_base_url().is_none() {
+        if UrlConfig::_stored_base_url().is_none() {
             return rsx! {
                 div {
                     style: "height:100vh; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",

@@ -6,6 +6,7 @@ use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
+use sqlx::SqlitePool;
 
 // Acceleration thresholds (m/s²)
 const ACCELERATION_X_MIN_THRESHOLD: f32 = -2.0; // m/s²
@@ -63,6 +64,35 @@ const KALMAN_Z_MAX_THRESHOLD: f32 = 1000.0; // arbitrary units
 
 #[cfg(not(feature = "testing"))]
 const BOARD_TIMEOUT_MS: u64 = 500;
+const FLIGHT_STATE_DB_RETRIES: usize = 5;
+const FLIGHT_STATE_DB_RETRY_DELAY_MS: u64 = 50;
+
+async fn insert_flight_state_with_retry(
+    db: &SqlitePool,
+    timestamp_ms: i64,
+    state_code: i64,
+) -> Result<(), sqlx::Error> {
+    let mut delay = FLIGHT_STATE_DB_RETRY_DELAY_MS;
+    let mut last_err: Option<sqlx::Error> = None;
+
+    for _ in 0..=FLIGHT_STATE_DB_RETRIES {
+        match sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
+            .bind(timestamp_ms)
+            .bind(state_code)
+            .execute(db)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                sleep(Duration::from_millis(delay)).await;
+                delay = (delay * 2).min(1000);
+            }
+        }
+    }
+
+    Err(last_err.unwrap())
+}
 #[cfg(feature = "testing")]
 const BOARD_TIMEOUT_MS: u64 = 3000;
 
@@ -120,12 +150,12 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
             };
 
             if should_advance {
-                sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
-                    .bind(get_current_timestamp_ms() as i64)
-                    .bind(FlightState::Idle as i64)
-                    .execute(&state.db)
-                    .await
-                    .expect("DB insert into flight_state failed");
+                let ts_ms = get_current_timestamp_ms() as i64;
+                if let Err(e) =
+                    insert_flight_state_with_retry(&state.db, ts_ms, FlightState::Idle as i64).await
+                {
+                    eprintln!("DB insert into flight_state failed after retry: {e}");
+                }
                 let _ = state.state_tx.send(crate::web::FlightStateMsg {
                     state: FlightState::Idle,
                 });

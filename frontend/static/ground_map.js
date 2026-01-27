@@ -259,7 +259,10 @@ function initCompassOnce() {
   if (!el) return;
 
   if (groundMap && groundMap.getContainer() === el) return;
-  if (groundMap) groundMap.remove();
+  if (groundMap) {
+    groundMap.remove();
+    window.__gs26_ground_map = null;
+  }
 
   groundMap = L.map(el, {
     center: lastMapView ? [lastMapView.lat, lastMapView.lon] : [centerLat, centerLon],
@@ -271,6 +274,7 @@ function initCompassOnce() {
   createNaTileLayer(tilesUrl).addTo(groundMap);
   groundMap.on("moveend zoomend", rememberMapView);
   rememberMapView();
+  window.__gs26_ground_map = groundMap;
 
   if (lastRocketLatLng) {
     rocketMarker = L.marker(lastRocketLatLng, {

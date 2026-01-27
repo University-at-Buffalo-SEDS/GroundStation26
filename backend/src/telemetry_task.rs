@@ -97,6 +97,31 @@ pub async fn telemetry_task(
     }
 }
 
+const DB_RETRIES: usize = 5;
+const DB_RETRY_DELAY_MS: u64 = 50;
+
+async fn insert_with_retry<F, Fut>(mut f: F) -> Result<(), sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
+{
+    let mut delay = DB_RETRY_DELAY_MS;
+    let mut last_err: Option<sqlx::Error> = None;
+
+    for _ in 0..=DB_RETRIES {
+        match f().await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                delay = (delay * 2).min(1000);
+            }
+        }
+    }
+
+    Err(last_err.unwrap())
+}
+
 pub async fn handle_packet(state: &Arc<AppState>) {
     // Keep raw packet in ring buffer if you still want it
     let pkt = {
@@ -139,12 +164,17 @@ pub async fn handle_packet(state: &Arc<AppState>) {
             let mut fs = state.state.lock().unwrap();
             *fs = new_flight_state;
         }
-        sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
-            .bind(get_current_timestamp_ms() as i64)
-            .bind(pkt_data as i64)
-            .execute(&state.db)
-            .await
-            .expect("DB insert into flight_state failed");
+        let ts_ms = get_current_timestamp_ms() as i64;
+        if let Err(e) = insert_with_retry(|| {
+            sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
+                .bind(ts_ms)
+                .bind(pkt_data as i64)
+                .execute(&state.db)
+        })
+        .await
+        {
+            eprintln!("DB insert into flight_state failed after retry: {e}");
+        }
 
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
@@ -168,9 +198,10 @@ pub async fn handle_packet(state: &Arc<AppState>) {
     let v6 = values.get(6).copied();
     let v7 = values.get(7).copied();
 
-    sqlx::query(
-        "INSERT INTO telemetry (timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
+    if let Err(e) = insert_with_retry(|| {
+        sqlx::query(
+            "INSERT INTO telemetry (timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
         .bind(ts_ms)
         .bind(&data_type_str)
         .bind(v0)
@@ -182,8 +213,11 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         .bind(v6)
         .bind(v7)
         .execute(&state.db)
-        .await
-        .expect("DB insert into telemetry failed");
+    })
+    .await
+    {
+        eprintln!("DB insert into telemetry failed after retry: {e}");
+    }
 
     let row = TelemetryRow {
         timestamp_ms: ts_ms,

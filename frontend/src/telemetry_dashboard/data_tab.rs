@@ -27,6 +27,7 @@ fn localstorage_set(key: &str, value: &str) {
 
 #[component]
 pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> Element {
+    let mut is_fullscreen = use_signal(|| false);
     // -------- Restore + persist active tab --------
     let did_restore = use_signal(|| false);
     let last_saved = use_signal(|| String::new());
@@ -108,6 +109,11 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     // Labels for cards
     let labels = labels_for_datatype(&current);
 
+    let on_toggle_fullscreen = move |_| {
+        let next = !*is_fullscreen.read();
+        is_fullscreen.set(next);
+    };
+
     rsx! {
         div { style: "padding:16px; height:100%; display:flex; flex-direction:column; gap:12px;",
 
@@ -161,8 +167,62 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
             // -------- Big centered graph --------
             div { style: "flex:0; display:flex; align-items:center; justify-content:center; margin-top:6px;",
                 div { style: "width:100%; max-width:1200px;",
+                    div { style: "display:flex; justify-content:flex-end; margin-bottom:6px;",
+                        button {
+                            style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                            onclick: on_toggle_fullscreen,
+                            "Fullscreen"
+                        }
+                    }
                     svg {
                         style: "width:100%; height:auto; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
+                        view_box: "0 0 1200 360",
+
+                        // axes
+                        line { x1:"60", y1:"20",  x2:"60",   y2:"340", stroke:"#334155", stroke_width:"1" }
+                        line { x1:"60", y1:"340", x2:"1180", y2:"340", stroke:"#334155", stroke_width:"1" }
+
+                        // y labels
+                        text { x:"10", y:"26", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
+                        text { x:"10", y:"184", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
+                        text { x:"10", y:"344", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
+
+                        // x labels (span in minutes)
+                        text { x:"70",   y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
+                        text { x:"600",  y:"355", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
+                        text { x:"1120", y:"355", fill:"#94a3b8", "font-size":"10", "now" }
+
+                        // series
+                        for (i, pts) in paths.iter().enumerate() {
+                            if !pts.is_empty() {
+                                polyline {
+                                    points: "{pts}",
+                                    fill: "none",
+                                    stroke: "{series_color(i)}",
+                                    stroke_width: "2",
+                                    stroke_linejoin: "round",
+                                    stroke_linecap: "round",
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if *is_fullscreen.read() {
+            div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
+                div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
+                    h2 { style: "margin:0; color:#f97316;", "Data Graph" }
+                    button {
+                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                        onclick: on_toggle_fullscreen,
+                        "Exit Fullscreen"
+                    }
+                }
+                div { style: "flex:1; min-height:0; width:100%;",
+                    svg {
+                        style: "width:100%; height:100%; display:block; background:#020617; border-radius:14px; border:1px solid #334155;",
                         view_box: "0 0 1200 360",
 
                         // axes

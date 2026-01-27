@@ -1,6 +1,8 @@
 // frontend/src/telemetry_dashboard/map_tab.rs
 
-use crate::telemetry_dashboard::{js_eval, js_is_ground_map_ready, js_read_window_string,abs_http};
+use crate::telemetry_dashboard::{
+    abs_http, js_eval, js_is_ground_map_ready, js_read_window_string,
+};
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 // #[cfg(target_arch = "wasm32")]
@@ -15,6 +17,7 @@ pub fn MapTab(
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
 ) -> Element {
+    let mut is_fullscreen = use_signal(|| false);
     // Browser-derived location (from navigator.geolocation inside the webview/page)
     let browser_user_gps = use_signal(|| None::<(f64, f64)>);
     let has_centered_on_user = use_signal(|| false);
@@ -199,24 +202,68 @@ pub fn MapTab(
         }
     };
 
+    {
+        use_effect(move || {
+            js_invalidate_map();
+        });
+    }
+
+    let on_toggle_fullscreen = move |_| {
+        let next = !*is_fullscreen.read();
+        is_fullscreen.set(next);
+    };
+
     rsx! {
-        div {
-            style: "display:flex; flex-direction:column; gap:12px; width:100%; padding:12px; border-radius:12px; background:#020617ee; border:1px solid #4b5563; box-shadow:0 10px 25px rgba(0,0,0,0.45);",
-            div {
-                style: "display:flex; align-items:center; gap:12px; flex-wrap:wrap;",
-                h2 { style: "margin:0; color:#22c55e;", "Launch Site Map" }
-                button {
-                    style: "padding:6px 12px; border-radius:999px; border:1px solid #22c55e; background:#022c22; color:#bbf7d0; font-size:0.85rem; cursor:pointer;",
-                    onclick: on_center_me,
-                    "Center on Me"
+        if *is_fullscreen.read() {
+            div { style: "position:fixed; inset:0; z-index:9999; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
+                div { style: "display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:space-between;",
+                    h2 { style: "margin:0; color:#22c55e;", "Launch Site Map" }
+                    div { style: "display:flex; gap:8px; flex-wrap:wrap;",
+                        button {
+                            style: "padding:6px 12px; border-radius:999px; border:1px solid #22c55e; background:#022c22; color:#bbf7d0; font-size:0.85rem; cursor:pointer;",
+                            onclick: on_center_me,
+                            "Center on Me"
+                        }
+                        button {
+                            style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                            onclick: on_toggle_fullscreen,
+                            "Exit Fullscreen"
+                        }
+                    }
+                }
+                div { style: "flex:1; min-height:0; width:100%;",
+                    div {
+                        id: "ground-map",
+                        style: "width:100%; height:100%; border-radius:12px; overflow:hidden; background:#000; border:1px solid #4b5563;",
+                    }
                 }
             }
-
+        } else {
             div {
-                style: "height: calc(100vh - 220px); min-height: 400px; width:100%;",
+                style: "display:flex; flex-direction:column; gap:12px; width:100%; padding:12px; \
+                        border-radius:12px; background:#020617ee; border:1px solid #4b5563; \
+                        box-shadow:0 10px 25px rgba(0,0,0,0.45);",
                 div {
-                    id: "ground-map",
-                    style: "width:100%; height:100%; border-radius:12px; overflow:hidden; background:#000; border:1px solid #4b5563;",
+                    style: "display:flex; align-items:center; gap:12px; flex-wrap:wrap;",
+                    h2 { style: "margin:0; color:#22c55e;", "Launch Site Map" }
+                    button {
+                        style: "padding:6px 12px; border-radius:999px; border:1px solid #22c55e; background:#022c22; color:#bbf7d0; font-size:0.85rem; cursor:pointer;",
+                        onclick: on_center_me,
+                        "Center on Me"
+                    }
+                    button {
+                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                        onclick: on_toggle_fullscreen,
+                        "Fullscreen"
+                    }
+                }
+
+                div {
+                    style: "height: clamp(180px, 45vh, 520px); width:100%;",
+                    div {
+                        id: "ground-map",
+                        style: "width:100%; height:100%; border-radius:12px; overflow:hidden; background:#000; border:1px solid #4b5563;",
+                    }
                 }
             }
         }
@@ -290,6 +337,21 @@ fn js_center_on(lat: f64, lon: f64) {
         lat = lat,
         lon = lon
     ));
+}
+
+fn js_invalidate_map() {
+    js_eval(
+        r#"
+        (function() {
+          try {
+            const m = window.__gs26_ground_map;
+            if (m && typeof m.invalidateSize === "function") {
+              setTimeout(() => { try { m.invalidateSize(); } catch (e) {} }, 50);
+            }
+          } catch (e) {}
+        })();
+        "#,
+    );
 }
 
 fn js_cached_user_latlon() -> Option<(f64, f64)> {
