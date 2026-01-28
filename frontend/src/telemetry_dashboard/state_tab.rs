@@ -35,8 +35,15 @@ pub fn StateTab(
             {action_section(state)}
         },
 
-        FlightState::Armed
-        | FlightState::Launch
+        FlightState::Armed => rsx! {
+            Section { title: "Pressure",
+                {summary_row(&rows_snapshot, "FUEL_TANK_PRESSURE", &[("Tank Pressure", 0)])}
+                {data_style_chart(&rows_snapshot, "FUEL_TANK_PRESSURE", 260.0, Some("Fuel Tank Pressure"))}
+            }
+            {action_section(state)}
+        },
+
+        FlightState::Launch
         | FlightState::Ascent
         | FlightState::Coast
         | FlightState::Apogee
