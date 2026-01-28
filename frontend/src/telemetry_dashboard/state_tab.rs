@@ -124,12 +124,7 @@ struct ActionDef {
 
 fn actions_for_state(state: FlightState) -> Vec<ActionDef> {
     match state {
-        FlightState::Startup
-        | FlightState::Idle
-        | FlightState::PreFill
-        | FlightState::FillTest
-        | FlightState::NitrogenFill
-        | FlightState::NitrousFill => vec![
+        FlightState::Armed => vec![
             ActionDef {
                 label: "Launch",
                 cmd: "Launch",
@@ -137,6 +132,19 @@ fn actions_for_state(state: FlightState) -> Vec<ActionDef> {
                 bg: "#022c22",
                 fg: "#bbf7d0",
             },
+            ActionDef {
+                label: "Dump",
+                cmd: "Dump",
+                border: "#ef4444",
+                bg: "#450a0a",
+                fg: "#fecaca",
+            },
+        ],
+        FlightState::Idle
+        | FlightState::PreFill
+        | FlightState::FillTest
+        | FlightState::NitrogenFill
+        | FlightState::NitrousFill => vec![
             ActionDef {
                 label: "Dump",
                 cmd: "Dump",
@@ -166,8 +174,8 @@ fn actions_for_state(state: FlightState) -> Vec<ActionDef> {
                 fg: "#bfdbfe",
             },
         ],
-        FlightState::Armed
-        | FlightState::Launch
+        FlightState::Startup => vec![],
+        FlightState::Launch
         | FlightState::Ascent
         | FlightState::Coast
         | FlightState::Apogee
