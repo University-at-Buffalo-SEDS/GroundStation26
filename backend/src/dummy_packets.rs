@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 // ---------------------------------------------------------------------------------------------
 
 /// How often we want to advance to the next flight state (ms).
-const FLIGHTSTATE_INTERVAL_MS: i64 = 7_000;
+const FLIGHT_STATE_INTERVAL_MS: i64 = 7_000;
 
 /// The cycle of dummy flight states we want to walk through.
 const FLIGHT_STATES: &[FlightState] = &[
@@ -88,7 +88,7 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     let mut state_guard = dummy_state().lock().expect("dummy_state mutex poisoned");
 
     let mut emit_flightstate = false;
-    if now_ms as i64 - state_guard.last_flightstate_ms >= FLIGHTSTATE_INTERVAL_MS {
+    if now_ms as i64 - state_guard.last_flightstate_ms >= FLIGHT_STATE_INTERVAL_MS {
         // Advance to next state (wrapping) and mark that we should
         // emit a flight-state packet instead of random telemetry.
         state_guard.last_flightstate_ms = now_ms as i64;
