@@ -465,10 +465,10 @@ pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
             VALUES (?, 'warning', ?)
             "#,
         )
-        .bind(timestamp)
-        .bind(msg_string)
-        .execute(&db)
-        .await;
+            .bind(timestamp)
+            .bind(msg_string)
+            .execute(&db)
+            .await;
     });
 }
 

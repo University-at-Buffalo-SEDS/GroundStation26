@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TelemetryCommand {
-    Arm,
-    Disarm,
+    Launch,
+    Dump,
     Abort,
     Tanks,
     Pilot,
@@ -75,7 +75,6 @@ impl Board {
             Board::GatewayBoard => "GW",
             Board::ActuatorBoard => "AB",
             Board::DaqBoard => "DAQ",
-
         }
     }
 

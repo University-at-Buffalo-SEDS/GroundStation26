@@ -4,9 +4,10 @@ use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
 use sedsprintf_rs_2026::config::DataType;
 
 use crate::radio::RadioDevice;
+use crate::rocket_commands::{FlightCommands, ValveCommands};
 use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
-use groundstation_shared::Board;
 use crate::GPIO_IGNITION_PIN;
+use groundstation_shared::Board;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
@@ -42,26 +43,26 @@ pub async fn telemetry_task(
                 }
                 Some(cmd) = rx.recv() => {
                     match cmd {
-                        TelemetryCommand::Arm => {
+                        TelemetryCommand::Launch => {
                             router.log_queue(
-                                    DataType::MessageData,
-                                    "Arm".as_bytes()
-                                ).expect("failed to log Arm command");
+                                    DataType::FlightCommand,
+                                    &[FlightCommands::Launch as u8],
+                                ).expect("failed to log Launch command");
                             let gpio = &state.gpio;
                             gpio.write_output_pin(GPIO_IGNITION_PIN, true).expect("failed to set gpio output");
-                            println!("Arm command sent");
+                            println!("Launch command sent");
 
                         }
-                        TelemetryCommand::Disarm => {
+                        TelemetryCommand::Dump => {
                             router.log_queue(
-                                    DataType::MessageData,
-                                    "Disarm".as_bytes()
-                                ).expect("failed to log Arm command");
+                                    DataType::ValveCommand,
+                                    &[ValveCommands::Dump as u8],
+                                ).expect("failed to log Dump command");
                             {
                                 let gpio = &state.gpio;
                                 gpio.write_output_pin(GPIO_IGNITION_PIN, false).expect("failed to set gpio output");
                             }
-                            println!("Disarm command sent");
+                            println!("Dump command sent");
                         }
                         TelemetryCommand::Abort => {
                             router.log(
@@ -73,21 +74,21 @@ pub async fn telemetry_task(
                         TelemetryCommand::Igniter => {
                             router.log_queue(
                                     DataType::ValveCommand,
-                                    &[1u8],
+                                    &[ValveCommands::Igniter as u8],
                                 ).expect("failed to log Igniter command");
                             println!("Igniter command sent");
                         }
                     TelemetryCommand::Pilot => {
                             router.log_queue(
                                     DataType::ValveCommand,
-                                    &[2u8],
+                                    &[ValveCommands::Pilot as u8],
                                 ).expect("failed to log Igniter command");
                             println!("Pilot command sent");
                         }
                     TelemetryCommand::Tanks => {
                             router.log_queue(
                                     DataType::ValveCommand,
-                                    &[3u8],
+                                    &[ValveCommands::Tanks as u8],
                                 ).expect("failed to log Igniter command");
                             println!("Tanks command sent");
                         }

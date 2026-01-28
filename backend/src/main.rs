@@ -10,6 +10,7 @@ mod safety_task;
 mod state;
 mod telemetry_task;
 mod web;
+mod rocket_commands;
 
 use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
 use crate::ring_buffer::RingBuffer;

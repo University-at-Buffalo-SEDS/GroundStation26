@@ -1,6 +1,7 @@
 // frontend/src/telemetry_dashboard/mod.rs
 
 mod actions_tab;
+pub mod data_chart;
 mod chart;
 mod connection_status_tab;
 pub mod data_tab;
@@ -679,7 +680,7 @@ fn TelemetryDashboardInner() -> Element {
                     &mut ack_error_ts_s,
                     alive.clone(),
                 )
-                .await
+                    .await
                     && alive.load(Ordering::Relaxed)
                     && *WS_EPOCH.read() == epoch
                 {
@@ -738,10 +739,10 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
-            || *warning_event_counter.read() > *ack_warning_count.read());
+        || *warning_event_counter.read() > *ack_warning_count.read());
     let has_unacked_errors = latest_error_ts > 0
         && (latest_error_ts > *ack_error_ts.read()
-            || *error_event_counter.read() > *ack_error_count.read());
+        || *error_event_counter.read() > *ack_error_count.read());
 
     let border_style = if has_unacked_errors && *flash_on.read() {
         "2px solid #ef4444"
@@ -818,7 +819,7 @@ fn TelemetryDashboardInner() -> Element {
                     user_gps,
                     alive.clone(),
                 )
-                .await
+                    .await
                     && alive.load(Ordering::Relaxed)
                 {
                     log!("[WS] supervisor ended: {e}");
@@ -1155,7 +1156,13 @@ fn TelemetryDashboardInner() -> Element {
                 match *active_main_tab.read() {
                     MainTab::State => rsx! {
                         div { style: "height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto;",
-                            StateTab { flight_state: flight_state }
+                            StateTab {
+                                flight_state: flight_state,
+                                rows: rows,
+                                board_status: board_status,
+                                rocket_gps: rocket_gps,
+                                user_gps: user_gps,
+                            }
                         }
                     },
                     MainTab::ConnectionStatus => rsx! { ConnectionStatusTab { boards: board_status } },
@@ -1426,7 +1433,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                .await
+                    .await
             }
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -1444,7 +1451,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                .await
+                    .await
             }
         };
 
@@ -1576,7 +1583,7 @@ async fn connect_ws_once_wasm(
             &mut closed_rx,
             gloo_timers::future::TimeoutFuture::new(150),
         )
-        .await;
+            .await;
 
         match done {
             futures_util::future::Either::Left((_closed, _timeout)) => break,

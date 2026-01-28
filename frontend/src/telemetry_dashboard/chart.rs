@@ -15,8 +15,18 @@ use dioxus::prelude::*;
 
 /// Monotonic-enough “now” for feedback timing.
 /// In wasm this is wall-clock-ish, but fine for relative ms thresholds.
+#[cfg(target_arch = "wasm32")]
 fn _now_ms() -> f64 {
     js_sys::Date::now()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn _now_ms() -> f64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
 }
 
 /// Build a single-series polyline with optional sliding window trimming.
