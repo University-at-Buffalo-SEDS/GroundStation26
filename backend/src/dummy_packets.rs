@@ -10,17 +10,25 @@ use std::sync::{Arc, Mutex, OnceLock};
 // ---------------------------------------------------------------------------------------------
 
 /// How often we want to advance to the next flight state (ms).
-const FLIGHTSTATE_INTERVAL_MS: i64 = 5_000;
+const FLIGHTSTATE_INTERVAL_MS: i64 = 7_000;
 
 /// The cycle of dummy flight states we want to walk through.
 const FLIGHT_STATES: &[FlightState] = &[
     FlightState::Startup,
     FlightState::Idle,
+    FlightState::PreFill,
+    FlightState::NitrogenFill,
+    FlightState::FillTest,
+    FlightState::NitrousFill,
     FlightState::Armed,
+    FlightState::Launch,
     FlightState::Ascent,
     FlightState::Coast,
+    FlightState::Apogee,
+    FlightState::ParachuteDeploy,
     FlightState::Descent,
     FlightState::Landed,
+    FlightState::Recovery,
     // Add/remove as needed
 ];
 
