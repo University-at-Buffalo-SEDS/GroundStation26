@@ -180,6 +180,27 @@ fn actions_for_state(state: FlightState) -> Vec<ActionDef> {
                 bg: "#0b1220",
                 fg: "#bfdbfe",
             },
+            ActionDef {
+                label: "Nitrogen",
+                cmd: "Nitrogen",
+                border: "#22d3ee",
+                bg: "#0b1220",
+                fg: "#cffafe",
+            },
+            ActionDef {
+                label: "Nitrous",
+                cmd: "Nitrous",
+                border: "#a3e635",
+                bg: "#111827",
+                fg: "#ecfccb",
+            },
+            ActionDef {
+                label: "Retract Plumbing",
+                cmd: "RetractPlumbing",
+                border: "#eab308",
+                bg: "#1f2937",
+                fg: "#fef9c3",
+            },
         ],
         FlightState::Startup => vec![],
         FlightState::Launch

@@ -60,6 +60,21 @@ pub fn ActionsTab() -> Element {
                     onclick: move |_| crate::telemetry_dashboard::send_cmd("Tanks"),
                     "Tanks"
                 }
+                button {
+                    style: "{btn_style(\"#22d3ee\", \"#0b1220\", \"#cffafe\")}",
+                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Nitrogen"),
+                    "Nitrogen"
+                }
+                button {
+                    style: "{btn_style(\"#a3e635\", \"#111827\", \"#ecfccb\")}",
+                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Nitrous"),
+                    "Nitrous"
+                }
+                button {
+                    style: "{btn_style(\"#eab308\", \"#1f2937\", \"#fef9c3\")}",
+                    onclick: move |_| crate::telemetry_dashboard::send_cmd("RetractPlumbing"),
+                    "Retract Plumbing"
+                }
             }
         }
     }

@@ -54,9 +54,16 @@ pub async fn telemetry_task(
 
                             }
                         TelemetryCommand::Dump => {
+                                let key = ValveBoardCommands::DumpOpen as u8;
+                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                                let cmd = if is_on {
+                                    ValveBoardCommands::DumpClose
+                                } else {
+                                    ValveBoardCommands::DumpOpen
+                                };
                                 router.log_queue(
                                         DataType::ValveCommand,
-                                        &[ValveBoardCommands::DumpOpen as u8],
+                                        &[cmd as u8],
                                     ).expect("failed to log Dump command");
                                 {
                                     let gpio = &state.gpio;
@@ -72,30 +79,58 @@ pub async fn telemetry_task(
                                 println!("Abort command sent");
                             }
                         TelemetryCommand::Igniter => {
+                                let key = ActuatorBoardCommands::IgniterOn as u8;
+                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                                let cmd = if is_on {
+                                    ActuatorBoardCommands::IgniterOff
+                                } else {
+                                    ActuatorBoardCommands::IgniterOn
+                                };
                                 router.log_queue(
                                         DataType::ActuatorCommand,
-                                        &[ActuatorBoardCommands::IgniterOn as u8],
+                                        &[cmd as u8],
                                     ).expect("failed to log Igniter command");
                                 println!("Igniter command sent");
                             }
                         TelemetryCommand::Pilot => {
+                                let key = ValveBoardCommands::PilotOpen as u8;
+                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                                let cmd = if is_on {
+                                    ValveBoardCommands::PilotClose
+                                } else {
+                                    ValveBoardCommands::PilotOpen
+                                };
                                 router.log_queue(
                                         DataType::ValveCommand,
-                                        &[ValveBoardCommands::PilotOpen as u8],
+                                        &[cmd as u8],
                                     ).expect("failed to log Igniter command");
                                 println!("Pilot command sent");
                             }
                         TelemetryCommand::Tanks => {
+                                let key = ValveBoardCommands::TanksOpen as u8;
+                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                                let cmd = if is_on {
+                                    ValveBoardCommands::TanksClose
+                                } else {
+                                    ValveBoardCommands::TanksOpen
+                                };
                                 router.log_queue(
                                         DataType::ValveCommand,
-                                        &[ValveBoardCommands::TanksOpen as u8],
+                                        &[cmd as u8],
                                     ).expect("failed to log Igniter command");
                                 println!("Tanks command sent");
                             }
                         TelemetryCommand::Nitrogen => {
+                                let cmd_id = ActuatorBoardCommands::NitrogenOpen as u8;
+                                let is_on = state.get_umbilical_valve_state(cmd_id).unwrap_or(false);
+                                let cmd = if is_on {
+                                    ActuatorBoardCommands::NitrogenClose
+                                } else {
+                                    ActuatorBoardCommands::NitrogenOpen
+                                };
                                 router.log_queue(
                                         DataType::ActuatorCommand,
-                                        &[ActuatorBoardCommands::NitrogenValveOpen as u8],
+                                        &[cmd as u8],
                                     ).expect("failed to log Nitrogen command");
                                 println!("Nitrogen command sent");
                             }
@@ -107,9 +142,16 @@ pub async fn telemetry_task(
                                 println!("RetractPlumbing command sent");
                         }
                         TelemetryCommand::Nitrous => {
+                                let cmd_id = ActuatorBoardCommands::NitrousOpen as u8;
+                                let is_on = state.get_umbilical_valve_state(cmd_id).unwrap_or(false);
+                                let cmd = if is_on {
+                                    ActuatorBoardCommands::NitrousClose
+                                } else {
+                                    ActuatorBoardCommands::NitrousOpen
+                                };
                                 router.log_queue(
                                         DataType::ActuatorCommand,
-                                        &[ActuatorBoardCommands::NitrousOpen as u8],
+                                        &[cmd as u8],
                                     ).expect("failed to log Nitrous command");
                                 println!("Nitrous command sent");
                         }
@@ -135,6 +177,28 @@ pub async fn telemetry_task(
                     handle_packet(&state).await;
                 }
         }
+    }
+}
+
+fn umbilical_state_key(cmd_id: u8, on: bool) -> Option<(u8, bool)> {
+    use ActuatorBoardCommands as A;
+    use ValveBoardCommands as V;
+
+    match cmd_id {
+        x if x == V::PilotOpen as u8 => Some((V::PilotOpen as u8, on)),
+        x if x == V::PilotClose as u8 => Some((V::PilotOpen as u8, false)),
+        x if x == V::TanksOpen as u8 => Some((V::TanksOpen as u8, on)),
+        x if x == V::TanksClose as u8 => Some((V::TanksOpen as u8, false)),
+        x if x == V::DumpOpen as u8 => Some((V::DumpOpen as u8, on)),
+        x if x == V::DumpClose as u8 => Some((V::DumpOpen as u8, false)),
+        x if x == A::IgniterOn as u8 => Some((A::IgniterOn as u8, on)),
+        x if x == A::IgniterOff as u8 => Some((A::IgniterOn as u8, false)),
+        x if x == A::NitrogenOpen as u8 => Some((A::NitrogenOpen as u8, on)),
+        x if x == A::NitrogenClose as u8 => Some((A::NitrogenOpen as u8, false)),
+        x if x == A::NitrousOpen as u8 => Some((A::NitrousOpen as u8, on)),
+        x if x == A::NitrousClose as u8 => Some((A::NitrousOpen as u8, false)),
+        x if x == A::RetractPlumbing as u8 => Some((A::RetractPlumbing as u8, on)),
+        _ => None,
     }
 }
 
@@ -220,6 +284,17 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
         });
+        return;
+    }
+
+    if pkt.data_type().as_str() == "UmbilicalStatus" {
+        if let Ok(data) = pkt.data_as_u8() && data.len() >= 2 {
+            let cmd_id = data[0];
+            let on = data[1] != 0;
+            if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
+                state.set_umbilical_valve_state(key_cmd_id, key_on);
+            }
+        }
         return;
     }
 

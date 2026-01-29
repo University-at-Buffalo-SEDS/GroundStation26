@@ -146,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
         gpio,
         board_status: Arc::new(Mutex::new(board_status)),
         board_status_tx,
+        umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
     });
 
     // --- Router endpoint handlers ---

@@ -48,6 +48,9 @@ pub struct AppState {
 
     /// Board status updates → frontend
     pub board_status_tx: broadcast::Sender<BoardStatusMsg>,
+
+    /// Umbilical valve states keyed by command id (u8)
+    pub umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
 }
 
 impl AppState {
@@ -87,5 +90,15 @@ impl AppState {
         }
 
         BoardStatusMsg { boards }
+    }
+
+    pub fn set_umbilical_valve_state(&self, cmd_id: u8, on: bool) {
+        let mut map = self.umbilical_valve_states.lock().unwrap();
+        map.insert(cmd_id, on);
+    }
+
+    pub fn get_umbilical_valve_state(&self, cmd_id: u8) -> Option<bool> {
+        let map = self.umbilical_valve_states.lock().unwrap();
+        map.get(&cmd_id).copied()
     }
 }
