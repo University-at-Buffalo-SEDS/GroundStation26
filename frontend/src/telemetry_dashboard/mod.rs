@@ -1123,7 +1123,6 @@ fn TelemetryDashboardInner() -> Element {
                                 onclick: {
                                     let mut ack_warning_ts = ack_warning_ts;
                                     let mut ack_warning_count = ack_warning_count;
-                                    let warning_event_counter = warning_event_counter;
                                     move |_| {
                                         ack_warning_ts.set(latest_warning_ts);
                                         ack_warning_count.set(*warning_event_counter.read());
@@ -1148,7 +1147,6 @@ fn TelemetryDashboardInner() -> Element {
                                 onclick: {
                                     let mut ack_error_ts = ack_error_ts;
                                     let mut ack_error_count = ack_error_count;
-                                    let error_event_counter = error_event_counter;
                                     move |_| {
                                         ack_error_ts.set(latest_error_ts);
                                         ack_error_count.set(*error_event_counter.read());
