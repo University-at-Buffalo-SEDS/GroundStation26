@@ -35,13 +35,13 @@ pub fn ActionsTab() -> Element {
                 // Replace/extend these with your real commands (everything except Abort)
                 button {
                     style: "{btn_style(\"#22c55e\", \"#022c22\", \"#bbf7d0\")}",
-                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Arm"),
-                    "Arm"
+                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Launch"),
+                    "Launch"
                 }
                 button {
                     style: "{btn_style(\"#ef4444\", \"#450a0a\", \"#fecaca\")}",
-                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Disarm"),
-                    "Disarm"
+                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Dump"),
+                    "Dump"
                 }
 
                 // Examples
