@@ -15,8 +15,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8.7"
-sedsprintf_rs_2026 = { git = "https://github.com/University-at-Buffalo-SEDS/sedsprintf_2026.git", branch = "main" }
-
 
 
 [profile.release]

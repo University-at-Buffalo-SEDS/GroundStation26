@@ -1,5 +1,4 @@
-use sedsprintf_rs_2026::router::{Router, RouterSideId};
-use sedsprintf_rs_2026::{TelemetryError, TelemetryResult};
+use sedsprintf_rs_2026::{TelemetryError, TelemetryResult, router::{Router, RouterSideId}};
 use anyhow::Context;
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;

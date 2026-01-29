@@ -18,3 +18,4 @@ __pycache__/
 /frontend/dist/
 /frontend/target/
 /frontend/build.log
+/.ai/mcp/mcp.json
