@@ -89,12 +89,18 @@ fn next_umbilical_status(
         ValveBoardCommands::PilotOpen as u8,
         ValveBoardCommands::TanksOpen as u8,
         ValveBoardCommands::DumpOpen as u8,
+        ValveBoardCommands::PilotClose as u8,
+        ValveBoardCommands::TanksClose as u8,
+        ValveBoardCommands::DumpClose as u8,
     ];
     let actuator_cmds = [
         ActuatorBoardCommands::IgniterOn as u8,
-        ActuatorBoardCommands::NitrogenValveOpen as u8,
+        ActuatorBoardCommands::NitrogenOpen as u8,
         ActuatorBoardCommands::NitrousOpen as u8,
         ActuatorBoardCommands::RetractPlumbing as u8,
+        ActuatorBoardCommands::IgniterOff as u8,
+        ActuatorBoardCommands::NitrogenClose as u8,
+        ActuatorBoardCommands::NitrousClose as u8,
     ];
 
     // Pick a command id, avoiding retracted (one-way) if already on.
