@@ -250,11 +250,7 @@ pub async fn handle_packet(state: &Arc<AppState>) {
     }
 
     if pkt.data_type() == DataType::FlightState {
-        let current_state = { *state.state.lock().unwrap() };
-        if current_state == groundstation_shared::FlightState::Startup {
-            return;
-        }
-        if !state.all_boards_seen() {
+        if !cfg!(feature = "testing") && !state.all_boards_seen() {
             return;
         }
         let pkt_data = match pkt.data_as_u8() {
@@ -287,8 +283,8 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         return;
     }
 
-    if pkt.data_type().as_str() == "UmbilicalStatus" {
-        if let Ok(data) = pkt.data_as_u8() && data.len() >= 2 {
+    if pkt.data_type() == DataType::UmbilicalStatus{
+        if let Ok(data) = pkt.data_as_u8() && data.len() == 2 {
             let cmd_id = data[0];
             let on = data[1] != 0;
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
