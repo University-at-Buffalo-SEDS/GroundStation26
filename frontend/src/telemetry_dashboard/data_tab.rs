@@ -103,7 +103,8 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     // Latest row for summary cards
     let latest_row = tab_rows.last().cloned();
 
-    let is_graph_allowed = current != "GPS_DATA" && current != "VALVE_STATE";
+    let is_valve_state = current == "VALVE_STATE";
+    let is_graph_allowed = current != "GPS_DATA" && !is_valve_state;
 
     // Labels for cards and legend
     let labels = labels_for_datatype(&current);
@@ -181,10 +182,14 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         rsx! {
                             div { style: "display:flex; gap:10px; flex-wrap:wrap; align-items:flex-start;",
                                 for i in 0..8usize {
-                                    if !labels[i].is_empty() && vals[i].is_some() {
+                                    if !labels[i].is_empty() {
                                         SummaryCard {
                                             label: labels[i],
-                                            value: fmt_opt(vals[i]),
+                                            value: if is_valve_state {
+                                                valve_state_text(vals[i], labels[i] == "Fill Lines")
+                                            } else {
+                                                fmt_opt(vals[i])
+                                            },
                                             color: summary_color(i),
                                         }
                                     }
@@ -382,6 +387,26 @@ fn fmt_opt(v: Option<f32>) -> String {
     match v {
         Some(x) => format!("{x:.4}"),
         None => "-".to_string(),
+    }
+}
+
+fn valve_state_text(v: Option<f32>, is_fill_lines: bool) -> String {
+    match v {
+        Some(val) if val >= 0.5 => {
+            if is_fill_lines {
+                "Installed".to_string()
+            } else {
+                "Open".to_string()
+            }
+        }
+        Some(_) => {
+            if is_fill_lines {
+                "Removed".to_string()
+            } else {
+                "Closed".to_string()
+            }
+        }
+        None => "Unknown".to_string(),
     }
 }
 
