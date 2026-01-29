@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use dioxus_signals::Signal;
 use groundstation_shared::{BoardStatusEntry, FlightState, TelemetryRow};
 
+use crate::telemetry_dashboard::data_chart::data_style_chart;
 use crate::telemetry_dashboard::map_tab::MapTab;
 
 #[component]
@@ -29,6 +30,7 @@ pub fn StateTab(
         | FlightState::NitrousFill => rsx! {
             Section { title: "Pressure",
                 {summary_row(&rows_snapshot, "FUEL_TANK_PRESSURE", &[("Tank Pressure", 0)])}
+                {data_style_chart(&rows_snapshot, "FUEL_TANK_PRESSURE", 260.0, Some("Fuel Tank Pressure"))}
             }
             Section { title: "Valve States",
                 {valve_state_grid(&rows_snapshot)}
@@ -39,6 +41,7 @@ pub fn StateTab(
         FlightState::Armed => rsx! {
             Section { title: "Pressure",
                 {summary_row(&rows_snapshot, "FUEL_TANK_PRESSURE", &[("Tank Pressure", 0)])}
+                {data_style_chart(&rows_snapshot, "FUEL_TANK_PRESSURE", 260.0, Some("Fuel Tank Pressure"))}
             }
             Section { title: "Valve States",
                 {valve_state_grid(&rows_snapshot)}
@@ -54,12 +57,15 @@ pub fn StateTab(
         | FlightState::Descent => rsx! {
             Section { title: "Altitude",
                 {summary_row(&rows_snapshot, "BAROMETER_DATA", &[("Altitude", 2), ("Pressure", 0), ("Temp", 1)])}
+                {data_style_chart(&rows_snapshot, "BAROMETER_DATA", 280.0, Some("Barometer Data"))}
             }
             Section { title: "Acceleration",
                 {summary_row(&rows_snapshot, "ACCEL_DATA", &[("Accel X", 0), ("Accel Y", 1), ("Accel Z", 2)])}
+                {data_style_chart(&rows_snapshot, "ACCEL_DATA", 300.0, Some("Acceleration"))}
             }
             Section { title: "Kalman Filter",
                 {summary_row(&rows_snapshot, "KALMAN_FILTER_DATA", &[("Kalman X", 0), ("Kalman Y", 1), ("Kalman Z", 2)])}
+                {data_style_chart(&rows_snapshot, "KALMAN_FILTER_DATA", 300.0, Some("Kalman Filter"))}
             }
             {action_section(state)}
         },
