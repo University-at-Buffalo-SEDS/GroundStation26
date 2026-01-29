@@ -104,7 +104,8 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     let latest_row = tab_rows.last().cloned();
 
     let is_valve_state = current == "VALVE_STATE";
-    let is_graph_allowed = current != "GPS_DATA" && !is_valve_state;
+    let has_telemetry = latest_row.is_some();
+    let is_graph_allowed = has_telemetry && current != "GPS_DATA" && !is_valve_state;
 
     // Labels for cards and legend
     let labels = labels_for_datatype(&current);
