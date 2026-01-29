@@ -167,7 +167,6 @@ pub fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([Stri
     let span_minutes = effective_span_ms as f32 / 60_000.0;
 
     let window_start = newest_ts.saturating_sub(effective_span_ms);
-    let window_end = newest_ts;
 
     // 2) rows in window
     let mut window_rows: Vec<&TelemetryRow> = rows
@@ -248,18 +247,14 @@ pub fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([Stri
     }
 
     let mut buckets = vec![BucketAcc::default(); max_points];
-    let span_ms = (window_end - window_start).max(1) as f64;
+    let total = window_rows.len().max(1);
 
-    for r in &window_rows {
-        let t = (r.timestamp_ms - window_start) as f64;
-        let mut bi = ((t / span_ms) * (max_points as f64 - 1.0)).floor() as isize;
-        if bi < 0 {
-            bi = 0;
+    for (idx, r) in window_rows.iter().enumerate() {
+        let mut bi = (idx * max_points) / total;
+        if bi >= max_points {
+            bi = max_points - 1;
         }
-        if bi as usize >= max_points {
-            bi = (max_points - 1) as isize;
-        }
-        let b = &mut buckets[bi as usize];
+        let b = &mut buckets[bi];
 
         let vals = [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7];
         for (j, opt) in vals.iter().enumerate() {
@@ -283,24 +278,13 @@ pub fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([Stri
         }
     }
 
-    // 6) build polyline strings with time-based x-spacing
+    // 6) build polyline strings with constant x-spacing
     let mut out: [String; 8] = std::array::from_fn(|_| String::new());
-
-    let map_x = |t: f64| -> f32 {
-        let tt = if span_ms > 0.0 { t / span_ms } else { 0.0 };
-        let tt = tt.clamp(0.0, 1.0);
-        left + plot_w * tt as f32
-    };
 
     let mut last_seen: [Option<f32>; 8] = [None, None, None, None, None, None, None, None];
 
     for (idx, b) in buckets.iter().enumerate() {
-        let center_t = if max_points > 0 {
-            ((idx as f64 + 0.5) / max_points as f64) * span_ms
-        } else {
-            0.0
-        };
-        let center_x = map_x(center_t);
+        let center_x = left + plot_w * ((idx as f32 + 0.5) / max_points as f32);
         for ch in 0..8usize {
             let s = &mut out[ch];
 
