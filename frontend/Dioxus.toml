@@ -1,13 +1,11 @@
 [application]
-name = "groundstation_frontend"
+name = "GroundStation 26"
 default_platform = "web"
 out_dir = "dist"
 # This folder is copied into the output dir after build/serve
 asset_dir = "assets"
 icon = "assets/icon.png"
 category = "public.app-category.utilities"
-# If this is a workspace, uncomment and set:
-# sub_package = "groundstation_frontend"
 
 [web.app]
 title = "GroundStation 26"
@@ -17,13 +15,12 @@ watch_path = ["src", "assets"]
 reload_html = true
 index_on_404 = true
 
-# If wasm-opt keeps crashing on your machine, disable it
-# (In 0.7, wasm-opt is configured under [assets.wasm_opt])
 [web.wasm_opt]
 level = "3"
 debug = false
 
 [bundle]
+name = "GroundStation 26"
 identifier = "com.UBSEDS.GROUNDSTATION26"
 publisher = "UBSEDS"
 icon = ["assets/icon.png"]

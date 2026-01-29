@@ -11,9 +11,11 @@ from pathlib import Path
 from subprocess import DEVNULL
 from typing import Optional
 
-APP_NAME = "GroundstationFrontend"
+APP_NAME = "GroundStation 26"
+LEGACY_APP_NAME = "GroundstationFrontend"
 DIST_DIRNAME = "dist"
 APP_BUNDLE_NAME = f"{APP_NAME}.app"
+LEGACY_APP_BUNDLE_NAME = f"{LEGACY_APP_NAME}.app"
 
 
 def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None:
@@ -244,17 +246,30 @@ def dist_dir(frontend_dir: Path) -> Path:
 
 
 def app_bundle_path(frontend_dir: Path) -> Path:
-    return dist_dir(frontend_dir) / APP_BUNDLE_NAME
+    """
+    Return the built app bundle path, preferring the new bundle name but falling
+    back to legacy bundle name if needed.
+    """
+    dist = dist_dir(frontend_dir)
+    preferred = dist / APP_BUNDLE_NAME
+    legacy = dist / LEGACY_APP_BUNDLE_NAME
+    if preferred.exists():
+        return preferred
+    if legacy.exists():
+        return legacy
+    return preferred
 
 
 def clear_app_bundle(frontend_dir: Path) -> None:
     """
     Clear out the dist/*.app bundle before building so old artifacts don't linger.
     """
-    bundle = app_bundle_path(frontend_dir)
-    if bundle.exists():
-        print(f"Removing existing app bundle: {bundle}")
-        shutil.rmtree(bundle)
+    dist = dist_dir(frontend_dir)
+    bundles = [dist / APP_BUNDLE_NAME, dist / LEGACY_APP_BUNDLE_NAME]
+    for bundle in bundles:
+        if bundle.exists():
+            print(f"Removing existing app bundle: {bundle}")
+            shutil.rmtree(bundle)
 
 
 def _prebuild_frontend_for_container(frontend_dir: Path) -> None:

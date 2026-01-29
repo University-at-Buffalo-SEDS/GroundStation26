@@ -3,7 +3,8 @@ set -euo pipefail
 
 debug=false
 
-APP_NAME="GroundstationFrontend"
+APP_NAME="GroundStation 26"
+LEGACY_APP_NAME="GroundstationFrontend"
 APP_DIR="./dist/${APP_NAME}.app"
 PLIST="${APP_DIR}/Info.plist"
 
@@ -22,6 +23,7 @@ fi
 log() { printf "[%s] %s\n" "$(date '+%H:%M:%S')" "$*" >&3; }
 die() { printf "[ERROR] %s\n" "$*" >&2; exit 1; }
 
+# shellcheck disable=SC2154
 trap 'rc=$?; printf "\n[FAIL] line=%s rc=%s cmd: %s\n" "$LINENO" "$rc" "$BASH_COMMAND" >&2; exit $rc' ERR
 
 run_dbg() {
@@ -31,6 +33,11 @@ run_dbg() {
 
 [[ -x "$PB" ]] || die "PlistBuddy not found/executable at: $PB"
 [[ -x "$PLUTIL" ]] || die "plutil not found/executable at: $PLUTIL"
+if [[ ! -d "$APP_DIR" && -d "./dist/${LEGACY_APP_NAME}.app" ]]; then
+  log "Renaming app bundle to ${APP_NAME}.app"
+  mv "./dist/${LEGACY_APP_NAME}.app" "$APP_DIR"
+fi
+
 [[ -d "$APP_DIR" ]] || die "App bundle directory not found: $APP_DIR"
 [[ -f "$PLIST" ]] || die "Info.plist not found: $PLIST"
 [[ -f "$MOBILEPROVISION_SRC" ]] || die "Missing provisioning profile: $MOBILEPROVISION_SRC"
@@ -128,6 +135,9 @@ fi
 
 # 3) Patch Info.plist
 dump_plist_sections
+
+set_string "CFBundleDisplayName" "GS 26"
+set_string "CFBundleName" "GroundStation 26"
 
 ensure_dict "CFBundleIcons"
 ensure_dict "CFBundleIcons:CFBundlePrimaryIcon"
