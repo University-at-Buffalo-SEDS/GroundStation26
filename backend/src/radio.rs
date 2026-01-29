@@ -1,7 +1,7 @@
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
-use sedsprintf_rs_2026::router::{LinkId, Router};
+use sedsprintf_rs_2026::router::{Router, RouterSideId};
 use sedsprintf_rs_2026::{TelemetryError, TelemetryResult};
 use serial::{SerialPort, SystemPort};
 use std::error::Error;
@@ -19,6 +19,7 @@ pub const MAX_PACKET_SIZE: usize = 256;
 pub trait RadioDevice: Send {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()>;
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>>;
+    fn set_side_id(&mut self, side_id: RouterSideId);
 }
 
 // ======================================================================
@@ -26,11 +27,11 @@ pub trait RadioDevice: Send {
 // ======================================================================
 pub struct Radio {
     inner: SystemPort,
-    id: LinkId,
+    side_id: Option<RouterSideId>,
 }
 
 impl Radio {
-    pub fn open(path: &str, baud: usize, id: LinkId) -> anyhow::Result<Self> {
+    pub fn open(path: &str, baud: usize) -> anyhow::Result<Self> {
         let mut inner = serial::open(path)?;
         inner
             .reconfigure(&|settings| {
@@ -43,13 +44,20 @@ impl Radio {
             })
             .context("failed to configure serial port")?;
         inner.set_timeout(Duration::from_millis(200))?;
-        Ok(Self { inner, id })
+        Ok(Self {
+            inner,
+            side_id: None,
+        })
     }
 }
 
 impl RadioDevice for Radio {
     /// Blocking receive of one TelemetryPacket
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
+        let side_id = self.side_id.ok_or(TelemetryError::HandlerError(
+            "radio side id not set",
+        ))?;
+
         // read length prefix
         let mut len_buf = [0u8; 2];
         self.inner.read_exact(&mut len_buf)?;
@@ -65,7 +73,7 @@ impl RadioDevice for Radio {
         let mut payload = vec![0u8; frame_len];
         self.inner.read_exact(&mut payload)?;
 
-        router.rx_serialized_queue_from(&payload, self.id)
+        router.rx_serialized_queue_from_side(&payload, side_id)
     }
 
     /// Blocking send of serialized bytes (length-prefixed).
@@ -83,6 +91,10 @@ impl RadioDevice for Radio {
         self.inner.flush()?;
         Ok(())
     }
+
+    fn set_side_id(&mut self, side_id: RouterSideId) {
+        self.side_id = Some(side_id);
+    }
 }
 
 // ======================================================================
@@ -92,22 +104,28 @@ impl RadioDevice for Radio {
 #[derive(Debug)]
 pub struct DummyRadio {
     name: &'static str,
-    id: LinkId,
+    side_id: Option<RouterSideId>,
 }
 
 #[cfg(feature = "testing")]
 
 impl DummyRadio {
-    pub fn new(name: &'static str, id: LinkId) -> Self {
-        DummyRadio { name, id }
+    pub fn new(name: &'static str) -> Self {
+        DummyRadio {
+            name,
+            side_id: None,
+        }
     }
 }
 
 #[cfg(feature = "testing")]
 impl RadioDevice for DummyRadio {
     fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
+        let side_id = self.side_id.ok_or(TelemetryError::HandlerError(
+            "radio side id not set",
+        ))?;
         let pkt = get_dummy_packet()?;
-        return _router.rx_queue_from(pkt, self.id);
+        return _router.rx_queue_from_side(pkt, side_id);
 
         // No incoming packets in dummy mode
     }
@@ -125,5 +143,9 @@ impl RadioDevice for DummyRadio {
             self.name
         );
         Ok(())
+    }
+
+    fn set_side_id(&mut self, side_id: RouterSideId) {
+        self.side_id = Some(side_id);
     }
 }

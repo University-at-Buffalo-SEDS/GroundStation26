@@ -27,9 +27,9 @@ use axum::Router;
 use groundstation_shared::{Board, FlightState as FlightStateMode};
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
-use sedsprintf_rs_2026::router::{EndpointHandler, LinkId, RouterMode};
+use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
-use sedsprintf_rs_2026::{TelemetryError, TelemetryResult};
+use sedsprintf_rs_2026::{TelemetryError};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -43,9 +43,6 @@ fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
 }
 const GPIO_IGNITION_PIN: u8 = 5;
 const GPIO_ABORT_PIN: u8 = 9;
-const ROCKET_RADIO_ID: LinkId = unsafe { LinkId::new_unchecked(3) };
-const UMBILICAL_RADIO_ID: LinkId = unsafe { LinkId::new_unchecked(4) };
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize GPIO
@@ -158,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
 
     let ground_station_handler = EndpointHandler::new_packet_handler(
         GroundStation,
-        move |pkt: &TelemetryPacket, _sender| {
+        move |pkt: &TelemetryPacket| {
             ground_station_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             let mut rb = ground_station_handler_state_clone
@@ -171,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let flight_state_handler =
-        EndpointHandler::new_packet_handler(FlightState, move |pkt: &TelemetryPacket, _sender| {
+        EndpointHandler::new_packet_handler(FlightState, move |pkt: &TelemetryPacket| {
             flight_state_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             let mut rb = flight_state_handler_state_clone.ring_buffer.lock().unwrap();
@@ -180,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
         });
 
     let abort_handler =
-        EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket, _sender| {
+        EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket| {
             abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             let error_msg = pkt
                 .data_as_string()
@@ -197,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Radios ---
     let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
-        match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUD_RATE, ROCKET_RADIO_ID) {
+        match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUD_RATE) {
             Ok(r) => {
                 println!("Rocket radio online");
                 Arc::new(Mutex::new(Box::new(r)))
@@ -206,10 +203,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Rocket radio missing, using DummyRadio: {}", e);
                 #[cfg(feature = "testing")]
                 {
-                    Arc::new(Mutex::new(Box::new(DummyRadio::new(
-                        "Rocket Radio",
-                        ROCKET_RADIO_ID,
-                    ))))
+                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio"))))
                 }
                 #[cfg(not(feature = "testing"))]
                 panic!("Rocket radio missing and testing mode not enabled")
@@ -217,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
     let umbilical_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
-        match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUD_RATE, UMBILICAL_RADIO_ID) {
+        match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUD_RATE) {
             Ok(r) => {
                 println!("Umbilical radio online");
                 Arc::new(Mutex::new(Box::new(r)))
@@ -226,47 +220,53 @@ async fn main() -> anyhow::Result<()> {
                 println!("Umbilical radio missing, using DummyRadio: {}", e);
                 #[cfg(feature = "testing")]
                 {
-                    Arc::new(Mutex::new(Box::new(DummyRadio::new(
-                        "Umbilical Radio",
-                        UMBILICAL_RADIO_ID,
-                    ))))
+                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio"))))
                 }
                 #[cfg(not(feature = "testing"))]
                 panic!("Umbilical radio missing and testing mode not enabled")
             }
         };
 
-    let serialized_handler = {
-        let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> = Arc::clone(&rocket_radio);
-        let umbilical_radio: Arc<Mutex<Box<dyn RadioDevice>>> = Arc::clone(&umbilical_radio);
-
-        Some(move |pkt: &[u8], sender: &LinkId| -> TelemetryResult<()> {
-            if *sender != ROCKET_RADIO_ID {
-                let mut guard = rocket_radio
-                    .lock()
-                    .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
-                guard
-                    .send_data(pkt)
-                    .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
-            }
-            if *sender != UMBILICAL_RADIO_ID {
-                let mut guard = umbilical_radio
-                    .lock()
-                    .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
-                guard
-                    .send_data(pkt)
-                    .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
-            }
-            Ok(())
-        })
-    };
-
     let router = Arc::new(sedsprintf_rs_2026::router::Router::new(
-        serialized_handler,
         RouterMode::Relay,
         cfg,
         clock(),
     ));
+
+    let rocket_side = {
+        let rocket_radio = Arc::clone(&rocket_radio);
+        router.add_side_serialized("rocket_radio", move |pkt| {
+            let mut guard = rocket_radio
+                .lock()
+                .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
+            guard
+                .send_data(pkt)
+                .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
+            Ok(())
+        })
+    };
+
+    let umbilical_side = {
+        let umbilical_radio = Arc::clone(&umbilical_radio);
+        router.add_side_serialized("umbilical_radio", move |pkt| {
+            let mut guard = umbilical_radio
+                .lock()
+                .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
+            guard
+                .send_data(pkt)
+                .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
+            Ok(())
+        })
+    };
+
+    rocket_radio
+        .lock()
+        .expect("failed to get rocket radio lock")
+        .set_side_id(rocket_side);
+    umbilical_radio
+        .lock()
+        .expect("failed to get umbilical radio lock")
+        .set_side_id(umbilical_side);
 
     // Clone what you need for the callback
     let router_for_cb = router.clone();
