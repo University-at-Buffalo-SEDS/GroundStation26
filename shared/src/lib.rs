@@ -11,6 +11,9 @@ pub enum TelemetryCommand {
     Tanks,
     Pilot,
     Igniter,
+    RetractPlumbing,
+    Nitrogen,
+    Nitrous,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]

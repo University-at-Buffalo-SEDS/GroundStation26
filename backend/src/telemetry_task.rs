@@ -4,7 +4,7 @@ use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
 use sedsprintf_rs_2026::config::DataType;
 
 use crate::radio::RadioDevice;
-use crate::rocket_commands::{FlightCommands, ValveCommands};
+use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
 use crate::GPIO_IGNITION_PIN;
 use groundstation_shared::Board;
@@ -44,53 +44,74 @@ pub async fn telemetry_task(
                 Some(cmd) = rx.recv() => {
                     match cmd {
                         TelemetryCommand::Launch => {
-                            router.log_queue(
-                                    DataType::FlightCommand,
-                                    &[FlightCommands::Launch as u8],
-                                ).expect("failed to log Launch command");
-                            let gpio = &state.gpio;
-                            gpio.write_output_pin(GPIO_IGNITION_PIN, true).expect("failed to set gpio output");
-                            println!("Launch command sent");
-
-                        }
-                        TelemetryCommand::Dump => {
-                            router.log_queue(
-                                    DataType::ValveCommand,
-                                    &[ValveCommands::Dump as u8],
-                                ).expect("failed to log Dump command");
-                            {
+                                router.log_queue(
+                                        DataType::FlightCommand,
+                                        &[FlightCommands::Launch as u8],
+                                    ).expect("failed to log Launch command");
                                 let gpio = &state.gpio;
-                                gpio.write_output_pin(GPIO_IGNITION_PIN, false).expect("failed to set gpio output");
+                                gpio.write_output_pin(GPIO_IGNITION_PIN, true).expect("failed to set gpio output");
+                                println!("Launch command sent");
+
                             }
-                            println!("Dump command sent");
-                        }
+                        TelemetryCommand::Dump => {
+                                router.log_queue(
+                                        DataType::ValveCommand,
+                                        &[ValveBoardCommands::DumpOpen as u8],
+                                    ).expect("failed to log Dump command");
+                                {
+                                    let gpio = &state.gpio;
+                                    gpio.write_output_pin(GPIO_IGNITION_PIN, false).expect("failed to set gpio output");
+                                }
+                                println!("Dump command sent");
+                            }
                         TelemetryCommand::Abort => {
-                            router.log(
-                                    DataType::Abort,
-                                    "Manual Abort Command Issued".as_ref(),
-                                ).expect("failed to log Abort command");
-                            println!("Abort command sent");
-                        }
+                                router.log(
+                                        DataType::Abort,
+                                        "Manual Abort Command Issued".as_ref(),
+                                    ).expect("failed to log Abort command");
+                                println!("Abort command sent");
+                            }
                         TelemetryCommand::Igniter => {
-                            router.log_queue(
-                                    DataType::ValveCommand,
-                                    &[ValveCommands::Igniter as u8],
-                                ).expect("failed to log Igniter command");
-                            println!("Igniter command sent");
+                                router.log_queue(
+                                        DataType::ActuatorCommand,
+                                        &[ActuatorBoardCommands::IgniterOn as u8],
+                                    ).expect("failed to log Igniter command");
+                                println!("Igniter command sent");
+                            }
+                        TelemetryCommand::Pilot => {
+                                router.log_queue(
+                                        DataType::ValveCommand,
+                                        &[ValveBoardCommands::PilotOpen as u8],
+                                    ).expect("failed to log Igniter command");
+                                println!("Pilot command sent");
+                            }
+                        TelemetryCommand::Tanks => {
+                                router.log_queue(
+                                        DataType::ValveCommand,
+                                        &[ValveBoardCommands::TanksOpen as u8],
+                                    ).expect("failed to log Igniter command");
+                                println!("Tanks command sent");
+                            }
+                        TelemetryCommand::Nitrogen => {
+                                router.log_queue(
+                                        DataType::ActuatorCommand,
+                                        &[ActuatorBoardCommands::NitrogenValveOpen as u8],
+                                    ).expect("failed to log Nitrogen command");
+                                println!("Nitrogen command sent");
+                            }
+                        TelemetryCommand::RetractPlumbing => {
+                                router.log_queue(
+                                        DataType::ActuatorCommand,
+                                        &[ActuatorBoardCommands::RetractPlumbing as u8],
+                                    ).expect("failed to log RetractPlumbing command");
+                                println!("RetractPlumbing command sent");
                         }
-                    TelemetryCommand::Pilot => {
-                            router.log_queue(
-                                    DataType::ValveCommand,
-                                    &[ValveCommands::Pilot as u8],
-                                ).expect("failed to log Igniter command");
-                            println!("Pilot command sent");
-                        }
-                    TelemetryCommand::Tanks => {
-                            router.log_queue(
-                                    DataType::ValveCommand,
-                                    &[ValveCommands::Tanks as u8],
-                                ).expect("failed to log Igniter command");
-                            println!("Tanks command sent");
+                        TelemetryCommand::Nitrous => {
+                                router.log_queue(
+                                        DataType::ActuatorCommand,
+                                        &[ActuatorBoardCommands::NitrousOpen as u8],
+                                    ).expect("failed to log Nitrous command");
+                                println!("Nitrous command sent");
                         }
                     }
                 }
@@ -107,7 +128,7 @@ pub async fn telemetry_task(
                                 "Warning: Ground Station heartbeat send failed",
                             );
                             heartbeat_failed = true;
-                
+
                     }
                 }
                 _ = handle_interval.tick() => {
@@ -123,7 +144,7 @@ const DB_RETRY_DELAY_MS: u64 = 50;
 async fn insert_with_retry<F, Fut>(mut f: F) -> Result<(), sqlx::Error>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output=Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
+    Fut: Future<Output = Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
 {
     let mut delay = DB_RETRY_DELAY_MS;
     let mut last_err: Option<sqlx::Error> = None;
@@ -191,7 +212,7 @@ pub async fn handle_packet(state: &Arc<AppState>) {
                 .bind(pkt_data as i64)
                 .execute(&state.db)
         })
-            .await
+        .await
         {
             eprintln!("DB insert into flight_state failed after retry: {e}");
         }
