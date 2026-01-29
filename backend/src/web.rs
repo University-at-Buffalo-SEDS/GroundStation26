@@ -198,11 +198,14 @@ async fn get_favicon() -> impl IntoResponse {
 }
 async fn get_flight_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // get the state from the db
-    let data = sqlx::query("SELECT f_state FROM flight_state ORDER BY timestamp_ms DESC LIMIT 1")
+    let flight_state: i64 = match sqlx::query("SELECT f_state FROM flight_state ORDER BY timestamp_ms DESC LIMIT 1")
         .fetch_one(&state.db)
-        .await
-        .expect("failed to fetch flight state");
-    let flight_state: i64 = data.get::<i64, _>("f_state");
+        .await {
+        Ok(data) => {
+            data.get::<i64, _>("f_state")
+        }
+        Err(_) => {FlightState::Startup as i64}
+    };
     let flight_state = groundstation_shared::u8_to_flight_state(flight_state as u8)
         .unwrap_or(FlightState::Startup);
     Json(flight_state)
