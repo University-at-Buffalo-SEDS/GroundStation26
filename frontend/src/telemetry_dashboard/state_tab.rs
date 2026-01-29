@@ -2,7 +2,6 @@ use dioxus::prelude::*;
 use dioxus_signals::Signal;
 use groundstation_shared::{BoardStatusEntry, FlightState, TelemetryRow};
 
-use crate::telemetry_dashboard::data_chart::data_style_chart;
 use crate::telemetry_dashboard::map_tab::MapTab;
 
 #[component]
@@ -30,7 +29,9 @@ pub fn StateTab(
         | FlightState::NitrousFill => rsx! {
             Section { title: "Pressure",
                 {summary_row(&rows_snapshot, "FUEL_TANK_PRESSURE", &[("Tank Pressure", 0)])}
-                {data_style_chart(&rows_snapshot, "FUEL_TANK_PRESSURE", 260.0, Some("Fuel Tank Pressure"))}
+            }
+            Section { title: "Valve States",
+                {valve_state_grid(&rows_snapshot)}
             }
             {action_section(state)}
         },
@@ -38,7 +39,9 @@ pub fn StateTab(
         FlightState::Armed => rsx! {
             Section { title: "Pressure",
                 {summary_row(&rows_snapshot, "FUEL_TANK_PRESSURE", &[("Tank Pressure", 0)])}
-                {data_style_chart(&rows_snapshot, "FUEL_TANK_PRESSURE", 260.0, Some("Fuel Tank Pressure"))}
+            }
+            Section { title: "Valve States",
+                {valve_state_grid(&rows_snapshot)}
             }
             {action_section(state)}
         },
@@ -51,15 +54,12 @@ pub fn StateTab(
         | FlightState::Descent => rsx! {
             Section { title: "Altitude",
                 {summary_row(&rows_snapshot, "BAROMETER_DATA", &[("Altitude", 2), ("Pressure", 0), ("Temp", 1)])}
-                {data_style_chart(&rows_snapshot, "BAROMETER_DATA", 280.0, Some("Barometer Data"))}
             }
             Section { title: "Acceleration",
                 {summary_row(&rows_snapshot, "ACCEL_DATA", &[("Accel X", 0), ("Accel Y", 1), ("Accel Z", 2)])}
-                {data_style_chart(&rows_snapshot, "ACCEL_DATA", 300.0, Some("Acceleration"))}
             }
             Section { title: "Kalman Filter",
                 {summary_row(&rows_snapshot, "KALMAN_FILTER_DATA", &[("Kalman X", 0), ("Kalman Y", 1), ("Kalman Z", 2)])}
-                {data_style_chart(&rows_snapshot, "KALMAN_FILTER_DATA", 300.0, Some("Kalman Filter"))}
             }
             {action_section(state)}
         },
@@ -96,6 +96,63 @@ fn Section(title: &'static str, children: Element) -> Element {
         div { style: "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;",
             div { style: "font-size:15px; color:#cbd5f5; font-weight:600; margin-bottom:10px;", "{title}" }
             {children}
+        }
+    }
+}
+
+fn valve_state_grid(rows: &[TelemetryRow]) -> Element {
+    let latest = rows
+        .iter()
+        .filter(|r| r.data_type == "VALVE_STATE")
+        .max_by_key(|r| r.timestamp_ms);
+
+    let Some(row) = latest else {
+        return rsx! { div { style: "color:#94a3b8; font-size:12px;", "No valve state yet." } };
+    };
+
+    let items = [
+        ("Pilot", row.v0),
+        ("Tanks", row.v1),
+        ("Dump", row.v2),
+        ("Igniter", row.v3),
+        ("Nitrogen", row.v4),
+        ("Nitrous", row.v5),
+        ("Fill Lines", row.v6),
+    ];
+
+    rsx! {
+        div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-bottom:12px;",
+            for (label, value) in items {
+                ValveStateCard { label: label, value: value, is_fill_lines: label == "Fill Lines" }
+            }
+        }
+    }
+}
+
+#[component]
+fn ValveStateCard(label: &'static str, value: Option<f32>, is_fill_lines: bool) -> Element {
+    let (bg, border, fg, text) = match value {
+        Some(v) if v >= 0.5 => {
+            if is_fill_lines {
+                ("#052e16", "#22c55e", "#bbf7d0", "Installed")
+            } else {
+                ("#052e16", "#22c55e", "#bbf7d0", "Open")
+            }
+        }
+        Some(_) => {
+            if is_fill_lines {
+                ("#1f2937", "#94a3b8", "#e2e8f0", "Removed")
+            } else {
+                ("#1f2937", "#94a3b8", "#e2e8f0", "Closed")
+            }
+        }
+        None => ("#0b1220", "#475569", "#94a3b8", "Unknown"),
+    };
+
+    rsx! {
+        div { style: "padding:10px; border-radius:12px; background:{bg}; border:1px solid {border};",
+            div { style: "font-size:12px; color:{fg};", "{label}" }
+            div { style: "font-size:18px; font-weight:700; color:{fg};", "{text}" }
         }
     }
 }
@@ -195,7 +252,7 @@ fn actions_for_state(state: FlightState) -> Vec<ActionDef> {
                 fg: "#ecfccb",
             },
             ActionDef {
-                label: "Retract Plumbing",
+                label: "Fill Lines",
                 cmd: "RetractPlumbing",
                 border: "#eab308",
                 bg: "#1f2937",

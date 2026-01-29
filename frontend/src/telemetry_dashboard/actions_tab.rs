@@ -73,7 +73,7 @@ pub fn ActionsTab() -> Element {
                 button {
                     style: "{btn_style(\"#eab308\", \"#1f2937\", \"#fef9c3\")}",
                     onclick: move |_| crate::telemetry_dashboard::send_cmd("RetractPlumbing"),
-                    "Retract Plumbing"
+                    "Fill Lines"
                 }
             }
         }

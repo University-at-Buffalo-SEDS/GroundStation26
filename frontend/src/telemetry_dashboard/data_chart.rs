@@ -131,6 +131,16 @@ pub fn labels_for_datatype(dt: &str) -> [&'static str; 8] {
         "GPS_DATA" => ["Latitude", "Longitude", "", "", "", "", "", ""],
         "FUEL_FLOW" => ["Flow Rate", "", "", "", "", "", "", ""],
         "FUEL_TANK_PRESSURE" => ["Pressure", "", "", "", "", "", "", ""],
+        "VALVE_STATE" => [
+            "Pilot",
+            "Tanks",
+            "Dump",
+            "Igniter",
+            "Nitrogen",
+            "Nitrous",
+            "Fill Lines",
+            "",
+        ],
         _ => ["", "", "", "", "", "", "", ""],
     }
 }

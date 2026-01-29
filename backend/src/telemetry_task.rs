@@ -202,6 +202,28 @@ fn umbilical_state_key(cmd_id: u8, on: bool) -> Option<(u8, bool)> {
     }
 }
 
+const VALVE_STATE_DATA_TYPE: &str = "VALVE_STATE";
+
+fn bool_to_f32(value: Option<bool>) -> Option<f32> {
+    value.map(|v| if v { 1.0 } else { 0.0 })
+}
+
+fn valve_state_values(state: &AppState) -> [Option<f32>; 8] {
+    use ActuatorBoardCommands as A;
+    use ValveBoardCommands as V;
+
+    [
+        bool_to_f32(state.get_umbilical_valve_state(V::PilotOpen as u8)),
+        bool_to_f32(state.get_umbilical_valve_state(V::TanksOpen as u8)),
+        bool_to_f32(state.get_umbilical_valve_state(V::DumpOpen as u8)),
+        bool_to_f32(state.get_umbilical_valve_state(A::IgniterOn as u8)),
+        bool_to_f32(state.get_umbilical_valve_state(A::NitrogenOpen as u8)),
+        bool_to_f32(state.get_umbilical_valve_state(A::NitrousOpen as u8)),
+        bool_to_f32(state.get_umbilical_valve_state(A::RetractPlumbing as u8)),
+        None,
+    ]
+}
+
 const DB_RETRIES: usize = 5;
 const DB_RETRY_DELAY_MS: u64 = 50;
 
@@ -289,6 +311,44 @@ pub async fn handle_packet(state: &Arc<AppState>) {
             let on = data[1] != 0;
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
                 state.set_umbilical_valve_state(key_cmd_id, key_on);
+
+                let ts_ms = pkt.timestamp() as i64;
+                let values = valve_state_values(state);
+
+                if let Err(e) = insert_with_retry(|| {
+                    sqlx::query(
+                        "INSERT INTO telemetry (timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                        .bind(ts_ms)
+                        .bind(VALVE_STATE_DATA_TYPE)
+                        .bind(values[0])
+                        .bind(values[1])
+                        .bind(values[2])
+                        .bind(values[3])
+                        .bind(values[4])
+                        .bind(values[5])
+                        .bind(values[6])
+                        .bind(values[7])
+                        .execute(&state.db)
+                })
+                    .await
+                {
+                    eprintln!("DB insert into telemetry failed after retry: {e}");
+                }
+
+                let row = TelemetryRow {
+                    timestamp_ms: ts_ms,
+                    data_type: VALVE_STATE_DATA_TYPE.to_string(),
+                    v0: values[0],
+                    v1: values[1],
+                    v2: values[2],
+                    v3: values[3],
+                    v4: values[4],
+                    v5: values[5],
+                    v6: values[6],
+                    v7: values[7],
+                };
+                let _ = state.ws_tx.send(row);
             }
         }
         return;

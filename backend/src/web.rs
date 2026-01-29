@@ -40,17 +40,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/gps", get(get_gps))
         .route("/ws", get(ws_handler))
         .nest_service("/tiles", tiles_dir)
-        // .nest_service("/vendor/leaflet", vendor_dir)
-        // .route("/ground_map.js", get(|| async {
-        //     // Serve the ground_map.js file
-        //     let path: PathBuf = "./frontend/assets/ground_map.js".into();
-        //     match tokio::fs::read_to_string(&path).await {
-        //         Ok(content) => ([(header::CONTENT_TYPE, "application/javascript")], content).into_response(),
-        //         Err(_) => (axum::http::StatusCode::NOT_FOUND, "Not Found").into_response(),
-        //     }
-        // }))
         .route("/favicon.ico", get(get_favicon))
-
+        .route("/valvestate", get(get_valve_state))
 
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
@@ -75,6 +66,18 @@ pub enum WsOutMsg {
 #[derive(Clone, Serialize)]
 pub struct FlightStateMsg {
     pub state: FlightState,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ValveStateMsg {
+    pub timestamp_ms: i64,
+    pub pilot_open: Option<bool>,
+    pub tanks_open: Option<bool>,
+    pub dump_open: Option<bool>,
+    pub igniter_on: Option<bool>,
+    pub nitrogen_open: Option<bool>,
+    pub nitrous_open: Option<bool>,
+    pub retract_plumbing: Option<bool>,
 }
 /// Warning row sent to frontend (and stored in AppState channel)
 #[derive(Clone, Serialize)]
@@ -110,6 +113,44 @@ pub struct GpsPoint {
 #[derive(Serialize)]
 pub struct GpsResponse {
     pub rocket: Option<GpsPoint>,
+}
+
+async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Latest valve state row: data_type = 'VALVE_STATE'
+    // v0..v6: pilot, tanks, dump, igniter, nitrogen, nitrous, retract_plumbing
+    let row = sqlx::query(
+        r#"
+        SELECT timestamp_ms, v0, v1, v2, v3, v4, v5, v6
+        FROM telemetry
+        WHERE data_type = 'VALVE_STATE'
+        ORDER BY timestamp_ms DESC
+        LIMIT 1
+        "#,
+    )
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+
+    let valve_state = row.map(|r| {
+        let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
+        let to_bool = |key: &str| -> Option<bool> {
+            let v: Option<f32> = r.get::<Option<f32>, _>(key);
+            v.map(|x| x >= 0.5)
+        };
+
+        ValveStateMsg {
+            timestamp_ms,
+            pilot_open: to_bool("v0"),
+            tanks_open: to_bool("v1"),
+            dump_open: to_bool("v2"),
+            igniter_on: to_bool("v3"),
+            nitrogen_open: to_bool("v4"),
+            nitrous_open: to_bool("v5"),
+            retract_plumbing: to_bool("v6"),
+        }
+    });
+
+    Json(valve_state)
 }
 
 async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
