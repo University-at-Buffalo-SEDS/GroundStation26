@@ -283,6 +283,8 @@ static WS_RAW: GlobalSignal<Option<web_sys::WebSocket>> = Signal::global(|| None
 // IMPORTANT: this key is applied ONLY to the INNER component, so it does NOT
 // trigger TelemetryDashboard’s unmount guard.
 static UI_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
+// Force re-seed of graphs/history from backend.
+static SEED_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 
 fn normalize_base_url(mut url: String) -> String {
     if let Some(idx) = url.find('#') {
@@ -329,6 +331,9 @@ fn _bump_ui_epoch() {
     *UI_EPOCH.write() += 1;
 }
 
+fn bump_seed_epoch() {
+    *SEED_EPOCH.write() += 1;
+}
 // tab <-> string
 fn _main_tab_to_str(tab: MainTab) -> &'static str {
     match tab {
@@ -427,6 +432,7 @@ fn hard_reload_app_web() {
 fn reconnect_and_reload_ui() {
     // Always restart websockets/tasks
     bump_ws_epoch();
+    bump_seed_epoch();
 
     // Web: real reload
     #[cfg(target_arch = "wasm32")]
@@ -643,7 +649,7 @@ fn TelemetryDashboardInner() -> Element {
 
     // Seed from DB (HTTP) on mount
     {
-        let mut did_seed = use_signal(|| false);
+        let mut last_seed_epoch = use_signal(|| None::<u64>);
 
         let mut rows_s = rows;
         let mut warnings_s = warnings;
@@ -657,10 +663,14 @@ fn TelemetryDashboardInner() -> Element {
         let alive = alive.clone();
 
         use_effect(move || {
-            if *did_seed.read() {
+            let current_seed = *SEED_EPOCH.read();
+            if last_seed_epoch.read().as_ref() == Some(&current_seed) {
                 return;
             }
-            did_seed.set(true);
+            last_seed_epoch.set(Some(current_seed));
+
+            // Clear graphs immediately before re-seeding.
+            rows_s.set(Vec::new());
 
             let alive = alive.clone();
             let epoch = *WS_EPOCH.read();
