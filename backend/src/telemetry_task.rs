@@ -69,7 +69,7 @@ pub async fn telemetry_task(
                                     let gpio = &state.gpio;
                                     gpio.write_output_pin(GPIO_IGNITION_PIN, false).expect("failed to set gpio output");
                                 }
-                                println!("Dump command sent");
+                                println!("Dump command sent {:?}", cmd);
                             }
                         TelemetryCommand::Abort => {
                                 router.log(
@@ -90,7 +90,7 @@ pub async fn telemetry_task(
                                         DataType::ActuatorCommand,
                                         &[cmd as u8],
                                     ).expect("failed to log Igniter command");
-                                println!("Igniter command sent");
+                                println!("Igniter command sent {:?}", cmd);
                             }
                         TelemetryCommand::Pilot => {
                                 let key = ValveBoardCommands::PilotOpen as u8;
@@ -104,7 +104,7 @@ pub async fn telemetry_task(
                                         DataType::ValveCommand,
                                         &[cmd as u8],
                                     ).expect("failed to log Igniter command");
-                                println!("Pilot command sent");
+                                println!("Pilot command sent {:?}", cmd);
                             }
                         TelemetryCommand::Tanks => {
                                 let key = ValveBoardCommands::TanksOpen as u8;
@@ -118,7 +118,7 @@ pub async fn telemetry_task(
                                         DataType::ValveCommand,
                                         &[cmd as u8],
                                     ).expect("failed to log Igniter command");
-                                println!("Tanks command sent");
+                                println!("Tanks command sent {:?}", cmd);
                             }
                         TelemetryCommand::Nitrogen => {
                                 let cmd_id = ActuatorBoardCommands::NitrogenOpen as u8;
@@ -132,7 +132,7 @@ pub async fn telemetry_task(
                                         DataType::ActuatorCommand,
                                         &[cmd as u8],
                                     ).expect("failed to log Nitrogen command");
-                                println!("Nitrogen command sent");
+                                println!("Nitrogen command sent {:?}", cmd);
                             }
                         TelemetryCommand::RetractPlumbing => {
                                 router.log_queue(
@@ -153,7 +153,7 @@ pub async fn telemetry_task(
                                         DataType::ActuatorCommand,
                                         &[cmd as u8],
                                     ).expect("failed to log Nitrous command");
-                                println!("Nitrous command sent");
+                                println!("Nitrous command sent: {:?}", cmd);
                         }
                     }
                 }

@@ -1,9 +1,11 @@
 #[repr(u8)]
+#[derive(Debug, Clone, Copy)]
 pub enum FlightCommands {
     Launch,
 }
 
 #[repr(u8)]
+#[derive(Debug, Clone, Copy)]
 pub enum ValveBoardCommands {
     PilotOpen = 0,
     TanksOpen = 1,
@@ -13,6 +15,7 @@ pub enum ValveBoardCommands {
     DumpClose = 5,
 }
 #[repr(u8)]
+#[derive(Debug, Clone, Copy)]
 pub enum ActuatorBoardCommands {
     IgniterOn = 6,
     RetractPlumbing = 7,
