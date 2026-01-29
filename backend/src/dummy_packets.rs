@@ -1,9 +1,11 @@
 use crate::telemetry_task::get_current_timestamp_ms;
+use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 use groundstation_shared::{Board, FlightState};
 use rand::Rng;
 use sedsprintf_rs_2026::config::DataEndpoint;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::TelemetryResult;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 // ---------------------------------------------------------------------------------------------
 // Configuration
@@ -11,6 +13,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// How often we want to advance to the next flight state (ms).
 const FLIGHT_STATE_INTERVAL_MS: i64 = 7_000;
+const UMBILICAL_MIN_INTERVAL_MS: i64 = 800;
+const UMBILICAL_MAX_INTERVAL_MS: i64 = 2_500;
 
 /// The cycle of dummy flight states we want to walk through.
 const FLIGHT_STATES: &[FlightState] = &[
@@ -41,6 +45,12 @@ struct DummyState {
     last_flightstate_ms: i64,
     /// Index into FLIGHT_STATES.
     idx: usize,
+    /// Timestamp of last umbilical status packet.
+    last_umbilical_ms: i64,
+    /// Next interval (ms) to emit umbilical status.
+    next_umbilical_ms: i64,
+    /// Umbilical valve states keyed by command id.
+    umbilical_states: HashMap<u8, bool>,
 }
 
 static DUMMY_STATE: OnceLock<Mutex<DummyState>> = OnceLock::new();
@@ -53,6 +63,9 @@ fn dummy_state() -> &'static Mutex<DummyState> {
             // after 5 seconds have passed.
             last_flightstate_ms: get_current_timestamp_ms() as i64,
             idx: 0,
+            last_umbilical_ms: get_current_timestamp_ms() as i64,
+            next_umbilical_ms: UMBILICAL_MIN_INTERVAL_MS,
+            umbilical_states: HashMap::new(),
         })
     })
 }
@@ -66,6 +79,57 @@ fn next_dummy_sender() -> &'static str {
     let sender = Board::ALL[*idx % Board::ALL.len()].sender_id();
     *idx = (*idx + 1) % Board::ALL.len();
     sender
+}
+
+fn next_umbilical_status(
+    state: &mut DummyState,
+    rng: &mut impl Rng,
+) -> (u8, bool, &'static str) {
+    let valve_cmds = [
+        ValveBoardCommands::PilotOpen as u8,
+        ValveBoardCommands::TanksOpen as u8,
+        ValveBoardCommands::DumpOpen as u8,
+    ];
+    let actuator_cmds = [
+        ActuatorBoardCommands::IgniterOn as u8,
+        ActuatorBoardCommands::NitrogenValveOpen as u8,
+        ActuatorBoardCommands::NitrousOpen as u8,
+        ActuatorBoardCommands::RetractPlumbing as u8,
+    ];
+
+    // Pick a command id, avoiding retracted (one-way) if already on.
+    let mut cmd_id = actuator_cmds[rng.random_range(0..actuator_cmds.len())];
+    for _ in 0..6 {
+        let pick_actuator = rng.random_range(0..2) == 0;
+        cmd_id = if pick_actuator {
+            actuator_cmds[rng.random_range(0..actuator_cmds.len())]
+        } else {
+            valve_cmds[rng.random_range(0..valve_cmds.len())]
+        };
+
+        if cmd_id == ActuatorBoardCommands::RetractPlumbing as u8 {
+            if state.umbilical_states.get(&cmd_id).copied().unwrap_or(false) {
+                continue;
+            }
+        }
+        break;
+    }
+
+    let current = state.umbilical_states.get(&cmd_id).copied().unwrap_or(false);
+    let next = if cmd_id == ActuatorBoardCommands::RetractPlumbing as u8 {
+        true
+    } else {
+        !current
+    };
+    state.umbilical_states.insert(cmd_id, next);
+
+    let sender = if valve_cmds.contains(&cmd_id) {
+        Board::ValveBoard.sender_id()
+    } else {
+        Board::ActuatorBoard.sender_id()
+    };
+
+    (cmd_id, next, sender)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -85,39 +149,58 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     let now_ms = get_current_timestamp_ms();
 
     // Decide whether we should emit a flight-state packet on this call.
-    let mut state_guard = dummy_state().lock().expect("dummy_state mutex poisoned");
+    {
+        let mut state_guard = dummy_state().lock().expect("dummy_state mutex poisoned");
 
-    let mut emit_flightstate = false;
-    if now_ms as i64 - state_guard.last_flightstate_ms >= FLIGHT_STATE_INTERVAL_MS {
-        // Advance to next state (wrapping) and mark that we should
-        // emit a flight-state packet instead of random telemetry.
-        state_guard.last_flightstate_ms = now_ms as i64;
-        state_guard.idx = (state_guard.idx + 1) % FLIGHT_STATES.len();
-        emit_flightstate = true;
+        let mut emit_flightstate = false;
+        if now_ms as i64 - state_guard.last_flightstate_ms >= FLIGHT_STATE_INTERVAL_MS {
+            // Advance to next state (wrapping) and mark that we should
+            // emit a flight-state packet instead of random telemetry.
+            state_guard.last_flightstate_ms = now_ms as i64;
+            state_guard.idx = (state_guard.idx + 1) % FLIGHT_STATES.len();
+            emit_flightstate = true;
+        }
+
+        if emit_flightstate {
+            // Grab the state we advanced to.
+            let flight_state = &FLIGHT_STATES[state_guard.idx];
+
+            // Encode FlightState into payload; here as a single u8.
+            // If you have a helper like flight_state_to_u8, use that instead.
+            let state_code = *flight_state as u8;
+
+            return TelemetryPacket::new(
+                FlightState, // <- make sure this matches your DataType variant name
+                &[DataEndpoint::GroundStation],
+                sender,
+                now_ms,
+                Arc::from([state_code]),
+            );
+        }
     }
 
-    if emit_flightstate {
-        // Grab the state we advanced to.
-        let flight_state = &FLIGHT_STATES[state_guard.idx];
-        drop(state_guard); // release mutex early
+    // Maybe emit umbilical status
+    let mut rng = rand::rng();
+    {
+        let mut state_guard = dummy_state().lock().expect("dummy_state mutex poisoned");
+        let since = now_ms as i64 - state_guard.last_umbilical_ms;
+        if since >= state_guard.next_umbilical_ms {
+            let (cmd_id, on, sender_id) = next_umbilical_status(&mut state_guard, &mut rng);
+            state_guard.last_umbilical_ms = now_ms as i64;
+            state_guard.next_umbilical_ms = rng.random_range(UMBILICAL_MIN_INTERVAL_MS..=UMBILICAL_MAX_INTERVAL_MS);
+            drop(state_guard);
 
-        // Encode FlightState into payload; here as a single u8.
-        // If you have a helper like flight_state_to_u8, use that instead.
-        let state_code = *flight_state as u8;
-
-        return TelemetryPacket::new(
-            FlightState, // <- make sure this matches your DataType variant name
-            &[DataEndpoint::GroundStation],
-            sender,
-            now_ms,
-            Arc::from([state_code]),
-        );
+            return TelemetryPacket::new(
+                UmbilicalStatus,
+                &[DataEndpoint::GroundStation],
+                sender_id,
+                now_ms,
+                Arc::from([cmd_id, if on { 1 } else { 0 }]),
+            );
+        }
     }
 
     // Not time for a flight-state packet → generate a random telemetry packet.
-    drop(state_guard);
-
-    let mut rng = rand::rng();
 
     // Choose one of the data-carrying types (NOT TelemetryError / GenericError / MessageData)
     let choices = [
