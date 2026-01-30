@@ -6,11 +6,11 @@ use sedsprintf_rs_2026::config::DataType;
 use crate::radio::RadioDevice;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
-use crate::GPIO_IGNITION_PIN;
 use groundstation_shared::Board;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
+use crate::gpio_panel::IGNITION_PIN;
 
 pub async fn telemetry_task(
     state: Arc<AppState>,
@@ -49,7 +49,7 @@ pub async fn telemetry_task(
                                         &[FlightCommands::Launch as u8],
                                     ).expect("failed to log Launch command");
                                 let gpio = &state.gpio;
-                                gpio.write_output_pin(GPIO_IGNITION_PIN, true).expect("failed to set gpio output");
+                                gpio.write_output_pin(IGNITION_PIN, true).expect("failed to set gpio output");
                                 println!("Launch command sent");
 
                             }
@@ -67,7 +67,7 @@ pub async fn telemetry_task(
                                     ).expect("failed to log Dump command");
                                 {
                                     let gpio = &state.gpio;
-                                    gpio.write_output_pin(GPIO_IGNITION_PIN, false).expect("failed to set gpio output");
+                                    gpio.write_output_pin(IGNITION_PIN, false).expect("failed to set gpio output");
                                 }
                                 println!("Dump command sent {:?}", cmd);
                             }
@@ -106,13 +106,13 @@ pub async fn telemetry_task(
                                     ).expect("failed to log Igniter command");
                                 println!("Pilot command sent {:?}", cmd);
                             }
-                        TelemetryCommand::Tanks => {
-                                let key = ValveBoardCommands::TanksOpen as u8;
+                        TelemetryCommand::NormallyOpen => {
+                                let key = ValveBoardCommands::NormallyOpenOpen as u8;
                                 let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
                                 let cmd = if is_on {
-                                    ValveBoardCommands::TanksClose
+                                    ValveBoardCommands::NormallyOpenClose
                                 } else {
-                                    ValveBoardCommands::TanksOpen
+                                    ValveBoardCommands::NormallyOpenOpen
                                 };
                                 router.log_queue(
                                         DataType::ValveCommand,
@@ -187,8 +187,8 @@ fn umbilical_state_key(cmd_id: u8, on: bool) -> Option<(u8, bool)> {
     match cmd_id {
         x if x == V::PilotOpen as u8 => Some((V::PilotOpen as u8, on)),
         x if x == V::PilotClose as u8 => Some((V::PilotOpen as u8, false)),
-        x if x == V::TanksOpen as u8 => Some((V::TanksOpen as u8, on)),
-        x if x == V::TanksClose as u8 => Some((V::TanksOpen as u8, false)),
+        x if x == V::NormallyOpenOpen as u8 => Some((V::NormallyOpenOpen as u8, on)),
+        x if x == V::NormallyOpenClose as u8 => Some((V::NormallyOpenOpen as u8, false)),
         x if x == V::DumpOpen as u8 => Some((V::DumpOpen as u8, on)),
         x if x == V::DumpClose as u8 => Some((V::DumpOpen as u8, false)),
         x if x == A::IgniterOn as u8 => Some((A::IgniterOn as u8, on)),
@@ -214,7 +214,7 @@ fn valve_state_values(state: &AppState) -> [Option<f32>; 8] {
 
     [
         bool_to_f32(state.get_umbilical_valve_state(V::PilotOpen as u8)),
-        bool_to_f32(state.get_umbilical_valve_state(V::TanksOpen as u8)),
+        bool_to_f32(state.get_umbilical_valve_state(V::NormallyOpenOpen as u8)),
         bool_to_f32(state.get_umbilical_valve_state(V::DumpOpen as u8)),
         bool_to_f32(state.get_umbilical_valve_state(A::IgniterOn as u8)),
         bool_to_f32(state.get_umbilical_valve_state(A::NitrogenOpen as u8)),

@@ -8,7 +8,7 @@ pub enum TelemetryCommand {
     Launch,
     Dump,
     Abort,
-    Tanks,
+    NormallyOpen,
     Pilot,
     Igniter,
     RetractPlumbing,

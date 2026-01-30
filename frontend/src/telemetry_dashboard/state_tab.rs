@@ -118,7 +118,7 @@ fn valve_state_grid(rows: &[TelemetryRow]) -> Element {
 
     let items = [
         ("Pilot", row.v0),
-        ("Tanks", row.v1),
+        ("NormallyOpen", row.v1),
         ("Dump", row.v2),
         ("Igniter", row.v3),
         ("Nitrogen", row.v4),
@@ -223,8 +223,8 @@ fn actions_for_state(state: FlightState) -> Vec<ActionDef> {
                 fg: "#fecaca",
             },
             ActionDef {
-                label: "Tanks",
-                cmd: "Tanks",
+                label: "NormallyOpen",
+                cmd: "NormallyOpen",
                 border: "#f97316",
                 bg: "#1f2937",
                 fg: "#ffedd5",

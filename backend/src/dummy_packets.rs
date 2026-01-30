@@ -87,10 +87,10 @@ fn next_umbilical_status(
 ) -> (u8, bool, &'static str) {
     let valve_cmds = [
         ValveBoardCommands::PilotOpen as u8,
-        ValveBoardCommands::TanksOpen as u8,
+        ValveBoardCommands::NormallyOpenOpen as u8,
         ValveBoardCommands::DumpOpen as u8,
         ValveBoardCommands::PilotClose as u8,
-        ValveBoardCommands::TanksClose as u8,
+        ValveBoardCommands::NormallyOpenClose as u8,
         ValveBoardCommands::DumpClose as u8,
     ];
     let actuator_cmds = [

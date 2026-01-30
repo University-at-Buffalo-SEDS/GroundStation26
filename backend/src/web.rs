@@ -72,7 +72,7 @@ pub struct FlightStateMsg {
 pub struct ValveStateMsg {
     pub timestamp_ms: i64,
     pub pilot_open: Option<bool>,
-    pub tanks_open: Option<bool>,
+    pub normally_open_open: Option<bool>,
     pub dump_open: Option<bool>,
     pub igniter_on: Option<bool>,
     pub nitrogen_open: Option<bool>,
@@ -141,7 +141,7 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
         ValveStateMsg {
             timestamp_ms,
             pilot_open: to_bool("v0"),
-            tanks_open: to_bool("v1"),
+            normally_open_open: to_bool("v1"),
             dump_open: to_bool("v2"),
             igniter_on: to_bool("v3"),
             nitrogen_open: to_bool("v4"),

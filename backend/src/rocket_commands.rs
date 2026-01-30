@@ -8,10 +8,10 @@ pub enum FlightCommands {
 #[derive(Debug, Clone, Copy)]
 pub enum ValveBoardCommands {
     PilotOpen = 0,
-    TanksOpen = 1,
+    NormallyOpenOpen = 1,
     DumpOpen = 2,
     PilotClose = 3,
-    TanksClose = 4,
+    NormallyOpenClose = 4,
     DumpClose = 5,
 }
 #[repr(u8)]

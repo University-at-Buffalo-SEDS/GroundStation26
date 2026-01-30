@@ -51,6 +51,9 @@ pub struct AppState {
 
     /// Umbilical valve states keyed by command id (u8)
     pub umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
+
+    /// Latest fuel tank pressure (psi)
+    pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
 }
 
 impl AppState {

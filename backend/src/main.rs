@@ -3,14 +3,15 @@
 #[cfg(feature = "testing")]
 mod dummy_packets;
 mod gpio;
+mod gpio_panel;
 mod map;
 mod radio;
 mod ring_buffer;
+mod rocket_commands;
 mod safety_task;
 mod state;
 mod telemetry_task;
 mod web;
-mod rocket_commands;
 
 use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
 use crate::ring_buffer::RingBuffer;
@@ -18,42 +19,32 @@ use crate::safety_task::safety_task;
 use crate::state::{AppState, BoardStatus};
 use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
-use crate::gpio::Trigger::RisingEdge;
 #[cfg(feature = "testing")]
 use crate::radio::DummyRadio;
 use crate::radio::{Radio, RadioDevice, RADIO_BAUD_RATE, ROCKET_RADIO_PORT, UMBILICAL_RADIO_PORT};
-use crate::web::emit_error;
 use axum::Router;
 use groundstation_shared::{Board, FlightState as FlightStateMode};
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
-use sedsprintf_rs_2026::{TelemetryError};
+use sedsprintf_rs_2026::TelemetryError;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+// use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc};
+use crate::web::emit_error;
 
 fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
     Box::new(get_current_timestamp_ms)
 }
-const GPIO_IGNITION_PIN: u8 = 5;
-const GPIO_ABORT_PIN: u8 = 9;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize GPIO
     let gpio = gpio::GpioPins::new();
-
-    gpio.setup_input_pin(GPIO_ABORT_PIN)
-        .expect("failed to setup gpio pin");
-    gpio.setup_output_pin(GPIO_IGNITION_PIN)
-        .expect("failed to setup gpio pin");
-
-    let gpio_clone = gpio.clone();
 
     // Ensure offline map tiles
     if let Err(e) = ensure_map_data(DEFAULT_MAP_REGION).await {
@@ -89,8 +80,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     sqlx::query(
         r#"
@@ -102,8 +93,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     sqlx::query(
         r#"
@@ -114,8 +105,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -147,16 +138,19 @@ async fn main() -> anyhow::Result<()> {
         board_status: Arc::new(Mutex::new(board_status)),
         board_status_tx,
         umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
+        latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
     });
+
+    gpio_panel::setup_gpio_panel(state.clone())
+        .expect("failed to setup gpio panel");
 
     // --- Router endpoint handlers ---
     let ground_station_handler_state_clone = state.clone();
     let abort_handler_state_clone = state.clone();
     let flight_state_handler_state_clone = state.clone();
 
-    let ground_station_handler = EndpointHandler::new_packet_handler(
-        GroundStation,
-        move |pkt: &TelemetryPacket| {
+    let ground_station_handler =
+        EndpointHandler::new_packet_handler(GroundStation, move |pkt: &TelemetryPacket| {
             ground_station_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             let mut rb = ground_station_handler_state_clone
@@ -165,8 +159,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap();
             rb.push(pkt.clone());
             Ok(())
-        },
-    );
+        });
 
     let flight_state_handler =
         EndpointHandler::new_packet_handler(FlightState, move |pkt: &TelemetryPacket| {
@@ -177,15 +170,14 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         });
 
-    let abort_handler =
-        EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket| {
-            abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
-            let error_msg = pkt
-                .data_as_string()
-                .expect("Abort packet with invalid UTF-8");
-            emit_error(&abort_handler_state_clone, error_msg);
-            Ok(())
-        });
+    let abort_handler = EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket| {
+        abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+        let error_msg = pkt
+            .data_as_string()
+            .expect("Abort packet with invalid UTF-8");
+        emit_error(&abort_handler_state_clone, error_msg);
+        Ok(())
+    });
 
     let cfg = sedsprintf_rs_2026::router::RouterConfig::new([
         ground_station_handler,
@@ -268,28 +260,6 @@ async fn main() -> anyhow::Result<()> {
         .lock()
         .expect("failed to get umbilical radio lock")
         .set_side_id(umbilical_side);
-
-    // Clone what you need for the callback
-    let router_for_cb = router.clone();
-    let state_for_cb = state.clone();
-
-    gpio_clone
-        .setup_callback_input_pin(
-            GPIO_ABORT_PIN,
-            RisingEdge,
-            Duration::from_millis(50),
-            move |_| {
-                // now we use the owned clones captured by `move`
-                router_for_cb
-                    .log::<u8>(DataType::Abort, "Manual abort button pressed!".as_bytes())
-                    .expect("failed to log Abort command");
-
-                emit_error(&state_for_cb, "Manual abort button pressed!".to_string());
-
-                println!("Manual abort button pressed!");
-            },
-        )
-        .expect("failed to setup gpio callback input");
 
     router.log_queue(DataType::MessageData, "hello".as_bytes())?;
     router.log_queue(DataType::FlightState, &[FlightStateMode::Startup as u8])?;

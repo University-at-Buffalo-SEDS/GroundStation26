@@ -58,7 +58,7 @@ pub fn ActionsTab() -> Element {
                 button {
                     style: "{btn_style(\"#f97316\", \"#1f2937\", \"#ffedd5\")}",
                     onclick: move |_| crate::telemetry_dashboard::send_cmd("Tanks"),
-                    "Tanks"
+                    "NormallyOpen"
                 }
                 button {
                     style: "{btn_style(\"#22d3ee\", \"#0b1220\", \"#cffafe\")}",

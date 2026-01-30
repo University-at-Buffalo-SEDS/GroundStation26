@@ -366,12 +366,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
 }
 
 fn summary_color(i: usize) -> &'static str {
-    match i {
-        0 => "#f97316",
-        1 => "#22d3ee",
-        2 => "#a3e635",
-        _ => "#9ca3af",
-    }
+    series_color(i)
 }
 
 #[component]

@@ -116,6 +116,11 @@ pub fn series_color(i: usize) -> &'static str {
         0 => "#f97316",
         1 => "#22d3ee",
         2 => "#a3e635",
+        3 => "#f43f5e",
+        4 => "#8b5cf6",
+        5 => "#e879f9",
+        6 => "#10b981",
+        7 => "#fbbf24",
         _ => "#9ca3af",
     }
 }
@@ -133,7 +138,7 @@ pub fn labels_for_datatype(dt: &str) -> [&'static str; 8] {
         "FUEL_TANK_PRESSURE" => ["Pressure", "", "", "", "", "", "", ""],
         "VALVE_STATE" => [
             "Pilot",
-            "Tanks",
+            "NormallyOpen",
             "Dump",
             "Igniter",
             "Nitrogen",
