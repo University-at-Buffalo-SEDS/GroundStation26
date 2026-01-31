@@ -89,7 +89,9 @@ pub fn charts_cache_get_channel_minmax(
 // Cache internals
 // ============================================================
 
-const MAX_POINTS: usize = 1200;
+const MAX_POINTS_CAP: usize = 60000; // cap for downsample points (smooth scrolling at 20min)
+const MIN_POINTS: usize = 240;       // keep some detail even for tiny spans
+const TARGET_BUCKET_MS: i64 = 20;   // aim ~5Hz resolution at max span
 const MIN_SPAN_MS: i64 = 1_000; // avoid divide-by-zero (1s)
 
 // Keep at most this many samples per datatype as a hard cap (in addition to time pruning).
@@ -327,9 +329,17 @@ impl CachedChart {
         let span_ms = raw_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
         let start_ts = newest_ts.saturating_sub(span_ms);
 
-        let bucket_ms = (span_ms / MAX_POINTS as i64).max(1);
+        // Adaptive downsampling:
+        // - Aim ~TARGET_BUCKET_MS resolution when the window is large.
+        // - Cap point count by pixel width so tiny charts don't build huge paths.
+        let mut points = ((span_ms + TARGET_BUCKET_MS - 1) / TARGET_BUCKET_MS) as usize;
+        points = points.clamp(MIN_POINTS, MAX_POINTS_CAP);
+        let px_cap = (w.max(1.0) as usize).saturating_mul(3).max(MIN_POINTS);
+        points = points.min(px_cap).clamp(MIN_POINTS, MAX_POINTS_CAP);
 
-        let mut buckets = vec![Bucket::default(); MAX_POINTS];
+        let bucket_ms = (span_ms / points as i64).max(1);
+
+        let mut buckets = vec![Bucket::default(); points];
 
         let mut chan_min: [Option<f32>; 8] = [None; 8];
         let mut chan_max: [Option<f32>; 8] = [None; 8];
@@ -343,7 +353,7 @@ impl CachedChart {
             }
 
             let bi =
-                ((samp.ts - start_ts) / bucket_ms).clamp(0, (MAX_POINTS as i64) - 1) as usize;
+                ((samp.ts - start_ts) / bucket_ms).clamp(0, (points as i64) - 1) as usize;
 
             let b = &mut buckets[bi];
 
@@ -399,8 +409,8 @@ impl CachedChart {
 
         let mut last_seen: [Option<f32>; 8] = [None; 8];
 
-        for idx in 0..MAX_POINTS {
-            let x = left + pw * ((idx as f32 + 0.5) / MAX_POINTS as f32);
+        for idx in 0..buckets.len() {
+            let x = left + pw * ((idx as f32 + 0.5) / buckets.len().max(1) as f32);
 
             let b = &buckets[idx];
 
