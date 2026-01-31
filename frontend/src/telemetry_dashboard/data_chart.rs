@@ -68,6 +68,23 @@ pub fn charts_cache_get(
     })
 }
 
+pub fn charts_cache_get_channel_minmax(
+    data_type: &str,
+    width: f32,
+    height: f32,
+) -> ([Option<f32>; 8], [Option<f32>; 8]) {
+    CHARTS_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(ch) = c.charts.get_mut(data_type) {
+            ch.build_if_needed(width, height);
+            (ch.chan_min, ch.chan_max)
+        } else {
+            ([None; 8], [None; 8])
+        }
+    })
+}
+
+
 // ============================================================
 // Cache internals
 // ============================================================
@@ -158,6 +175,10 @@ struct CachedChart {
     raw_min: f32,
     raw_max: f32,
 
+    // Per-channel min/max (for summary cards)
+    chan_min: [Option<f32>; 8],
+    chan_max: [Option<f32>; 8],
+
     // Displayed (sticky) range
     disp_min: f32,
     disp_max: f32,
@@ -174,6 +195,8 @@ impl CachedChart {
             paths: std::array::from_fn(|_| String::new()),
             raw_min: 0.0,
             raw_max: 1.0,
+            chan_min: [None; 8],
+            chan_max: [None; 8],
             disp_min: 0.0,
             disp_max: 1.0,
             span_min: 0.0,
@@ -283,6 +306,8 @@ impl CachedChart {
             }
             self.raw_min = 0.0;
             self.raw_max = 1.0;
+            self.chan_min = [None; 8];
+            self.chan_max = [None; 8];
             self.disp_min = 0.0;
             self.disp_max = 1.0;
             self.span_min = 0.0;
@@ -305,6 +330,9 @@ impl CachedChart {
         let bucket_ms = (span_ms / MAX_POINTS as i64).max(1);
 
         let mut buckets = vec![Bucket::default(); MAX_POINTS];
+
+        let mut chan_min: [Option<f32>; 8] = [None; 8];
+        let mut chan_max: [Option<f32>; 8] = [None; 8];
 
         let mut min = f32::INFINITY;
         let mut max = f32::NEG_INFINITY;
@@ -334,6 +362,9 @@ impl CachedChart {
 
                     min = min.min(v);
                     max = max.max(v);
+
+                    chan_min[ch] = Some(match chan_min[ch] { Some(m) => m.min(v), None => v });
+                    chan_max[ch] = Some(match chan_max[ch] { Some(m) => m.max(v), None => v });
                 }
             }
         }
@@ -342,6 +373,8 @@ impl CachedChart {
 
         self.raw_min = min;
         self.raw_max = max;
+        self.chan_min = chan_min;
+        self.chan_max = chan_max;
 
         // Sticky displayed range (this is the key fix)
         self.update_display_range(self.raw_min, self.raw_max);

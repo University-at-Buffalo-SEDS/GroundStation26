@@ -5,7 +5,7 @@ use dioxus_signals::Signal;
 use groundstation_shared::{BoardStatusEntry, FlightState, TelemetryRow};
 
 use crate::telemetry_dashboard::data_chart::{
-    charts_cache_get, labels_for_datatype, series_color,
+    charts_cache_get, charts_cache_get_channel_minmax, labels_for_datatype, series_color,
 };
 use crate::telemetry_dashboard::map_tab::MapTab;
 #[cfg(not(target_arch = "wasm32"))]
@@ -14,9 +14,9 @@ fn target_frame_duration() -> std::time::Duration {
     let fps: u64 = std::env::var("GS_UI_FPS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(120);
+        .unwrap_or(240);
 
-    let fps = fps.clamp(1, 240);
+    let fps = fps.clamp(1, 480);
     std::time::Duration::from_micros(1_000_000 / fps)
 }
 
@@ -464,26 +464,49 @@ fn action_style(border: &str, bg: &str, fg: &str) -> String {
 }
 
 fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[(&'static str, usize)]) -> Element {
+    let want_minmax = dt != "VALVE_STATE" && dt != "GPS_DATA";
+
+    // Min/max over the same effective window as the chart cache.
+    // Height doesn't matter for stats; keep width consistent with the charts in this tab.
+    let (chan_min, chan_max) = if want_minmax {
+        charts_cache_get_channel_minmax(dt, 1200.0, 300.0)
+    } else {
+        ([None; 8], [None; 8])
+    };
+
     let latest = items
         .iter()
-        .map(|(label, idx)| (*label, latest_value(rows, dt, *idx)))
+        .map(|(label, idx)| (*label, *idx, latest_value(rows, dt, *idx)))
         .collect::<Vec<_>>();
 
     rsx! {
         div { style: "display:flex; flex-wrap:wrap; gap:10px; margin-bottom:12px;",
-            for (label, value) in latest {
-                SummaryCard { label: label, value: fmt_opt(value) }
+            for (label, idx, value) in latest {
+                SummaryCard {
+                    label: label,
+                    value: fmt_opt(value),
+                    min: if want_minmax { chan_min[idx].map(|v| format!("{v:.4}")) } else { None },
+                    max: if want_minmax { chan_max[idx].map(|v| format!("{v:.4}")) } else { None },
+                }
             }
         }
     }
 }
 
 #[component]
-fn SummaryCard(label: &'static str, value: String) -> Element {
+fn SummaryCard(label: &'static str, value: String, min: Option<String>, max: Option<String>) -> Element {
+    let mm = match (min.as_deref(), max.as_deref()) {
+        (Some(mi), Some(ma)) => Some(format!("min {mi} • max {ma}")),
+        _ => None,
+    };
+
     rsx! {
-        div { style: "padding:10px; border-radius:12px; background:#0f172a; border:1px solid #334155; min-width:120px;",
+        div { style: "padding:10px; border-radius:12px; background:#0f172a; border:1px solid #334155; min-width:140px;",
             div { style: "font-size:12px; color:#93c5fd;", "{label}" }
-            div { style: "font-size:18px; color:#e5e7eb;", "{value}" }
+            div { style: "font-size:18px; color:#e5e7eb; line-height:1.1;", "{value}" }
+            if let Some(t) = mm {
+                div { style: "font-size:11px; color:#94a3b8; margin-top:4px;", "{t}" }
+            }
         }
     }
 }

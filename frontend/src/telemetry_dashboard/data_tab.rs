@@ -3,7 +3,9 @@ use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use groundstation_shared::TelemetryRow;
 
-use super::data_chart::{charts_cache_get, labels_for_datatype, series_color};
+use super::data_chart::{
+    charts_cache_get, charts_cache_get_channel_minmax, labels_for_datatype, series_color,
+};
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
 
@@ -21,9 +23,9 @@ fn target_frame_duration() -> std::time::Duration {
     let fps: u64 = std::env::var("GS_UI_FPS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(120);
+        .unwrap_or(240);
 
-    let fps = fps.clamp(1, 240);
+    let fps = fps.clamp(1, 480);
     std::time::Duration::from_micros(1_000_000 / fps)
 }
 
@@ -223,6 +225,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
 
     // Cache fetch
     let (paths, y_min, y_max, span_min) = charts_cache_get(&current, view_w as f32, view_h as f32);
+    let (chan_min, chan_max) = charts_cache_get_channel_minmax(&current, view_w as f32, view_h as f32);
     let (paths_full, _, _, _) = charts_cache_get(&current, view_w as f32, view_h_full as f32);
     let y_mid = (y_min + y_max) * 0.5;
 
@@ -286,6 +289,8 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                                     if !labels[i].is_empty() {
                                         SummaryCard {
                                             label: labels[i],
+                                            min: if is_graph_allowed { chan_min[i].map(|v| format!("{v:.4}")) } else { None },
+                                            max: if is_graph_allowed { chan_max[i].map(|v| format!("{v:.4}")) } else { None },
                                             value: if is_valve_state {
                                                 valve_state_text(vals[i], labels[i] == "Fill Lines")
                                             } else {
@@ -460,11 +465,25 @@ fn summary_color(i: usize) -> &'static str {
 }
 
 #[component]
-fn SummaryCard(label: &'static str, value: String, color: &'static str) -> Element {
+fn SummaryCard(
+    label: &'static str,
+    value: String,
+    min: Option<String>,
+    max: Option<String>,
+    color: &'static str,
+) -> Element {
+    let mm = match (min.as_deref(), max.as_deref()) {
+        (Some(mi), Some(ma)) => Some(format!("min {mi} • max {ma}")),
+        _ => None,
+    };
+
     rsx! {
-        div { style: "padding:10px; border-radius:12px; background:#0f172a; border:1px solid #334155; min-width:92px;",
+        div { style: "padding:10px; border-radius:12px; background:#0f172a; border:1px solid #334155; min-width:120px;",
             div { style: "font-size:12px; color:{color};", "{label}" }
-            div { style: "font-size:18px; color:#e5e7eb;", "{value}" }
+            div { style: "font-size:18px; color:#e5e7eb; line-height:1.1;", "{value}" }
+            if let Some(t) = mm {
+                div { style: "font-size:11px; color:#94a3b8; margin-top:4px;", "{t}" }
+            }
         }
     }
 }

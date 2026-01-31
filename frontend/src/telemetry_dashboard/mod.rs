@@ -638,14 +638,18 @@ fn TelemetryDashboardInner() -> Element {
 
             spawn(async move {
                 // Target ~120 FPS. In browsers this often ends up ~60 FPS depending on clamps.
-                const TICK_MS: u32 = 8;
+                let tick_ms: u32 = std::env::var("GS_UI_TICK_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(4)
+                    .clamp(1, 50);
 
                 while alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
                     #[cfg(target_arch = "wasm32")]
-                    gloo_timers::future::TimeoutFuture::new(TICK_MS).await;
+                    gloo_timers::future::TimeoutFuture::new(tick_ms).await;
 
                     #[cfg(not(target_arch = "wasm32"))]
-                    tokio::time::sleep(std::time::Duration::from_millis(TICK_MS as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(tick_ms as u64)).await;
 
                     if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
                         break;
