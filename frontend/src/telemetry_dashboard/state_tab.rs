@@ -8,9 +8,10 @@ use crate::telemetry_dashboard::data_chart::{
     charts_cache_get, charts_cache_get_channel_minmax, labels_for_datatype, series_color,
 };
 use crate::telemetry_dashboard::map_tab::MapTab;
+
 #[cfg(not(target_arch = "wasm32"))]
 fn target_frame_duration() -> std::time::Duration {
-    // Default 120fps; override with GS_UI_FPS=60 etc.
+    // Default 240fps; override with GS_UI_FPS=60 etc.
     let fps: u64 = std::env::var("GS_UI_FPS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -30,9 +31,6 @@ pub fn StateTab(
 ) -> Element {
     // ------------------------------------------------------------
     // Redraw driver for charts on State tab
-    // - wasm32: requestAnimationFrame (display refresh)
-    // - native: ~120fps timer (GS_UI_FPS override)
-    // Always ticks (no dirty gate) so charts stay smooth even if ingestion is batched.
     // ------------------------------------------------------------
     let redraw_tick = use_signal(|| 0u64);
 
@@ -51,7 +49,6 @@ pub fn StateTab(
                 let cb2 = cb.clone();
 
                 *cb2.borrow_mut() = Some(Closure::wrap(Box::new(move |_ts: f64| {
-                    // E0502-safe: read then set
                     let next = redraw_tick.read().wrapping_add(1);
                     redraw_tick.set(next);
 
@@ -68,7 +65,6 @@ pub fn StateTab(
                     );
                 }
 
-                // Keep callback alive forever
                 std::mem::forget(cb2);
             }
 
@@ -78,8 +74,6 @@ pub fn StateTab(
                 spawn(async move {
                     loop {
                         tokio::time::sleep(frame).await;
-
-                        // E0502-safe: read then set
                         let next = redraw_tick.read().wrapping_add(1);
                         redraw_tick.set(next);
                     }
@@ -161,7 +155,8 @@ pub fn StateTab(
     };
 
     rsx! {
-        div { style: "padding:16px; display:flex; flex-direction:column; gap:16px;",
+        // ✅ Make StateTab scrollable + add bottom padding and a spacer div
+        div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto; display:flex; flex-direction:column; gap:16px; padding-bottom:100px;",
             h2 { style: "margin:0; color:#e5e7eb;", "State" }
             div { style: "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;",
                 div { style: "font-size:14px; color:#94a3b8;", "Current Flight State" }
@@ -170,6 +165,7 @@ pub fn StateTab(
                 }
             }
             {content}
+
         }
     }
 }
@@ -185,7 +181,7 @@ fn Section(title: &'static str, children: Element) -> Element {
 }
 
 // ============================================================
-// NEW: cached chart renderer (uses charts_cache_get)
+// cached chart renderer (uses charts_cache_get)
 // ============================================================
 
 fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&str>) -> Element {
@@ -218,7 +214,6 @@ fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&st
                 style: "width:100%; height:auto; display:block;",
                 view_box: "0 0 {view_w} {view_h}",
 
-                // gridlines
                 for i in 1..=5 {
                     line {
                         x1:"{left}", y1:"{top + grid_y_step * (i as f64)}",
@@ -234,21 +229,17 @@ fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&st
                     }
                 }
 
-                // axes
                 line { x1:"{left}", y1:"{top}",    x2:"{left}",  y2:"{bottom}", stroke:"#334155", stroke_width:"1" }
                 line { x1:"{left}", y1:"{bottom}", x2:"{right}", y2:"{bottom}", stroke:"#334155", stroke_width:"1" }
 
-                // y labels  (IMPORTANT: these must be expressions, NOT quoted strings)
                 text { x:"10", y:"{top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
                 text { x:"10", y:"{top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
                 text { x:"10", y:"{bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
 
-                // x labels (span in minutes)  (IMPORTANT: expressions, NOT quoted)
                 text { x:"{left + 10.0}",  y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
                 text { x:"{view_w * 0.5}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
                 text { x:"{right - 60.0}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
 
-                // series paths
                 for ch in 0..8usize {
                     if !paths[ch].is_empty() {
                         path {
@@ -262,7 +253,6 @@ fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&st
                 }
             }
 
-            // legend (optional)
             div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
                 for i in 0..8usize {
                     if !labels[i].is_empty() {
@@ -280,7 +270,7 @@ fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&st
 }
 
 // ============================================================
-// Existing StateTab helpers (unchanged)
+// Existing StateTab helpers (mostly unchanged)
 // ============================================================
 
 fn valve_state_grid(rows: &[TelemetryRow]) -> Element {
@@ -392,55 +382,13 @@ fn actions_for_state(state: FlightState) -> Vec<ActionDef> {
         | FlightState::FillTest
         | FlightState::NitrogenFill
         | FlightState::NitrousFill => vec![
-            ActionDef {
-                label: "Dump",
-                cmd: "Dump",
-                border: "#ef4444",
-                bg: "#450a0a",
-                fg: "#fecaca",
-            },
-            ActionDef {
-                label: "NormallyOpen",
-                cmd: "NormallyOpen",
-                border: "#f97316",
-                bg: "#1f2937",
-                fg: "#ffedd5",
-            },
-            ActionDef {
-                label: "Pilot",
-                cmd: "Pilot",
-                border: "#a78bfa",
-                bg: "#111827",
-                fg: "#ddd6fe",
-            },
-            ActionDef {
-                label: "Igniter",
-                cmd: "Igniter",
-                border: "#60a5fa",
-                bg: "#0b1220",
-                fg: "#bfdbfe",
-            },
-            ActionDef {
-                label: "Nitrogen",
-                cmd: "Nitrogen",
-                border: "#22d3ee",
-                bg: "#0b1220",
-                fg: "#cffafe",
-            },
-            ActionDef {
-                label: "Nitrous",
-                cmd: "Nitrous",
-                border: "#a3e635",
-                bg: "#111827",
-                fg: "#ecfccb",
-            },
-            ActionDef {
-                label: "Fill Lines",
-                cmd: "RetractPlumbing",
-                border: "#eab308",
-                bg: "#1f2937",
-                fg: "#fef9c3",
-            },
+            ActionDef { label: "Dump", cmd: "Dump", border: "#ef4444", bg: "#450a0a", fg: "#fecaca" },
+            ActionDef { label: "NormallyOpen", cmd: "NormallyOpen", border: "#f97316", bg: "#1f2937", fg: "#ffedd5" },
+            ActionDef { label: "Pilot", cmd: "Pilot", border: "#a78bfa", bg: "#111827", fg: "#ddd6fe" },
+            ActionDef { label: "Igniter", cmd: "Igniter", border: "#60a5fa", bg: "#0b1220", fg: "#bfdbfe" },
+            ActionDef { label: "Nitrogen", cmd: "Nitrogen", border: "#22d3ee", bg: "#0b1220", fg: "#cffafe" },
+            ActionDef { label: "Nitrous", cmd: "Nitrous", border: "#a3e635", bg: "#111827", fg: "#ecfccb" },
+            ActionDef { label: "Fill Lines", cmd: "RetractPlumbing", border: "#eab308", bg: "#1f2937", fg: "#fef9c3" },
         ],
         FlightState::Startup => vec![],
         FlightState::Launch
@@ -466,8 +414,6 @@ fn action_style(border: &str, bg: &str, fg: &str) -> String {
 fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[(&'static str, usize)]) -> Element {
     let want_minmax = dt != "VALVE_STATE" && dt != "GPS_DATA";
 
-    // Min/max over the same effective window as the chart cache.
-    // Height doesn't matter for stats; keep width consistent with the charts in this tab.
     let (chan_min, chan_max) = if want_minmax {
         charts_cache_get_channel_minmax(dt, 1200.0, 300.0)
     } else {
@@ -480,7 +426,7 @@ fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[(&'static str, usize)])
         .collect::<Vec<_>>();
 
     rsx! {
-        div { style: "display:flex; flex-wrap:wrap; gap:10px; margin-bottom:12px;",
+        div { style: "display:grid; gap:10px; margin-bottom:12px; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); width:100%;",
             for (label, idx, value) in latest {
                 SummaryCard {
                     label: label,
@@ -501,7 +447,7 @@ fn SummaryCard(label: &'static str, value: String, min: Option<String>, max: Opt
     };
 
     rsx! {
-        div { style: "padding:10px; border-radius:12px; background:#0f172a; border:1px solid #334155; min-width:140px;",
+        div { style: "padding:10px; border-radius:12px; background:#0f172a; border:1px solid #334155; width:100%; min-width:0; box-sizing:border-box;",
             div { style: "font-size:12px; color:#93c5fd;", "{label}" }
             div { style: "font-size:18px; color:#e5e7eb; line-height:1.1;", "{value}" }
             if let Some(t) = mm {

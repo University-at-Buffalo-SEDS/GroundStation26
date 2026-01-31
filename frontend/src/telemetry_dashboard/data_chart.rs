@@ -3,17 +3,19 @@
 // High-performance chart cache (incremental ingest):
 // - Keep a bounded, time-pruned ring of samples per data_type.
 // - Rebuild downsampled buckets only when dirty.
-// - Bucket width is based on *effective span*, not HISTORY_MS.
+// - bucket width is based on *effective span*, not HISTORY_MS.
 //
 // FIXES:
 // - Sticky / hysteretic Y-axis so the scale does NOT jump when old spikes fall out of the window.
 //   * Expand immediately (never clip)
 //   * Shrink slowly (prevents “random” mid-run rescaling)
 //   * Add a small padding around the range
-// - Stable X buckets WITHOUT breaking adaptive timescale:
-//   * Window span follows available data (up to HISTORY_MS)
-//   * Bucket boundaries are snapped to a bucket_ms grid so already-plotted data doesn't shimmer
-//   * Line uses bucket "last" value (min/max still tracked for summaries)
+//
+// - IMPORTANT FIX (fullscreen / multiple sizes):
+//   CachedChart used to keep only ONE `paths` buffer. If you call charts_cache_get()
+//   with (w,h) = (1200,360) then later (1200,700) in the same frame, it would not rebuild
+//   because `dirty=false`, causing fullscreen to reuse non-fullscreen geometry.
+//   We now track last_w/last_h and rebuild when size changes.
 //
 // API:
 //   charts_cache_reset_and_ingest(rows)
@@ -61,11 +63,7 @@ pub fn charts_cache_ingest_row(row: &TelemetryRow) {
 /// - [String;8] where each String is an SVG path `d` (may be empty)
 /// - y_min, y_max (for labels)
 /// - span_min (minutes of effective history window)
-pub fn charts_cache_get(
-    data_type: &str,
-    width: f32,
-    height: f32,
-) -> ([String; 8], f32, f32, f32) {
+pub fn charts_cache_get(data_type: &str, width: f32, height: f32) -> ([String; 8], f32, f32, f32) {
     CHARTS_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         c.get(data_type, width, height)
@@ -92,9 +90,10 @@ pub fn charts_cache_get_channel_minmax(
 // Cache internals
 // ============================================================
 
-const MAX_POINTS_CAP: usize = 60000; // cap for downsample points
+const MAX_POINTS_CAP: usize = 60000; // cap for downsample points (smooth scrolling at 20min)
 const MIN_POINTS: usize = 240; // keep some detail even for tiny spans
-const TARGET_BUCKET_MS: i64 = 20; // target temporal resolution (ms)
+const TARGET_BUCKET_MS: i64 = 20; // aim ~5Hz resolution at max span
+const X_ALIGN_MS: i64 = 50; // snap window end to reduce x jitter
 const MIN_SPAN_MS: i64 = 1_000; // avoid divide-by-zero (1s)
 
 // Keep at most this many samples per datatype as a hard cap (in addition to time pruning).
@@ -106,9 +105,9 @@ const MAX_SAMPLES_PER_TYPE: usize = 20_000;
 //
 // Expand immediately (alpha=1.0) when the new range exceeds the displayed range.
 // Shrink slowly to avoid “jumping” when old extremes fall out of the window.
-const Y_SHRINK_ALPHA: f32 = 0.04; // slow convergence; increase for faster shrink
+const Y_SHRINK_ALPHA: f32 = 0.04; // ~ slow convergence; increase for faster shrink
 const Y_PAD_FRAC: f32 = 0.06; // 6% padding around range
-const Y_MIN_PAD_ABS: f32 = 1.0; // at least +/-1 unit of padding
+const Y_MIN_PAD_ABS: f32 = 1.0; // at least +/-1 unit of padding (helps small ranges)
 
 struct ChartsCache {
     charts: HashMap<String, CachedChart>,
@@ -189,9 +188,11 @@ struct CachedChart {
     disp_max: f32,
 
     span_min: f32,
-
-    // Kept for compatibility; we now keep timescale adaptive, so this is only informational.
     prev_span_ms: i64,
+
+    // ✅ NEW: last size used to build `paths`
+    last_w: f32,
+    last_h: f32,
 }
 
 impl CachedChart {
@@ -209,6 +210,8 @@ impl CachedChart {
             disp_max: 1.0,
             span_min: 0.0,
             prev_span_ms: 0,
+            last_w: 0.0,
+            last_h: 0.0,
         }
     }
 
@@ -308,9 +311,13 @@ impl CachedChart {
     }
 
     fn build_if_needed(&mut self, w: f32, h: f32) {
-        if !self.dirty {
+        // ✅ Rebuild if size changed (fixes fullscreen / multi-size callers)
+        let size_changed = (self.last_w - w).abs() > 0.5 || (self.last_h - h).abs() > 0.5;
+        if !self.dirty && !size_changed {
             return;
         }
+        self.last_w = w;
+        self.last_h = h;
 
         if self.samples.is_empty() {
             for s in &mut self.paths {
@@ -338,38 +345,46 @@ impl CachedChart {
 
         let raw_span_ms = newest_ts.saturating_sub(oldest_ts).max(1);
 
-        // Effective window is adaptive: it follows available data up to HISTORY_MS.
-        let span_target_ms = raw_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
+        // Effective window: grow up to HISTORY_MS, but never shrink automatically.
+        let mut span_ms = raw_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
+        if self.prev_span_ms > 0 {
+            span_ms = span_ms.max(self.prev_span_ms);
+        }
+        span_ms = span_ms.min(HISTORY_MS);
+        self.prev_span_ms = span_ms;
 
-        // ------------------------------------------------------------
-        // Stable bucket grid WITHOUT breaking adaptive timescale
-        // ------------------------------------------------------------
-
-        // Choose point count based on target span + width cap.
-        let mut points = ((span_target_ms + TARGET_BUCKET_MS - 1) / TARGET_BUCKET_MS) as usize;
+        // Pick point count
+        let mut points = ((span_ms + TARGET_BUCKET_MS - 1) / TARGET_BUCKET_MS) as usize;
         points = points.clamp(MIN_POINTS, MAX_POINTS_CAP);
         let px_cap = (w.max(1.0) as usize).saturating_mul(3).max(MIN_POINTS);
         points = points.min(px_cap).clamp(MIN_POINTS, MAX_POINTS_CAP);
 
-        // Compute bucket_ms from target span and points (ceil_div).
-        // Do NOT force bucket_ms to be a multiple of some other quantum; that breaks adaptiveness.
-        let bucket_ms = ((span_target_ms + points as i64 - 1) / points as i64).max(1);
+        // Compute bucket_ms from span/points, then lock the window to bucket boundaries.
+        let mut bucket_ms = (span_ms / points as i64).max(1);
 
-        // Snap end_ts to the bucket grid so bucket boundaries don't slide each rebuild.
-        let end_ts = (newest_ts / bucket_ms) * bucket_ms;
+        // Align quantum: round bucket_ms up to a multiple of X_ALIGN_MS
+        let align = if X_ALIGN_MS > 1 {
+            if bucket_ms % X_ALIGN_MS != 0 {
+                bucket_ms = ((bucket_ms + X_ALIGN_MS - 1) / X_ALIGN_MS) * X_ALIGN_MS;
+            }
+            bucket_ms
+        } else {
+            bucket_ms
+        };
 
-        // Start is end - target span, then snapped to the same grid.
-        let mut start_ts = end_ts.saturating_sub(span_target_ms);
-        start_ts = (start_ts / bucket_ms) * bucket_ms;
+        // Snap end_ts to alignment quantum
+        let end_ts = if align > 1 {
+            (newest_ts / align) * align
+        } else {
+            newest_ts
+        };
 
-        // Effective span after snapping (still adaptive, but grid-aligned).
-        let span_ms = end_ts.saturating_sub(start_ts).max(bucket_ms);
+        // Define start_ts so the window spans an integer number of buckets.
+        let start_ts = end_ts.saturating_sub(bucket_ms.saturating_mul(points as i64));
 
-        // Recompute number of buckets from snapped span (ceil_div).
-        let points = ((span_ms + bucket_ms - 1) / bucket_ms) as usize;
-        let points = points.clamp(1, MAX_POINTS_CAP);
-
-        self.prev_span_ms = span_ms;
+        // Update span_ms to match exactly the bucket grid
+        let span_ms = bucket_ms.saturating_mul(points as i64);
+        self.prev_span_ms = self.prev_span_ms.max(span_ms).min(HISTORY_MS);
 
         let mut buckets = vec![Bucket::default(); points];
 
@@ -384,9 +399,7 @@ impl CachedChart {
                 continue;
             }
 
-            let bi =
-                ((samp.ts - start_ts) / bucket_ms).clamp(0, (points as i64) - 1) as usize;
-
+            let bi = ((samp.ts - start_ts) / bucket_ms).clamp(0, (points as i64) - 1) as usize;
             let b = &mut buckets[bi];
 
             for ch in 0..8 {
@@ -449,12 +462,10 @@ impl CachedChart {
 
         for idx in 0..buckets.len() {
             let x = left + pw * ((idx as f32 + 0.5) / buckets.len().max(1) as f32);
-
             let b = &buckets[idx];
 
             for ch in 0..8 {
                 let v_opt = if b.has[ch] {
-                    // Draw the last value in the bucket (stable line; no shimmer).
                     let v = b.last[ch];
                     last_seen[ch] = Some(v);
                     Some(v)

@@ -19,7 +19,7 @@ fn localstorage_get(key: &str) -> Option<String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn target_frame_duration() -> std::time::Duration {
-    // Default 120fps; override with GS_UI_FPS=60 etc.
+    // Default 240fps; override with GS_UI_FPS=60 etc.
     let fps: u64 = std::env::var("GS_UI_FPS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -124,7 +124,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     // ------------------------------------------------------------
     // Redraw driver (START ONCE)
     // - wasm32: requestAnimationFrame
-    // - native: ~120fps timer (GS_UI_FPS)
+    // - native: ~timer (GS_UI_FPS)
     // ------------------------------------------------------------
     let redraw_tick = use_signal(|| 0u64);
     let started_redraw = use_signal(|| false);
@@ -225,7 +225,8 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
 
     // Cache fetch
     let (paths, y_min, y_max, span_min) = charts_cache_get(&current, view_w as f32, view_h as f32);
-    let (chan_min, chan_max) = charts_cache_get_channel_minmax(&current, view_w as f32, view_h as f32);
+    let (chan_min, chan_max) =
+        charts_cache_get_channel_minmax(&current, view_w as f32, view_h as f32);
     let (paths_full, _, _, _) = charts_cache_get(&current, view_w as f32, view_h_full as f32);
     let y_mid = (y_min + y_max) * 0.5;
 
@@ -254,7 +255,8 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     };
 
     rsx! {
-        div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto; display:flex; flex-direction:column; gap:12px;",
+        div {
+            style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto; display:flex; flex-direction:column; gap:12px; padding-bottom:10px;",
 
             div { style: "display:flex; flex-direction:column; gap:10px;",
 
@@ -284,7 +286,11 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         let vals = [row.v0, row.v1, row.v2, row.v3, row.v4, row.v5, row.v6, row.v7];
 
                         rsx! {
-                            div { style: "display:flex; gap:10px; flex-wrap:wrap; align-items:flex-start;",
+                            // repeat(auto-fit, minmax(110px, 1fr)) typically yields:
+                            // - iPhone: 3 columns
+                            // - wider: more columns as space allows
+                            div {
+                                style: "display:grid; gap:10px; align-items:stretch; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); width:100%;",
                                 for i in 0..8usize {
                                     if !labels[i].is_empty() {
                                         SummaryCard {
@@ -478,7 +484,8 @@ fn SummaryCard(
     };
 
     rsx! {
-        div { style: "padding:10px; border-radius:12px; background:#0f172a; border:1px solid #334155; min-width:120px;",
+        // ✅ no fixed min-width; allow grid to pack 3-per-row on iPhone
+        div { style: "padding:10px; border-radius:12px; background:#0f172a; border:1px solid #334155; width:100%; min-width:0; box-sizing:border-box;",
             div { style: "font-size:12px; color:{color};", "{label}" }
             div { style: "font-size:18px; color:#e5e7eb; line-height:1.1;", "{value}" }
             if let Some(t) = mm {
@@ -498,10 +505,18 @@ fn fmt_opt(v: Option<f32>) -> String {
 fn valve_state_text(v: Option<f32>, is_fill_lines: bool) -> String {
     match v {
         Some(val) if val >= 0.5 => {
-            if is_fill_lines { "Installed".to_string() } else { "Open".to_string() }
+            if is_fill_lines {
+                "Installed".to_string()
+            } else {
+                "Open".to_string()
+            }
         }
         Some(_) => {
-            if is_fill_lines { "Removed".to_string() } else { "Closed".to_string() }
+            if is_fill_lines {
+                "Removed".to_string()
+            } else {
+                "Closed".to_string()
+            }
         }
         None => "Unknown".to_string(),
     }
