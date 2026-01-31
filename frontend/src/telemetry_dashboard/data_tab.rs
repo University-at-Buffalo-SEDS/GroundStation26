@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use groundstation_shared::TelemetryRow;
 
-use super::data_chart::{build_polylines, labels_for_datatype, series_color};
+use super::data_chart::{charts_cache_get, labels_for_datatype, series_color};
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
 
@@ -13,6 +13,18 @@ fn localstorage_get(key: &str) -> Option<String> {
     let w = window()?;
     let ls = w.local_storage().ok()??;
     ls.get_item(key).ok().flatten()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn target_frame_duration() -> std::time::Duration {
+    // Default 120fps; override with GS_UI_FPS=60 etc.
+    let fps: u64 = std::env::var("GS_UI_FPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+
+    let fps = fps.clamp(1, 240);
+    std::time::Duration::from_micros(1_000_000 / fps)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -29,9 +41,14 @@ fn localstorage_set(key: &str, value: &str) {
 pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> Element {
     let mut is_fullscreen = use_signal(|| false);
     let mut show_chart = use_signal(|| true);
+
     // -------- Restore + persist active tab --------
     let did_restore = use_signal(|| false);
     let last_saved = use_signal(String::new);
+
+    // Cached unique data types list (avoid O(n) scan every render)
+    let types_cache = use_signal(Vec::<String>::new);
+    let types_cache_len = use_signal(|| 0usize);
 
     // Restore ONCE
     use_effect({
@@ -84,24 +101,100 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
         }
     });
 
-    // Collect unique data types (for buttons)
-    let mut types: Vec<String> = rows.read().iter().map(|r| r.data_type.clone()).collect();
-    types.sort();
-    types.dedup();
+    // Update cached type list only when rows length changes
+    use_effect({
+        let rows = rows;
+        let mut types_cache = types_cache;
+        let mut types_cache_len = types_cache_len;
+        move || {
+            let len = rows.read().len();
+            if len == *types_cache_len.read() {
+                return;
+            }
+            types_cache_len.set(len);
+            let mut types: Vec<String> = rows.read().iter().map(|r| r.data_type.clone()).collect();
+            types.sort();
+            types.dedup();
+            types_cache.set(types);
+        }
+    });
 
+    // ------------------------------------------------------------
+    // Redraw driver (START ONCE)
+    // - wasm32: requestAnimationFrame
+    // - native: ~120fps timer (GS_UI_FPS)
+    // ------------------------------------------------------------
+    let redraw_tick = use_signal(|| 0u64);
+    let started_redraw = use_signal(|| false);
+
+    use_effect({
+        let mut redraw_tick = redraw_tick;
+        let mut started_redraw = started_redraw;
+
+        move || {
+            if *started_redraw.read() {
+                return;
+            }
+            started_redraw.set(true);
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                use std::cell::RefCell;
+                use std::rc::Rc;
+                use wasm_bindgen::closure::Closure;
+                use wasm_bindgen::JsCast;
+
+                let cb: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
+                let cb2 = cb.clone();
+
+                *cb2.borrow_mut() = Some(Closure::wrap(Box::new(move |_ts: f64| {
+                    let next = redraw_tick.read().wrapping_add(1);
+                    redraw_tick.set(next);
+
+                    if let Some(win) = web_sys::window() {
+                        let _ = win.request_animation_frame(
+                            cb.borrow().as_ref().unwrap().as_ref().unchecked_ref(),
+                        );
+                    }
+                }) as Box<dyn FnMut(f64)>));
+
+                if let Some(win) = web_sys::window() {
+                    let _ = win.request_animation_frame(
+                        cb2.borrow().as_ref().unwrap().as_ref().unchecked_ref(),
+                    );
+                }
+
+                std::mem::forget(cb2);
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let frame = target_frame_duration();
+                spawn(async move {
+                    loop {
+                        tokio::time::sleep(frame).await;
+                        let next = redraw_tick.read().wrapping_add(1);
+                        redraw_tick.set(next);
+                    }
+                });
+            }
+        }
+    });
+
+    // Force rerender when redraw driver ticks
+    let _ = *redraw_tick.read();
+
+    // Collect unique data types (for buttons)
+    let types = types_cache.read().clone();
     let current = active_tab.read().clone();
 
-    // Filter rows for selected datatype, chronological (oldest..newest)
-    let mut tab_rows: Vec<TelemetryRow> = rows
+    // Latest row for summary cards (scan backward; no sort/filter allocations)
+    let latest_row = rows
         .read()
         .iter()
-        .filter(|r| r.data_type == current)
-        .cloned()
-        .collect();
-    tab_rows.sort_by_key(|r| r.timestamp_ms);
-
-    // Latest row for summary cards
-    let latest_row = tab_rows.last().cloned();
+        .rev()
+        .find(|r| r.data_type == current)
+        .cloned();
 
     let is_valve_state = current == "VALVE_STATE";
     let has_telemetry = latest_row.is_some();
@@ -110,14 +203,16 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     // Labels for cards and legend
     let labels = labels_for_datatype(&current);
 
-    // Build graph polylines (8 series) + y-range + span
+    // Viewport constants
     let view_w = 1200.0_f64;
     let view_h = 360.0_f64;
     let view_h_full = fullscreen_view_height().max(260.0);
+
     let left = 60.0_f64;
     let right = view_w - 20.0_f64;
     let pad_top = 20.0_f64;
     let pad_bottom = 20.0_f64;
+
     let inner_w = right - left;
     let grid_x_step = inner_w / 6.0_f64;
 
@@ -126,9 +221,17 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     let grid_y_step = inner_h / 6.0_f64;
     let grid_y_step_full = inner_h_full / 6.0_f64;
 
-    let (paths, y_min, y_max, span_min) = build_polylines(&tab_rows, view_w as f32, view_h as f32);
-    let (paths_full, _, _, _) = build_polylines(&tab_rows, view_w as f32, view_h_full as f32);
+    // Cache fetch
+    let (paths, y_min, y_max, span_min) = charts_cache_get(&current, view_w as f32, view_h as f32);
+    let (paths_full, _, _, _) = charts_cache_get(&current, view_w as f32, view_h_full as f32);
     let y_mid = (y_min + y_max) * 0.5;
+
+    let y_max_s = format!("{:.2}", y_max);
+    let y_mid_s = format!("{:.2}", y_mid);
+    let y_min_s = format!("{:.2}", y_min);
+
+    let x_left_s = fmt_span(span_min);
+    let x_mid_s = fmt_span(span_min * 0.5);
 
     let legend_items: Vec<(usize, &'static str)> = labels
         .iter()
@@ -150,10 +253,8 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     rsx! {
         div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto; display:flex; flex-direction:column; gap:12px;",
 
-            // -------- Top area: Tabs row THEN cards row (always below) --------
             div { style: "display:flex; flex-direction:column; gap:10px;",
 
-                // Tabs row
                 div { style: "display:flex; gap:8px; flex-wrap:wrap; align-items:center;",
                     for t in types.iter().take(32) {
                         button {
@@ -172,7 +273,6 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                     }
                 }
 
-                // Cards row (ALWAYS below tabs)
                 match latest_row {
                     None => rsx! {
                         div { style: "color:#94a3b8; padding:2px 2px;", "Waiting for telemetry…" }
@@ -201,7 +301,6 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                 }
             }
 
-            // -------- Big centered graph --------
             if is_graph_allowed {
                 div { style: "flex:0; display:flex; align-items:center; justify-content:center; margin-top:6px;",
                     div { style: "width:100%; max-width:1200px;",
@@ -217,69 +316,65 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                                 "Fullscreen"
                             }
                         }
+
                         if *show_chart.read() {
                             div { style: "width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
                                 svg {
                                     style: "width:100%; height:auto; display:block;",
                                     view_box: "0 0 {view_w} {view_h}",
 
-                                // gridlines
-                                for i in 1..=5 {
-                                    line {
-                                        x1:"{left}", y1:"{pad_top + grid_y_step * (i as f64)}",
-                                        x2:"{right}", y2:"{pad_top + grid_y_step * (i as f64)}",
-                                        stroke:"#1f2937", "stroke-width":"1"
-                                    }
-                                }
-                                for i in 1..=5 {
-                                    line {
-                                        x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
-                                        x2:"{left + grid_x_step * (i as f64)}", y2:"{view_h - pad_bottom}",
-                                        stroke:"#1f2937", "stroke-width":"1"
-                                    }
-                                }
-
-                                // axes
-                                line { x1:"{left}", y1:"{pad_top}",  x2:"{left}",   y2:"{view_h - pad_bottom}", stroke:"#334155", stroke_width:"1" }
-                                line { x1:"{left}", y1:"{view_h - pad_bottom}", x2:"{right}", y2:"{view_h - pad_bottom}", stroke:"#334155", stroke_width:"1" }
-
-                                // y labels
-                                text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
-                                text { x:"10", y:"{pad_top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
-                                text { x:"10", y:"{view_h - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
-
-                                // x labels (span in minutes)
-                                text { x:"{left + 10.0}",   y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
-                                text { x:"{view_w * 0.5}",  y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
-                                text { x:"{right - 60.0}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
-
-                                // series
-                                for (i, pts) in paths.iter().enumerate() {
-                                    if !pts.is_empty() {
-                                        polyline {
-                                            points: "{pts}",
-                                            fill: "none",
-                                            stroke: "{series_color(i)}",
-                                            stroke_width: "2",
-                                            stroke_linejoin: "round",
-                                            stroke_linecap: "round",
+                                    for i in 1..=5 {
+                                        line {
+                                            x1:"{left}", y1:"{pad_top + grid_y_step * (i as f64)}",
+                                            x2:"{right}", y2:"{pad_top + grid_y_step * (i as f64)}",
+                                            stroke:"#1f2937", "stroke-width":"1"
                                         }
                                     }
-                                }
-                            }
+                                    for i in 1..=5 {
+                                        line {
+                                            x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
+                                            x2:"{left + grid_x_step * (i as f64)}", y2:"{view_h - pad_bottom}",
+                                            stroke:"#1f2937", "stroke-width":"1"
+                                        }
+                                    }
 
-                            if !legend_rows.is_empty() {
-                                div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
-                                    for (i, label) in legend_rows.iter() {
-                                        div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
-                                            svg { width:"26", height:"8", view_box:"0 0 26 8",
-                                                line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", stroke_width:"2", stroke_linecap:"round" }
+                                    line { x1:"{left}", y1:"{pad_top}", x2:"{left}",  y2:"{view_h - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
+                                    line { x1:"{left}", y1:"{view_h - pad_bottom}", x2:"{right}", y2:"{view_h - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
+
+                                    text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {y_max_s.clone()} }
+                                    text { x:"10", y:"{pad_top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {y_mid_s.clone()} }
+                                    text { x:"10", y:"{view_h - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {y_min_s.clone()} }
+
+                                    text { x:"{left + 10.0}",  y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {x_left_s.clone()} }
+                                    text { x:"{view_w * 0.5}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {x_mid_s.clone()} }
+                                    text { x:"{right - 60.0}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
+
+                                    for i in 0..8usize {
+                                        if !paths[i].is_empty() {
+                                            path {
+                                                d: "{paths[i]}",
+                                                fill: "none",
+                                                stroke: "{series_color(i)}",
+                                                "stroke-width": "2",
+                                                "stroke-linejoin": "round",
+                                                "stroke-linecap": "round",
                                             }
-                                            "{label}"
                                         }
                                     }
                                 }
-                            }
+
+                                if !legend_rows.is_empty() {
+                                    div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
+                                        for (i, label) in legend_rows.iter() {
+                                            div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
+                                                svg { width:"26", height:"8", view_box:"0 0 26 8",
+                                                    line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", "stroke-width":"2", "stroke-linecap":"round" }
+                                                }
+                                                "{label}"
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -302,7 +397,6 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         style: "width:100%; flex:1; min-height:0; display:block;",
                         view_box: "0 0 {view_w} {view_h_full}",
 
-                        // gridlines
                         for i in 1..=5 {
                             line {
                                 x1:"{left}", y1:"{pad_top + grid_y_step_full * (i as f64)}",
@@ -318,41 +412,37 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                             }
                         }
 
-                        // axes
-                        line { x1:"{left}", y1:"{pad_top}",  x2:"{left}",   y2:"{view_h_full - pad_bottom}", stroke:"#334155", stroke_width:"1" }
-                        line { x1:"{left}", y1:"{view_h_full - pad_bottom}", x2:"{right}", y2:"{view_h_full - pad_bottom}", stroke:"#334155", stroke_width:"1" }
+                        line { x1:"{left}", y1:"{pad_top}", x2:"{left}", y2:"{view_h_full - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
+                        line { x1:"{left}", y1:"{view_h_full - pad_bottom}", x2:"{right}", y2:"{view_h_full - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
 
-                        // y labels
-                        text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
-                        text { x:"10", y:"{pad_top + inner_h_full / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
-                        text { x:"10", y:"{view_h_full - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
+                        text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {y_max_s.clone()} }
+                        text { x:"10", y:"{pad_top + inner_h_full / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {y_mid_s.clone()} }
+                        text { x:"10", y:"{view_h_full - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {y_min_s.clone()} }
 
-                        // x labels (span in minutes)
-                        text { x:"{left + 10.0}",   y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
-                        text { x:"{view_w * 0.5}",  y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
+                        text { x:"{left + 10.0}",  y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {x_left_s.clone()} }
+                        text { x:"{view_w * 0.5}", y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {x_mid_s.clone()} }
                         text { x:"{right - 60.0}", y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
 
-                        // series
-                        for (i, pts) in paths_full.iter().enumerate() {
-                            if !pts.is_empty() {
-                                polyline {
-                                    points: "{pts}",
+                        for i in 0..8usize {
+                            if !paths_full[i].is_empty() {
+                                path {
+                                    d: "{paths_full[i]}",
                                     fill: "none",
                                     stroke: "{series_color(i)}",
-                                    stroke_width: "2",
-                                    stroke_linejoin: "round",
-                                    stroke_linecap: "round",
+                                    "stroke-width": "2",
+                                    "stroke-linejoin": "round",
+                                    "stroke-linecap": "round",
                                 }
                             }
                         }
-
                     }
+
                     if !legend_rows.is_empty() {
                         div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:8px 12px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
                             for (i, label) in legend_rows.iter() {
                                 div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
                                     svg { width:"26", height:"8", view_box:"0 0 26 8",
-                                        line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", stroke_width:"2", stroke_linecap:"round" }
+                                        line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", "stroke-width":"2", "stroke-linecap":"round" }
                                     }
                                     "{label}"
                                 }
@@ -389,18 +479,10 @@ fn fmt_opt(v: Option<f32>) -> String {
 fn valve_state_text(v: Option<f32>, is_fill_lines: bool) -> String {
     match v {
         Some(val) if val >= 0.5 => {
-            if is_fill_lines {
-                "Installed".to_string()
-            } else {
-                "Open".to_string()
-            }
+            if is_fill_lines { "Installed".to_string() } else { "Open".to_string() }
         }
         Some(_) => {
-            if is_fill_lines {
-                "Removed".to_string()
-            } else {
-                "Closed".to_string()
-            }
+            if is_fill_lines { "Removed".to_string() } else { "Closed".to_string() }
         }
         None => "Unknown".to_string(),
     }
@@ -413,11 +495,20 @@ fn fullscreen_view_height() -> f64 {
             .and_then(|w| w.inner_height().ok())
             .and_then(|v| v.as_f64())
             .unwrap_or(700.0);
-        // Account for padding + header row in fullscreen overlay.
         (h - 140.0).max(360.0)
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
         600.0
+    }
+}
+
+fn fmt_span(span_min: f32) -> String {
+    if !span_min.is_finite() || span_min <= 0.0 {
+        "-0 s".to_string()
+    } else if span_min < 1.0 {
+        format!("-{:.0} s", span_min * 60.0)
+    } else {
+        format!("-{:.1} min", span_min)
     }
 }

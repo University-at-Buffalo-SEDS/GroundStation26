@@ -1,4 +1,4 @@
-// frontend/src/telemetry_dashboard/chart.rs
+// frontend/src/telemetry_dashboard/latency_chart
 //
 // Dioxus LineChart with:
 //  - Optional time-window trimming (keeps graph near “now”)

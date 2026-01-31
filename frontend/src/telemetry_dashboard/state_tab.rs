@@ -1,9 +1,24 @@
+// frontend/src/telemetry_dashboard/state_tab.rs
+
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 use groundstation_shared::{BoardStatusEntry, FlightState, TelemetryRow};
 
-use crate::telemetry_dashboard::data_chart::data_style_chart;
+use crate::telemetry_dashboard::data_chart::{
+    charts_cache_get, labels_for_datatype, series_color,
+};
 use crate::telemetry_dashboard::map_tab::MapTab;
+#[cfg(not(target_arch = "wasm32"))]
+fn target_frame_duration() -> std::time::Duration {
+    // Default 120fps; override with GS_UI_FPS=60 etc.
+    let fps: u64 = std::env::var("GS_UI_FPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+
+    let fps = fps.clamp(1, 240);
+    std::time::Duration::from_micros(1_000_000 / fps)
+}
 
 #[component]
 pub fn StateTab(
@@ -13,9 +28,72 @@ pub fn StateTab(
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
 ) -> Element {
+    // ------------------------------------------------------------
+    // Redraw driver for charts on State tab
+    // - wasm32: requestAnimationFrame (display refresh)
+    // - native: ~120fps timer (GS_UI_FPS override)
+    // Always ticks (no dirty gate) so charts stay smooth even if ingestion is batched.
+    // ------------------------------------------------------------
+    let redraw_tick = use_signal(|| 0u64);
+
+    use_effect({
+        let mut redraw_tick = redraw_tick;
+
+        move || {
+            #[cfg(target_arch = "wasm32")]
+            {
+                use std::cell::RefCell;
+                use std::rc::Rc;
+                use wasm_bindgen::JsCast;
+                use wasm_bindgen::closure::Closure;
+
+                let cb: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
+                let cb2 = cb.clone();
+
+                *cb2.borrow_mut() = Some(Closure::wrap(Box::new(move |_ts: f64| {
+                    // E0502-safe: read then set
+                    let next = redraw_tick.read().wrapping_add(1);
+                    redraw_tick.set(next);
+
+                    if let Some(win) = web_sys::window() {
+                        let _ = win.request_animation_frame(
+                            cb.borrow().as_ref().unwrap().as_ref().unchecked_ref(),
+                        );
+                    }
+                }) as Box<dyn FnMut(f64)>));
+
+                if let Some(win) = web_sys::window() {
+                    let _ = win.request_animation_frame(
+                        cb2.borrow().as_ref().unwrap().as_ref().unchecked_ref(),
+                    );
+                }
+
+                // Keep callback alive forever
+                std::mem::forget(cb2);
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let frame = target_frame_duration();
+                spawn(async move {
+                    loop {
+                        tokio::time::sleep(frame).await;
+
+                        // E0502-safe: read then set
+                        let next = redraw_tick.read().wrapping_add(1);
+                        redraw_tick.set(next);
+                    }
+                });
+            }
+        }
+    });
+
+    // Force rerender when redraw driver ticks
+    let _ = *redraw_tick.read();
+
     let state = *flight_state.read();
-    let rows_snapshot = rows.read().clone();
-    let boards_snapshot = board_status.read().clone();
+    let rows_snapshot = rows.read();
+    let boards_snapshot = board_status.read();
 
     let content = match state {
         FlightState::Startup => rsx! {
@@ -30,7 +108,7 @@ pub fn StateTab(
         | FlightState::NitrousFill => rsx! {
             Section { title: "Pressure",
                 {summary_row(&rows_snapshot, "FUEL_TANK_PRESSURE", &[("Tank Pressure", 0)])}
-                {data_style_chart(&rows_snapshot, "FUEL_TANK_PRESSURE", 260.0, Some("Fuel Tank Pressure"))}
+                {data_style_chart_cached("FUEL_TANK_PRESSURE", 1200.0, 260.0, Some("Fuel Tank Pressure"))}
             }
             Section { title: "Valve States",
                 {valve_state_grid(&rows_snapshot)}
@@ -41,7 +119,7 @@ pub fn StateTab(
         FlightState::Armed => rsx! {
             Section { title: "Pressure",
                 {summary_row(&rows_snapshot, "FUEL_TANK_PRESSURE", &[("Tank Pressure", 0)])}
-                {data_style_chart(&rows_snapshot, "FUEL_TANK_PRESSURE", 260.0, Some("Fuel Tank Pressure"))}
+                {data_style_chart_cached("FUEL_TANK_PRESSURE", 1200.0, 260.0, Some("Fuel Tank Pressure"))}
             }
             Section { title: "Valve States",
                 {valve_state_grid(&rows_snapshot)}
@@ -57,15 +135,15 @@ pub fn StateTab(
         | FlightState::Descent => rsx! {
             Section { title: "Altitude",
                 {summary_row(&rows_snapshot, "BAROMETER_DATA", &[("Altitude", 2), ("Pressure", 0), ("Temp", 1)])}
-                {data_style_chart(&rows_snapshot, "BAROMETER_DATA", 280.0, Some("Barometer Data"))}
+                {data_style_chart_cached("BAROMETER_DATA", 1200.0, 280.0, Some("Barometer Data"))}
             }
             Section { title: "Acceleration",
                 {summary_row(&rows_snapshot, "ACCEL_DATA", &[("Accel X", 0), ("Accel Y", 1), ("Accel Z", 2)])}
-                {data_style_chart(&rows_snapshot, "ACCEL_DATA", 300.0, Some("Acceleration"))}
+                {data_style_chart_cached("ACCEL_DATA", 1200.0, 300.0, Some("Acceleration"))}
             }
             Section { title: "Kalman Filter",
                 {summary_row(&rows_snapshot, "KALMAN_FILTER_DATA", &[("Kalman X", 0), ("Kalman Y", 1), ("Kalman Z", 2)])}
-                {data_style_chart(&rows_snapshot, "KALMAN_FILTER_DATA", 300.0, Some("Kalman Filter"))}
+                {data_style_chart_cached("KALMAN_FILTER_DATA", 1200.0, 300.0, Some("Kalman Filter"))}
             }
             {action_section(state)}
         },
@@ -105,6 +183,105 @@ fn Section(title: &'static str, children: Element) -> Element {
         }
     }
 }
+
+// ============================================================
+// NEW: cached chart renderer (uses charts_cache_get)
+// ============================================================
+
+fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&str>) -> Element {
+    let w = view_w as f32;
+    let h = view_h as f32;
+
+    let (paths, y_min, y_max, span_min) = charts_cache_get(dt, w, h);
+    let labels = labels_for_datatype(dt);
+
+    let left = 60.0_f64;
+    let right = view_w - 20.0_f64;
+    let top = 20.0_f64;
+    let bottom = view_h - 20.0_f64;
+
+    let inner_w = right - left;
+    let inner_h = bottom - top;
+
+    let grid_x_step = inner_w / 6.0;
+    let grid_y_step = inner_h / 6.0;
+
+    let y_mid = (y_min + y_max) * 0.5;
+
+    rsx! {
+        div { style: "width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
+            if let Some(t) = title {
+                div { style: "color:#e5e7eb; font-weight:700; font-size:14px;", "{t}" }
+            }
+
+            svg {
+                style: "width:100%; height:auto; display:block;",
+                view_box: "0 0 {view_w} {view_h}",
+
+                // gridlines
+                for i in 1..=5 {
+                    line {
+                        x1:"{left}", y1:"{top + grid_y_step * (i as f64)}",
+                        x2:"{right}", y2:"{top + grid_y_step * (i as f64)}",
+                        stroke:"#1f2937", "stroke-width":"1"
+                    }
+                }
+                for i in 1..=5 {
+                    line {
+                        x1:"{left + grid_x_step * (i as f64)}", y1:"{top}",
+                        x2:"{left + grid_x_step * (i as f64)}", y2:"{bottom}",
+                        stroke:"#1f2937", "stroke-width":"1"
+                    }
+                }
+
+                // axes
+                line { x1:"{left}", y1:"{top}",    x2:"{left}",  y2:"{bottom}", stroke:"#334155", stroke_width:"1" }
+                line { x1:"{left}", y1:"{bottom}", x2:"{right}", y2:"{bottom}", stroke:"#334155", stroke_width:"1" }
+
+                // y labels  (IMPORTANT: these must be expressions, NOT quoted strings)
+                text { x:"10", y:"{top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
+                text { x:"10", y:"{top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
+                text { x:"10", y:"{bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
+
+                // x labels (span in minutes)  (IMPORTANT: expressions, NOT quoted)
+                text { x:"{left + 10.0}",  y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
+                text { x:"{view_w * 0.5}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
+                text { x:"{right - 60.0}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
+
+                // series paths
+                for ch in 0..8usize {
+                    if !paths[ch].is_empty() {
+                        path {
+                            d: "{paths[ch]}",
+                            fill: "none",
+                            stroke: "{series_color(ch)}",
+                            stroke_width: "2",
+                            stroke_linecap: "round",
+                        }
+                    }
+                }
+            }
+
+            // legend (optional)
+            div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
+                for i in 0..8usize {
+                    if !labels[i].is_empty() {
+                        div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
+                            svg { width:"26", height:"8", view_box:"0 0 26 8",
+                                line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(i)}", stroke_width:"2", stroke_linecap:"round" }
+                            }
+                            "{labels[i]}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// Existing StateTab helpers (unchanged)
+// ============================================================
 
 fn valve_state_grid(rows: &[TelemetryRow]) -> Element {
     let latest = rows

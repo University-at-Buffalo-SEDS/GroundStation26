@@ -1,9 +1,9 @@
 // frontend/src/telemetry_dashboard/mod.rs
 
 mod actions_tab;
-pub mod data_chart;
-mod chart;
+mod latency_chart;
 mod connection_status_tab;
+pub mod data_chart;
 pub mod data_tab;
 pub mod errors_tab;
 mod gps;
@@ -18,6 +18,7 @@ pub mod warnings_tab;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::Route;
+use data_chart::{charts_cache_ingest_row, charts_cache_reset_and_ingest};
 
 use crate::telemetry_dashboard::actions_tab::ActionsTab;
 use connection_status_tab::ConnectionStatusTab;
@@ -31,10 +32,21 @@ use serde::Deserialize;
 use state_tab::StateTab;
 use warnings_tab::WarningsTab;
 
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
+
+use once_cell::sync::Lazy;
+
+// ============================================================================
+// Telemetry queue: decouple high-rate telemetry ingest from UI re-render cadence.
+// - WS ingest becomes O(1) and never does large Vec rebuilds.
+// - UI flush loop drains at ~120Hz (or as fast as runtime allows).
+// ============================================================================
+static TELEMETRY_QUEUE: Lazy<Mutex<VecDeque<TelemetryRow>>> =
+    Lazy::new(|| Mutex::new(VecDeque::new()));
 
 // ============================================================================
 // Dashboard lifetime: STATIC + ALWAYS PRESENT (never Option)
@@ -613,39 +625,69 @@ fn TelemetryDashboardInner() -> Element {
         });
     }
 
-    // Start GPS updates only once JS is ready
-    // use_effect({
-    //     let alive = alive.clone();
-    //     let user_gps = user_gps;
-    //     move || {
-    //         let alive = alive.clone();
-    //         let epoch = *WS_EPOCH.read();
-    //         spawn(async move {
-    //             for _ in 0..2000 {
-    //                 if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
-    //                     return;
-    //                 }
-    //
-    //                 if js_is_ground_map_ready() {
-    //                     gps::start_gps_updates(user_gps);
-    //                     return;
-    //                 }
-    //
-    //                 #[cfg(target_arch = "wasm32")]
-    //                 gloo_timers::future::TimeoutFuture::new(50).await;
-    //
-    //                 #[cfg(not(target_arch = "wasm32"))]
-    //                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    //             }
-    //
-    //             if alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
-    //                 js_eval(
-    //                     r#"console.warn("[GS26] JS not ready; skipped gps::start_gps_updates (timeout)");"#,
-    //                 );
-    //             }
-    //         });
-    //     }
-    // });
+    // ------------------------------------------------------------------------
+    // UI flush loop: drain telemetry queue into `rows` at a fixed cadence
+    // ------------------------------------------------------------------------
+    {
+        let alive = alive.clone();
+        let mut rows_s = rows;
+
+        use_effect(move || {
+            let alive = alive.clone();
+            let epoch = *WS_EPOCH.read();
+
+            spawn(async move {
+                // Target ~120 FPS. In browsers this often ends up ~60 FPS depending on clamps.
+                const TICK_MS: u32 = 8;
+
+                while alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
+                    #[cfg(target_arch = "wasm32")]
+                    gloo_timers::future::TimeoutFuture::new(TICK_MS).await;
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    tokio::time::sleep(std::time::Duration::from_millis(TICK_MS as u64)).await;
+
+                    if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
+                        break;
+                    }
+
+                    // Drain queued telemetry
+                    let mut drained: Vec<TelemetryRow> = Vec::new();
+                    if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
+                        while let Some(r) = q.pop_front() {
+                            drained.push(r);
+                        }
+                    }
+
+                    if drained.is_empty() {
+                        continue;
+                    }
+
+                    // Append + prune in one write
+                    {
+                        let mut v = rows_s.write();
+                        v.extend(drained);
+
+                        // Time prune to HISTORY_MS using newest timestamp
+                        if let Some(last) = v.last() {
+                            let cutoff = last.timestamp_ms - HISTORY_MS;
+                            let split = v.partition_point(|r| r.timestamp_ms < cutoff);
+                            if split > 0 {
+                                v.drain(0..split);
+                            }
+                        }
+
+                        // Hard cap to keep UI/state light (avoid pathological growth)
+                        const MAX_KEEP: usize = 12_000;
+                        if v.len() > MAX_KEEP {
+                            let drop_n = v.len() - MAX_KEEP;
+                            v.drain(0..drop_n);
+                        }
+                    }
+                }
+            });
+        });
+    }
 
     // Seed from DB (HTTP) on mount
     {
@@ -671,6 +713,13 @@ fn TelemetryDashboardInner() -> Element {
 
             // Clear graphs immediately before re-seeding.
             rows_s.set(Vec::new());
+            // Reset chart cache too (so DataTab doesn't show stale lines)
+            charts_cache_reset_and_ingest(&[]);
+
+            // Also clear any queued telemetry to avoid mixing old/new epochs
+            if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
+                q.clear();
+            }
 
             let alive = alive.clone();
             let epoch = *WS_EPOCH.read();
@@ -690,7 +739,7 @@ fn TelemetryDashboardInner() -> Element {
                     &mut ack_error_ts_s,
                     alive.clone(),
                 )
-                    .await
+                .await
                     && alive.load(Ordering::Relaxed)
                     && *WS_EPOCH.read() == epoch
                 {
@@ -749,10 +798,10 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
-        || *warning_event_counter.read() > *ack_warning_count.read());
+            || *warning_event_counter.read() > *ack_warning_count.read());
     let has_unacked_errors = latest_error_ts > 0
         && (latest_error_ts > *ack_error_ts.read()
-        || *error_event_counter.read() > *ack_error_count.read());
+            || *error_event_counter.read() > *ack_error_count.read());
 
     let border_style = if has_unacked_errors && *flash_on.read() {
         "2px solid #ef4444"
@@ -829,7 +878,7 @@ fn TelemetryDashboardInner() -> Element {
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
                     && alive.load(Ordering::Relaxed)
                 {
                     log!("[WS] supervisor ended: {e}");
@@ -1326,6 +1375,8 @@ async fn seed_from_db(
             rocket_gps.set(Some(gps));
         }
 
+        // IMPORTANT: keep chart cache in sync with seeded history
+        charts_cache_reset_and_ingest(&list);
         rows.set(list);
     }
 
@@ -1441,7 +1492,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -1459,7 +1510,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
         };
 
@@ -1591,7 +1642,7 @@ async fn connect_ws_once_wasm(
             &mut closed_rx,
             gloo_timers::future::TimeoutFuture::new(150),
         )
-            .await;
+        .await;
 
         match done {
             futures_util::future::Either::Left((_closed, _timeout)) => break,
@@ -1699,7 +1750,6 @@ fn handle_ws_message(
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
 ) {
-    let mut rows = rows;
     let mut warnings = warnings;
     let mut errors = errors;
     let mut warning_event_counter = warning_event_counter;
@@ -1709,39 +1759,32 @@ fn handle_ws_message(
     let mut rocket_gps = rocket_gps;
     let _user_gps = user_gps;
 
+    // NOTE: `rows` is no longer written here; we batch-update it in the UI flush loop.
+    let _rows = rows;
+
     let Ok(msg) = serde_json::from_str::<WsInMsg>(s) else {
         return;
     };
 
     match msg {
         WsInMsg::Telemetry(row) => {
+            // Always keep chart cache hot (cheap, incremental)
+            charts_cache_ingest_row(&row);
+
             if let Some((lat, lon)) = row_to_gps(&row) {
                 rocket_gps.set(Some((lat, lon)));
             }
 
-            let mut v = rows.read().clone();
-            v.push(row);
+            // Queue telemetry for UI batch flush
+            if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
+                q.push_back(row);
 
-            if let Some(last) = v.last() {
-                let cutoff = last.timestamp_ms - HISTORY_MS;
-                let split = v.partition_point(|r| r.timestamp_ms < cutoff);
-                if split > 0 {
-                    v.drain(0..split);
+                // Safety cap if UI stalls
+                const MAX_QUEUE: usize = 30_000;
+                while q.len() > MAX_QUEUE {
+                    q.pop_front();
                 }
             }
-
-            const MAX_SAMPLES: usize = 10_000;
-            if v.len() > MAX_SAMPLES {
-                let n = v.len();
-                let stride = (n as f32 / MAX_SAMPLES as f32).ceil() as usize;
-                v = v
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(i, row)| (i % stride == 0).then_some(row))
-                    .collect();
-            }
-
-            rows.set(v);
         }
 
         WsInMsg::FlightState(st) => {

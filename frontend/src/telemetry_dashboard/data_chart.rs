@@ -1,128 +1,413 @@
-use dioxus::prelude::*;
+// frontend/src/telemetry_dashboard/data_chart.rs
+//
+// High-performance chart cache (incremental ingest):
+// - Keep a bounded, time-pruned ring of samples per data_type.
+// - Rebuild downsampled buckets only when dirty.
+// - bucket width is based on *effective span*, not HISTORY_MS.
+//
+// FIXES:
+// - Sticky / hysteretic Y-axis so the scale does NOT jump when old spikes fall out of the window.
+//   * Expand immediately (never clip)
+//   * Shrink slowly (prevents “random” mid-run rescaling)
+//   * Add a small padding around the range
+//
+// API:
+//   charts_cache_reset_and_ingest(rows)
+//   charts_cache_ingest_row(row)
+//   charts_cache_get(data_type, width, height) -> ([d;8], y_min, y_max, span_min)
+
 use groundstation_shared::TelemetryRow;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 
 use super::HISTORY_MS;
 
-pub fn data_style_chart(
-    rows: &[TelemetryRow],
+// ============================================================
+// Global cache (updated once per telemetry row)
+// ============================================================
+
+thread_local! {
+    static CHARTS_CACHE: RefCell<ChartsCache> = RefCell::new(ChartsCache::new());
+}
+
+pub fn _charts_cache_is_dirty(data_type: &str) -> bool {
+    CHARTS_CACHE.with(|c| {
+        let c = c.borrow();
+        c.charts.get(data_type).map(|ch| ch.dirty).unwrap_or(false)
+    })
+}
+
+pub fn charts_cache_reset_and_ingest(rows: &[TelemetryRow]) {
+    CHARTS_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.clear();
+        for r in rows {
+            c.ingest_row(r);
+        }
+    });
+}
+
+pub fn charts_cache_ingest_row(row: &TelemetryRow) {
+    CHARTS_CACHE.with(|c| {
+        c.borrow_mut().ingest_row(row);
+    });
+}
+
+/// Returns:
+/// - [String;8] where each String is an SVG path `d` (may be empty)
+/// - y_min, y_max (for labels)
+/// - span_min (minutes of effective history window)
+pub fn charts_cache_get(
     data_type: &str,
-    height: f64,
-    title: Option<&str>,
-) -> Element {
-    let mut tab_rows: Vec<TelemetryRow> = rows
-        .iter()
-        .filter(|r| r.data_type == data_type)
-        .cloned()
-        .collect();
-    tab_rows.sort_by_key(|r| r.timestamp_ms);
+    width: f32,
+    height: f32,
+) -> ([String; 8], f32, f32, f32) {
+    CHARTS_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.get(data_type, width, height)
+    })
+}
 
-    let view_w = 1200.0_f64;
-    let view_h = height.max(220.0);
-    let left = 60.0_f64;
-    let right = view_w - 20.0_f64;
-    let pad_top = 20.0_f64;
-    let pad_bottom = 20.0_f64;
-    let inner_w = right - left;
-    let grid_x_step = inner_w / 6.0_f64;
+// ============================================================
+// Cache internals
+// ============================================================
 
-    let inner_h = view_h - pad_top - pad_bottom;
-    let grid_y_step = inner_h / 6.0_f64;
+const MAX_POINTS: usize = 1200;
+const MIN_SPAN_MS: i64 = 1_000; // avoid divide-by-zero (1s)
 
-    let (paths, y_min, y_max, span_min) =
-        build_polylines(&tab_rows, view_w as f32, view_h as f32);
-    let y_mid = (y_min + y_max) * 0.5;
+// Keep at most this many samples per datatype as a hard cap (in addition to time pruning).
+const MAX_SAMPLES_PER_TYPE: usize = 20_000;
 
-    let labels = labels_for_datatype(data_type);
-    let legend_items: Vec<(usize, &'static str)> = labels
-        .iter()
-        .enumerate()
-        .filter_map(|(i, l)| if l.is_empty() { None } else { Some((i, *l)) })
-        .collect();
-    let legend_rows: Vec<(usize, &'static str)> =
-        legend_items.iter().map(|(i, label)| (*i, *label)).collect();
+// -------------------------
+// Sticky Y-axis tuning
+// -------------------------
+//
+// Expand immediately (alpha=1.0) when the new range exceeds the displayed range.
+// Shrink slowly to avoid “jumping” when old extremes fall out of the window.
+const Y_SHRINK_ALPHA: f32 = 0.04; // ~ slow convergence; increase for faster shrink
+const Y_PAD_FRAC: f32 = 0.06;     // 6% padding around range
+const Y_MIN_PAD_ABS: f32 = 1.0;   // at least +/-1 unit of padding (helps small ranges)
 
-    rsx! {
-        div { style: "width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
-            if let Some(title) = title {
-                div { style:"color:#94a3b8; font-size:12px; margin-bottom:2px;", "{title}" }
-            }
-            svg {
-                style: "width:100%; height:auto; display:block;",
-                view_box: "0 0 {view_w} {view_h}",
+struct ChartsCache {
+    charts: HashMap<String, CachedChart>,
+}
 
-                // gridlines
-                for i in 1..=5 {
-                    line {
-                        x1:"{left}", y1:"{pad_top + grid_y_step * (i as f64)}",
-                        x2:"{right}", y2:"{pad_top + grid_y_step * (i as f64)}",
-                        stroke:"#1f2937", "stroke-width":"1"
-                    }
-                }
-                for i in 1..=5 {
-                    line {
-                        x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
-                        x2:"{left + grid_x_step * (i as f64)}", y2:"{view_h - pad_bottom}",
-                        stroke:"#1f2937", "stroke-width":"1"
-                    }
-                }
+impl ChartsCache {
+    fn new() -> Self {
+        Self {
+            charts: HashMap::new(),
+        }
+    }
 
-                // axes
-                line { x1:"{left}", y1:"{pad_top}",  x2:"{left}",   y2:"{view_h - pad_bottom}", stroke:"#334155", stroke_width:"1" }
-                line { x1:"{left}", y1:"{view_h - pad_bottom}", x2:"{right}", y2:"{view_h - pad_bottom}", stroke:"#334155", stroke_width:"1" }
+    fn clear(&mut self) {
+        self.charts.clear();
+    }
 
-                // y labels
-                text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
-                text { x:"10", y:"{pad_top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
-                text { x:"10", y:"{view_h - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
+    fn ingest_row(&mut self, r: &TelemetryRow) {
+        let chart = self
+            .charts
+            .entry(r.data_type.clone())
+            .or_insert_with(CachedChart::new);
+        chart.ingest(r);
+    }
 
-                // x labels (span in minutes)
-                text { x:"{left + 10.0}",   y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
-                text { x:"{view_w * 0.5}",  y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
-                text { x:"{right - 60.0}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
-
-                // series
-                for (i, pts) in paths.iter().enumerate() {
-                    if !pts.is_empty() {
-                        polyline {
-                            points: "{pts}",
-                            fill: "none",
-                            stroke: "{series_color(i)}",
-                            stroke_width: "2",
-                            stroke_linejoin: "round",
-                            stroke_linecap: "round",
-                        }
-                    }
-                }
-            }
-
-            if !legend_rows.is_empty() {
-                div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
-                    for (i, label) in legend_rows.iter() {
-                        div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
-                            svg { width:"26", height:"8", view_box:"0 0 26 8",
-                                line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", stroke_width:"2", stroke_linecap:"round" }
-                            }
-                            "{label}"
-                        }
-                    }
-                }
-            }
+    fn get(&mut self, dt: &str, w: f32, h: f32) -> ([String; 8], f32, f32, f32) {
+        if let Some(c) = self.charts.get_mut(dt) {
+            c.build_if_needed(w, h);
+            (c.paths.clone(), c.disp_min, c.disp_max, c.span_min)
+        } else {
+            (std::array::from_fn(|_| String::new()), 0.0, 1.0, 0.0)
         }
     }
 }
 
-pub fn series_color(i: usize) -> &'static str {
-    match i {
-        0 => "#f97316",
-        1 => "#22d3ee",
-        2 => "#a3e635",
-        3 => "#f43f5e",
-        4 => "#8b5cf6",
-        5 => "#e879f9",
-        6 => "#10b981",
-        7 => "#fbbf24",
-        _ => "#9ca3af",
+// A compact sample (store only what we need)
+#[derive(Clone)]
+struct Sample {
+    ts: i64,
+    v: [Option<f32>; 8],
+}
+
+impl From<&TelemetryRow> for Sample {
+    fn from(r: &TelemetryRow) -> Self {
+        Self {
+            ts: r.timestamp_ms,
+            v: [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7],
+        }
     }
+}
+
+#[derive(Clone, Default)]
+struct Bucket {
+    has: [bool; 8],
+    min: [f32; 8],
+    max: [f32; 8],
+    last: [f32; 8],
+}
+
+struct CachedChart {
+    // Raw samples (time-pruned deque)
+    samples: VecDeque<Sample>,
+    newest_ts: i64,
+    dirty: bool,
+
+    // Cached output
+    paths: [String; 8], // SVG path `d`
+
+    // Raw range from current effective window
+    raw_min: f32,
+    raw_max: f32,
+
+    // Displayed (sticky) range
+    disp_min: f32,
+    disp_max: f32,
+
+    span_min: f32,
+}
+
+impl CachedChart {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::new(),
+            newest_ts: 0,
+            dirty: true,
+            paths: std::array::from_fn(|_| String::new()),
+            raw_min: 0.0,
+            raw_max: 1.0,
+            disp_min: 0.0,
+            disp_max: 1.0,
+            span_min: 0.0,
+        }
+    }
+
+    fn ingest(&mut self, r: &TelemetryRow) {
+        let s: Sample = r.into();
+
+        if s.ts > self.newest_ts {
+            self.newest_ts = s.ts;
+        } else if self.newest_ts == 0 {
+            self.newest_ts = s.ts;
+        }
+
+        self.samples.push_back(s);
+
+        // Time-prune using newest_ts as "now"
+        let cutoff = self.newest_ts.saturating_sub(HISTORY_MS);
+        while let Some(front) = self.samples.front() {
+            if front.ts < cutoff {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        while self.samples.len() > MAX_SAMPLES_PER_TYPE {
+            self.samples.pop_front();
+        }
+
+        self.dirty = true;
+    }
+
+    fn stabilize_raw_range(min: &mut f32, max: &mut f32) {
+        if !min.is_finite() || !max.is_finite() {
+            *min = 0.0;
+            *max = 1.0;
+            return;
+        }
+        let range = *max - *min;
+        if range.abs() < 1e-6 {
+            let center = *min;
+            let pad = (center.abs() * 0.05).max(1.0);
+            *min = center - pad;
+            *max = center + pad;
+        }
+    }
+
+    fn apply_padding(min: f32, max: f32) -> (f32, f32) {
+        let mut lo = min;
+        let mut hi = max;
+        let r = (hi - lo).abs().max(1e-6);
+        let pad = (r * Y_PAD_FRAC).max(Y_MIN_PAD_ABS);
+        lo -= pad;
+        hi += pad;
+        (lo, hi)
+    }
+
+    fn update_display_range(&mut self, raw_min: f32, raw_max: f32) {
+        // Always pad the *raw* range first.
+        let (raw_min, raw_max) = Self::apply_padding(raw_min, raw_max);
+
+        // First build: snap.
+        if !self.disp_min.is_finite() || !self.disp_max.is_finite() || (self.disp_max - self.disp_min).abs() < 1e-6 {
+            self.disp_min = raw_min;
+            self.disp_max = raw_max;
+            return;
+        }
+
+        // Expand immediately to avoid clipping.
+        let mut lo = self.disp_min;
+        let mut hi = self.disp_max;
+
+        if raw_min < lo {
+            lo = raw_min;
+        }
+        if raw_max > hi {
+            hi = raw_max;
+        }
+
+        // Shrink slowly to avoid “jump” rescaling.
+        if raw_min > lo {
+            lo = lo + (raw_min - lo) * Y_SHRINK_ALPHA;
+        }
+        if raw_max < hi {
+            hi = hi + (raw_max - hi) * Y_SHRINK_ALPHA;
+        }
+
+        // Safety: keep non-degenerate.
+        if (hi - lo).abs() < 1e-6 {
+            hi = lo + 1.0;
+        }
+
+        self.disp_min = lo;
+        self.disp_max = hi;
+    }
+
+    fn build_if_needed(&mut self, w: f32, h: f32) {
+        if !self.dirty {
+            return;
+        }
+
+        if self.samples.is_empty() {
+            for s in &mut self.paths {
+                s.clear();
+            }
+            self.raw_min = 0.0;
+            self.raw_max = 1.0;
+            self.disp_min = 0.0;
+            self.disp_max = 1.0;
+            self.span_min = 0.0;
+            self.dirty = false;
+            return;
+        }
+
+        let oldest_ts = self.samples.front().map(|s| s.ts).unwrap_or(self.newest_ts);
+        let newest_ts = self
+            .samples
+            .back()
+            .map(|s| s.ts)
+            .unwrap_or(self.newest_ts)
+            .max(self.newest_ts);
+
+        let raw_span_ms = newest_ts.saturating_sub(oldest_ts).max(1);
+        let span_ms = raw_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
+        let start_ts = newest_ts.saturating_sub(span_ms);
+
+        let bucket_ms = (span_ms / MAX_POINTS as i64).max(1);
+
+        let mut buckets = vec![Bucket::default(); MAX_POINTS];
+
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+
+        for samp in self.samples.iter() {
+            if samp.ts < start_ts {
+                continue;
+            }
+
+            let bi =
+                ((samp.ts - start_ts) / bucket_ms).clamp(0, (MAX_POINTS as i64) - 1) as usize;
+
+            let b = &mut buckets[bi];
+
+            for ch in 0..8 {
+                if let Some(v) = samp.v[ch] {
+                    if !b.has[ch] {
+                        b.has[ch] = true;
+                        b.min[ch] = v;
+                        b.max[ch] = v;
+                        b.last[ch] = v;
+                    } else {
+                        b.min[ch] = b.min[ch].min(v);
+                        b.max[ch] = b.max[ch].max(v);
+                        b.last[ch] = v;
+                    }
+
+                    min = min.min(v);
+                    max = max.max(v);
+                }
+            }
+        }
+
+        Self::stabilize_raw_range(&mut min, &mut max);
+
+        self.raw_min = min;
+        self.raw_max = max;
+
+        // Sticky displayed range (this is the key fix)
+        self.update_display_range(self.raw_min, self.raw_max);
+
+        // Viewport mapping (match DataTab geometry)
+        let left = 60.0_f32;
+        let right = (w - 20.0).max(left + 1.0);
+        let top = 20.0_f32;
+        let bottom = (h - 20.0).max(top + 1.0);
+
+        let pw = right - left;
+        let ph = bottom - top;
+
+        let y_min = self.disp_min;
+        let y_max = self.disp_max;
+
+        let map_y = |v: f32| -> f32 { bottom - (v - y_min) / (y_max - y_min) * ph };
+
+        for s in &mut self.paths {
+            s.clear();
+        }
+
+        let mut last_seen: [Option<f32>; 8] = [None; 8];
+
+        for idx in 0..MAX_POINTS {
+            let x = left + pw * ((idx as f32 + 0.5) / MAX_POINTS as f32);
+
+            let b = &buckets[idx];
+
+            for ch in 0..8 {
+                let v_opt = if b.has[ch] {
+                    let mid = (b.min[ch] + b.max[ch]) * 0.5;
+                    last_seen[ch] = Some(b.last[ch]);
+                    Some(mid)
+                } else {
+                    last_seen[ch]
+                };
+
+                let Some(v) = v_opt else { continue };
+                let y = map_y(v);
+
+                let out = &mut self.paths[ch];
+                if out.is_empty() {
+                    out.push_str(&format!("M {:.2} {:.2} ", x, y));
+                } else {
+                    out.push_str(&format!("L {:.2} {:.2} ", x, y));
+                }
+            }
+        }
+
+        self.span_min = span_ms as f32 / 60_000.0;
+        self.dirty = false;
+    }
+}
+
+// ============================================================
+// Labels / colors
+// ============================================================
+
+pub fn series_color(i: usize) -> &'static str {
+    [
+        "#f97316", "#22d3ee", "#a3e635", "#f43f5e", "#8b5cf6", "#e879f9", "#10b981", "#fbbf24",
+    ]
+    .get(i)
+    .copied()
+    .unwrap_or("#9ca3af")
 }
 
 pub fn labels_for_datatype(dt: &str) -> [&'static str; 8] {
@@ -130,12 +415,9 @@ pub fn labels_for_datatype(dt: &str) -> [&'static str; 8] {
         "GYRO_DATA" => ["Roll", "Pitch", "Yaw", "", "", "", "", ""],
         "ACCEL_DATA" => ["X Accel", "Y Accel", "Z Accel", "", "", "", "", ""],
         "BAROMETER_DATA" => ["Pressure", "Temp", "Altitude", "", "", "", "", ""],
-        "BATTERY_VOLTAGE" => ["Voltage", "", "", "", "", "", "", ""],
-        "BATTERY_CURRENT" => ["Current", "", "", "", "", "", "", ""],
         "KALMAN_FILTER_DATA" => ["X", "Y", "Z", "", "", "", "", ""],
-        "GPS_DATA" => ["Latitude", "Longitude", "", "", "", "", "", ""],
-        "FUEL_FLOW" => ["Flow Rate", "", "", "", "", "", "", ""],
-        "FUEL_TANK_PRESSURE" => ["Pressure", "", "", "", "", "", "", ""],
+        "GPS_DATA" => ["Lat", "Lon", "", "", "", "", "", ""],
+        "FUEL_TANK_PRESSURE" => ["Tank Pressure", "", "", "", "", "", "", ""],
         "VALVE_STATE" => [
             "Pilot",
             "NormallyOpen",
@@ -148,175 +430,4 @@ pub fn labels_for_datatype(dt: &str) -> [&'static str; 8] {
         ],
         _ => ["", "", "", "", "", "", "", ""],
     }
-}
-
-/// Build eight SVG polyline point strings (v0..v7),
-/// plus y-min, y-max, and span_minutes (0-HISTORY_MS).
-///
-/// `paths[i]` is `"x,y x,y x,y ..."`, suitable for `<polyline points=... />`.
-pub fn build_polylines(rows: &[TelemetryRow], width: f32, height: f32) -> ([String; 8], f32, f32, f32) {
-    if rows.is_empty() {
-        return (std::array::from_fn(|_| String::new()), 0.0, 1.0, 0.0);
-    }
-
-    // 1) time window & span
-    let newest_ts = rows.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
-    let oldest_ts = rows
-        .iter()
-        .map(|r| r.timestamp_ms)
-        .min()
-        .unwrap_or(newest_ts);
-
-    let raw_span_ms = (newest_ts - oldest_ts).max(1);
-    let effective_span_ms = raw_span_ms.min(HISTORY_MS);
-    let span_minutes = effective_span_ms as f32 / 60_000.0;
-
-    let window_start = newest_ts.saturating_sub(effective_span_ms);
-
-    // 2) rows in window
-    let mut window_rows: Vec<&TelemetryRow> = rows
-        .iter()
-        .filter(|r| r.timestamp_ms >= window_start)
-        .collect();
-    if window_rows.is_empty() {
-        return (
-            std::array::from_fn(|_| String::new()),
-            0.0,
-            1.0,
-            span_minutes,
-        );
-    }
-    window_rows.sort_by_key(|r| r.timestamp_ms);
-
-    // 3) min/max across windowed rows
-    let mut min_v: Option<f32> = None;
-    let mut max_v: Option<f32> = None;
-
-    for r in &window_rows {
-        for x in [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7]
-            .into_iter()
-            .flatten()
-        {
-            min_v = Some(min_v.map(|m| m.min(x)).unwrap_or(x));
-            max_v = Some(max_v.map(|m| m.max(x)).unwrap_or(x));
-        }
-    }
-
-    let (min_v, mut max_v) = match (min_v, max_v) {
-        (Some(a), Some(b)) => (a, b),
-        _ => {
-            return (
-                std::array::from_fn(|_| String::new()),
-                0.0,
-                1.0,
-                span_minutes,
-            );
-        }
-    };
-
-    if (max_v - min_v).abs() < 1e-6 {
-        max_v = min_v + 1.0;
-    }
-
-    // 4) plot geometry
-    let left = 60.0;
-    let right = width - 20.0;
-    let top = 20.0;
-    let bottom = height - 20.0;
-
-    let plot_w = right - left;
-    let plot_h = bottom - top;
-
-    let map_y = |v: f32| bottom - ((v - min_v) / (max_v - min_v)) * plot_h;
-
-    // 5) downsample into fixed buckets (constant x-density while preserving extrema)
-    let max_points: usize = 1200;
-
-    #[derive(Clone)]
-    struct BucketAcc {
-        min_v: [f64; 8],
-        max_v: [f64; 8],
-        last_v: [f64; 8],
-        has: [bool; 8],
-    }
-
-    impl Default for BucketAcc {
-        fn default() -> Self {
-            Self {
-                min_v: [0.0; 8],
-                max_v: [0.0; 8],
-                last_v: [0.0; 8],
-                has: [false; 8],
-            }
-        }
-    }
-
-    let mut buckets = vec![BucketAcc::default(); max_points];
-    let total = window_rows.len().max(1);
-
-    for (idx, r) in window_rows.iter().enumerate() {
-        let mut bi = (idx * max_points) / total;
-        if bi >= max_points {
-            bi = max_points - 1;
-        }
-        let b = &mut buckets[bi];
-
-        let vals = [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7];
-        for (j, opt) in vals.iter().enumerate() {
-            if let Some(x) = opt {
-                let xf = *x as f64;
-                if !b.has[j] {
-                    b.has[j] = true;
-                    b.min_v[j] = xf;
-                    b.max_v[j] = xf;
-                    b.last_v[j] = xf;
-                } else {
-                    if xf < b.min_v[j] {
-                        b.min_v[j] = xf;
-                    }
-                    if xf > b.max_v[j] {
-                        b.max_v[j] = xf;
-                    }
-                    b.last_v[j] = xf;
-                }
-            }
-        }
-    }
-
-    // 6) build polyline strings with constant x-spacing
-    let mut out: [String; 8] = std::array::from_fn(|_| String::new());
-
-    let mut last_seen: [Option<f32>; 8] = [None, None, None, None, None, None, None, None];
-
-    for (idx, b) in buckets.iter().enumerate() {
-        let center_x = left + plot_w * ((idx as f32 + 0.5) / max_points as f32);
-        for ch in 0..8usize {
-            let s = &mut out[ch];
-
-            let mut push_point = |x: f32, y: f32| {
-                if !s.is_empty() {
-                    s.push(' ');
-                }
-                s.push_str(&format!("{x:.2},{y:.2}"));
-            };
-
-            if b.has[ch] {
-                let min_v = b.min_v[ch] as f32;
-                let max_v = b.max_v[ch] as f32;
-
-                if (min_v - max_v).abs() < f32::EPSILON {
-                    push_point(center_x, map_y(min_v));
-                } else {
-                    push_point(center_x, map_y(min_v));
-                    push_point(center_x, map_y(max_v));
-                }
-
-                last_seen[ch] = Some(b.last_v[ch] as f32);
-            } else if let Some(v) = last_seen[ch] {
-                push_point(center_x, map_y(v));
-            }
-        }
-    }
-
-    (out, min_v, max_v, span_minutes)
 }
