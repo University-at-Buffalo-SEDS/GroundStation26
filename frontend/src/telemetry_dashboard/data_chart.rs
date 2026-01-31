@@ -3,13 +3,17 @@
 // High-performance chart cache (incremental ingest):
 // - Keep a bounded, time-pruned ring of samples per data_type.
 // - Rebuild downsampled buckets only when dirty.
-// - bucket width is based on *effective span*, not HISTORY_MS.
+// - Bucket width is based on *effective span*, not HISTORY_MS.
 //
 // FIXES:
 // - Sticky / hysteretic Y-axis so the scale does NOT jump when old spikes fall out of the window.
 //   * Expand immediately (never clip)
 //   * Shrink slowly (prevents “random” mid-run rescaling)
 //   * Add a small padding around the range
+// - Stable X buckets WITHOUT breaking adaptive timescale:
+//   * Window span follows available data (up to HISTORY_MS)
+//   * Bucket boundaries are snapped to a bucket_ms grid so already-plotted data doesn't shimmer
+//   * Line uses bucket "last" value (min/max still tracked for summaries)
 //
 // API:
 //   charts_cache_reset_and_ingest(rows)
@@ -84,14 +88,13 @@ pub fn charts_cache_get_channel_minmax(
     })
 }
 
-
 // ============================================================
 // Cache internals
 // ============================================================
 
-const MAX_POINTS_CAP: usize = 60000; // cap for downsample points (smooth scrolling at 20min)
-const MIN_POINTS: usize = 240;       // keep some detail even for tiny spans
-const TARGET_BUCKET_MS: i64 = 20;   // aim ~5Hz resolution at max span
+const MAX_POINTS_CAP: usize = 60000; // cap for downsample points
+const MIN_POINTS: usize = 240; // keep some detail even for tiny spans
+const TARGET_BUCKET_MS: i64 = 20; // target temporal resolution (ms)
 const MIN_SPAN_MS: i64 = 1_000; // avoid divide-by-zero (1s)
 
 // Keep at most this many samples per datatype as a hard cap (in addition to time pruning).
@@ -103,9 +106,9 @@ const MAX_SAMPLES_PER_TYPE: usize = 20_000;
 //
 // Expand immediately (alpha=1.0) when the new range exceeds the displayed range.
 // Shrink slowly to avoid “jumping” when old extremes fall out of the window.
-const Y_SHRINK_ALPHA: f32 = 0.04; // ~ slow convergence; increase for faster shrink
-const Y_PAD_FRAC: f32 = 0.06;     // 6% padding around range
-const Y_MIN_PAD_ABS: f32 = 1.0;   // at least +/-1 unit of padding (helps small ranges)
+const Y_SHRINK_ALPHA: f32 = 0.04; // slow convergence; increase for faster shrink
+const Y_PAD_FRAC: f32 = 0.06; // 6% padding around range
+const Y_MIN_PAD_ABS: f32 = 1.0; // at least +/-1 unit of padding
 
 struct ChartsCache {
     charts: HashMap<String, CachedChart>,
@@ -186,6 +189,9 @@ struct CachedChart {
     disp_max: f32,
 
     span_min: f32,
+
+    // Kept for compatibility; we now keep timescale adaptive, so this is only informational.
+    prev_span_ms: i64,
 }
 
 impl CachedChart {
@@ -202,6 +208,7 @@ impl CachedChart {
             disp_min: 0.0,
             disp_max: 1.0,
             span_min: 0.0,
+            prev_span_ms: 0,
         }
     }
 
@@ -263,7 +270,10 @@ impl CachedChart {
         let (raw_min, raw_max) = Self::apply_padding(raw_min, raw_max);
 
         // First build: snap.
-        if !self.disp_min.is_finite() || !self.disp_max.is_finite() || (self.disp_max - self.disp_min).abs() < 1e-6 {
+        if !self.disp_min.is_finite()
+            || !self.disp_max.is_finite()
+            || (self.disp_max - self.disp_min).abs() < 1e-6
+        {
             self.disp_min = raw_min;
             self.disp_max = raw_max;
             return;
@@ -313,6 +323,7 @@ impl CachedChart {
             self.disp_min = 0.0;
             self.disp_max = 1.0;
             self.span_min = 0.0;
+            self.prev_span_ms = 0;
             self.dirty = false;
             return;
         }
@@ -326,18 +337,39 @@ impl CachedChart {
             .max(self.newest_ts);
 
         let raw_span_ms = newest_ts.saturating_sub(oldest_ts).max(1);
-        let span_ms = raw_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
-        let start_ts = newest_ts.saturating_sub(span_ms);
 
-        // Adaptive downsampling:
-        // - Aim ~TARGET_BUCKET_MS resolution when the window is large.
-        // - Cap point count by pixel width so tiny charts don't build huge paths.
-        let mut points = ((span_ms + TARGET_BUCKET_MS - 1) / TARGET_BUCKET_MS) as usize;
+        // Effective window is adaptive: it follows available data up to HISTORY_MS.
+        let span_target_ms = raw_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
+
+        // ------------------------------------------------------------
+        // Stable bucket grid WITHOUT breaking adaptive timescale
+        // ------------------------------------------------------------
+
+        // Choose point count based on target span + width cap.
+        let mut points = ((span_target_ms + TARGET_BUCKET_MS - 1) / TARGET_BUCKET_MS) as usize;
         points = points.clamp(MIN_POINTS, MAX_POINTS_CAP);
         let px_cap = (w.max(1.0) as usize).saturating_mul(3).max(MIN_POINTS);
         points = points.min(px_cap).clamp(MIN_POINTS, MAX_POINTS_CAP);
 
-        let bucket_ms = (span_ms / points as i64).max(1);
+        // Compute bucket_ms from target span and points (ceil_div).
+        // Do NOT force bucket_ms to be a multiple of some other quantum; that breaks adaptiveness.
+        let bucket_ms = ((span_target_ms + points as i64 - 1) / points as i64).max(1);
+
+        // Snap end_ts to the bucket grid so bucket boundaries don't slide each rebuild.
+        let end_ts = (newest_ts / bucket_ms) * bucket_ms;
+
+        // Start is end - target span, then snapped to the same grid.
+        let mut start_ts = end_ts.saturating_sub(span_target_ms);
+        start_ts = (start_ts / bucket_ms) * bucket_ms;
+
+        // Effective span after snapping (still adaptive, but grid-aligned).
+        let span_ms = end_ts.saturating_sub(start_ts).max(bucket_ms);
+
+        // Recompute number of buckets from snapped span (ceil_div).
+        let points = ((span_ms + bucket_ms - 1) / bucket_ms) as usize;
+        let points = points.clamp(1, MAX_POINTS_CAP);
+
+        self.prev_span_ms = span_ms;
 
         let mut buckets = vec![Bucket::default(); points];
 
@@ -373,8 +405,14 @@ impl CachedChart {
                     min = min.min(v);
                     max = max.max(v);
 
-                    chan_min[ch] = Some(match chan_min[ch] { Some(m) => m.min(v), None => v });
-                    chan_max[ch] = Some(match chan_max[ch] { Some(m) => m.max(v), None => v });
+                    chan_min[ch] = Some(match chan_min[ch] {
+                        Some(m) => m.min(v),
+                        None => v,
+                    });
+                    chan_max[ch] = Some(match chan_max[ch] {
+                        Some(m) => m.max(v),
+                        None => v,
+                    });
                 }
             }
         }
@@ -386,7 +424,7 @@ impl CachedChart {
         self.chan_min = chan_min;
         self.chan_max = chan_max;
 
-        // Sticky displayed range (this is the key fix)
+        // Sticky displayed range
         self.update_display_range(self.raw_min, self.raw_max);
 
         // Viewport mapping (match DataTab geometry)
@@ -416,9 +454,10 @@ impl CachedChart {
 
             for ch in 0..8 {
                 let v_opt = if b.has[ch] {
-                    let mid = (b.min[ch] + b.max[ch]) * 0.5;
-                    last_seen[ch] = Some(b.last[ch]);
-                    Some(mid)
+                    // Draw the last value in the bucket (stable line; no shimmer).
+                    let v = b.last[ch];
+                    last_seen[ch] = Some(v);
+                    Some(v)
                 } else {
                     last_seen[ch]
                 };
