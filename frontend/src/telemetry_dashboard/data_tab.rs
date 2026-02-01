@@ -143,8 +143,8 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
             {
                 use std::cell::RefCell;
                 use std::rc::Rc;
-                use wasm_bindgen::closure::Closure;
                 use wasm_bindgen::JsCast;
+                use wasm_bindgen::closure::Closure;
 
                 let cb: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
                 let cb2 = cb.clone();
@@ -206,6 +206,9 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     let labels = labels_for_datatype(&current);
 
     // Viewport constants
+    //
+    // NOTE: We still render in a "virtual" width (viewBox), and the SVG is set to width:100%,
+    // so it scales to fill whatever width is available.
     let view_w = 1200.0_f64;
     let view_h = 360.0_f64;
     let view_h_full = fullscreen_view_height().max(260.0);
@@ -312,9 +315,14 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                 }
             }
 
+            // =========================
+            // Graph (non-fullscreen)
+            // FIX: remove max-width cap + remove centering wrapper that can encourage shrink
+            // =========================
             if is_graph_allowed {
-                div { style: "flex:0; display:flex; align-items:center; justify-content:center; margin-top:6px;",
-                    div { style: "width:100%; max-width:1200px;",
+                div { style: "flex:0; width:100%; margin-top:6px;",
+                    div { style: "width:100%;",
+
                         div { style: "display:flex; justify-content:flex-end; gap:8px; margin-bottom:6px;",
                             button {
                                 style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
@@ -331,7 +339,8 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         if *show_chart.read() {
                             div { style: "width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
                                 svg {
-                                    style: "width:100%; height:auto; display:block;",
+                                    // FIX: ensure it stretches to container width (and doesn't use intrinsic sizing)
+                                    style: "width:100%; height:auto; display:block; max-width:100%;",
                                     view_box: "0 0 {view_w} {view_h}",
 
                                     for i in 1..=5 {
@@ -393,6 +402,11 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
             }
         }
 
+        // =========================
+        // Fullscreen
+        // FIX: make the chart container stretch and the SVG truly fill width/height
+        //      (some browsers/webviews can keep SVG at intrinsic size unless height is explicit)
+        // =========================
         if is_graph_allowed && *is_fullscreen.read() {
             div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
                 div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
@@ -403,10 +417,19 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         "Exit Fullscreen"
                     }
                 }
-                div { style: "flex:1; min-height:0; width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
+
+                // Important bits:
+                // - width:100% (obvious)
+                // - flex:1 + min-height:0 (allow it to take available height)
+                // - align-items:stretch (avoid accidental shrink/center behavior in some webviews)
+                div {
+                    style: "flex:1; min-height:0; width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; align-items:stretch; gap:8px;",
                     svg {
-                        style: "width:100%; flex:1; min-height:0; display:block;",
+                        // FIX: force it to occupy the flex slot, not just its intrinsic size
+                        style: "width:100%; height:auto; display:block;",
                         view_box: "0 0 {view_w} {view_h_full}",
+                        preserve_aspect_ratio: "none",
+
 
                         for i in 1..=5 {
                             line {
