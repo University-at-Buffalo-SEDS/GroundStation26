@@ -374,7 +374,7 @@ def _deploy_ios_single(frontend_dir: Path, bundle: Path) -> None:
     Single-device deploy that waits for a device to be connected.
     """
     try:
-        run(["ios-deploy", "--bundle", str(bundle), "--wait-for-device"], cwd=frontend_dir)
+        run(["ios-deploy", "--bundle", str(bundle)], cwd=frontend_dir)
     except subprocess.CalledProcessError:
         print(
             "Warning: `ios-deploy --wait-for-device` failed; retrying without the flag.",
