@@ -143,8 +143,8 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
             {
                 use std::cell::RefCell;
                 use std::rc::Rc;
-                use wasm_bindgen::JsCast;
                 use wasm_bindgen::closure::Closure;
+                use wasm_bindgen::JsCast;
 
                 let cb: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
                 let cb2 = cb.clone();
@@ -206,9 +206,6 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     let labels = labels_for_datatype(&current);
 
     // Viewport constants
-    //
-    // NOTE: We still render in a "virtual" width (viewBox), and the SVG is set to width:100%,
-    // so it scales to fill whatever width is available.
     let view_w = 1200.0_f64;
     let view_h = 360.0_f64;
     let view_h_full = fullscreen_view_height().max(260.0);
@@ -226,11 +223,15 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     let grid_y_step = inner_h / 6.0_f64;
     let grid_y_step_full = inner_h_full / 6.0_f64;
 
-    // Cache fetch
+    // Cache fetch (NON-FULLSCREEN)
+    //
+    // IMPORTANT: We do NOT fetch fullscreen geometry here anymore.
+    // That avoids doing two cache builds every frame (w,h=360 and w,h=full),
+    // which can interact badly with "window span" behavior and costs extra CPU.
     let (paths, y_min, y_max, span_min) = charts_cache_get(&current, view_w as f32, view_h as f32);
     let (chan_min, chan_max) =
         charts_cache_get_channel_minmax(&current, view_w as f32, view_h as f32);
-    let (paths_full, _, _, _) = charts_cache_get(&current, view_w as f32, view_h_full as f32);
+
     let y_mid = (y_min + y_max) * 0.5;
 
     let y_max_s = format!("{:.2}", y_max);
@@ -289,9 +290,6 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         let vals = [row.v0, row.v1, row.v2, row.v3, row.v4, row.v5, row.v6, row.v7];
 
                         rsx! {
-                            // repeat(auto-fit, minmax(110px, 1fr)) typically yields:
-                            // - iPhone: 3 columns
-                            // - wider: more columns as space allows
                             div {
                                 style: "display:grid; gap:10px; align-items:stretch; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); width:100%;",
                                 for i in 0..8usize {
@@ -317,7 +315,6 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
 
             // =========================
             // Graph (non-fullscreen)
-            // FIX: remove max-width cap + remove centering wrapper that can encourage shrink
             // =========================
             if is_graph_allowed {
                 div { style: "flex:0; width:100%; margin-top:6px;",
@@ -339,7 +336,6 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                         if *show_chart.read() {
                             div { style: "width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
                                 svg {
-                                    // FIX: ensure it stretches to container width (and doesn't use intrinsic sizing)
                                     style: "width:100%; height:auto; display:block; max-width:100%;",
                                     view_box: "0 0 {view_w} {view_h}",
 
@@ -404,81 +400,80 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
 
         // =========================
         // Fullscreen
-        // FIX: make the chart container stretch and the SVG truly fill width/height
-        //      (some browsers/webviews can keep SVG at intrinsic size unless height is explicit)
         // =========================
         if is_graph_allowed && *is_fullscreen.read() {
-            div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
-                div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
-                    h2 { style: "margin:0; color:#f97316;", "Data Graph" }
-                    button {
-                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
-                        onclick: on_toggle_fullscreen,
-                        "Exit Fullscreen"
-                    }
-                }
+            {
+                let (paths_full, _y_min2, _y_max2, _span_min2) =
+                    charts_cache_get(&current, view_w as f32, view_h_full as f32);
 
-                // Important bits:
-                // - width:100% (obvious)
-                // - flex:1 + min-height:0 (allow it to take available height)
-                // - align-items:stretch (avoid accidental shrink/center behavior in some webviews)
-                div {
-                    style: "flex:1; min-height:0; width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; align-items:stretch; gap:8px;",
-                    svg {
-                        // FIX: force it to occupy the flex slot, not just its intrinsic size
-                        style: "width:100%; height:auto; display:block;",
-                        view_box: "0 0 {view_w} {view_h_full}",
-                        preserve_aspect_ratio: "none",
-
-
-                        for i in 1..=5 {
-                            line {
-                                x1:"{left}", y1:"{pad_top + grid_y_step_full * (i as f64)}",
-                                x2:"{right}", y2:"{pad_top + grid_y_step_full * (i as f64)}",
-                                stroke:"#1f2937", "stroke-width":"1"
-                            }
-                        }
-                        for i in 1..=5 {
-                            line {
-                                x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
-                                x2:"{left + grid_x_step * (i as f64)}", y2:"{view_h_full - pad_bottom}",
-                                stroke:"#1f2937", "stroke-width":"1"
+                rsx! {
+                    div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
+                        div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
+                            h2 { style: "margin:0; color:#f97316;", "Data Graph" }
+                            button {
+                                style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                                onclick: on_toggle_fullscreen,
+                                "Exit Fullscreen"
                             }
                         }
 
-                        line { x1:"{left}", y1:"{pad_top}", x2:"{left}", y2:"{view_h_full - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
-                        line { x1:"{left}", y1:"{view_h_full - pad_bottom}", x2:"{right}", y2:"{view_h_full - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
+                        div {
+                            style: "flex:1; min-height:0; width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; align-items:stretch; gap:8px;",
+                            svg {
+                                style: "width:100%; height:auto; display:block;",
+                                view_box: "0 0 {view_w} {view_h_full}",
+                                preserve_aspect_ratio: "none",
 
-                        text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {y_max_s.clone()} }
-                        text { x:"10", y:"{pad_top + inner_h_full / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {y_mid_s.clone()} }
-                        text { x:"10", y:"{view_h_full - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {y_min_s.clone()} }
+                                for i in 1..=5 {
+                                    line {
+                                        x1:"{left}", y1:"{pad_top + grid_y_step_full * (i as f64)}",
+                                        x2:"{right}", y2:"{pad_top + grid_y_step_full * (i as f64)}",
+                                        stroke:"#1f2937", "stroke-width":"1"
+                                    }
+                                }
+                                for i in 1..=5 {
+                                    line {
+                                        x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
+                                        x2:"{left + grid_x_step * (i as f64)}", y2:"{view_h_full - pad_bottom}",
+                                        stroke:"#1f2937", "stroke-width":"1"
+                                    }
+                                }
 
-                        text { x:"{left + 10.0}",  y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {x_left_s.clone()} }
-                        text { x:"{view_w * 0.5}", y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {x_mid_s.clone()} }
-                        text { x:"{right - 60.0}", y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
+                                line { x1:"{left}", y1:"{pad_top}", x2:"{left}", y2:"{view_h_full - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
+                                line { x1:"{left}", y1:"{view_h_full - pad_bottom}", x2:"{right}", y2:"{view_h_full - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
 
-                        for i in 0..8usize {
-                            if !paths_full[i].is_empty() {
-                                path {
-                                    d: "{paths_full[i]}",
-                                    fill: "none",
-                                    stroke: "{series_color(i)}",
-                                    "stroke-width": "2",
-                                    "stroke-linejoin": "round",
-                                    "stroke-linecap": "round",
+                                text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {y_max_s.clone()} }
+                                text { x:"10", y:"{pad_top + inner_h_full / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {y_mid_s.clone()} }
+                                text { x:"10", y:"{view_h_full - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {y_min_s.clone()} }
+
+                                text { x:"{left + 10.0}",  y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {x_left_s.clone()} }
+                                text { x:"{view_w * 0.5}", y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {x_mid_s.clone()} }
+                                text { x:"{right - 60.0}", y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
+
+                                for i in 0..8usize {
+                                    if !paths_full[i].is_empty() {
+                                        path {
+                                            d: "{paths_full[i]}",
+                                            fill: "none",
+                                            stroke: "{series_color(i)}",
+                                            "stroke-width": "2",
+                                            "stroke-linejoin": "round",
+                                            "stroke-linecap": "round",
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    }
 
-                    if !legend_rows.is_empty() {
-                        div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:8px 12px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
-                            for (i, label) in legend_rows.iter() {
-                                div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
-                                    svg { width:"26", height:"8", view_box:"0 0 26 8",
-                                        line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", "stroke-width":"2", "stroke-linecap":"round" }
+                            if !legend_rows.is_empty() {
+                                div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:8px 12px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
+                                    for (i, label) in legend_rows.iter() {
+                                        div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
+                                            svg { width:"26", height:"8", view_box:"0 0 26 8",
+                                                line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", "stroke-width":"2", "stroke-linecap":"round" }
+                                            }
+                                            "{label}"
+                                        }
                                     }
-                                    "{label}"
                                 }
                             }
                         }
@@ -507,7 +502,6 @@ fn SummaryCard(
     };
 
     rsx! {
-        // ✅ no fixed min-width; allow grid to pack 3-per-row on iPhone
         div { style: "padding:10px; border-radius:12px; background:#0f172a; border:1px solid #334155; width:100%; min-width:0; box-sizing:border-box;",
             div { style: "font-size:12px; color:{color};", "{label}" }
             div { style: "font-size:18px; color:#e5e7eb; line-height:1.1;", "{value}" }

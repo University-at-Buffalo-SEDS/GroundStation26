@@ -1,13 +1,13 @@
 // frontend/src/telemetry_dashboard/mod.rs
 
 mod actions_tab;
-mod latency_chart;
 mod connection_status_tab;
 pub mod data_chart;
 pub mod data_tab;
 pub mod errors_tab;
 mod gps;
 mod gps_android;
+mod latency_chart;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod gps_apple;
@@ -18,7 +18,9 @@ pub mod warnings_tab;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::Route;
-use data_chart::{charts_cache_ingest_row, charts_cache_reset_and_ingest};
+use data_chart::{
+    charts_cache_ingest_row, charts_cache_request_refit, charts_cache_reset_and_ingest,
+};
 
 use crate::telemetry_dashboard::actions_tab::ActionsTab;
 use connection_status_tab::ConnectionStatusTab;
@@ -34,8 +36,8 @@ use warnings_tab::WarningsTab;
 
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    atomic::{AtomicBool, Ordering}, Arc,
+    Mutex,
 };
 
 use once_cell::sync::Lazy;
@@ -717,6 +719,11 @@ fn TelemetryDashboardInner() -> Element {
 
             // Clear graphs immediately before re-seeding.
             rows_s.set(Vec::new());
+
+            // Tell charts to refit their time window to whatever history we load next
+            // (smooth shrink on demand; does nothing during normal live updates)
+            charts_cache_request_refit();
+
             // Reset chart cache too (so DataTab doesn't show stale lines)
             charts_cache_reset_and_ingest(&[]);
 
@@ -966,6 +973,8 @@ fn TelemetryDashboardInner() -> Element {
                 cursor:pointer;
             ",
             onclick: move |_| {
+                    charts_cache_request_refit();
+
                 reconnect_and_reload_ui();
             },
             "RELOAD"

@@ -15,6 +15,52 @@ use dioxus_router::{Routable, Router};
 use crate::telemetry_dashboard::UrlConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use dioxus_router::use_navigator;
+// -------------------------
+// Native-only keep-awake shims (mobile)
+// -------------------------
+#[cfg(not(target_arch = "wasm32"))]
+mod keep_awake {
+    #[cfg(target_os = "ios")]
+    mod ios {
+        use std::os::raw::c_int;
+
+        unsafe extern "C" {
+            fn gs26_set_idle_timer_disabled(disabled: c_int);
+        }
+
+        pub fn set_enabled(enabled: bool) {
+            // iOS API is "idle timer disabled", so enabled=true -> disabled=1
+            unsafe { gs26_set_idle_timer_disabled(if enabled { 1 } else { 0 }) };
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    mod android {
+        use std::os::raw::c_int;
+
+        unsafe extern "C" {
+            fn gs26_android_set_keep_screen_on(enabled: c_int);
+        }
+
+        pub fn set_enabled(enabled: bool) {
+            unsafe { gs26_android_set_keep_screen_on(if enabled { 1 } else { 0 }) };
+        }
+    }
+
+    pub fn set_enabled(enabled: bool) {
+        #[cfg(target_os = "ios")]
+        ios::set_enabled(enabled);
+
+        #[cfg(target_os = "android")]
+        android::set_enabled(enabled);
+
+        // Other native targets: no-op
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            let _ = enabled;
+        }
+    }
+}
 
 // --- global css ---
 const GLOBAL_CSS: &str = r#"
@@ -413,6 +459,12 @@ fn format_route_report_host_only(
 
 #[component]
 pub fn App() -> Element {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Keep screen awake on mobile while app is running.
+        // If you only want this on iOS/Android, the shim already no-ops elsewhere.
+        keep_awake::set_enabled(true);
+    }
     rsx! {
         document::Style { "{GLOBAL_CSS}" }
         Meta { name: "viewport", content: "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" }
@@ -459,8 +511,8 @@ pub fn Root() -> Element {
 pub fn Connect() -> Element {
     let nav = use_navigator();
 
-    let initial = UrlConfig::_stored_base_url()
-        .unwrap_or_else(|| "http://localhost:3000".to_string());
+    let initial =
+        UrlConfig::_stored_base_url().unwrap_or_else(|| "http://localhost:3000".to_string());
 
     let mut url_edit = use_signal(|| initial);
 

@@ -3,16 +3,24 @@
 // iOS/macOS Objective-C shim for:
 //  - Requesting Location permission + streaming coordinates to a Rust callback
 //  - Triggering the Local Network permission prompt by doing a short-lived TCP connect
-//    using Network.framework *to the user-provided host/port*.
+//    using Network.framework to the user-provided host/port
+//  - Preventing sleep on iOS via UIApplication.idleTimerDisabled (no-op on macOS)
 //
 // Build:
 //  - Compile with ARC: -fobjc-arc
 //  - Link frameworks: CoreLocation.framework, Network.framework
+//  - iOS only: UIKit.framework
 //
 
 #import <Foundation/Foundation.h>
 #import <CoreLocation/CoreLocation.h>
 #import <Network/Network.h>
+#import <dispatch/dispatch.h>
+#import <TargetConditionals.h>
+
+#if TARGET_OS_IOS
+#import <UIKit/UIKit.h>
+#endif
 
 #pragma mark - Location shim
 
@@ -46,6 +54,7 @@ typedef void (*LocationCallback)(double lat, double lon);
 - (void)locationManager:(CLLocationManager *)manager
      didUpdateLocations:(NSArray<CLLocation *> *)locations
 {
+    (void)manager;
     CLLocation *last = locations.lastObject;
     if (!last || !self.cb) return;
     self.cb(last.coordinate.latitude, last.coordinate.longitude);
@@ -69,6 +78,20 @@ void gs26_location_start(LocationCallback cb) {
     }
 }
 
+#pragma mark - Keep awake (iOS only)
+
+// iOS: prevent sleep while app is open.
+// macOS: no-op.
+void gs26_set_idle_timer_disabled(int disabled) {
+#if TARGET_OS_IOS
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = (disabled != 0);
+    });
+#else
+    (void)disabled;
+#endif
+}
+
 #pragma mark - Local Network prompt shim (Network.framework)
 
 static dispatch_queue_t gs26_net_queue(void) {
@@ -81,7 +104,6 @@ static dispatch_queue_t gs26_net_queue(void) {
 }
 
 // Keep short-lived connections alive until their callbacks fire.
-// nw_connection_t is already an ObjC object type.
 static NSMutableSet<id> *gs26_live_conns(void) {
     static NSMutableSet<id> *s;
     static dispatch_once_t once;
@@ -110,8 +132,10 @@ static void gs26_poke_host_port(NSString *host, uint16_t port, uint32_t timeout_
     NSString *portStr = [NSString stringWithFormat:@"%u", (unsigned)port];
     nw_endpoint_t ep = nw_endpoint_create_host(host.UTF8String, portStr.UTF8String);
 
-    // Plain TCP (TLS disabled):
-    // This is the supported way to create TCP parameters in Network.framework C API.
+    // Plain TCP (TLS disabled).
+    // Modern Network.framework supports:
+    //   nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL,
+    //                                  NW_PARAMETERS_DEFAULT_CONFIGURATION);
     nw_parameters_t params =
         nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL,
                                         NW_PARAMETERS_DEFAULT_CONFIGURATION);
@@ -119,7 +143,6 @@ static void gs26_poke_host_port(NSString *host, uint16_t port, uint32_t timeout_
     nw_connection_t conn = nw_connection_create(ep, params);
     nw_connection_set_queue(conn, q);
 
-    // Hold a strong reference until finished (no __bridge needed).
     @synchronized (gs26_live_conns()) {
         [gs26_live_conns() addObject:conn];
     }
@@ -149,9 +172,6 @@ static void gs26_poke_host_port(NSString *host, uint16_t port, uint32_t timeout_
             finish();
             return;
         }
-
-        // WAITING might occur before permission is granted / route is available.
-        // We rely on the timeout to stop it.
     });
 
     nw_connection_start(conn);
@@ -171,7 +191,7 @@ void gs26_localnet_poke_host_port(const char *host, uint16_t port) {
     }
 }
 
-// Public C API: poke from a URL like "http://192.168.1.50:3000" or "https://jetbrains-vm.com:3000"
+// Public C API: poke from a URL like "http://192.168.1.50:3000" or "https://example.com:3000"
 void gs26_localnet_poke_url(const char *url_cstr) {
     @autoreleasepool {
         NSString *urlStr = gs26_string_from_c(url_cstr);

@@ -27,6 +27,13 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 
 use super::HISTORY_MS;
+// Time-window shrink tuning (only used during explicit "refit")
+const X_SHRINK_ALPHA: f32 = 0.12; // 0.05..0.2, higher = faster settle
+const X_SHRINK_EPS_MS: i64 = 250; // snap when within this many ms
+
+pub fn charts_cache_request_refit() {
+    CHARTS_CACHE.with(|c| c.borrow_mut().request_refit());
+}
 
 // ============================================================
 // Global cache (updated once per telemetry row)
@@ -91,7 +98,7 @@ pub fn charts_cache_get_channel_minmax(
 // ============================================================
 
 const MAX_POINTS_CAP: usize = 60000; // cap for downsample points (smooth scrolling at 20min)
-const MIN_POINTS: usize = 240; // keep some detail even for tiny spans
+const MIN_POINTS: usize = 1; // keep some detail even for tiny spans
 const TARGET_BUCKET_MS: i64 = 20; // aim ~5Hz resolution at max span
 const X_ALIGN_MS: i64 = 50; // snap window end to reduce x jitter
 const MIN_SPAN_MS: i64 = 1_000; // avoid divide-by-zero (1s)
@@ -138,6 +145,11 @@ impl ChartsCache {
             (c.paths.clone(), c.disp_min, c.disp_max, c.span_min)
         } else {
             (std::array::from_fn(|_| String::new()), 0.0, 1.0, 0.0)
+        }
+    }
+    fn request_refit(&mut self) {
+        for ch in self.charts.values_mut() {
+            ch.request_refit();
         }
     }
 }
@@ -193,6 +205,7 @@ struct CachedChart {
     // ✅ NEW: last size used to build `paths`
     last_w: f32,
     last_h: f32,
+    refit_pending: bool,
 }
 
 impl CachedChart {
@@ -212,7 +225,12 @@ impl CachedChart {
             prev_span_ms: 0,
             last_w: 0.0,
             last_h: 0.0,
+            refit_pending: false,
         }
+    }
+    fn request_refit(&mut self) {
+        self.refit_pending = true;
+        self.dirty = true; // ensure next build applies it
     }
 
     fn ingest(&mut self, r: &TelemetryRow) {
@@ -345,12 +363,44 @@ impl CachedChart {
 
         let raw_span_ms = newest_ts.saturating_sub(oldest_ts).max(1);
 
-        // Effective window: grow up to HISTORY_MS, but never shrink automatically.
+        // Base span from data (clamped)
         let mut span_ms = raw_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
+
         if self.prev_span_ms > 0 {
-            span_ms = span_ms.max(self.prev_span_ms);
+            if self.refit_pending {
+                // Smoothly shrink prev_span_ms toward span_ms, but still expand immediately if needed.
+                let prev = self.prev_span_ms;
+
+                if span_ms > prev {
+                    // still expand immediately
+                    self.prev_span_ms = span_ms;
+                    self.refit_pending = false; // already needs expansion, refit done
+                } else {
+                    // ease down
+                    let diff = (prev - span_ms) as f32;
+                    let step = (diff * X_SHRINK_ALPHA).max(1.0);
+                    let next = (prev as f32 - step).round() as i64;
+
+                    let next = next.max(span_ms); // never go below target
+                    self.prev_span_ms = next;
+
+                    if (self.prev_span_ms - span_ms).abs() <= X_SHRINK_EPS_MS {
+                        self.prev_span_ms = span_ms;
+                        self.refit_pending = false; // done refitting
+                    }
+                }
+                span_ms = self.prev_span_ms;
+            } else {
+                // Normal runtime: never shrink automatically (prevents jitter)
+                span_ms = span_ms.max(self.prev_span_ms);
+                self.prev_span_ms = span_ms;
+            }
+        } else {
+            self.prev_span_ms = span_ms;
         }
+
         span_ms = span_ms.min(HISTORY_MS);
+
         self.prev_span_ms = span_ms;
 
         // Pick point count
