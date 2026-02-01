@@ -18,7 +18,7 @@ const UMBILICAL_MAX_INTERVAL_MS: i64 = 2_500;
 
 /// The cycle of dummy flight states we want to walk through.
 const FLIGHT_STATES: &[FlightState] = &[
-    FlightState::Startup,
+    // FlightState::Startup,
     FlightState::Idle,
     FlightState::PreFill,
     FlightState::NitrogenFill,
@@ -170,6 +170,7 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
         if emit_flightstate {
             // Grab the state we advanced to.
             let flight_state = &FLIGHT_STATES[state_guard.idx];
+
 
             // Encode FlightState into payload; here as a single u8.
             // If you have a helper like flight_state_to_u8, use that instead.
