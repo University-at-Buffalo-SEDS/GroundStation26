@@ -583,6 +583,9 @@ pub fn labels_for_datatype(dt: &str) -> [&'static str; 8] {
         "KALMAN_FILTER_DATA" => ["X", "Y", "Z", "", "", "", "", ""],
         "GPS_DATA" => ["Lat", "Lon", "", "", "", "", "", ""],
         "FUEL_TANK_PRESSURE" => ["Tank Pressure", "", "", "", "", "", "", ""],
+        "BATTERY_VOLTAGE" => ["Voltage", "", "", "", "", "", "", ""],
+        "BATTERY_CURRENT" => ["Current", "", "", "", "", "", "", ""],
+        "FUEL_FLOW" => ["Flow Rate", "", "", "", "", "", "", ""],
         "VALVE_STATE" => [
             "Pilot",
             "NormallyOpen",
