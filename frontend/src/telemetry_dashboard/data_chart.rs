@@ -17,6 +17,11 @@
 //   because `dirty=false`, causing fullscreen to reuse non-fullscreen geometry.
 //   We now track last_w/last_h and rebuild when size changes.
 //
+// - X-axis fix:
+//   The graph is no longer *defined* by whole buckets. Buckets are just an internal rendering
+//   optimization. The displayed span is the true span, and the right edge always corresponds
+//   to the newest sample timestamp (no "+1 minute" drift, no "minimum 3 minutes" quantization).
+//
 // API:
 //   charts_cache_reset_and_ingest(rows)
 //   charts_cache_ingest_row(row)
@@ -27,7 +32,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 
 use super::HISTORY_MS;
-// Time-window shrink tuning (only used during explicit "refit")
+
+// Time-window shrink tuning (hysteresis)
 const X_SHRINK_ALPHA: f32 = 0.12; // 0.05..0.2, higher = faster settle
 const X_SHRINK_EPS_MS: i64 = 250; // snap when within this many ms
 
@@ -98,9 +104,8 @@ pub fn charts_cache_get_channel_minmax(
 // ============================================================
 
 const MAX_POINTS_CAP: usize = 60000; // cap for downsample points (smooth scrolling at 20min)
-const MIN_POINTS: usize = 1; // keep some detail even for tiny spans
+const MIN_POINTS: usize = 240; // keep some detail even for tiny spans
 const TARGET_BUCKET_MS: i64 = 20; // aim ~5Hz resolution at max span
-const X_ALIGN_MS: i64 = 50; // snap window end to reduce x jitter
 const MIN_SPAN_MS: i64 = 1_000; // avoid divide-by-zero (1s)
 
 // Keep at most this many samples per datatype as a hard cap (in addition to time pruning).
@@ -147,6 +152,7 @@ impl ChartsCache {
             (std::array::from_fn(|_| String::new()), 0.0, 1.0, 0.0)
         }
     }
+
     fn request_refit(&mut self) {
         for ch in self.charts.values_mut() {
             ch.request_refit();
@@ -202,9 +208,11 @@ struct CachedChart {
     span_min: f32,
     prev_span_ms: i64,
 
-    // ✅ NEW: last size used to build `paths`
+    // last size used to build `paths`
     last_w: f32,
     last_h: f32,
+
+    // If true: shrink span faster until it settles
     refit_pending: bool,
 }
 
@@ -228,6 +236,7 @@ impl CachedChart {
             refit_pending: false,
         }
     }
+
     fn request_refit(&mut self) {
         self.refit_pending = true;
         self.dirty = true; // ensure next build applies it
@@ -329,7 +338,7 @@ impl CachedChart {
     }
 
     fn build_if_needed(&mut self, w: f32, h: f32) {
-        // ✅ Rebuild if size changed (fixes fullscreen / multi-size callers)
+        // Rebuild if size changed (fixes fullscreen / multi-size callers)
         let size_changed = (self.last_w - w).abs() > 0.5 || (self.last_h - h).abs() > 0.5;
         if !self.dirty && !size_changed {
             return;
@@ -349,6 +358,7 @@ impl CachedChart {
             self.disp_max = 1.0;
             self.span_min = 0.0;
             self.prev_span_ms = 0;
+            self.refit_pending = false;
             self.dirty = false;
             return;
         }
@@ -363,78 +373,61 @@ impl CachedChart {
 
         let raw_span_ms = newest_ts.saturating_sub(oldest_ts).max(1);
 
-        // Base span from data (clamped)
-        let mut span_ms = raw_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
+        // Desired span from the actual data (clamped).
+        //
+        // We keep a *hysteretic* displayed span:
+        // - Expand immediately (never clip)
+        // - Shrink slowly (prevents jitter)
+        // - If a refit was explicitly requested, shrink faster until it settles.
+        let desired_span_ms = raw_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
 
+        let mut span_ms = desired_span_ms;
         if self.prev_span_ms > 0 {
-            if self.refit_pending {
-                // Smoothly shrink prev_span_ms toward span_ms, but still expand immediately if needed.
-                let prev = self.prev_span_ms;
+            let prev = self.prev_span_ms;
 
-                if span_ms > prev {
-                    // still expand immediately
-                    self.prev_span_ms = span_ms;
-                    self.refit_pending = false; // already needs expansion, refit done
-                } else {
-                    // ease down
-                    let diff = (prev - span_ms) as f32;
-                    let step = (diff * X_SHRINK_ALPHA).max(1.0);
-                    let next = (prev as f32 - step).round() as i64;
-
-                    let next = next.max(span_ms); // never go below target
-                    self.prev_span_ms = next;
-
-                    if (self.prev_span_ms - span_ms).abs() <= X_SHRINK_EPS_MS {
-                        self.prev_span_ms = span_ms;
-                        self.refit_pending = false; // done refitting
-                    }
-                }
-                span_ms = self.prev_span_ms;
-            } else {
-                // Normal runtime: never shrink automatically (prevents jitter)
-                span_ms = span_ms.max(self.prev_span_ms);
+            if span_ms > prev {
+                // Expand immediately.
                 self.prev_span_ms = span_ms;
+                self.refit_pending = false;
+            } else {
+                // Shrink slowly (or faster when refit_pending).
+                let alpha = if self.refit_pending {
+                    (X_SHRINK_ALPHA * 2.5).min(0.85)
+                } else {
+                    X_SHRINK_ALPHA
+                };
+
+                let diff = (prev - span_ms) as f32;
+                let step = (diff * alpha).max(1.0);
+                let mut next = (prev as f32 - step).round() as i64;
+                next = next.max(span_ms); // never go below desired span
+
+                self.prev_span_ms = next;
+
+                if (self.prev_span_ms - span_ms).abs() <= X_SHRINK_EPS_MS {
+                    self.prev_span_ms = span_ms;
+                    self.refit_pending = false;
+                }
             }
+
+            span_ms = self.prev_span_ms;
         } else {
             self.prev_span_ms = span_ms;
         }
 
         span_ms = span_ms.min(HISTORY_MS);
-
         self.prev_span_ms = span_ms;
 
-        // Pick point count
+        // Pick point count (bucket count).
         let mut points = ((span_ms + TARGET_BUCKET_MS - 1) / TARGET_BUCKET_MS) as usize;
         points = points.clamp(MIN_POINTS, MAX_POINTS_CAP);
         let px_cap = (w.max(1.0) as usize).saturating_mul(3).max(MIN_POINTS);
         points = points.min(px_cap).clamp(MIN_POINTS, MAX_POINTS_CAP);
 
-        // Compute bucket_ms from span/points, then lock the window to bucket boundaries.
-        let mut bucket_ms = (span_ms / points as i64).max(1);
-
-        // Align quantum: round bucket_ms up to a multiple of X_ALIGN_MS
-        let align = if X_ALIGN_MS > 1 {
-            if bucket_ms % X_ALIGN_MS != 0 {
-                bucket_ms = ((bucket_ms + X_ALIGN_MS - 1) / X_ALIGN_MS) * X_ALIGN_MS;
-            }
-            bucket_ms
-        } else {
-            bucket_ms
-        };
-
-        // Snap end_ts to alignment quantum
-        let end_ts = if align > 1 {
-            (newest_ts / align) * align
-        } else {
-            newest_ts
-        };
-
-        // Define start_ts so the window spans an integer number of buckets.
-        let start_ts = end_ts.saturating_sub(bucket_ms.saturating_mul(points as i64));
-
-        // Update span_ms to match exactly the bucket grid
-        let span_ms = bucket_ms.saturating_mul(points as i64);
-        self.prev_span_ms = self.prev_span_ms.max(span_ms).min(HISTORY_MS);
+        // IMPORTANT: do NOT force the window to land on whole buckets.
+        // The buckets are for rendering efficiency; the *displayed* span is span_ms, and
+        // the right edge always corresponds to newest_ts.
+        let start_ts = newest_ts.saturating_sub(span_ms);
 
         let mut buckets = vec![Bucket::default(); points];
 
@@ -449,7 +442,11 @@ impl CachedChart {
                 continue;
             }
 
-            let bi = ((samp.ts - start_ts) / bucket_ms).clamp(0, (points as i64) - 1) as usize;
+            // Map timestamp to bucket index in [0, points-1] over the *true* span.
+            let bi = (((samp.ts - start_ts) as f32 / span_ms as f32) * points as f32)
+                .floor()
+                .clamp(0.0, (points as f32) - 1.0) as usize;
+
             let b = &mut buckets[bi];
 
             for ch in 0..8 {
