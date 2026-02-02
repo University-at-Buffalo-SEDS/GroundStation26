@@ -35,8 +35,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 // use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc};
 use crate::web::emit_error;
+use tokio::sync::{broadcast, mpsc};
 
 fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
     Box::new(get_current_timestamp_ms)
@@ -80,8 +80,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     sqlx::query(
         r#"
@@ -93,8 +93,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     sqlx::query(
         r#"
@@ -105,8 +105,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);

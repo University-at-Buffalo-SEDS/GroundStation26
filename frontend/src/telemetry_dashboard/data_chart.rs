@@ -5,7 +5,7 @@
 // - Historical bucket values NEVER change (only newest bucket is "live").
 // - Rendering uses the last N buckets -> stable X ordering, stable per-bucket Y.
 //
-// Keeps your API:
+// Keeps the API:
 //   charts_cache_reset_and_ingest(rows)
 //   charts_cache_ingest_row(row)
 //   charts_cache_get(data_type, width, height) -> ([d;8], y_min, y_max, span_min)
@@ -34,7 +34,7 @@ use super::HISTORY_MS;
 // Bucket grid configuration
 // -------------------------
 //
-// This is your downsample timebase.
+// This is our downsample timebase.
 // Smaller = more detail, more points.
 // Larger = smoother, fewer points.
 //
@@ -570,9 +570,9 @@ pub fn series_color(i: usize) -> &'static str {
     [
         "#f97316", "#22d3ee", "#a3e635", "#f43f5e", "#8b5cf6", "#e879f9", "#10b981", "#fbbf24",
     ]
-    .get(i)
-    .copied()
-    .unwrap_or("#9ca3af")
+        .get(i)
+        .copied()
+        .unwrap_or("#9ca3af")
 }
 
 pub fn labels_for_datatype(dt: &str) -> [&'static str; 8] {

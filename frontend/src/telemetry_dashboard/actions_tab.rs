@@ -32,7 +32,6 @@ pub fn ActionsTab() -> Element {
                     gap:12px;
                 ",
 
-                // Replace/extend these with your real commands (everything except Abort)
                 button {
                     style: "{btn_style(\"#22c55e\", \"#022c22\", \"#bbf7d0\")}",
                     onclick: move |_| crate::telemetry_dashboard::send_cmd("Launch"),

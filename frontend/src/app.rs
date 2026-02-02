@@ -2,11 +2,19 @@
 //
 // COMPLETE REPLACEMENT FILE
 //
-// Changes:
+// Changes (this version):
+// - Connection tests are MUCH faster:
+//   * Reuse one reqwest Client
+//   * Probe routes concurrently with Tokio (join_all)
+//   * Short connect + overall timeouts
+//   * Cap response body size (avoid huge tile downloads)
 // - Removed IP-based resolve/poke/tests (hostname only)
 // - Added REAL WebSocket connect probe (ws:// or wss://) and prints why it fails
 // - Kept native ObjC poke for Local Network prompt (hostname only)
 // - WASM behavior unchanged (no Connect screen)
+const CONNECTION_TIMEOUT_MS: u64 = 8000;
+const BODY_TRANSFER_TIMEOUT_MS: u64 = 10000;
+const WS_TIMEOUT_MS: u64 = 4500;
 
 use dioxus::prelude::*;
 use dioxus_router::{Routable, Router};
@@ -15,6 +23,7 @@ use dioxus_router::{Routable, Router};
 use crate::telemetry_dashboard::UrlConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use dioxus_router::use_navigator;
+
 // -------------------------
 // Native-only keep-awake shims (mobile)
 // -------------------------
@@ -60,6 +69,13 @@ mod keep_awake {
             let _ = enabled;
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn all_tests_passed(checks: &[RouteCheck], ws_probe: &Option<Result<String, String>>) -> bool {
+    let routes_ok = checks.iter().all(|c| c.ok);
+    let ws_ok = matches!(ws_probe, Some(Ok(_)));
+    routes_ok && ws_ok
 }
 
 // --- global css ---
@@ -123,7 +139,6 @@ mod objc_poke {
 // -------------------------
 // Persistence helpers
 // -------------------------
-
 #[cfg(not(target_arch = "wasm32"))]
 mod persist {
     use super::_CONNECT_SHOWN_KEY;
@@ -223,7 +238,6 @@ fn parse_base_url(url: &str) -> Result<ParsedBaseUrl, String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn ws_origin_for_base(parsed: &ParsedBaseUrl) -> String {
-    // Use explicit port if non-default, keep it always (simpler + matches your base)
     let ws_scheme = if parsed.scheme == "https" {
         "wss"
     } else {
@@ -303,11 +317,23 @@ fn classify_reqwest_error(e: &reqwest::Error) -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn http_probe(url: String) -> Result<(u16, String), String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(18000))
+fn build_probe_client() -> Result<reqwest::Client, String> {
+    // Fast but still reliable:
+    // - connect_timeout: how long we wait for TCP/TLS connect
+    // - timeout: total request time budget (includes body)
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_millis(CONNECTION_TIMEOUT_MS))
+        .timeout(std::time::Duration::from_millis(BODY_TRANSFER_TIMEOUT_MS))
         .build()
-        .map_err(|e| format!("build client failed: {e}"))?;
+        .map_err(|e| format!("build client failed: {e}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn http_probe_with_client(
+    client: &reqwest::Client,
+    url: String,
+) -> Result<(u16, String), String> {
+    const MAX_BODY_BYTES: usize = 4096;
 
     let resp = client
         .get(&url)
@@ -316,15 +342,27 @@ async fn http_probe(url: String) -> Result<(u16, String), String> {
         .map_err(|e| format!("send failed: {} | kind={}", e, classify_reqwest_error(&e)))?;
 
     let status = resp.status().as_u16();
-    let body = resp
-        .text()
+
+    // Cap body download so routes like /tiles don't slow the "test connection" UI.
+    // We only need enough to help debugging / confirm "responding".
+    let bytes = resp
+        .bytes()
         .await
         .map_err(|e| format!("read body failed: {e}"))?;
 
+    let mut slice = bytes.as_ref();
+    if slice.len() > MAX_BODY_BYTES {
+        slice = &slice[..MAX_BODY_BYTES];
+    }
+
+    let body = String::from_utf8_lossy(slice).to_string();
     Ok((status, snip(body, 300)))
 }
+
 #[cfg(not(target_arch = "wasm32"))]
 async fn test_routes_host_only(base: &str) -> Vec<RouteCheck> {
+    use futures_util::future::join_all;
+
     let probes: &[&str] = &[
         "/api/recent",
         "/api/history",
@@ -335,26 +373,46 @@ async fn test_routes_host_only(base: &str) -> Vec<RouteCheck> {
         "/ws",
     ];
 
-    let mut out = Vec::new();
-
-    for path in probes {
-        let url = join_url(base, path);
-
-        match http_probe(url.clone()).await {
-            Ok((status, body_snip)) => {
-                let (ok, note) = status_ok_for_path(path, status);
-                out.push(RouteCheck {
+    let client = match build_probe_client() {
+        Ok(c) => c,
+        Err(e) => {
+            // If client build failed, mark everything failed quickly.
+            return probes
+                .iter()
+                .map(|path| RouteCheck {
                     path,
-                    url,
-                    ok,
-                    status: Some(status),
-                    body_snip,
-                    note: note.to_string(),
-                    err: None,
-                });
-            }
-            Err(e) => {
-                out.push(RouteCheck {
+                    url: join_url(base, path),
+                    ok: false,
+                    status: None,
+                    body_snip: "".to_string(),
+                    note: "client build failed".to_string(),
+                    err: Some(e.clone()),
+                })
+                .collect();
+        }
+    };
+
+    // Run all probes concurrently.
+    let futs = probes.iter().map(|path| {
+        let url = join_url(base, path);
+        let path = *path;
+        let client = &client;
+
+        async move {
+            match http_probe_with_client(client, url.clone()).await {
+                Ok((status, body_snip)) => {
+                    let (ok, note) = status_ok_for_path(path, status);
+                    RouteCheck {
+                        path,
+                        url,
+                        ok,
+                        status: Some(status),
+                        body_snip,
+                        note: note.to_string(),
+                        err: None,
+                    }
+                }
+                Err(e) => RouteCheck {
                     path,
                     url,
                     ok: false,
@@ -362,36 +420,46 @@ async fn test_routes_host_only(base: &str) -> Vec<RouteCheck> {
                     body_snip: "".to_string(),
                     note: "request failed".to_string(),
                     err: Some(e),
-                });
+                },
             }
         }
-    }
+    });
 
-    out
+    join_all(futs).await
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn ws_connect_probe(parsed: &ParsedBaseUrl) -> Result<String, String> {
+    use tokio::time::timeout;
     use tokio_tungstenite::connect_async;
 
     let ws_origin = ws_origin_for_base(parsed);
     let ws_url = format!("{ws_origin}/ws");
 
-    // This is a REAL websocket handshake. If wss fails due to cert/trust/SNI, you’ll see it here.
-    let res = connect_async(ws_url.clone()).await;
+    // Real websocket handshake, but time-bounded so it can't hang forever.
+    let res = timeout(
+        std::time::Duration::from_millis(WS_TIMEOUT_MS),
+        connect_async(ws_url.clone()),
+    )
+    .await;
 
     match res {
-        Ok((_stream, resp)) => Ok(format!(
+        Err(_) => Err(format!(
+            "❌ WebSocket connect FAILED (timeout)\n    URL: {}",
+            ws_url
+        )),
+        Ok(Ok((_stream, resp))) => Ok(format!(
             "✅ WebSocket handshake OK\n    URL: {}\n    HTTP: {}",
             ws_url,
             resp.status()
         )),
-        Err(e) => Err(format!(
+        Ok(Err(e)) => Err(format!(
             "❌ WebSocket connect FAILED\n    URL: {}\n    ERROR: {}",
             ws_url, e
         )),
     }
 }
+
 #[cfg(not(target_arch = "wasm32"))]
 fn format_route_report_host_only(
     original_base: &str,
@@ -401,13 +469,20 @@ fn format_route_report_host_only(
 ) -> String {
     let mut s = String::new();
 
+    // ⭐ All-tests-passed banner
+    if all_tests_passed(checks, &ws_probe) {
+        s.push_str("🎉 ALL CONNECTION TESTS PASSED\n");
+        s.push_str("    Backend is reachable, HTTP routes OK, WebSocket OK.\n");
+        s.push_str("--------------------------------------------------------\n\n");
+    }
+
     s.push_str(&format!("Original base: {original_base}\n"));
     s.push_str(&format!(
         "Parsed host: {}  port: {}  scheme: {}\n\n",
         parsed.host, parsed.port, parsed.scheme
     ));
 
-    s.push_str("=== Probing via host ===\n\n");
+    s.push_str("=== Probing via host (concurrent, short timeouts) ===\n\n");
 
     for c in checks {
         let icon = if c.ok { "✅" } else { "❌" };
@@ -446,6 +521,7 @@ fn format_route_report_host_only(
     }
 
     s.push_str("\nNotes:\n");
+    s.push_str("- Tests are concurrent; worst-case time ~= the slowest single probe, not sum of all probes.\n");
     s.push_str("- If HTTP routes are OK but WebSocket fails: likely TLS/cert/SNI issue for wss, or WS is blocked by server/proxy.\n");
     s.push_str("- If /ws HTTP probe shows 400/426 but WS probe fails: server is reachable, handshake is failing.\n");
     s.push_str("- Local Network prompt on iOS triggers only for LAN access; this test uses hostname only.\n");
@@ -456,13 +532,10 @@ fn format_route_report_host_only(
 // -------------------------
 // App
 // -------------------------
-
 #[component]
 pub fn App() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        // Keep screen awake on mobile while app is running.
-        // If you only want this on iOS/Android, the shim already no-ops elsewhere.
         keep_awake::set_enabled(true);
     }
     rsx! {
@@ -590,16 +663,16 @@ pub fn Connect() -> Element {
                             };
 
                             testing.set(true);
-                            test_status.set("Testing connection...".to_string());
+                            test_status.set("Testing connection (fast probes)...".to_string());
 
-                            // Hostname-only poke (keeps your original behavior)
+                            // Trigger iOS local-network prompt (best-effort)
                             objc_poke::poke_url(&u_norm);
 
                             spawn(async move {
-                                // 1) HTTP probes
+                                // 1) HTTP probes (concurrent)
                                 let checks = test_routes_host_only(&u_norm).await;
 
-                                // 2) REAL websocket probe (ws/wss)
+                                // 2) REAL websocket probe (ws/wss) (time-bounded)
                                 let ws_probe = Some(ws_connect_probe(&parsed).await);
 
                                 let report = format_route_report_host_only(&u_norm, &parsed, &checks, ws_probe);

@@ -394,7 +394,6 @@ function updateGroundMapMarkers(rLat, rLon, uLat, uLon) {
         },
     });
 
-    // Backwards-compat globals (so your Rust `window.*` calls still work)
     window.initGroundMap = api.initGroundMap;
     window.updateGroundMapMarkers = api.updateGroundMapMarkers;
     window.centerGroundMapOn = api.centerGroundMapOn;

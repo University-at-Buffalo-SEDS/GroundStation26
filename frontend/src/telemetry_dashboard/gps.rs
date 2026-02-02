@@ -25,7 +25,7 @@ pub fn stop_gps_updates() {
 }
 
 /// ONE common interface:
-/// Mount this once in your dashboard and it will:
+/// Mount this once in the dashboard and it will:
 /// - connect `user_gps`
 /// - start/stop native backends if needed
 /// - use dioxus_sdk_geolocation on wasm/windows (hook-based)
@@ -34,7 +34,6 @@ pub fn stop_gps_updates() {
 #[component]
 pub fn GpsDriver(
     user_gps: Signal<Option<(f64, f64)>>,
-    /// Optional: gate GPS init until your JS is ready (only used on wasm).
     #[props(optional)]
     js_ready: Option<bool>,
 ) -> Element {

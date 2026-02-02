@@ -29,7 +29,7 @@ const MAX_ZOOM: u32 = 12;
 const NA_BOUNDS: (f64, f64, f64, f64) = (-170.0, 5.0, -50.0, 83.0);
 
 /// Max concurrent HTTP fetches at a time.
-/// Tune this: higher = faster but more load on GIBS / your network.
+/// Tune this: higher = faster but more load on GIBS / network.
 const MAX_CONCURRENT: usize = 256;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| env::current_dir().expect("failed to get current dir"));
 
-    // ./data/maps/<region>/tiles (adjusted to your ../backend/data)
+    // ./data/maps/<region>/tiles (adjusted to ../backend/data)
     let data_dir = manifest_dir
         .join("../backend/data")
         .join("maps")

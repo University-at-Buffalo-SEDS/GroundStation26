@@ -3,6 +3,7 @@ use groundstation_shared::TelemetryRow;
 use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
 use sedsprintf_rs_2026::config::DataType;
 
+use crate::gpio_panel::IGNITION_PIN;
 use crate::radio::RadioDevice;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
@@ -10,7 +11,6 @@ use groundstation_shared::Board;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
-use crate::gpio_panel::IGNITION_PIN;
 
 pub async fn telemetry_task(
     state: Arc<AppState>,
@@ -230,7 +230,7 @@ const DB_RETRY_DELAY_MS: u64 = 50;
 async fn insert_with_retry<F, Fut>(mut f: F) -> Result<(), sqlx::Error>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
+    Fut: Future<Output=Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
 {
     let mut delay = DB_RETRY_DELAY_MS;
     let mut last_err: Option<sqlx::Error> = None;
@@ -294,7 +294,7 @@ pub async fn handle_packet(state: &Arc<AppState>) {
                 .bind(pkt_data as i64)
                 .execute(&state.db)
         })
-        .await
+            .await
         {
             eprintln!("DB insert into flight_state failed after retry: {e}");
         }
@@ -305,7 +305,7 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         return;
     }
 
-    if pkt.data_type() == DataType::UmbilicalStatus{
+    if pkt.data_type() == DataType::UmbilicalStatus {
         if let Ok(data) = pkt.data_as_u8() && data.len() == 2 {
             let cmd_id = data[0];
             let on = data[1] != 0;

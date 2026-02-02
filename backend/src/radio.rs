@@ -1,7 +1,7 @@
-use sedsprintf_rs_2026::{TelemetryError, TelemetryResult, router::{Router, RouterSideId}};
-use anyhow::Context;
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
+use anyhow::Context;
+use sedsprintf_rs_2026::{router::{Router, RouterSideId}, TelemetryError, TelemetryResult};
 use serial::{SerialPort, SystemPort};
 use std::error::Error;
 use std::io::{Read, Write};

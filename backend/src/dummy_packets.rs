@@ -1,5 +1,5 @@
-use crate::telemetry_task::get_current_timestamp_ms;
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
+use crate::telemetry_task::get_current_timestamp_ms;
 use groundstation_shared::{Board, FlightState};
 use rand::Rng;
 use sedsprintf_rs_2026::config::DataEndpoint;
@@ -177,7 +177,7 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
             let state_code = *flight_state as u8;
 
             return TelemetryPacket::new(
-                FlightState, // <- make sure this matches your DataType variant name
+                FlightState, // <- make sure this matches the DataType variant name
                 &[DataEndpoint::GroundStation],
                 sender,
                 now_ms,
