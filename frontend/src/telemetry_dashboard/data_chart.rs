@@ -1,31 +1,28 @@
 // frontend/src/telemetry_dashboard/data_chart.rs
 //
-// High-performance chart cache (incremental ingest):
-// - Keep a bounded, time-pruned ring of samples per data_type.
-// - Rebuild downsampled buckets only when dirty.
-// - bucket width is based on *effective span*, not HISTORY_MS.
+// Stable chart buckets (artifact-free):
+// - Fixed bucket grid in absolute time (epoch-aligned).
+// - Historical bucket values NEVER change (only newest bucket is "live").
+// - Rendering uses the last N buckets -> stable X ordering, stable per-bucket Y.
 //
-// FIXES:
-// - Sticky / hysteretic Y-axis so the scale does NOT jump when old spikes fall out of the window.
-//   * Expand immediately (never clip)
-//   * Shrink slowly (prevents “random” mid-run rescaling)
-//   * Add a small padding around the range
-//
-// - IMPORTANT FIX (fullscreen / multiple sizes):
-//   CachedChart used to keep only ONE `paths` buffer. If you call charts_cache_get()
-//   with (w,h) = (1200,360) then later (1200,700) in the same frame, it would not rebuild
-//   because `dirty=false`, causing fullscreen to reuse non-fullscreen geometry.
-//   We now track last_w/last_h and rebuild when size changes.
-//
-// - X-axis fix:
-//   The graph is no longer *defined* by whole buckets. Buckets are just an internal rendering
-//   optimization. The displayed span is the true span, and the right edge always corresponds
-//   to the newest sample timestamp (no "+1 minute" drift, no "minimum 3 minutes" quantization).
-//
-// API:
+// Keeps your API:
 //   charts_cache_reset_and_ingest(rows)
 //   charts_cache_ingest_row(row)
 //   charts_cache_get(data_type, width, height) -> ([d;8], y_min, y_max, span_min)
+//   charts_cache_get_channel_minmax(data_type, width, height) -> (mins, maxs)
+//
+// Y-axis:
+// - Expand immediately (never clip)
+// - Shrink only on explicit refit (charts_cache_request_refit)
+// - Padding added around range
+//
+// Span:
+// - Expand immediately
+// - Shrink only on refit
+//
+// IMPORTANT:
+// - This intentionally trades “perfect accuracy for late/out-of-order samples”
+//   for visual stability: once a bucket is in the past, it is frozen.
 
 use groundstation_shared::TelemetryRow;
 use std::cell::RefCell;
@@ -33,16 +30,42 @@ use std::collections::{HashMap, VecDeque};
 
 use super::HISTORY_MS;
 
-// Time-window shrink tuning (hysteresis)
-const X_SHRINK_ALPHA: f32 = 0.12; // 0.05..0.2, higher = faster settle
-const X_SHRINK_EPS_MS: i64 = 250; // snap when within this many ms
+// -------------------------
+// Bucket grid configuration
+// -------------------------
+//
+// This is your downsample timebase.
+// Smaller = more detail, more points.
+// Larger = smoother, fewer points.
+//
+// 20ms = 50Hz plotted. 40ms = 25Hz plotted. 100ms = 10Hz plotted.
+const BUCKET_MS: i64 = 20;
+
+// Only this many most-recent buckets are kept (hard cap besides HISTORY_MS).
+const MAX_BUCKETS_PER_TYPE: usize = 60_000;
+
+// Only the newest bucket is mutable. Older buckets are frozen.
+// If you want to allow small reordering/late packets, set this to 2 or 3.
+const LIVE_BUCKETS_BACK: i64 = 1;
+
+// Avoid zero span
+const MIN_SPAN_MS: i64 = 1_000;
+
+// X-span refit tuning (used only when refit_pending=true)
+const X_SHRINK_ALPHA: f32 = 0.18;
+const X_SHRINK_EPS_MS: i64 = 250;
+
+// Y-range tuning
+const Y_SHRINK_ALPHA: f32 = 0.10; // used only during refit_pending
+const Y_PAD_FRAC: f32 = 0.06;
+const Y_MIN_PAD_ABS: f32 = 1.0;
 
 pub fn charts_cache_request_refit() {
     CHARTS_CACHE.with(|c| c.borrow_mut().request_refit());
 }
 
 // ============================================================
-// Global cache (updated once per telemetry row)
+// Global cache
 // ============================================================
 
 thread_local! {
@@ -73,9 +96,9 @@ pub fn charts_cache_ingest_row(row: &TelemetryRow) {
 }
 
 /// Returns:
-/// - [String;8] where each String is an SVG path `d` (may be empty)
-/// - y_min, y_max (for labels)
-/// - span_min (minutes of effective history window)
+/// - [String;8] SVG path `d` strings (may be empty)
+/// - y_min, y_max (labels)
+/// - span_min (minutes of effective window)
 pub fn charts_cache_get(data_type: &str, width: f32, height: f32) -> ([String; 8], f32, f32, f32) {
     CHARTS_CACHE.with(|c| {
         let mut c = c.borrow_mut();
@@ -100,26 +123,8 @@ pub fn charts_cache_get_channel_minmax(
 }
 
 // ============================================================
-// Cache internals
+// Internals
 // ============================================================
-
-const MAX_POINTS_CAP: usize = 60000; // cap for downsample points (smooth scrolling at 20min)
-const MIN_POINTS: usize = 240; // keep some detail even for tiny spans
-const TARGET_BUCKET_MS: i64 = 20; // aim ~5Hz resolution at max span
-const MIN_SPAN_MS: i64 = 1_000; // avoid divide-by-zero (1s)
-
-// Keep at most this many samples per datatype as a hard cap (in addition to time pruning).
-const MAX_SAMPLES_PER_TYPE: usize = 20_000;
-
-// -------------------------
-// Sticky Y-axis tuning
-// -------------------------
-//
-// Expand immediately (alpha=1.0) when the new range exceeds the displayed range.
-// Shrink slowly to avoid “jumping” when old extremes fall out of the window.
-const Y_SHRINK_ALPHA: f32 = 0.04; // ~ slow convergence; increase for faster shrink
-const Y_PAD_FRAC: f32 = 0.06; // 6% padding around range
-const Y_MIN_PAD_ABS: f32 = 1.0; // at least +/-1 unit of padding (helps small ranges)
 
 struct ChartsCache {
     charts: HashMap<String, CachedChart>,
@@ -160,66 +165,87 @@ impl ChartsCache {
     }
 }
 
-// A compact sample (store only what we need)
-#[derive(Clone)]
-struct Sample {
-    ts: i64,
-    v: [Option<f32>; 8],
+#[derive(Clone, Default)]
+struct Bucket {
+    // absolute bucket id (ts_ms / BUCKET_MS)
+    id: i64,
+
+    has: [bool; 8],
+    last: [f32; 8],
+    min: [f32; 8],
+    max: [f32; 8],
 }
 
-impl From<&TelemetryRow> for Sample {
-    fn from(r: &TelemetryRow) -> Self {
+impl Bucket {
+    fn new(id: i64) -> Self {
         Self {
-            ts: r.timestamp_ms,
-            v: [r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7],
+            id,
+            has: [false; 8],
+            last: [0.0; 8],
+            min: [0.0; 8],
+            max: [0.0; 8],
+        }
+    }
+
+    fn update(&mut self, v: [Option<f32>; 8]) {
+        for ch in 0..8 {
+            if let Some(x) = v[ch] {
+                if !x.is_finite() {
+                    continue;
+                }
+                if !self.has[ch] {
+                    self.has[ch] = true;
+                    self.last[ch] = x;
+                    self.min[ch] = x;
+                    self.max[ch] = x;
+                } else {
+                    self.last[ch] = x;
+                    self.min[ch] = self.min[ch].min(x);
+                    self.max[ch] = self.max[ch].max(x);
+                }
+            }
         }
     }
 }
 
-#[derive(Clone, Default)]
-struct Bucket {
-    has: [bool; 8],
-    min: [f32; 8],
-    max: [f32; 8],
-    last: [f32; 8],
-}
-
 struct CachedChart {
-    // Raw samples (time-pruned deque)
-    samples: VecDeque<Sample>,
+    buckets: VecDeque<Bucket>,
+    newest_bucket_id: i64,
     newest_ts: i64,
     dirty: bool,
 
-    // Cached output
-    paths: [String; 8], // SVG path `d`
+    // cached output
+    paths: [String; 8],
 
-    // Raw range from current effective window
+    // per-window min/max (raw)
     raw_min: f32,
     raw_max: f32,
 
-    // Per-channel min/max (for summary cards)
+    // per-channel min/max over window
     chan_min: [Option<f32>; 8],
     chan_max: [Option<f32>; 8],
 
-    // Displayed (sticky) range
+    // displayed (sticky) range
     disp_min: f32,
     disp_max: f32,
 
+    // displayed span (sticky)
     span_min: f32,
     prev_span_ms: i64,
 
-    // last size used to build `paths`
+    // last size
     last_w: f32,
     last_h: f32,
 
-    // If true: shrink span faster until it settles
+    // if true: allow shrink of x-span and y-range until settled
     refit_pending: bool,
 }
 
 impl CachedChart {
     fn new() -> Self {
         Self {
-            samples: VecDeque::new(),
+            buckets: VecDeque::new(),
+            newest_bucket_id: 0,
             newest_ts: 0,
             dirty: true,
             paths: std::array::from_fn(|_| String::new()),
@@ -239,32 +265,67 @@ impl CachedChart {
 
     fn request_refit(&mut self) {
         self.refit_pending = true;
-        self.dirty = true; // ensure next build applies it
+        self.dirty = true;
     }
 
     fn ingest(&mut self, r: &TelemetryRow) {
-        let s: Sample = r.into();
+        let ts = r.timestamp_ms;
+        let bid = ts.div_euclid(BUCKET_MS);
 
-        if s.ts > self.newest_ts {
-            self.newest_ts = s.ts;
-        } else if self.newest_ts == 0 {
-            self.newest_ts = s.ts;
+        if self.newest_ts == 0 || ts > self.newest_ts {
+            self.newest_ts = ts;
+        }
+        if self.buckets.is_empty() {
+            self.newest_bucket_id = bid;
+            self.buckets.push_back(Bucket::new(bid));
+        } else if bid > self.newest_bucket_id {
+            // append buckets up to new bucket
+            let mut cur = self.newest_bucket_id;
+            while cur < bid {
+                cur += 1;
+                self.buckets.push_back(Bucket::new(cur));
+            }
+            self.newest_bucket_id = bid;
         }
 
-        self.samples.push_back(s);
+        // Freeze rule: only allow updating buckets within LIVE_BUCKETS_BACK of newest.
+        // This guarantees historical buckets never change.
+        let live_min = self.newest_bucket_id.saturating_sub(LIVE_BUCKETS_BACK - 1);
 
-        // Time-prune using newest_ts as "now"
-        let cutoff = self.newest_ts.saturating_sub(HISTORY_MS);
-        while let Some(front) = self.samples.front() {
-            if front.ts < cutoff {
-                self.samples.pop_front();
+        if bid < live_min {
+            // ignore late/out-of-order for stability
+            return;
+        }
+
+        // find bucket
+        if let Some(back) = self.buckets.back_mut() {
+            if back.id == bid {
+                back.update([r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7]);
+            } else {
+                // bid may be within last LIVE_BUCKETS_BACK; scan from back a tiny amount
+                for b in self.buckets.iter_mut().rev().take(LIVE_BUCKETS_BACK as usize + 2) {
+                    if b.id == bid {
+                        b.update([r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7]);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // time prune by HISTORY_MS using bucket ids
+        let oldest_allowed_ts = self.newest_ts.saturating_sub(HISTORY_MS);
+        let oldest_allowed_bid = oldest_allowed_ts.div_euclid(BUCKET_MS);
+
+        while let Some(front) = self.buckets.front() {
+            if front.id < oldest_allowed_bid {
+                self.buckets.pop_front();
             } else {
                 break;
             }
         }
 
-        while self.samples.len() > MAX_SAMPLES_PER_TYPE {
-            self.samples.pop_front();
+        while self.buckets.len() > MAX_BUCKETS_PER_TYPE {
+            self.buckets.pop_front();
         }
 
         self.dirty = true;
@@ -296,10 +357,8 @@ impl CachedChart {
     }
 
     fn update_display_range(&mut self, raw_min: f32, raw_max: f32) {
-        // Always pad the *raw* range first.
         let (raw_min, raw_max) = Self::apply_padding(raw_min, raw_max);
 
-        // First build: snap.
         if !self.disp_min.is_finite()
             || !self.disp_max.is_finite()
             || (self.disp_max - self.disp_min).abs() < 1e-6
@@ -309,7 +368,7 @@ impl CachedChart {
             return;
         }
 
-        // Expand immediately to avoid clipping.
+        // expand immediately
         let mut lo = self.disp_min;
         let mut hi = self.disp_max;
 
@@ -320,15 +379,16 @@ impl CachedChart {
             hi = raw_max;
         }
 
-        // Shrink slowly to avoid “jump” rescaling.
-        if raw_min > lo {
-            lo = lo + (raw_min - lo) * Y_SHRINK_ALPHA;
-        }
-        if raw_max < hi {
-            hi = hi + (raw_max - hi) * Y_SHRINK_ALPHA;
+        // shrink only during refit
+        if self.refit_pending {
+            if raw_min > lo {
+                lo = lo + (raw_min - lo) * Y_SHRINK_ALPHA;
+            }
+            if raw_max < hi {
+                hi = hi + (raw_max - hi) * Y_SHRINK_ALPHA;
+            }
         }
 
-        // Safety: keep non-degenerate.
         if (hi - lo).abs() < 1e-6 {
             hi = lo + 1.0;
         }
@@ -338,7 +398,6 @@ impl CachedChart {
     }
 
     fn build_if_needed(&mut self, w: f32, h: f32) {
-        // Rebuild if size changed (fixes fullscreen / multi-size callers)
         let size_changed = (self.last_w - w).abs() > 0.5 || (self.last_h - h).abs() > 0.5;
         if !self.dirty && !size_changed {
             return;
@@ -346,7 +405,7 @@ impl CachedChart {
         self.last_w = w;
         self.last_h = h;
 
-        if self.samples.is_empty() {
+        if self.buckets.is_empty() {
             for s in &mut self.paths {
                 s.clear();
             }
@@ -363,108 +422,55 @@ impl CachedChart {
             return;
         }
 
-        let oldest_ts = self.samples.front().map(|s| s.ts).unwrap_or(self.newest_ts);
-        let newest_ts = self
-            .samples
-            .back()
-            .map(|s| s.ts)
-            .unwrap_or(self.newest_ts)
-            .max(self.newest_ts);
+        let newest_bid = self.newest_bucket_id;
+        let oldest_bid_available = self.buckets.front().map(|b| b.id).unwrap_or(newest_bid);
 
-        let raw_span_ms = newest_ts.saturating_sub(oldest_ts).max(1);
+        // compute actual available span from buckets (in ms)
+        let raw_span_ms = ((newest_bid - oldest_bid_available + 1).max(1)) * BUCKET_MS;
 
-        // Desired span from the actual data (clamped).
-        //
-        // We keep a *hysteretic* displayed span:
-        // - Expand immediately (never clip)
-        // - Shrink slowly (prevents jitter)
-        // - If a refit was explicitly requested, shrink faster until it settles.
         let desired_span_ms = raw_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
 
-        let mut span_ms = desired_span_ms;
-        if self.prev_span_ms > 0 {
-            let prev = self.prev_span_ms;
-
-            if span_ms > prev {
-                // Expand immediately.
-                self.prev_span_ms = span_ms;
-                self.refit_pending = false;
+        // expand-only span unless refit
+        let prev = self.prev_span_ms;
+        let mut span_ms = if prev <= 0 {
+            desired_span_ms
+        } else if desired_span_ms > prev {
+            desired_span_ms
+        } else if self.refit_pending {
+            let diff = (prev - desired_span_ms) as f32;
+            let step = (diff * X_SHRINK_ALPHA).max(1.0);
+            let mut next = (prev as f32 - step).round() as i64;
+            next = next.max(desired_span_ms);
+            if (next - desired_span_ms).abs() <= X_SHRINK_EPS_MS {
+                desired_span_ms
             } else {
-                // Shrink slowly (or faster when refit_pending).
-                let alpha = if self.refit_pending {
-                    (X_SHRINK_ALPHA * 2.5).min(0.85)
-                } else {
-                    X_SHRINK_ALPHA
-                };
-
-                let diff = (prev - span_ms) as f32;
-                let step = (diff * alpha).max(1.0);
-                let mut next = (prev as f32 - step).round() as i64;
-                next = next.max(span_ms); // never go below desired span
-
-                self.prev_span_ms = next;
-
-                if (self.prev_span_ms - span_ms).abs() <= X_SHRINK_EPS_MS {
-                    self.prev_span_ms = span_ms;
-                    self.refit_pending = false;
-                }
+                next
             }
-
-            span_ms = self.prev_span_ms;
         } else {
-            self.prev_span_ms = span_ms;
-        }
-
+            prev
+        };
         span_ms = span_ms.min(HISTORY_MS);
         self.prev_span_ms = span_ms;
 
-        // Pick point count (bucket count).
-        let mut points = ((span_ms + TARGET_BUCKET_MS - 1) / TARGET_BUCKET_MS) as usize;
-        points = points.clamp(MIN_POINTS, MAX_POINTS_CAP);
-        let px_cap = (w.max(1.0) as usize).saturating_mul(3).max(MIN_POINTS);
-        points = points.min(px_cap).clamp(MIN_POINTS, MAX_POINTS_CAP);
+        // Determine how many buckets to render from that span (stable)
+        let want_buckets = (span_ms.div_euclid(BUCKET_MS)).max(1);
+        let start_bid = newest_bid.saturating_sub(want_buckets - 1);
 
-        // IMPORTANT: do NOT force the window to land on whole buckets.
-        // The buckets are for rendering efficiency; the *displayed* span is span_ms, and
-        // the right edge always corresponds to newest_ts.
-        let start_ts = newest_ts.saturating_sub(span_ms);
-
-        let mut buckets = vec![Bucket::default(); points];
-
+        // Build window min/max from buckets in [start_bid, newest_bid]
         let mut chan_min: [Option<f32>; 8] = [None; 8];
         let mut chan_max: [Option<f32>; 8] = [None; 8];
-
         let mut min = f32::INFINITY;
         let mut max = f32::NEG_INFINITY;
 
-        for samp in self.samples.iter() {
-            if samp.ts < start_ts {
+        for b in self.buckets.iter() {
+            if b.id < start_bid || b.id > newest_bid {
                 continue;
             }
-
-            // Map timestamp to bucket index in [0, points-1] over the *true* span.
-            let bi = (((samp.ts - start_ts) as f32 / span_ms as f32) * points as f32)
-                .floor()
-                .clamp(0.0, (points as f32) - 1.0) as usize;
-
-            let b = &mut buckets[bi];
-
             for ch in 0..8 {
-                if let Some(v) = samp.v[ch] {
-                    if !b.has[ch] {
-                        b.has[ch] = true;
-                        b.min[ch] = v;
-                        b.max[ch] = v;
-                        b.last[ch] = v;
-                    } else {
-                        b.min[ch] = b.min[ch].min(v);
-                        b.max[ch] = b.max[ch].max(v);
-                        b.last[ch] = v;
-                    }
-
+                if b.has[ch] {
+                    let v = b.last[ch];
                     min = min.min(v);
                     max = max.max(v);
-
                     chan_min[ch] = Some(match chan_min[ch] {
                         Some(m) => m.min(v),
                         None => v,
@@ -478,14 +484,23 @@ impl CachedChart {
         }
 
         Self::stabilize_raw_range(&mut min, &mut max);
-
         self.raw_min = min;
         self.raw_max = max;
         self.chan_min = chan_min;
         self.chan_max = chan_max;
 
-        // Sticky displayed range
         self.update_display_range(self.raw_min, self.raw_max);
+
+        // If refit, clear it when close to target
+        if self.refit_pending {
+            let span_settled = (self.prev_span_ms - desired_span_ms).abs() <= X_SHRINK_EPS_MS;
+            let (pmin, pmax) = Self::apply_padding(self.raw_min, self.raw_max);
+            let y_settled =
+                (self.disp_min - pmin).abs() < 1e-3 && (self.disp_max - pmax).abs() < 1e-3;
+            if span_settled && y_settled {
+                self.refit_pending = false;
+            }
+        }
 
         // Viewport mapping (match DataTab geometry)
         let left = 60.0_f32;
@@ -498,18 +513,28 @@ impl CachedChart {
 
         let y_min = self.disp_min;
         let y_max = self.disp_max;
-
         let map_y = |v: f32| -> f32 { bottom - (v - y_min) / (y_max - y_min) * ph };
 
         for s in &mut self.paths {
             s.clear();
         }
 
+        // Build paths by iterating stable bucket ids in order.
+        // If a bucket is missing (pruned gaps), we just skip it.
+        //
+        // Also: to keep line continuity, we carry-forward last_seen if a bucket has no value.
+        // This does NOT mutate historical bucket values; it's just how we draw gaps.
         let mut last_seen: [Option<f32>; 8] = [None; 8];
 
-        for idx in 0..buckets.len() {
-            let x = left + pw * ((idx as f32 + 0.5) / buckets.len().max(1) as f32);
-            let b = &buckets[idx];
+        let total = (newest_bid - start_bid + 1).max(1) as f32;
+
+        for b in self.buckets.iter() {
+            if b.id < start_bid || b.id > newest_bid {
+                continue;
+            }
+
+            let i = (b.id - start_bid) as f32;
+            let x = left + pw * ((i + 0.5) / total);
 
             for ch in 0..8 {
                 let v_opt = if b.has[ch] {
@@ -532,7 +557,7 @@ impl CachedChart {
             }
         }
 
-        self.span_min = span_ms as f32 / 60_000.0;
+        self.span_min = (want_buckets as f32 * BUCKET_MS as f32) / 60_000.0;
         self.dirty = false;
     }
 }
