@@ -243,7 +243,7 @@ where
         if !is_high {
             return;
         }
-        if !can_press(&*allowed.lock().unwrap()) {
+        if !can_press(&allowed.lock().unwrap()) {
             return;
         }
         if tx.try_send(cmd.clone()).is_err() {
