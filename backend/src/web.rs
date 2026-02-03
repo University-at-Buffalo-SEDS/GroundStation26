@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
 use tower_http::services::ServeDir;
+use tower_http::compression::CompressionLayer;
+
 // NEW
 
 static FAVICON_DATA: OnceCell<Bytes> = OnceCell::const_new();
@@ -30,6 +32,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let tiles_dir = tile_service(DEFAULT_MAP_REGION); // NEW
 
     Router::new()
+        .layer(CompressionLayer::new())
         .route("/api/recent", get(get_recent))
         .route("/api/command", post(send_command))
         .route("/api/history", get(get_history))

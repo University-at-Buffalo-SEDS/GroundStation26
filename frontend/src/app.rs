@@ -12,9 +12,9 @@
 // - Added REAL WebSocket connect probe (ws:// or wss://) and prints why it fails
 // - Kept native ObjC poke for Local Network prompt (hostname only)
 // - WASM behavior unchanged (no Connect screen)
-const CONNECTION_TIMEOUT_MS: u64 = 8000;
-const BODY_TRANSFER_TIMEOUT_MS: u64 = 10000;
-const WS_TIMEOUT_MS: u64 = 4500;
+const _CONNECTION_TIMEOUT_MS: u64 = 8000;
+const _BODY_TRANSFER_TIMEOUT_MS: u64 = 10000;
+const _WS_TIMEOUT_MS: u64 = 4500;
 
 use dioxus::prelude::*;
 use dioxus_router::{Routable, Router};
@@ -322,8 +322,8 @@ fn build_probe_client() -> Result<reqwest::Client, String> {
     // - connect_timeout: how long we wait for TCP/TLS connect
     // - timeout: total request time budget (includes body)
     reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_millis(CONNECTION_TIMEOUT_MS))
-        .timeout(std::time::Duration::from_millis(BODY_TRANSFER_TIMEOUT_MS))
+        .connect_timeout(std::time::Duration::from_millis(_CONNECTION_TIMEOUT_MS))
+        .timeout(std::time::Duration::from_millis(_BODY_TRANSFER_TIMEOUT_MS))
         .build()
         .map_err(|e| format!("build client failed: {e}"))
 }
@@ -438,7 +438,7 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl) -> Result<String, String> {
 
     // Real websocket handshake, but time-bounded so it can't hang forever.
     let res = timeout(
-        std::time::Duration::from_millis(WS_TIMEOUT_MS),
+        std::time::Duration::from_millis(_WS_TIMEOUT_MS),
         connect_async(ws_url.clone()),
     )
     .await;
