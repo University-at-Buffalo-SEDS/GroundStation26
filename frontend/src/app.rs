@@ -274,7 +274,7 @@ struct RouteCheck {
 #[cfg(not(target_arch = "wasm32"))]
 fn status_ok_for_path(path: &str, status: u16) -> (bool, &'static str) {
     match path {
-        "/api/recent" | "/api/history" | "/api/alerts" | "/flightstate" | "/api/gps" => {
+        "/api/recent" | "/api/alerts" | "/flightstate" | "/api/gps" => {
             (status == 200, "expected 200")
         }
         "/ws" => match status {
@@ -365,7 +365,6 @@ async fn test_routes_host_only(base: &str) -> Vec<RouteCheck> {
 
     let probes: &[&str] = &[
         "/api/recent",
-        "/api/history",
         "/api/alerts",
         "/flightstate",
         "/api/gps",

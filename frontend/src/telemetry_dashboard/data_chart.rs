@@ -42,7 +42,7 @@ use super::HISTORY_MS;
 const BUCKET_MS: i64 = 20;
 
 // Only this many most-recent buckets are kept (hard cap besides HISTORY_MS).
-const MAX_BUCKETS_PER_TYPE: usize = 60_000;
+const MAX_BUCKETS_PER_TYPE: usize = 6_000;
 
 // Only the newest bucket is mutable. Older buckets are frozen.
 // If you want to allow small reordering/late packets, set this to 2 or 3.
@@ -432,9 +432,7 @@ impl CachedChart {
 
         // expand-only span unless refit
         let prev = self.prev_span_ms;
-        let mut span_ms = if prev <= 0 {
-            desired_span_ms
-        } else if desired_span_ms > prev {
+        let mut span_ms = if prev <= 0 || desired_span_ms > prev {
             desired_span_ms
         } else if self.refit_pending {
             let diff = (prev - desired_span_ms) as f32;

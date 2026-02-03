@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
-use tower_http::services::ServeDir;
 use tower_http::compression::CompressionLayer;
+use tower_http::services::ServeDir;
 
 // NEW
 
@@ -45,7 +45,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest_service("/tiles", tiles_dir)
         .route("/favicon.ico", get(get_favicon))
         .route("/valvestate", get(get_valve_state))
-
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
         .with_state(state)
@@ -106,7 +105,6 @@ pub struct AlertDto {
     pub message: String,
 }
 
-
 #[derive(Serialize)]
 pub struct GpsPoint {
     pub lat: f64,
@@ -130,9 +128,9 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
@@ -168,9 +166,9 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
         let lat: Option<f32> = r.get::<Option<f32>, _>("v0");
@@ -188,21 +186,50 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(GpsResponse { rocket })
 }
 
-
 async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let now_ms = Utc::now().timestamp_millis();
     let cutoff = now_ms - 20 * 60 * 1000; // 20 minutes
 
+    // Match frontend bucket grid (frontend BUCKET_MS = 20).
+    // This returns at most 1 row per (data_type, 20ms bucket) in the window:
+    // - Uses REAL rows (no averaging).
+    // - Picks the latest timestamp within each bucket for each data_type.
+    // - Keeps chronological order for the frontend.
+    const BUCKET_MS: i64 = 20;
+
     let rows_db = sqlx::query(
-        "SELECT timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7 \
-         FROM telemetry \
-         WHERE timestamp_ms >= ? \
-         ORDER BY timestamp_ms ASC",
+        r#"
+        WITH filtered AS (
+            SELECT
+                timestamp_ms,
+                data_type,
+                v0, v1, v2, v3, v4, v5, v6, v7,
+                (timestamp_ms / ?) AS bucket_id
+            FROM telemetry
+            WHERE timestamp_ms BETWEEN ? AND ?
+        ),
+        latest AS (
+            SELECT data_type, bucket_id, MAX(timestamp_ms) AS ts
+            FROM filtered
+            GROUP BY data_type, bucket_id
+        )
+        SELECT
+            f.timestamp_ms, f.data_type,
+            f.v0, f.v1, f.v2, f.v3, f.v4, f.v5, f.v6, f.v7
+        FROM filtered f
+        JOIN latest l
+          ON l.data_type = f.data_type
+         AND l.bucket_id = f.bucket_id
+         AND l.ts = f.timestamp_ms
+        ORDER BY f.timestamp_ms ASC
+        "#,
     )
-        .bind(cutoff)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(BUCKET_MS)
+    .bind(cutoff)
+    .bind(now_ms)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -242,14 +269,14 @@ async fn get_favicon() -> impl IntoResponse {
 }
 async fn get_flight_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // get the state from the db
-    let flight_state: i64 = match sqlx::query("SELECT f_state FROM flight_state ORDER BY timestamp_ms DESC LIMIT 1")
-        .fetch_one(&state.db)
-        .await {
-        Ok(data) => {
-            data.get::<i64, _>("f_state")
-        }
-        Err(_) => { FlightState::Startup as i64 }
-    };
+    let flight_state: i64 =
+        match sqlx::query("SELECT f_state FROM flight_state ORDER BY timestamp_ms DESC LIMIT 1")
+            .fetch_one(&state.db)
+            .await
+        {
+            Ok(data) => data.get::<i64, _>("f_state"),
+            Err(_) => FlightState::Startup as i64,
+        };
     let flight_state = groundstation_shared::u8_to_flight_state(flight_state as u8)
         .unwrap_or(FlightState::Startup);
     Json(flight_state)
@@ -393,10 +420,10 @@ async fn get_history(
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",
     )
-        .bind(cutoff)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -434,10 +461,10 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-        .bind(cutoff)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -492,10 +519,10 @@ pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
             VALUES (?, 'warning', ?)
             "#,
         )
-            .bind(timestamp)
-            .bind(msg_string)
-            .execute(&db)
-            .await;
+        .bind(timestamp)
+        .bind(msg_string)
+        .execute(&db)
+        .await;
     });
 }
 
@@ -512,10 +539,10 @@ pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
             VALUES (?, 'warning', ?)
             "#,
         )
-            .bind(timestamp)
-            .bind(msg_string)
-            .execute(&db)
-            .await;
+        .bind(timestamp)
+        .bind(msg_string)
+        .execute(&db)
+        .await;
     });
 }
 
@@ -539,9 +566,9 @@ pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
             VALUES (?, 'error', ?)
             "#,
         )
-            .bind(timestamp)
-            .bind(msg_string)
-            .execute(&db)
-            .await;
+        .bind(timestamp)
+        .bind(msg_string)
+        .execute(&db)
+        .await;
     });
 }

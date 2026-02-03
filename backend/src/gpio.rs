@@ -185,7 +185,7 @@ mod dummy {
         ) -> Result<(), Box<dyn std::error::Error>> {
             let mut output_pins = self.output_pins.lock().expect("failed to get lock");
             if let Some(_pin) = output_pins.get_mut(&pin_number) {
-                println!("Writing output pin {} (dummy, no actual effect)", pin_number);
+                // println!("Writing output pin {} (dummy, no actual effect)", pin_number);
                 Ok(())
             } else {
                 Err(format!("Output pin {} not configured", pin_number).into())
