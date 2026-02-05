@@ -22,7 +22,8 @@ pub fn ActionsTab() -> Element {
             ",
             h2 { style: "margin:0 0 8px 0; color:#e5e7eb;", "Actions" }
             p  { style: "margin:0 0 12px 0; color:#9ca3af; font-size:0.9rem;",
-                "All available actions are live, use with caution."
+                "All available actions are available all the time, use with caution as improper use \
+                can and will damage the system."
             }
 
             div {
