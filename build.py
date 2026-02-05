@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 from subprocess import DEVNULL
-from typing import Optional
+from typing import Optional, Literal
 
 APP_NAME = "GroundStation 26"
 LEGACY_APP_NAME = "GroundstationFrontend"
@@ -41,12 +41,6 @@ def run_script(path: Path, cwd: Path, env: Optional[dict[str, str]] = None) -> N
 
 
 def _list_connected_ios_device_ids(frontend_dir: Path) -> list[str]:
-    """
-    Return a list of connected iPhone/iPad UDIDs as reported by ios-deploy --detect.
-
-    ios-deploy sometimes prints iPads as "unknownos". We'll include those as long as
-    they are NOT watches and look like a real iOS/iPadOS device entry.
-    """
     if platform.system() != "Darwin":
         print("Error: iOS device deploy requires macOS.", file=sys.stderr)
         sys.exit(1)
@@ -64,10 +58,6 @@ def _list_connected_ios_device_ids(frontend_dir: Path) -> list[str]:
         sys.exit(1)
 
     ids: list[str] = []
-
-    # Example:
-    # [....] Found <UDID> (D74AP, iPhone 14 Pro Max, iphoneos, arm64e, 26.2, 23C55) a.k.a. 'Rylan’s iPhone' ...
-    # [....] Found <UDID> (..., unknownos, ...) a.k.a. 'Rylan’s iPad' ...
     pat = re.compile(r"\bFound\s+([0-9A-Fa-f-]+)\s+\(([^)]*)\)(.*)$")
 
     for line in out.splitlines():
@@ -79,29 +69,21 @@ def _list_connected_ios_device_ids(frontend_dir: Path) -> list[str]:
         meta = m.group(2).lower()
         tail = m.group(3).lower()
 
-        # Always ignore watches / companion proxy entries
         if "watch" in meta or "watch" in tail or "companion" in tail:
             continue
 
-        # Preferred: explicit iphoneos/ipados
         if "iphoneos" in meta or "ipados" in meta:
             ids.append(udid)
             continue
 
-        # Fallback: ios-deploy sometimes prints "unknownos" for iPads
-        # Include it if there's an alias and it smells like a phone/tablet entry.
         if "unknownos" in meta or "uknownos" in meta:
-            # If the alias contains ipad/iphone, accept
             if "a.k.a." in tail and ("ipad" in tail or "iphone" in tail):
                 ids.append(udid)
                 continue
-
-            # Or accept if it's connected through USB and NOT a watch
             if "connected through usb" in tail and "a.k.a." in tail:
                 ids.append(udid)
                 continue
 
-    # Dedup while preserving order
     seen = set()
     deduped: list[str] = []
     for d in ids:
@@ -113,7 +95,6 @@ def _list_connected_ios_device_ids(frontend_dir: Path) -> list[str]:
 
 
 def is_raspberry_pi() -> bool:
-    """Return True if this looks like a Raspberry Pi."""
     if platform.system() != "Linux":
         return False
 
@@ -134,13 +115,6 @@ def is_raspberry_pi() -> bool:
 
 
 def is_container() -> bool:
-    """
-    Detect if we are actually inside a container.
-
-    IMPORTANT:
-    - This is intentionally NOT the same as "no parallel requested".
-    - Used to decide whether to run cargo prefetch/build before dx bundle.
-    """
     if Path("/.dockerenv").exists():
         return True
 
@@ -157,11 +131,6 @@ def is_container() -> bool:
 
 
 def no_parallel_requested() -> bool:
-    """
-    User override: force sequential build even on host.
-
-    This should NOT imply "we are in docker".
-    """
     return os.environ.get("GROUNDSTATION_NO_PARALLEL", "").strip().lower() in {
         "1",
         "true",
@@ -171,23 +140,12 @@ def no_parallel_requested() -> bool:
 
 
 def in_docker_build() -> bool:
-    """
-    Best-effort detection that we're running inside a Docker build/container
-    OR the user forced single-thread mode.
-
-    Existing behavior preserved (sequential build when forced).
-    """
     if no_parallel_requested():
         return True
     return is_container()
 
 
 def get_compose_base_cmd() -> list[str]:
-    """
-    Return the base command for docker compose, preferring `docker compose`
-    but falling back to `docker-compose` if needed.
-    Exits with an error if neither is available.
-    """
     try:
         subprocess.run(
             ["docker", "compose", "version"],
@@ -217,9 +175,6 @@ def get_compose_base_cmd() -> list[str]:
 
 
 def build_docker(repo_root: Path, pi_build: bool, testing: bool) -> None:
-    """
-    Build using docker compose. If pi_build is True, pass PI_BUILD as a build-arg.
-    """
     compose_cmd = get_compose_base_cmd()
     cmd: list[str] = [*compose_cmd, "build"]
 
@@ -234,9 +189,6 @@ def build_docker(repo_root: Path, pi_build: bool, testing: bool) -> None:
 
 
 def patch_plist(frontend_dir: Path) -> None:
-    """
-    Run frontend/scripts/patch_plist.sh (used to patch macOS/iOS Info.plist, etc.)
-    """
     script = frontend_dir / "scripts" / "patch_plist.sh"
     run_script(script, cwd=frontend_dir)
 
@@ -246,10 +198,6 @@ def dist_dir(frontend_dir: Path) -> Path:
 
 
 def app_bundle_path(frontend_dir: Path) -> Path:
-    """
-    Return the built app bundle path, preferring the new bundle name but falling
-    back to legacy bundle name if needed.
-    """
     dist = dist_dir(frontend_dir)
     preferred = dist / APP_BUNDLE_NAME
     legacy = dist / LEGACY_APP_BUNDLE_NAME
@@ -261,9 +209,6 @@ def app_bundle_path(frontend_dir: Path) -> Path:
 
 
 def clear_app_bundle(frontend_dir: Path) -> None:
-    """
-    Clear out the dist/*.app bundle before building so old artifacts don't linger.
-    """
     dist = dist_dir(frontend_dir)
     bundles = [dist / APP_BUNDLE_NAME, dist / LEGACY_APP_BUNDLE_NAME]
     for bundle in bundles:
@@ -273,36 +218,251 @@ def clear_app_bundle(frontend_dir: Path) -> None:
 
 
 def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
-    """
-    When running inside a container (Docker build/container), dx bundle can stall
-    at `cargo metadata` if the network/index isn't ready.
-    Prime cargo first (network allowed) then run dx bundle.
-
-    NOTE: This is ONLY for real containers, NOT for host single-thread mode.
-    """
     print("Container detected → priming cargo for frontend before dx bundle")
-    # fetch is a cheap way to force index/network setup
     run(["cargo", "fetch"], cwd=frontend_dir)
-    # build the frontend crate so metadata/deps are definitely warm
     run(["cargo", "build", "--release", "-p", "groundstation_frontend"], cwd=frontend_dir)
 
 
-def build_frontend(
-        frontend_dir: Path,
-        platform_name: Optional[str] = None,
-        *,
-        rust_target: Optional[str] = None,
-) -> None:
-    """
-    Build the frontend.
+# -----------------------------
+# Signing helpers (Python owns)
+# -----------------------------
+SignKind = Literal["development", "distribution"]
 
-    - platform_name: passed to dx --platform (e.g. "ios", "web", "macos")
-    - rust_target: passed to dx --target (e.g. "aarch64-apple-ios")
 
-    New behavior:
-    - If inside a REAL container, run cargo fetch + cargo build(frontend) first, then dx bundle.
-    - Host builds (even sequential forced via GROUNDSTATION_NO_PARALLEL) are unchanged.
+def _stat_mtime_epoch(p: Path) -> int:
+    try:
+        return int(p.stat().st_mtime)
+    except Exception:
+        return 0
+
+
+def pick_newest_mobileprovision(frontend_dir: Path) -> Path:
+    static_dir = frontend_dir / "static"
+    profiles = sorted(static_dir.glob("*.mobileprovision"))
+    if not profiles:
+        raise FileNotFoundError(f"No provisioning profiles found in: {static_dir} (*.mobileprovision)")
+    profiles.sort(key=_stat_mtime_epoch, reverse=True)
+    return profiles[0]
+
+
+def _parse_identity_lines(sign_kind: SignKind, output: str) -> list[tuple[str, str]]:
     """
+    Return [(sha1, name), ...] filtered to Apple Development / Apple Distribution.
+    """
+    if sign_kind == "development":
+        want_prefix = "Apple Development:"
+    else:
+        want_prefix = "Apple Distribution:"
+
+    # Example line:
+    #  1) 0123ABCD... "Apple Development: you@example.com (TEAMID)"
+    pat = re.compile(r'^\s*\d+\)\s*([0-9A-Fa-f]{40})\s+"([^"]+)"\s*$')
+    out: list[tuple[str, str]] = []
+    for line in output.splitlines():
+        m = pat.match(line)
+        if not m:
+            continue
+        sha1 = m.group(1)
+        name = m.group(2)
+        if name.startswith(want_prefix):
+            out.append((sha1, name))
+    return out
+
+
+def pick_codesign_identity_sha1(sign_kind: SignKind, *, team_id: str = "") -> str:
+    """
+    Pick an unambiguous signing identity by SHA-1.
+    We choose the identity with the latest notAfter date.
+    """
+    if platform.system() != "Darwin":
+        raise RuntimeError("Codesigning requires macOS.")
+
+    try:
+        raw = run_capture(["security", "find-identity", "-v", "-p", "codesigning"], cwd=Path("."))
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError("Failed to run security find-identity") from e
+
+    candidates = _parse_identity_lines(sign_kind, raw)
+    if team_id:
+        candidates = [(sha, nm) for (sha, nm) in candidates if f"({team_id})" in nm]
+
+    if not candidates:
+        raise RuntimeError(f"No codesigning identities found for {sign_kind!r} (team filter={team_id!r}).")
+
+    best_sha = ""
+    best_epoch = -1
+
+    for sha1, name in candidates:
+        # Extract PEM for this cert, then read end date
+        try:
+            pem = run_capture(["security", "find-certificate", "-a", "-Z", "-p", "-c", name], cwd=Path("."))
+        except subprocess.CalledProcessError:
+            continue
+
+        # find-certificate may output multiple certs; pick the PEM block that matches SHA-1
+        # We'll do a simple scan: locate the SHA-1 header then take the next PEM block.
+        lines = pem.splitlines()
+        want = False
+        in_pem = False
+        pem_block: list[str] = []
+        for ln in lines:
+            if ln.startswith("SHA-1 hash: "):
+                want = sha1.lower() in ln.lower()
+                in_pem = False
+                pem_block = []
+                continue
+            if want and "-----BEGIN CERTIFICATE-----" in ln:
+                in_pem = True
+            if want and in_pem:
+                pem_block.append(ln)
+            if want and in_pem and "-----END CERTIFICATE-----" in ln:
+                break
+
+        if not pem_block:
+            continue
+
+        # notAfter parsing via openssl
+        try:
+            end = run_capture(
+                ["openssl", "x509", "-noout", "-enddate"],
+                cwd=Path("."),
+            )
+        except Exception:
+            # Fallback: write pem to temp and read
+            import tempfile
+
+            with tempfile.NamedTemporaryFile("w", delete=False) as f:
+                f.write("\n".join(pem_block) + "\n")
+                tmp = f.name
+            try:
+                end = subprocess.check_output(["openssl", "x509", "-noout", "-enddate", "-in", tmp]).decode()
+            finally:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+
+        # Normalize: notAfter=...
+        end = end.strip()
+        if end.startswith("notAfter="):
+            end = end[len("notAfter=") :].strip()
+
+        # Parse to epoch using python datetime (handles double-space day)
+        from datetime import datetime, timezone
+
+        fmts = ["%b %d %H:%M:%S %Y %Z", "%b  %d %H:%M:%S %Y %Z", "%b %e %H:%M:%S %Y %Z"]
+        epoch = None
+        for fmt in fmts:
+            try:
+                dt = datetime.strptime(end, fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                epoch = int(dt.timestamp())
+                break
+            except Exception:
+                pass
+        if epoch is None:
+            continue
+
+        if epoch > best_epoch:
+            best_epoch = epoch
+            best_sha = sha1
+
+    if not best_sha:
+        # fallback: first candidate
+        best_sha = candidates[0][0]
+
+    return best_sha
+
+
+def extract_entitlements_from_profile(profile: Path, out_plist: Path) -> None:
+    """
+    Decode .mobileprovision -> plist, then extract Entitlements -> xml plist.
+    """
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        profile_plist = Path(f.name)
+
+    try:
+        # Decode CMS
+        subprocess.run(
+            ["security", "cms", "-D", "-i", str(profile)],
+            check=True,
+            stdout=profile_plist.open("w"),
+            stderr=DEVNULL,
+        )
+        # Extract Entitlements
+        subprocess.run(
+            ["/usr/bin/plutil", "-extract", "Entitlements", "xml1", "-o", str(out_plist), str(profile_plist)],
+            check=True,
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+        )
+        if not out_plist.exists() or out_plist.stat().st_size == 0:
+            raise RuntimeError(f"Entitlements plist is empty: {out_plist}")
+    finally:
+        try:
+            profile_plist.unlink()
+        except Exception:
+            pass
+
+
+def sign_ios_app(frontend_dir: Path, *, sign_kind: SignKind) -> None:
+    """
+    Codesign dist/*.app using newest profile in frontend/static and matching identity.
+    """
+    if platform.system() != "Darwin":
+        print("Error: iOS signing requires macOS.", file=sys.stderr)
+        sys.exit(1)
+
+    app = app_bundle_path(frontend_dir)
+    if not app.exists():
+        raise FileNotFoundError(f"App bundle not found: {app}")
+
+    team_id = os.environ.get("GS26_TEAM_ID", "").strip()
+    profile = pick_newest_mobileprovision(frontend_dir)
+
+    # Always embed the selected profile when we sign (needed for device install / ad-hoc style)
+    embedded = app / "embedded.mobileprovision"
+    print(f"Embedding profile: {profile} -> {embedded}")
+    shutil.copyfile(profile, embedded)
+
+    # Extract entitlements
+    entitlements = Path("/tmp/gs26-entitlements.plist")
+    extract_entitlements_from_profile(profile, entitlements)
+
+    # Choose identity
+    sha1 = pick_codesign_identity_sha1(sign_kind, team_id=team_id)
+    print(f"Using codesign identity ({sign_kind}): {sha1}")
+
+    # Remove old signature
+    codesig = app / "_CodeSignature"
+    if codesig.exists():
+        shutil.rmtree(codesig)
+
+    # Sign
+    subprocess.run(
+        [
+            "codesign",
+            "--force",
+            "--deep",
+            "--timestamp=none",
+            "--sign",
+            sha1,
+            "--entitlements",
+            str(entitlements),
+            str(app),
+        ],
+        check=True,
+    )
+
+    # Verify
+    subprocess.run(["codesign", "--verify", "--deep", "--strict", "--verbose=4", str(app)], check=True)
+    print("✅ Signed successfully")
+
+
+def build_frontend(frontend_dir: Path, platform_name: Optional[str] = None, *, rust_target: Optional[str] = None) -> None:
     try:
         clear_app_bundle(frontend_dir)
 
@@ -313,6 +473,8 @@ def build_frontend(
 
         if platform_name:
             cmd.extend(["--platform", platform_name])
+            if platform_name == "ios":
+                cmd.extend(["--device", "true"])
         else:
             cmd.extend(["--platform", "web"])
 
@@ -321,7 +483,6 @@ def build_frontend(
 
         run(cmd, cwd=frontend_dir)
 
-        # Patch plist for iOS bundles (device or sim)
         if platform_name == "ios":
             patch_plist(frontend_dir)
 
@@ -331,24 +492,15 @@ def build_frontend(
 
 
 def deploy_ios(frontend_dir: Path) -> None:
-    """
-    Deploy an already-built iOS .app to ALL connected devices using ios-deploy.
-    """
     bundle = app_bundle_path(frontend_dir)
     if not bundle.exists():
         print(f"Error: iOS app bundle not found at: {bundle}", file=sys.stderr)
-        print("Build it first with: ./build.py ios (or ./build.py ios_deploy)", file=sys.stderr)
         sys.exit(1)
 
     device_ids = _list_connected_ios_device_ids(frontend_dir)
 
-    # If we couldn't detect devices (or ios-deploy output format changed),
-    # fall back to the old behavior (ios-deploy picks a device, waiting if needed).
     if not device_ids:
-        print(
-            "No device IDs detected via `ios-deploy --detect`; falling back to single-device deploy.",
-            file=sys.stderr,
-        )
+        print("No device IDs detected via `ios-deploy --detect`; falling back to single-device deploy.", file=sys.stderr)
         _deploy_ios_single(frontend_dir, bundle)
         return
 
@@ -370,162 +522,10 @@ def deploy_ios(frontend_dir: Path) -> None:
 
 
 def _deploy_ios_single(frontend_dir: Path, bundle: Path) -> None:
-    """
-    Single-device deploy that waits for a device to be connected.
-    """
     try:
         run(["ios-deploy", "--bundle", str(bundle)], cwd=frontend_dir)
     except subprocess.CalledProcessError:
-        print(
-            "Warning: `ios-deploy --wait-for-device` failed; retrying without the flag.",
-            file=sys.stderr,
-        )
         run(["ios-deploy", "--bundle", str(bundle)], cwd=frontend_dir)
-
-
-def _read_bundle_identifier(app_bundle: Path) -> Optional[str]:
-    plist_path = app_bundle / "Info.plist"
-    try:
-        with plist_path.open("rb") as f:
-            info = plistlib.load(f)
-        bid = info.get("CFBundleIdentifier")
-        if isinstance(bid, str) and bid.strip():
-            return bid.strip()
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
-    return None
-
-
-def _open_simulator_app(frontend_dir: Path) -> None:
-    if platform.system() != "Darwin":
-        return
-    try:
-        run(["open", "-a", "Simulator"], cwd=frontend_dir)
-    except Exception:
-        pass
-
-
-def _pick_or_boot_simulator_udid(frontend_dir: Path) -> str:
-    """
-    Returns a UDID of a booted simulator. If none are booted, best-effort boots
-    the first available iPhone simulator device.
-    """
-    if platform.system() != "Darwin":
-        print("Error: iOS simulator install requires macOS (xcrun).", file=sys.stderr)
-        sys.exit(1)
-
-    # Prefer an already-booted device
-    try:
-        out = run_capture(["xcrun", "simctl", "list", "devices", "booted"], cwd=frontend_dir)
-        for line in out.splitlines():
-            line = line.strip()
-            if "(Booted)" in line and "(" in line and ")" in line:
-                parts = line.split("(")
-                for p in parts:
-                    cand = p.split(")")[0].strip()
-                    if "-" in cand and len(cand) >= 20:
-                        return cand
-    except subprocess.CalledProcessError:
-        pass
-
-    # None booted: boot first available iPhone
-    try:
-        out = run_capture(["xcrun", "simctl", "list", "devices"], cwd=frontend_dir)
-    except subprocess.CalledProcessError as e:
-        print("Error: failed to list simulators via xcrun simctl.", file=sys.stderr)
-        sys.exit(e.returncode)
-
-    chosen: Optional[str] = None
-    for line in out.splitlines():
-        t = line.strip()
-        if t.startswith("iPhone ") and "(Shutdown)" in t and "(" in t and ")" in t:
-            parts = t.split("(")
-            for p in parts:
-                cand = p.split(")")[0].strip()
-                if "-" in cand and len(cand) >= 20:
-                    chosen = cand
-                    break
-        if chosen:
-            break
-
-    if not chosen:
-        print(
-            "Error: no booted simulator found and couldn't find a Shutdown iPhone simulator to boot.\n"
-            "Open Simulator.app and create/boot a device, then re-run.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    _open_simulator_app(frontend_dir)
-    try:
-        run(["xcrun", "simctl", "boot", chosen], cwd=frontend_dir)
-    except subprocess.CalledProcessError:
-        pass
-
-    return chosen
-
-
-def deploy_ios_sim(frontend_dir: Path) -> None:
-    """
-    Install the built iOS simulator .app into the current simulator (booted),
-    and auto-launch it.
-    """
-    bundle = app_bundle_path(frontend_dir)
-    if not bundle.exists():
-        print(f"Error: iOS sim app bundle not found at: {bundle}", file=sys.stderr)
-        print("Build it first with: ./build.py ios_sim (or ./build.py ios_sim_install)", file=sys.stderr)
-        sys.exit(1)
-
-    udid = _pick_or_boot_simulator_udid(frontend_dir)
-
-    try:
-        run(["xcrun", "simctl", "install", udid, str(bundle)], cwd=frontend_dir)
-    except subprocess.CalledProcessError as e:
-        print("Error: failed to install app into simulator.", file=sys.stderr)
-        sys.exit(e.returncode)
-
-    bundle_id = _read_bundle_identifier(bundle)
-    if not bundle_id:
-        print(
-            "Installed into simulator, but could not read CFBundleIdentifier to auto-launch.\n"
-            f"Tip: ensure {bundle / 'Info.plist'} has CFBundleIdentifier, or launch manually in Simulator.",
-            file=sys.stderr,
-        )
-        return
-
-    try:
-        run(["xcrun", "simctl", "launch", udid, bundle_id], cwd=frontend_dir)
-    except subprocess.CalledProcessError as e:
-        print(
-            "Installed into simulator, but auto-launch failed.\n"
-            f"Try launching manually, or run: xcrun simctl launch {udid} {bundle_id}",
-            file=sys.stderr,
-        )
-        sys.exit(e.returncode)
-
-
-def deploy_macos(frontend_dir: Path) -> None:
-    """
-    Copy the built macOS .app bundle into the user's Applications folder (~/Applications).
-    """
-    src = app_bundle_path(frontend_dir)
-    if not src.exists():
-        print(f"Error: macOS app bundle not found at: {src}", file=sys.stderr)
-        print("Build it first with: ./build.py macos (or ./build.py macos_deploy)", file=sys.stderr)
-        sys.exit(1)
-
-    user_apps = Path.home() / "Applications"
-    user_apps.mkdir(parents=True, exist_ok=True)
-
-    dst = user_apps / APP_BUNDLE_NAME
-    if dst.exists():
-        print(f"Removing existing installed app: {dst}")
-        shutil.rmtree(dst)
-
-    print(f"Copying app bundle to: {dst}")
-    shutil.copytree(src, dst)
 
 
 def build_backend(backend_dir: Path, force_pi: bool, force_no_pi: bool, testing_mode: bool) -> None:
@@ -569,21 +569,22 @@ def print_usage() -> None:
     print("  ./build.py testing                 # local: backend w/ testing feature")
     print("  ./build.py docker [pi_build|no_pi] [testing]")
     print("")
-    print("Frontend-only OS builds:")
-    print("  ./build.py ios                     # iPhoneOS device build (aarch64-apple-ios)")
-    print("  ./build.py ios_sim                 # iOS simulator build (aarch64-apple-ios-sim)")
+    print("Frontend-only builds:")
+    print("  ./build.py ios                     # iPhoneOS build (UNSIGNED; patched)")
+    print("  ./build.py ios_sim                 # iOS simulator build (patched)")
     print("  ./build.py macos")
     print("  ./build.py windows")
     print("  ./build.py android")
     print("  ./build.py linux")
     print("")
-    print("Frontend deploy actions:")
-    print("  ./build.py ios_deploy              # build ios + deploy to device via ios-deploy")
-    print("  ./build.py ios_sim_install         # build ios_sim + install into Simulator + auto-launch")
-    print("  ./build.py macos_deploy            # build macos + copy .app to ~/Applications")
+    print("Frontend actions:")
+    print("  ./build.py ios_deploy              # build ios + patch + SIGN (Dev) + deploy to device")
+    print("  ./build.py ios_sign                # SIGN (Dev) the existing dist app (no deploy)")
+    print("  ./build.py ios_dist_sign           # SIGN (Distribution) existing dist app (no deploy)")
     print("")
-    print("Environment overrides:")
-    print("  GROUNDSTATION_NO_PARALLEL=1         # force sequential builds (useful in Docker)")
+    print("Env:")
+    print("  GS26_TEAM_ID=TEAMID                # optional filter when picking identity")
+    print("  GROUNDSTATION_NO_PARALLEL=1        # force sequential build")
     sys.exit(1)
 
 
@@ -595,7 +596,7 @@ def main() -> None:
 
     frontend_only_platform: Optional[str] = None
     frontend_rust_target: Optional[str] = None
-    frontend_deploy_action: Optional[str] = None  # "ios" | "macos" | "ios_sim_install"
+    action: Optional[str] = None  # ios_deploy | ios_sign | ios_dist_sign
 
     args = [a.strip().lower() for a in sys.argv[1:]]
 
@@ -612,11 +613,7 @@ def main() -> None:
         "linux": ("linux", None),
     }
 
-    deploy_map = {
-        "ios_deploy": "ios",
-        "ios_sim_install": "ios_sim_install",
-        "macos_deploy": "macos",
-    }
+    actions = {"ios_deploy", "ios_sign", "ios_dist_sign"}
 
     for arg in args:
         if arg == "pi_build":
@@ -627,14 +624,14 @@ def main() -> None:
             docker_mode = True
         elif arg == "testing":
             testing_mode = True
-        elif arg in deploy_map:
-            if frontend_deploy_action is not None or frontend_only_platform is not None:
-                print("Error: Only one frontend action (build OR deploy) may be specified.", file=sys.stderr)
+        elif arg in actions:
+            if action or frontend_only_platform:
+                print("Error: Only one frontend action/build may be specified.", file=sys.stderr)
                 print_usage()
-            frontend_deploy_action = deploy_map[arg]
+            action = arg
         elif arg in frontend_platform_map:
-            if frontend_only_platform is not None or frontend_deploy_action is not None:
-                print("Error: Only one frontend action (build OR deploy) may be specified.", file=sys.stderr)
+            if frontend_only_platform or action:
+                print("Error: Only one frontend action/build may be specified.", file=sys.stderr)
                 print_usage()
             frontend_only_platform, frontend_rust_target = frontend_platform_map[arg]
         else:
@@ -649,69 +646,49 @@ def main() -> None:
     frontend_dir = repo_root / "frontend"
     backend_dir = repo_root / "backend"
 
-    # Frontend deploy mode (build + deploy)
-    if frontend_deploy_action is not None:
+    # Frontend actions
+    if action:
         if docker_mode or force_pi or force_no_pi or testing_mode:
-            print(
-                "Error: Frontend deploy actions cannot be combined with docker/pi_build/no_pi/testing.",
-                file=sys.stderr,
-            )
+            print("Error: Frontend actions cannot be combined with docker/pi_build/no_pi/testing.", file=sys.stderr)
             print_usage()
 
-        if frontend_deploy_action == "ios":
+        if action == "ios_deploy":
             build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
+            sign_ios_app(frontend_dir, sign_kind="development")
             deploy_ios(frontend_dir)
             return
 
-        if frontend_deploy_action == "ios_sim_install":
-            build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios-sim")
-            deploy_ios_sim(frontend_dir)
+        if action == "ios_sign":
+            sign_ios_app(frontend_dir, sign_kind="development")
             return
 
-        if frontend_deploy_action == "macos":
-            build_frontend(frontend_dir, platform_name="macos", rust_target=None)
-            deploy_macos(frontend_dir)
+        if action == "ios_dist_sign":
+            sign_ios_app(frontend_dir, sign_kind="distribution")
             return
 
-        print("Error: Unknown deploy action.", file=sys.stderr)
+        print("Error: unknown action", file=sys.stderr)
         sys.exit(1)
 
     # Frontend-only build mode
     if frontend_only_platform is not None:
         if docker_mode or force_pi or force_no_pi or testing_mode:
-            print(
-                "Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing.",
-                file=sys.stderr,
-            )
+            print("Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing.", file=sys.stderr)
             print_usage()
         build_frontend(frontend_dir, platform_name=frontend_only_platform, rust_target=frontend_rust_target)
         return
 
-    # Docker mode (compose build) - already single-threaded here
+    # Docker mode
     if docker_mode:
-        if force_pi and force_no_pi:
-            print("Error: Cannot specify both 'pi_build' and 'no_pi' in docker mode.", file=sys.stderr)
-            sys.exit(1)
-
         if force_no_pi:
-            print("Docker mode: no_pi override supplied → PI_BUILD will NOT be set, even on Raspberry Pi.")
             pi_build_flag = False
         else:
             if not force_pi and is_raspberry_pi():
-                print("Docker mode: detected Raspberry Pi host → enabling PI_BUILD build arg.")
                 force_pi = True
-            elif force_pi:
-                print("Docker mode: pi_build override supplied → enabling PI_BUILD build arg.")
-            else:
-                print("Docker mode: not on Raspberry Pi and no pi_build override → PI_BUILD will not be set.")
             pi_build_flag = force_pi
-
         build_docker(repo_root=repo_root, pi_build=pi_build_flag, testing=testing_mode)
         return
 
     # Normal local build mode:
-    # - parallel on host
-    # - sequential when running inside docker build/container (avoids cargo/dx contention)
     if in_docker_build():
         print("Sequential build")
         build_frontend(frontend_dir, None)
@@ -721,7 +698,6 @@ def main() -> None:
     # Parallel host build
     bfe = mp.Process(target=build_frontend, args=(frontend_dir, None))
     bbe = mp.Process(target=build_backend, args=(backend_dir, force_pi, force_no_pi, testing_mode))
-
     bfe.start()
     bbe.start()
     bfe.join()
@@ -733,4 +709,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n\nexiting...")
-        exit(0)
+        sys.exit(0)

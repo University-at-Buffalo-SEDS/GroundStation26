@@ -21,7 +21,7 @@ debug = false
 
 [bundle]
 name = "GroundStation 26"
-identifier = "com.UBSEDS.GROUNDSTATION26"
+identifier = "com.UBSEDS.GS26"
 publisher = "UBSEDS"
 icon = ["assets/icon.png"]
 

@@ -19,3 +19,4 @@ __pycache__/
 /frontend/target/
 /frontend/build.log
 /.ai/mcp/mcp.json
+!.mobileprovision

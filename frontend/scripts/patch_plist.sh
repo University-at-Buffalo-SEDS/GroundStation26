@@ -3,17 +3,16 @@ set -euo pipefail
 
 # scripts/patch_plist.sh
 #
-# iOS .app bundle post-processing:
-#  - copies embedded.mobileprovision into the bundle
-#  - copies AppIcon*.png into the bundle
-#  - patches Info.plist (display name, icons, privacy strings)
-#  - extracts entitlements from embedded.mobileprovision
-#  - codesigns the app using an unambiguous identity (SHA-1 hash)
+# iOS .app bundle post-processing (COSMETIC + METADATA):
+#  - Copies Assets.car into the bundle (asset catalog icons)
+#  - (Optionally) removes loose AppIcon*.png so Transporter doesn't get confused
+#  - Patches Info.plist (display name, icon name, privacy strings)
+#  - Adds required Xcode/SDK metadata keys commonly required by Transporter validation
 #
-# macOS compatibility notes:
-#  - Avoids GNU awk features (BSD awk doesn't support match(..., ..., array))
-#  - Avoids sed regex features that differ across BSD/GNU sed
-#
+# IMPORTANT:
+#  - This script does NOT embed provisioning profiles
+#  - This script does NOT extract entitlements
+#  - This script does NOT codesign
 
 debug=false
 
@@ -22,15 +21,14 @@ LEGACY_APP_NAME="GroundstationFrontend"
 APP_DIR="./dist/${APP_NAME}.app"
 PLIST="${APP_DIR}/Info.plist"
 
-MOBILEPROVISION_SRC="static/embedded.mobileprovision"
 ICON_SRC_DIR="./assets"
+ASSETS_CAR_SRC="${ICON_SRC_DIR}/Assets.car"
 
 PB="/usr/libexec/PlistBuddy"
-PLUTIL="/usr/bin/plutil"
 
-# Optional: pin selection by Team ID (the "(TEAMID)" in cert name)
-# export GS26_TEAM_ID="9W6VP6AYB4"
-GS26_TEAM_ID="${GS26_TEAM_ID:-}"
+# If true, delete loose AppIcon*.png after copying Assets.car
+# Recommended when you want Transporter to rely on the asset catalog only.
+REMOVE_LOOSE_ICONS=true
 
 if [[ "$debug" == true ]]; then
   exec 3>&1 4>&2
@@ -41,15 +39,10 @@ fi
 log() { printf "[%s] %s\n" "$(date '+%H:%M:%S')" "$*" >&3; }
 die() { printf "[ERROR] %s\n" "$*" >&2; exit 1; }
 
+# shellcheck disable=SC2154
 trap 'rc=$?; printf "\n[FAIL] line=%s rc=%s cmd: %s\n" "$LINENO" "$rc" "$BASH_COMMAND" >&2; exit $rc' ERR
 
-run_dbg() {
-  log "CMD: $*"
-  "$@" 1>&3 2>&4
-}
-
 [[ -x "$PB" ]] || die "PlistBuddy not found/executable at: $PB"
-[[ -x "$PLUTIL" ]] || die "plutil not found/executable at: $PLUTIL"
 
 # Handle legacy bundle name if build produced a different folder name
 if [[ ! -d "$APP_DIR" && -d "./dist/${LEGACY_APP_NAME}.app" ]]; then
@@ -59,7 +52,6 @@ fi
 
 [[ -d "$APP_DIR" ]] || die "App bundle directory not found: $APP_DIR"
 [[ -f "$PLIST" ]] || die "Info.plist not found: $PLIST"
-[[ -f "$MOBILEPROVISION_SRC" ]] || die "Missing provisioning profile: $MOBILEPROVISION_SRC"
 [[ -d "$ICON_SRC_DIR" ]] || die "Missing icon source dir: $ICON_SRC_DIR"
 
 pb() {
@@ -93,11 +85,12 @@ ensure_array() {
   fi
 }
 
+# PlistBuddy "Set :Key value" expects unquoted scalars.
+# We keep everything as a single-line token.
 set_string() {
   local key="$1"
   local value="$2"
 
-  # PlistBuddy tokenizes; keep values single-line and escape quotes.
   local safe="$value"
   safe="${safe//$'\n'/ }"
   safe="${safe//\"/\\\"}"
@@ -107,6 +100,62 @@ set_string() {
   else
     pb "Add :$key string $safe"
   fi
+}
+
+set_bool() {
+  local key="$1"
+  local value="$2" # true|false
+  if plist_has "$key"; then
+    pb "Set :$key $value"
+  else
+    pb "Add :$key bool $value"
+  fi
+}
+
+set_int() {
+  local key="$1"
+  local value="$2"
+  if plist_has "$key"; then
+    pb "Set :$key $value"
+  else
+    pb "Add :$key integer $value"
+  fi
+}
+
+# Only set if missing (so we don't stomp values injected elsewhere)
+set_string_if_missing() {
+  local key="$1"
+  local value="$2"
+  if ! plist_has "$key"; then
+    set_string "$key" "$value"
+  else
+    log "Key already present (skip): :$key"
+  fi
+}
+
+set_bool_if_missing() {
+  local key="$1"
+  local value="$2"
+  if ! plist_has "$key"; then
+    set_bool "$key" "$value"
+  else
+    log "Key already present (skip): :$key"
+  fi
+}
+
+set_int_if_missing() {
+  local key="$1"
+  local value="$2"
+  if ! plist_has "$key"; then
+    set_int "$key" "$value"
+  else
+    log "Key already present (skip): :$key"
+  fi
+}
+
+get_string() {
+  local key="$1"
+  "$PB" -c "Print :$key" "$PLIST" 2>/dev/null | tr -d '\r' || true
 }
 
 array_add_unique() {
@@ -132,215 +181,134 @@ array_add_unique() {
 dump_plist_sections() {
   [[ "$debug" == true ]] || return 0
   pb_try "Print :CFBundleIdentifier" || true
+  pb_try "Print :CFBundleVersion" || true
+  pb_try "Print :CFBundleShortVersionString" || true
+  pb_try "Print :MinimumOSVersion" || true
+  pb_try "Print :DTPlatformName" || true
+  pb_try "Print :DTSDKName" || true
   pb_try "Print :CFBundleIcons" || true
   pb_try "Print :CFBundleIcons~ipad" || true
+  pb_try "Print :CFBundleIconFiles" || true
+  pb_try "Print :CFBundleIconFile" || true
 }
 
-# ----------------------------
-# Pick newest Apple Development identity (return SHA-1 hash)
-# ----------------------------
-# We avoid: awk match(..., ..., array) (GNU-only)
-# We avoid: relying on label strings for codesign (can be ambiguous)
-pick_newest_apple_development_identity_sha1() {
-  local tmpout
-  tmpout="$(mktemp -t gs26-identities.XXXXXX)"
+# -----------------------------------------------------------------------------
+# 1) Copy asset catalog (Assets.car)
+# -----------------------------------------------------------------------------
+[[ -f "$ASSETS_CAR_SRC" ]] || die "Missing Assets.car at: $ASSETS_CAR_SRC"
+log "Copying Assets.car from $ASSETS_CAR_SRC into bundle"
+cp -f "$ASSETS_CAR_SRC" "$APP_DIR/Assets.car"
 
-  # shellcheck disable=SC2064
-  trap "rm -f '$tmpout' 2>/dev/null || true" RETURN
-
-  # Parse `security find-identity -v -p codesigning` using portable tools.
-  #
-  # Example line:
-  #  1) 0123ABCD... "Apple Development: you@example.com (TEAMID)"
-  #
-  # We'll extract:
-  #   sha1|Apple Development: ...
-  security find-identity -v -p codesigning 2>/dev/null \
-    | sed -n 's/^[[:space:]]*[0-9][0-9]*[)]*[[:space:]]*\([0-9A-Fa-f]\{40\}\)[[:space:]]*"\(Apple Development:.*\)".*/\1|\2/p' \
-    > "$tmpout"
-
-  [[ -s "$tmpout" ]] || return 1
-
-  local best_epoch=-1
-  local best_sha1=""
-  local best_name=""
-
-  while IFS='|' read -r sha1 name; do
-    [[ -n "${sha1:-}" && -n "${name:-}" ]] || continue
-
-    # Optional team filter
-    if [[ -n "$GS26_TEAM_ID" ]]; then
-      case "$name" in
-        *"(${GS26_TEAM_ID})"*) : ;;
-        *) continue ;;
-      esac
-    fi
-
-    # Extract PEM for this exact sha1 from find-certificate output
-    local pem=""
-    pem="$(
-      security find-certificate -a -Z -p -c "$name" 2>/dev/null \
-        | awk -v h="$sha1" '
-            BEGIN { want=0; inpem=0 }
-            /^SHA-1 hash: / {
-              if (index($0, h) > 0) want=1; else want=0;
-              inpem=0;
-              next
-            }
-            want && /-----BEGIN CERTIFICATE-----/ { inpem=1 }
-            want && inpem { print }
-            want && /-----END CERTIFICATE-----/ { exit }
-          '
-    )"
-
-    if [[ -z "$pem" ]]; then
-      log "WARN: Could not extract PEM for identity sha1=$sha1 name=$name"
-      continue
-    fi
-
-    local enddate=""
-    enddate="$(
-      printf "%s\n" "$pem" | openssl x509 -noout -enddate 2>/dev/null | sed 's/^notAfter=//'
-    )"
-    if [[ -z "$enddate" ]]; then
-      log "WARN: Could not read notAfter for identity sha1=$sha1 name=$name"
-      continue
-    fi
-
-    local epoch=""
-    epoch="$(
-      python3 - <<'PY' "$enddate" 2>/dev/null || true
-import sys
-from datetime import datetime, timezone
-s = sys.argv[1].strip()
-fmts = ["%b %d %H:%M:%S %Y %Z", "%b  %d %H:%M:%S %Y %Z", "%b %e %H:%M:%S %Y %Z"]
-for f in fmts:
-    try:
-        dt = datetime.strptime(s, f)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        print(int(dt.timestamp()))
-        sys.exit(0)
-    except Exception:
-        pass
-sys.exit(1)
-PY
-    )"
-
-    if [[ -z "$epoch" ]]; then
-      log "WARN: Could not parse notAfter date '$enddate' for sha1=$sha1 name=$name"
-      continue
-    fi
-
-    log "Candidate identity: sha1=$sha1 name=$name notAfter='$enddate' epoch=$epoch"
-
-    if (( epoch > best_epoch )); then
-      best_epoch="$epoch"
-      best_sha1="$sha1"
-      best_name="$name"
-    fi
-  done < "$tmpout"
-
-  if [[ -n "$best_sha1" ]]; then
-    log "Selected identity: sha1=$best_sha1 name=$best_name epoch=$best_epoch"
-    printf "%s" "$best_sha1"
-    return 0
-  fi
-
-  # Fallback: first Apple Development identity
-  best_sha1="$(head -n 1 "$tmpout" | cut -d'|' -f1)"
-  [[ -n "$best_sha1" ]] || return 1
-  printf "%s" "$best_sha1"
-  return 0
-}
-
-# 1) Copy embedded.mobileprovision
-log "Copying embedded.mobileprovision into bundle"
-cp -f "$MOBILEPROVISION_SRC" "$APP_DIR/embedded.mobileprovision"
-
-# 2) Copy icons
-log "Copying AppIcon*.png from $ICON_SRC_DIR into bundle"
-shopt -s nullglob
-ICONS=( "$ICON_SRC_DIR"/AppIcon*.png )
-shopt -u nullglob
-[[ ${#ICONS[@]} -gt 0 ]] || die "No AppIcon*.png found in $ICON_SRC_DIR"
-
-for f in "${ICONS[@]}"; do
-  cp -f "$f" "$APP_DIR/"
-done
-
-# Normalize iPad icon filename variant
-if [[ -f "$APP_DIR/AppIcon76x76@2x~ipad.png" && ! -f "$APP_DIR/AppIcon76x76@2x.png" ]]; then
-  mv "$APP_DIR/AppIcon76x76@2x~ipad.png" "$APP_DIR/AppIcon76x76@2x.png"
-fi
-if [[ -f "$APP_DIR/AppIcon76x76@2x~ipad.png" ]]; then
-  rm -f "$APP_DIR/AppIcon76x76@2x~ipad.png"
+# Optional: remove loose icons so Transporter uses the asset catalog
+if [[ "$REMOVE_LOOSE_ICONS" == true ]]; then
+  log "Removing loose AppIcon*.png from bundle (asset catalog only)"
+  rm -f "$APP_DIR"/AppIcon*.png 2>/dev/null || true
 fi
 
-# 3) Patch Info.plist
+# -----------------------------------------------------------------------------
+# 2) Patch Info.plist
+# -----------------------------------------------------------------------------
 dump_plist_sections
 
+# Human-facing names
 set_string "CFBundleDisplayName" "GS 26"
 set_string "CFBundleName" "GroundStation 26"
 
+# Asset-catalog icons:
+# With Assets.car, do NOT use CFBundleIconFiles / CFBundleIconFile.
+# Instead, set the icon *name* to match the AppIcon set inside the asset catalog.
 ensure_dict "CFBundleIcons"
 ensure_dict "CFBundleIcons:CFBundlePrimaryIcon"
-ensure_array "CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles"
-set_string  "CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName" "AppIcon"
+set_string "CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName" "AppIcon"
 
 ensure_dict "CFBundleIcons~ipad"
 ensure_dict "CFBundleIcons~ipad:CFBundlePrimaryIcon"
-ensure_array "CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles"
-set_string  "CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconName" "AppIcon"
+set_string "CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconName" "AppIcon"
 
-# NOTE: array_add_unique prevents duplicates, but if the existing array contains
-# differing variants it may still grow over time. See optional "reset arrays" note below.
-array_add_unique "CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles" "AppIcon60x60"
-array_add_unique "CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles" "AppIcon60x60"
-array_add_unique "CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles" "AppIcon76x76"
+# iPad multitasking requires a launch screen.
+# Since MinimumOSVersion >= 14, use UILaunchScreen dictionary (no storyboard file needed).
+ensure_dict "UILaunchScreen"
+set_bool_if_missing "UILaunchScreen:UILaunchScreenRequiresPersistentWiFi" "false" 2>/dev/null || true
+# Provide at least one key; BackgroundColor is enough for validation.
+set_string "UILaunchScreen:UILaunchScreenBackgroundColor" "#1E1F22"
 
+
+# Clean up loose-icon keys if they exist (avoid validator ambiguity)
+if plist_has "CFBundleIconFiles"; then
+  pb "Delete :CFBundleIconFiles"
+fi
+if plist_has "CFBundleIconFile"; then
+  pb "Delete :CFBundleIconFile"
+fi
+# Some builds may have added this under CFBundleIcons primary icon
+if plist_has "CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles"; then
+  pb "Delete :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles"
+fi
+if plist_has "CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles"; then
+  pb "Delete :CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles"
+fi
+
+# Privacy strings
 set_string "NSLocalNetworkUsageDescription" \
   "This app connects to devices on your local network to get data from the ground station."
 set_string "NSLocationWhenInUseUsageDescription" \
   "This app requires location access to help you locate your rocket."
 
+# -----------------------------------------------------------------------------
+# 2b) Add required/expected bundle keys for iOS uploads
+# -----------------------------------------------------------------------------
+set_string_if_missing "CFBundlePackageType" "APPL"
+set_bool_if_missing   "LSRequiresIPhoneOS" "true"
+
+if ! plist_has "MinimumOSVersion"; then
+  set_string "MinimumOSVersion" "14.0"
+fi
+
+# -----------------------------------------------------------------------------
+# 2c) Add Xcode/SDK metadata keys Transporter validates for some packages
+# -----------------------------------------------------------------------------
+set_string_if_missing "DTPlatformName" "iphoneos"
+
+MIN_OS="$(get_string "MinimumOSVersion")"
+SDK_VER_FALLBACK="${MIN_OS%%.*}.${MIN_OS#*.}"
+if [[ "$SDK_VER_FALLBACK" == "$MIN_OS" ]]; then
+  SDK_VER_FALLBACK="$MIN_OS"
+fi
+
+SDK_NAME_ENV="${SDK_NAME:-iphoneos}"
+SDK_VER_ENV="${SDK_VERSION:-$SDK_VER_FALLBACK}"
+
+set_string_if_missing "DTSDKName" "${SDK_NAME_ENV}${SDK_VER_ENV}"
+set_string_if_missing "DTPlatformVersion" "${SDK_VER_ENV}"
+
+if [[ -n "${XCODE_VERSION_ACTUAL:-}" ]]; then
+  set_string_if_missing "DTXcode" "${XCODE_VERSION_ACTUAL}"
+fi
+if [[ -n "${XCODE_PRODUCT_BUILD_VERSION:-}" ]]; then
+  set_string_if_missing "DTXcodeBuild" "${XCODE_PRODUCT_BUILD_VERSION}"
+fi
+
+if [[ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ]]; then
+  set_string_if_missing "BuildMachineOSBuild" "${MACOSX_DEPLOYMENT_TARGET}"
+fi
+
+ensure_dict "UILaunchScreen"
+set_string "UILaunchScreen:UILaunchScreenBackgroundColor" "#1E1F22"
+
+# Required by App Store validation for some non-Xcode bundles
+# CFBundleSupportedPlatforms must be an array with a single entry: iPhoneOS
+if plist_has "CFBundleSupportedPlatforms"; then
+  pb "Delete :CFBundleSupportedPlatforms"
+fi
+pb "Add :CFBundleSupportedPlatforms array"
+pb "Add :CFBundleSupportedPlatforms:0 string iPhoneOS"
+
 dump_plist_sections
 
-# 4) Decode profile + extract entitlements as REAL plist + sign
-log "Decoding embedded.mobileprovision -> /tmp/gs26-profile.plist"
-security cms -D -i "$APP_DIR/embedded.mobileprovision" > /tmp/gs26-profile.plist 2>/tmp/gs26-profile.err || {
-  cat /tmp/gs26-profile.err >&2 || true
-  die "Failed to decode embedded.mobileprovision"
-}
-[[ -s /tmp/gs26-profile.plist ]] || die "Decoded profile plist is empty: /tmp/gs26-profile.plist"
-
-log "Extracting Entitlements via plutil -> /tmp/gs26-entitlements.plist"
-"$PLUTIL" -extract Entitlements xml1 -o /tmp/gs26-entitlements.plist /tmp/gs26-profile.plist 2>/tmp/gs26-entitlements.err || {
-  cat /tmp/gs26-entitlements.err >&2 || true
-  die "Failed to extract Entitlements using plutil"
-}
-[[ -s /tmp/gs26-entitlements.plist ]] || die "Entitlements plist is empty: /tmp/gs26-entitlements.plist"
-
-log "Finding Apple Development signing identity (newest cert) (SHA-1)"
-IDENTITY_SHA1="$(pick_newest_apple_development_identity_sha1 || true)"
-[[ -n "$IDENTITY_SHA1" ]] || die "No 'Apple Development' codesigning identity found."
-
-log "Using identity SHA-1: $IDENTITY_SHA1"
-
+# -----------------------------------------------------------------------------
+# 3) Ensure we do NOT leave old signing artifacts around
+# -----------------------------------------------------------------------------
+rm -f "$APP_DIR/embedded.mobileprovision" 2>/dev/null || true
 rm -rf "$APP_DIR/_CodeSignature" 2>/dev/null || true
 
-log "Signing app bundle"
-run_dbg codesign --force --deep --timestamp=none --sign "$IDENTITY_SHA1" \
-  --entitlements /tmp/gs26-entitlements.plist \
-  "$APP_DIR"
-
-log "Verifying signature"
-run_dbg codesign --verify --deep --strict --verbose=4 "$APP_DIR"
-
-log "✅ Patch + sign complete"
-
-# Optional: if you want icon arrays to be stable across repeated runs, uncomment:
-# pb_try "Delete :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles" || true
-# pb "Add :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles array"
-# pb_try "Delete :CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles" || true
-# pb "Add :CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles array"
+log "✅ Patch complete (UNSIGNED)"

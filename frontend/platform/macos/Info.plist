@@ -20,7 +20,7 @@
 		<string>groundstation_frontend</string>
 
 		<key>CFBundleIdentifier</key>
-		<string>com.UBSEDS.GROUNDSTATION26</string>
+		<string>com.UBSEDS.GS26</string>
 
 		<key>CFBundleInfoDictionaryVersion</key>
 		<string>6.0</string>

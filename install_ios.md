@@ -13,7 +13,7 @@ profile and bundle match the app.
 Set these fields:
 
 - **Product Name:** `GroundStation 26`
-- **Bundle Identifier:** `com.UBSEDS.GROUNDSTATION26`
+- **Bundle Identifier:** `com.UBSEDS.GS26`
 - **Display Name:** `GroundStation 26`
 
 If any of these differ, the generated provisioning profile will not install or the app will be treated as a different
