@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+
 try:
     import tomllib  # py3.11+
 except ImportError:  # pragma: no cover - fallback for older pythons
@@ -248,8 +249,6 @@ def _read_dioxus_build(frontend_dir: Path) -> str:
     raise ValueError(f"Failed to read [application].build from: {dioxus_toml}")
 
 
-
-
 def dist_dir(frontend_dir: Path) -> Path:
     return frontend_dir / DIST_DIRNAME
 
@@ -357,6 +356,45 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
     return ipa_out
 
 
+# -----------------------------
+# Frontend target selection
+# -----------------------------
+def _host_macos_target() -> str:
+    # Allow override if you want to force x86_64 under Rosetta, etc.
+    override = os.environ.get("GS26_MACOS_TARGET", "").strip()
+    if override:
+        return override
+
+    m = platform.machine().lower()
+    # Apple Silicon usually reports "arm64"
+    if "arm" in m or "aarch64" in m:
+        return "aarch64-apple-darwin"
+    return "x86_64-apple-darwin"
+
+
+def _windows_target_default() -> str:
+    # Best default for cross-compiling on macOS.
+    # You can override to "...-windows-msvc" if you have that toolchain working.
+    return os.environ.get("GS26_WINDOWS_TARGET", "x86_64-pc-windows-gnu").strip()
+
+
+def _default_rust_target_for_frontend(platform_name: Optional[str]) -> Optional[str]:
+    # For web builds, do not force a Rust target.
+    if platform_name is None or platform_name == "web":
+        return None
+
+    if platform_name == "macos":
+        return _host_macos_target()
+
+    if platform_name == "windows":
+        return _windows_target_default()
+
+    # iOS targets are already explicitly provided by the caller/map.
+    # Other platforms are intentionally left None here because cross-compiling
+    # requires additional toolchain setup and dx often manages defaults.
+    return None
+
+
 def build_frontend(
         frontend_dir: Path,
         platform_name: Optional[str] = None,
@@ -375,8 +413,17 @@ def build_frontend(
             cmd.extend(["--platform", platform_name])
             if platform_name == "ios":
                 cmd.extend(["--device", "true"])
+            elif platform_name == "windows":
+                # dx has a first-class flag for this; don't use /SUBSYSTEM link args.
+                cmd.extend(["--windows-subsystem", "WINDOWS"])
+
+
         else:
             cmd.extend(["--platform", "web"])
+
+        # If caller didn't provide a target, pick one for certain platforms.
+        if not rust_target:
+            rust_target = _default_rust_target_for_frontend(platform_name)
 
         if rust_target:
             cmd.extend(["--target", rust_target])
@@ -441,7 +488,7 @@ def print_usage() -> None:
     print("  ./build.py linux")
     print("")
     print("Frontend actions:")
-    print("  ./build.py ios_deploy              # build ios + patch + package+sign (Dev) -> IPA")
+    print("  ./build.py ios_deploy              # build ios + patch + package+sign (Distribution) -> IPA")
     print("  ./build.py ios_sign                # package+sign (Dev) existing dist app -> IPA")
     print("  ./build.py ios_dist_sign           # package+sign (Distribution) existing dist app -> IPA")
     print("")
@@ -452,6 +499,8 @@ def print_usage() -> None:
     print("  CERT_REGEX=...                     # override cert regex for signer script")
     print("  CERT_PICK=newest|first             # override cert selection for signer script")
     print("  GROUNDSTATION_NO_PARALLEL=1        # force sequential build")
+    print("  GS26_WINDOWS_TARGET=...            # override windows Rust target (default x86_64-pc-windows-gnu)")
+    print("  GS26_MACOS_TARGET=...              # override macos Rust target (auto-detects by default)")
     sys.exit(1)
 
 
@@ -471,11 +520,14 @@ def main() -> None:
         print("Error: Too many arguments.", file=sys.stderr)
         print_usage()
 
+    # NOTE: We only hardcode targets where it is unambiguous/required.
+    # - ios/ios_sim MUST be explicit.
+    # - windows/macos are now auto-selected if not provided.
     frontend_platform_map = {
         "ios": ("ios", "aarch64-apple-ios"),
         "ios_sim": ("ios", "aarch64-apple-ios-sim"),
         "macos": ("macos", None),
-        "windows": ("windows", None),
+        "windows": ("windows", None),  # default chosen in build_frontend()
         "android": ("android", None),
         "linux": ("linux", None),
     }
@@ -523,7 +575,7 @@ def main() -> None:
             # NOTE: per your latest direction, this is now just "package and sign" (no local deploy)
             build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
-            print(f"✅ Dev IPA created: {ipa}")
+            print(f"✅ Distribution IPA created: {ipa}")
             return
 
         if action == "ios_sign":
