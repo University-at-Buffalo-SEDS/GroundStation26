@@ -99,7 +99,7 @@ pub fn charts_cache_ingest_row(row: &TelemetryRow) {
 /// - [String;8] SVG path `d` strings (may be empty)
 /// - y_min, y_max (labels)
 /// - span_min (minutes of effective window)
-pub fn charts_cache_get(data_type: &str, width: f32, height: f32) -> ([String; 8], f32, f32, f32) {
+pub fn charts_cache_get(data_type: &str, width: f32, height: f32) -> (Vec<String>, f32, f32, f32) {
     CHARTS_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         c.get(data_type, width, height)
@@ -110,14 +110,14 @@ pub fn charts_cache_get_channel_minmax(
     data_type: &str,
     width: f32,
     height: f32,
-) -> ([Option<f32>; 8], [Option<f32>; 8]) {
+) -> (Vec<Option<f32>>, Vec<Option<f32>>) {
     CHARTS_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if let Some(ch) = c.charts.get_mut(data_type) {
             ch.build_if_needed(width, height);
-            (ch.chan_min, ch.chan_max)
+            (ch.chan_min.clone(), ch.chan_max.clone())
         } else {
-            ([None; 8], [None; 8])
+            (Vec::new(), Vec::new())
         }
     })
 }
@@ -149,12 +149,12 @@ impl ChartsCache {
         chart.ingest(r);
     }
 
-    fn get(&mut self, dt: &str, w: f32, h: f32) -> ([String; 8], f32, f32, f32) {
+    fn get(&mut self, dt: &str, w: f32, h: f32) -> (Vec<String>, f32, f32, f32) {
         if let Some(c) = self.charts.get_mut(dt) {
             c.build_if_needed(w, h);
             (c.paths.clone(), c.disp_min, c.disp_max, c.span_min)
         } else {
-            (std::array::from_fn(|_| String::new()), 0.0, 1.0, 0.0)
+            (Vec::new(), 0.0, 1.0, 0.0)
         }
     }
 
@@ -170,38 +170,50 @@ struct Bucket {
     // absolute bucket id (ts_ms / BUCKET_MS)
     id: i64,
 
-    has: [bool; 8],
-    last: [f32; 8],
-    min: [f32; 8],
-    max: [f32; 8],
+    has: Vec<bool>,
+    last: Vec<f32>,
+    min: Vec<f32>,
+    max: Vec<f32>,
 }
 
 impl Bucket {
-    fn new(id: i64) -> Self {
+    fn new(id: i64, channels: usize) -> Self {
         Self {
             id,
-            has: [false; 8],
-            last: [0.0; 8],
-            min: [0.0; 8],
-            max: [0.0; 8],
+            has: vec![false; channels],
+            last: vec![0.0; channels],
+            min: vec![0.0; channels],
+            max: vec![0.0; channels],
         }
     }
 
-    fn update(&mut self, v: [Option<f32>; 8]) {
-        for ch in 0..8 {
-            if let Some(x) = v[ch] {
+    fn ensure_channels(&mut self, channels: usize) {
+        if self.has.len() >= channels {
+            return;
+        }
+        let add = channels - self.has.len();
+        self.has.extend(std::iter::repeat(false).take(add));
+        self.last.extend(std::iter::repeat(0.0).take(add));
+        self.min.extend(std::iter::repeat(0.0).take(add));
+        self.max.extend(std::iter::repeat(0.0).take(add));
+    }
+
+    fn update(&mut self, v: &[Option<f32>]) {
+        self.ensure_channels(v.len());
+        for (ch, val) in v.iter().enumerate() {
+            if let Some(x) = val {
                 if !x.is_finite() {
                     continue;
                 }
                 if !self.has[ch] {
                     self.has[ch] = true;
-                    self.last[ch] = x;
-                    self.min[ch] = x;
-                    self.max[ch] = x;
+                    self.last[ch] = *x;
+                    self.min[ch] = *x;
+                    self.max[ch] = *x;
                 } else {
-                    self.last[ch] = x;
-                    self.min[ch] = self.min[ch].min(x);
-                    self.max[ch] = self.max[ch].max(x);
+                    self.last[ch] = *x;
+                    self.min[ch] = self.min[ch].min(*x);
+                    self.max[ch] = self.max[ch].max(*x);
                 }
             }
         }
@@ -213,17 +225,18 @@ struct CachedChart {
     newest_bucket_id: i64,
     newest_ts: i64,
     dirty: bool,
+    channel_count: usize,
 
     // cached output
-    paths: [String; 8],
+    paths: Vec<String>,
 
     // per-window min/max (raw)
     raw_min: f32,
     raw_max: f32,
 
     // per-channel min/max over window
-    chan_min: [Option<f32>; 8],
-    chan_max: [Option<f32>; 8],
+    chan_min: Vec<Option<f32>>,
+    chan_max: Vec<Option<f32>>,
 
     // displayed (sticky) range
     disp_min: f32,
@@ -248,11 +261,12 @@ impl CachedChart {
             newest_bucket_id: 0,
             newest_ts: 0,
             dirty: true,
-            paths: std::array::from_fn(|_| String::new()),
+            channel_count: 0,
+            paths: Vec::new(),
             raw_min: 0.0,
             raw_max: 1.0,
-            chan_min: [None; 8],
-            chan_max: [None; 8],
+            chan_min: Vec::new(),
+            chan_max: Vec::new(),
             disp_min: 0.0,
             disp_max: 1.0,
             span_min: 0.0,
@@ -269,6 +283,10 @@ impl CachedChart {
     }
 
     fn ingest(&mut self, r: &TelemetryRow) {
+        let ch_count = r.values.len();
+        if ch_count > self.channel_count {
+            self.ensure_channels(ch_count);
+        }
         let ts = r.timestamp_ms;
         let bid = ts.div_euclid(BUCKET_MS);
 
@@ -277,13 +295,13 @@ impl CachedChart {
         }
         if self.buckets.is_empty() {
             self.newest_bucket_id = bid;
-            self.buckets.push_back(Bucket::new(bid));
+            self.buckets.push_back(Bucket::new(bid, self.channel_count));
         } else if bid > self.newest_bucket_id {
             // append buckets up to new bucket
             let mut cur = self.newest_bucket_id;
             while cur < bid {
                 cur += 1;
-                self.buckets.push_back(Bucket::new(cur));
+                self.buckets.push_back(Bucket::new(cur, self.channel_count));
             }
             self.newest_bucket_id = bid;
         }
@@ -300,12 +318,12 @@ impl CachedChart {
         // find bucket
         if let Some(back) = self.buckets.back_mut() {
             if back.id == bid {
-                back.update([r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7]);
+                back.update(&r.values);
             } else {
                 // bid may be within last LIVE_BUCKETS_BACK; scan from back a tiny amount
                 for b in self.buckets.iter_mut().rev().take(LIVE_BUCKETS_BACK as usize + 2) {
                     if b.id == bid {
-                        b.update([r.v0, r.v1, r.v2, r.v3, r.v4, r.v5, r.v6, r.v7]);
+                        b.update(&r.values);
                         break;
                     }
                 }
@@ -328,6 +346,21 @@ impl CachedChart {
             self.buckets.pop_front();
         }
 
+        self.dirty = true;
+    }
+
+    fn ensure_channels(&mut self, channels: usize) {
+        if self.channel_count >= channels {
+            return;
+        }
+        let add = channels - self.channel_count;
+        self.channel_count = channels;
+        self.paths.extend(std::iter::repeat(String::new()).take(add));
+        self.chan_min.extend(std::iter::repeat(None).take(add));
+        self.chan_max.extend(std::iter::repeat(None).take(add));
+        for b in self.buckets.iter_mut() {
+            b.ensure_channels(channels);
+        }
         self.dirty = true;
     }
 
@@ -406,13 +439,11 @@ impl CachedChart {
         self.last_h = h;
 
         if self.buckets.is_empty() {
-            for s in &mut self.paths {
-                s.clear();
-            }
+            self.paths.iter_mut().for_each(|s| s.clear());
             self.raw_min = 0.0;
             self.raw_max = 1.0;
-            self.chan_min = [None; 8];
-            self.chan_max = [None; 8];
+            self.chan_min = vec![None; self.channel_count];
+            self.chan_max = vec![None; self.channel_count];
             self.disp_min = 0.0;
             self.disp_max = 1.0;
             self.span_min = 0.0;
@@ -455,8 +486,8 @@ impl CachedChart {
         let start_bid = newest_bid.saturating_sub(want_buckets - 1);
 
         // Build window min/max from buckets in [start_bid, newest_bid]
-        let mut chan_min: [Option<f32>; 8] = [None; 8];
-        let mut chan_max: [Option<f32>; 8] = [None; 8];
+        let mut chan_min: Vec<Option<f32>> = vec![None; self.channel_count];
+        let mut chan_max: Vec<Option<f32>> = vec![None; self.channel_count];
         let mut min = f32::INFINITY;
         let mut max = f32::NEG_INFINITY;
 
@@ -464,7 +495,7 @@ impl CachedChart {
             if b.id < start_bid || b.id > newest_bid {
                 continue;
             }
-            for ch in 0..8 {
+            for ch in 0..self.channel_count {
                 if b.has[ch] {
                     let v = b.last[ch];
                     min = min.min(v);
@@ -522,7 +553,7 @@ impl CachedChart {
         //
         // Also: to keep line continuity, we carry-forward last_seen if a bucket has no value.
         // This does NOT mutate historical bucket values; it's just how we draw gaps.
-        let mut last_seen: [Option<f32>; 8] = [None; 8];
+        let mut last_seen: Vec<Option<f32>> = vec![None; self.channel_count];
 
         let total = (newest_bid - start_bid + 1).max(1) as f32;
 
@@ -534,7 +565,7 @@ impl CachedChart {
             let i = (b.id - start_bid) as f32;
             let x = left + pw * ((i + 0.5) / total);
 
-            for ch in 0..8 {
+            for ch in 0..self.channel_count {
                 let v_opt = if b.has[ch] {
                     let v = b.last[ch];
                     last_seen[ch] = Some(v);

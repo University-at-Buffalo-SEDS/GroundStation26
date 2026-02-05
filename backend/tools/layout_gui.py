@@ -5,7 +5,7 @@ from pathlib import Path
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import colorchooser, filedialog, messagebox, ttk
 except ImportError:
     print(
         "Error: Tkinter is not available in this Python environment.\n"
@@ -98,6 +98,7 @@ class LayoutEditor(tk.Tk):
 
         self.load()
         self.after(100, self.focus_force)
+        self.notebook.bind("<<NotebookTabChanged>>", lambda _: self._commit_all_forms())
 
     # ------------------------
     # Data tab editor
@@ -106,10 +107,11 @@ class LayoutEditor(tk.Tk):
         frame = self.data_tab_frame
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(0, weight=1)
+        self._data_selected_idx: int | None = None
 
         self.data_list = tk.Listbox(frame, height=20)
         self.data_list.grid(row=0, column=0, sticky="ns", padx=(0, 10), pady=5)
-        self.data_list.bind("<<ListboxSelect>>", lambda _: self._load_data_item())
+        self.data_list.bind("<<ListboxSelect>>", lambda _: self._on_data_select())
 
         form = ttk.Frame(frame)
         form.grid(row=0, column=1, sticky="nsew")
@@ -126,7 +128,6 @@ class LayoutEditor(tk.Tk):
         btns = ttk.Frame(form)
         btns.grid(row=4, column=1, sticky="w", pady=8)
         ttk.Button(btns, text="Add", command=self._add_data_item).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Update", command=self._update_data_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove", command=self._remove_data_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Up", command=lambda: self._move_data_item(-1)).pack(
             side=tk.LEFT, padx=4
@@ -142,10 +143,11 @@ class LayoutEditor(tk.Tk):
         frame = self.connection_tab_frame
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(0, weight=1)
+        self._conn_selected_idx: int | None = None
 
         self.conn_list = tk.Listbox(frame, height=20)
         self.conn_list.grid(row=0, column=0, sticky="ns", padx=(0, 10), pady=5)
-        self.conn_list.bind("<<ListboxSelect>>", lambda _: self._load_conn_item())
+        self.conn_list.bind("<<ListboxSelect>>", lambda _: self._on_conn_select())
 
         form = ttk.Frame(frame)
         form.grid(row=0, column=1, sticky="nsew")
@@ -161,9 +163,6 @@ class LayoutEditor(tk.Tk):
         btns = ttk.Frame(form)
         btns.grid(row=2, column=1, sticky="w", pady=8)
         ttk.Button(btns, text="Add", command=self._add_conn_item).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Update", command=self._update_conn_item).pack(
-            side=tk.LEFT, padx=4
-        )
         ttk.Button(btns, text="Remove", command=self._remove_conn_item).pack(
             side=tk.LEFT, padx=4
         )
@@ -181,10 +180,14 @@ class LayoutEditor(tk.Tk):
         frame = self.actions_tab_frame
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(0, weight=1)
+        self._actions_selected_idx: int | None = None
+        self._state_entry_selected_idx: int | None = None
+        self._state_section_selected_idx: int | None = None
+        self._state_widget_selected_idx: int | None = None
 
         self.actions_list = tk.Listbox(frame, height=20)
         self.actions_list.grid(row=0, column=0, sticky="ns", padx=(0, 10), pady=5)
-        self.actions_list.bind("<<ListboxSelect>>", lambda _: self._load_action_item())
+        self.actions_list.bind("<<ListboxSelect>>", lambda _: self._on_action_select())
 
         form = ttk.Frame(frame)
         form.grid(row=0, column=1, sticky="nsew")
@@ -192,16 +195,13 @@ class LayoutEditor(tk.Tk):
 
         self.action_label = self._entry(form, "Label", 0)
         self.action_cmd = self._entry(form, "Command", 1)
-        self.action_border = self._entry(form, "Border color", 2)
-        self.action_bg = self._entry(form, "Background color", 3)
-        self.action_fg = self._entry(form, "Text color", 4)
+        self.action_border = self._color_entry(form, "Border color", 2)
+        self.action_bg = self._color_entry(form, "Background color", 3)
+        self.action_fg = self._color_entry(form, "Text color", 4)
 
         btns = ttk.Frame(form)
         btns.grid(row=5, column=1, sticky="w", pady=8)
         ttk.Button(btns, text="Add", command=self._add_action_item).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Update", command=self._update_action_item).pack(
-            side=tk.LEFT, padx=4
-        )
         ttk.Button(btns, text="Remove", command=self._remove_action_item).pack(
             side=tk.LEFT, padx=4
         )
@@ -224,25 +224,25 @@ class LayoutEditor(tk.Tk):
         ttk.Label(frame, text="State entries").grid(row=0, column=0, sticky="w")
         self.state_entry_list = tk.Listbox(frame, height=18)
         self.state_entry_list.grid(row=1, column=0, sticky="ns", padx=(0, 10))
-        self.state_entry_list.bind("<<ListboxSelect>>", lambda _: self._load_state_entry())
+        self.state_entry_list.bind("<<ListboxSelect>>", lambda _: self._on_state_entry_select())
 
         # Sections
         ttk.Label(frame, text="Sections").grid(row=0, column=1, sticky="w")
         self.section_list = tk.Listbox(frame, height=18)
         self.section_list.grid(row=1, column=1, sticky="ns", padx=(0, 10))
-        self.section_list.bind("<<ListboxSelect>>", lambda _: self._load_section_from_selection())
-        self.section_list.bind("<ButtonRelease-1>", lambda _: self._load_section_from_selection())
-        self.section_list.bind("<KeyRelease-Up>", lambda _: self._load_section_from_selection())
-        self.section_list.bind("<KeyRelease-Down>", lambda _: self._load_section_from_selection())
+        self.section_list.bind("<<ListboxSelect>>", lambda _: self._on_section_select())
+        self.section_list.bind("<ButtonRelease-1>", lambda _: self._on_section_select())
+        self.section_list.bind("<KeyRelease-Up>", lambda _: self._on_section_select())
+        self.section_list.bind("<KeyRelease-Down>", lambda _: self._on_section_select())
 
         # Widgets
         ttk.Label(frame, text="Widgets").grid(row=0, column=2, sticky="w")
         self.widget_list = tk.Listbox(frame, height=18)
         self.widget_list.grid(row=1, column=2, sticky="nsew")
-        self.widget_list.bind("<<ListboxSelect>>", lambda _: self._load_widget_from_selection())
-        self.widget_list.bind("<ButtonRelease-1>", lambda _: self._load_widget_from_selection())
-        self.widget_list.bind("<KeyRelease-Up>", lambda _: self._load_widget_from_selection())
-        self.widget_list.bind("<KeyRelease-Down>", lambda _: self._load_widget_from_selection())
+        self.widget_list.bind("<<ListboxSelect>>", lambda _: self._on_widget_select())
+        self.widget_list.bind("<ButtonRelease-1>", lambda _: self._on_widget_select())
+        self.widget_list.bind("<KeyRelease-Up>", lambda _: self._on_widget_select())
+        self.widget_list.bind("<KeyRelease-Down>", lambda _: self._on_widget_select())
 
         form = ttk.Frame(frame)
         form.grid(row=2, column=0, columnspan=3, sticky="ew", pady=10)
@@ -256,9 +256,6 @@ class LayoutEditor(tk.Tk):
         ttk.Button(form, text="Add State Entry", command=self._add_state_entry).grid(
             row=1, column=1, padx=6, pady=4, sticky="w"
         )
-        ttk.Button(form, text="Update State Entry", command=self._update_state_entry).grid(
-            row=1, column=2, padx=6, pady=4, sticky="w"
-        )
         ttk.Button(form, text="Remove State Entry", command=self._remove_state_entry).grid(
             row=1, column=3, padx=6, pady=4, sticky="w"
         )
@@ -269,9 +266,6 @@ class LayoutEditor(tk.Tk):
         self.section_title.grid(row=2, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
         ttk.Button(form, text="Add Section", command=self._add_section).grid(
             row=3, column=1, padx=6, pady=4, sticky="w"
-        )
-        ttk.Button(form, text="Update Section", command=self._update_section).grid(
-            row=3, column=2, padx=6, pady=4, sticky="w"
         )
         ttk.Button(form, text="Remove Section", command=self._remove_section).grid(
             row=3, column=3, padx=6, pady=4, sticky="w"
@@ -315,9 +309,6 @@ class LayoutEditor(tk.Tk):
         ttk.Button(form, text="Add Widget", command=self._add_widget).grid(
             row=7, column=1, padx=6, pady=4, sticky="w"
         )
-        ttk.Button(form, text="Update Widget", command=self._update_widget).grid(
-            row=7, column=2, padx=6, pady=4, sticky="w"
-        )
         ttk.Button(form, text="Remove Widget", command=self._remove_widget).grid(
             row=7, column=3, padx=6, pady=4, sticky="w"
         )
@@ -328,12 +319,31 @@ class LayoutEditor(tk.Tk):
     # ------------------------
     # Helpers
     # ------------------------
-    def _entry(self, parent: ttk.Frame, label: str, row: int, col: int = 0, col_span: int = 1) -> tk.Entry:
+    def _entry(
+        self, parent: ttk.Frame, label: str, row: int, col: int = 0, col_span: int = 1
+    ) -> tk.Entry:
         ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w")
         entry = ttk.Entry(parent)
         entry.grid(row=row, column=col + 1, columnspan=col_span, sticky="ew", padx=6, pady=3)
         parent.columnconfigure(col + 1, weight=1)
         return entry
+
+    def _color_entry(self, parent: ttk.Frame, label: str, row: int) -> ttk.Entry:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
+        entry = ttk.Entry(parent)
+        entry.grid(row=row, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Button(parent, text="Pick", command=lambda: self._pick_color(entry)).grid(
+            row=row, column=2, sticky="w", padx=(0, 6)
+        )
+        parent.columnconfigure(1, weight=1)
+        return entry
+
+    def _pick_color(self, entry: ttk.Entry) -> None:
+        initial = entry.get().strip() or None
+        _, hex_color = colorchooser.askcolor(color=initial, parent=self)
+        if hex_color:
+            entry.delete(0, tk.END)
+            entry.insert(0, hex_color)
 
     def _refresh_lists(self) -> None:
         self.data_list.delete(0, tk.END)
@@ -403,6 +413,7 @@ class LayoutEditor(tk.Tk):
         idx = self._selected_index(self.data_list)
         if idx is None:
             return
+        self._data_selected_idx = idx
         item = self.data["data_tab"]["tabs"][idx]
         self.data_id.delete(0, tk.END)
         self.data_id.insert(0, item.get("id", ""))
@@ -424,19 +435,6 @@ class LayoutEditor(tk.Tk):
         self.data["data_tab"]["tabs"].append(item)
         self._refresh_lists()
 
-    def _update_data_item(self) -> None:
-        idx = self._selected_index(self.data_list)
-        if idx is None:
-            return
-        self.data["data_tab"]["tabs"][idx] = {
-            "id": self.data_id.get().strip(),
-            "label": self.data_label.get().strip(),
-            "channels": self._clean_channels(self._split_list(self.data_channels.get())),
-            "chart": {"enabled": bool(self.data_chart.get())},
-        }
-        self._refresh_lists()
-        self.data_list.selection_set(idx)
-
     def _remove_data_item(self) -> None:
         idx = self._selected_index(self.data_list)
         if idx is None:
@@ -454,6 +452,7 @@ class LayoutEditor(tk.Tk):
         idx = self._selected_index(self.conn_list)
         if idx is None:
             return
+        self._conn_selected_idx = idx
         item = self.data["connection_tab"]["sections"][idx]
         self.conn_kind.set(item.get("kind", "board_status"))
         self.conn_title.delete(0, tk.END)
@@ -464,17 +463,6 @@ class LayoutEditor(tk.Tk):
             {"kind": self.conn_kind.get(), "title": self.conn_title.get().strip()}
         )
         self._refresh_lists()
-
-    def _update_conn_item(self) -> None:
-        idx = self._selected_index(self.conn_list)
-        if idx is None:
-            return
-        self.data["connection_tab"]["sections"][idx] = {
-            "kind": self.conn_kind.get(),
-            "title": self.conn_title.get().strip(),
-        }
-        self._refresh_lists()
-        self.conn_list.selection_set(idx)
 
     def _remove_conn_item(self) -> None:
         idx = self._selected_index(self.conn_list)
@@ -493,6 +481,7 @@ class LayoutEditor(tk.Tk):
         idx = self._selected_index(self.actions_list)
         if idx is None:
             return
+        self._actions_selected_idx = idx
         item = self.data["actions_tab"]["actions"][idx]
         self.action_label.delete(0, tk.END)
         self.action_label.insert(0, item.get("label", ""))
@@ -508,14 +497,6 @@ class LayoutEditor(tk.Tk):
     def _add_action_item(self) -> None:
         self.data["actions_tab"]["actions"].append(self._action_from_form())
         self._refresh_lists()
-
-    def _update_action_item(self) -> None:
-        idx = self._selected_index(self.actions_list)
-        if idx is None:
-            return
-        self.data["actions_tab"]["actions"][idx] = self._action_from_form()
-        self._refresh_lists()
-        self.actions_list.selection_set(idx)
 
     def _remove_action_item(self) -> None:
         idx = self._selected_index(self.actions_list)
@@ -544,6 +525,9 @@ class LayoutEditor(tk.Tk):
         if idx is None:
             return
         entry = self.data["state_tab"]["states"][idx]
+        self._state_entry_selected_idx = idx
+        self._state_section_selected_idx = None
+        self._state_widget_selected_idx = None
         self.state_states.delete(0, tk.END)
         self.state_states.insert(0, ", ".join(entry.get("states", [])))
         self.section_list.delete(0, tk.END)
@@ -566,6 +550,8 @@ class LayoutEditor(tk.Tk):
 
     def _load_section_for(self, e_idx: int, s_idx: int) -> None:
         section = self.data["state_tab"]["states"][e_idx]["sections"][s_idx]
+        self._state_section_selected_idx = s_idx
+        self._state_widget_selected_idx = None
         self.section_title.delete(0, tk.END)
         self.section_title.insert(0, section.get("title", ""))
         self.widget_list.delete(0, tk.END)
@@ -574,10 +560,7 @@ class LayoutEditor(tk.Tk):
             widgets = []
             section["widgets"] = widgets
         for w in widgets:
-            label = w.get("kind", "widget")
-            if w.get("data_type"):
-                label = f"{label} ({w.get('data_type')})"
-            self.widget_list.insert(tk.END, label)
+            self.widget_list.insert(tk.END, self._widget_label(w))
         if widgets:
             self.widget_list.selection_clear(0, tk.END)
             self.widget_list.selection_set(0)
@@ -595,6 +578,7 @@ class LayoutEditor(tk.Tk):
 
     def _load_widget_for(self, e_idx: int, s_idx: int, w_idx: int) -> None:
         widget = self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["widgets"][w_idx]
+        self._state_widget_selected_idx = w_idx
         self.widget_kind.set(widget.get("kind", "summary"))
         self.widget_data_type.delete(0, tk.END)
         self.widget_data_type.insert(0, widget.get("data_type", ""))
@@ -613,16 +597,6 @@ class LayoutEditor(tk.Tk):
         self.data["state_tab"]["states"].append(entry)
         self._refresh_lists()
 
-    def _update_state_entry(self) -> None:
-        idx = self._selected_index(self.state_entry_list)
-        if idx is None:
-            return
-        self.data["state_tab"]["states"][idx]["states"] = self._split_list(
-            self.state_states.get()
-        )
-        self._refresh_lists()
-        self.state_entry_list.selection_set(idx)
-
     def _remove_state_entry(self) -> None:
         idx = self._selected_index(self.state_entry_list)
         if idx is None:
@@ -638,18 +612,6 @@ class LayoutEditor(tk.Tk):
         section = {"title": self.section_title.get().strip(), "widgets": []}
         self.data["state_tab"]["states"][e_idx]["sections"].append(section)
         self._load_state_entry()
-
-    def _update_section(self) -> None:
-        e_idx = self._selected_index(self.state_entry_list)
-        s_idx = self._selected_index(self.section_list)
-        if None in (e_idx, s_idx):
-            messagebox.showwarning("Selection required", "Select a state entry and section first.")
-            return
-        self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["title"] = (
-            self.section_title.get().strip()
-        )
-        self._load_state_entry()
-        self.section_list.selection_set(s_idx)
 
     def _remove_section(self) -> None:
         e_idx = self._selected_index(self.state_entry_list)
@@ -670,21 +632,6 @@ class LayoutEditor(tk.Tk):
         self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["widgets"].append(widget)
         self._load_section_from_selection()
 
-    def _update_widget(self) -> None:
-        e_idx = self._selected_index(self.state_entry_list)
-        s_idx = self._selected_index(self.section_list)
-        w_idx = self._selected_index(self.widget_list)
-        if None in (e_idx, s_idx, w_idx):
-            messagebox.showwarning(
-                "Selection required", "Select a state entry, section, and widget first."
-            )
-            return
-        self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["widgets"][w_idx] = (
-            self._widget_from_form()
-        )
-        self._load_section_from_selection()
-        self.widget_list.selection_set(w_idx)
-
     def _remove_widget(self) -> None:
         e_idx = self._selected_index(self.state_entry_list)
         s_idx = self._selected_index(self.section_list)
@@ -703,6 +650,12 @@ class LayoutEditor(tk.Tk):
     def _selected_index(self, listbox: tk.Listbox) -> int | None:
         sel = listbox.curselection()
         return sel[0] if sel else None
+
+    def _widget_label(self, widget: dict) -> str:
+        label = widget.get("kind", "widget")
+        if widget.get("data_type"):
+            label = f"{label} ({widget.get('data_type')})"
+        return label
 
     def _split_list(self, text: str) -> list[str]:
         return [s.strip() for s in text.split(",") if s.strip()]
@@ -782,6 +735,121 @@ class LayoutEditor(tk.Tk):
         items[idx], items[new_idx] = items[new_idx], items[idx]
         self._refresh_lists()
         listbox.selection_set(new_idx)
+
+    # ------------------------
+    # Auto-commit (no Update buttons)
+    # ------------------------
+    def _commit_all_forms(self) -> None:
+        self._commit_data_form()
+        self._commit_conn_form()
+        self._commit_action_form()
+        self._commit_state_form()
+
+    def _commit_data_form(self) -> None:
+        idx = self._data_selected_idx
+        if idx is None or idx >= len(self.data["data_tab"]["tabs"]):
+            return
+        self.data["data_tab"]["tabs"][idx] = {
+            "id": self.data_id.get().strip(),
+            "label": self.data_label.get().strip(),
+            "channels": self._clean_channels(self._split_list(self.data_channels.get())),
+            "chart": {"enabled": bool(self.data_chart.get())},
+        }
+        self._refresh_lists()
+        self.data_list.selection_set(idx)
+
+    def _commit_conn_form(self) -> None:
+        idx = self._conn_selected_idx
+        if idx is None or idx >= len(self.data["connection_tab"]["sections"]):
+            return
+        self.data["connection_tab"]["sections"][idx] = {
+            "kind": self.conn_kind.get(),
+            "title": self.conn_title.get().strip(),
+        }
+        self._refresh_lists()
+        self.conn_list.selection_set(idx)
+
+    def _commit_action_form(self) -> None:
+        idx = self._actions_selected_idx
+        if idx is None or idx >= len(self.data["actions_tab"]["actions"]):
+            return
+        self.data["actions_tab"]["actions"][idx] = self._action_from_form()
+        self._refresh_lists()
+        self.actions_list.selection_set(idx)
+
+    def _commit_state_form(self) -> None:
+        e_idx = self._state_entry_selected_idx
+        if e_idx is None or e_idx >= len(self.data["state_tab"]["states"]):
+            return
+        states = self._split_list(self.state_states.get())
+        self.data["state_tab"]["states"][e_idx]["states"] = states
+        if e_idx < self.state_entry_list.size():
+            self.state_entry_list.delete(e_idx)
+            self.state_entry_list.insert(e_idx, ", ".join(states) or "state entry")
+            self.state_entry_list.selection_set(e_idx)
+
+        sections = self.data["state_tab"]["states"][e_idx]["sections"]
+        s_idx = self._state_section_selected_idx
+        if s_idx is not None and s_idx < len(sections):
+            sections[s_idx]["title"] = self.section_title.get().strip()
+            if s_idx < self.section_list.size():
+                self.section_list.delete(s_idx)
+                self.section_list.insert(s_idx, sections[s_idx].get("title") or "Section")
+                self.section_list.selection_set(s_idx)
+
+            widgets = sections[s_idx].get("widgets", [])
+            w_idx = self._state_widget_selected_idx
+            if w_idx is not None and w_idx < len(widgets):
+                widgets[w_idx] = self._widget_from_form()
+                if w_idx < self.widget_list.size():
+                    self.widget_list.delete(w_idx)
+                    self.widget_list.insert(w_idx, self._widget_label(widgets[w_idx]))
+                    self.widget_list.selection_set(w_idx)
+
+    def _on_data_select(self) -> None:
+        self._commit_data_form()
+        self._load_data_item()
+
+    def _on_conn_select(self) -> None:
+        self._commit_conn_form()
+        self._load_conn_item()
+
+    def _on_action_select(self) -> None:
+        self._commit_action_form()
+        self._load_action_item()
+
+    def _on_state_entry_select(self) -> None:
+        new_idx = self._selected_index(self.state_entry_list)
+        self._commit_state_form()
+        if new_idx is None:
+            return
+        self.state_entry_list.selection_clear(0, tk.END)
+        self.state_entry_list.selection_set(new_idx)
+        self.state_entry_list.activate(new_idx)
+        self.state_entry_list.see(new_idx)
+        self._load_state_entry()
+
+    def _on_section_select(self) -> None:
+        new_idx = self._selected_index(self.section_list)
+        self._commit_state_form()
+        if new_idx is None:
+            return
+        self.section_list.selection_clear(0, tk.END)
+        self.section_list.selection_set(new_idx)
+        self.section_list.activate(new_idx)
+        self.section_list.see(new_idx)
+        self._load_section_from_selection()
+
+    def _on_widget_select(self) -> None:
+        new_idx = self._selected_index(self.widget_list)
+        self._commit_state_form()
+        if new_idx is None:
+            return
+        self.widget_list.selection_clear(0, tk.END)
+        self.widget_list.selection_set(new_idx)
+        self.widget_list.activate(new_idx)
+        self.widget_list.see(new_idx)
+        self._load_widget_from_selection()
 
 
 if __name__ == "__main__":

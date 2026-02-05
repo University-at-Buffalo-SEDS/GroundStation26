@@ -104,3 +104,64 @@ pub enum StateWidgetKind {
     Map,
     Actions,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::LayoutConfig;
+
+    #[test]
+    fn parses_layout_endpoint_payload() {
+        let payload = r##"{
+            "version": 1,
+            "connection_tab": {
+                "sections": [
+                    { "kind": "board_status", "title": "Board Status" }
+                ]
+            },
+            "actions_tab": {
+                "actions": [
+                    {
+                        "label": "Launch",
+                        "cmd": "Launch",
+                        "border": "#22c55e",
+                        "bg": "#022c22",
+                        "fg": "#bbf7d0"
+                    }
+                ]
+            },
+            "data_tab": {
+                "tabs": [
+                    {
+                        "id": "GYRO_DATA",
+                        "label": "GYRO_DATA",
+                        "channels": ["Roll", "Pitch", "Yaw"],
+                        "chart": { "enabled": true }
+                    }
+                ]
+            },
+            "state_tab": {
+                "states": [
+                    {
+                        "states": ["Startup"],
+                        "sections": [
+                            {
+                                "title": "Connected Devices",
+                                "widgets": [
+                                    { "kind": "board_status" }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        }"##;
+
+        let layout: LayoutConfig = serde_json::from_str(payload).expect("valid layout payload");
+
+        assert_eq!(layout.version, 1);
+        assert_eq!(layout.connection_tab.sections.len(), 1);
+        assert_eq!(layout.actions_tab.actions.len(), 1);
+        assert_eq!(layout.data_tab.tabs[0].channels.len(), 3);
+        assert_eq!(layout.state_tab.states.len(), 1);
+    }
+}

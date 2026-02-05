@@ -14,6 +14,7 @@ use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
 use serde::{Deserialize, Serialize};
+use serde_json;
 use sqlx::Row;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,6 +26,31 @@ use tower_http::services::ServeDir;
 // NEW
 
 static FAVICON_DATA: OnceCell<Bytes> = OnceCell::const_new();
+
+fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
+    if let Ok(raw) = row.try_get::<Option<String>, _>("values_json") {
+        if let Some(raw) = raw {
+            if let Ok(values) = serde_json::from_str::<Vec<Option<f32>>>(&raw) {
+                return values;
+            }
+        }
+    }
+
+    vec![
+        row.get::<Option<f32>, _>("v0"),
+        row.get::<Option<f32>, _>("v1"),
+        row.get::<Option<f32>, _>("v2"),
+        row.get::<Option<f32>, _>("v3"),
+        row.get::<Option<f32>, _>("v4"),
+        row.get::<Option<f32>, _>("v5"),
+        row.get::<Option<f32>, _>("v6"),
+        row.get::<Option<f32>, _>("v7"),
+    ]
+}
+
+fn value_at(values: &[Option<f32>], idx: usize) -> Option<f32> {
+    values.get(idx).copied().flatten()
+}
 
 /// Public router constructor
 pub fn router(state: Arc<AppState>) -> Router {
@@ -123,7 +149,7 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
     // v0..v6: pilot, tanks, dump, igniter, nitrogen, nitrous, retract_plumbing
     let row = sqlx::query(
         r#"
-        SELECT timestamp_ms, v0, v1, v2, v3, v4, v5, v6
+        SELECT timestamp_ms, values_json, v0, v1, v2, v3, v4, v5, v6
         FROM telemetry
         WHERE data_type = 'VALVE_STATE'
         ORDER BY timestamp_ms DESC
@@ -136,20 +162,20 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
-        let to_bool = |key: &str| -> Option<bool> {
-            let v: Option<f32> = r.get::<Option<f32>, _>(key);
-            v.map(|x| x >= 0.5)
+        let values = values_from_row(&r);
+        let to_bool = |idx: usize| -> Option<bool> {
+            value_at(&values, idx).map(|x| x >= 0.5)
         };
 
         ValveStateMsg {
             timestamp_ms,
-            pilot_open: to_bool("v0"),
-            normally_open_open: to_bool("v1"),
-            dump_open: to_bool("v2"),
-            igniter_on: to_bool("v3"),
-            nitrogen_open: to_bool("v4"),
-            nitrous_open: to_bool("v5"),
-            retract_plumbing: to_bool("v6"),
+            pilot_open: to_bool(0),
+            normally_open_open: to_bool(1),
+            dump_open: to_bool(2),
+            igniter_on: to_bool(3),
+            nitrogen_open: to_bool(4),
+            nitrous_open: to_bool(5),
+            retract_plumbing: to_bool(6),
         }
     });
 
@@ -161,7 +187,7 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // and v0 = lat, v1 = lon (adjust if needed)
     let row = sqlx::query(
         r#"
-        SELECT v0, v1
+        SELECT values_json, v0, v1
         FROM telemetry
         WHERE data_type = 'GPS'
         ORDER BY timestamp_ms DESC
@@ -173,10 +199,8 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
-        let lat: Option<f32> = r.get::<Option<f32>, _>("v0");
-        let lon: Option<f32> = r.get::<Option<f32>, _>("v1");
-
-        match (lat, lon) {
+        let values = values_from_row(&r);
+        match (value_at(&values, 0), value_at(&values, 1)) {
             (Some(lat), Some(lon)) => Some(GpsPoint {
                 lat: lat as f64,
                 lon: lon as f64,
@@ -224,7 +248,7 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         )
         SELECT
             f.timestamp_ms, f.data_type,
-            f.v0, f.v1, f.v2, f.v3, f.v4, f.v5, f.v6, f.v7
+            f.values_json, f.v0, f.v1, f.v2, f.v3, f.v4, f.v5, f.v6, f.v7
         FROM filtered f
         JOIN latest l
           ON l.data_type = f.data_type
@@ -245,14 +269,7 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .map(|row| TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             data_type: row.get::<String, _>("data_type"),
-            v0: row.get::<Option<f32>, _>("v0"),
-            v1: row.get::<Option<f32>, _>("v1"),
-            v2: row.get::<Option<f32>, _>("v2"),
-            v3: row.get::<Option<f32>, _>("v3"),
-            v4: row.get::<Option<f32>, _>("v4"),
-            v5: row.get::<Option<f32>, _>("v5"),
-            v6: row.get::<Option<f32>, _>("v6"),
-            v7: row.get::<Option<f32>, _>("v7"),
+            values: values_from_row(&row),
         })
         .collect();
 
@@ -424,7 +441,7 @@ async fn get_history(
     let cutoff = now_ms - (minutes as i64) * 60_000;
 
     let rows_db = sqlx::query(
-        "SELECT timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7 \
+        "SELECT timestamp_ms, data_type, values_json, v0, v1, v2, v3, v4, v5, v6, v7 \
          FROM telemetry \
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",
@@ -439,14 +456,7 @@ async fn get_history(
         .map(|row| TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             data_type: row.get::<String, _>("data_type"),
-            v0: row.get::<Option<f32>, _>("v0"),
-            v1: row.get::<Option<f32>, _>("v1"),
-            v2: row.get::<Option<f32>, _>("v2"),
-            v3: row.get::<Option<f32>, _>("v3"),
-            v4: row.get::<Option<f32>, _>("v4"),
-            v5: row.get::<Option<f32>, _>("v5"),
-            v6: row.get::<Option<f32>, _>("v6"),
-            v7: row.get::<Option<f32>, _>("v7"),
+            values: values_from_row(&row),
         })
         .collect();
 

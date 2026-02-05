@@ -1453,7 +1453,10 @@ fn row_to_gps(row: &TelemetryRow) -> Option<(f64, f64)> {
     if !is_gps_type {
         return None;
     }
-    Some((row.v0? as f64, row.v1? as f64))
+    Some((
+        row.values.get(0).copied().flatten()? as f64,
+        row.values.get(1).copied().flatten()? as f64,
+    ))
 }
 
 // ---------- Web vs Native logging ----------

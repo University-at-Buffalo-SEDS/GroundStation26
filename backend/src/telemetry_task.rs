@@ -8,6 +8,7 @@ use crate::radio::RadioDevice;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
 use groundstation_shared::Board;
+use serde_json;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
@@ -314,21 +315,24 @@ pub async fn handle_packet(state: &Arc<AppState>) {
 
                 let ts_ms = pkt.timestamp() as i64;
                 let values = valve_state_values(state);
+                let values_vec: Vec<Option<f32>> = values.into_iter().collect();
+                let values_json = serde_json::to_string(&values_vec).unwrap_or_else(|_| "[]".to_string());
 
                 if let Err(e) = insert_with_retry(|| {
                     sqlx::query(
-                        "INSERT INTO telemetry (timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO telemetry (timestamp_ms, data_type, values_json, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     )
                         .bind(ts_ms)
                         .bind(VALVE_STATE_DATA_TYPE)
-                        .bind(values[0])
-                        .bind(values[1])
-                        .bind(values[2])
-                        .bind(values[3])
-                        .bind(values[4])
-                        .bind(values[5])
-                        .bind(values[6])
-                        .bind(values[7])
+                        .bind(values_json.clone())
+                        .bind(values_vec.get(0).copied().flatten())
+                        .bind(values_vec.get(1).copied().flatten())
+                        .bind(values_vec.get(2).copied().flatten())
+                        .bind(values_vec.get(3).copied().flatten())
+                        .bind(values_vec.get(4).copied().flatten())
+                        .bind(values_vec.get(5).copied().flatten())
+                        .bind(values_vec.get(6).copied().flatten())
+                        .bind(values_vec.get(7).copied().flatten())
                         .execute(&state.db)
                 })
                     .await
@@ -339,14 +343,7 @@ pub async fn handle_packet(state: &Arc<AppState>) {
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
                     data_type: VALVE_STATE_DATA_TYPE.to_string(),
-                    v0: values[0],
-                    v1: values[1],
-                    v2: values[2],
-                    v3: values[3],
-                    v4: values[4],
-                    v5: values[5],
-                    v6: values[6],
-                    v7: values[7],
+                    values: values_vec,
                 };
                 let _ = state.ws_tx.send(row);
             }
@@ -361,29 +358,24 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         Ok(v) => v,
         Err(_) => return,
     };
-    let v0 = values.first().copied();
-    let v1 = values.get(1).copied();
-    let v2 = values.get(2).copied();
-    let v3 = values.get(3).copied();
-    let v4 = values.get(4).copied();
-    let v5 = values.get(5).copied();
-    let v6 = values.get(6).copied();
-    let v7 = values.get(7).copied();
+    let values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
+    let values_json = serde_json::to_string(&values_vec).unwrap_or_else(|_| "[]".to_string());
 
     if let Err(e) = insert_with_retry(|| {
         sqlx::query(
-            "INSERT INTO telemetry (timestamp_ms, data_type, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO telemetry (timestamp_ms, data_type, values_json, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
             .bind(ts_ms)
             .bind(&data_type_str)
-            .bind(v0)
-            .bind(v1)
-            .bind(v2)
-            .bind(v3)
-            .bind(v4)
-            .bind(v5)
-            .bind(v6)
-            .bind(v7)
+            .bind(values_json.as_str())
+            .bind(values_vec.first().copied().flatten())
+            .bind(values_vec.get(1).copied().flatten())
+            .bind(values_vec.get(2).copied().flatten())
+            .bind(values_vec.get(3).copied().flatten())
+            .bind(values_vec.get(4).copied().flatten())
+            .bind(values_vec.get(5).copied().flatten())
+            .bind(values_vec.get(6).copied().flatten())
+            .bind(values_vec.get(7).copied().flatten())
             .execute(&state.db)
     })
         .await
@@ -394,14 +386,7 @@ pub async fn handle_packet(state: &Arc<AppState>) {
     let row = TelemetryRow {
         timestamp_ms: ts_ms,
         data_type: data_type_str,
-        v0,
-        v1,
-        v2,
-        v3,
-        v4,
-        v5,
-        v6,
-        v7,
+        values: values_vec,
     };
 
     let _ = state.ws_tx.send(row);

@@ -195,7 +195,7 @@ fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&st
     let h = view_h as f32;
 
     let (paths, y_min, y_max, span_min) = charts_cache_get(dt, w, h);
-    let labels = labels_for_datatype(dt);
+    let labels: Vec<String> = labels_for_datatype(dt).iter().map(|s| s.to_string()).collect();
 
     let left = 60.0_f64;
     let right = view_w - 20.0_f64;
@@ -246,10 +246,10 @@ fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&st
                 text { x:"{view_w * 0.5}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
                 text { x:"{right - 60.0}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
 
-                for ch in 0..8usize {
-                    if !paths[ch].is_empty() {
+                for (ch, path_d) in paths.iter().enumerate() {
+                    if !path_d.is_empty() {
                         path {
-                            d: "{paths[ch]}",
+                            d: "{path_d}",
                             fill: "none",
                             stroke: "{series_color(ch)}",
                             stroke_width: "2",
@@ -260,13 +260,13 @@ fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&st
             }
 
             div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
-                for i in 0..8usize {
-                    if !labels[i].is_empty() {
+                for (i, label) in labels.iter().enumerate() {
+                    if !label.is_empty() {
                         div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
                             svg { width:"26", height:"8", view_box:"0 0 26 8",
                                 line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(i)}", stroke_width:"2", stroke_linecap:"round" }
                             }
-                            "{labels[i]}"
+                            "{label}"
                         }
                     }
                 }
@@ -290,13 +290,13 @@ fn valve_state_grid(rows: &[TelemetryRow]) -> Element {
     };
 
     let items = [
-        ("Pilot", row.v0),
-        ("NormallyOpen", row.v1),
-        ("Dump", row.v2),
-        ("Igniter", row.v3),
-        ("Nitrogen", row.v4),
-        ("Nitrous", row.v5),
-        ("Fill Lines", row.v6),
+        ("Pilot", value_at(row, 0)),
+        ("NormallyOpen", value_at(row, 1)),
+        ("Dump", value_at(row, 2)),
+        ("Igniter", value_at(row, 3)),
+        ("Nitrogen", value_at(row, 4)),
+        ("Nitrous", value_at(row, 5)),
+        ("Fill Lines", value_at(row, 6)),
     ];
 
     rsx! {
@@ -423,7 +423,7 @@ fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[SummaryItem]) -> Elemen
     let (chan_min, chan_max) = if want_minmax {
         charts_cache_get_channel_minmax(dt, 1200.0, 300.0)
     } else {
-        ([None; 8], [None; 8])
+        (Vec::new(), Vec::new())
     };
 
     let latest = items
@@ -437,8 +437,8 @@ fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[SummaryItem]) -> Elemen
                 SummaryCard {
                     label: label,
                     value: fmt_opt(value),
-                    min: if want_minmax { chan_min[idx].map(|v| format!("{v:.4}")) } else { None },
-                    max: if want_minmax { chan_max[idx].map(|v| format!("{v:.4}")) } else { None },
+                    min: if want_minmax { chan_min.get(idx).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
+                    max: if want_minmax { chan_max.get(idx).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
                 }
             }
         }
@@ -471,17 +471,7 @@ fn latest_value(rows: &[TelemetryRow], dt: &str, idx: usize) -> Option<f32> {
 }
 
 fn value_at(row: &TelemetryRow, idx: usize) -> Option<f32> {
-    match idx {
-        0 => row.v0,
-        1 => row.v1,
-        2 => row.v2,
-        3 => row.v3,
-        4 => row.v4,
-        5 => row.v5,
-        6 => row.v6,
-        7 => row.v7,
-        _ => None,
-    }
+    row.values.get(idx).copied().flatten()
 }
 
 fn fmt_opt(v: Option<f32>) -> String {

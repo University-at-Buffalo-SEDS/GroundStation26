@@ -30,6 +30,7 @@ use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::TelemetryError;
+use sqlx::Row;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -70,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp_ms INTEGER NOT NULL,
             data_type    TEXT    NOT NULL,
+            values_json  TEXT,
             v0           REAL,
             v1           REAL,
             v2           REAL,
@@ -83,6 +85,17 @@ async fn main() -> anyhow::Result<()> {
     )
         .execute(&db)
         .await?;
+
+    // Add values_json column for older DBs.
+    let cols = sqlx::query("PRAGMA table_info(telemetry)")
+        .fetch_all(&db)
+        .await?;
+    let has_values_json = cols.iter().any(|row| row.get::<String, _>("name") == "values_json");
+    if !has_values_json {
+        sqlx::query("ALTER TABLE telemetry ADD COLUMN values_json TEXT")
+            .execute(&db)
+            .await?;
+    }
 
     sqlx::query(
         r#"

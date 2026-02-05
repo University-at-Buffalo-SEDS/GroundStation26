@@ -80,12 +80,7 @@
         "channels": [
           "Roll",
           "Pitch",
-          "Yaw",
-          "",
-          "",
-          "",
-          "",
-          ""
+          "Yaw"
         ],
         "chart": {
           "enabled": true
@@ -97,12 +92,7 @@
         "channels": [
           "X Accel",
           "Y Accel",
-          "Z Accel",
-          "",
-          "",
-          "",
-          "",
-          ""
+          "Z Accel"
         ],
         "chart": {
           "enabled": true
@@ -114,12 +104,7 @@
         "channels": [
           "Pressure",
           "Temp",
-          "Altitude",
-          "",
-          "",
-          "",
-          "",
-          ""
+          "Altitude"
         ],
         "chart": {
           "enabled": true
@@ -131,12 +116,7 @@
         "channels": [
           "X",
           "Y",
-          "Z",
-          "",
-          "",
-          "",
-          "",
-          ""
+          "Z"
         ],
         "chart": {
           "enabled": true
@@ -147,13 +127,7 @@
         "label": "GPS_DATA",
         "channels": [
           "Lat",
-          "Lon",
-          "",
-          "",
-          "",
-          "",
-          "",
-          ""
+          "Lon"
         ],
         "chart": {
           "enabled": true
@@ -163,14 +137,7 @@
         "id": "FUEL_TANK_PRESSURE",
         "label": "FUEL_TANK_PRESSURE",
         "channels": [
-          "Tank Pressure",
-          "",
-          "",
-          "",
-          "",
-          "",
-          "",
-          ""
+          "Tank Pressure"
         ],
         "chart": {
           "enabled": true
@@ -180,14 +147,7 @@
         "id": "BATTERY_VOLTAGE",
         "label": "BATTERY_VOLTAGE",
         "channels": [
-          "Voltage",
-          "",
-          "",
-          "",
-          "",
-          "",
-          "",
-          ""
+          "Voltage"
         ],
         "chart": {
           "enabled": true
@@ -197,14 +157,7 @@
         "id": "BATTERY_CURRENT",
         "label": "BATTERY_CURRENT",
         "channels": [
-          "Current",
-          "",
-          "",
-          "",
-          "",
-          "",
-          "",
-          ""
+          "Current"
         ],
         "chart": {
           "enabled": true
@@ -214,14 +167,7 @@
         "id": "FUEL_FLOW",
         "label": "FUEL_FLOW",
         "channels": [
-          "Flow Rate",
-          "",
-          "",
-          "",
-          "",
-          "",
-          "",
-          ""
+          "Flow Rate"
         ],
         "chart": {
           "enabled": true
@@ -237,8 +183,7 @@
           "Igniter",
           "Nitrogen",
           "Nitrous",
-          "Fill Lines",
-          ""
+          "Fill Lines"
         ],
         "chart": {
           "enabled": true

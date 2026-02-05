@@ -169,11 +169,9 @@ pub fn DataTab(
 
     let current_tab = types.iter().find(|t| t.id == current);
 
-    let mut labels = vec![String::new(); 8];
+    let mut labels: Vec<String> = Vec::new();
     if let Some(tab) = current_tab {
-        for (i, label) in tab.channels.iter().take(8).enumerate() {
-            labels[i] = label.clone();
-        }
+        labels = tab.channels.clone();
     }
 
     let chart_enabled = current_tab
@@ -274,21 +272,21 @@ pub fn DataTab(
                         div { style: "color:#94a3b8; padding:2px 2px;", "Waiting for telemetry…" }
                     },
                     Some(row) => {
-                        let vals = [row.v0, row.v1, row.v2, row.v3, row.v4, row.v5, row.v6, row.v7];
+                        let vals = row.values.clone();
 
                         rsx! {
                             div {
                                 style: "display:grid; gap:10px; align-items:stretch; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); width:100%;",
-                                for i in 0..8usize {
+                                for i in 0..labels.len() {
                                     if !labels[i].is_empty() {
                                         SummaryCard {
                                             label: labels[i].clone(),
-                                            min: if is_graph_allowed { chan_min[i].map(|v| format!("{v:.4}")) } else { None },
-                                            max: if is_graph_allowed { chan_max[i].map(|v| format!("{v:.4}")) } else { None },
+                                            min: if is_graph_allowed { chan_min.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
+                                            max: if is_graph_allowed { chan_max.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
                                             value: if is_valve_state {
-                                                valve_state_text(vals[i], labels[i] == "Fill Lines")
+                                                valve_state_text(vals.get(i).copied().flatten(), labels[i] == "Fill Lines")
                                             } else {
-                                                fmt_opt(vals[i])
+                                                fmt_opt(vals.get(i).copied().flatten())
                                             },
                                             color: summary_color(i),
                                         }
@@ -352,10 +350,10 @@ pub fn DataTab(
                                     text { x:"{view_w * 0.5}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {x_mid_s.clone()} }
                                     text { x:"{right - 60.0}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
 
-                                    for i in 0..8usize {
-                                        if !paths[i].is_empty() {
+                                    for (i, path_d) in paths.iter().enumerate() {
+                                        if !path_d.is_empty() {
                                             path {
-                                                d: "{paths[i]}",
+                                                d: "{path_d}",
                                                 fill: "none",
                                                 stroke: "{series_color(i)}",
                                                 "stroke-width": "2",
@@ -437,10 +435,10 @@ pub fn DataTab(
                                 text { x:"{view_w * 0.5}", y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {x_mid_s.clone()} }
                                 text { x:"{right - 60.0}", y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
 
-                                for i in 0..8usize {
-                                    if !paths_full[i].is_empty() {
+                                for (i, path_d) in paths_full.iter().enumerate() {
+                                    if !path_d.is_empty() {
                                         path {
-                                            d: "{paths_full[i]}",
+                                            d: "{path_d}",
                                             fill: "none",
                                             stroke: "{series_color(i)}",
                                             "stroke-width": "2",
