@@ -2,7 +2,6 @@
 import multiprocessing as mp
 import os
 import platform
-import plistlib
 import re
 import shutil
 import subprocess
@@ -16,6 +15,9 @@ LEGACY_APP_NAME = "GroundstationFrontend"
 DIST_DIRNAME = "dist"
 APP_BUNDLE_NAME = f"{APP_NAME}.app"
 LEGACY_APP_BUNDLE_NAME = f"{LEGACY_APP_NAME}.app"
+
+# NEW: fixed provisioning profile path (repo-local)
+FIXED_MOBILEPROVISION_REL = Path("Groundstation_26.mobileprovision")
 
 
 def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None:
@@ -224,245 +226,85 @@ def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
 
 
 # -----------------------------
-# Signing helpers (Python owns)
+# Signing / packaging helpers
 # -----------------------------
 SignKind = Literal["development", "distribution"]
 
 
-def _stat_mtime_epoch(p: Path) -> int:
-    try:
-        return int(p.stat().st_mtime)
-    except Exception:
-        return 0
+def fixed_mobileprovision_path(frontend_dir: Path) -> Path:
+    p = frontend_dir / FIXED_MOBILEPROVISION_REL
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Missing provisioning profile: {p}\n"
+            f"Expected at: frontend/{FIXED_MOBILEPROVISION_REL}"
+        )
+    return p
 
 
-def pick_newest_mobileprovision(frontend_dir: Path) -> Path:
-    static_dir = frontend_dir / "static"
-    profiles = sorted(static_dir.glob("*.mobileprovision"))
-    if not profiles:
-        raise FileNotFoundError(f"No provisioning profiles found in: {static_dir} (*.mobileprovision)")
-    profiles.sort(key=_stat_mtime_epoch, reverse=True)
-    return profiles[0]
-
-
-def _parse_identity_lines(sign_kind: SignKind, output: str) -> list[tuple[str, str]]:
+def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> Path:
     """
-    Return [(sha1, name), ...] filtered to Apple Development / Apple Distribution.
-    """
-    if sign_kind == "development":
-        want_prefix = "Apple Development:"
-    else:
-        want_prefix = "Apple Distribution:"
-
-    # Example line:
-    #  1) 0123ABCD... "Apple Development: you@example.com (TEAMID)"
-    pat = re.compile(r'^\s*\d+\)\s*([0-9A-Fa-f]{40})\s+"([^"]+)"\s*$')
-    out: list[tuple[str, str]] = []
-    for line in output.splitlines():
-        m = pat.match(line)
-        if not m:
-            continue
-        sha1 = m.group(1)
-        name = m.group(2)
-        if name.startswith(want_prefix):
-            out.append((sha1, name))
-    return out
-
-
-def pick_codesign_identity_sha1(sign_kind: SignKind, *, team_id: str = "") -> str:
-    """
-    Pick an unambiguous signing identity by SHA-1.
-    We choose the identity with the latest notAfter date.
+    Uses frontend/scripts/ios_package_sign.sh to:
+      - embed provisioning profile from frontend/Groundstation_26.mobileprovision
+      - pick signing cert by regex (no PII in repo)
+      - sign + package an IPA
+    Returns IPA path.
     """
     if platform.system() != "Darwin":
-        raise RuntimeError("Codesigning requires macOS.")
-
-    try:
-        raw = run_capture(["security", "find-identity", "-v", "-p", "codesigning"], cwd=Path("."))
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError("Failed to run security find-identity") from e
-
-    candidates = _parse_identity_lines(sign_kind, raw)
-    if team_id:
-        candidates = [(sha, nm) for (sha, nm) in candidates if f"({team_id})" in nm]
-
-    if not candidates:
-        raise RuntimeError(f"No codesigning identities found for {sign_kind!r} (team filter={team_id!r}).")
-
-    best_sha = ""
-    best_epoch = -1
-
-    for sha1, name in candidates:
-        # Extract PEM for this cert, then read end date
-        try:
-            pem = run_capture(["security", "find-certificate", "-a", "-Z", "-p", "-c", name], cwd=Path("."))
-        except subprocess.CalledProcessError:
-            continue
-
-        # find-certificate may output multiple certs; pick the PEM block that matches SHA-1
-        # We'll do a simple scan: locate the SHA-1 header then take the next PEM block.
-        lines = pem.splitlines()
-        want = False
-        in_pem = False
-        pem_block: list[str] = []
-        for ln in lines:
-            if ln.startswith("SHA-1 hash: "):
-                want = sha1.lower() in ln.lower()
-                in_pem = False
-                pem_block = []
-                continue
-            if want and "-----BEGIN CERTIFICATE-----" in ln:
-                in_pem = True
-            if want and in_pem:
-                pem_block.append(ln)
-            if want and in_pem and "-----END CERTIFICATE-----" in ln:
-                break
-
-        if not pem_block:
-            continue
-
-        # notAfter parsing via openssl
-        try:
-            end = run_capture(
-                ["openssl", "x509", "-noout", "-enddate"],
-                cwd=Path("."),
-            )
-        except Exception:
-            # Fallback: write pem to temp and read
-            import tempfile
-
-            with tempfile.NamedTemporaryFile("w", delete=False) as f:
-                f.write("\n".join(pem_block) + "\n")
-                tmp = f.name
-            try:
-                end = subprocess.check_output(["openssl", "x509", "-noout", "-enddate", "-in", tmp]).decode()
-            finally:
-                try:
-                    os.unlink(tmp)
-                except Exception:
-                    pass
-
-        # Normalize: notAfter=...
-        end = end.strip()
-        if end.startswith("notAfter="):
-            end = end[len("notAfter=") :].strip()
-
-        # Parse to epoch using python datetime (handles double-space day)
-        from datetime import datetime, timezone
-
-        fmts = ["%b %d %H:%M:%S %Y %Z", "%b  %d %H:%M:%S %Y %Z", "%b %e %H:%M:%S %Y %Z"]
-        epoch = None
-        for fmt in fmts:
-            try:
-                dt = datetime.strptime(end, fmt)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                epoch = int(dt.timestamp())
-                break
-            except Exception:
-                pass
-        if epoch is None:
-            continue
-
-        if epoch > best_epoch:
-            best_epoch = epoch
-            best_sha = sha1
-
-    if not best_sha:
-        # fallback: first candidate
-        best_sha = candidates[0][0]
-
-    return best_sha
-
-
-def extract_entitlements_from_profile(profile: Path, out_plist: Path) -> None:
-    """
-    Decode .mobileprovision -> plist, then extract Entitlements -> xml plist.
-    """
-    import tempfile
-
-    with tempfile.NamedTemporaryFile("w", delete=False) as f:
-        profile_plist = Path(f.name)
-
-    try:
-        # Decode CMS
-        subprocess.run(
-            ["security", "cms", "-D", "-i", str(profile)],
-            check=True,
-            stdout=profile_plist.open("w"),
-            stderr=DEVNULL,
-        )
-        # Extract Entitlements
-        subprocess.run(
-            ["/usr/bin/plutil", "-extract", "Entitlements", "xml1", "-o", str(out_plist), str(profile_plist)],
-            check=True,
-            stdout=DEVNULL,
-            stderr=DEVNULL,
-        )
-        if not out_plist.exists() or out_plist.stat().st_size == 0:
-            raise RuntimeError(f"Entitlements plist is empty: {out_plist}")
-    finally:
-        try:
-            profile_plist.unlink()
-        except Exception:
-            pass
-
-
-def sign_ios_app(frontend_dir: Path, *, sign_kind: SignKind) -> None:
-    """
-    Codesign dist/*.app using newest profile in frontend/static and matching identity.
-    """
-    if platform.system() != "Darwin":
-        print("Error: iOS signing requires macOS.", file=sys.stderr)
+        print("Error: iOS packaging/signing requires macOS.", file=sys.stderr)
         sys.exit(1)
 
     app = app_bundle_path(frontend_dir)
     if not app.exists():
         raise FileNotFoundError(f"App bundle not found: {app}")
 
-    team_id = os.environ.get("GS26_TEAM_ID", "").strip()
-    profile = pick_newest_mobileprovision(frontend_dir)
+    profile = fixed_mobileprovision_path(frontend_dir)
 
-    # Always embed the selected profile when we sign (needed for device install / ad-hoc style)
-    embedded = app / "embedded.mobileprovision"
-    print(f"Embedding profile: {profile} -> {embedded}")
-    shutil.copyfile(profile, embedded)
+    signer = frontend_dir / "scripts" / "ios_package_sign.sh"
+    if not signer.exists():
+        raise FileNotFoundError(f"Missing signer script: {signer}")
 
-    # Extract entitlements
-    entitlements = Path("/tmp/gs26-entitlements.plist")
-    extract_entitlements_from_profile(profile, entitlements)
+    # IMPORTANT: make output path relative to frontend_dir (since cwd=frontend_dir)
+    ipas_dir = frontend_dir / "dist" / "ipas"
+    ipas_dir.mkdir(parents=True, exist_ok=True)
 
-    # Choose identity
-    sha1 = pick_codesign_identity_sha1(sign_kind, team_id=team_id)
-    print(f"Using codesign identity ({sign_kind}): {sha1}")
+    ipa_name = "GroundStation26.ipa" if sign_kind == "development" else "gs26_signed_dist.ipa"
+    ipa_out = ipas_dir / ipa_name
 
-    # Remove old signature
-    codesig = app / "_CodeSignature"
-    if codesig.exists():
-        shutil.rmtree(codesig)
+    try:
+        ipa_out.unlink()
+    except FileNotFoundError:
+        pass
 
-    # Sign
-    subprocess.run(
-        [
-            "codesign",
-            "--force",
-            "--deep",
-            "--timestamp=none",
-            "--sign",
-            sha1,
-            "--entitlements",
-            str(entitlements),
-            str(app),
-        ],
-        check=True,
+    cert_regex = os.environ.get(
+        "CERT_REGEX",
+        (r"^Apple Development:" if sign_kind == "development" else r"^Apple Distribution:"),
+    )
+    cert_pick = os.environ.get("CERT_PICK", "newest")
+
+    env = {
+        "CERT_REGEX": cert_regex,
+        "CERT_PICK": cert_pick,
+    }
+
+    # Use absolute paths so the script can't get confused by cwd.
+    run(
+        ["bash", str(signer), str(app.resolve()), str(profile.resolve()), str(ipa_out.resolve())],
+        cwd=frontend_dir,
+        env=env,
     )
 
-    # Verify
-    subprocess.run(["codesign", "--verify", "--deep", "--strict", "--verbose=4", str(app)], check=True)
-    print("✅ Signed successfully")
+    if not ipa_out.exists() or ipa_out.stat().st_size == 0:
+        raise RuntimeError(f"IPA not created or empty: {ipa_out}")
+
+    return ipa_out
 
 
-def build_frontend(frontend_dir: Path, platform_name: Optional[str] = None, *, rust_target: Optional[str] = None) -> None:
+def build_frontend(
+        frontend_dir: Path,
+        platform_name: Optional[str] = None,
+        *,
+        rust_target: Optional[str] = None,
+) -> None:
     try:
         clear_app_bundle(frontend_dir)
 
@@ -489,43 +331,6 @@ def build_frontend(frontend_dir: Path, platform_name: Optional[str] = None, *, r
     except subprocess.CalledProcessError as e:
         print("Frontend build failed.", file=sys.stderr)
         sys.exit(e.returncode)
-
-
-def deploy_ios(frontend_dir: Path) -> None:
-    bundle = app_bundle_path(frontend_dir)
-    if not bundle.exists():
-        print(f"Error: iOS app bundle not found at: {bundle}", file=sys.stderr)
-        sys.exit(1)
-
-    device_ids = _list_connected_ios_device_ids(frontend_dir)
-
-    if not device_ids:
-        print("No device IDs detected via `ios-deploy --detect`; falling back to single-device deploy.", file=sys.stderr)
-        _deploy_ios_single(frontend_dir, bundle)
-        return
-
-    print(f"Deploying to {len(device_ids)} connected iOS device(s): {', '.join(device_ids)}")
-
-    failures: list[tuple[str, int]] = []
-    for udid in device_ids:
-        print(f"\n=== Deploying to device {udid} ===")
-        try:
-            run(["ios-deploy", "--id", udid, "--bundle", str(bundle)], cwd=frontend_dir)
-        except subprocess.CalledProcessError as e:
-            failures.append((udid, e.returncode))
-
-    if failures:
-        print("\nOne or more device deploys failed:", file=sys.stderr)
-        for udid, code in failures:
-            print(f"  - {udid}: exit code {code}", file=sys.stderr)
-        sys.exit(1)
-
-
-def _deploy_ios_single(frontend_dir: Path, bundle: Path) -> None:
-    try:
-        run(["ios-deploy", "--bundle", str(bundle)], cwd=frontend_dir)
-    except subprocess.CalledProcessError:
-        run(["ios-deploy", "--bundle", str(bundle)], cwd=frontend_dir)
 
 
 def build_backend(backend_dir: Path, force_pi: bool, force_no_pi: bool, testing_mode: bool) -> None:
@@ -578,12 +383,16 @@ def print_usage() -> None:
     print("  ./build.py linux")
     print("")
     print("Frontend actions:")
-    print("  ./build.py ios_deploy              # build ios + patch + SIGN (Dev) + deploy to device")
-    print("  ./build.py ios_sign                # SIGN (Dev) the existing dist app (no deploy)")
-    print("  ./build.py ios_dist_sign           # SIGN (Distribution) existing dist app (no deploy)")
+    print("  ./build.py ios_deploy              # build ios + patch + package+sign (Dev) -> IPA")
+    print("  ./build.py ios_sign                # package+sign (Dev) existing dist app -> IPA")
+    print("  ./build.py ios_dist_sign           # package+sign (Distribution) existing dist app -> IPA")
     print("")
-    print("Env:")
-    print("  GS26_TEAM_ID=TEAMID                # optional filter when picking identity")
+    print("Provisioning profile path (fixed):")
+    print(f"  frontend/{FIXED_MOBILEPROVISION_REL}")
+    print("")
+    print("Env (optional):")
+    print("  CERT_REGEX=...                     # override cert regex for signer script")
+    print("  CERT_PICK=newest|first             # override cert selection for signer script")
     print("  GROUNDSTATION_NO_PARALLEL=1        # force sequential build")
     sys.exit(1)
 
@@ -653,17 +462,20 @@ def main() -> None:
             print_usage()
 
         if action == "ios_deploy":
+            # NOTE: per your latest direction, this is now just "package and sign" (no local deploy)
             build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
-            sign_ios_app(frontend_dir, sign_kind="development")
-            deploy_ios(frontend_dir)
+            ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="development")
+            print(f"✅ Dev IPA created: {ipa}")
             return
 
         if action == "ios_sign":
-            sign_ios_app(frontend_dir, sign_kind="development")
+            ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="development")
+            print(f"✅ Dev IPA created: {ipa}")
             return
 
         if action == "ios_dist_sign":
-            sign_ios_app(frontend_dir, sign_kind="distribution")
+            ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
+            print(f"✅ Distribution IPA created: {ipa}")
             return
 
         print("Error: unknown action", file=sys.stderr)

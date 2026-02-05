@@ -22,7 +22,7 @@ pub fn ActionsTab() -> Element {
             ",
             h2 { style: "margin:0 0 8px 0; color:#e5e7eb;", "Actions" }
             p  { style: "margin:0 0 12px 0; color:#9ca3af; font-size:0.9rem;",
-                "Non-emergency actions live here. Abort is always available in the header."
+                "All available actions are live, use with caution."
             }
 
             div {

@@ -20,3 +20,4 @@ __pycache__/
 /frontend/build.log
 /.ai/mcp/mcp.json
 !.mobileprovision
+Groundstation_26.mobileprovision
