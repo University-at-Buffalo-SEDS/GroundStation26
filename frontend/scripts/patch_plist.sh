@@ -20,6 +20,7 @@ APP_NAME="GroundStation 26"
 LEGACY_APP_NAME="GroundstationFrontend"
 APP_DIR="./dist/${APP_NAME}.app"
 PLIST="${APP_DIR}/Info.plist"
+VERSION_INPUT="${1:-${APP_VERSION:-}}"
 
 ICON_SRC_DIR="./assets"
 ASSETS_CAR_SRC="${ICON_SRC_DIR}/Assets.car"
@@ -213,6 +214,14 @@ dump_plist_sections
 # Human-facing names
 set_string "CFBundleDisplayName" "GS 26"
 set_string "CFBundleName" "GroundStation 26"
+
+# Versioning (optional)
+if [[ -n "$VERSION_INPUT" ]]; then
+  set_string "CFBundleShortVersionString" "$VERSION_INPUT"
+  set_string "CFBundleVersion" "$VERSION_INPUT"
+else
+  log "No version provided; skipping CFBundleShortVersionString/CFBundleVersion"
+fi
 
 # Asset-catalog icons:
 # With Assets.car, do NOT use CFBundleIconFiles / CFBundleIconFile.

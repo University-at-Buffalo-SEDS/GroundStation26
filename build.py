@@ -6,6 +6,10 @@ import re
 import shutil
 import subprocess
 import sys
+try:
+    import tomllib  # py3.11+
+except ImportError:  # pragma: no cover - fallback for older pythons
+    tomllib = None
 from pathlib import Path
 from subprocess import DEVNULL
 from typing import Optional, Literal
@@ -192,7 +196,32 @@ def build_docker(repo_root: Path, pi_build: bool, testing: bool) -> None:
 
 def patch_plist(frontend_dir: Path) -> None:
     script = frontend_dir / "scripts" / "patch_plist.sh"
-    run_script(script, cwd=frontend_dir)
+    version = _read_frontend_version(frontend_dir)
+    run_script(script, cwd=frontend_dir, env={"APP_VERSION": version})
+
+
+def _read_frontend_version(frontend_dir: Path) -> str:
+    cargo_toml = frontend_dir / "Cargo.toml"
+    raw = cargo_toml.read_text(encoding="utf-8")
+
+    if tomllib is not None:
+        data = tomllib.loads(raw)
+        version = data.get("package", {}).get("version")
+        if version:
+            return str(version)
+
+    in_package = False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_package = stripped == "[package]"
+            continue
+        if in_package:
+            m = re.match(r'version\s*=\s*"([^"]+)"\s*$', stripped)
+            if m:
+                return m.group(1)
+
+    raise ValueError(f"Failed to read frontend version from: {cargo_toml}")
 
 
 def dist_dir(frontend_dir: Path) -> Path:
@@ -257,6 +286,9 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
     if not app.exists():
         raise FileNotFoundError(f"App bundle not found: {app}")
 
+    # Ensure Info.plist is patched with the current version before signing.
+    patch_plist(frontend_dir)
+
     profile = fixed_mobileprovision_path(frontend_dir)
 
     signer = frontend_dir / "scripts" / "ios_package_sign.sh"
@@ -267,7 +299,7 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
     ipas_dir = frontend_dir / "dist" / "ipas"
     ipas_dir.mkdir(parents=True, exist_ok=True)
 
-    ipa_name = "GroundStation26.ipa" if sign_kind == "development" else "gs26_signed_dist.ipa"
+    ipa_name = "GroundStation26.ipa"
     ipa_out = ipas_dir / ipa_name
 
     try:
@@ -464,7 +496,7 @@ def main() -> None:
         if action == "ios_deploy":
             # NOTE: per your latest direction, this is now just "package and sign" (no local deploy)
             build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
-            ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="development")
+            ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
             print(f"✅ Dev IPA created: {ipa}")
             return
 
