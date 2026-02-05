@@ -5,10 +5,10 @@ mod connection_status_tab;
 pub mod data_chart;
 pub mod data_tab;
 pub mod errors_tab;
-pub mod layout;
 mod gps;
 mod gps_android;
 mod latency_chart;
+pub mod layout;
 pub mod types;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -31,10 +31,10 @@ use dioxus::prelude::*;
 use dioxus_signals::Signal;
 use errors_tab::ErrorsTab;
 use layout::LayoutConfig;
-use types::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
 use map_tab::MapTab;
 use serde::Deserialize;
 use state_tab::StateTab;
+use types::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
 use warnings_tab::WarningsTab;
 
 use std::collections::VecDeque;
@@ -861,7 +861,7 @@ fn TelemetryDashboardInner() -> Element {
                     &mut ack_error_ts_s,
                     alive.clone(),
                 )
-                    .await
+                .await
                     && alive.load(Ordering::Relaxed)
                     && *WS_EPOCH.read() == epoch
                 {
@@ -920,10 +920,10 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
-        || *warning_event_counter.read() > *ack_warning_count.read());
+            || *warning_event_counter.read() > *ack_warning_count.read());
     let has_unacked_errors = latest_error_ts > 0
         && (latest_error_ts > *ack_error_ts.read()
-        || *error_event_counter.read() > *ack_error_count.read());
+            || *error_event_counter.read() > *ack_error_count.read());
 
     let border_style = if has_unacked_errors && *flash_on.read() {
         "2px solid #ef4444"
@@ -1000,7 +1000,7 @@ fn TelemetryDashboardInner() -> Element {
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
                     && alive.load(Ordering::Relaxed)
                 {
                     log!("[WS] supervisor ended: {e}");
@@ -1071,9 +1071,40 @@ fn TelemetryDashboardInner() -> Element {
         }
     };
 
+    let layout_config = layout_config;
+    let mut layout_loading = layout_loading;
+    let mut layout_error = layout_error;
+    let refresh_layout = move || {
+        layout_loading.set(true);
+        layout_error.set(None);
+        persist::_remove(LAYOUT_CACHE_KEY);
+        let mut layout_config = layout_config;
+        let mut layout_loading = layout_loading;
+        let mut layout_error = layout_error;
+        spawn(async move {
+            match http_get_json::<LayoutConfig>("/api/layout").await {
+                Ok(layout) => {
+                    layout_config.set(Some(layout.clone()));
+                    layout_loading.set(false);
+                    layout_error.set(None);
+                    if let Ok(raw) = serde_json::to_string(&layout) {
+                        persist::set_string(LAYOUT_CACHE_KEY, &raw);
+                    }
+                }
+                Err(err) => {
+                    layout_error.set(Some(format!("Layout failed to load: {err}")));
+                    if layout_config.read().is_none() {
+                        layout_loading.set(false);
+                    }
+                }
+            }
+        });
+    };
+
     // Reload button (web: full reload, native: remount inner UI)
     let mut warnings = warnings;
     let mut errors = errors;
+    let mut _refresh_layout = refresh_layout;
     let reload_button: Element = rsx! {
         button {
             style: "
@@ -1089,7 +1120,10 @@ fn TelemetryDashboardInner() -> Element {
                     charts_cache_request_refit();
                     warnings.set(Vec::new());
                     errors.set(Vec::new());
-
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                    _refresh_layout();
+                    }
                 reconnect_and_reload_ui();
             },
             "RELOAD"
@@ -1698,7 +1732,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -1716,7 +1750,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
         };
 
@@ -1848,7 +1882,7 @@ async fn connect_ws_once_wasm(
             &mut closed_rx,
             gloo_timers::future::TimeoutFuture::new(150),
         )
-            .await;
+        .await;
 
         match done {
             futures_util::future::Either::Left((_closed, _timeout)) => break,
