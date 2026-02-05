@@ -268,6 +268,8 @@ set_string "NSLocalNetworkUsageDescription" \
 set_string "NSLocationWhenInUseUsageDescription" \
   "This app requires location access to help you locate your rocket."
 
+set_bool "ITSAppUsesNonExemptEncryption" "false"
+
 # -----------------------------------------------------------------------------
 # 2b) Add required/expected bundle keys for iOS uploads
 # -----------------------------------------------------------------------------
