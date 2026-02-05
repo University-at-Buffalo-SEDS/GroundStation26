@@ -357,6 +357,53 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
 
 
 # -----------------------------
+# macOS deploy helper
+# -----------------------------
+def macos_deploy(frontend_dir: Path) -> Path:
+    """
+    Copies the built .app bundle into /Applications, replacing any existing copy.
+
+    Notes:
+    - This is a local convenience deploy (NOT notarization, NOT dmg/pkg).
+    - If /Applications requires privileges on your machine, run build.py via sudo
+      or adjust permissions.
+    """
+    if platform.system() != "Darwin":
+        print("Error: macos_deploy requires macOS.", file=sys.stderr)
+        sys.exit(1)
+
+    src_app = app_bundle_path(frontend_dir)
+    if not src_app.exists():
+        raise FileNotFoundError(f"App bundle not found: {src_app}")
+
+    applications_dir = Path("/Applications")
+    dst_app = applications_dir / src_app.name
+
+    print(f"Deploying macOS app → {dst_app}")
+
+    if dst_app.exists():
+        print(f"Removing existing /Applications copy: {dst_app}")
+        shutil.rmtree(dst_app)
+
+    try:
+        # copytree preserves bundle structure
+        shutil.copytree(src_app, dst_app, symlinks=True)
+    except PermissionError as e:
+        print(
+            "Error: Permission denied copying into /Applications.\n"
+            "Try one of these:\n"
+            "  - Run: sudo ./build.py macos_deploy\n"
+            "  - Or deploy to ~/Applications (create it) and drag-drop manually.\n"
+            f"Original error: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"✅ Deployed: {dst_app}")
+    return dst_app
+
+
+# -----------------------------
 # Frontend target selection
 # -----------------------------
 def _host_macos_target() -> str:
@@ -396,10 +443,10 @@ def _default_rust_target_for_frontend(platform_name: Optional[str]) -> Optional[
 
 
 def build_frontend(
-        frontend_dir: Path,
-        platform_name: Optional[str] = None,
-        *,
-        rust_target: Optional[str] = None,
+    frontend_dir: Path,
+    platform_name: Optional[str] = None,
+    *,
+    rust_target: Optional[str] = None,
 ) -> None:
     try:
         clear_app_bundle(frontend_dir)
@@ -416,8 +463,6 @@ def build_frontend(
             elif platform_name == "windows":
                 # dx has a first-class flag for this; don't use /SUBSYSTEM link args.
                 cmd.extend(["--windows-subsystem", "WINDOWS"])
-
-
         else:
             cmd.extend(["--platform", "web"])
 
@@ -491,6 +536,7 @@ def print_usage() -> None:
     print("  ./build.py ios_deploy              # build ios + patch + package+sign (Distribution) -> IPA")
     print("  ./build.py ios_sign                # package+sign (Dev) existing dist app -> IPA")
     print("  ./build.py ios_dist_sign           # package+sign (Distribution) existing dist app -> IPA")
+    print("  ./build.py macos_deploy            # build macos + copy .app into /Applications")
     print("")
     print("Provisioning profile path (fixed):")
     print(f"  frontend/{FIXED_MOBILEPROVISION_REL}")
@@ -512,7 +558,7 @@ def main() -> None:
 
     frontend_only_platform: Optional[str] = None
     frontend_rust_target: Optional[str] = None
-    action: Optional[str] = None  # ios_deploy | ios_sign | ios_dist_sign
+    action: Optional[str] = None  # ios_deploy | ios_sign | ios_dist_sign | macos_deploy
 
     args = [a.strip().lower() for a in sys.argv[1:]]
 
@@ -532,7 +578,7 @@ def main() -> None:
         "linux": ("linux", None),
     }
 
-    actions = {"ios_deploy", "ios_sign", "ios_dist_sign"}
+    actions = {"ios_deploy", "ios_sign", "ios_dist_sign", "macos_deploy"}
 
     for arg in args:
         if arg == "pi_build":
@@ -586,6 +632,13 @@ def main() -> None:
         if action == "ios_dist_sign":
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
             print(f"✅ Distribution IPA created: {ipa}")
+            return
+
+        if action == "macos_deploy":
+            # Build + copy into /Applications
+            build_frontend(frontend_dir, platform_name="macos", rust_target=None)
+            deployed = macos_deploy(frontend_dir)
+            print(f"✅ Installed into /Applications: {deployed}")
             return
 
         print("Error: unknown action", file=sys.stderr)

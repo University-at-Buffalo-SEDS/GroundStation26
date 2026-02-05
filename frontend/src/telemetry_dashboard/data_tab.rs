@@ -1,11 +1,10 @@
 // frontend/src/telemetry_dashboard/data_tab.rs
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
-use groundstation_shared::TelemetryRow;
+use super::layout::DataTabLayout;
+use super::types::TelemetryRow;
 
-use super::data_chart::{
-    charts_cache_get, charts_cache_get_channel_minmax, labels_for_datatype, series_color,
-};
+use super::data_chart::{charts_cache_get, charts_cache_get_channel_minmax, series_color};
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
 
@@ -40,7 +39,11 @@ fn localstorage_set(key: &str, value: &str) {
 }
 
 #[component]
-pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> Element {
+pub fn DataTab(
+    rows: Signal<Vec<TelemetryRow>>,
+    active_tab: Signal<String>,
+    layout: DataTabLayout,
+) -> Element {
     let mut is_fullscreen = use_signal(|| false);
     let mut show_chart = use_signal(|| true);
 
@@ -48,15 +51,11 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     let did_restore = use_signal(|| false);
     let last_saved = use_signal(String::new);
 
-    // Cached unique data types list (avoid O(n) scan every render)
-    let types_cache = use_signal(Vec::<String>::new);
-    let types_cache_len = use_signal(|| 0usize);
-
     // Restore ONCE
     use_effect({
-        let rows = rows;
         let mut active_tab = active_tab;
         let mut did_restore = did_restore;
+        let layout_tabs = layout.tabs.clone();
 
         move || {
             if *did_restore.read() {
@@ -73,14 +72,10 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                 }
             }
 
-            // 2) Fallback: if empty, pick first observed datatype
+            // 2) Fallback: if empty, pick first layout tab
             if active_tab.read().is_empty() {
-                let mut types: Vec<String> =
-                    rows.read().iter().map(|r| r.data_type.clone()).collect();
-                types.sort();
-                types.dedup();
-                if let Some(first) = types.first() {
-                    active_tab.set(first.clone());
+                if let Some(first) = layout_tabs.first() {
+                    active_tab.set(first.id.clone());
                 }
             }
         }
@@ -100,24 +95,6 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
 
             #[cfg(target_arch = "wasm32")]
             localstorage_set(_ACTIVE_TAB_STORAGE_KEY, &cur);
-        }
-    });
-
-    // Update cached type list only when rows length changes
-    use_effect({
-        let rows = rows;
-        let mut types_cache = types_cache;
-        let mut types_cache_len = types_cache_len;
-        move || {
-            let len = rows.read().len();
-            if len == *types_cache_len.read() {
-                return;
-            }
-            types_cache_len.set(len);
-            let mut types: Vec<String> = rows.read().iter().map(|r| r.data_type.clone()).collect();
-            types.sort();
-            types.dedup();
-            types_cache.set(types);
         }
     });
 
@@ -186,9 +163,22 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     // Force rerender when redraw driver ticks
     let _ = *redraw_tick.read();
 
-    // Collect unique data types (for buttons)
-    let types = types_cache.read().clone();
+    // Layout-defined data types (for buttons)
+    let types = layout.tabs.clone();
     let current = active_tab.read().clone();
+
+    let current_tab = types.iter().find(|t| t.id == current);
+
+    let mut labels = vec![String::new(); 8];
+    if let Some(tab) = current_tab {
+        for (i, label) in tab.channels.iter().take(8).enumerate() {
+            labels[i] = label.clone();
+        }
+    }
+
+    let chart_enabled = current_tab
+        .and_then(|tab| tab.chart.as_ref().map(|c| c.enabled))
+        .unwrap_or(true);
 
     // Latest row for summary cards (scan backward; no sort/filter allocations)
     let latest_row = rows
@@ -200,10 +190,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
 
     let is_valve_state = current == "VALVE_STATE";
     let has_telemetry = latest_row.is_some();
-    let is_graph_allowed = has_telemetry && current != "GPS_DATA" && !is_valve_state;
-
-    // Labels for cards and legend
-    let labels = labels_for_datatype(&current);
+    let is_graph_allowed = chart_enabled && has_telemetry && current != "GPS_DATA" && !is_valve_state;
 
     // Viewport constants
     let view_w = 1200.0_f64;
@@ -241,12 +228,12 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
     let x_left_s = fmt_span(span_min);
     let x_mid_s = fmt_span(span_min * 0.5);
 
-    let legend_items: Vec<(usize, &'static str)> = labels
+    let legend_items: Vec<(usize, &str)> = labels
         .iter()
         .enumerate()
-        .filter_map(|(i, l)| if l.is_empty() { None } else { Some((i, *l)) })
+        .filter_map(|(i, l)| if l.is_empty() { None } else { Some((i, l.as_str())) })
         .collect();
-    let legend_rows: Vec<(usize, &'static str)> =
+    let legend_rows: Vec<(usize, &str)> =
         legend_items.iter().map(|(i, label)| (*i, *label)).collect();
 
     let on_toggle_fullscreen = move |_| {
@@ -267,17 +254,17 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                 div { style: "display:flex; gap:8px; flex-wrap:wrap; align-items:center;",
                     for t in types.iter().take(32) {
                         button {
-                            style: if *t == current {
+                            style: if t.id == current {
                                 "padding:6px 10px; border-radius:999px; border:1px solid #f97316; background:#111827; color:#f97316; cursor:pointer;"
                             } else {
                                 "padding:6px 10px; border-radius:999px; border:1px solid #334155; background:#0b1220; color:#e5e7eb; cursor:pointer;"
                             },
                             onclick: {
-                                let t = t.clone();
+                                let t = t.id.clone();
                                 let mut active_tab2 = active_tab;
                                 move |_| active_tab2.set(t.clone())
                             },
-                            "{t}"
+                            "{t.label}"
                         }
                     }
                 }
@@ -295,7 +282,7 @@ pub fn DataTab(rows: Signal<Vec<TelemetryRow>>, active_tab: Signal<String>) -> E
                                 for i in 0..8usize {
                                     if !labels[i].is_empty() {
                                         SummaryCard {
-                                            label: labels[i],
+                                            label: labels[i].clone(),
                                             min: if is_graph_allowed { chan_min[i].map(|v| format!("{v:.4}")) } else { None },
                                             max: if is_graph_allowed { chan_max[i].map(|v| format!("{v:.4}")) } else { None },
                                             value: if is_valve_state {
@@ -490,7 +477,7 @@ fn summary_color(i: usize) -> &'static str {
 
 #[component]
 fn SummaryCard(
-    label: &'static str,
+    label: String,
     value: String,
     min: Option<String>,
     max: Option<String>,

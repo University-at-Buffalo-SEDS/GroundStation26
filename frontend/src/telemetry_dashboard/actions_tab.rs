@@ -2,6 +2,8 @@
 
 use dioxus::prelude::*;
 
+use super::layout::ActionsTabLayout;
+
 fn btn_style(border: &str, bg: &str, fg: &str) -> String {
     format!(
         "padding:0.65rem 1rem; border-radius:0.75rem; cursor:pointer; width:100%; \
@@ -11,7 +13,7 @@ fn btn_style(border: &str, bg: &str, fg: &str) -> String {
 }
 
 #[component]
-pub fn ActionsTab() -> Element {
+pub fn ActionsTab(layout: ActionsTabLayout) -> Element {
     rsx! {
         div {
             style: "
@@ -33,47 +35,15 @@ pub fn ActionsTab() -> Element {
                     gap:12px;
                 ",
 
-                button {
-                    style: "{btn_style(\"#22c55e\", \"#022c22\", \"#bbf7d0\")}",
-                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Launch"),
-                    "Launch"
-                }
-                button {
-                    style: "{btn_style(\"#ef4444\", \"#450a0a\", \"#fecaca\")}",
-                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Dump"),
-                    "Dump"
-                }
-
-                // Examples
-                button {
-                    style: "{btn_style(\"#60a5fa\", \"#0b1220\", \"#bfdbfe\")}",
-                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Igniter"),
-                    "Igniter"
-                }
-                button {
-                    style: "{btn_style(\"#a78bfa\", \"#111827\", \"#ddd6fe\")}",
-                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Pilot"),
-                    "Pilot"
-                }
-                button {
-                    style: "{btn_style(\"#f97316\", \"#1f2937\", \"#ffedd5\")}",
-                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Tanks"),
-                    "NormallyOpen"
-                }
-                button {
-                    style: "{btn_style(\"#22d3ee\", \"#0b1220\", \"#cffafe\")}",
-                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Nitrogen"),
-                    "Nitrogen"
-                }
-                button {
-                    style: "{btn_style(\"#a3e635\", \"#111827\", \"#ecfccb\")}",
-                    onclick: move |_| crate::telemetry_dashboard::send_cmd("Nitrous"),
-                    "Nitrous"
-                }
-                button {
-                    style: "{btn_style(\"#eab308\", \"#1f2937\", \"#fef9c3\")}",
-                    onclick: move |_| crate::telemetry_dashboard::send_cmd("RetractPlumbing"),
-                    "Fill Lines"
+                for action in layout.actions.iter() {
+                    button {
+                        style: "{btn_style(&action.border, &action.bg, &action.fg)}",
+                        onclick: {
+                            let cmd = action.cmd.clone();
+                            move |_| crate::telemetry_dashboard::send_cmd(&cmd)
+                        },
+                        "{action.label}"
+                    }
                 }
             }
         }

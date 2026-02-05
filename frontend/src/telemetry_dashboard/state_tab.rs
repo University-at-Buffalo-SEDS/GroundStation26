@@ -2,7 +2,9 @@
 
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
-use groundstation_shared::{BoardStatusEntry, FlightState, TelemetryRow};
+
+use super::layout::{StateSection, StateTabLayout, StateWidget, StateWidgetKind, SummaryItem};
+use super::types::{BoardStatusEntry, FlightState, TelemetryRow};
 
 use crate::telemetry_dashboard::data_chart::{
     charts_cache_get, charts_cache_get_channel_minmax, labels_for_datatype, series_color,
@@ -28,6 +30,7 @@ pub fn StateTab(
     board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
+    layout: StateTabLayout,
 ) -> Element {
     // ------------------------------------------------------------
     // Redraw driver for charts on State tab
@@ -89,69 +92,18 @@ pub fn StateTab(
     let rows_snapshot = rows.read();
     let boards_snapshot = board_status.read();
 
-    let content = match state {
-        FlightState::Startup => rsx! {
-            Section { title: "Connected Devices",
-                {board_status_table(&boards_snapshot)}
+    let content = if let Some(state_layout) = layout
+        .states
+        .iter()
+        .find(|entry| entry.states.contains(&state))
+    {
+        rsx! {
+            for section in state_layout.sections.iter() {
+                {render_state_section(section, state, &rows_snapshot, &boards_snapshot, rocket_gps, user_gps)}
             }
-        },
-
-        FlightState::PreFill
-        | FlightState::FillTest
-        | FlightState::NitrogenFill
-        | FlightState::NitrousFill => rsx! {
-            Section { title: "Pressure",
-                {summary_row(&rows_snapshot, "FUEL_TANK_PRESSURE", &[("Tank Pressure", 0)])}
-                {data_style_chart_cached("FUEL_TANK_PRESSURE", 1200.0, 260.0, Some("Fuel Tank Pressure"))}
-            }
-            Section { title: "Valve States",
-                {valve_state_grid(&rows_snapshot)}
-            }
-            {action_section(state)}
-        },
-
-        FlightState::Armed => rsx! {
-            Section { title: "Pressure",
-                {summary_row(&rows_snapshot, "FUEL_TANK_PRESSURE", &[("Tank Pressure", 0)])}
-                {data_style_chart_cached("FUEL_TANK_PRESSURE", 1200.0, 260.0, Some("Fuel Tank Pressure"))}
-            }
-            Section { title: "Valve States",
-                {valve_state_grid(&rows_snapshot)}
-            }
-            {action_section(state)}
-        },
-
-        FlightState::Launch
-        | FlightState::Ascent
-        | FlightState::Coast
-        | FlightState::Apogee
-        | FlightState::ParachuteDeploy
-        | FlightState::Descent => rsx! {
-            Section { title: "Altitude",
-                {summary_row(&rows_snapshot, "BAROMETER_DATA", &[("Altitude", 2), ("Pressure", 0), ("Temp", 1)])}
-                {data_style_chart_cached("BAROMETER_DATA", 1200.0, 280.0, Some("Barometer Data"))}
-            }
-            Section { title: "Acceleration",
-                {summary_row(&rows_snapshot, "ACCEL_DATA", &[("Accel X", 0), ("Accel Y", 1), ("Accel Z", 2)])}
-                {data_style_chart_cached("ACCEL_DATA", 1200.0, 300.0, Some("Acceleration"))}
-            }
-            Section { title: "Kalman Filter",
-                {summary_row(&rows_snapshot, "KALMAN_FILTER_DATA", &[("Kalman X", 0), ("Kalman Y", 1), ("Kalman Z", 2)])}
-                {data_style_chart_cached("KALMAN_FILTER_DATA", 1200.0, 300.0, Some("Kalman Filter"))}
-            }
-            {action_section(state)}
-        },
-
-        FlightState::Landed | FlightState::Recovery => rsx! {
-            Section { title: "Recovery Map",
-                MapTab { rocket_gps: rocket_gps, user_gps: user_gps }
-            }
-            {action_section(state)}
-        },
-
-        FlightState::Idle | FlightState::Aborted => rsx! {
-            {action_section(state)}
-        },
+        }
+    } else {
+        rsx! { div { style: "color:#94a3b8; font-size:12px;", "No layout for this flight state." } }
     };
 
     rsx! {
@@ -171,12 +123,66 @@ pub fn StateTab(
 }
 
 #[component]
-fn Section(title: &'static str, children: Element) -> Element {
+fn Section(title: String, children: Element) -> Element {
     rsx! {
         div { style: "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;",
             div { style: "font-size:15px; color:#cbd5f5; font-weight:600; margin-bottom:10px;", "{title}" }
             {children}
         }
+    }
+}
+
+fn render_state_section(
+    section: &StateSection,
+    state: FlightState,
+    rows: &[TelemetryRow],
+    boards: &[BoardStatusEntry],
+    rocket_gps: Signal<Option<(f64, f64)>>,
+    user_gps: Signal<Option<(f64, f64)>>,
+) -> Element {
+    let title = section.title.clone().unwrap_or_else(|| "Section".to_string());
+
+    rsx! {
+        Section { title: title,
+            for widget in section.widgets.iter() {
+                {render_state_widget(widget, state, rows, boards, rocket_gps, user_gps)}
+            }
+        }
+    }
+}
+
+fn render_state_widget(
+    widget: &StateWidget,
+    state: FlightState,
+    rows: &[TelemetryRow],
+    boards: &[BoardStatusEntry],
+    rocket_gps: Signal<Option<(f64, f64)>>,
+    user_gps: Signal<Option<(f64, f64)>>,
+) -> Element {
+    match widget.kind {
+        StateWidgetKind::BoardStatus => rsx! { {board_status_table(boards)} },
+        StateWidgetKind::Summary => {
+            let dt = widget.data_type.as_deref().unwrap_or("");
+            let items = widget.items.as_deref().unwrap_or(&[]);
+            if dt.is_empty() {
+                rsx! { div { style: "color:#94a3b8; font-size:12px;", "Missing summary data_type" } }
+            } else {
+                rsx! { {summary_row(rows, dt, items)} }
+            }
+        }
+        StateWidgetKind::Chart => {
+            let dt = widget.data_type.as_deref().unwrap_or("");
+            if dt.is_empty() {
+                rsx! { div { style: "color:#94a3b8; font-size:12px;", "Missing chart data_type" } }
+            } else {
+                let w = widget.width.unwrap_or(1200.0);
+                let h = widget.height.unwrap_or(260.0);
+                rsx! { {data_style_chart_cached(dt, w, h, widget.chart_title.as_deref())} }
+            }
+        }
+        StateWidgetKind::ValveState => rsx! { {valve_state_grid(rows)} },
+        StateWidgetKind::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
+        StateWidgetKind::Actions => rsx! { {action_section(state)} },
     }
 }
 
@@ -337,7 +343,7 @@ fn action_section(state: FlightState) -> Element {
     }
 
     rsx! {
-        Section { title: "Actions",
+        Section { title: "Actions".to_string(),
             div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px;",
                 for action in actions {
                     button {
@@ -411,7 +417,7 @@ fn action_style(border: &str, bg: &str, fg: &str) -> String {
     )
 }
 
-fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[(&'static str, usize)]) -> Element {
+fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[SummaryItem]) -> Element {
     let want_minmax = dt != "VALVE_STATE" && dt != "GPS_DATA";
 
     let (chan_min, chan_max) = if want_minmax {
@@ -422,7 +428,7 @@ fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[(&'static str, usize)])
 
     let latest = items
         .iter()
-        .map(|(label, idx)| (*label, *idx, latest_value(rows, dt, *idx)))
+        .map(|item| (item.label.clone(), item.index, latest_value(rows, dt, item.index)))
         .collect::<Vec<_>>();
 
     rsx! {
@@ -440,7 +446,7 @@ fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[(&'static str, usize)])
 }
 
 #[component]
-fn SummaryCard(label: &'static str, value: String, min: Option<String>, max: Option<String>) -> Element {
+fn SummaryCard(label: String, value: String, min: Option<String>, max: Option<String>) -> Element {
     let mm = match (min.as_deref(), max.as_deref()) {
         (Some(mi), Some(ma)) => Some(format!("min {mi} • max {ma}")),
         _ => None,

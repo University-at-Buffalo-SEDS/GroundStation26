@@ -5,9 +5,11 @@ mod connection_status_tab;
 pub mod data_chart;
 pub mod data_tab;
 pub mod errors_tab;
+pub mod layout;
 mod gps;
 mod gps_android;
 mod latency_chart;
+pub mod types;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod gps_apple;
@@ -28,7 +30,8 @@ use data_tab::DataTab;
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 use errors_tab::ErrorsTab;
-use groundstation_shared::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
+use layout::LayoutConfig;
+use types::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
 use map_tab::MapTab;
 use serde::Deserialize;
 use state_tab::StateTab;
@@ -285,6 +288,8 @@ const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
 const MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
 const DATA_TAB_STORAGE_KEY: &str = "gs_data_tab";
 const BASE_URL_STORAGE_KEY: &str = "gs_base_url";
+const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v1";
+const _SKIP_TLS_VERIFY_KEY_PREFIX: &str = "gs_skip_tls_verify_";
 
 // When this number changes, we tear down and rebuild the websocket connection.
 static WS_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
@@ -431,6 +436,48 @@ impl UrlConfig {
             format!("ws://{base_http}")
         }
     }
+
+    pub fn _set_skip_tls_verify_for_base(base: &str, value: bool) {
+        let clean = normalize_base_url(base.to_string());
+        if clean.is_empty() {
+            return;
+        }
+        let key = _tls_skip_key(&clean);
+        persist::set_string(&key, if value { "true" } else { "false" });
+    }
+
+    pub fn _skip_tls_verify_for_base(base: &str) -> bool {
+        let clean = normalize_base_url(base.to_string());
+        if clean.is_empty() {
+            return false;
+        }
+        let key = _tls_skip_key(&clean);
+        persist::get_string(&key)
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    }
+
+    pub fn _set_skip_tls_verify(value: bool) {
+        let base = UrlConfig::base_http();
+        UrlConfig::_set_skip_tls_verify_for_base(&base, value);
+    }
+
+    pub fn _skip_tls_verify() -> bool {
+        let base = UrlConfig::base_http();
+        UrlConfig::_skip_tls_verify_for_base(&base)
+    }
+}
+
+fn _tls_skip_key(base: &str) -> String {
+    let mut cleaned = String::with_capacity(base.len());
+    for ch in base.chars() {
+        if ch.is_ascii_alphanumeric() {
+            cleaned.push(ch.to_ascii_lowercase());
+        } else {
+            cleaned.push('_');
+        }
+    }
+    format!("{_SKIP_TLS_VERIFY_KEY_PREFIX}{cleaned}")
 }
 
 static BASE_URL: GlobalSignal<String> = Signal::global(String::new);
@@ -522,6 +569,11 @@ fn TelemetryDashboardInner() -> Element {
     let st_data_tab = use_signal(|| persist::get_or(DATA_TAB_STORAGE_KEY, "GYRO_DATA"));
     let st_base_url = use_signal(|| persist::get_or(BASE_URL_STORAGE_KEY, ""));
 
+    let layout_config = use_signal(|| None::<LayoutConfig>);
+    let layout_loading = use_signal(|| true);
+    let layout_error = use_signal(|| None::<String>);
+    let did_request_layout = use_signal(|| false);
+
     let parse_i64 = |s: &str| s.parse::<i64>().unwrap_or(0);
 
     // ----------------------------
@@ -536,6 +588,23 @@ fn TelemetryDashboardInner() -> Element {
     let board_status = use_signal(Vec::<BoardStatusEntry>::new);
 
     let active_main_tab = use_signal(|| _main_tab_from_str(st_main_tab.read().as_str()));
+
+    {
+        let mut active_data_tab = active_data_tab;
+        let layout_config = layout_config;
+        use_effect(move || {
+            let Some(layout) = layout_config.read().clone() else {
+                return;
+            };
+            if layout.data_tab.tabs.is_empty() {
+                return;
+            }
+            let current = active_data_tab.read().clone();
+            if !layout.data_tab.tabs.iter().any(|t| t.id == current) {
+                active_data_tab.set(layout.data_tab.tabs[0].id.clone());
+            }
+        });
+    }
 
     let ack_warning_ts = use_signal(|| parse_i64(st_warn_ack.read().as_str()));
     let ack_error_ts = use_signal(|| parse_i64(st_err_ack.read().as_str()));
@@ -566,6 +635,49 @@ fn TelemetryDashboardInner() -> Element {
             UrlConfig::set_base_url_and_persist(base);
             log!("[GS26] Base URL changed; bumping ws epoch.");
             bump_ws_epoch();
+        });
+    }
+
+    // ---------------------------------------------------------
+    // Layout config fetch + cache
+    // ---------------------------------------------------------
+    {
+        let mut layout_config = layout_config;
+        let mut layout_loading = layout_loading;
+        let mut layout_error = layout_error;
+        let mut did_request_layout = did_request_layout;
+
+        use_effect(move || {
+            if *did_request_layout.read() {
+                return;
+            }
+            did_request_layout.set(true);
+
+            if let Some(cached) = persist::get_string(LAYOUT_CACHE_KEY) {
+                if let Ok(layout) = serde_json::from_str::<LayoutConfig>(&cached) {
+                    layout_config.set(Some(layout));
+                    layout_loading.set(false);
+                }
+            }
+
+            spawn(async move {
+                match http_get_json::<LayoutConfig>("/api/layout").await {
+                    Ok(layout) => {
+                        layout_config.set(Some(layout.clone()));
+                        layout_loading.set(false);
+                        layout_error.set(None);
+                        if let Ok(raw) = serde_json::to_string(&layout) {
+                            persist::set_string(LAYOUT_CACHE_KEY, &raw);
+                        }
+                    }
+                    Err(err) => {
+                        layout_error.set(Some(format!("Layout failed to load: {err}")));
+                        if layout_config.read().is_none() {
+                            layout_loading.set(false);
+                        }
+                    }
+                }
+            });
         });
     }
 
@@ -993,6 +1105,10 @@ fn TelemetryDashboardInner() -> Element {
         true
     }
 
+    let layout_snapshot = layout_config.read().clone();
+    let layout_error_snapshot = layout_error.read().clone();
+    let layout_loading_snapshot = *layout_loading.read();
+
     // MAIN UI
     rsx! {
     gps::GpsDriver {
@@ -1000,6 +1116,51 @@ fn TelemetryDashboardInner() -> Element {
         // Only needed if you want to gate geolocation until the JS is ready on wasm:
         js_ready: Some(start_gps_js()),
     }
+        if layout_loading_snapshot && layout_snapshot.is_none() {
+            div {
+                style: "
+                    height:100vh;
+                    padding:24px;
+                    color:#e5e7eb;
+                    font-family:system-ui, -apple-system, BlinkMacSystemFont;
+                    background:#020617;
+                    display:flex;
+                    align-items:center;
+                    justify-content:center;
+                    border:{border_style};
+                    box-sizing:border-box;
+                ",
+                div { style: "text-align:center; display:flex; flex-direction:column; gap:10px;",
+                    div { style: "font-size:22px; font-weight:800; color:#f97316;", "Loading layout..." }
+                    div { style: "font-size:14px; color:#94a3b8;", "Waiting for layout from backend" }
+                }
+            }
+        } else if layout_snapshot.is_none() {
+            div {
+                style: "
+                    height:100vh;
+                    padding:24px;
+                    color:#e5e7eb;
+                    font-family:system-ui, -apple-system, BlinkMacSystemFont;
+                    background:#020617;
+                    display:flex;
+                    align-items:center;
+                    justify-content:center;
+                    border:{border_style};
+                    box-sizing:border-box;
+                ",
+                div { style: "text-align:center; display:flex; flex-direction:column; gap:12px; align-items:center;",
+                    div { style: "font-size:20px; font-weight:800; color:#ef4444;", "Layout failed to load" }
+                    if let Some(msg) = layout_error_snapshot.clone() {
+                        div { style: "font-size:13px; color:#94a3b8;", "{msg}" }
+                    }
+                    div { style: "display:flex; gap:10px; flex-wrap:wrap; justify-content:center;",
+                        {reload_button}
+                        {connect_button}
+                    }
+                }
+            }
+        } else if let Some(layout) = layout_snapshot {
         div {
 
             style: "
@@ -1045,6 +1206,12 @@ fn TelemetryDashboardInner() -> Element {
 
                     {reload_button}
                     {connect_button}
+                }
+            }
+
+            if let Some(msg) = layout_error_snapshot.clone() {
+                div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid #ef4444; background:#450a0a; color:#fecaca; font-size:12px;",
+                    "{msg}"
                 }
             }
 
@@ -1235,14 +1402,20 @@ fn TelemetryDashboardInner() -> Element {
                                 board_status: board_status,
                                 rocket_gps: rocket_gps,
                                 user_gps: user_gps,
+                                layout: layout.state_tab.clone(),
                             }
                         }
                     },
-                    MainTab::ConnectionStatus => rsx! { ConnectionStatusTab { boards: board_status } },
+                    MainTab::ConnectionStatus => rsx! {
+                        ConnectionStatusTab {
+                            boards: board_status,
+                            layout: layout.connection_tab.clone(),
+                        }
+                    },
                     MainTab::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
                     MainTab::Actions => rsx! {
                         div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
-                            ActionsTab {}
+                            ActionsTab { layout: layout.actions_tab.clone() }
                         }
                     },
                     MainTab::Warnings => rsx! {
@@ -1255,9 +1428,16 @@ fn TelemetryDashboardInner() -> Element {
                             ErrorsTab { errors: errors }
                         }
                     },
-                    MainTab::Data => rsx! { DataTab { rows: rows, active_tab: active_data_tab } },
+                    MainTab::Data => rsx! {
+                        DataTab {
+                            rows: rows,
+                            active_tab: active_data_tab,
+                            layout: layout.data_tab.clone(),
+                        }
+                    },
                 }
             }
+        }
         }
     }
 }
@@ -1333,7 +1513,14 @@ async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, St
         format!("{base}{path}")
     };
 
-    reqwest::get(url)
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(UrlConfig::_skip_tls_verify())
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    client
+        .get(url)
+        .send()
         .await
         .map_err(|e| e.to_string())?
         .json::<T>()
@@ -1706,9 +1893,26 @@ async fn connect_ws_once_native(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     *WS_SENDER.write() = Some(WsSender { tx });
 
-    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url.as_str())
+    let ws_stream = if UrlConfig::_skip_tls_verify() && ws_url.starts_with("wss://") {
+        let tls = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|e| format!("[WS] tls build failed: {e}"))?;
+        tokio_tungstenite::connect_async_tls_with_config(
+            ws_url.as_str(),
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::NativeTls(tls)),
+        )
         .await
-        .map_err(|e| format!("[WS] connect failed: {e}"))?;
+        .map_err(|e| format!("[WS] connect failed: {e}"))?
+        .0
+    } else {
+        tokio_tungstenite::connect_async(ws_url.as_str())
+            .await
+            .map_err(|e| format!("[WS] connect failed: {e}"))?
+            .0
+    };
 
     let (mut write, mut read) = ws_stream.split();
 

@@ -1,7 +1,9 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
-use groundstation_shared::BoardStatusEntry;
 use std::collections::HashMap;
+
+use super::layout::{ConnectionSectionKind, ConnectionTabLayout};
+use super::types::BoardStatusEntry;
 
 const LATENCY_WINDOW_MS: i64 = 20 * 60_000;
 const LATENCY_MAX_POINTS: usize = 2000;
@@ -9,7 +11,7 @@ const LATENCY_MAX_POINTS: usize = 2000;
 const SCROLL_TRIGGER_THRESHOLD_MS: i64 = 200;
 
 #[component]
-pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
+pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>, layout: ConnectionTabLayout) -> Element {
     let mut show_board = use_signal(|| true);
     let mut board_fullscreen = use_signal(|| false);
     let mut show_latency = use_signal(|| true);
@@ -88,55 +90,74 @@ pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>) -> Element {
     rsx! {
         div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto;",
             h2 { style: "margin:0 0 12px 0;", "Connection Status" }
-            div { style: "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;",
-                div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
-                    div { style: "font-size:14px; color:#94a3b8;", "Board Status" }
-                    div { style: "display:flex; gap:8px; flex-wrap:wrap;",
-                        button {
-                            style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
-                            onclick: toggle_board,
-                            if *show_board.read() { "Collapse" } else { "Expand" }
-                        }
-                        button {
-                            style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
-                            onclick: toggle_board_fullscreen,
-                            "Fullscreen"
-                        }
-                    }
-                }
-                if *show_board.read() {
-                    {render_board_table(&boards.read())}
-                }
-            }
-
-            div { style: "margin-top:16px; padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;",
-                div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
-                    div { style: "font-size:14px; color:#94a3b8;", "Packet Age (ms)" }
-                    div { style: "display:flex; gap:8px; flex-wrap:wrap;",
-                        button {
-                            style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
-                            onclick: toggle_latency,
-                            if *show_latency.read() { "Collapse" } else { "Expand" }
-                        }
-                        button {
-                            style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
-                            onclick: toggle_latency_fullscreen,
-                            "Fullscreen"
-                        }
-                    }
-                }
-
-                if *show_latency.read() {
-                    div { style: "display:flex; flex-direction:column; gap:10px;",
-                        for entry in boards.read().iter() {
-                            div { style: "padding:10px; border:1px solid #1f2937; border-radius:10px; background:#020617;",
-                                div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
-                                    "{entry.board.as_str()} ({entry.sender_id})"
+            for (idx, section) in layout.sections.iter().enumerate() {
+                match section.kind {
+                    ConnectionSectionKind::BoardStatus => rsx! {
+                        div { style: {
+                                let top_margin = if idx == 0 { "" } else { "margin-top:16px;" };
+                                format!(
+                                    "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;{}",
+                                    top_margin
+                                )
+                            },
+                            div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
+                                div { style: "font-size:14px; color:#94a3b8;", "{section.title.clone().unwrap_or_else(|| \"Board Status\".to_string())}" }
+                                div { style: "display:flex; gap:8px; flex-wrap:wrap;",
+                                    button {
+                                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                                        onclick: toggle_board,
+                                        if *show_board.read() { "Collapse" } else { "Expand" }
+                                    }
+                                    button {
+                                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                                        onclick: toggle_board_fullscreen,
+                                        "Fullscreen"
+                                    }
                                 }
-                                {render_latency_chart(history.read().get(&entry.sender_id), 360.0_f64)}
+                            }
+                            if *show_board.read() {
+                                {render_board_table(&boards.read())}
                             }
                         }
-                    }
+                    },
+                    ConnectionSectionKind::Latency => rsx! {
+                        div { style: {
+                                let top_margin = if idx == 0 { "" } else { "margin-top:16px;" };
+                                format!(
+                                    "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;{}",
+                                    top_margin
+                                )
+                            },
+                            div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
+                                div { style: "font-size:14px; color:#94a3b8;", "{section.title.clone().unwrap_or_else(|| \"Packet Age (ms)\".to_string())}" }
+                                div { style: "display:flex; gap:8px; flex-wrap:wrap;",
+                                    button {
+                                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                                        onclick: toggle_latency,
+                                        if *show_latency.read() { "Collapse" } else { "Expand" }
+                                    }
+                                    button {
+                                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                                        onclick: toggle_latency_fullscreen,
+                                        "Fullscreen"
+                                    }
+                                }
+                            }
+
+                            if *show_latency.read() {
+                                div { style: "display:flex; flex-direction:column; gap:10px;",
+                                    for entry in boards.read().iter() {
+                                        div { style: "padding:10px; border:1px solid #1f2937; border-radius:10px; background:#020617;",
+                                            div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
+                                                "{entry.board.as_str()} ({entry.sender_id})"
+                                            }
+                                            {render_latency_chart(history.read().get(&entry.sender_id), 360.0_f64)}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
                 }
             }
         }

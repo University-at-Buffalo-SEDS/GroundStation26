@@ -317,13 +317,14 @@ fn classify_reqwest_error(e: &reqwest::Error) -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn build_probe_client() -> Result<reqwest::Client, String> {
+fn build_probe_client(skip_tls_verify: bool) -> Result<reqwest::Client, String> {
     // Fast but still reliable:
     // - connect_timeout: how long we wait for TCP/TLS connect
     // - timeout: total request time budget (includes body)
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_millis(_CONNECTION_TIMEOUT_MS))
         .timeout(std::time::Duration::from_millis(_BODY_TRANSFER_TIMEOUT_MS))
+        .danger_accept_invalid_certs(skip_tls_verify)
         .build()
         .map_err(|e| format!("build client failed: {e}"))
 }
@@ -360,7 +361,7 @@ async fn http_probe_with_client(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn test_routes_host_only(base: &str) -> Vec<RouteCheck> {
+async fn test_routes_host_only(base: &str, skip_tls_verify: bool) -> Vec<RouteCheck> {
     use futures_util::future::join_all;
 
     let probes: &[&str] = &[
@@ -372,7 +373,7 @@ async fn test_routes_host_only(base: &str) -> Vec<RouteCheck> {
         "/ws",
     ];
 
-    let client = match build_probe_client() {
+    let client = match build_probe_client(skip_tls_verify) {
         Ok(c) => c,
         Err(e) => {
             // If client build failed, mark everything failed quickly.
@@ -428,9 +429,8 @@ async fn test_routes_host_only(base: &str) -> Vec<RouteCheck> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn ws_connect_probe(parsed: &ParsedBaseUrl) -> Result<String, String> {
+async fn ws_connect_probe(parsed: &ParsedBaseUrl, skip_tls_verify: bool) -> Result<String, String> {
     use tokio::time::timeout;
-    use tokio_tungstenite::connect_async;
 
     let ws_origin = ws_origin_for_base(parsed);
     let ws_url = format!("{ws_origin}/ws");
@@ -438,7 +438,26 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl) -> Result<String, String> {
     // Real websocket handshake, but time-bounded so it can't hang forever.
     let res = timeout(
         std::time::Duration::from_millis(_WS_TIMEOUT_MS),
-        connect_async(ws_url.clone()),
+        async {
+            if skip_tls_verify && ws_url.starts_with("wss://") {
+                let tls = native_tls::TlsConnector::builder()
+                    .danger_accept_invalid_certs(true)
+                    .build()
+                    .map_err(|e| format!("tls build failed: {e}"))?;
+                tokio_tungstenite::connect_async_tls_with_config(
+                    ws_url.clone(),
+                    None,
+                    false,
+                    Some(tokio_tungstenite::Connector::NativeTls(tls)),
+                )
+                .await
+                .map_err(|e| format!("{e}"))
+            } else {
+                tokio_tungstenite::connect_async(ws_url.clone())
+                    .await
+                    .map_err(|e| format!("{e}"))
+            }
+        },
     )
     .await;
 
@@ -584,9 +603,11 @@ pub fn Connect() -> Element {
     let nav = use_navigator();
 
     let initial =
-        UrlConfig::_stored_base_url().unwrap_or_else(|| "http://localhost:3000".to_string());
+        UrlConfig::_stored_base_url().unwrap_or_else(|| "https://your-backend-url.com".to_string());
+    let initial_skip_tls = UrlConfig::_skip_tls_verify_for_base(&initial);
 
     let mut url_edit = use_signal(|| initial);
+    let mut skip_tls = use_signal(|| initial_skip_tls);
 
     let mut test_status = use_signal(|| "".to_string());
     let mut testing = use_signal(|| false);
@@ -601,7 +622,7 @@ pub fn Connect() -> Element {
 
                 p { style: "margin:0 0 16px 0; color:#94a3b8;",
                     "Enter the backend URL (including http:// or https://). Example: ",
-                    code { "http://localhost:3000" }
+                    code { "http://https://your-backend-url.com" }
                 }
 
                 input {
@@ -611,6 +632,24 @@ pub fn Connect() -> Element {
                         url_edit.set(evt.value());
                         test_status.set("".to_string());
                     },
+                }
+
+                div { style: "margin-top:12px; display:flex; align-items:center; gap:10px;",
+                    input {
+                        r#type: "checkbox",
+                        checked: *skip_tls.read(),
+                        onclick: move |_| {
+                            let next = !*skip_tls.read();
+                            skip_tls.set(next);
+                            let base = normalize_base_url(url_edit().trim().to_string());
+                            if !base.is_empty() {
+                                UrlConfig::_set_skip_tls_verify_for_base(&base, next);
+                            }
+                        }
+                    }
+                    div { style: "font-size:13px; color:#94a3b8;",
+                        "Disable TLS certificate verification for this host (self-signed certs)"
+                    }
                 }
 
                 if !test_status().is_empty() {
@@ -667,12 +706,13 @@ pub fn Connect() -> Element {
                             // Trigger iOS local-network prompt (best-effort)
                             objc_poke::poke_url(&u_norm);
 
+                            let skip_tls_verify = *skip_tls.read();
                             spawn(async move {
                                 // 1) HTTP probes (concurrent)
-                                let checks = test_routes_host_only(&u_norm).await;
+                                let checks = test_routes_host_only(&u_norm, skip_tls_verify).await;
 
                                 // 2) REAL websocket probe (ws/wss) (time-bounded)
-                                let ws_probe = Some(ws_connect_probe(&parsed).await);
+                                let ws_probe = Some(ws_connect_probe(&parsed, skip_tls_verify).await);
 
                                 let report = format_route_report_host_only(&u_norm, &parsed, &checks, ws_probe);
 
@@ -707,6 +747,7 @@ pub fn Connect() -> Element {
                             objc_poke::poke_url(&u_norm);
 
                             UrlConfig::set_base_url_and_persist(u_norm.to_string());
+                            UrlConfig::_set_skip_tls_verify_for_base(&u_norm, *skip_tls.read());
                             let _ = persist::write_connect_shown(true);
                             let _ = nav.replace(Route::Dashboard {});
                         },

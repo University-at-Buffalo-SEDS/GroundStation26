@@ -4,6 +4,7 @@
 mod dummy_packets;
 mod gpio;
 mod gpio_panel;
+mod layout;
 mod map;
 mod radio;
 mod ring_buffer;

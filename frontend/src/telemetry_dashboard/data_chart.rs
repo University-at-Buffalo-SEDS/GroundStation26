@@ -24,7 +24,7 @@
 // - This intentionally trades “perfect accuracy for late/out-of-order samples”
 //   for visual stability: once a bucket is in the past, it is frozen.
 
-use groundstation_shared::TelemetryRow;
+use super::types::TelemetryRow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 

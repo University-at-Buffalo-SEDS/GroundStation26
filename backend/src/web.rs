@@ -1,6 +1,7 @@
+use crate::layout;
 use crate::map::{tile_service, DEFAULT_MAP_REGION};
 use crate::state::AppState;
-use axum::http::header;
+use axum::http::{header, StatusCode};
 use axum::{
     extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade}, extract::{Query, State},
     response::IntoResponse,
@@ -38,6 +39,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/history", get(get_history))
         .route("/api/alerts", get(get_alerts))
         .route("/api/boards", get(get_boards))
+        .route("/api/layout", get(get_layout))
         .route("/favicon", get(get_favicon))
         .route("/flightstate", get(get_flight_state))
         .route("/api/gps", get(get_gps))
@@ -184,6 +186,13 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     });
 
     Json(GpsResponse { rocket })
+}
+
+async fn get_layout() -> impl IntoResponse {
+    match layout::load_layout() {
+        Ok(layout) => Json(layout).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+    }
 }
 
 async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {

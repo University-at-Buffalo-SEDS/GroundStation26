@@ -1,0 +1,328 @@
+{
+  "version": 1,
+  "connection_tab": {
+    "sections": [
+      {
+        "kind": "board_status",
+        "title": "Board Status"
+      },
+      {
+        "kind": "latency",
+        "title": "Packet Age (ms)"
+      }
+    ]
+  },
+  "actions_tab": {
+    "actions": [
+      {
+        "label": "Launch",
+        "cmd": "Launch",
+        "border": "#22c55e",
+        "bg": "#022c22",
+        "fg": "#bbf7d0"
+      },
+      {
+        "label": "Dump",
+        "cmd": "Dump",
+        "border": "#ef4444",
+        "bg": "#450a0a",
+        "fg": "#fecaca"
+      },
+      {
+        "label": "Igniter",
+        "cmd": "Igniter",
+        "border": "#60a5fa",
+        "bg": "#0b1220",
+        "fg": "#bfdbfe"
+      },
+      {
+        "label": "Pilot",
+        "cmd": "Pilot",
+        "border": "#a78bfa",
+        "bg": "#111827",
+        "fg": "#ddd6fe"
+      },
+      {
+        "label": "NormallyOpen",
+        "cmd": "NormallyOpen",
+        "border": "#f97316",
+        "bg": "#1f2937",
+        "fg": "#ffedd5"
+      },
+      {
+        "label": "Nitrogen",
+        "cmd": "Nitrogen",
+        "border": "#22d3ee",
+        "bg": "#0b1220",
+        "fg": "#cffafe"
+      },
+      {
+        "label": "Nitrous",
+        "cmd": "Nitrous",
+        "border": "#a3e635",
+        "bg": "#111827",
+        "fg": "#ecfccb"
+      },
+      {
+        "label": "Fill Lines",
+        "cmd": "RetractPlumbing",
+        "border": "#eab308",
+        "bg": "#1f2937",
+        "fg": "#fef9c3"
+      }
+    ]
+  },
+  "data_tab": {
+    "tabs": [
+      {
+        "id": "GYRO_DATA",
+        "label": "GYRO_DATA",
+        "channels": ["Roll", "Pitch", "Yaw", "", "", "", "", ""],
+        "chart": { "enabled": true }
+      },
+      {
+        "id": "ACCEL_DATA",
+        "label": "ACCEL_DATA",
+        "channels": ["X Accel", "Y Accel", "Z Accel", "", "", "", "", ""],
+        "chart": { "enabled": true }
+      },
+      {
+        "id": "BAROMETER_DATA",
+        "label": "BAROMETER_DATA",
+        "channels": ["Pressure", "Temp", "Altitude", "", "", "", "", ""],
+        "chart": { "enabled": true }
+      },
+      {
+        "id": "KALMAN_FILTER_DATA",
+        "label": "KALMAN_FILTER_DATA",
+        "channels": ["X", "Y", "Z", "", "", "", "", ""],
+        "chart": { "enabled": true }
+      },
+      {
+        "id": "GPS_DATA",
+        "label": "GPS_DATA",
+        "channels": ["Lat", "Lon", "", "", "", "", "", ""],
+        "chart": { "enabled": true }
+      },
+      {
+        "id": "FUEL_TANK_PRESSURE",
+        "label": "FUEL_TANK_PRESSURE",
+        "channels": ["Tank Pressure", "", "", "", "", "", "", ""],
+        "chart": { "enabled": true }
+      },
+      {
+        "id": "BATTERY_VOLTAGE",
+        "label": "BATTERY_VOLTAGE",
+        "channels": ["Voltage", "", "", "", "", "", "", ""],
+        "chart": { "enabled": true }
+      },
+      {
+        "id": "BATTERY_CURRENT",
+        "label": "BATTERY_CURRENT",
+        "channels": ["Current", "", "", "", "", "", "", ""],
+        "chart": { "enabled": true }
+      },
+      {
+        "id": "FUEL_FLOW",
+        "label": "FUEL_FLOW",
+        "channels": ["Flow Rate", "", "", "", "", "", "", ""],
+        "chart": { "enabled": true }
+      },
+      {
+        "id": "VALVE_STATE",
+        "label": "VALVE_STATE",
+        "channels": ["Pilot", "NormallyOpen", "Dump", "Igniter", "Nitrogen", "Nitrous", "Fill Lines", ""],
+        "chart": { "enabled": true }
+      }
+    ]
+  },
+  "state_tab": {
+    "states": [
+      {
+        "states": ["Startup"],
+        "sections": [
+          {
+            "title": "Connected Devices",
+            "widgets": [
+              { "kind": "board_status" }
+            ]
+          }
+        ]
+      },
+      {
+        "states": ["PreFill", "FillTest", "NitrogenFill", "NitrousFill"],
+        "sections": [
+          {
+            "title": "Pressure",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "items": [
+                  { "label": "Tank Pressure", "index": 0 }
+                ]
+              },
+              {
+                "kind": "chart",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "chart_title": "Fuel Tank Pressure",
+                "width": 1200.0,
+                "height": 260.0
+              }
+            ]
+          },
+          {
+            "title": "Valve States",
+            "widgets": [
+              { "kind": "valve_state" }
+            ]
+          },
+          {
+            "title": "Actions",
+            "widgets": [
+              { "kind": "actions" }
+            ]
+          }
+        ]
+      },
+      {
+        "states": ["Armed"],
+        "sections": [
+          {
+            "title": "Pressure",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "items": [
+                  { "label": "Tank Pressure", "index": 0 }
+                ]
+              },
+              {
+                "kind": "chart",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "chart_title": "Fuel Tank Pressure",
+                "width": 1200.0,
+                "height": 260.0
+              }
+            ]
+          },
+          {
+            "title": "Valve States",
+            "widgets": [
+              { "kind": "valve_state" }
+            ]
+          },
+          {
+            "title": "Actions",
+            "widgets": [
+              { "kind": "actions" }
+            ]
+          }
+        ]
+      },
+      {
+        "states": ["Launch", "Ascent", "Coast", "Apogee", "ParachuteDeploy", "Descent"],
+        "sections": [
+          {
+            "title": "Altitude",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "BAROMETER_DATA",
+                "items": [
+                  { "label": "Altitude", "index": 2 },
+                  { "label": "Pressure", "index": 0 },
+                  { "label": "Temp", "index": 1 }
+                ]
+              },
+              {
+                "kind": "chart",
+                "data_type": "BAROMETER_DATA",
+                "chart_title": "Barometer Data",
+                "width": 1200.0,
+                "height": 280.0
+              }
+            ]
+          },
+          {
+            "title": "Acceleration",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "ACCEL_DATA",
+                "items": [
+                  { "label": "Accel X", "index": 0 },
+                  { "label": "Accel Y", "index": 1 },
+                  { "label": "Accel Z", "index": 2 }
+                ]
+              },
+              {
+                "kind": "chart",
+                "data_type": "ACCEL_DATA",
+                "chart_title": "Acceleration",
+                "width": 1200.0,
+                "height": 300.0
+              }
+            ]
+          },
+          {
+            "title": "Kalman Filter",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "KALMAN_FILTER_DATA",
+                "items": [
+                  { "label": "Kalman X", "index": 0 },
+                  { "label": "Kalman Y", "index": 1 },
+                  { "label": "Kalman Z", "index": 2 }
+                ]
+              },
+              {
+                "kind": "chart",
+                "data_type": "KALMAN_FILTER_DATA",
+                "chart_title": "Kalman Filter",
+                "width": 1200.0,
+                "height": 300.0
+              }
+            ]
+          },
+          {
+            "title": "Actions",
+            "widgets": [
+              { "kind": "actions" }
+            ]
+          }
+        ]
+      },
+      {
+        "states": ["Landed", "Recovery"],
+        "sections": [
+          {
+            "title": "Recovery Map",
+            "widgets": [
+              { "kind": "map" }
+            ]
+          },
+          {
+            "title": "Actions",
+            "widgets": [
+              { "kind": "actions" }
+            ]
+          }
+        ]
+      },
+      {
+        "states": ["Idle", "Aborted"],
+        "sections": [
+          {
+            "title": "Actions",
+            "widgets": [
+              { "kind": "actions" }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
