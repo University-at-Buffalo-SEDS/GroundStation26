@@ -186,8 +186,50 @@
           "Fill Lines"
         ],
         "chart": {
-          "enabled": true
-        }
+          "enabled": false
+        },
+        "boolean_labels": {
+          "true_label": "Open",
+          "false_label": "Closed",
+          "unknown_label": "Unknown"
+        },
+        "channel_boolean_labels": [
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Installed",
+            "false_label": "Removed",
+            "unknown_label": "Unknown"
+          }
+        ]
       }
     ]
   },
@@ -242,7 +284,74 @@
             "title": "Valve States",
             "widgets": [
               {
-                "kind": "valve_state"
+                "kind": "valve_state",
+                "valves": [
+                  {
+                    "label": "Pilot",
+                    "index": 0
+                  },
+                  {
+                    "label": "NormallyOpen",
+                    "index": 1
+                  },
+                  {
+                    "label": "Dump",
+                    "index": 2
+                  },
+                  {
+                    "label": "Igniter",
+                    "index": 3
+                  },
+                  {
+                    "label": "Nitrogen",
+                    "index": 4
+                  },
+                  {
+                    "label": "Nitrous",
+                    "index": 5
+                  },
+                  {
+                    "label": "Fill Lines",
+                    "index": 6
+                  }
+                ],
+                "valve_labels": [
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Installed",
+                    "false_label": "Removed",
+                    "unknown_label": "Unknown"
+                  }
+                ]
               }
             ]
           },
@@ -250,7 +359,14 @@
             "title": "Actions",
             "widgets": [
               {
-                "kind": "actions"
+                "kind": "actions",
+                "actions": [
+                  "Dump",
+                  "NormallyOpen",
+                  "Nitrogen",
+                  "Nitrous",
+                  "Pilot"
+                ]
               }
             ]
           }
@@ -287,7 +403,44 @@
             "title": "Valve States",
             "widgets": [
               {
-                "kind": "valve_state"
+                "kind": "valve_state",
+                "valve_labels": [
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Installed",
+                    "false_label": "Removed",
+                    "unknown_label": "Unknown"
+                  }
+                ]
               }
             ]
           },
@@ -295,7 +448,19 @@
             "title": "Actions",
             "widgets": [
               {
-                "kind": "actions"
+                "kind": "actions",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "items": [
+                  {
+                    "label": "Tank Pressure",
+                    "index": 0
+                  }
+                ],
+                "actions": [
+                  "Launch",
+                  "Dump",
+                  "Pilot"
+                ]
               }
             ]
           }
@@ -400,14 +565,6 @@
                 "height": 300.0
               }
             ]
-          },
-          {
-            "title": "Actions",
-            "widgets": [
-              {
-                "kind": "actions"
-              }
-            ]
           }
         ]
       },
@@ -424,14 +581,6 @@
                 "kind": "map"
               }
             ]
-          },
-          {
-            "title": "Actions",
-            "widgets": [
-              {
-                "kind": "actions"
-              }
-            ]
           }
         ]
       },
@@ -442,10 +591,17 @@
         ],
         "sections": [
           {
-            "title": "Actions",
+            "title": "FUEL TANK PRESSURE",
             "widgets": [
               {
-                "kind": "actions"
+                "kind": "summary",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "items": [
+                  {
+                    "label": "Tank Pressure",
+                    "index": 0
+                  }
+                ]
               }
             ]
           }

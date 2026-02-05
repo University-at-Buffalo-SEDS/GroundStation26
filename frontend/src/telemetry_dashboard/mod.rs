@@ -1430,15 +1430,22 @@ fn TelemetryDashboardInner() -> Element {
                 match *active_main_tab.read() {
                     MainTab::State => rsx! {
                         div { style: "height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto;",
-                            StateTab {
-                                flight_state: flight_state,
-                                rows: rows,
-                                board_status: board_status,
-                                rocket_gps: rocket_gps,
-                                user_gps: user_gps,
-                                layout: layout.state_tab.clone(),
+                                StateTab {
+                                    flight_state: flight_state,
+                                    rows: rows,
+                                    board_status: board_status,
+                                    rocket_gps: rocket_gps,
+                                    user_gps: user_gps,
+                                    layout: layout.state_tab.clone(),
+                                    actions: layout.actions_tab.clone(),
+                                    default_valve_labels: layout
+                                        .data_tab
+                                        .tabs
+                                        .iter()
+                                        .find(|t| t.id == "VALVE_STATE")
+                                        .and_then(|t| t.boolean_labels.clone()),
+                                }
                             }
-                        }
                     },
                     MainTab::ConnectionStatus => rsx! {
                         ConnectionStatusTab {

@@ -40,6 +40,8 @@ pub struct DataTabSpec {
     pub label: String,
     pub channels: Vec<String>,
     pub chart: Option<DataTabChart>,
+    pub boolean_labels: Option<BooleanLabels>,
+    pub channel_boolean_labels: Option<Vec<BooleanLabels>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,6 +88,32 @@ pub struct StateWidget {
     pub chart_title: Option<String>,
     pub width: Option<f64>,
     pub height: Option<f64>,
+    pub actions: Option<Vec<String>>,
+    pub valves: Option<Vec<SummaryItem>>,
+    pub valve_colors: Option<ValveColorSet>,
+    pub boolean_labels: Option<BooleanLabels>,
+    pub valve_labels: Option<Vec<BooleanLabels>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BooleanLabels {
+    pub true_label: String,
+    pub false_label: String,
+    pub unknown_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValveColor {
+    pub bg: String,
+    pub border: String,
+    pub fg: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValveColorSet {
+    pub open: Option<ValveColor>,
+    pub closed: Option<ValveColor>,
+    pub unknown: Option<ValveColor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 // frontend/src/telemetry_dashboard/data_tab.rs
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
-use super::layout::DataTabLayout;
+use super::layout::{BooleanLabels, DataTabLayout};
 use super::types::TelemetryRow;
 
 use super::data_chart::{charts_cache_get, charts_cache_get_channel_minmax, series_color};
@@ -187,6 +187,8 @@ pub fn DataTab(
         .cloned();
 
     let is_valve_state = current == "VALVE_STATE";
+    let boolean_labels = current_tab.and_then(|t| t.boolean_labels.as_ref());
+    let channel_boolean_labels = current_tab.and_then(|t| t.channel_boolean_labels.as_ref());
     let has_telemetry = latest_row.is_some();
     let is_graph_allowed = chart_enabled && has_telemetry && current != "GPS_DATA" && !is_valve_state;
 
@@ -283,8 +285,12 @@ pub fn DataTab(
                                             label: labels[i].clone(),
                                             min: if is_graph_allowed { chan_min.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
                                             max: if is_graph_allowed { chan_max.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
-                                            value: if is_valve_state {
-                                                valve_state_text(vals.get(i).copied().flatten(), labels[i] == "Fill Lines")
+                                            value: if let Some(lbls) = channel_boolean_labels
+                                                .and_then(|list| list.get(i))
+                                            {
+                                                boolean_value_text(vals.get(i).copied().flatten(), Some(lbls))
+                                            } else if is_valve_state || boolean_labels.is_some() {
+                                                boolean_value_text(vals.get(i).copied().flatten(), boolean_labels)
                                             } else {
                                                 fmt_opt(vals.get(i).copied().flatten())
                                             },
@@ -504,23 +510,20 @@ fn fmt_opt(v: Option<f32>) -> String {
     }
 }
 
-fn valve_state_text(v: Option<f32>, is_fill_lines: bool) -> String {
+fn boolean_value_text(v: Option<f32>, labels: Option<&BooleanLabels>) -> String {
+    let true_label = labels
+        .map(|l| l.true_label.as_str())
+        .unwrap_or("Open");
+    let false_label = labels
+        .map(|l| l.false_label.as_str())
+        .unwrap_or("Closed");
+    let unknown_label = labels
+        .and_then(|l| l.unknown_label.as_deref())
+        .unwrap_or("Unknown");
     match v {
-        Some(val) if val >= 0.5 => {
-            if is_fill_lines {
-                "Installed".to_string()
-            } else {
-                "Open".to_string()
-            }
-        }
-        Some(_) => {
-            if is_fill_lines {
-                "Removed".to_string()
-            } else {
-                "Closed".to_string()
-            }
-        }
-        None => "Unknown".to_string(),
+        Some(val) if val >= 0.5 => true_label.to_string(),
+        Some(_) => false_label.to_string(),
+        None => unknown_label.to_string(),
     }
 }
 

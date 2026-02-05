@@ -3,7 +3,10 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 
-use super::layout::{StateSection, StateTabLayout, StateWidget, StateWidgetKind, SummaryItem};
+use super::layout::{
+    ActionSpec, ActionsTabLayout, BooleanLabels, StateSection, StateTabLayout, StateWidget,
+    StateWidgetKind, SummaryItem, ValveColor, ValveColorSet,
+};
 use super::types::{BoardStatusEntry, FlightState, TelemetryRow};
 
 use crate::telemetry_dashboard::data_chart::{
@@ -31,6 +34,8 @@ pub fn StateTab(
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
     layout: StateTabLayout,
+    actions: ActionsTabLayout,
+    default_valve_labels: Option<BooleanLabels>,
 ) -> Element {
     // ------------------------------------------------------------
     // Redraw driver for charts on State tab
@@ -91,6 +96,7 @@ pub fn StateTab(
     let state = *flight_state.read();
     let rows_snapshot = rows.read();
     let boards_snapshot = board_status.read();
+    let actions_snapshot = actions.actions.clone();
 
     let content = if let Some(state_layout) = layout
         .states
@@ -99,7 +105,15 @@ pub fn StateTab(
     {
         rsx! {
             for section in state_layout.sections.iter() {
-                {render_state_section(section, state, &rows_snapshot, &boards_snapshot, rocket_gps, user_gps)}
+                {render_state_section(
+                    section,
+                    &rows_snapshot,
+                    &boards_snapshot,
+                    &actions_snapshot,
+                    default_valve_labels.as_ref(),
+                    rocket_gps,
+                    user_gps
+                )}
             }
         }
     } else {
@@ -107,7 +121,6 @@ pub fn StateTab(
     };
 
     rsx! {
-        // ✅ Make StateTab scrollable + add bottom padding and a spacer div
         div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto; display:flex; flex-direction:column; gap:16px; padding-bottom:100px;",
             h2 { style: "margin:0; color:#e5e7eb;", "State" }
             div { style: "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;",
@@ -134,18 +147,30 @@ fn Section(title: String, children: Element) -> Element {
 
 fn render_state_section(
     section: &StateSection,
-    state: FlightState,
     rows: &[TelemetryRow],
     boards: &[BoardStatusEntry],
+    actions: &[ActionSpec],
+    default_valve_labels: Option<&BooleanLabels>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
 ) -> Element {
+    if !section_has_content(section, actions) {
+        return rsx! { div {} };
+    }
     let title = section.title.clone().unwrap_or_else(|| "Section".to_string());
 
     rsx! {
         Section { title: title,
             for widget in section.widgets.iter() {
-                {render_state_widget(widget, state, rows, boards, rocket_gps, user_gps)}
+                {render_state_widget(
+                    widget,
+                    rows,
+                    boards,
+                    actions,
+                    default_valve_labels,
+                    rocket_gps,
+                    user_gps
+                )}
             }
         }
     }
@@ -153,9 +178,10 @@ fn render_state_section(
 
 fn render_state_widget(
     widget: &StateWidget,
-    state: FlightState,
     rows: &[TelemetryRow],
     boards: &[BoardStatusEntry],
+    actions: &[ActionSpec],
+    default_valve_labels: Option<&BooleanLabels>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
 ) -> Element {
@@ -180,10 +206,37 @@ fn render_state_widget(
                 rsx! { {data_style_chart_cached(dt, w, h, widget.chart_title.as_deref())} }
             }
         }
-        StateWidgetKind::ValveState => rsx! { {valve_state_grid(rows)} },
+        StateWidgetKind::ValveState => {
+            let labels = widget.boolean_labels.as_ref().or(default_valve_labels);
+            rsx! { {valve_state_grid(
+                rows,
+                widget.valves.as_deref(),
+                widget.valve_colors.as_ref(),
+                labels,
+                widget.valve_labels.as_deref(),
+            )} }
+        }
         StateWidgetKind::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
-        StateWidgetKind::Actions => rsx! { {action_section(state)} },
+        StateWidgetKind::Actions => rsx! { {action_section(actions, widget.actions.as_deref())} },
     }
+}
+
+fn section_has_content(section: &StateSection, actions: &[ActionSpec]) -> bool {
+    if section.widgets.is_empty() {
+        return false;
+    }
+    let has_actions = !actions.is_empty();
+    for widget in section.widgets.iter() {
+        match widget.kind {
+            StateWidgetKind::Actions => {
+                if has_actions && has_any_actions(actions, widget.actions.as_deref()) {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+    }
+    false
 }
 
 // ============================================================
@@ -279,7 +332,13 @@ fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&st
 // Existing StateTab helpers (mostly unchanged)
 // ============================================================
 
-fn valve_state_grid(rows: &[TelemetryRow]) -> Element {
+fn valve_state_grid(
+    rows: &[TelemetryRow],
+    valves: Option<&[SummaryItem]>,
+    colors: Option<&ValveColorSet>,
+    labels: Option<&BooleanLabels>,
+    valve_labels: Option<&[BooleanLabels]>,
+) -> Element {
     let latest = rows
         .iter()
         .filter(|r| r.data_type == "VALVE_STATE")
@@ -289,43 +348,80 @@ fn valve_state_grid(rows: &[TelemetryRow]) -> Element {
         return rsx! { div { style: "color:#94a3b8; font-size:12px;", "No valve state yet." } };
     };
 
-    let items = [
-        ("Pilot", value_at(row, 0)),
-        ("NormallyOpen", value_at(row, 1)),
-        ("Dump", value_at(row, 2)),
-        ("Igniter", value_at(row, 3)),
-        ("Nitrogen", value_at(row, 4)),
-        ("Nitrous", value_at(row, 5)),
-        ("Fill Lines", value_at(row, 6)),
+    let default_items = [
+        SummaryItem { label: "Pilot".to_string(), index: 0 },
+        SummaryItem { label: "NormallyOpen".to_string(), index: 1 },
+        SummaryItem { label: "Dump".to_string(), index: 2 },
+        SummaryItem { label: "Igniter".to_string(), index: 3 },
+        SummaryItem { label: "Nitrogen".to_string(), index: 4 },
+        SummaryItem { label: "Nitrous".to_string(), index: 5 },
+        SummaryItem { label: "Fill Lines".to_string(), index: 6 },
     ];
+
+    let items: Vec<(String, Option<f32>)> = match valves {
+        Some(list) if !list.is_empty() => list
+            .iter()
+            .map(|item| (item.label.clone(), value_at(row, item.index)))
+            .collect(),
+        _ => default_items
+            .iter()
+            .map(|item| (item.label.clone(), value_at(row, item.index)))
+            .collect(),
+    };
+
+    let (open, closed, unknown) = valve_colors(colors);
 
     rsx! {
         div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-bottom:12px;",
-            for (label, value) in items {
-                ValveStateCard { label: label, value: value, is_fill_lines: label == "Fill Lines" }
+            for (idx, (label, value)) in items.iter().enumerate() {
+                ValveStateCard {
+                    label: label.clone(),
+                    value: *value,
+                    open: open.clone(),
+                    closed: closed.clone(),
+                    unknown: unknown.clone(),
+                    labels: widget_valve_labels_at(labels, valve_labels, idx),
+                }
             }
         }
     }
 }
 
 #[component]
-fn ValveStateCard(label: &'static str, value: Option<f32>, is_fill_lines: bool) -> Element {
+fn ValveStateCard(
+    label: String,
+    value: Option<f32>,
+    open: ValveColor,
+    closed: ValveColor,
+    unknown: ValveColor,
+    labels: Option<BooleanLabels>,
+) -> Element {
+    let true_label = labels
+        .as_ref()
+        .map(|l| l.true_label.as_str())
+        .unwrap_or("Open");
+    let false_label = labels
+        .as_ref()
+        .map(|l| l.false_label.as_str())
+        .unwrap_or("Closed");
+    let unknown_label = labels
+        .as_ref()
+        .and_then(|l| l.unknown_label.as_deref())
+        .unwrap_or("Unknown");
+
     let (bg, border, fg, text) = match value {
         Some(v) if v >= 0.5 => {
-            if is_fill_lines {
-                ("#052e16", "#22c55e", "#bbf7d0", "Installed")
-            } else {
-                ("#052e16", "#22c55e", "#bbf7d0", "Open")
-            }
+            (open.bg.as_str(), open.border.as_str(), open.fg.as_str(), true_label)
         }
         Some(_) => {
-            if is_fill_lines {
-                ("#1f2937", "#94a3b8", "#e2e8f0", "Removed")
-            } else {
-                ("#1f2937", "#94a3b8", "#e2e8f0", "Closed")
-            }
+            (closed.bg.as_str(), closed.border.as_str(), closed.fg.as_str(), false_label)
         }
-        None => ("#0b1220", "#475569", "#94a3b8", "Unknown"),
+        None => (
+            unknown.bg.as_str(),
+            unknown.border.as_str(),
+            unknown.fg.as_str(),
+            unknown_label,
+        ),
     };
 
     rsx! {
@@ -336,77 +432,93 @@ fn ValveStateCard(label: &'static str, value: Option<f32>, is_fill_lines: bool) 
     }
 }
 
-fn action_section(state: FlightState) -> Element {
-    let actions = actions_for_state(state);
-    if actions.is_empty() {
+fn valve_colors(colors: Option<&ValveColorSet>) -> (ValveColor, ValveColor, ValveColor) {
+    let default_open = ValveColor {
+        bg: "#052e16".to_string(),
+        border: "#22c55e".to_string(),
+        fg: "#bbf7d0".to_string(),
+    };
+    let default_closed = ValveColor {
+        bg: "#1f2937".to_string(),
+        border: "#94a3b8".to_string(),
+        fg: "#e2e8f0".to_string(),
+    };
+    let default_unknown = ValveColor {
+        bg: "#0b1220".to_string(),
+        border: "#475569".to_string(),
+        fg: "#94a3b8".to_string(),
+    };
+
+    let open = colors.and_then(|c| c.open.clone()).unwrap_or(default_open);
+    let closed = colors.and_then(|c| c.closed.clone()).unwrap_or(default_closed);
+    let unknown = colors
+        .and_then(|c| c.unknown.clone())
+        .unwrap_or(default_unknown);
+    (open, closed, unknown)
+}
+
+fn widget_valve_labels_at<'a>(
+    default_labels: Option<&'a BooleanLabels>,
+    valve_labels: Option<&'a [BooleanLabels]>,
+    idx: usize,
+) -> Option<BooleanLabels> {
+    if let Some(list) = valve_labels {
+        if idx < list.len() {
+            return Some(list[idx].clone());
+        }
+    }
+    default_labels.cloned()
+}
+
+fn action_section(actions: &[ActionSpec], selection: Option<&[String]>) -> Element {
+    let filtered = filter_actions(actions, selection);
+    if filtered.is_empty() {
         return rsx! { div {} };
     }
 
     rsx! {
-        Section { title: "Actions".to_string(),
-            div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px;",
-                for action in actions {
-                    button {
-                        style: action_style(action.border, action.bg, action.fg),
-                        onclick: move |_| crate::telemetry_dashboard::send_cmd(action.cmd),
-                        "{action.label}"
-                    }
+        div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px;",
+            for action in filtered.iter() {
+                button {
+                    style: action_style(&action.border, &action.bg, &action.fg),
+                    onclick: {
+                        let cmd = action.cmd.clone();
+                        move |_| crate::telemetry_dashboard::send_cmd(&cmd)
+                    },
+                    "{action.label}"
                 }
             }
         }
     }
 }
 
-struct ActionDef {
-    label: &'static str,
-    cmd: &'static str,
-    border: &'static str,
-    bg: &'static str,
-    fg: &'static str,
+fn filter_actions<'a>(
+    actions: &'a [ActionSpec],
+    selection: Option<&[String]>,
+) -> Vec<&'a ActionSpec> {
+    let Some(selected) = selection else {
+        return actions.iter().collect();
+    };
+    if selected.is_empty() {
+        return actions.iter().collect();
+    }
+    let mut filtered = Vec::with_capacity(selected.len());
+    for cmd in selected {
+        if let Some(action) = actions.iter().find(|a| &a.cmd == cmd) {
+            filtered.push(action);
+        }
+    }
+    filtered
 }
 
-fn actions_for_state(state: FlightState) -> Vec<ActionDef> {
-    match state {
-        FlightState::Armed => vec![
-            ActionDef {
-                label: "Launch",
-                cmd: "Launch",
-                border: "#22c55e",
-                bg: "#022c22",
-                fg: "#bbf7d0",
-            },
-            ActionDef {
-                label: "Dump",
-                cmd: "Dump",
-                border: "#ef4444",
-                bg: "#450a0a",
-                fg: "#fecaca",
-            },
-        ],
-        FlightState::Idle
-        | FlightState::PreFill
-        | FlightState::FillTest
-        | FlightState::NitrogenFill
-        | FlightState::NitrousFill => vec![
-            ActionDef { label: "Dump", cmd: "Dump", border: "#ef4444", bg: "#450a0a", fg: "#fecaca" },
-            ActionDef { label: "NormallyOpen", cmd: "NormallyOpen", border: "#f97316", bg: "#1f2937", fg: "#ffedd5" },
-            ActionDef { label: "Pilot", cmd: "Pilot", border: "#a78bfa", bg: "#111827", fg: "#ddd6fe" },
-            ActionDef { label: "Igniter", cmd: "Igniter", border: "#60a5fa", bg: "#0b1220", fg: "#bfdbfe" },
-            ActionDef { label: "Nitrogen", cmd: "Nitrogen", border: "#22d3ee", bg: "#0b1220", fg: "#cffafe" },
-            ActionDef { label: "Nitrous", cmd: "Nitrous", border: "#a3e635", bg: "#111827", fg: "#ecfccb" },
-            ActionDef { label: "Fill Lines", cmd: "RetractPlumbing", border: "#eab308", bg: "#1f2937", fg: "#fef9c3" },
-        ],
-        FlightState::Startup => vec![],
-        FlightState::Launch
-        | FlightState::Ascent
-        | FlightState::Coast
-        | FlightState::Apogee
-        | FlightState::ParachuteDeploy
-        | FlightState::Descent
-        | FlightState::Landed
-        | FlightState::Recovery
-        | FlightState::Aborted => vec![],
+fn has_any_actions(actions: &[ActionSpec], selection: Option<&[String]>) -> bool {
+    let Some(selected) = selection else {
+        return !actions.is_empty();
+    };
+    if selected.is_empty() {
+        return !actions.is_empty();
     }
+    selected.iter().any(|cmd| actions.iter().any(|a| &a.cmd == cmd))
 }
 
 fn action_style(border: &str, bg: &str, fg: &str) -> String {
