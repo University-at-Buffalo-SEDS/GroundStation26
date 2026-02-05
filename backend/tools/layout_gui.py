@@ -230,13 +230,19 @@ class LayoutEditor(tk.Tk):
         ttk.Label(frame, text="Sections").grid(row=0, column=1, sticky="w")
         self.section_list = tk.Listbox(frame, height=18)
         self.section_list.grid(row=1, column=1, sticky="ns", padx=(0, 10))
-        self.section_list.bind("<<ListboxSelect>>", lambda _: self._load_section())
+        self.section_list.bind("<<ListboxSelect>>", lambda _: self._load_section_from_selection())
+        self.section_list.bind("<ButtonRelease-1>", lambda _: self._load_section_from_selection())
+        self.section_list.bind("<KeyRelease-Up>", lambda _: self._load_section_from_selection())
+        self.section_list.bind("<KeyRelease-Down>", lambda _: self._load_section_from_selection())
 
         # Widgets
         ttk.Label(frame, text="Widgets").grid(row=0, column=2, sticky="w")
         self.widget_list = tk.Listbox(frame, height=18)
         self.widget_list.grid(row=1, column=2, sticky="nsew")
-        self.widget_list.bind("<<ListboxSelect>>", lambda _: self._load_widget())
+        self.widget_list.bind("<<ListboxSelect>>", lambda _: self._load_widget_from_selection())
+        self.widget_list.bind("<ButtonRelease-1>", lambda _: self._load_widget_from_selection())
+        self.widget_list.bind("<KeyRelease-Up>", lambda _: self._load_widget_from_selection())
+        self.widget_list.bind("<KeyRelease-Down>", lambda _: self._load_widget_from_selection())
 
         form = ttk.Frame(frame)
         form.grid(row=2, column=0, columnspan=3, sticky="ew", pady=10)
@@ -315,6 +321,9 @@ class LayoutEditor(tk.Tk):
         ttk.Button(form, text="Remove Widget", command=self._remove_widget).grid(
             row=7, column=3, padx=6, pady=4, sticky="w"
         )
+
+        self.widget_kind.trace_add("write", lambda *_: self._sync_widget_fields())
+        self._sync_widget_fields()
 
     # ------------------------
     # Helpers
@@ -400,7 +409,8 @@ class LayoutEditor(tk.Tk):
         self.data_label.delete(0, tk.END)
         self.data_label.insert(0, item.get("label", ""))
         self.data_channels.delete(0, tk.END)
-        self.data_channels.insert(0, ", ".join(item.get("channels", [])))
+        channels = self._clean_channels(item.get("channels", []))
+        self.data_channels.insert(0, ", ".join(channels))
         chart = item.get("chart", {})
         self.data_chart.set(chart.get("enabled", True))
 
@@ -408,7 +418,7 @@ class LayoutEditor(tk.Tk):
         item = {
             "id": self.data_id.get().strip(),
             "label": self.data_label.get().strip(),
-            "channels": self._split_list(self.data_channels.get()),
+            "channels": self._clean_channels(self._split_list(self.data_channels.get())),
             "chart": {"enabled": bool(self.data_chart.get())},
         }
         self.data["data_tab"]["tabs"].append(item)
@@ -421,7 +431,7 @@ class LayoutEditor(tk.Tk):
         self.data["data_tab"]["tabs"][idx] = {
             "id": self.data_id.get().strip(),
             "label": self.data_label.get().strip(),
-            "channels": self._split_list(self.data_channels.get()),
+            "channels": self._clean_channels(self._split_list(self.data_channels.get())),
             "chart": {"enabled": bool(self.data_chart.get())},
         }
         self._refresh_lists()
@@ -541,33 +551,49 @@ class LayoutEditor(tk.Tk):
             self.section_list.insert(tk.END, s.get("title", "Section"))
         self.widget_list.delete(0, tk.END)
         if entry.get("sections"):
+            self.section_list.selection_clear(0, tk.END)
             self.section_list.selection_set(0)
-            self._load_section()
+            self.section_list.activate(0)
+            self.section_list.see(0)
+            self._load_section_for(idx, 0)
 
-    def _load_section(self) -> None:
+    def _load_section_from_selection(self) -> None:
         s_idx = self._selected_index(self.section_list)
         e_idx = self._selected_index(self.state_entry_list)
         if e_idx is None or s_idx is None:
             return
+        self._load_section_for(e_idx, s_idx)
+
+    def _load_section_for(self, e_idx: int, s_idx: int) -> None:
         section = self.data["state_tab"]["states"][e_idx]["sections"][s_idx]
         self.section_title.delete(0, tk.END)
         self.section_title.insert(0, section.get("title", ""))
         self.widget_list.delete(0, tk.END)
-        for w in section.get("widgets", []):
+        widgets = section.get("widgets", [])
+        if not isinstance(widgets, list):
+            widgets = []
+            section["widgets"] = widgets
+        for w in widgets:
             label = w.get("kind", "widget")
             if w.get("data_type"):
                 label = f"{label} ({w.get('data_type')})"
             self.widget_list.insert(tk.END, label)
-        if section.get("widgets"):
+        if widgets:
+            self.widget_list.selection_clear(0, tk.END)
             self.widget_list.selection_set(0)
-            self._load_widget()
+            self.widget_list.activate(0)
+            self.widget_list.see(0)
+            self._load_widget_for(e_idx, s_idx, 0)
 
-    def _load_widget(self) -> None:
+    def _load_widget_from_selection(self) -> None:
         e_idx = self._selected_index(self.state_entry_list)
         s_idx = self._selected_index(self.section_list)
         w_idx = self._selected_index(self.widget_list)
         if None in (e_idx, s_idx, w_idx):
             return
+        self._load_widget_for(e_idx, s_idx, w_idx)
+
+    def _load_widget_for(self, e_idx: int, s_idx: int, w_idx: int) -> None:
         widget = self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["widgets"][w_idx]
         self.widget_kind.set(widget.get("kind", "summary"))
         self.widget_data_type.delete(0, tk.END)
@@ -580,6 +606,7 @@ class LayoutEditor(tk.Tk):
         self.widget_height.insert(0, str(widget.get("height", "")))
         self.widget_items.delete(0, tk.END)
         self.widget_items.insert(0, self._format_items(widget.get("items", [])))
+        self._sync_widget_fields()
 
     def _add_state_entry(self) -> None:
         entry = {"states": self._split_list(self.state_states.get()), "sections": []}
@@ -641,7 +668,7 @@ class LayoutEditor(tk.Tk):
             return
         widget = self._widget_from_form()
         self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["widgets"].append(widget)
-        self._load_section()
+        self._load_section_from_selection()
 
     def _update_widget(self) -> None:
         e_idx = self._selected_index(self.state_entry_list)
@@ -655,7 +682,7 @@ class LayoutEditor(tk.Tk):
         self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["widgets"][w_idx] = (
             self._widget_from_form()
         )
-        self._load_section()
+        self._load_section_from_selection()
         self.widget_list.selection_set(w_idx)
 
     def _remove_widget(self) -> None:
@@ -668,7 +695,7 @@ class LayoutEditor(tk.Tk):
             )
             return
         self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["widgets"].pop(w_idx)
-        self._load_section()
+        self._load_section_from_selection()
 
     # ------------------------
     # Utility
@@ -679,6 +706,9 @@ class LayoutEditor(tk.Tk):
 
     def _split_list(self, text: str) -> list[str]:
         return [s.strip() for s in text.split(",") if s.strip()]
+
+    def _clean_channels(self, channels: list[str]) -> list[str]:
+        return [c.strip() for c in channels if str(c).strip()]
 
     def _format_items(self, items: list[dict]) -> str:
         parts = []
@@ -726,6 +756,21 @@ class LayoutEditor(tk.Tk):
         if items:
             widget["items"] = items
         return widget
+
+    def _sync_widget_fields(self) -> None:
+        kind = self.widget_kind.get()
+        enable_data_type = kind in ("summary", "chart")
+        enable_items = kind == "summary"
+        enable_chart = kind == "chart"
+
+        self._set_entry_state(self.widget_data_type, enable_data_type)
+        self._set_entry_state(self.widget_items, enable_items)
+        self._set_entry_state(self.widget_chart_title, enable_chart)
+        self._set_entry_state(self.widget_width, enable_chart)
+        self._set_entry_state(self.widget_height, enable_chart)
+
+    def _set_entry_state(self, entry: ttk.Entry, enabled: bool) -> None:
+        entry.configure(state="normal" if enabled else "disabled")
 
     def _move_list_item(self, items: list, listbox: tk.Listbox, delta: int) -> None:
         idx = self._selected_index(listbox)

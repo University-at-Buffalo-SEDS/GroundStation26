@@ -361,7 +361,8 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
 # -----------------------------
 def macos_deploy(frontend_dir: Path) -> Path:
     """
-    Copies the built .app bundle into /Applications, replacing any existing copy.
+    Copies the built .app bundle into /Applications as APP_NAME.app,
+    replacing any existing copy.
 
     Notes:
     - This is a local convenience deploy (NOT notarization, NOT dmg/pkg).
@@ -377,16 +378,17 @@ def macos_deploy(frontend_dir: Path) -> Path:
         raise FileNotFoundError(f"App bundle not found: {src_app}")
 
     applications_dir = Path("/Applications")
-    dst_app = applications_dir / src_app.name
 
-    print(f"Deploying macOS app → {dst_app}")
+    # ✅ Always install as APP_NAME.app (even if source is legacy name)
+    dst_app = applications_dir / APP_BUNDLE_NAME
+
+    print(f"Deploying macOS app → {dst_app} (from {src_app.name})")
 
     if dst_app.exists():
         print(f"Removing existing /Applications copy: {dst_app}")
         shutil.rmtree(dst_app)
 
     try:
-        # copytree preserves bundle structure
         shutil.copytree(src_app, dst_app, symlinks=True)
     except PermissionError as e:
         print(
@@ -401,6 +403,7 @@ def macos_deploy(frontend_dir: Path) -> Path:
 
     print(f"✅ Deployed: {dst_app}")
     return dst_app
+
 
 
 # -----------------------------

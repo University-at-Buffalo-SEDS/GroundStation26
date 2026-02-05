@@ -77,80 +77,199 @@
       {
         "id": "GYRO_DATA",
         "label": "GYRO_DATA",
-        "channels": ["Roll", "Pitch", "Yaw", "", "", "", "", ""],
-        "chart": { "enabled": true }
+        "channels": [
+          "Roll",
+          "Pitch",
+          "Yaw",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "chart": {
+          "enabled": true
+        }
       },
       {
         "id": "ACCEL_DATA",
         "label": "ACCEL_DATA",
-        "channels": ["X Accel", "Y Accel", "Z Accel", "", "", "", "", ""],
-        "chart": { "enabled": true }
+        "channels": [
+          "X Accel",
+          "Y Accel",
+          "Z Accel",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "chart": {
+          "enabled": true
+        }
       },
       {
         "id": "BAROMETER_DATA",
         "label": "BAROMETER_DATA",
-        "channels": ["Pressure", "Temp", "Altitude", "", "", "", "", ""],
-        "chart": { "enabled": true }
+        "channels": [
+          "Pressure",
+          "Temp",
+          "Altitude",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "chart": {
+          "enabled": true
+        }
       },
       {
         "id": "KALMAN_FILTER_DATA",
         "label": "KALMAN_FILTER_DATA",
-        "channels": ["X", "Y", "Z", "", "", "", "", ""],
-        "chart": { "enabled": true }
+        "channels": [
+          "X",
+          "Y",
+          "Z",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "chart": {
+          "enabled": true
+        }
       },
       {
         "id": "GPS_DATA",
         "label": "GPS_DATA",
-        "channels": ["Lat", "Lon", "", "", "", "", "", ""],
-        "chart": { "enabled": true }
+        "channels": [
+          "Lat",
+          "Lon",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "chart": {
+          "enabled": true
+        }
       },
       {
         "id": "FUEL_TANK_PRESSURE",
         "label": "FUEL_TANK_PRESSURE",
-        "channels": ["Tank Pressure", "", "", "", "", "", "", ""],
-        "chart": { "enabled": true }
+        "channels": [
+          "Tank Pressure",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "chart": {
+          "enabled": true
+        }
       },
       {
         "id": "BATTERY_VOLTAGE",
         "label": "BATTERY_VOLTAGE",
-        "channels": ["Voltage", "", "", "", "", "", "", ""],
-        "chart": { "enabled": true }
+        "channels": [
+          "Voltage",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "chart": {
+          "enabled": true
+        }
       },
       {
         "id": "BATTERY_CURRENT",
         "label": "BATTERY_CURRENT",
-        "channels": ["Current", "", "", "", "", "", "", ""],
-        "chart": { "enabled": true }
+        "channels": [
+          "Current",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "chart": {
+          "enabled": true
+        }
       },
       {
         "id": "FUEL_FLOW",
         "label": "FUEL_FLOW",
-        "channels": ["Flow Rate", "", "", "", "", "", "", ""],
-        "chart": { "enabled": true }
+        "channels": [
+          "Flow Rate",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "chart": {
+          "enabled": true
+        }
       },
       {
         "id": "VALVE_STATE",
         "label": "VALVE_STATE",
-        "channels": ["Pilot", "NormallyOpen", "Dump", "Igniter", "Nitrogen", "Nitrous", "Fill Lines", ""],
-        "chart": { "enabled": true }
+        "channels": [
+          "Pilot",
+          "NormallyOpen",
+          "Dump",
+          "Igniter",
+          "Nitrogen",
+          "Nitrous",
+          "Fill Lines",
+          ""
+        ],
+        "chart": {
+          "enabled": true
+        }
       }
     ]
   },
   "state_tab": {
     "states": [
       {
-        "states": ["Startup"],
+        "states": [
+          "Startup"
+        ],
         "sections": [
           {
             "title": "Connected Devices",
             "widgets": [
-              { "kind": "board_status" }
+              {
+                "kind": "board_status"
+              }
             ]
           }
         ]
       },
       {
-        "states": ["PreFill", "FillTest", "NitrogenFill", "NitrousFill"],
+        "states": [
+          "PreFill",
+          "FillTest",
+          "NitrogenFill",
+          "NitrousFill"
+        ],
         "sections": [
           {
             "title": "Pressure",
@@ -159,7 +278,10 @@
                 "kind": "summary",
                 "data_type": "FUEL_TANK_PRESSURE",
                 "items": [
-                  { "label": "Tank Pressure", "index": 0 }
+                  {
+                    "label": "Tank Pressure",
+                    "index": 0
+                  }
                 ]
               },
               {
@@ -174,19 +296,25 @@
           {
             "title": "Valve States",
             "widgets": [
-              { "kind": "valve_state" }
+              {
+                "kind": "valve_state"
+              }
             ]
           },
           {
             "title": "Actions",
             "widgets": [
-              { "kind": "actions" }
+              {
+                "kind": "actions"
+              }
             ]
           }
         ]
       },
       {
-        "states": ["Armed"],
+        "states": [
+          "Armed"
+        ],
         "sections": [
           {
             "title": "Pressure",
@@ -195,7 +323,10 @@
                 "kind": "summary",
                 "data_type": "FUEL_TANK_PRESSURE",
                 "items": [
-                  { "label": "Tank Pressure", "index": 0 }
+                  {
+                    "label": "Tank Pressure",
+                    "index": 0
+                  }
                 ]
               },
               {
@@ -210,19 +341,30 @@
           {
             "title": "Valve States",
             "widgets": [
-              { "kind": "valve_state" }
+              {
+                "kind": "valve_state"
+              }
             ]
           },
           {
             "title": "Actions",
             "widgets": [
-              { "kind": "actions" }
+              {
+                "kind": "actions"
+              }
             ]
           }
         ]
       },
       {
-        "states": ["Launch", "Ascent", "Coast", "Apogee", "ParachuteDeploy", "Descent"],
+        "states": [
+          "Launch",
+          "Ascent",
+          "Coast",
+          "Apogee",
+          "ParachuteDeploy",
+          "Descent"
+        ],
         "sections": [
           {
             "title": "Altitude",
@@ -231,9 +373,18 @@
                 "kind": "summary",
                 "data_type": "BAROMETER_DATA",
                 "items": [
-                  { "label": "Altitude", "index": 2 },
-                  { "label": "Pressure", "index": 0 },
-                  { "label": "Temp", "index": 1 }
+                  {
+                    "label": "Altitude",
+                    "index": 2
+                  },
+                  {
+                    "label": "Pressure",
+                    "index": 0
+                  },
+                  {
+                    "label": "Temp",
+                    "index": 1
+                  }
                 ]
               },
               {
@@ -252,9 +403,18 @@
                 "kind": "summary",
                 "data_type": "ACCEL_DATA",
                 "items": [
-                  { "label": "Accel X", "index": 0 },
-                  { "label": "Accel Y", "index": 1 },
-                  { "label": "Accel Z", "index": 2 }
+                  {
+                    "label": "Accel X",
+                    "index": 0
+                  },
+                  {
+                    "label": "Accel Y",
+                    "index": 1
+                  },
+                  {
+                    "label": "Accel Z",
+                    "index": 2
+                  }
                 ]
               },
               {
@@ -273,9 +433,18 @@
                 "kind": "summary",
                 "data_type": "KALMAN_FILTER_DATA",
                 "items": [
-                  { "label": "Kalman X", "index": 0 },
-                  { "label": "Kalman Y", "index": 1 },
-                  { "label": "Kalman Z", "index": 2 }
+                  {
+                    "label": "Kalman X",
+                    "index": 0
+                  },
+                  {
+                    "label": "Kalman Y",
+                    "index": 1
+                  },
+                  {
+                    "label": "Kalman Z",
+                    "index": 2
+                  }
                 ]
               },
               {
@@ -290,35 +459,49 @@
           {
             "title": "Actions",
             "widgets": [
-              { "kind": "actions" }
+              {
+                "kind": "actions"
+              }
             ]
           }
         ]
       },
       {
-        "states": ["Landed", "Recovery"],
+        "states": [
+          "Landed",
+          "Recovery"
+        ],
         "sections": [
           {
             "title": "Recovery Map",
             "widgets": [
-              { "kind": "map" }
+              {
+                "kind": "map"
+              }
             ]
           },
           {
             "title": "Actions",
             "widgets": [
-              { "kind": "actions" }
+              {
+                "kind": "actions"
+              }
             ]
           }
         ]
       },
       {
-        "states": ["Idle", "Aborted"],
+        "states": [
+          "Idle",
+          "Aborted"
+        ],
         "sections": [
           {
             "title": "Actions",
             "widgets": [
-              { "kind": "actions" }
+              {
+                "kind": "actions"
+              }
             ]
           }
         ]
