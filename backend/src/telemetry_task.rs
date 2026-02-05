@@ -8,7 +8,6 @@ use crate::radio::RadioDevice;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
 use groundstation_shared::Board;
-use serde_json;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
@@ -324,8 +323,8 @@ pub async fn handle_packet(state: &Arc<AppState>) {
                     )
                         .bind(ts_ms)
                         .bind(VALVE_STATE_DATA_TYPE)
-                        .bind(values_json.clone())
-                        .bind(values_vec.get(0).copied().flatten())
+                        .bind(values_json.as_str())
+                        .bind(values_vec.first().copied().flatten())
                         .bind(values_vec.get(1).copied().flatten())
                         .bind(values_vec.get(2).copied().flatten())
                         .bind(values_vec.get(3).copied().flatten())

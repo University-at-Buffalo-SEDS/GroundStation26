@@ -91,6 +91,7 @@ class LayoutEditor(tk.Tk):
         self.notebook.add(self.actions_tab_frame, text="Actions")
         self.notebook.add(self.state_tab_frame, text="State Layout")
 
+        self._suspend_events = False
         self._build_data_tab()
         self._build_connection_tab()
         self._build_actions_tab()
@@ -346,6 +347,9 @@ class LayoutEditor(tk.Tk):
             entry.insert(0, hex_color)
 
     def _refresh_lists(self) -> None:
+        self._with_suspended_events(self._refresh_lists_inner)
+
+    def _refresh_lists_inner(self) -> None:
         self.data_list.delete(0, tk.END)
         for t in self.data["data_tab"]["tabs"]:
             self.data_list.insert(tk.END, t.get("label") or t.get("id") or "tab")
@@ -535,11 +539,14 @@ class LayoutEditor(tk.Tk):
             self.section_list.insert(tk.END, s.get("title", "Section"))
         self.widget_list.delete(0, tk.END)
         if entry.get("sections"):
-            self.section_list.selection_clear(0, tk.END)
-            self.section_list.selection_set(0)
-            self.section_list.activate(0)
-            self.section_list.see(0)
-            self._load_section_for(idx, 0)
+            def _select_first() -> None:
+                self.section_list.selection_clear(0, tk.END)
+                self.section_list.selection_set(0)
+                self.section_list.activate(0)
+                self.section_list.see(0)
+                self._load_section_for(idx, 0)
+
+            self._with_suspended_events(_select_first)
 
     def _load_section_from_selection(self) -> None:
         s_idx = self._selected_index(self.section_list)
@@ -562,11 +569,14 @@ class LayoutEditor(tk.Tk):
         for w in widgets:
             self.widget_list.insert(tk.END, self._widget_label(w))
         if widgets:
-            self.widget_list.selection_clear(0, tk.END)
-            self.widget_list.selection_set(0)
-            self.widget_list.activate(0)
-            self.widget_list.see(0)
-            self._load_widget_for(e_idx, s_idx, 0)
+            def _select_first() -> None:
+                self.widget_list.selection_clear(0, tk.END)
+                self.widget_list.selection_set(0)
+                self.widget_list.activate(0)
+                self.widget_list.see(0)
+                self._load_widget_for(e_idx, s_idx, 0)
+
+            self._with_suspended_events(_select_first)
 
     def _load_widget_from_selection(self) -> None:
         e_idx = self._selected_index(self.state_entry_list)
@@ -756,7 +766,7 @@ class LayoutEditor(tk.Tk):
             "chart": {"enabled": bool(self.data_chart.get())},
         }
         self._refresh_lists()
-        self.data_list.selection_set(idx)
+        self._with_suspended_events(lambda: self.data_list.selection_set(idx))
 
     def _commit_conn_form(self) -> None:
         idx = self._conn_selected_idx
@@ -767,7 +777,7 @@ class LayoutEditor(tk.Tk):
             "title": self.conn_title.get().strip(),
         }
         self._refresh_lists()
-        self.conn_list.selection_set(idx)
+        self._with_suspended_events(lambda: self.conn_list.selection_set(idx))
 
     def _commit_action_form(self) -> None:
         idx = self._actions_selected_idx
@@ -775,7 +785,7 @@ class LayoutEditor(tk.Tk):
             return
         self.data["actions_tab"]["actions"][idx] = self._action_from_form()
         self._refresh_lists()
-        self.actions_list.selection_set(idx)
+        self._with_suspended_events(lambda: self.actions_list.selection_set(idx))
 
     def _commit_state_form(self) -> None:
         e_idx = self._state_entry_selected_idx
@@ -784,72 +794,142 @@ class LayoutEditor(tk.Tk):
         states = self._split_list(self.state_states.get())
         self.data["state_tab"]["states"][e_idx]["states"] = states
         if e_idx < self.state_entry_list.size():
-            self.state_entry_list.delete(e_idx)
-            self.state_entry_list.insert(e_idx, ", ".join(states) or "state entry")
-            self.state_entry_list.selection_set(e_idx)
+            def _update_entry() -> None:
+                self.state_entry_list.delete(e_idx)
+                self.state_entry_list.insert(e_idx, ", ".join(states) or "state entry")
+                self.state_entry_list.selection_set(e_idx)
+
+            self._with_suspended_events(_update_entry)
 
         sections = self.data["state_tab"]["states"][e_idx]["sections"]
         s_idx = self._state_section_selected_idx
         if s_idx is not None and s_idx < len(sections):
             sections[s_idx]["title"] = self.section_title.get().strip()
             if s_idx < self.section_list.size():
-                self.section_list.delete(s_idx)
-                self.section_list.insert(s_idx, sections[s_idx].get("title") or "Section")
-                self.section_list.selection_set(s_idx)
+                def _update_section() -> None:
+                    self.section_list.delete(s_idx)
+                    self.section_list.insert(
+                        s_idx, sections[s_idx].get("title") or "Section"
+                    )
+                    self.section_list.selection_set(s_idx)
+
+                self._with_suspended_events(_update_section)
 
             widgets = sections[s_idx].get("widgets", [])
             w_idx = self._state_widget_selected_idx
             if w_idx is not None and w_idx < len(widgets):
                 widgets[w_idx] = self._widget_from_form()
                 if w_idx < self.widget_list.size():
-                    self.widget_list.delete(w_idx)
-                    self.widget_list.insert(w_idx, self._widget_label(widgets[w_idx]))
-                    self.widget_list.selection_set(w_idx)
+                    def _update_widget() -> None:
+                        self.widget_list.delete(w_idx)
+                        self.widget_list.insert(w_idx, self._widget_label(widgets[w_idx]))
+                        self.widget_list.selection_set(w_idx)
+
+                    self._with_suspended_events(_update_widget)
 
     def _on_data_select(self) -> None:
+        if self._suspend_events:
+            return
+        new_idx = self._selected_index(self.data_list)
         self._commit_data_form()
+        if new_idx is None:
+            return
+        def _select_data() -> None:
+            self.data_list.selection_clear(0, tk.END)
+            self.data_list.selection_set(new_idx)
+            self.data_list.activate(new_idx)
+            self.data_list.see(new_idx)
+
+        self._with_suspended_events(_select_data)
         self._load_data_item()
 
     def _on_conn_select(self) -> None:
+        if self._suspend_events:
+            return
+        new_idx = self._selected_index(self.conn_list)
         self._commit_conn_form()
+        if new_idx is None:
+            return
+        def _select_conn() -> None:
+            self.conn_list.selection_clear(0, tk.END)
+            self.conn_list.selection_set(new_idx)
+            self.conn_list.activate(new_idx)
+            self.conn_list.see(new_idx)
+
+        self._with_suspended_events(_select_conn)
         self._load_conn_item()
 
     def _on_action_select(self) -> None:
+        if self._suspend_events:
+            return
+        new_idx = self._selected_index(self.actions_list)
         self._commit_action_form()
+        if new_idx is None:
+            return
+        def _select_action() -> None:
+            self.actions_list.selection_clear(0, tk.END)
+            self.actions_list.selection_set(new_idx)
+            self.actions_list.activate(new_idx)
+            self.actions_list.see(new_idx)
+
+        self._with_suspended_events(_select_action)
         self._load_action_item()
 
     def _on_state_entry_select(self) -> None:
+        if self._suspend_events:
+            return
         new_idx = self._selected_index(self.state_entry_list)
         self._commit_state_form()
         if new_idx is None:
             return
-        self.state_entry_list.selection_clear(0, tk.END)
-        self.state_entry_list.selection_set(new_idx)
-        self.state_entry_list.activate(new_idx)
-        self.state_entry_list.see(new_idx)
-        self._load_state_entry()
+        def _select_entry() -> None:
+            self.state_entry_list.selection_clear(0, tk.END)
+            self.state_entry_list.selection_set(new_idx)
+            self.state_entry_list.activate(new_idx)
+            self.state_entry_list.see(new_idx)
+            self._load_state_entry()
+
+        self._with_suspended_events(_select_entry)
 
     def _on_section_select(self) -> None:
+        if self._suspend_events:
+            return
         new_idx = self._selected_index(self.section_list)
         self._commit_state_form()
         if new_idx is None:
             return
-        self.section_list.selection_clear(0, tk.END)
-        self.section_list.selection_set(new_idx)
-        self.section_list.activate(new_idx)
-        self.section_list.see(new_idx)
-        self._load_section_from_selection()
+        def _select_section() -> None:
+            self.section_list.selection_clear(0, tk.END)
+            self.section_list.selection_set(new_idx)
+            self.section_list.activate(new_idx)
+            self.section_list.see(new_idx)
+            self._load_section_from_selection()
+
+        self._with_suspended_events(_select_section)
 
     def _on_widget_select(self) -> None:
+        if self._suspend_events:
+            return
         new_idx = self._selected_index(self.widget_list)
         self._commit_state_form()
         if new_idx is None:
             return
-        self.widget_list.selection_clear(0, tk.END)
-        self.widget_list.selection_set(new_idx)
-        self.widget_list.activate(new_idx)
-        self.widget_list.see(new_idx)
-        self._load_widget_from_selection()
+        def _select_widget() -> None:
+            self.widget_list.selection_clear(0, tk.END)
+            self.widget_list.selection_set(new_idx)
+            self.widget_list.activate(new_idx)
+            self.widget_list.see(new_idx)
+            self._load_widget_from_selection()
+
+        self._with_suspended_events(_select_widget)
+
+    def _with_suspended_events(self, callback) -> None:
+        prev = self._suspend_events
+        self._suspend_events = True
+        try:
+            callback()
+        finally:
+            self._suspend_events = prev
 
 
 if __name__ == "__main__":
