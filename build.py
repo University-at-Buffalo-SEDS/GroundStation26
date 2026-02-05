@@ -197,7 +197,15 @@ def build_docker(repo_root: Path, pi_build: bool, testing: bool) -> None:
 def patch_plist(frontend_dir: Path) -> None:
     script = frontend_dir / "scripts" / "patch_plist.sh"
     version = _read_frontend_version(frontend_dir)
-    run_script(script, cwd=frontend_dir, env={"APP_VERSION": version})
+    build = _read_dioxus_build(frontend_dir)
+    run_script(
+        script,
+        cwd=frontend_dir,
+        env={
+            "APP_VERSION": version,
+            "APP_BUILD": build,
+        },
+    )
 
 
 def _read_frontend_version(frontend_dir: Path) -> str:
@@ -222,6 +230,24 @@ def _read_frontend_version(frontend_dir: Path) -> str:
                 return m.group(1)
 
     raise ValueError(f"Failed to read frontend version from: {cargo_toml}")
+
+
+def _read_dioxus_build(frontend_dir: Path) -> str:
+    dioxus_toml = frontend_dir / "Dioxus.toml"
+    raw = dioxus_toml.read_text(encoding="utf-8")
+    in_application = False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_application = stripped == "[application]"
+            continue
+        if in_application:
+            m = re.match(r'build\s*=\s*"([^"]+)"\s*$', stripped)
+            if m:
+                return m.group(1)
+    raise ValueError(f"Failed to read [application].build from: {dioxus_toml}")
+
+
 
 
 def dist_dir(frontend_dir: Path) -> Path:
@@ -286,7 +312,7 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
     if not app.exists():
         raise FileNotFoundError(f"App bundle not found: {app}")
 
-    # Ensure Info.plist is patched with the current version before signing.
+    # Ensure Info.plist is patched with the current version/build before signing.
     patch_plist(frontend_dir)
 
     profile = fixed_mobileprovision_path(frontend_dir)

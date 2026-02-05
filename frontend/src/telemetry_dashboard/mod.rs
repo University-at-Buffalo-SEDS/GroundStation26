@@ -960,6 +960,8 @@ fn TelemetryDashboardInner() -> Element {
     };
 
     // Reload button (web: full reload, native: remount inner UI)
+    let mut warnings = warnings;
+    let mut errors = errors;
     let reload_button: Element = rsx! {
         button {
             style: "
@@ -973,6 +975,8 @@ fn TelemetryDashboardInner() -> Element {
             ",
             onclick: move |_| {
                     charts_cache_request_refit();
+                    warnings.set(Vec::new());
+                    errors.set(Vec::new());
 
                 reconnect_and_reload_ui();
             },

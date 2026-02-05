@@ -6,7 +6,7 @@ out_dir = "dist"
 asset_dir = "assets"
 icon = "assets/icon.png"
 category = "public.app-category.utilities"
-version = "0.1.2"
+build = "0.1.3"
 
 [web.app]
 title = "GroundStation 26"

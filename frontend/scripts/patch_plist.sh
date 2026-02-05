@@ -21,6 +21,7 @@ LEGACY_APP_NAME="GroundstationFrontend"
 APP_DIR="./dist/${APP_NAME}.app"
 PLIST="${APP_DIR}/Info.plist"
 VERSION_INPUT="${1:-${APP_VERSION:-}}"
+BUILD_INPUT="${2:-${APP_BUILD:-}}"
 
 ICON_SRC_DIR="./assets"
 ASSETS_CAR_SRC="${ICON_SRC_DIR}/Assets.car"
@@ -218,9 +219,13 @@ set_string "CFBundleName" "GroundStation 26"
 # Versioning (optional)
 if [[ -n "$VERSION_INPUT" ]]; then
   set_string "CFBundleShortVersionString" "$VERSION_INPUT"
-  set_string "CFBundleVersion" "$VERSION_INPUT"
 else
-  log "No version provided; skipping CFBundleShortVersionString/CFBundleVersion"
+  log "No version provided; skipping CFBundleShortVersionString"
+fi
+if [[ -n "$BUILD_INPUT" ]]; then
+  set_string "CFBundleVersion" "$BUILD_INPUT"
+elif [[ -n "$VERSION_INPUT" ]]; then
+  set_string "CFBundleVersion" "$VERSION_INPUT"
 fi
 
 # Asset-catalog icons:
