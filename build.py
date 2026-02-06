@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 try:
     import tomllib  # py3.11+
@@ -264,6 +265,38 @@ def app_bundle_path(frontend_dir: Path) -> Path:
     return preferred
 
 
+def rename_macos_app_bundle(frontend_dir: Path) -> Optional[Path]:
+    dist = dist_dir(frontend_dir)
+    preferred = dist / APP_BUNDLE_NAME
+    legacy = dist / LEGACY_APP_BUNDLE_NAME
+
+    if preferred.exists():
+        return preferred
+    if legacy.exists():
+        print(f"Renaming macOS app bundle: {legacy.name} -> {preferred.name}")
+        if preferred.exists():
+            shutil.rmtree(preferred)
+        legacy.rename(preferred)
+        return preferred
+    return None
+
+
+def remove_legacy_app_bundle(frontend_dir: Path) -> None:
+    dist = dist_dir(frontend_dir)
+    preferred = dist / APP_BUNDLE_NAME
+    legacy = dist / LEGACY_APP_BUNDLE_NAME
+    if preferred.exists() and legacy.exists():
+        print(f"Removing legacy macOS app bundle: {legacy}")
+        shutil.rmtree(legacy)
+
+
+def remove_legacy_dmgs(frontend_dir: Path) -> None:
+    dist = dist_dir(frontend_dir)
+    for dmg in sorted(dist.glob(f"{LEGACY_APP_NAME}*.dmg")):
+        print(f"Removing legacy dmg: {dmg}")
+        dmg.unlink()
+
+
 def clear_app_bundle(frontend_dir: Path) -> None:
     dist = dist_dir(frontend_dir)
     bundles = [dist / APP_BUNDLE_NAME, dist / LEGACY_APP_BUNDLE_NAME]
@@ -271,6 +304,13 @@ def clear_app_bundle(frontend_dir: Path) -> None:
         if bundle.exists():
             print(f"Removing existing app bundle: {bundle}")
             shutil.rmtree(bundle)
+
+    dmgs = [dist / f"{APP_NAME}.dmg", dist / f"{LEGACY_APP_NAME}.dmg"]
+    for dmg in dmgs:
+        if dmg.exists():
+            print(f"Removing existing dmg: {dmg}")
+            dmg.unlink()
+    remove_legacy_dmgs(frontend_dir)
 
 
 def rename_macos_dmg(frontend_dir: Path) -> Optional[Path]:
@@ -301,6 +341,160 @@ def rename_macos_dmg(frontend_dir: Path) -> Optional[Path]:
 
     print("Warning: multiple .dmg files found; leaving as-is.", file=sys.stderr)
     return None
+
+
+def rebuild_macos_dmg(frontend_dir: Path) -> Optional[Path]:
+    dist = dist_dir(frontend_dir)
+    app = rename_macos_app_bundle(frontend_dir) or app_bundle_path(frontend_dir)
+    if not app.exists():
+        raise FileNotFoundError(f"App bundle not found: {app}")
+
+    target = dist / f"{APP_NAME}.dmg"
+    legacy = dist / f"{LEGACY_APP_NAME}.dmg"
+
+    for dmg in [target, legacy]:
+        if dmg.exists():
+            dmg.unlink()
+
+    print(f"Creating macOS dmg: {target.name}")
+    with tempfile.TemporaryDirectory(prefix="gs26_dmg_") as temp_dir:
+        temp_path = Path(temp_dir)
+        staged_app = temp_path / APP_BUNDLE_NAME
+        shutil.copytree(app, staged_app, symlinks=True)
+        os.symlink("/Applications", temp_path / "Applications")
+        run(
+            [
+                "hdiutil",
+                "create",
+                "-volname",
+                APP_NAME,
+                "-srcfolder",
+                str(temp_path),
+                "-ov",
+                "-format",
+                "UDZO",
+                str(target),
+            ],
+            cwd=frontend_dir,
+        )
+    return target if target.exists() else None
+
+
+def _pick_codesign_identity(frontend_dir: Path, regex: str, pick: str) -> str:
+    out = run_capture(["security", "find-identity", "-v", "-p", "codesigning"], cwd=frontend_dir)
+    matches: list[str] = []
+    pat = re.compile(r'^\s*\d+\)\s+[0-9A-Fa-f]+\s+"([^"]+)"\s*$')
+    rx = re.compile(regex)
+
+    for line in out.splitlines():
+        m = pat.match(line.strip())
+        if not m:
+            continue
+        name = m.group(1)
+        if rx.search(name):
+            matches.append(name)
+
+    if not matches:
+        raise RuntimeError(f"No matching code signing identities for regex: {regex}")
+
+    if pick == "first":
+        return matches[-1]
+    return matches[0]
+
+
+def _macos_entitlements_path(frontend_dir: Path) -> Optional[Path]:
+    ent = os.environ.get("MACOS_ENTITLEMENTS", "").strip()
+    if not ent:
+        return None
+    p = Path(ent)
+    if not p.is_absolute():
+        p = frontend_dir / p
+    if not p.exists():
+        raise FileNotFoundError(f"Entitlements file not found: {p}")
+    return p
+
+
+def sign_macos_app_and_dmg(frontend_dir: Path) -> None:
+    if platform.system() != "Darwin":
+        print("Error: macOS signing requires macOS.", file=sys.stderr)
+        sys.exit(1)
+
+    app = rename_macos_app_bundle(frontend_dir) or app_bundle_path(frontend_dir)
+    if not app.exists():
+        raise FileNotFoundError(f"App bundle not found: {app}")
+
+    cert_regex = os.environ.get("CERT_REGEX", r"^Developer ID Application:")
+    cert_pick = os.environ.get("CERT_PICK", "newest")
+    identity = _pick_codesign_identity(frontend_dir, cert_regex, cert_pick)
+    entitlements = _macos_entitlements_path(frontend_dir)
+
+    print(f"Signing macOS app with identity: {identity}")
+    sign_cmd = [
+        "codesign",
+        "--force",
+        "--options",
+        "runtime",
+        "--timestamp",
+        "--sign",
+        identity,
+    ]
+    if entitlements:
+        sign_cmd.extend(["--entitlements", str(entitlements)])
+    sign_cmd.extend(["--deep", str(app)])
+    run(sign_cmd, cwd=frontend_dir)
+
+    dmg = rebuild_macos_dmg(frontend_dir)
+    if not dmg:
+        dmg = rename_macos_dmg(frontend_dir)
+    if not dmg or not dmg.exists():
+        print("Warning: no macOS .dmg found to sign.", file=sys.stderr)
+        return
+
+    print(f"Signing macOS dmg with identity: {identity}")
+    run(
+        [
+            "codesign",
+            "--force",
+            "--timestamp",
+            "--sign",
+            identity,
+            str(dmg),
+        ],
+        cwd=frontend_dir,
+    )
+
+
+def notarize_macos(frontend_dir: Path) -> None:
+    if platform.system() != "Darwin":
+        print("Error: macOS notarization requires macOS.", file=sys.stderr)
+        sys.exit(1)
+
+    dmg = rebuild_macos_dmg(frontend_dir)
+    if not dmg:
+        dmg = rename_macos_dmg(frontend_dir)
+    target = dmg if dmg and dmg.exists() else app_bundle_path(frontend_dir)
+    if not target.exists():
+        raise FileNotFoundError(f"Notarization target not found: {target}")
+
+    profile = os.environ.get("NOTARY_PROFILE", "").strip()
+    apple_id = os.environ.get("NOTARY_APPLE_ID", "").strip()
+    team_id = os.environ.get("NOTARY_TEAM_ID", "").strip()
+    password = os.environ.get("NOTARY_PASSWORD", "").strip()
+
+    auth_args: list[str]
+    if profile:
+        auth_args = ["--keychain-profile", profile]
+    elif apple_id and team_id and password:
+        auth_args = ["--apple-id", apple_id, "--team-id", team_id, "--password", password]
+    else:
+        raise RuntimeError(
+            "Missing notarization credentials. Set NOTARY_PROFILE or "
+            "NOTARY_APPLE_ID + NOTARY_TEAM_ID + NOTARY_PASSWORD."
+        )
+
+    print(f"Notarizing macOS artifact: {target.name}")
+    run(["xcrun", "notarytool", "submit", str(target), "--wait", *auth_args], cwd=frontend_dir)
+    run(["xcrun", "stapler", "staple", str(target)], cwd=frontend_dir)
 
 
 def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
@@ -509,7 +703,10 @@ def build_frontend(
         run(cmd, cwd=frontend_dir)
 
         if platform_name == "macos":
-            rename_macos_dmg(frontend_dir)
+            rename_macos_app_bundle(frontend_dir)
+            remove_legacy_app_bundle(frontend_dir)
+            remove_legacy_dmgs(frontend_dir)
+            sign_macos_app_and_dmg(frontend_dir)
 
         if platform_name == "ios":
             patch_plist(frontend_dir)
@@ -573,6 +770,8 @@ def print_usage() -> None:
     print("  ./build.py ios_sign                # package+sign (Dev) existing dist app -> IPA")
     print("  ./build.py ios_dist_sign           # package+sign (Distribution) existing dist app -> IPA")
     print("  ./build.py macos_deploy            # build macos + copy .app into /Applications")
+    print("  ./build.py macos_sign              # sign existing macos app + dmg (Developer ID)")
+    print("  ./build.py macos_notarize          # build macos + sign + notarize + staple")
     print("")
     print("Provisioning profile path (fixed):")
     print(f"  frontend/{FIXED_MOBILEPROVISION_REL}")
@@ -580,6 +779,12 @@ def print_usage() -> None:
     print("Env (optional):")
     print("  CERT_REGEX=...                     # override cert regex for signer script")
     print("  CERT_PICK=newest|first             # override cert selection for signer script")
+    print("  MACOS_ENTITLEMENTS=...             # optional entitlements file for macOS codesign")
+    print("  NOTARY_PROFILE=...                 # notarytool keychain profile (preferred)")
+    print("  NOTARY_APPLE_ID=...                # notarytool Apple ID (alt auth)")
+    print("  NOTARY_TEAM_ID=...                 # notarytool team ID (alt auth)")
+    print("  NOTARY_PASSWORD=...                # notarytool app-specific password (alt auth)")
+    print("  existing                           # skip build step for frontend actions/builds")
     print("  GROUNDSTATION_NO_PARALLEL=1        # force sequential build")
     print("  GS26_WINDOWS_TARGET=...            # override windows Rust target (default x86_64-pc-windows-gnu)")
     print("  GS26_MACOS_TARGET=...              # override macos Rust target (auto-detects by default)")
@@ -591,14 +796,15 @@ def main() -> None:
     force_no_pi = False
     docker_mode = False
     testing_mode = False
+    use_existing = False
 
     frontend_only_platform: Optional[str] = None
     frontend_rust_target: Optional[str] = None
-    action: Optional[str] = None  # ios_deploy | ios_sign | ios_dist_sign | macos_deploy
+    action: Optional[str] = None  # ios_deploy | ios_sign | ios_dist_sign | macos_deploy | macos_sign | macos_notarize
 
     args = [a.strip().lower() for a in sys.argv[1:]]
 
-    if len(args) > 4:
+    if len(args) > 5:
         print("Error: Too many arguments.", file=sys.stderr)
         print_usage()
 
@@ -614,7 +820,7 @@ def main() -> None:
         "linux": ("linux", None),
     }
 
-    actions = {"ios_deploy", "ios_sign", "ios_dist_sign", "macos_deploy"}
+    actions = {"ios_deploy", "ios_sign", "ios_dist_sign", "macos_deploy", "macos_sign", "macos_notarize"}
 
     for arg in args:
         if arg == "pi_build":
@@ -625,6 +831,8 @@ def main() -> None:
             docker_mode = True
         elif arg == "testing":
             testing_mode = True
+        elif arg == "existing":
+            use_existing = True
         elif arg in actions:
             if action or frontend_only_platform:
                 print("Error: Only one frontend action/build may be specified.", file=sys.stderr)
@@ -655,26 +863,47 @@ def main() -> None:
 
         if action == "ios_deploy":
             # NOTE: per your latest direction, this is now just "package and sign" (no local deploy)
-            build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
+            if not use_existing:
+                build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
             print(f"✅ Distribution IPA created: {ipa}")
             return
 
         if action == "ios_sign":
+            if not use_existing:
+                build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="development")
             print(f"✅ Dev IPA created: {ipa}")
             return
 
         if action == "ios_dist_sign":
+            if not use_existing:
+                build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
             print(f"✅ Distribution IPA created: {ipa}")
             return
 
         if action == "macos_deploy":
             # Build + copy into /Applications
-            build_frontend(frontend_dir, platform_name="macos", rust_target=None)
+            if not use_existing:
+                build_frontend(frontend_dir, platform_name="macos", rust_target=None)
+            sign_macos_app_and_dmg(frontend_dir)
             deployed = macos_deploy(frontend_dir)
             print(f"✅ Installed into /Applications: {deployed}")
+            return
+
+        if action == "macos_sign":
+            if not use_existing:
+                build_frontend(frontend_dir, platform_name="macos", rust_target=None)
+            sign_macos_app_and_dmg(frontend_dir)
+            print("✅ Signed macOS app and dmg")
+            return
+
+        if action == "macos_notarize":
+            if not use_existing:
+                build_frontend(frontend_dir, platform_name="macos", rust_target=None)
+            notarize_macos(frontend_dir)
+            print("✅ Notarized macOS artifact")
             return
 
         print("Error: unknown action", file=sys.stderr)
@@ -685,6 +914,9 @@ def main() -> None:
         if docker_mode or force_pi or force_no_pi or testing_mode:
             print("Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing.", file=sys.stderr)
             print_usage()
+        if use_existing:
+            print("Skipping frontend build (existing requested).")
+            return
         build_frontend(frontend_dir, platform_name=frontend_only_platform, rust_target=frontend_rust_target)
         return
 
