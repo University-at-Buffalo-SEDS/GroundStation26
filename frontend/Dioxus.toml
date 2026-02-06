@@ -1,15 +1,15 @@
 [application]
-name = "GroundStation 26"
+name = "UBSEDS GS"
 default_platform = "web"
 out_dir = "dist"
 # This folder is copied into the output dir after build/serve
 asset_dir = "assets"
 icon = "assets/icon.png"
 category = "public.app-category.utilities"
-build = "0.1.6"
+build = "0.1.7"
 
 [web.app]
-title = "GroundStation 26"
+title = "UBSEDS GroundStation"
 
 [web.watcher]
 watch_path = ["src", "assets"]
@@ -21,7 +21,7 @@ level = "3"
 debug = false
 
 [bundle]
-name = "GroundStation 26"
+name = "UBSEDS GS"
 identifier = "com.UBSEDS.GS26"
 publisher = "UBSEDS"
 icon = ["assets/icon.png"]

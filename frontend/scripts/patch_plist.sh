@@ -16,7 +16,7 @@ set -euo pipefail
 
 debug=false
 
-APP_NAME="GroundStation 26"
+APP_NAME="UBSEDS GS"
 LEGACY_APP_NAME="GroundstationFrontend"
 APP_DIR="./dist/${APP_NAME}.app"
 PLIST="${APP_DIR}/Info.plist"
@@ -213,8 +213,8 @@ fi
 dump_plist_sections
 
 # Human-facing names
-set_string "CFBundleDisplayName" "GS 26"
-set_string "CFBundleName" "GroundStation 26"
+set_string "CFBundleDisplayName" "SEDS GS"
+set_string "CFBundleName" "SEDS GroundStation"
 
 # Versioning (optional)
 if [[ -n "$VERSION_INPUT" ]]; then

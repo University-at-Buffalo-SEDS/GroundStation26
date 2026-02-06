@@ -15,7 +15,7 @@ from pathlib import Path
 from subprocess import DEVNULL
 from typing import Optional, Literal
 
-APP_NAME = "GroundStation 26"
+APP_NAME = "UBSEDS GS"
 LEGACY_APP_NAME = "GroundstationFrontend"
 DIST_DIRNAME = "dist"
 APP_BUNDLE_NAME = f"{APP_NAME}.app"
@@ -273,6 +273,36 @@ def clear_app_bundle(frontend_dir: Path) -> None:
             shutil.rmtree(bundle)
 
 
+def rename_macos_dmg(frontend_dir: Path) -> Optional[Path]:
+    dist = dist_dir(frontend_dir)
+    expected = dist / f"{APP_NAME}.dmg"
+    legacy = dist / f"{LEGACY_APP_NAME}.dmg"
+
+    if expected.exists():
+        return expected
+
+    if legacy.exists():
+        print(f"Renaming macOS dmg: {legacy.name} -> {expected.name}")
+        legacy.rename(expected)
+        return expected
+
+    dmgs = sorted(dist.glob("*.dmg"))
+    if not dmgs:
+        print("Warning: no macOS .dmg found to rename.", file=sys.stderr)
+        return None
+
+    if len(dmgs) == 1:
+        src = dmgs[0]
+        print(f"Renaming macOS dmg: {src.name} -> {expected.name}")
+        if expected.exists():
+            expected.unlink()
+        src.rename(expected)
+        return expected
+
+    print("Warning: multiple .dmg files found; leaving as-is.", file=sys.stderr)
+    return None
+
+
 def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
     print("Container detected → priming cargo for frontend before dx bundle")
     run(["cargo", "fetch"], cwd=frontend_dir)
@@ -324,7 +354,7 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
     ipas_dir = frontend_dir / "dist" / "ipas"
     ipas_dir.mkdir(parents=True, exist_ok=True)
 
-    ipa_name = "GroundStation26.ipa"
+    ipa_name = "UBSEDS GS.ipa"
     ipa_out = ipas_dir / ipa_name
 
     try:
@@ -477,6 +507,9 @@ def build_frontend(
             cmd.extend(["--target", rust_target])
 
         run(cmd, cwd=frontend_dir)
+
+        if platform_name == "macos":
+            rename_macos_dmg(frontend_dir)
 
         if platform_name == "ios":
             patch_plist(frontend_dir)

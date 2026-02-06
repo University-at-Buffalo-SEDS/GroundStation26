@@ -618,7 +618,7 @@ pub fn Connect() -> Element {
             div {
                 style: "width:min(900px, 94vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
 
-                h1 { style: "margin:0 0 12px 0; font-size:20px;", "GroundStation 26" }
+                h1 { style: "margin:0 0 12px 0; font-size:20px;", "UBSEDS GS" }
 
                 p { style: "margin:0 0 16px 0; color:#94a3b8;",
                     "Enter the backend URL (including http:// or https://). Example: ",
