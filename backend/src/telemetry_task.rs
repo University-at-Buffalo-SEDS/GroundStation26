@@ -2,10 +2,10 @@ use crate::state::AppState;
 use groundstation_shared::TelemetryRow;
 use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
 use sedsprintf_rs_2026::config::DataType;
+use sedsprintf_rs_2026::config::DEVICE_IDENTIFIER;
 use sedsprintf_rs_2026::timesync::{
-    compute_offset_delay, decode_timesync_request, decode_timesync_response, send_timesync_announce,
-    send_timesync_request, send_timesync_response, TimeSyncConfig, TimeSyncRole, TimeSyncTracker,
-    TimeSyncUpdate,
+    compute_offset_delay, decode_timesync_request, decode_timesync_response, TimeSyncConfig,
+    TimeSyncRole, TimeSyncTracker, TimeSyncUpdate,
 };
 
 use crate::gpio_panel::IGNITION_PIN;
@@ -85,21 +85,25 @@ pub async fn telemetry_task(
                                 // Packet received and handled by router
                             }
                             Err(e) => {
-                                println!("radio_task exited with error: {}", e);
+                                log_telemetry_error("radio_task recv_packet failed", e);
                             }
                         }
                     }
                 }
             _= router_interval.tick() => {
-                    router.process_all_queues_with_timeout(20).expect("Failed to process all queues with timeout");
+                    if let Err(e) = router.process_all_queues_with_timeout(20) {
+                        log_telemetry_error("router queue processing failed", e);
+                    }
                 }
                 Some(cmd) = rx.recv() => {
                     match cmd {
                         TelemetryCommand::Launch => {
-                                router.log_queue(
-                                        DataType::FlightCommand,
-                                        &[FlightCommands::Launch as u8],
-                                    ).expect("failed to log Launch command");
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightCommands::Launch as u8],
+                                ) {
+                                    log_telemetry_error("failed to log Launch command", e);
+                                }
                                 let gpio = &state.gpio;
                                 gpio.write_output_pin(IGNITION_PIN, true).expect("failed to set gpio output");
                                 println!("Launch command sent");
@@ -113,10 +117,12 @@ pub async fn telemetry_task(
                                 } else {
                                     ValveBoardCommands::DumpOpen
                                 };
-                                router.log_queue(
-                                        DataType::ValveCommand,
-                                        &[cmd as u8],
-                                    ).expect("failed to log Dump command");
+                                if let Err(e) = router.log_queue(
+                                    DataType::ValveCommand,
+                                    &[cmd as u8],
+                                ) {
+                                    log_telemetry_error("failed to log Dump command", e);
+                                }
                                 {
                                     let gpio = &state.gpio;
                                     gpio.write_output_pin(IGNITION_PIN, false).expect("failed to set gpio output");
@@ -124,10 +130,12 @@ pub async fn telemetry_task(
                                 println!("Dump command sent {:?}", cmd);
                             }
                         TelemetryCommand::Abort => {
-                                router.log(
-                                        DataType::Abort,
-                                        "Manual Abort Command Issued".as_ref(),
-                                    ).expect("failed to log Abort command");
+                                if let Err(e) = router.log(
+                                    DataType::Abort,
+                                    "Manual Abort Command Issued".as_ref(),
+                                ) {
+                                    log_telemetry_error("failed to log Abort command", e);
+                                }
                                 println!("Abort command sent");
                             }
                         TelemetryCommand::Igniter => {
@@ -138,10 +146,12 @@ pub async fn telemetry_task(
                                 } else {
                                     ActuatorBoardCommands::IgniterOn
                                 };
-                                router.log_queue(
-                                        DataType::ActuatorCommand,
-                                        &[cmd as u8],
-                                    ).expect("failed to log Igniter command");
+                                if let Err(e) = router.log_queue(
+                                    DataType::ActuatorCommand,
+                                    &[cmd as u8],
+                                ) {
+                                    log_telemetry_error("failed to log Igniter command", e);
+                                }
                                 println!("Igniter command sent {:?}", cmd);
                             }
                         TelemetryCommand::Pilot => {
@@ -152,10 +162,12 @@ pub async fn telemetry_task(
                                 } else {
                                     ValveBoardCommands::PilotOpen
                                 };
-                                router.log_queue(
-                                        DataType::ValveCommand,
-                                        &[cmd as u8],
-                                    ).expect("failed to log Igniter command");
+                                if let Err(e) = router.log_queue(
+                                    DataType::ValveCommand,
+                                    &[cmd as u8],
+                                ) {
+                                    log_telemetry_error("failed to log Pilot command", e);
+                                }
                                 println!("Pilot command sent {:?}", cmd);
                             }
                         TelemetryCommand::NormallyOpen => {
@@ -166,10 +178,12 @@ pub async fn telemetry_task(
                                 } else {
                                     ValveBoardCommands::NormallyOpenOpen
                                 };
-                                router.log_queue(
-                                        DataType::ValveCommand,
-                                        &[cmd as u8],
-                                    ).expect("failed to log Igniter command");
+                                if let Err(e) = router.log_queue(
+                                    DataType::ValveCommand,
+                                    &[cmd as u8],
+                                ) {
+                                    log_telemetry_error("failed to log NormallyOpen command", e);
+                                }
                                 println!("Tanks command sent {:?}", cmd);
                             }
                         TelemetryCommand::Nitrogen => {
@@ -180,17 +194,21 @@ pub async fn telemetry_task(
                                 } else {
                                     ActuatorBoardCommands::NitrogenOpen
                                 };
-                                router.log_queue(
-                                        DataType::ActuatorCommand,
-                                        &[cmd as u8],
-                                    ).expect("failed to log Nitrogen command");
+                                if let Err(e) = router.log_queue(
+                                    DataType::ActuatorCommand,
+                                    &[cmd as u8],
+                                ) {
+                                    log_telemetry_error("failed to log Nitrogen command", e);
+                                }
                                 println!("Nitrogen command sent {:?}", cmd);
                             }
                         TelemetryCommand::RetractPlumbing => {
-                                router.log_queue(
-                                        DataType::ActuatorCommand,
-                                        &[ActuatorBoardCommands::RetractPlumbing as u8],
-                                    ).expect("failed to log RetractPlumbing command");
+                                if let Err(e) = router.log_queue(
+                                    DataType::ActuatorCommand,
+                                    &[ActuatorBoardCommands::RetractPlumbing as u8],
+                                ) {
+                                    log_telemetry_error("failed to log RetractPlumbing command", e);
+                                }
                                 println!("RetractPlumbing command sent");
                         }
                         TelemetryCommand::Nitrous => {
@@ -201,10 +219,12 @@ pub async fn telemetry_task(
                                 } else {
                                     ActuatorBoardCommands::NitrousOpen
                                 };
-                                router.log_queue(
-                                        DataType::ActuatorCommand,
-                                        &[cmd as u8],
-                                    ).expect("failed to log Nitrous command");
+                                if let Err(e) = router.log_queue(
+                                    DataType::ActuatorCommand,
+                                    &[cmd as u8],
+                                ) {
+                                    log_telemetry_error("failed to log Nitrous command", e);
+                                }
                                 println!("Nitrous command sent: {:?}", cmd);
                         }
                     }
@@ -229,7 +249,9 @@ pub async fn telemetry_task(
                     handle_packet(&state, &router, &timesync_state).await;
                 }
                 _ = timesync_interval.tick() => {
-                    handle_timesync_tick(&router, &timesync_state);
+                    if timesync_enabled() {
+                        handle_timesync_tick(&router, &timesync_state);
+                    }
                 }
         }
     }
@@ -471,6 +493,10 @@ fn get_system_timestamp_ms() -> u64 {
     duration_since_epoch.as_millis() as u64
 }
 
+fn log_telemetry_error(context: &str, err: sedsprintf_rs_2026::TelemetryError) {
+    eprintln!("{context}: {:?}", err);
+}
+
 fn handle_timesync_tick(
     router: &Arc<sedsprintf_rs_2026::router::Router>,
     timesync_state: &Arc<Mutex<TimeSyncState>>,
@@ -484,7 +510,7 @@ fn handle_timesync_tick(
 
     if ts.tracker.should_announce(now_ms) {
         if now_ms.saturating_sub(ts.last_announce_ms) >= TIMESYNC_ANNOUNCE_INTERVAL_MS {
-            let _ = send_timesync_announce(router, ts.tracker.config().priority, get_current_timestamp_ms());
+            let _ = queue_timesync_announce(router, ts.tracker.config().priority, get_current_timestamp_ms());
             ts.last_announce_ms = now_ms;
         }
         return;
@@ -497,7 +523,7 @@ fn handle_timesync_tick(
         let seq = ts.next_seq;
         ts.next_seq = ts.next_seq.wrapping_add(1);
         let t1_ms = get_system_timestamp_ms();
-        if send_timesync_request(router, seq, t1_ms).is_ok() {
+        if queue_timesync_request(router, seq, t1_ms).is_ok() {
             ts.mark_request(seq, t1_ms, now_ms);
         }
     }
@@ -508,6 +534,14 @@ fn handle_timesync_packet(
     timesync_state: &Arc<Mutex<TimeSyncState>>,
     pkt: &sedsprintf_rs_2026::telemetry_packet::TelemetryPacket,
 ) -> bool {
+    if !timesync_enabled() {
+        return false;
+    }
+
+    if pkt.sender() == DEVICE_IDENTIFIER {
+        return true;
+    }
+
     match pkt.data_type() {
         DataType::TimeSyncAnnounce => {
             let now_ms = get_system_timestamp_ms();
@@ -529,7 +563,7 @@ fn handle_timesync_packet(
             };
             let t2_ms = get_current_timestamp_ms();
             let t3_ms = get_current_timestamp_ms();
-            let _ = send_timesync_response(router, req.seq, req.t1_ms, t2_ms, t3_ms);
+            let _ = queue_timesync_response(router, req.seq, req.t1_ms, t2_ms, t3_ms);
             true
         }
         DataType::TimeSyncResponse => {
@@ -561,4 +595,41 @@ fn handle_timesync_packet(
         }
         _ => false,
     }
+}
+
+fn timesync_enabled() -> bool {
+    if cfg!(feature = "testing") {
+        return std::env::var("GROUNDSTATION_TIMESYNC").ok().as_deref() == Some("1");
+    }
+    true
+}
+
+fn queue_timesync_announce(
+    router: &sedsprintf_rs_2026::router::Router,
+    priority: u64,
+    time_ms: u64,
+) -> sedsprintf_rs_2026::TelemetryResult<()> {
+    router.log_queue_ts(DataType::TimeSyncAnnounce, time_ms, &[priority, time_ms])
+}
+
+fn queue_timesync_request(
+    router: &sedsprintf_rs_2026::router::Router,
+    seq: u64,
+    t1_ms: u64,
+) -> sedsprintf_rs_2026::TelemetryResult<()> {
+    router.log_queue_ts(DataType::TimeSyncRequest, t1_ms, &[seq, t1_ms])
+}
+
+fn queue_timesync_response(
+    router: &sedsprintf_rs_2026::router::Router,
+    seq: u64,
+    t1_ms: u64,
+    t2_ms: u64,
+    t3_ms: u64,
+) -> sedsprintf_rs_2026::TelemetryResult<()> {
+    router.log_queue_ts(
+        DataType::TimeSyncResponse,
+        t3_ms,
+        &[seq, t1_ms, t2_ms, t3_ms],
+    )
 }

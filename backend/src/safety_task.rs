@@ -443,7 +443,9 @@ pub async fn safety_task(state: Arc<AppState>, router: Arc<Router>) {
                     DataType::Abort,
                     "Safety Task Abort Command Issued".as_bytes(),
                 )
-                .expect("failed to log Abort command");
+                .unwrap_or_else(|e| {
+                    eprintln!("failed to log Abort command: {:?}", e);
+                });
             println!("Safety task: Abort command sent");
             break;
         }

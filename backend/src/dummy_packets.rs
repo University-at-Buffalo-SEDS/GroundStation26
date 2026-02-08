@@ -227,13 +227,14 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     const BASE_LON: f32 = -106.485;
     let values: Vec<f32> = match dtype {
         GpsData => {
-            // (lat, lon)
+            // (lat, lon, alt)
             let margin = 0.001;
 
             // Random offset within ±margin
             let lat = BASE_LAT + rng.random_range(-margin..margin);
             let lon = BASE_LON + rng.random_range(-margin..margin);
-            vec![lat, lon]
+            let alt = rng.random_range(0.0..3000.0);
+            vec![lat, lon, alt]
         }
         KalmanFilterData => {
             // Example: filtered accel XYZ
