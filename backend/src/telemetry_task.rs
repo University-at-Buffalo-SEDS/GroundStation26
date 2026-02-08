@@ -2,15 +2,65 @@ use crate::state::AppState;
 use groundstation_shared::TelemetryRow;
 use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
 use sedsprintf_rs_2026::config::DataType;
+use sedsprintf_rs_2026::timesync::{
+    compute_offset_delay, decode_timesync_request, decode_timesync_response, send_timesync_announce,
+    send_timesync_request, send_timesync_response, TimeSyncConfig, TimeSyncRole, TimeSyncTracker,
+    TimeSyncUpdate,
+};
 
 use crate::gpio_panel::IGNITION_PIN;
 use crate::radio::RadioDevice;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
 use groundstation_shared::Board;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
+
+const TIMESYNC_PRIORITY: u64 = 50;
+const TIMESYNC_SOURCE_TIMEOUT_MS: u64 = 5_000;
+const TIMESYNC_ANNOUNCE_INTERVAL_MS: u64 = 1_000;
+const TIMESYNC_REQUEST_INTERVAL_MS: u64 = 1_000;
+
+static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
+
+pub struct TimeSyncState {
+    tracker: TimeSyncTracker,
+    next_seq: u64,
+    pending: Option<(u64, u64)>,
+    last_request_ms: u64,
+    last_announce_ms: u64,
+    last_offset_ms: Option<i64>,
+    last_delay_ms: Option<u64>,
+}
+
+impl TimeSyncState {
+    fn new() -> Self {
+        Self {
+            tracker: TimeSyncTracker::new(TimeSyncConfig {
+                role: TimeSyncRole::Auto,
+                priority: TIMESYNC_PRIORITY,
+                source_timeout_ms: TIMESYNC_SOURCE_TIMEOUT_MS,
+            }),
+            next_seq: 1,
+            pending: None,
+            last_request_ms: 0,
+            last_announce_ms: 0,
+            last_offset_ms: None,
+            last_delay_ms: None,
+        }
+    }
+
+    fn mark_request(&mut self, seq: u64, t1_ms: u64, now_ms: u64) {
+        self.pending = Some((seq, t1_ms));
+        self.last_request_ms = now_ms;
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending = None;
+    }
+}
 
 pub async fn telemetry_task(
     state: Arc<AppState>,
@@ -22,7 +72,9 @@ pub async fn telemetry_task(
     let mut handle_interval = interval(Duration::from_millis(1));
     let mut router_interval = interval(Duration::from_millis(10));
     let mut heartbeat_interval = interval(Duration::from_millis(500));
+    let mut timesync_interval = interval(Duration::from_millis(100));
     let mut heartbeat_failed = false;
+    let timesync_state = Arc::new(Mutex::new(TimeSyncState::new()));
 
     loop {
         tokio::select! {
@@ -174,7 +226,10 @@ pub async fn telemetry_task(
                     }
                 }
                 _ = handle_interval.tick() => {
-                    handle_packet(&state).await;
+                    handle_packet(&state, &router, &timesync_state).await;
+                }
+                _ = timesync_interval.tick() => {
+                    handle_timesync_tick(&router, &timesync_state);
                 }
         }
     }
@@ -249,7 +304,11 @@ where
     Err(last_err.unwrap())
 }
 
-pub async fn handle_packet(state: &Arc<AppState>) {
+pub async fn handle_packet(
+    state: &Arc<AppState>,
+    router: &Arc<sedsprintf_rs_2026::router::Router>,
+    timesync_state: &Arc<Mutex<TimeSyncState>>,
+) {
     // Keep raw packet in ring buffer if you still want it
     let pkt = {
         //get the most recent packet from the ring buffer
@@ -268,6 +327,10 @@ pub async fn handle_packet(state: &Arc<AppState>) {
         } else {
             emit_warning(state, "Warning packet with invalid UTF-8 payload");
         }
+        return;
+    }
+
+    if handle_timesync_packet(router, timesync_state, &pkt) {
         return;
     }
 
@@ -392,8 +455,110 @@ pub async fn handle_packet(state: &Arc<AppState>) {
 }
 
 pub fn get_current_timestamp_ms() -> u64 {
+    let raw = get_system_timestamp_ms();
+    let offset = TIMESYNC_OFFSET_MS.load(Ordering::Relaxed);
+    if offset >= 0 {
+        raw.saturating_add(offset as u64)
+    } else {
+        raw.saturating_sub((-offset) as u64)
+    }
+}
+
+fn get_system_timestamp_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now();
     let duration_since_epoch = now.duration_since(UNIX_EPOCH).unwrap();
     duration_since_epoch.as_millis() as u64
+}
+
+fn handle_timesync_tick(
+    router: &Arc<sedsprintf_rs_2026::router::Router>,
+    timesync_state: &Arc<Mutex<TimeSyncState>>,
+) {
+    let now_ms = get_system_timestamp_ms();
+    let mut ts = timesync_state.lock().unwrap();
+
+    if ts.tracker.refresh(now_ms) == TimeSyncUpdate::SourceChanged {
+        ts.clear_pending();
+    }
+
+    if ts.tracker.should_announce(now_ms) {
+        if now_ms.saturating_sub(ts.last_announce_ms) >= TIMESYNC_ANNOUNCE_INTERVAL_MS {
+            let _ = send_timesync_announce(router, ts.tracker.config().priority, get_current_timestamp_ms());
+            ts.last_announce_ms = now_ms;
+        }
+        return;
+    }
+
+    if ts.tracker.current_source().is_some()
+        && ts.pending.is_none()
+        && now_ms.saturating_sub(ts.last_request_ms) >= TIMESYNC_REQUEST_INTERVAL_MS
+    {
+        let seq = ts.next_seq;
+        ts.next_seq = ts.next_seq.wrapping_add(1);
+        let t1_ms = get_system_timestamp_ms();
+        if send_timesync_request(router, seq, t1_ms).is_ok() {
+            ts.mark_request(seq, t1_ms, now_ms);
+        }
+    }
+}
+
+fn handle_timesync_packet(
+    router: &Arc<sedsprintf_rs_2026::router::Router>,
+    timesync_state: &Arc<Mutex<TimeSyncState>>,
+    pkt: &sedsprintf_rs_2026::telemetry_packet::TelemetryPacket,
+) -> bool {
+    match pkt.data_type() {
+        DataType::TimeSyncAnnounce => {
+            let now_ms = get_system_timestamp_ms();
+            let mut ts = timesync_state.lock().unwrap();
+            if ts.tracker.handle_announce(pkt, now_ms).is_ok() {
+                return true;
+            }
+            true
+        }
+        DataType::TimeSyncRequest => {
+            let now_ms = get_system_timestamp_ms();
+            let ts = timesync_state.lock().unwrap();
+            if !ts.tracker.should_announce(now_ms) {
+                return true;
+            }
+            let req = match decode_timesync_request(pkt) {
+                Ok(req) => req,
+                Err(_) => return true,
+            };
+            let t2_ms = get_current_timestamp_ms();
+            let t3_ms = get_current_timestamp_ms();
+            let _ = send_timesync_response(router, req.seq, req.t1_ms, t2_ms, t3_ms);
+            true
+        }
+        DataType::TimeSyncResponse => {
+            let now_ms = get_system_timestamp_ms();
+            let mut ts = timesync_state.lock().unwrap();
+            let resp = match decode_timesync_response(pkt) {
+                Ok(resp) => resp,
+                Err(_) => return true,
+            };
+            let Some((pending_seq, t1_ms)) = ts.pending else {
+                return true;
+            };
+            if pending_seq != resp.seq {
+                return true;
+            }
+            if let Some(source) = ts.tracker.current_source() {
+                if source.sender != pkt.sender() {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+            let sample = compute_offset_delay(t1_ms, resp.t2_ms, resp.t3_ms, now_ms);
+            TIMESYNC_OFFSET_MS.store(sample.offset_ms, Ordering::Relaxed);
+            ts.last_offset_ms = Some(sample.offset_ms);
+            ts.last_delay_ms = Some(sample.delay_ms);
+            ts.clear_pending();
+            true
+        }
+        _ => false,
+    }
 }
