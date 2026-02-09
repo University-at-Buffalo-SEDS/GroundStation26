@@ -10,11 +10,9 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
 use serde::{Deserialize, Serialize};
-use serde_json;
 use sqlx::Row;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,12 +26,29 @@ use tower_http::services::ServeDir;
 static FAVICON_DATA: OnceCell<Bytes> = OnceCell::const_new();
 
 fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
-    if let Ok(raw) = row.try_get::<Option<String>, _>("values_json") {
-        if let Some(raw) = raw {
-            if let Ok(values) = serde_json::from_str::<Vec<Option<f32>>>(&raw) {
-                return values;
-            }
+    let values_from_json = row
+        .try_get::<Option<String>, _>("values_json")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<Option<f32>>>(&raw).ok());
+    if let Some(values) = values_from_json {
+        if !values.is_empty() {
+            return values;
         }
+    }
+
+    if let Ok(raw) = row.try_get::<Option<String>, _>("payload_json")
+        && let Some(raw) = raw
+        && let Ok(bytes) = serde_json::from_str::<Vec<u8>>(&raw)
+        && bytes.len().is_multiple_of(4)
+        && !bytes.is_empty()
+    {
+        let mut out = Vec::with_capacity(bytes.len() / 4);
+        for chunk in bytes.chunks_exact(4) {
+            let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            out.push(Some(f32::from_le_bytes(arr)));
+        }
+        return out;
     }
 
     vec![
@@ -149,7 +164,7 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
     // v0..v6: pilot, tanks, dump, igniter, nitrogen, nitrous, retract_plumbing
     let row = sqlx::query(
         r#"
-        SELECT timestamp_ms, values_json, v0, v1, v2, v3, v4, v5, v6
+        SELECT timestamp_ms, values_json, payload_json, v0, v1, v2, v3, v4, v5, v6
         FROM telemetry
         WHERE data_type = 'VALVE_STATE'
         ORDER BY timestamp_ms DESC
@@ -163,9 +178,7 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
         let values = values_from_row(&r);
-        let to_bool = |idx: usize| -> Option<bool> {
-            value_at(&values, idx).map(|x| x >= 0.5)
-        };
+        let to_bool = |idx: usize| -> Option<bool> { value_at(&values, idx).map(|x| x >= 0.5) };
 
         ValveStateMsg {
             timestamp_ms,
@@ -187,7 +200,7 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // and v0 = lat, v1 = lon (adjust if needed)
     let row = sqlx::query(
         r#"
-        SELECT values_json, v0, v1
+        SELECT values_json, payload_json, v0, v1
         FROM telemetry
         WHERE data_type = 'GPS'
         ORDER BY timestamp_ms DESC
@@ -220,7 +233,16 @@ async fn get_layout() -> impl IntoResponse {
 }
 
 async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let now_ms = Utc::now().timestamp_millis();
+    let latest_ts: Option<i64> = sqlx::query_scalar("SELECT MAX(timestamp_ms) FROM telemetry")
+        .fetch_one(&state.db)
+        .await
+        .ok()
+        .flatten();
+
+    let Some(now_ms) = latest_ts else {
+        return Json(Vec::<TelemetryRow>::new());
+    };
+
     let cutoff = now_ms - 20 * 60 * 1000; // 20 minutes
 
     // Match frontend bucket grid (frontend BUCKET_MS = 20).
@@ -236,6 +258,8 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             SELECT
                 timestamp_ms,
                 data_type,
+                values_json,
+                payload_json,
                 v0, v1, v2, v3, v4, v5, v6, v7,
                 (timestamp_ms / ?) AS bucket_id
             FROM telemetry
@@ -248,7 +272,7 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         )
         SELECT
             f.timestamp_ms, f.data_type,
-            f.values_json, f.v0, f.v1, f.v2, f.v3, f.v4, f.v5, f.v6, f.v7
+            f.values_json, f.payload_json, f.v0, f.v1, f.v2, f.v3, f.v4, f.v5, f.v6, f.v7
         FROM filtered f
         JOIN latest l
           ON l.data_type = f.data_type
@@ -441,7 +465,7 @@ async fn get_history(
     let cutoff = now_ms - (minutes as i64) * 60_000;
 
     let rows_db = sqlx::query(
-        "SELECT timestamp_ms, data_type, values_json, v0, v1, v2, v3, v4, v5, v6, v7 \
+        "SELECT timestamp_ms, data_type, values_json, payload_json, v0, v1, v2, v3, v4, v5, v6, v7 \
          FROM telemetry \
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",

@@ -42,7 +42,8 @@ use super::HISTORY_MS;
 const BUCKET_MS: i64 = 20;
 
 // Only this many most-recent buckets are kept (hard cap besides HISTORY_MS).
-const MAX_BUCKETS_PER_TYPE: usize = 6_000;
+// Keep enough to cover the full HISTORY_MS window at BUCKET_MS granularity.
+const MAX_BUCKETS_PER_TYPE: usize = (HISTORY_MS as usize / BUCKET_MS as usize) + 500;
 
 // Only the newest bucket is mutable. Older buckets are frozen.
 // If you want to allow small reordering/late packets, set this to 2 or 3.

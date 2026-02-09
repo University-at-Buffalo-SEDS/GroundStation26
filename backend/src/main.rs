@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
             timestamp_ms INTEGER NOT NULL,
             data_type    TEXT    NOT NULL,
             values_json  TEXT,
+            payload_json TEXT,
             v0           REAL,
             v1           REAL,
             v2           REAL,
@@ -93,6 +94,12 @@ async fn main() -> anyhow::Result<()> {
     let has_values_json = cols.iter().any(|row| row.get::<String, _>("name") == "values_json");
     if !has_values_json {
         sqlx::query("ALTER TABLE telemetry ADD COLUMN values_json TEXT")
+            .execute(&db)
+            .await?;
+    }
+    let has_payload_json = cols.iter().any(|row| row.get::<String, _>("name") == "payload_json");
+    if !has_payload_json {
+        sqlx::query("ALTER TABLE telemetry ADD COLUMN payload_json TEXT")
             .execute(&db)
             .await?;
     }
