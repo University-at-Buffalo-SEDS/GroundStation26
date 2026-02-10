@@ -13,6 +13,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p backend/src
 COPY backend/Cargo.toml backend/
 COPY backend/src backend/src
+COPY backend/layout backend/layout
 
 # Map downloader crate
 RUN mkdir -p map_downloader/src
@@ -78,9 +79,7 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
-
-COPY --from=builder /app/target/release/groundstation_backend /app/
-COPY --from=builder /app/target/release/map_downloader /app/map_downloader/
+COPY --from=builder /app/backend/layout /app/backend/layout/
 COPY --from=builder /app/frontend/dist /app/frontend/dist/
 COPY --from=builder /app/frontend/static /app/frontend/static/
 COPY --from=builder /app/frontend/assets /app/frontend/assets/
