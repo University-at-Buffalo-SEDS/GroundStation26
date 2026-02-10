@@ -171,9 +171,9 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
 
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
@@ -207,9 +207,9 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
         let values = values_from_row(&r);
@@ -281,12 +281,12 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         ORDER BY f.timestamp_ms ASC
         "#,
     )
-    .bind(BUCKET_MS)
-    .bind(cutoff)
-    .bind(now_ms)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(BUCKET_MS)
+        .bind(cutoff)
+        .bind(now_ms)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -470,10 +470,10 @@ async fn get_history(
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",
     )
-    .bind(cutoff)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -504,10 +504,10 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-    .bind(cutoff)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -562,10 +562,10 @@ pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
             VALUES (?, 'warning', ?)
             "#,
         )
-        .bind(timestamp)
-        .bind(msg_string)
-        .execute(&db)
-        .await;
+            .bind(timestamp)
+            .bind(msg_string)
+            .execute(&db)
+            .await;
     });
 }
 
@@ -582,10 +582,10 @@ pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
             VALUES (?, 'warning', ?)
             "#,
         )
-        .bind(timestamp)
-        .bind(msg_string)
-        .execute(&db)
-        .await;
+            .bind(timestamp)
+            .bind(msg_string)
+            .execute(&db)
+            .await;
     });
 }
 
@@ -609,9 +609,9 @@ pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
             VALUES (?, 'error', ?)
             "#,
         )
-        .bind(timestamp)
-        .bind(msg_string)
-        .execute(&db)
-        .await;
+            .bind(timestamp)
+            .bind(msg_string)
+            .execute(&db)
+            .await;
     });
 }

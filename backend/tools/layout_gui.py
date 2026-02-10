@@ -460,7 +460,7 @@ class LayoutEditor(tk.Tk):
     # Helpers
     # ------------------------
     def _entry(
-        self, parent: ttk.Frame, label: str, row: int, col: int = 0, col_span: int = 1
+            self, parent: ttk.Frame, label: str, row: int, col: int = 0, col_span: int = 1
     ) -> tk.Entry:
         ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w")
         entry = ttk.Entry(parent)
@@ -495,7 +495,7 @@ class LayoutEditor(tk.Tk):
 
         self.conn_list.delete(0, tk.END)
         for s in self.data["connection_tab"]["sections"]:
-            self.conn_list.insert(tk.END, f'{s.get("kind")} - {s.get("title","")}')
+            self.conn_list.insert(tk.END, f'{s.get("kind")} - {s.get("title", "")}')
 
         self.actions_list.delete(0, tk.END)
         for a in self.data["actions_tab"]["actions"]:
@@ -811,6 +811,7 @@ class LayoutEditor(tk.Tk):
                     self.section_list.delete(s_idx)
                     self.section_list.insert(s_idx, self._section_title_loaded or "Section")
                     self.section_list.selection_set(s_idx)
+
                 self._with_suspended_events(_restore_title)
         section = {"title": self.section_title.get().strip(), "widgets": []}
         sections.append(section)
@@ -822,6 +823,7 @@ class LayoutEditor(tk.Tk):
                 self.section_list.selection_set(new_idx)
                 self.section_list.activate(new_idx)
                 self.section_list.see(new_idx)
+
             self._with_suspended_events(_select_new)
             self._state_section_selected_idx = new_idx
             self._load_section_for(e_idx, new_idx)
@@ -838,10 +840,12 @@ class LayoutEditor(tk.Tk):
         self._state_section_selected_idx = None
         if self.section_list.size() > 0:
             next_idx = min(s_idx, self.section_list.size() - 1)
+
             def _select_next() -> None:
                 self.section_list.selection_set(next_idx)
                 self.section_list.activate(next_idx)
                 self.section_list.see(next_idx)
+
             self._with_suspended_events(_select_next)
             self._state_section_selected_idx = next_idx
             self._load_section_for(e_idx, next_idx)
@@ -872,6 +876,7 @@ class LayoutEditor(tk.Tk):
                 self.widget_list.selection_set(w_idx)
                 self.widget_list.activate(w_idx)
                 self.widget_list.see(w_idx)
+
             self._with_suspended_events(_select_new)
             self._load_widget_for(e_idx, s_idx, w_idx)
 
@@ -908,6 +913,7 @@ class LayoutEditor(tk.Tk):
                 self.state_entry_list.selection_set(0)
                 self.state_entry_list.activate(0)
                 self.state_entry_list.see(0)
+
             self._with_suspended_events(_select_first)
             self._state_entry_selected_idx = 0
             self._load_state_entry()
@@ -929,6 +935,7 @@ class LayoutEditor(tk.Tk):
                 self.section_list.selection_set(0)
                 self.section_list.activate(0)
                 self.section_list.see(0)
+
             self._with_suspended_events(_select_first)
             self._state_section_selected_idx = 0
             self._load_section_for(e_idx, 0)
@@ -951,6 +958,7 @@ class LayoutEditor(tk.Tk):
                 self.section_list.delete(s_idx)
                 self.section_list.insert(s_idx, title or "Section")
                 self.section_list.selection_set(s_idx)
+
             self._with_suspended_events(_update)
 
     def _widget_label(self, widget: dict) -> str:

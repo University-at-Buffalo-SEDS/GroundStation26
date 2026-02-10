@@ -629,7 +629,6 @@ def macos_deploy(frontend_dir: Path) -> Path:
     return dst_app
 
 
-
 # -----------------------------
 # Frontend target selection
 # -----------------------------
@@ -670,10 +669,10 @@ def _default_rust_target_for_frontend(platform_name: Optional[str]) -> Optional[
 
 
 def build_frontend(
-    frontend_dir: Path,
-    platform_name: Optional[str] = None,
-    *,
-    rust_target: Optional[str] = None,
+        frontend_dir: Path,
+        platform_name: Optional[str] = None,
+        *,
+        rust_target: Optional[str] = None,
 ) -> None:
     try:
         clear_app_bundle(frontend_dir)

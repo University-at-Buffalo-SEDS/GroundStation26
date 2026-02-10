@@ -1,8 +1,8 @@
+use super::layout::{BooleanLabels, DataTabLayout};
+use super::types::TelemetryRow;
 // frontend/src/telemetry_dashboard/data_tab.rs
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
-use super::layout::{BooleanLabels, DataTabLayout};
-use super::types::TelemetryRow;
 
 use super::data_chart::{charts_cache_get, charts_cache_get_channel_minmax, series_color};
 
