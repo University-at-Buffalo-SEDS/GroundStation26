@@ -75,6 +75,10 @@ LABEL authors="rylan"
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
 COPY --from=builder /app/target/release/groundstation_backend /app/
 COPY --from=builder /app/target/release/map_downloader /app/map_downloader/
 COPY --from=builder /app/frontend/dist /app/frontend/dist/
