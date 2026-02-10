@@ -79,7 +79,10 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
 COPY --from=builder /app/backend/layout /app/backend/layout/
+COPY --from=builder /app/target/release/groundstation_backend /app/
+COPY --from=builder /app/target/release/map_downloader /app/map_downloader/
 COPY --from=builder /app/frontend/dist /app/frontend/dist/
 COPY --from=builder /app/frontend/static /app/frontend/static/
 COPY --from=builder /app/frontend/assets /app/frontend/assets/
