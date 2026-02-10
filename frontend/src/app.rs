@@ -1,17 +1,5 @@
 // frontend/src/app.rs
 //
-// COMPLETE REPLACEMENT FILE
-//
-// Changes (this version):
-// - Connection tests are MUCH faster:
-//   * Reuse one reqwest Client
-//   * Probe routes concurrently with Tokio (join_all)
-//   * Short connect + overall timeouts
-//   * Cap response body size (avoid huge tile downloads)
-// - Removed IP-based resolve/poke/tests (hostname only)
-// - Added REAL WebSocket connect probe (ws:// or wss://) and prints why it fails
-// - Kept native ObjC poke for Local Network prompt (hostname only)
-// - WASM behavior unchanged (no Connect screen)
 const _CONNECTION_TIMEOUT_MS: u64 = 8000;
 const _BODY_TRANSFER_TIMEOUT_MS: u64 = 10000;
 const _WS_TIMEOUT_MS: u64 = 4500;
@@ -274,7 +262,7 @@ struct RouteCheck {
 #[cfg(not(target_arch = "wasm32"))]
 fn status_ok_for_path(path: &str, status: u16) -> (bool, &'static str) {
     match path {
-        "/api/recent" | "/api/alerts" | "/flightstate" | "/api/gps" => {
+        "/api/recent" | "/api/alerts" | "/api/layout" | "/flightstate" | "/api/gps" => {
             (status == 200, "expected 200")
         }
         "/ws" => match status {
@@ -367,6 +355,7 @@ async fn test_routes_host_only(base: &str, skip_tls_verify: bool) -> Vec<RouteCh
     let probes: &[&str] = &[
         "/api/recent",
         "/api/alerts",
+        "/api/layout",
         "/flightstate",
         "/api/gps",
         "/tiles",
@@ -436,30 +425,27 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl, skip_tls_verify: bool) -> Resu
     let ws_url = format!("{ws_origin}/ws");
 
     // Real websocket handshake, but time-bounded so it can't hang forever.
-    let res = timeout(
-        std::time::Duration::from_millis(_WS_TIMEOUT_MS),
-        async {
-            if skip_tls_verify && ws_url.starts_with("wss://") {
-                let tls = native_tls::TlsConnector::builder()
-                    .danger_accept_invalid_certs(true)
-                    .build()
-                    .map_err(|e| format!("tls build failed: {e}"))?;
-                tokio_tungstenite::connect_async_tls_with_config(
-                    ws_url.clone(),
-                    None,
-                    false,
-                    Some(tokio_tungstenite::Connector::NativeTls(tls)),
-                )
-                    .await
-                    .map_err(|e| format!("{e}"))
-            } else {
-                tokio_tungstenite::connect_async(ws_url.clone())
-                    .await
-                    .map_err(|e| format!("{e}"))
-            }
-        },
-    )
-        .await;
+    let res = timeout(std::time::Duration::from_millis(_WS_TIMEOUT_MS), async {
+        if skip_tls_verify && ws_url.starts_with("wss://") {
+            let tls = native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .map_err(|e| format!("tls build failed: {e}"))?;
+            tokio_tungstenite::connect_async_tls_with_config(
+                ws_url.clone(),
+                None,
+                false,
+                Some(tokio_tungstenite::Connector::NativeTls(tls)),
+            )
+            .await
+            .map_err(|e| format!("{e}"))
+        } else {
+            tokio_tungstenite::connect_async(ws_url.clone())
+                .await
+                .map_err(|e| format!("{e}"))
+        }
+    })
+    .await;
 
     match res {
         Err(_) => Err(format!(
@@ -614,7 +600,7 @@ pub fn Connect() -> Element {
 
     rsx! {
         div {
-            style: "height:100vh; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            style: "min-height:100vh; height:100vh; overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
             div {
                 style: "width:min(900px, 94vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
 
