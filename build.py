@@ -297,6 +297,58 @@ def remove_legacy_dmgs(frontend_dir: Path) -> None:
         dmg.unlink()
 
 
+def _remove_path(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _rename_legacy_binary_in_dir(dir_path: Path) -> None:
+    legacy_exe = dir_path / f"{LEGACY_APP_NAME}.exe"
+    if legacy_exe.exists():
+        dst = dir_path / f"{APP_NAME}.exe"
+        print(f"Renaming Windows binary: {legacy_exe} -> {dst}")
+        _remove_path(dst)
+        legacy_exe.rename(dst)
+
+    legacy_bin = dir_path / LEGACY_APP_NAME
+    if legacy_bin.exists():
+        dst = dir_path / APP_NAME
+        print(f"Renaming Linux binary: {legacy_bin} -> {dst}")
+        _remove_path(dst)
+        legacy_bin.rename(dst)
+
+
+def rename_windows_linux_artifacts(frontend_dir: Path, platform_name: str) -> None:
+    dist = dist_dir(frontend_dir)
+    if not dist.exists():
+        return
+
+    renamed_any = False
+    for item in sorted(dist.iterdir()):
+        name = item.name
+        if not name.startswith(LEGACY_APP_NAME):
+            continue
+        new_name = APP_NAME + name[len(LEGACY_APP_NAME):]
+        dst = dist / new_name
+        print(f"Renaming {platform_name} artifact: {name} -> {new_name}")
+        _remove_path(dst)
+        item.rename(dst)
+        renamed_any = True
+
+        if dst.is_dir():
+            _rename_legacy_binary_in_dir(dst)
+
+    # Also catch loose binaries in dist root
+    _rename_legacy_binary_in_dir(dist)
+
+    if not renamed_any:
+        print(f"Warning: no {platform_name} artifacts matched legacy name for rename.", file=sys.stderr)
+
+
 def clear_app_bundle(frontend_dir: Path) -> None:
     dist = dist_dir(frontend_dir)
     bundles = [dist / APP_BUNDLE_NAME, dist / LEGACY_APP_BUNDLE_NAME]
@@ -706,6 +758,8 @@ def build_frontend(
             remove_legacy_app_bundle(frontend_dir)
             remove_legacy_dmgs(frontend_dir)
             sign_macos_app_and_dmg(frontend_dir)
+        elif platform_name in {"windows", "linux"}:
+            rename_windows_linux_artifacts(frontend_dir, platform_name)
 
         if platform_name == "ios":
             patch_plist(frontend_dir)
