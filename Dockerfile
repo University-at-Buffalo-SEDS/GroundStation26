@@ -17,7 +17,7 @@ RUN set -e; \
 ENV PATH="/root/.cargo/bin:${PATH}"
 ENV WASM_OPT=/root/.cargo/bin/wasm-opt
 
-RUN which wasm-opt && wasm-opt --version && which wasm-pack && wasm-pack --version
+RUN which wasm-opt && wasm-opt --version && which wasm-pack && wasm-pack --version && sleep 5
 # Top-level workspace manifests
 COPY Cargo.toml Cargo.lock ./
 
