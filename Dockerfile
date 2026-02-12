@@ -14,7 +14,7 @@ RUN set -e; \
     arch="$(uname -m)"; \
     case "$arch" in \
         x86_64) bin_arch="x86_64" ;; \
-        aarch64|arm64) bin_arch="arm64" ;; \
+        aarch64|arm64) bin_arch="aarch64" ;; \
         *) echo "Unsupported arch for wasm-opt: $arch" >&2; exit 1 ;; \
     esac; \
     url="https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-${bin_arch}-linux.tar.gz"; \
