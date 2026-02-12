@@ -3,6 +3,7 @@ import multiprocessing as mp
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -35,9 +36,12 @@ def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None
     subprocess.run(cmd, cwd=cwd, check=True, env=merged)
 
 
-def run_capture(cmd: list[str], cwd: Path) -> str:
-    print(f"Running: {' '.join(cmd)} (cwd={cwd})")
-    out = subprocess.check_output(cmd, cwd=cwd)
+def run_capture(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> str:
+    print(f"Running: {' '.join([str(c) for c in cmd])} (cwd={cwd})")
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+    out = subprocess.check_output([str(c) for c in cmd], cwd=cwd, env=merged)
     return out.decode("utf-8", errors="replace")
 
 
@@ -574,29 +578,146 @@ def notarize_macos(frontend_dir: Path) -> None:
     run(["xcrun", "stapler", "staple", str(target)], cwd=frontend_dir)
 
 
-def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
-    print("Container detected → priming cargo for frontend before dx bundle")
-    run(["cargo", "fetch"], cwd=frontend_dir)
+# ------------------------------------------------------------
+# Container-safe tooling
+# ------------------------------------------------------------
+def _bash_login_capture(frontend_dir: Path, script: str) -> str:
+    # Use bash login shell so PATH + profile scripts match your interactive container shell.
+    return run_capture(["bash", "-lc", script], cwd=frontend_dir)
 
-def _find_wasm_opt() -> Optional[Path]:
+
+def _bash_login_which(frontend_dir: Path, exe: str) -> Optional[str]:
+    try:
+        out = _bash_login_capture(frontend_dir, f"command -v {shlex.quote(exe)} || true").strip()
+        return out if out else None
+    except Exception:
+        return None
+
+
+def _find_wasm_opt_in_container(frontend_dir: Path) -> Optional[Path]:
+    # 1) Ask login shell (most reliable)
+    p = _bash_login_which(frontend_dir, "wasm-opt")
+    if p:
+        pp = Path(p)
+        if pp.exists() and os.access(pp, os.X_OK):
+            return pp
+
+    # 2) Fallback hardcoded common locations
     candidates = [
-        Path("/usr/local/bin/wasm-opt"),
         Path("/usr/bin/wasm-opt"),
+        Path("/usr/local/bin/wasm-opt"),
         Path("/opt/binaryen/bin/wasm-opt"),
-        Path("/usr/local/bin/binaryen/bin/wasm-opt"),
+        Path("/usr/lib/binaryen/bin/wasm-opt"),
+        Path("/usr/libexec/binaryen/wasm-opt"),
         Path("/root/.cargo/bin/wasm-opt"),
+        Path.home() / ".cargo" / "bin" / "wasm-opt",
     ]
     for cand in candidates:
         if cand.exists() and os.access(cand, os.X_OK):
             return cand
-    path_env = os.environ.get("PATH", "")
-    for raw_dir in path_env.split(os.pathsep):
-        if not raw_dir:
-            continue
-        candidate = Path(raw_dir) / "wasm-opt"
-        if candidate.exists() and os.access(candidate, os.X_OK):
-            return candidate
+
+    # 3) Try PATH from current env
+    for raw_dir in os.environ.get("PATH", "").split(os.pathsep):
+        if raw_dir:
+            cand = Path(raw_dir) / "wasm-opt"
+            if cand.exists() and os.access(cand, os.X_OK):
+                return cand
+
     return None
+
+
+def _dx_bundle_env_container(frontend_dir: Path) -> dict[str, str]:
+    """
+    Container-only env:
+    - Take PATH from bash login shell (so it matches interactive container sessions)
+    - Force wasm-opt variables to point at the real binary
+    """
+    env: dict[str, str] = {}
+
+    base_path = os.environ.get("PATH", "")
+    try:
+        bash_path = _bash_login_capture(frontend_dir, 'printf "%s" "$PATH"').strip()
+        if bash_path:
+            base_path = bash_path
+    except Exception:
+        pass
+
+    # Ensure cargo/bin etc are always included even if login PATH is sparse.
+    extra_paths = [
+        str(Path.home() / ".cargo" / "bin"),
+        "/root/.cargo/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/opt/binaryen/bin",
+        "/usr/lib/binaryen/bin",
+    ]
+    env["PATH"] = os.pathsep.join(extra_paths + [base_path])
+
+    wasm_opt = _find_wasm_opt_in_container(frontend_dir)
+    if wasm_opt:
+        env["WASM_OPT"] = str(wasm_opt)
+        env["WASMOPT"] = str(wasm_opt)
+        env["DIOXUS_WASM_OPT"] = str(wasm_opt)
+        env["DIOXUS_WASM_OPT_PATH"] = str(wasm_opt)
+
+    return env
+
+
+def _container_dx_root(frontend_dir: Path) -> Path:
+    return frontend_dir / ".tools" / "dioxus-cli-no-downloads"
+
+
+def _container_dx_bin(frontend_dir: Path) -> Path:
+    return _container_dx_root(frontend_dir) / "bin" / "dx"
+
+
+def _ensure_dx_no_downloads_in_container(frontend_dir: Path) -> Path:
+    """
+    Prebuilt dx binaries sometimes ignore PATH tooling and attempt downloads.
+    In containers where the platform detection fails, that blows up (your error).
+
+    Fix: build/install dx from source with the `no-downloads` feature into a repo-local tool dir,
+    and then use that dx for bundling.
+    """
+    dx_bin = _container_dx_bin(frontend_dir)
+    if dx_bin.exists() and os.access(dx_bin, os.X_OK):
+        return dx_bin
+
+    root = _container_dx_root(frontend_dir)
+    root.mkdir(parents=True, exist_ok=True)
+
+    print("Container → installing dx (dioxus-cli) with --features no-downloads into .tools/ ...")
+    env = _dx_bundle_env_container(frontend_dir)
+
+    # Use cargo to install the CLI with no-downloads.
+    # Note: this can be cached by Docker layers if you put it in your Dockerfile, but
+    # doing it here guarantees the script works even if the image wasn't prepared.
+    run(
+        [
+            "cargo",
+            "install",
+            "dioxus-cli",
+            "--locked",
+            "--force",
+            "--features",
+            "no-downloads",
+            "--root",
+            str(root),
+        ],
+        cwd=frontend_dir,
+        env=env,
+    )
+
+    if not dx_bin.exists():
+        raise RuntimeError(f"Failed to install dx at expected path: {dx_bin}")
+
+    return dx_bin
+
+
+def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
+    print("Container detected → priming cargo for frontend before dx bundle")
+    env = _dx_bundle_env_container(frontend_dir)
+    run(["cargo", "fetch"], cwd=frontend_dir, env=env)
 
 
 def _find_dx() -> Optional[Path]:
@@ -609,67 +730,12 @@ def _find_dx() -> Optional[Path]:
         if cand.exists() and os.access(cand, os.X_OK):
             return cand
 
-    path_env = os.environ.get("PATH", "")
-    for raw_dir in path_env.split(os.pathsep):
-        if not raw_dir:
-            continue
-        candidate = Path(raw_dir) / "dx"
-        if candidate.exists() and os.access(candidate, os.X_OK):
-            return candidate
+    for raw_dir in os.environ.get("PATH", "").split(os.pathsep):
+        if raw_dir:
+            candidate = Path(raw_dir) / "dx"
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return candidate
     return None
-
-
-def _bash_login_path(cwd: Path) -> Optional[str]:
-    """
-    Return PATH as seen by a login bash shell (and also source ~/.bashrc if present).
-    Works well in containers where PATH is usually set up by profile scripts.
-    """
-    try:
-        cmd = [
-            "bash",
-            "-lc",
-            r'''
-            set -e
-            # login shell already sources /etc/profile and ~/.bash_profile|~/.bash_login|~/.profile
-            # also pull in bashrc if it exists (common in containers/dev shells)
-            if [ -f ~/.bashrc ]; then . ~/.bashrc; fi
-            printf "%s" "$PATH"
-            '''.strip(),
-        ]
-        out = subprocess.check_output(cmd, cwd=cwd, env=os.environ)
-        p = out.decode("utf-8", errors="replace").strip()
-        return p or None
-    except Exception:
-        return None
-
-
-def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
-    env: dict[str, str] = {}
-
-    base_path = os.environ.get("PATH", "")
-
-    # In containers, prefer PATH from a login bash environment (matches “usual bash env”)
-    if is_container():
-        bash_path = _bash_login_path(frontend_dir)
-        if bash_path:
-            base_path = bash_path
-
-    extra_paths = [
-        str(Path.home() / ".cargo" / "bin"),
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-        "/usr/bin",
-        "/opt/binaryen/bin",
-    ]
-    env["PATH"] = os.pathsep.join(extra_paths + [base_path])
-
-    wasm_opt = _find_wasm_opt()
-    if wasm_opt:
-        env["WASM_OPT"] = str(wasm_opt)
-        env["WASMOPT"] = str(wasm_opt)
-        env["DIOXUS_WASM_OPT"] = str(wasm_opt)
-        env["DIOXUS_WASM_OPT_PATH"] = str(wasm_opt)
-    return env
 
 
 # -----------------------------
@@ -713,7 +779,6 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
     if not signer.exists():
         raise FileNotFoundError(f"Missing signer script: {signer}")
 
-    # IMPORTANT: make output path relative to frontend_dir (since cwd=frontend_dir)
     ipas_dir = frontend_dir / "dist" / "ipas"
     ipas_dir.mkdir(parents=True, exist_ok=True)
 
@@ -736,7 +801,6 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
         "CERT_PICK": cert_pick,
     }
 
-    # Use absolute paths so the script can't get confused by cwd.
     run(
         ["bash", str(signer), str(app.resolve()), str(profile.resolve()), str(ipa_out.resolve())],
         cwd=frontend_dir,
@@ -756,11 +820,6 @@ def macos_deploy(frontend_dir: Path) -> Path:
     """
     Copies the built .app bundle into /Applications as APP_NAME.app,
     replacing any existing copy.
-
-    Notes:
-    - This is a local convenience deploy (NOT notarization, NOT dmg/pkg).
-    - If /Applications requires privileges on your machine, run build.py via sudo
-      or adjust permissions.
     """
     if platform.system() != "Darwin":
         print("Error: macos_deploy requires macOS.", file=sys.stderr)
@@ -771,8 +830,6 @@ def macos_deploy(frontend_dir: Path) -> Path:
         raise FileNotFoundError(f"App bundle not found: {src_app}")
 
     applications_dir = Path("/Applications")
-
-    # ✅ Always install as APP_NAME.app (even if source is legacy name)
     dst_app = applications_dir / APP_BUNDLE_NAME
 
     print(f"Deploying macOS app → {dst_app} (from {src_app.name})")
@@ -802,26 +859,21 @@ def macos_deploy(frontend_dir: Path) -> Path:
 # Frontend target selection
 # -----------------------------
 def _host_macos_target() -> str:
-    # Allow override if you want to force x86_64 under Rosetta, etc.
     override = os.environ.get("GS26_MACOS_TARGET", "").strip()
     if override:
         return override
 
     m = platform.machine().lower()
-    # Apple Silicon usually reports "arm64"
     if "arm" in m or "aarch64" in m:
         return "aarch64-apple-darwin"
     return "x86_64-apple-darwin"
 
 
 def _windows_target_default() -> str:
-    # Best default for cross-compiling on macOS.
-    # You can override to "...-windows-msvc" if you have that toolchain working.
     return os.environ.get("GS26_WINDOWS_TARGET", "x86_64-pc-windows-gnu").strip()
 
 
 def _default_rust_target_for_frontend(platform_name: Optional[str]) -> Optional[str]:
-    # For web builds, do not force a Rust target.
     if platform_name is None or platform_name == "web":
         return None
 
@@ -831,57 +883,66 @@ def _default_rust_target_for_frontend(platform_name: Optional[str]) -> Optional[
     if platform_name == "windows":
         return _windows_target_default()
 
-    # iOS targets are already explicitly provided by the caller/map.
-    # Other platforms are intentionally left None here because cross-compiling
-    # requires additional toolchain setup and dx often manages defaults.
     return None
 
 
 def build_frontend(
-        frontend_dir: Path,
-        platform_name: Optional[str] = None,
-        *,
-        rust_target: Optional[str] = None,
+    frontend_dir: Path,
+    platform_name: Optional[str] = None,
+    *,
+    rust_target: Optional[str] = None,
 ) -> None:
     try:
         clear_app_bundle(frontend_dir)
 
-        if is_container():
-            _prebuild_frontend_for_container(frontend_dir)
-            try:
-                run(["dx", "--version"], cwd=frontend_dir)
-            except Exception:
-                print("Warning: failed to read dx version", file=sys.stderr)
-            try:
-                run(["which", "wasm-opt"], cwd=frontend_dir, env=_dx_bundle_env(frontend_dir))
-                run(["wasm-opt", "--version"], cwd=frontend_dir, env=_dx_bundle_env(frontend_dir))
-            except Exception:
-                print("Warning: wasm-opt not available before dx bundle", file=sys.stderr)
+        container = is_container()
+        container_env = _dx_bundle_env_container(frontend_dir) if container else None
 
-        dx = _find_dx()
-        if dx:
-            cmd = [str(dx), "bundle", "--release"]
+        if container:
+            _prebuild_frontend_for_container(frontend_dir)
+
+            # Print what the container sees (useful when debugging CI logs)
+            try:
+                print("Container PATH (bash -lc):")
+                print(_bash_login_capture(frontend_dir, 'echo "$PATH"'))
+            except Exception:
+                pass
+            try:
+                w = _find_wasm_opt_in_container(frontend_dir)
+                print(f"Container wasm-opt: {w if w else 'NOT FOUND'}")
+                if w:
+                    run([str(w), "--version"], cwd=frontend_dir, env=container_env)
+            except Exception:
+                print("Warning: failed to verify wasm-opt in container", file=sys.stderr)
+
+        # Pick dx:
+        # - In containers: ALWAYS use a no-downloads dx installed repo-locally.
+        #   This prevents dx from trying (and failing) to auto-download wasm-opt in “unknown platform” environments.
+        # - On hosts: use dx from PATH.
+        if container:
+            dx_path = _ensure_dx_no_downloads_in_container(frontend_dir)
+            cmd: list[str] = [str(dx_path), "bundle", "--release"]
         else:
-            cmd = ["dx", "bundle", "--release"]
+            dx = _find_dx()
+            cmd = [str(dx), "bundle", "--release"] if dx else ["dx", "bundle", "--release"]
 
         if platform_name:
             cmd.extend(["--platform", platform_name])
             if platform_name == "ios":
                 cmd.extend(["--device", "true"])
             elif platform_name == "windows":
-                # dx has a first-class flag for this; don't use /SUBSYSTEM link args.
                 cmd.extend(["--windows-subsystem", "WINDOWS"])
         else:
             cmd.extend(["--platform", "web"])
 
-        # If caller didn't provide a target, pick one for certain platforms.
         if not rust_target:
             rust_target = _default_rust_target_for_frontend(platform_name)
 
         if rust_target:
             cmd.extend(["--target", rust_target])
 
-        run(cmd, cwd=frontend_dir, env=_dx_bundle_env(frontend_dir) if is_container() else None)
+        # Always pass container env in containers (PATH from bash login + forced wasm-opt)
+        run(cmd, cwd=frontend_dir, env=container_env)
 
         if platform_name == "macos":
             rename_macos_app_bundle(frontend_dir)
@@ -991,14 +1052,11 @@ def main() -> None:
         print("Error: Too many arguments.", file=sys.stderr)
         print_usage()
 
-    # NOTE: We only hardcode targets where it is unambiguous/required.
-    # - ios/ios_sim MUST be explicit.
-    # - windows/macos are now auto-selected if not provided.
     frontend_platform_map = {
         "ios": ("ios", "aarch64-apple-ios"),
         "ios_sim": ("ios", "aarch64-apple-ios-sim"),
         "macos": ("macos", None),
-        "windows": ("windows", None),  # default chosen in build_frontend()
+        "windows": ("windows", None),
         "android": ("android", None),
         "linux": ("linux", None),
     }
@@ -1045,7 +1103,6 @@ def main() -> None:
             print_usage()
 
         if action == "ios_deploy":
-            # NOTE: per your latest direction, this is now just "package and sign" (no local deploy)
             if not use_existing:
                 build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
@@ -1067,7 +1124,6 @@ def main() -> None:
             return
 
         if action == "macos_deploy":
-            # Build + copy into /Applications
             if not use_existing:
                 build_frontend(frontend_dir, platform_name="macos", rust_target=None)
             sign_macos_app_and_dmg(frontend_dir)
