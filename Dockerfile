@@ -7,24 +7,15 @@ LABEL authors="rylan"
 
 WORKDIR /app
 
-# wasm-opt for dx bundle --release (binaryen). Install from GitHub release.
+# wasm-opt + wasm-pack for dx bundle --release (install via cargo).
 RUN set -e; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl xz-utils; \
-    arch="$(uname -m)"; \
-    case "$arch" in \
-        x86_64) bin_arch="x86_64" ;; \
-        aarch64|arm64) bin_arch="aarch64" ;; \
-        *) echo "Unsupported arch for wasm-opt: $arch" >&2; exit 1 ;; \
-    esac; \
-    url="https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-${bin_arch}-linux.tar.gz"; \
-    curl -fsSL "$url" -o /tmp/binaryen.tar.gz; \
-    mkdir -p /opt/binaryen; \
-    tar -xzf /tmp/binaryen.tar.gz -C /opt/binaryen --strip-components=1; \
-    ln -sf /opt/binaryen/bin/wasm-opt /usr/local/bin/wasm-opt; \
-    rm -rf /tmp/binaryen*; \
+    cargo install wasm-opt; \
+    cargo install wasm-pack; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/*
-ENV WASM_OPT=/usr/local/bin/wasm-opt
+ENV PATH="/root/.cargo/bin:${PATH}"
+ENV WASM_OPT=/root/.cargo/bin/wasm-opt
 
 # Top-level workspace manifests
 COPY Cargo.toml Cargo.lock ./
