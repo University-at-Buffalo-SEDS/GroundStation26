@@ -108,7 +108,7 @@ pub enum Route {
 // -------------------------
 // Native-only Objective-C poke shims
 // -------------------------
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod objc_poke {
     use std::ffi::CString;
     use std::os::raw::c_char;
@@ -122,6 +122,11 @@ mod objc_poke {
             unsafe { gs26_localnet_poke_url(c.as_ptr()) };
         }
     }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "macos", target_os = "ios"))))]
+mod objc_poke {
+    pub fn poke_url(_url: &str) {}
 }
 
 // -------------------------
