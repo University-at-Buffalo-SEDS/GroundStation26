@@ -18,7 +18,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 ENV WASM_OPT=/root/.cargo/bin/wasm-opt
 
 # Top-level workspace manifests
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 
 # Backend crate (no data/)
 RUN mkdir -p backend/src

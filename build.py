@@ -577,7 +577,7 @@ def notarize_macos(frontend_dir: Path) -> None:
 def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
     print("Container detected → priming cargo for frontend before dx bundle")
     run(["cargo", "fetch"], cwd=frontend_dir)
-    run(["cargo", "build", "--release", "-p", "groundstation_frontend"], cwd=frontend_dir)
+    run(["dx", "bundle", "--release"], cwd=frontend_dir)
 
 
 def _find_wasm_opt() -> Optional[Path]:
