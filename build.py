@@ -322,6 +322,18 @@ def _rename_legacy_binary_in_dir(dir_path: Path) -> None:
         legacy_bin.rename(dst)
 
 
+def _strip_version_from_filename(name: str) -> str:
+    # Remove semantic version segments like _1.2.3_ or -1.2.3- (and common edge cases).
+    new = re.sub(r"([_-])\\d+\\.\\d+\\.\\d+([_-])?", r"\\1", name)
+    new = new.replace("-.", ".").replace("_.", ".")
+    while "__" in new:
+        new = new.replace("__", "_")
+    while "--" in new:
+        new = new.replace("--", "-")
+    new = new.replace("_-", "_").replace("-_", "-")
+    return new
+
+
 def rename_windows_linux_artifacts(frontend_dir: Path, platform_name: str) -> None:
     dist = dist_dir(frontend_dir)
     if not dist.exists():
@@ -330,17 +342,29 @@ def rename_windows_linux_artifacts(frontend_dir: Path, platform_name: str) -> No
     renamed_any = False
     for item in sorted(dist.iterdir()):
         name = item.name
-        if not name.startswith(LEGACY_APP_NAME):
+        if not (name.startswith(LEGACY_APP_NAME) or name.startswith(APP_NAME)):
             continue
-        new_name = APP_NAME + name[len(LEGACY_APP_NAME):]
-        dst = dist / new_name
-        print(f"Renaming {platform_name} artifact: {name} -> {new_name}")
-        _remove_path(dst)
-        item.rename(dst)
-        renamed_any = True
+        if name.startswith(LEGACY_APP_NAME):
+            new_name = APP_NAME + name[len(LEGACY_APP_NAME):]
+            dst = dist / new_name
+            print(f"Renaming {platform_name} artifact: {name} -> {new_name}")
+            _remove_path(dst)
+            item.rename(dst)
+            item = dst
+            name = new_name
+            renamed_any = True
 
-        if dst.is_dir():
-            _rename_legacy_binary_in_dir(dst)
+        stripped = _strip_version_from_filename(name)
+        if stripped != name:
+            dst = dist / stripped
+            print(f"Removing version from {platform_name} artifact: {name} -> {stripped}")
+            _remove_path(dst)
+            item.rename(dst)
+            item = dst
+            renamed_any = True
+
+        if item.is_dir():
+            _rename_legacy_binary_in_dir(item)
 
     # Also catch loose binaries in dist root
     _rename_legacy_binary_in_dir(dist)
