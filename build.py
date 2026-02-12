@@ -586,6 +586,7 @@ def _find_wasm_opt() -> Optional[Path]:
         Path("/usr/bin/wasm-opt"),
         Path("/opt/binaryen/bin/wasm-opt"),
         Path("/usr/local/bin/binaryen/bin/wasm-opt"),
+        Path("/root/.cargo/bin/wasm-opt"),
     ]
     for cand in candidates:
         if cand.exists() and os.access(cand, os.X_OK):
@@ -600,15 +601,34 @@ def _find_wasm_opt() -> Optional[Path]:
     return None
 
 
+def _find_dx() -> Optional[Path]:
+    candidates = [
+        Path("/root/.cargo/bin/dx"),
+        Path("/usr/local/bin/dx"),
+        Path("/usr/bin/dx"),
+    ]
+    for cand in candidates:
+        if cand.exists() and os.access(cand, os.X_OK):
+            return cand
+
+    path_env = os.environ.get("PATH", "")
+    for raw_dir in path_env.split(os.pathsep):
+        if not raw_dir:
+            continue
+        candidate = Path(raw_dir) / "dx"
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def _dx_bundle_env() -> dict[str, str]:
     env: dict[str, str] = {}
 
     extra_paths = [
+        "/opt/binaryen/bin",
         "/root/.cargo/bin",
         "/usr/local/bin",
         "/usr/bin",
-        "/opt/binaryen/bin",
-        "/usr/local/bin/binaryen/bin",
     ]
     base_path = os.environ.get("PATH", "")
     env["PATH"] = ":".join(extra_paths + [base_path])
@@ -808,7 +828,11 @@ def build_frontend(
             except Exception:
                 print("Warning: wasm-opt not available before dx bundle", file=sys.stderr)
 
-        cmd = ["dx", "bundle", "--release"]
+        dx = _find_dx()
+        if dx:
+            cmd = [str(dx), "bundle", "--release"]
+        else:
+            cmd = ["dx", "bundle", "--release"]
 
         if platform_name:
             cmd.extend(["--platform", platform_name])
