@@ -604,6 +604,7 @@ def _dx_bundle_env() -> dict[str, str]:
     env: dict[str, str] = {}
 
     extra_paths = [
+        "/root/.cargo/bin",
         "/usr/local/bin",
         "/usr/bin",
         "/opt/binaryen/bin",
@@ -797,6 +798,15 @@ def build_frontend(
 
         if is_container():
             _prebuild_frontend_for_container(frontend_dir)
+            try:
+                run(["dx", "--version"], cwd=frontend_dir)
+            except Exception:
+                print("Warning: failed to read dx version", file=sys.stderr)
+            try:
+                run(["which", "wasm-opt"], cwd=frontend_dir, env=_dx_bundle_env())
+                run(["wasm-opt", "--version"], cwd=frontend_dir, env=_dx_bundle_env())
+            except Exception:
+                print("Warning: wasm-opt not available before dx bundle", file=sys.stderr)
 
         cmd = ["dx", "bundle", "--release"]
 
