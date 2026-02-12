@@ -621,21 +621,54 @@ def _find_dx() -> Optional[Path]:
     return None
 
 
-def _dx_bundle_env() -> dict[str, str]:
+def _bash_login_path(cwd: Path) -> Optional[str]:
+    """
+    Return PATH as seen by a login bash shell (and also source ~/.bashrc if present).
+    Works well in containers where PATH is usually set up by profile scripts.
+    """
+    try:
+        cmd = [
+            "bash",
+            "-lc",
+            r'''
+            set -e
+            # login shell already sources /etc/profile and ~/.bash_profile|~/.bash_login|~/.profile
+            # also pull in bashrc if it exists (common in containers/dev shells)
+            if [ -f ~/.bashrc ]; then . ~/.bashrc; fi
+            printf "%s" "$PATH"
+            '''.strip(),
+        ]
+        out = subprocess.check_output(cmd, cwd=cwd, env=os.environ)
+        p = out.decode("utf-8", errors="replace").strip()
+        return p or None
+    except Exception:
+        return None
+
+
+def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
     env: dict[str, str] = {}
 
+    base_path = os.environ.get("PATH", "")
+
+    # In containers, prefer PATH from a login bash environment (matches “usual bash env”)
+    if is_container():
+        bash_path = _bash_login_path(frontend_dir)
+        if bash_path:
+            base_path = bash_path
+
     extra_paths = [
-        "/opt/binaryen/bin",
-        "/root/.cargo/bin",
+        str(Path.home() / ".cargo" / "bin"),
+        "/opt/homebrew/bin",
         "/usr/local/bin",
         "/usr/bin",
+        "/opt/binaryen/bin",
     ]
-    base_path = os.environ.get("PATH", "")
-    env["PATH"] = ":".join(extra_paths + [base_path])
+    env["PATH"] = os.pathsep.join(extra_paths + [base_path])
 
     wasm_opt = _find_wasm_opt()
     if wasm_opt:
         env["WASM_OPT"] = str(wasm_opt)
+        env["WASMOPT"] = str(wasm_opt)
         env["DIOXUS_WASM_OPT"] = str(wasm_opt)
         env["DIOXUS_WASM_OPT_PATH"] = str(wasm_opt)
 
@@ -851,7 +884,7 @@ def build_frontend(
         if rust_target:
             cmd.extend(["--target", rust_target])
 
-        run(cmd, cwd=frontend_dir, env=_dx_bundle_env() if is_container() else None)
+        run(cmd, cwd=frontend_dir, env=_dx_bundle_env(frontend_dir) if is_container() else None)
 
         if platform_name == "macos":
             rename_macos_app_bundle(frontend_dir)
