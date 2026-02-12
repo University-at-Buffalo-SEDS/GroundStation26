@@ -669,7 +669,6 @@ def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
         env["WASMOPT"] = str(wasm_opt)
         env["DIOXUS_WASM_OPT"] = str(wasm_opt)
         env["DIOXUS_WASM_OPT_PATH"] = str(wasm_opt)
-    print(env)
     return env
 
 
