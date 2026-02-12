@@ -11,11 +11,7 @@ WORKDIR /app
 RUN set -e; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl xz-utils; \
-    cargo install wasm-opt; \
-    cargo install wasm-pack; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/*
-ENV PATH="/root/.cargo/bin:${PATH}"
-ENV WASM_OPT=/root/.cargo/bin/wasm-opt
 
 # Top-level workspace manifests
 COPY Cargo.toml ./
