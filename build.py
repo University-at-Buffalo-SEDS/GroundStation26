@@ -27,6 +27,7 @@ FIXED_MOBILEPROVISION_REL = Path("Groundstation_26.mobileprovision")
 
 
 def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None:
+    cmd = [str(part) for part in cmd]
     print(f"Running: {' '.join(cmd)} (cwd={cwd})")
     merged = os.environ.copy()
     if env:
@@ -579,6 +580,47 @@ def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
     run(["cargo", "build", "--release", "-p", "groundstation_frontend"], cwd=frontend_dir)
 
 
+def _find_wasm_opt() -> Optional[Path]:
+    candidates = [
+        Path("/usr/local/bin/wasm-opt"),
+        Path("/usr/bin/wasm-opt"),
+        Path("/opt/binaryen/bin/wasm-opt"),
+        Path("/usr/local/bin/binaryen/bin/wasm-opt"),
+    ]
+    for cand in candidates:
+        if cand.exists() and os.access(cand, os.X_OK):
+            return cand
+    path_env = os.environ.get("PATH", "")
+    for raw_dir in path_env.split(os.pathsep):
+        if not raw_dir:
+            continue
+        candidate = Path(raw_dir) / "wasm-opt"
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _dx_bundle_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+
+    extra_paths = [
+        "/usr/local/bin",
+        "/usr/bin",
+        "/opt/binaryen/bin",
+        "/usr/local/bin/binaryen/bin",
+    ]
+    base_path = os.environ.get("PATH", "")
+    env["PATH"] = ":".join(extra_paths + [base_path])
+
+    wasm_opt = _find_wasm_opt()
+    if wasm_opt:
+        env["WASM_OPT"] = str(wasm_opt)
+        env["DIOXUS_WASM_OPT"] = str(wasm_opt)
+        env["DIOXUS_WASM_OPT_PATH"] = str(wasm_opt)
+
+    return env
+
+
 # -----------------------------
 # Signing / packaging helpers
 # -----------------------------
@@ -775,7 +817,7 @@ def build_frontend(
         if rust_target:
             cmd.extend(["--target", rust_target])
 
-        run(cmd, cwd=frontend_dir)
+        run(cmd, cwd=frontend_dir, env=_dx_bundle_env() if is_container() else None)
 
         if platform_name == "macos":
             rename_macos_app_bundle(frontend_dir)
