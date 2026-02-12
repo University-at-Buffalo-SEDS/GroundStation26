@@ -10,8 +10,9 @@ import tempfile
 
 try:
     import tomllib  # py3.11+
-except ImportError:  # pragma: no cover - fallback for older pythons
+except ImportError:  # pragma: no cover
     tomllib = None
+
 from pathlib import Path
 from subprocess import DEVNULL
 from typing import Optional, Literal
@@ -22,7 +23,7 @@ DIST_DIRNAME = "dist"
 APP_BUNDLE_NAME = f"{APP_NAME}.app"
 LEGACY_APP_BUNDLE_NAME = f"{LEGACY_APP_NAME}.app"
 
-# NEW: fixed provisioning profile path (repo-local)
+# fixed provisioning profile path (repo-local)
 FIXED_MOBILEPROVISION_REL = Path("Groundstation_26.mobileprovision")
 
 
@@ -38,10 +39,7 @@ def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None
 def run_capture(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> str:
     cmd = [str(part) for part in cmd]
     print(f"Running: {' '.join(cmd)} (cwd={cwd})")
-    merged = os.environ.copy()
-    if env:
-        merged.update(env)
-    out = subprocess.check_output(cmd, cwd=cwd, env=merged)
+    out = subprocess.check_output(cmd, cwd=cwd, env=(os.environ | (env or {})))
     return out.decode("utf-8", errors="replace")
 
 
@@ -328,7 +326,6 @@ def _rename_legacy_binary_in_dir(dir_path: Path) -> None:
 
 
 def _strip_version_from_filename(name: str) -> str:
-    # Remove semantic version segments like _1.2.3_ or -1.2.3- (and common edge cases).
     new = re.sub(r"([_-])\d+\.\d+\.\d+([_-])?", r"\1", name)
     new = new.replace("-.", ".").replace("_.", ".")
     while "__" in new:
@@ -350,7 +347,7 @@ def rename_windows_linux_artifacts(frontend_dir: Path, platform_name: str) -> No
         if not (name.startswith(LEGACY_APP_NAME) or name.startswith(APP_NAME)):
             continue
         if name.startswith(LEGACY_APP_NAME):
-            new_name = APP_NAME + name[len(LEGACY_APP_NAME) :]
+            new_name = APP_NAME + name[len(LEGACY_APP_NAME):]
             dst = dist / new_name
             print(f"Renaming {platform_name} artifact: {name} -> {new_name}")
             _remove_path(dst)
@@ -371,7 +368,6 @@ def rename_windows_linux_artifacts(frontend_dir: Path, platform_name: str) -> No
         if item.is_dir():
             _rename_legacy_binary_in_dir(item)
 
-    # Also catch loose binaries in dist root
     _rename_legacy_binary_in_dir(dist)
 
     if not renamed_any:
@@ -579,54 +575,37 @@ def notarize_macos(frontend_dir: Path) -> None:
 
 
 def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
-    # IMPORTANT: do NOT run dx here (avoids any CLI-managed tool downloads / long installs).
+    # IMPORTANT: do NOT run dx bundle here (you asked not to “install another version of dioxus” or do slow tooling work)
     print("Container detected → priming cargo for frontend before dx bundle")
     run(["cargo", "fetch"], cwd=frontend_dir)
 
 
-# -----------------------------------------------------------------------------
-# Container "usual bash env" capture + deterministic tool discovery
-# -----------------------------------------------------------------------------
-def _bash_login_env(cwd: Path) -> dict[str, str]:
+def _bash_login_path(cwd: Path) -> Optional[str]:
     """
-    Capture the environment as seen by a login bash shell.
-    This is the closest match to "what works when I exec into the container and run dx bundle".
-
-    We parse `env -0` (NUL-separated) so it's robust against weird values.
+    Return PATH as seen by `bash -lc` (login-ish shell), which is usually
+    what you mean by “usual bash env” in containers/dev shells.
     """
     try:
-        out = subprocess.check_output(["bash", "-lc", "env -0"], cwd=cwd, env=os.environ)
-        raw = out.split(b"\x00")
-        env: dict[str, str] = {}
-        for entry in raw:
-            if not entry:
-                continue
-            if b"=" not in entry:
-                continue
-            k, v = entry.split(b"=", 1)
-            try:
-                ks = k.decode("utf-8", errors="replace")
-                vs = v.decode("utf-8", errors="replace")
-            except Exception:
-                continue
-            env[ks] = vs
-        return env
+        cmd = ["bash", "-lc", "printf '%s' \"$PATH\""]
+        out = subprocess.check_output(cmd, cwd=cwd, env=os.environ)
+        p = out.decode("utf-8", errors="replace").strip()
+        return p or None
     except Exception:
-        return {}
+        return None
 
 
-def _find_executable_in_path(exe: str, path_value: str) -> Optional[Path]:
-    for raw_dir in (path_value or "").split(os.pathsep):
+def _which_in_path(exe: str, path_value: str) -> Optional[Path]:
+    for raw_dir in path_value.split(os.pathsep):
         if not raw_dir:
             continue
-        p = Path(raw_dir) / exe
-        if p.exists() and os.access(p, os.X_OK):
-            return p
+        candidate = Path(raw_dir) / exe
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return candidate
     return None
 
 
 def _find_wasm_opt(path_value: str) -> Optional[Path]:
-    # Known common locations first (fast path)
+    # Prefer explicit common locations, then PATH scan using the provided PATH value.
     candidates = [
         Path("/usr/local/bin/wasm-opt"),
         Path("/usr/bin/wasm-opt"),
@@ -638,9 +617,7 @@ def _find_wasm_opt(path_value: str) -> Optional[Path]:
     for cand in candidates:
         if cand.exists() and os.access(cand, os.X_OK):
             return cand
-
-    # Then search the *actual PATH we will pass to dx*
-    return _find_executable_in_path("wasm-opt", path_value)
+    return _which_in_path("wasm-opt", path_value)
 
 
 def _find_dx(path_value: str) -> Optional[Path]:
@@ -653,35 +630,23 @@ def _find_dx(path_value: str) -> Optional[Path]:
     for cand in candidates:
         if cand.exists() and os.access(cand, os.X_OK):
             return cand
-    return _find_executable_in_path("dx", path_value)
+    return _which_in_path("dx", path_value)
 
 
 def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
     """
-    Fix for container-only failures:
-
-    The dx CLI will try to auto-download wasm-opt if it can't *see* wasm-opt on PATH.
-    In Docker builds / non-login shells, PATH often differs from interactive shells.
-    So we:
-      1) Capture PATH + other env vars from `bash -lc` (login bash env)
-      2) Build a final PATH that includes common tool dirs + that login PATH
-      3) Find wasm-opt using that final PATH
-      4) Force dx to use it via env vars (WASM_OPT / DIOXUS_WASM_OPT*)
+    Construct an environment that:
+      - in containers: uses PATH from `bash -lc` so we match profile scripts
+      - forces Dioxus CLI to *not download tools* (NO_DOWNLOADS=1)
+      - points dx/wasm toolchains at your already-installed wasm-opt
     """
-    overrides: dict[str, str] = {}
+    base_path = os.environ.get("PATH", "")
 
-    # Base env (non-container): just use current process env.
-    base_env = os.environ.copy()
-
-    # In containers, prefer what a login bash session would produce.
     if is_container():
-        login_env = _bash_login_env(frontend_dir)
-        # Merge: login env first, then current env so explicit Docker ENV still wins
-        base_env.update(login_env)
+        bash_path = _bash_login_path(frontend_dir)
+        if bash_path:
+            base_path = bash_path
 
-    base_path = base_env.get("PATH", "")
-
-    # Prepend commonly-used locations (harmless if they don't exist)
     extra_paths = [
         str(Path.home() / ".cargo" / "bin"),
         "/usr/local/sbin",
@@ -693,22 +658,23 @@ def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
         "/opt/binaryen/bin",
     ]
 
-    final_path = os.pathsep.join([*extra_paths, base_path] if base_path else extra_paths)
-    overrides["PATH"] = final_path
+    env: dict[str, str] = {}
+    env["PATH"] = os.pathsep.join(extra_paths + [base_path])
 
-    wasm_opt = _find_wasm_opt(final_path)
+    # CRITICAL: tell dx to trust the environment and NOT auto-download wasm-opt/wasm-bindgen, etc.
+    # (Dioxus CLI supports NO_DOWNLOADS=1 and a runtime no_downloads setting). :contentReference[oaicite:1]{index=1}
+    if is_container():
+        env["NO_DOWNLOADS"] = "1"
+
+    wasm_opt = _find_wasm_opt(env["PATH"])
     if wasm_opt:
-        # These cover the common ways tooling checks for wasm-opt.
-        overrides["WASM_OPT"] = str(wasm_opt)
-        overrides["WASMOPT"] = str(wasm_opt)
-        overrides["DIOXUS_WASM_OPT"] = str(wasm_opt)
-        overrides["DIOXUS_WASM_OPT_PATH"] = str(wasm_opt)
+        # Cover common env names used by toolchains.
+        env["WASM_OPT"] = str(wasm_opt)
+        env["WASMOPT"] = str(wasm_opt)
+        env["DIOXUS_WASM_OPT"] = str(wasm_opt)
+        env["DIOXUS_WASM_OPT_PATH"] = str(wasm_opt)
 
-    # Make sure HOME is set (some container build contexts have it unset)
-    if "HOME" not in base_env and str(Path.home()):
-        overrides["HOME"] = str(Path.home())
-
-    return overrides
+    return env
 
 
 # -----------------------------
@@ -728,13 +694,6 @@ def fixed_mobileprovision_path(frontend_dir: Path) -> Path:
 
 
 def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> Path:
-    """
-    Uses frontend/scripts/ios_package_sign.sh to:
-      - embed provisioning profile from frontend/Groundstation_26.mobileprovision
-      - pick signing cert by regex (no PII in repo)
-      - sign + package an IPA
-    Returns IPA path.
-    """
     if platform.system() != "Darwin":
         print("Error: iOS packaging/signing requires macOS.", file=sys.stderr)
         sys.exit(1)
@@ -744,6 +703,7 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
         raise FileNotFoundError(f"App bundle not found: {app}")
 
     patch_plist(frontend_dir)
+
     profile = fixed_mobileprovision_path(frontend_dir)
 
     signer = frontend_dir / "scripts" / "ios_package_sign.sh"
@@ -784,9 +744,6 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
     return ipa_out
 
 
-# -----------------------------
-# macOS deploy helper
-# -----------------------------
 def macos_deploy(frontend_dir: Path) -> Path:
     if platform.system() != "Darwin":
         print("Error: macos_deploy requires macOS.", file=sys.stderr)
@@ -822,9 +779,6 @@ def macos_deploy(frontend_dir: Path) -> Path:
     return dst_app
 
 
-# -----------------------------
-# Frontend target selection
-# -----------------------------
 def _host_macos_target() -> str:
     override = os.environ.get("GS26_MACOS_TARGET", "").strip()
     if override:
@@ -859,25 +813,25 @@ def build_frontend(
     try:
         clear_app_bundle(frontend_dir)
 
-        env_for_dx = _dx_bundle_env(frontend_dir) if is_container() else None
+        env = _dx_bundle_env(frontend_dir) if is_container() else None
 
         if is_container():
             _prebuild_frontend_for_container(frontend_dir)
 
-            # Useful diagnostics without changing your installed dx/dioxus.
+            # quick sanity prints (won't install anything)
             try:
-                run(["dx", "--version"], cwd=frontend_dir, env=env_for_dx)
+                run(["bash", "-lc", "echo $PATH"], cwd=frontend_dir, env=env)
+                run(["bash", "-lc", "command -v wasm-opt && wasm-opt --version"], cwd=frontend_dir, env=env)
             except Exception:
-                print("Warning: failed to read dx version", file=sys.stderr)
-            try:
-                run(["bash", "-lc", "command -v wasm-opt && wasm-opt --version"], cwd=frontend_dir, env=env_for_dx)
-            except Exception:
-                print("Warning: wasm-opt not visible in container env", file=sys.stderr)
+                print("Warning: could not verify wasm-opt via bash -lc", file=sys.stderr)
 
-        # Prefer dx from the same PATH we're about to pass (important in containers)
+        # Find dx using the same PATH we will run with (important in containers)
         dx_path = None
-        if env_for_dx and "PATH" in env_for_dx:
-            dx_path = _find_dx(env_for_dx["PATH"])
+        if env is not None:
+            dx_path = _find_dx(env["PATH"])
+        else:
+            dx_path = _find_dx(os.environ.get("PATH", ""))
+
         if dx_path:
             cmd = [str(dx_path), "bundle", "--release"]
         else:
@@ -894,11 +848,11 @@ def build_frontend(
 
         if not rust_target:
             rust_target = _default_rust_target_for_frontend(platform_name)
+
         if rust_target:
             cmd.extend(["--target", rust_target])
 
-        # Critical: always pass our fixed env in containers so dx can see wasm-opt
-        run(cmd, cwd=frontend_dir, env=env_for_dx)
+        run(cmd, cwd=frontend_dir, env=env)
 
         if platform_name == "macos":
             rename_macos_app_bundle(frontend_dir)
@@ -1000,7 +954,7 @@ def main() -> None:
 
     frontend_only_platform: Optional[str] = None
     frontend_rust_target: Optional[str] = None
-    action: Optional[str] = None  # ios_deploy | ios_sign | ios_dist_sign | macos_deploy | macos_sign | macos_notarize
+    action: Optional[str] = None
 
     args = [a.strip().lower() for a in sys.argv[1:]]
 
@@ -1052,7 +1006,6 @@ def main() -> None:
     frontend_dir = repo_root / "frontend"
     backend_dir = repo_root / "backend"
 
-    # Frontend actions
     if action:
         if docker_mode or force_pi or force_no_pi or testing_mode:
             print("Error: Frontend actions cannot be combined with docker/pi_build/no_pi/testing.", file=sys.stderr)
@@ -1063,6 +1016,9 @@ def main() -> None:
                 build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
             print(f"✅ Distribution IPA created: {ipa}")
+            return
+
+        if action == "iosDRY_RUN":
             return
 
         if action == "ios_sign":
@@ -1104,7 +1060,6 @@ def main() -> None:
         print("Error: unknown action", file=sys.stderr)
         sys.exit(1)
 
-    # Frontend-only build mode
     if frontend_only_platform is not None:
         if docker_mode or force_pi or force_no_pi or testing_mode:
             print("Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing.", file=sys.stderr)
@@ -1115,7 +1070,6 @@ def main() -> None:
         build_frontend(frontend_dir, platform_name=frontend_only_platform, rust_target=frontend_rust_target)
         return
 
-    # Docker mode
     if docker_mode:
         if force_no_pi:
             pi_build_flag = False
@@ -1126,14 +1080,12 @@ def main() -> None:
         build_docker(repo_root=repo_root, pi_build=pi_build_flag, testing=testing_mode)
         return
 
-    # Normal local build mode:
     if in_docker_build():
         print("Sequential build")
         build_frontend(frontend_dir, None)
         build_backend(backend_dir, force_pi, force_no_pi, testing_mode)
         return
 
-    # Parallel host build
     bfe = mp.Process(target=build_frontend, args=(frontend_dir, None))
     bbe = mp.Process(target=build_backend, args=(backend_dir, force_pi, force_no_pi, testing_mode))
     bfe.start()
