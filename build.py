@@ -663,57 +663,6 @@ def _dx_bundle_env_container(frontend_dir: Path) -> dict[str, str]:
     return env
 
 
-def _container_dx_root(frontend_dir: Path) -> Path:
-    return frontend_dir / ".tools" / "dioxus-cli-no-downloads"
-
-
-def _container_dx_bin(frontend_dir: Path) -> Path:
-    return _container_dx_root(frontend_dir) / "bin" / "dx"
-
-
-def _ensure_dx_no_downloads_in_container(frontend_dir: Path) -> Path:
-    """
-    Prebuilt dx binaries sometimes ignore PATH tooling and attempt downloads.
-    In containers where the platform detection fails, that blows up (your error).
-
-    Fix: build/install dx from source with the `no-downloads` feature into a repo-local tool dir,
-    and then use that dx for bundling.
-    """
-    dx_bin = _container_dx_bin(frontend_dir)
-    if dx_bin.exists() and os.access(dx_bin, os.X_OK):
-        return dx_bin
-
-    root = _container_dx_root(frontend_dir)
-    root.mkdir(parents=True, exist_ok=True)
-
-    print("Container → installing dx (dioxus-cli) with --features no-downloads into .tools/ ...")
-    env = _dx_bundle_env_container(frontend_dir)
-
-    # Use cargo to install the CLI with no-downloads.
-    # Note: this can be cached by Docker layers if you put it in your Dockerfile, but
-    # doing it here guarantees the script works even if the image wasn't prepared.
-    run(
-        [
-            "cargo",
-            "install",
-            "dioxus-cli",
-            "--locked",
-            "--force",
-            "--features",
-            "no-downloads",
-            "--root",
-            str(root),
-        ],
-        cwd=frontend_dir,
-        env=env,
-    )
-
-    if not dx_bin.exists():
-        raise RuntimeError(f"Failed to install dx at expected path: {dx_bin}")
-
-    return dx_bin
-
-
 def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
     print("Container detected → priming cargo for frontend before dx bundle")
     env = _dx_bundle_env_container(frontend_dir)
@@ -920,7 +869,7 @@ def build_frontend(
         #   This prevents dx from trying (and failing) to auto-download wasm-opt in “unknown platform” environments.
         # - On hosts: use dx from PATH.
         if container:
-            dx_path = _ensure_dx_no_downloads_in_container(frontend_dir)
+            dx_path = _find_dx()
             cmd: list[str] = [str(dx_path), "bundle", "--release"]
         else:
             dx = _find_dx()
