@@ -129,10 +129,11 @@ async fn fetch_tiles_for_zoom_async(
     pb.set_prefix(format!("z={z}"));
     pb.set_style(
         ProgressStyle::with_template(
-            "{prefix} [{bar:40.cyan/blue}]\n{prefix} {pos}/{len} ({percent}%) ETA {eta}",
+            "{prefix} [{bar:40.cyan/blue}] {msg}\n{prefix} {pos}/{len} ({percent}%) ETA {eta}",
         )?
             .progress_chars("##-"),
     );
+    pb.set_message("                    ");
     pb.set_draw_target(ProgressDrawTarget::stdout_with_hz(10));
 
     let z_dir_arc = z_dir.clone();
