@@ -1,16 +1,40 @@
 FROM registry.gitlab.rylanswebsite.com/rylan-meilutis/rust-docker-builder:latest AS builder
 ARG PI_BUILD=""
 ARG TESTING=""
+ARG BINARYEN_VERSION=117
 
 LABEL authors="rylan"
 
 WORKDIR /app
 
-# wasm-opt for dx bundle --release (binaryen package)
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends binaryen ca-certificates \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
-ENV WASM_OPT=/usr/bin/wasm-opt
+# wasm-opt for dx bundle --release (binaryen). Use apt when possible, otherwise download a prebuilt binary.
+RUN set -e; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends binaryen ca-certificates curl xz-utils; \
+    if ! command -v wasm-opt >/dev/null 2>&1; then \
+        arch="$(uname -m)"; \
+        case "$arch" in \
+            x86_64) bin_arch="x86_64" ;; \
+            aarch64|arm64) bin_arch="arm64" ;; \
+            *) echo "Unsupported arch for wasm-opt: $arch" >&2; exit 1 ;; \
+        esac; \
+        url="https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-${bin_arch}-linux.tar.gz"; \
+        curl -fsSL "$url" -o /tmp/binaryen.tar.gz; \
+        tar -xzf /tmp/binaryen.tar.gz -C /tmp; \
+        cp "/tmp/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" /usr/local/bin/; \
+        chmod +x /usr/local/bin/wasm-opt; \
+        rm -rf /tmp/binaryen*; \
+    fi; \
+    if [ ! -x /usr/local/bin/wasm-opt ]; then \
+        for candidate in /usr/bin/wasm-opt /opt/binaryen/bin/wasm-opt /usr/local/bin/binaryen/bin/wasm-opt; do \
+            if [ -x "$candidate" ]; then \
+                ln -sf "$candidate" /usr/local/bin/wasm-opt; \
+                break; \
+            fi; \
+        done; \
+    fi; \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+ENV WASM_OPT=/usr/local/bin/wasm-opt
 
 # Top-level workspace manifests
 COPY Cargo.toml Cargo.lock ./
