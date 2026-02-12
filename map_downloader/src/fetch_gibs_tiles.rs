@@ -30,7 +30,7 @@ const NA_BOUNDS: (f64, f64, f64, f64) = (-170.0, 5.0, -50.0, 83.0);
 
 /// Max concurrent HTTP fetches at a time.
 /// Tune this: higher = faster but more load on GIBS / network.
-const MAX_CONCURRENT: usize = 256;
+const MAX_CONCURRENT: usize = 1024;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -63,6 +63,10 @@ async fn main() -> Result<()> {
         .build()?;
 
     for z in MIN_ZOOM..=MAX_ZOOM {
+        if z != MIN_ZOOM {
+            println!();
+            println!("----");
+        }
         if let Err(e) = fetch_tiles_for_zoom_async(z, &tiles_root, &client).await {
             eprintln!(
                 "fetch_gibs_tiles_async: WARNING: failed to fetch tiles for z={z}: {e}"
@@ -125,7 +129,7 @@ async fn fetch_tiles_for_zoom_async(
     pb.set_prefix(format!("z={z}"));
     pb.set_style(
         ProgressStyle::with_template(
-            "{prefix} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) ETA {eta}",
+            "{prefix} [{bar:40.cyan/blue}]\n{prefix} {pos}/{len} ({percent}%) ETA {eta}",
         )?
             .progress_chars("##-"),
     );
