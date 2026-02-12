@@ -856,8 +856,8 @@ def build_frontend(
             except Exception:
                 print("Warning: failed to read dx version", file=sys.stderr)
             try:
-                run(["which", "wasm-opt"], cwd=frontend_dir, env=_dx_bundle_env())
-                run(["wasm-opt", "--version"], cwd=frontend_dir, env=_dx_bundle_env())
+                run(["which", "wasm-opt"], cwd=frontend_dir, env=_dx_bundle_env(frontend_dir))
+                run(["wasm-opt", "--version"], cwd=frontend_dir, env=_dx_bundle_env(frontend_dir))
             except Exception:
                 print("Warning: wasm-opt not available before dx bundle", file=sys.stderr)
 
