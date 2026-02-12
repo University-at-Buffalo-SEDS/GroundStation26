@@ -10,6 +10,7 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends binaryen ca-certificates \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+ENV WASM_OPT=/usr/bin/wasm-opt
 
 # Top-level workspace manifests
 COPY Cargo.toml Cargo.lock ./
