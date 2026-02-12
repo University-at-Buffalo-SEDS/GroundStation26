@@ -6,6 +6,11 @@ LABEL authors="rylan"
 
 WORKDIR /app
 
+# wasm-opt for dx bundle --release (binaryen package)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends binaryen ca-certificates \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
 # Top-level workspace manifests
 COPY Cargo.toml Cargo.lock ./
 
