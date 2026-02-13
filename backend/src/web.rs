@@ -30,11 +30,13 @@ fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
         .try_get::<Option<String>, _>("values_json")
         .ok()
         .flatten()
-        .and_then(|raw| serde_json::from_str::<Vec<Option<f32>>>(&raw).ok());
-    if let Some(values) = values_from_json {
-        if !values.is_empty() {
-            return values;
-        }
+        .and_then(|raw| serde_json::from_str::<Vec<Option<f64>>>(&raw).ok());
+    if let Some(values) = values_from_json &&  !values.is_empty() {
+            return values
+                .into_iter()
+                .map(|v| v.map(|n| n as f32))
+                .collect();
+        
     }
 
     if let Ok(raw) = row.try_get::<Option<String>, _>("payload_json")
@@ -51,16 +53,7 @@ fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
         return out;
     }
 
-    vec![
-        row.get::<Option<f32>, _>("v0"),
-        row.get::<Option<f32>, _>("v1"),
-        row.get::<Option<f32>, _>("v2"),
-        row.get::<Option<f32>, _>("v3"),
-        row.get::<Option<f32>, _>("v4"),
-        row.get::<Option<f32>, _>("v5"),
-        row.get::<Option<f32>, _>("v6"),
-        row.get::<Option<f32>, _>("v7"),
-    ]
+    Vec::new()
 }
 
 fn value_at(values: &[Option<f32>], idx: usize) -> Option<f32> {
@@ -161,10 +154,9 @@ pub struct GpsResponse {
 
 async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Latest valve state row: data_type = 'VALVE_STATE'
-    // v0..v6: pilot, tanks, dump, igniter, nitrogen, nitrous, retract_plumbing
     let row = sqlx::query(
         r#"
-        SELECT timestamp_ms, values_json, payload_json, v0, v1, v2, v3, v4, v5, v6
+        SELECT timestamp_ms, values_json, payload_json
         FROM telemetry
         WHERE data_type = 'VALVE_STATE'
         ORDER BY timestamp_ms DESC
@@ -197,10 +189,9 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Latest GPS row: assumes `data_type = 'GPS'`
-    // and v0 = lat, v1 = lon (adjust if needed)
     let row = sqlx::query(
         r#"
-        SELECT values_json, payload_json, v0, v1
+        SELECT values_json, payload_json
         FROM telemetry
         WHERE data_type = 'GPS'
         ORDER BY timestamp_ms DESC
@@ -260,7 +251,6 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 data_type,
                 values_json,
                 payload_json,
-                v0, v1, v2, v3, v4, v5, v6, v7,
                 (timestamp_ms / ?) AS bucket_id
             FROM telemetry
             WHERE timestamp_ms BETWEEN ? AND ?
@@ -272,7 +262,7 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         )
         SELECT
             f.timestamp_ms, f.data_type,
-            f.values_json, f.payload_json, f.v0, f.v1, f.v2, f.v3, f.v4, f.v5, f.v6, f.v7
+            f.values_json, f.payload_json
         FROM filtered f
         JOIN latest l
           ON l.data_type = f.data_type
@@ -465,7 +455,7 @@ async fn get_history(
     let cutoff = now_ms - (minutes as i64) * 60_000;
 
     let rows_db = sqlx::query(
-        "SELECT timestamp_ms, data_type, values_json, payload_json, v0, v1, v2, v3, v4, v5, v6, v7 \
+        "SELECT timestamp_ms, data_type, values_json, payload_json \
          FROM telemetry \
          WHERE timestamp_ms >= ? \
          ORDER BY timestamp_ms ASC",

@@ -32,8 +32,7 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     query = (
-        "SELECT timestamp_ms, data_type, values_json, payload_json, "
-        "v0, v1, v2, v3, v4, v5, v6, v7 "
+        "SELECT timestamp_ms, data_type, values_json, payload_json "
         "FROM telemetry ORDER BY timestamp_ms"
     )
 

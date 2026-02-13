@@ -4,8 +4,8 @@ use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::config::DEVICE_IDENTIFIER;
 use sedsprintf_rs_2026::timesync::{
-    compute_offset_delay, decode_timesync_request, decode_timesync_response, TimeSyncConfig,
-    TimeSyncRole, TimeSyncTracker, TimeSyncUpdate,
+    compute_offset_delay, decode_timesync_request, decode_timesync_response, TimeSyncConfig, TimeSyncRole,
+    TimeSyncTracker, TimeSyncUpdate,
 };
 
 use crate::gpio_panel::IGNITION_PIN;
@@ -307,7 +307,7 @@ const DB_RETRY_DELAY_MS: u64 = 50;
 async fn insert_with_retry<F, Fut>(mut f: F) -> Result<(), sqlx::Error>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output=Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
+    Fut: Future<Output = Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
 {
     let mut delay = DB_RETRY_DELAY_MS;
     let mut last_err: Option<sqlx::Error> = None;
@@ -379,7 +379,7 @@ pub async fn handle_packet(
                 .bind(pkt_data as i64)
                 .execute(&state.db)
         })
-            .await
+        .await
         {
             eprintln!("DB insert into flight_state failed after retry: {e}");
         }
@@ -391,7 +391,9 @@ pub async fn handle_packet(
     }
 
     if pkt.data_type() == DataType::UmbilicalStatus {
-        if let Ok(data) = pkt.data_as_u8() && data.len() == 2 {
+        if let Ok(data) = pkt.data_as_u8()
+            && data.len() == 2
+        {
             let cmd_id = data[0];
             let on = data[1] != 0;
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
@@ -400,25 +402,23 @@ pub async fn handle_packet(
                 let ts_ms = pkt.timestamp() as i64;
                 let values = valve_state_values(state);
                 let values_vec: Vec<Option<f32>> = values.into_iter().collect();
-                let values_json = serde_json::to_string(&values_vec).ok();
+                let values_json = serde_json::to_string(
+                    &values_vec
+                        .iter()
+                        .map(|v| v.map(|n| n as f64))
+                        .collect::<Vec<_>>(),
+                )
+                .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 if let Err(e) = insert_with_retry(|| {
                     sqlx::query(
-                        "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json) VALUES (?, ?, ?, ?)",
                     )
                         .bind(ts_ms)
                         .bind(VALVE_STATE_DATA_TYPE)
                         .bind(values_json.as_deref())
                         .bind(payload_json.as_str())
-                        .bind(values_vec.first().copied().flatten())
-                        .bind(values_vec.get(1).copied().flatten())
-                        .bind(values_vec.get(2).copied().flatten())
-                        .bind(values_vec.get(3).copied().flatten())
-                        .bind(values_vec.get(4).copied().flatten())
-                        .bind(values_vec.get(5).copied().flatten())
-                        .bind(values_vec.get(6).copied().flatten())
-                        .bind(values_vec.get(7).copied().flatten())
                         .execute(&state.db)
                 })
                     .await
@@ -444,24 +444,19 @@ pub async fn handle_packet(
 
     if let Ok(values) = pkt.data_as_f32() {
         let values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
-        let values_json = serde_json::to_string(&values_vec).ok();
+        let values_json = serde_json::to_string(
+            &values_vec.iter().map(|v| v.map(|n| n as f64)).collect::<Vec<_>>(),
+        )
+        .ok();
 
         if let Err(e) = insert_with_retry(|| {
             sqlx::query(
-                "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json) VALUES (?, ?, ?, ?)",
             )
                 .bind(ts_ms)
                 .bind(&data_type_str)
                 .bind(values_json.as_deref())
                 .bind(payload_json.as_str())
-                .bind(values_vec.first().copied().flatten())
-                .bind(values_vec.get(1).copied().flatten())
-                .bind(values_vec.get(2).copied().flatten())
-                .bind(values_vec.get(3).copied().flatten())
-                .bind(values_vec.get(4).copied().flatten())
-                .bind(values_vec.get(5).copied().flatten())
-                .bind(values_vec.get(6).copied().flatten())
-                .bind(values_vec.get(7).copied().flatten())
                 .execute(&state.db)
         })
             .await
@@ -476,30 +471,20 @@ pub async fn handle_packet(
         };
 
         let _ = state.ws_tx.send(row);
-    } else {
-        if let Err(e) = insert_with_retry(|| {
+    } else if let Err(e) = insert_with_retry(|| {
             sqlx::query(
-                "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json, v0, v1, v2, v3, v4, v5, v6, v7) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json) VALUES (?, ?, ?, ?)",
             )
                 .bind(ts_ms)
                 .bind(&data_type_str)
                 .bind(Option::<String>::None)
                 .bind(payload_json.as_str())
-                .bind(Option::<f32>::None)
-                .bind(Option::<f32>::None)
-                .bind(Option::<f32>::None)
-                .bind(Option::<f32>::None)
-                .bind(Option::<f32>::None)
-                .bind(Option::<f32>::None)
-                .bind(Option::<f32>::None)
-                .bind(Option::<f32>::None)
                 .execute(&state.db)
         })
             .await
         {
             eprintln!("DB insert into telemetry failed after retry: {e}");
         }
-    }
 }
 
 pub fn get_current_timestamp_ms() -> u64 {
@@ -541,7 +526,11 @@ fn handle_timesync_tick(
 
     if ts.tracker.should_announce(now_ms) {
         if now_ms.saturating_sub(ts.last_announce_ms) >= TIMESYNC_ANNOUNCE_INTERVAL_MS {
-            let _ = queue_timesync_announce(router, ts.tracker.config().priority, get_current_timestamp_ms());
+            let _ = queue_timesync_announce(
+                router,
+                ts.tracker.config().priority,
+                get_current_timestamp_ms(),
+            );
             ts.last_announce_ms = now_ms;
         }
         return;

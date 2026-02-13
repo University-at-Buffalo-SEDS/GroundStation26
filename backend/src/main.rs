@@ -72,15 +72,7 @@ async fn main() -> anyhow::Result<()> {
             timestamp_ms INTEGER NOT NULL,
             data_type    TEXT    NOT NULL,
             values_json  TEXT,
-            payload_json TEXT,
-            v0           REAL,
-            v1           REAL,
-            v2           REAL,
-            v3           REAL,
-            v4           REAL,
-            v5           REAL,
-            v6           REAL,
-            v7           REAL
+            payload_json TEXT
         );
         "#,
     )
