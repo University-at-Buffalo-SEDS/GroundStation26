@@ -41,9 +41,17 @@ pub fn StateTab(
     // Redraw driver for charts on State tab
     // ------------------------------------------------------------
     let redraw_tick = use_signal(|| 0u64);
+    #[cfg(target_arch = "wasm32")]
+    let raf_running = use_signal(|| std::rc::Rc::new(std::cell::Cell::new(true)));
+    #[cfg(target_arch = "wasm32")]
+    let raf_id = use_signal(|| std::rc::Rc::new(std::cell::Cell::new(None::<i32>)));
 
     use_effect({
         let mut redraw_tick = redraw_tick;
+        #[cfg(target_arch = "wasm32")]
+        let raf_running = raf_running.read().clone();
+        #[cfg(target_arch = "wasm32")]
+        let raf_id = raf_id.read().clone();
 
         move || {
             #[cfg(target_arch = "wasm32")]
@@ -55,22 +63,33 @@ pub fn StateTab(
 
                 let cb: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
                 let cb2 = cb.clone();
+                let raf_running_cb = raf_running.clone();
+                let raf_id_cb = raf_id.clone();
+                let raf_id_start = raf_id.clone();
 
                 *cb2.borrow_mut() = Some(Closure::wrap(Box::new(move |_ts: f64| {
+                    if !raf_running_cb.get() {
+                        return;
+                    }
                     let next = redraw_tick.read().wrapping_add(1);
                     redraw_tick.set(next);
 
                     if let Some(win) = web_sys::window() {
-                        let _ = win.request_animation_frame(
-                            cb.borrow().as_ref().unwrap().as_ref().unchecked_ref(),
-                        );
+                        if let Some(cb_ref) = cb.borrow().as_ref() {
+                            if let Ok(id) = win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
+                            {
+                                raf_id_cb.set(Some(id));
+                            }
+                        }
                     }
                 }) as Box<dyn FnMut(f64)>));
 
                 if let Some(win) = web_sys::window() {
-                    let _ = win.request_animation_frame(
-                        cb2.borrow().as_ref().unwrap().as_ref().unchecked_ref(),
-                    );
+                    if let Some(cb_ref) = cb2.borrow().as_ref() {
+                        if let Ok(id) = win.request_animation_frame(cb_ref.as_ref().unchecked_ref()) {
+                            raf_id_start.set(Some(id));
+                        }
+                    }
                 }
 
                 std::mem::forget(cb2);
@@ -89,6 +108,20 @@ pub fn StateTab(
             }
         }
     });
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let raf_running = raf_running.read().clone();
+        let raf_id = raf_id.read().clone();
+        use_drop(move || {
+            raf_running.set(false);
+            if let Some(win) = web_sys::window() {
+                if let Some(id) = raf_id.get() {
+                    let _ = win.cancel_animation_frame(id);
+                }
+            }
+        });
+    }
 
     // Force rerender when redraw driver ticks
     let _ = *redraw_tick.read();
