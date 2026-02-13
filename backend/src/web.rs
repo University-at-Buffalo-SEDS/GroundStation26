@@ -14,6 +14,7 @@ use futures::{SinkExt, StreamExt};
 use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -70,7 +71,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(CompressionLayer::new())
         .route("/api/recent", get(get_recent))
         .route("/api/command", post(send_command))
-        .route("/api/history", get(get_history))
         .route("/api/alerts", get(get_alerts))
         .route("/api/boards", get(get_boards))
         .route("/api/layout", get(get_layout))
@@ -353,9 +353,18 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Task: server -> client (all streams multiplexed)
     let send_task = async move {
+        const BUCKET_MS: i64 = 20;
+        let mut last_bucket_by_type: HashMap<String, i64> = HashMap::new();
+
         loop {
             tokio::select! {
                 Ok(pkt) = telemetry_rx.recv() => {
+                    let bucket_id = pkt.timestamp_ms / BUCKET_MS;
+                    let key = pkt.data_type.clone();
+                    if last_bucket_by_type.get(&key).copied() == Some(bucket_id) {
+                        continue;
+                    }
+                    last_bucket_by_type.insert(key, bucket_id);
                     let msg = WsOutMsg::Telemetry(pkt);
                     let text = serde_json::to_string(&msg).unwrap_or_default();
                     if sender
@@ -440,41 +449,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 struct HistoryParams {
     // /api/history?minutes=20  (defaults to 20 if not provided)
     minutes: Option<u64>,
-}
-
-async fn get_history(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<HistoryParams>,
-) -> impl IntoResponse {
-    let minutes = params.minutes.unwrap_or(20);
-    let now_ms: i64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-
-    let cutoff = now_ms - (minutes as i64) * 60_000;
-
-    let rows_db = sqlx::query(
-        "SELECT timestamp_ms, data_type, values_json, payload_json \
-         FROM telemetry \
-         WHERE timestamp_ms >= ? \
-         ORDER BY timestamp_ms ASC",
-    )
-        .bind(cutoff)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
-
-    let rows: Vec<TelemetryRow> = rows_db
-        .into_iter()
-        .map(|row| TelemetryRow {
-            timestamp_ms: row.get::<i64, _>("timestamp_ms"),
-            data_type: row.get::<String, _>("data_type"),
-            values: values_from_row(&row),
-        })
-        .collect();
-
-    Json(rows)
 }
 
 /// NEW: /api/alerts – returns warnings + errors from `alerts` table
