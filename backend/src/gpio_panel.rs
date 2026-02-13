@@ -14,24 +14,32 @@ use tokio::time::interval;
 // TODO: Set the correct GPIO pin numbers, all current numbers are placeholders.
 pub const IGNITION_PIN: u8 = 5;
 #[allow(dead_code)]
-//TODO: finish gpio setup
 pub const IGNITION_PIN_LED: u8 = 6;
+
 pub const ABORT_PIN: u8 = 9;
 pub const ABORT_PIN_LED: u8 = 10;
+
 pub const LAUNCH_PIN: u8 = 3;
 pub const LAUNCH_PIN_LED: u8 = 11;
+
 pub const DUMP_PIN: u8 = 4;
 pub const DUMP_PIN_LED: u8 = 12;
+
 pub const RETRACT_PIN: u8 = 17;
 pub const RETRACT_PIN_LED: u8 = 18;
+
 pub const PILOT_VALVE_PIN: u8 = 27;
-pub const PILOT_VALVE_LED: u8 = 28;
+pub const PILOT_VALVE_LED: u8 = 16;          // was 28 (invalid)
+
 pub const NITROGEN_TANK_VALVE_PIN: u8 = 22;
 pub const NITROGEN_TANK_VALVE_LED: u8 = 23;
+
 pub const NITROUS_TANK_VALVE_PIN: u8 = 24;
 pub const NITROUS_TANK_VALVE_LED: u8 = 14;
+
 pub const NORMALLY_OPEN_PIN: u8 = 26;
-pub const NORMALLY_OPEN_LED: u8 = 5;
+pub const NORMALLY_OPEN_LED: u8 = 15;        // was 7 (spi0 CS1 used)
+
 //####################################################################
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
