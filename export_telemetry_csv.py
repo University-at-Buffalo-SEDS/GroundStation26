@@ -4,19 +4,19 @@ import csv
 import sqlite3
 from pathlib import Path
 
-
+script_dir = Path(__file__).parent.resolve()
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export telemetry rows from groundstation.db to a CSV file."
     )
     parser.add_argument(
         "--db",
-        default=str(Path( "data") / "groundstation.db"),
+        default=str(script_dir / Path("data") / "groundstation.db"),
         help="Path to the SQLite DB (default: data/groundstation.db)",
     )
     parser.add_argument(
         "--out",
-        default="telemetry.csv",
+        default=str(script_dir / "telemetry.csv"),
         help="Output CSV path (default: telemetry.csv)",
     )
     return parser.parse_args()
@@ -39,13 +39,14 @@ def main() -> None:
 
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(query)
+        cursor = conn.execute(query)
+        col_names = [col[0] for col in cursor.description]
 
         with out_path.open("w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(rows.keys())
-            for row in rows:
-                writer.writerow([row[k] for k in row.keys()])
+            writer.writerow(col_names)
+            for row in cursor:
+                writer.writerow([row[k] for k in col_names])
 
     print(f"Wrote telemetry CSV to {out_path}")
 
