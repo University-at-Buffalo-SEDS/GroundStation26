@@ -11,8 +11,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--db",
-        default=str(Path("backend") / "data" / "groundstation.db"),
-        help="Path to the SQLite DB (default: backend/data/groundstation.db)",
+        default=str(Path( "data") / "groundstation.db"),
+        help="Path to the SQLite DB (default: data/groundstation.db)",
     )
     parser.add_argument(
         "--out",
