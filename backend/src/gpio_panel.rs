@@ -28,10 +28,10 @@ pub const PILOT_VALVE_PIN: u8 = 27;
 pub const PILOT_VALVE_LED: u8 = 28;
 pub const NITROGEN_TANK_VALVE_PIN: u8 = 22;
 pub const NITROGEN_TANK_VALVE_LED: u8 = 23;
-pub const NITROUS_TANK_VALVE_PIN: u8 = 22;
-pub const NITROUS_TANK_VALVE_LED: u8 = 23;
-pub const NORMALLY_OPEN_PIN: u8 = 24;
-pub const NORMALLY_OPEN_LED: u8 = 25;
+pub const NITROUS_TANK_VALVE_PIN: u8 = 24;
+pub const NITROUS_TANK_VALVE_LED: u8 = 25;
+pub const NORMALLY_OPEN_PIN: u8 = 26;
+pub const NORMALLY_OPEN_LED: u8 = 29;
 //####################################################################
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
