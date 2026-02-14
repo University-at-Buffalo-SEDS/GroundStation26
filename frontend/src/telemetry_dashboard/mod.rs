@@ -332,6 +332,35 @@ pub fn abs_http(path: &str) -> String {
     }
 }
 
+pub fn map_tiles_url() -> String {
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(target_os = "macos", target_os = "windows", target_os = "linux")
+    ))]
+    {
+        if UrlConfig::_skip_tls_verify() {
+            return "gs26://local/tiles/{z}/{x}/{y}.jpg".to_string();
+        }
+    }
+
+    abs_http("/tiles/{z}/{x}/{y}.jpg")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn persisted_base_http_for_native_io() -> String {
+    persist::get_string(BASE_URL_STORAGE_KEY)
+        .map(normalize_base_url)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "http://localhost:3000".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn persisted_skip_tls_for_base_for_native_io(base: &str) -> bool {
+    persist::get_string(&_tls_skip_key(base))
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
 fn bump_ws_epoch() {
     *WS_SENDER.write() = None;
 

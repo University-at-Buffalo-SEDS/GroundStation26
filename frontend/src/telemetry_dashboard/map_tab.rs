@@ -1,6 +1,8 @@
 // frontend/src/telemetry_dashboard/map_tab.rs
 
-use crate::telemetry_dashboard::{abs_http, js_eval, js_is_ground_map_ready, js_read_window_string};
+use crate::telemetry_dashboard::{
+    js_eval, js_is_ground_map_ready, js_read_window_string, map_tiles_url,
+};
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 
@@ -8,7 +10,7 @@ const RESIZE_DEBOUNCE_MS: u64 = 250;
 const FULLSCREEN_REINIT_DELAY_MS: u64 = 80;
 
 fn tiles_url() -> String {
-    abs_http("/tiles/{z}/{x}/{y}.jpg")
+    map_tiles_url()
 }
 
 #[component]
@@ -66,6 +68,31 @@ pub fn MapTab(
                     js_center_on(lat, lon);
                     has_centered_on_user.set(true);
                 }
+            }
+        });
+    }
+
+    // --- 2b) Keep browser geolocation in sync (watchPosition updates window vars asynchronously) ---
+    {
+        let mut browser_user_gps = browser_user_gps;
+        let mut has_centered_on_user = has_centered_on_user;
+        use_future(move || async move {
+            loop {
+                if let Some((lat, lon)) = js_read_user_latlon_from_window() {
+                    if *browser_user_gps.read() != Some((lat, lon)) {
+                        browser_user_gps.set(Some((lat, lon)));
+                    }
+                    if !*has_centered_on_user.read() {
+                        js_center_on(lat, lon);
+                        has_centered_on_user.set(true);
+                    }
+                }
+
+                #[cfg(target_arch = "wasm32")]
+                gloo_timers::future::TimeoutFuture::new(700).await;
+
+                #[cfg(not(target_arch = "wasm32"))]
+                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             }
         });
     }

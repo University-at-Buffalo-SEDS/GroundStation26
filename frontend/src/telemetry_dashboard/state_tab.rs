@@ -76,7 +76,8 @@ pub fn StateTab(
 
                     if let Some(win) = web_sys::window() {
                         if let Some(cb_ref) = cb.borrow().as_ref() {
-                            if let Ok(id) = win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
+                            if let Ok(id) =
+                                win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
                             {
                                 raf_id_cb.set(Some(id));
                             }
@@ -86,7 +87,8 @@ pub fn StateTab(
 
                 if let Some(win) = web_sys::window() {
                     if let Some(cb_ref) = cb2.borrow().as_ref() {
-                        if let Ok(id) = win.request_animation_frame(cb_ref.as_ref().unchecked_ref()) {
+                        if let Ok(id) = win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
+                        {
                             raf_id_start.set(Some(id));
                         }
                     }
@@ -190,7 +192,10 @@ fn render_state_section(
     if !section_has_content(section, actions) {
         return rsx! { div {} };
     }
-    let title = section.title.clone().unwrap_or_else(|| "Section".to_string());
+    let title = section
+        .title
+        .clone()
+        .unwrap_or_else(|| "Section".to_string());
 
     rsx! {
         Section { title: title,
@@ -281,7 +286,10 @@ fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&st
     let h = view_h as f32;
 
     let (paths, y_min, y_max, span_min) = charts_cache_get(dt, w, h);
-    let labels: Vec<String> = labels_for_datatype(dt).iter().map(|s| s.to_string()).collect();
+    let labels: Vec<String> = labels_for_datatype(dt)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     let left = 60.0_f64;
     let right = view_w - 20.0_f64;
@@ -382,13 +390,34 @@ fn valve_state_grid(
     };
 
     let default_items = [
-        SummaryItem { label: "Pilot".to_string(), index: 0 },
-        SummaryItem { label: "NormallyOpen".to_string(), index: 1 },
-        SummaryItem { label: "Dump".to_string(), index: 2 },
-        SummaryItem { label: "Igniter".to_string(), index: 3 },
-        SummaryItem { label: "Nitrogen".to_string(), index: 4 },
-        SummaryItem { label: "Nitrous".to_string(), index: 5 },
-        SummaryItem { label: "Fill Lines".to_string(), index: 6 },
+        SummaryItem {
+            label: "Pilot".to_string(),
+            index: 0,
+        },
+        SummaryItem {
+            label: "NormallyOpen".to_string(),
+            index: 1,
+        },
+        SummaryItem {
+            label: "Dump".to_string(),
+            index: 2,
+        },
+        SummaryItem {
+            label: "Igniter".to_string(),
+            index: 3,
+        },
+        SummaryItem {
+            label: "Nitrogen".to_string(),
+            index: 4,
+        },
+        SummaryItem {
+            label: "Nitrous".to_string(),
+            index: 5,
+        },
+        SummaryItem {
+            label: "Fill Lines".to_string(),
+            index: 6,
+        },
     ];
 
     let items: Vec<(String, Option<f32>)> = match valves {
@@ -443,12 +472,18 @@ fn ValveStateCard(
         .unwrap_or("Unknown");
 
     let (bg, border, fg, text) = match value {
-        Some(v) if v >= 0.5 => {
-            (open.bg.as_str(), open.border.as_str(), open.fg.as_str(), true_label)
-        }
-        Some(_) => {
-            (closed.bg.as_str(), closed.border.as_str(), closed.fg.as_str(), false_label)
-        }
+        Some(v) if v >= 0.5 => (
+            open.bg.as_str(),
+            open.border.as_str(),
+            open.fg.as_str(),
+            true_label,
+        ),
+        Some(_) => (
+            closed.bg.as_str(),
+            closed.border.as_str(),
+            closed.fg.as_str(),
+            false_label,
+        ),
         None => (
             unknown.bg.as_str(),
             unknown.border.as_str(),
@@ -483,7 +518,9 @@ fn valve_colors(colors: Option<&ValveColorSet>) -> (ValveColor, ValveColor, Valv
     };
 
     let open = colors.and_then(|c| c.open.clone()).unwrap_or(default_open);
-    let closed = colors.and_then(|c| c.closed.clone()).unwrap_or(default_closed);
+    let closed = colors
+        .and_then(|c| c.closed.clone())
+        .unwrap_or(default_closed);
     let unknown = colors
         .and_then(|c| c.unknown.clone())
         .unwrap_or(default_unknown);
@@ -551,7 +588,9 @@ fn has_any_actions(actions: &[ActionSpec], selection: Option<&[String]>) -> bool
     if selected.is_empty() {
         return !actions.is_empty();
     }
-    selected.iter().any(|cmd| actions.iter().any(|a| &a.cmd == cmd))
+    selected
+        .iter()
+        .any(|cmd| actions.iter().any(|a| &a.cmd == cmd))
 }
 
 fn action_style(border: &str, bg: &str, fg: &str) -> String {
@@ -573,7 +612,13 @@ fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[SummaryItem]) -> Elemen
 
     let latest = items
         .iter()
-        .map(|item| (item.label.clone(), item.index, latest_value(rows, dt, item.index)))
+        .map(|item| {
+            (
+                item.label.clone(),
+                item.index,
+                latest_value(rows, dt, item.index),
+            )
+        })
         .collect::<Vec<_>>();
 
     rsx! {

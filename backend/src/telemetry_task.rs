@@ -307,7 +307,7 @@ const DB_RETRY_DELAY_MS: u64 = 50;
 async fn insert_with_retry<F, Fut>(mut f: F) -> Result<(), sqlx::Error>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
+    Fut: Future<Output=Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
 {
     let mut delay = DB_RETRY_DELAY_MS;
     let mut last_err: Option<sqlx::Error> = None;
@@ -379,7 +379,7 @@ pub async fn handle_packet(
                 .bind(pkt_data as i64)
                 .execute(&state.db)
         })
-        .await
+            .await
         {
             eprintln!("DB insert into flight_state failed after retry: {e}");
         }
@@ -408,7 +408,7 @@ pub async fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                .ok();
+                    .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 if let Err(e) = insert_with_retry(|| {
@@ -447,7 +447,7 @@ pub async fn handle_packet(
         let values_json = serde_json::to_string(
             &values_vec.iter().map(|v| v.map(|n| n as f64)).collect::<Vec<_>>(),
         )
-        .ok();
+            .ok();
 
         if let Err(e) = insert_with_retry(|| {
             sqlx::query(
@@ -472,19 +472,19 @@ pub async fn handle_packet(
 
         let _ = state.ws_tx.send(row);
     } else if let Err(e) = insert_with_retry(|| {
-            sqlx::query(
-                "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json) VALUES (?, ?, ?, ?)",
-            )
-                .bind(ts_ms)
-                .bind(&data_type_str)
-                .bind(Option::<String>::None)
-                .bind(payload_json.as_str())
-                .execute(&state.db)
-        })
-            .await
-        {
-            eprintln!("DB insert into telemetry failed after retry: {e}");
-        }
+        sqlx::query(
+            "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json) VALUES (?, ?, ?, ?)",
+        )
+            .bind(ts_ms)
+            .bind(&data_type_str)
+            .bind(Option::<String>::None)
+            .bind(payload_json.as_str())
+            .execute(&state.db)
+    })
+        .await
+    {
+        eprintln!("DB insert into telemetry failed after retry: {e}");
+    }
 }
 
 pub fn get_current_timestamp_ms() -> u64 {

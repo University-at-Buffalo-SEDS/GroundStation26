@@ -5,6 +5,8 @@ import sqlite3
 from pathlib import Path
 
 script_dir = Path(__file__).parent.resolve()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export telemetry rows from groundstation.db to a CSV file."

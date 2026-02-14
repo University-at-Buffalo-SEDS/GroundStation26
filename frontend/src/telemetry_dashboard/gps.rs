@@ -34,8 +34,7 @@ pub fn stop_gps_updates() {
 #[component]
 pub fn GpsDriver(
     user_gps: Signal<Option<(f64, f64)>>,
-    #[props(optional)]
-    js_ready: Option<bool>,
+    #[props(optional)] js_ready: Option<bool>,
 ) -> Element {
     // wasm/windows: hook-based SDK (no globals, no stop needed)
     #[cfg(any(target_arch = "wasm32", target_os = "windows"))]

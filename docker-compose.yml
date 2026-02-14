@@ -16,17 +16,17 @@ services:
     restart: always
     # Uncomment the following lines to allow GPIO access from the container. This is needed for testing on Raspberry Pi
     # devices, but should be left disabled for development on other platforms.
-#    devices:
-#      - /dev/gpiochip0:/dev/gpiochip0
-#      - /dev/gpiochip1:/dev/gpiochip1
-#      - /dev/gpiochip2:/dev/gpiochip2
-#      - /dev/gpiochip3:/dev/gpiochip3
-#      - /dev/gpiochip4:/dev/gpiochip4
-#      - /dev/gpiomem0:/dev/gpiomem0
-#      - /dev/gpiomem1:/dev/gpiomem1
-#      - /dev/gpiomem2:/dev/gpiomem2
-#      - /dev/gpiomem3:/dev/gpiomem3
-#      - /dev/gpiomem4:/dev/gpiomem4
+  #    devices:
+  #      - /dev/gpiochip0:/dev/gpiochip0
+  #      - /dev/gpiochip1:/dev/gpiochip1
+  #      - /dev/gpiochip2:/dev/gpiochip2
+  #      - /dev/gpiochip3:/dev/gpiochip3
+  #      - /dev/gpiochip4:/dev/gpiochip4
+  #      - /dev/gpiomem0:/dev/gpiomem0
+  #      - /dev/gpiomem1:/dev/gpiomem1
+  #      - /dev/gpiomem2:/dev/gpiomem2
+  #      - /dev/gpiomem3:/dev/gpiomem3
+  #      - /dev/gpiomem4:/dev/gpiomem4
 
   nginx:
     build: ./nginx

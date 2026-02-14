@@ -128,8 +128,8 @@ pub fn DataTab(
             {
                 use std::cell::RefCell;
                 use std::rc::Rc;
-                use wasm_bindgen::closure::Closure;
                 use wasm_bindgen::JsCast;
+                use wasm_bindgen::closure::Closure;
 
                 let cb: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
                 let cb2 = cb.clone();
@@ -146,7 +146,8 @@ pub fn DataTab(
 
                     if let Some(win) = web_sys::window() {
                         if let Some(cb_ref) = cb.borrow().as_ref() {
-                            if let Ok(id) = win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
+                            if let Ok(id) =
+                                win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
                             {
                                 raf_id_cb.set(Some(id));
                             }
@@ -156,7 +157,8 @@ pub fn DataTab(
 
                 if let Some(win) = web_sys::window() {
                     if let Some(cb_ref) = cb2.borrow().as_ref() {
-                        if let Ok(id) = win.request_animation_frame(cb_ref.as_ref().unchecked_ref()) {
+                        if let Ok(id) = win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
+                        {
                             raf_id_start.set(Some(id));
                         }
                     }
@@ -223,7 +225,8 @@ pub fn DataTab(
     let boolean_labels = current_tab.and_then(|t| t.boolean_labels.as_ref());
     let channel_boolean_labels = current_tab.and_then(|t| t.channel_boolean_labels.as_ref());
     let has_telemetry = latest_row.is_some();
-    let is_graph_allowed = chart_enabled && has_telemetry && current != "GPS_DATA" && !is_valve_state;
+    let is_graph_allowed =
+        chart_enabled && has_telemetry && current != "GPS_DATA" && !is_valve_state;
 
     // Viewport constants
     let view_w = 1200.0_f64;
@@ -264,7 +267,13 @@ pub fn DataTab(
     let legend_items: Vec<(usize, &str)> = labels
         .iter()
         .enumerate()
-        .filter_map(|(i, l)| if l.is_empty() { None } else { Some((i, l.as_str())) })
+        .filter_map(|(i, l)| {
+            if l.is_empty() {
+                None
+            } else {
+                Some((i, l.as_str()))
+            }
+        })
         .collect();
     let legend_rows: Vec<(usize, &str)> =
         legend_items.iter().map(|(i, label)| (*i, *label)).collect();
@@ -544,12 +553,8 @@ fn fmt_opt(v: Option<f32>) -> String {
 }
 
 fn boolean_value_text(v: Option<f32>, labels: Option<&BooleanLabels>) -> String {
-    let true_label = labels
-        .map(|l| l.true_label.as_str())
-        .unwrap_or("Open");
-    let false_label = labels
-        .map(|l| l.false_label.as_str())
-        .unwrap_or("Closed");
+    let true_label = labels.map(|l| l.true_label.as_str()).unwrap_or("Open");
+    let false_label = labels.map(|l| l.false_label.as_str()).unwrap_or("Closed");
     let unknown_label = labels
         .and_then(|l| l.unknown_label.as_deref())
         .unwrap_or("Unknown");

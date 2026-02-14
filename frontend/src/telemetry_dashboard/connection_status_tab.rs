@@ -11,7 +11,10 @@ const LATENCY_MAX_POINTS: usize = 2000;
 const SCROLL_TRIGGER_THRESHOLD_MS: i64 = 200;
 
 #[component]
-pub fn ConnectionStatusTab(boards: Signal<Vec<BoardStatusEntry>>, layout: ConnectionTabLayout) -> Element {
+pub fn ConnectionStatusTab(
+    boards: Signal<Vec<BoardStatusEntry>>,
+    layout: ConnectionTabLayout,
+) -> Element {
     let mut show_board = use_signal(|| true);
     let mut board_fullscreen = use_signal(|| false);
     let mut show_latency = use_signal(|| true);

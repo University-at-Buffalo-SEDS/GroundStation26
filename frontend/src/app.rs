@@ -124,7 +124,10 @@ mod objc_poke {
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "macos", target_os = "ios"))))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 mod objc_poke {
     pub fn poke_url(_url: &str) {}
 }

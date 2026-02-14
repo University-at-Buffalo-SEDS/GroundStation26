@@ -32,12 +32,11 @@ fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
         .ok()
         .flatten()
         .and_then(|raw| serde_json::from_str::<Vec<Option<f64>>>(&raw).ok());
-    if let Some(values) = values_from_json &&  !values.is_empty() {
-            return values
-                .into_iter()
-                .map(|v| v.map(|n| n as f32))
-                .collect();
-        
+    if let Some(values) = values_from_json && !values.is_empty() {
+        return values
+            .into_iter()
+            .map(|v| v.map(|n| n as f32))
+            .collect();
     }
 
     if let Ok(raw) = row.try_get::<Option<String>, _>("payload_json")

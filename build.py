@@ -575,7 +575,8 @@ def notarize_macos(frontend_dir: Path) -> None:
 
 
 def _prebuild_frontend_for_container(frontend_dir: Path) -> None:
-    # IMPORTANT: do NOT run dx bundle here (you asked not to “install another version of dioxus” or do slow tooling work)
+    # IMPORTANT: do NOT run dx bundle here (you asked not to “install another version of dioxus” or do slow tooling
+    # work)
     print("Container detected → priming cargo for frontend before dx bundle")
     run(["cargo", "fetch"], cwd=frontend_dir)
 
@@ -805,10 +806,11 @@ def _default_rust_target_for_frontend(platform_name: Optional[str]) -> Optional[
 
 
 def build_frontend(
-    frontend_dir: Path,
-    platform_name: Optional[str] = None,
-    *,
-    rust_target: Optional[str] = None,
+        frontend_dir: Path,
+        platform_name: Optional[str] = None,
+        *,
+        rust_target: Optional[str] = None,
+        debug_mode: bool = False,
 ) -> None:
     try:
         clear_app_bundle(frontend_dir)
@@ -833,9 +835,12 @@ def build_frontend(
             dx_path = _find_dx(os.environ.get("PATH", ""))
 
         if dx_path:
-            cmd = [str(dx_path), "bundle", "--release"]
+            cmd = [str(dx_path), "bundle"]
         else:
-            cmd = ["dx", "bundle", "--release"]
+            cmd = ["dx", "bundle"]
+
+        if not debug_mode:
+            cmd.append("--release")
 
         if platform_name:
             cmd.extend(["--platform", platform_name])
@@ -870,8 +875,16 @@ def build_frontend(
         sys.exit(e.returncode)
 
 
-def build_backend(backend_dir: Path, force_pi: bool, force_no_pi: bool, testing_mode: bool) -> None:
-    cmd = ["cargo", "build", "--release", "-p", "groundstation_backend"]
+def build_backend(
+        backend_dir: Path,
+        force_pi: bool,
+        force_no_pi: bool,
+        testing_mode: bool,
+        debug_mode: bool = False,
+) -> None:
+    cmd = ["cargo", "build", "-p", "groundstation_backend"]
+    if not debug_mode:
+        cmd.insert(2, "--release")
 
     if force_pi and force_no_pi:
         print("Error: Both pi_build and no_pi were requested. Choose one.", file=sys.stderr)
@@ -909,6 +922,7 @@ def print_usage() -> None:
     print("  ./build.py pi_build                # local: backend w/ raspberry_pi feature")
     print("  ./build.py no_pi                   # local: backend w/o raspberry_pi feature")
     print("  ./build.py testing                 # local: backend w/ testing feature")
+    print("  ./build.py debug                   # local: build frontend+backend in debug mode")
     print("  ./build.py docker [pi_build|no_pi] [testing]")
     print("")
     print("Frontend-only builds:")
@@ -918,6 +932,7 @@ def print_usage() -> None:
     print("  ./build.py windows")
     print("  ./build.py android")
     print("  ./build.py linux")
+    print("  (add `debug` to frontend/local builds to skip --release)")
     print("")
     print("Frontend actions:")
     print("  ./build.py ios_deploy              # build ios + patch + package+sign (Distribution) -> IPA")
@@ -950,6 +965,7 @@ def main() -> None:
     force_no_pi = False
     docker_mode = False
     testing_mode = False
+    debug_mode = False
     use_existing = False
 
     frontend_only_platform: Optional[str] = None
@@ -982,6 +998,8 @@ def main() -> None:
             docker_mode = True
         elif arg == "testing":
             testing_mode = True
+        elif arg == "debug":
+            debug_mode = True
         elif arg == "existing":
             use_existing = True
         elif arg in actions:
@@ -1013,7 +1031,12 @@ def main() -> None:
 
         if action == "ios_deploy":
             if not use_existing:
-                build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
+                build_frontend(
+                    frontend_dir,
+                    platform_name="ios",
+                    rust_target="aarch64-apple-ios",
+                    debug_mode=debug_mode,
+                )
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
             print(f"✅ Distribution IPA created: {ipa}")
             return
@@ -1023,21 +1046,31 @@ def main() -> None:
 
         if action == "ios_sign":
             if not use_existing:
-                build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
+                build_frontend(
+                    frontend_dir,
+                    platform_name="ios",
+                    rust_target="aarch64-apple-ios",
+                    debug_mode=debug_mode,
+                )
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="development")
             print(f"✅ Dev IPA created: {ipa}")
             return
 
         if action == "ios_dist_sign":
             if not use_existing:
-                build_frontend(frontend_dir, platform_name="ios", rust_target="aarch64-apple-ios")
+                build_frontend(
+                    frontend_dir,
+                    platform_name="ios",
+                    rust_target="aarch64-apple-ios",
+                    debug_mode=debug_mode,
+                )
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
             print(f"✅ Distribution IPA created: {ipa}")
             return
 
         if action == "macos_deploy":
             if not use_existing:
-                build_frontend(frontend_dir, platform_name="macos", rust_target=None)
+                build_frontend(frontend_dir, platform_name="macos", rust_target=None, debug_mode=debug_mode)
             sign_macos_app_and_dmg(frontend_dir)
             deployed = macos_deploy(frontend_dir)
             print(f"✅ Installed into /Applications: {deployed}")
@@ -1045,14 +1078,14 @@ def main() -> None:
 
         if action == "macos_sign":
             if not use_existing:
-                build_frontend(frontend_dir, platform_name="macos", rust_target=None)
+                build_frontend(frontend_dir, platform_name="macos", rust_target=None, debug_mode=debug_mode)
             sign_macos_app_and_dmg(frontend_dir)
             print("✅ Signed macOS app and dmg")
             return
 
         if action == "macos_notarize":
             if not use_existing:
-                build_frontend(frontend_dir, platform_name="macos", rust_target=None)
+                build_frontend(frontend_dir, platform_name="macos", rust_target=None, debug_mode=debug_mode)
             notarize_macos(frontend_dir)
             print("✅ Notarized macOS artifact")
             return
@@ -1067,7 +1100,12 @@ def main() -> None:
         if use_existing:
             print("Skipping frontend build (existing requested).")
             return
-        build_frontend(frontend_dir, platform_name=frontend_only_platform, rust_target=frontend_rust_target)
+        build_frontend(
+            frontend_dir,
+            platform_name=frontend_only_platform,
+            rust_target=frontend_rust_target,
+            debug_mode=debug_mode,
+        )
         return
 
     if docker_mode:
@@ -1082,12 +1120,19 @@ def main() -> None:
 
     if in_docker_build():
         print("Sequential build")
-        build_frontend(frontend_dir, None)
-        build_backend(backend_dir, force_pi, force_no_pi, testing_mode)
+        build_frontend(frontend_dir, None, debug_mode=debug_mode)
+        build_backend(backend_dir, force_pi, force_no_pi, testing_mode, debug_mode)
         return
 
-    bfe = mp.Process(target=build_frontend, args=(frontend_dir, None))
-    bbe = mp.Process(target=build_backend, args=(backend_dir, force_pi, force_no_pi, testing_mode))
+    bfe = mp.Process(
+        target=build_frontend,
+        args=(frontend_dir, None),
+        kwargs={"debug_mode": debug_mode},
+    )
+    bbe = mp.Process(
+        target=build_backend,
+        args=(backend_dir, force_pi, force_no_pi, testing_mode, debug_mode),
+    )
     bfe.start()
     bbe.start()
     bfe.join()

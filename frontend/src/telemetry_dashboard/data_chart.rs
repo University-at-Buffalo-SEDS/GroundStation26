@@ -322,7 +322,12 @@ impl CachedChart {
                 back.update(&r.values);
             } else {
                 // bid may be within last LIVE_BUCKETS_BACK; scan from back a tiny amount
-                for b in self.buckets.iter_mut().rev().take(LIVE_BUCKETS_BACK as usize + 2) {
+                for b in self
+                    .buckets
+                    .iter_mut()
+                    .rev()
+                    .take(LIVE_BUCKETS_BACK as usize + 2)
+                {
                     if b.id == bid {
                         b.update(&r.values);
                         break;
@@ -356,7 +361,8 @@ impl CachedChart {
         }
         let add = channels - self.channel_count;
         self.channel_count = channels;
-        self.paths.extend(std::iter::repeat(String::new()).take(add));
+        self.paths
+            .extend(std::iter::repeat(String::new()).take(add));
         self.chan_min.extend(std::iter::repeat(None).take(add));
         self.chan_max.extend(std::iter::repeat(None).take(add));
         for b in self.buckets.iter_mut() {
@@ -600,9 +606,9 @@ pub fn series_color(i: usize) -> &'static str {
     [
         "#f97316", "#22d3ee", "#a3e635", "#f43f5e", "#8b5cf6", "#e879f9", "#10b981", "#fbbf24",
     ]
-        .get(i)
-        .copied()
-        .unwrap_or("#9ca3af")
+    .get(i)
+    .copied()
+    .unwrap_or("#9ca3af")
 }
 
 pub fn labels_for_datatype(dt: &str) -> [&'static str; 8] {
