@@ -190,6 +190,13 @@ function updateUserMarkerRotation() {
         `translate(-50%, -50%) rotate(${userHeadingDeg}deg) translateY(-${ARROW_RADIUS}px)`;
 }
 
+function setGroundMapUserHeading(deg) {
+    if (!Number.isFinite(deg)) return;
+    userHeadingDegRaw = normalizeAngle(deg);
+    userHeadingDeg = userHeadingDegRaw;
+    updateUserMarkerRotation();
+}
+
 // ============================================================================
 // Compass handling
 // ============================================================================
@@ -229,9 +236,38 @@ function initCompassOnce() {
 
     const Dev = DeviceOrientationEvent;
     if (typeof Dev.requestPermission === "function") {
+        const KEY = "gs26_compass_permission_v1";
+
+        let saved;
+        try {
+            saved = window.localStorage ? (window.localStorage.getItem(KEY) || "") : "";
+        } catch (e) {
+            saved = "";
+        }
+
+        if (saved === "granted") {
+            window.addEventListener("deviceorientation", handleOrientation);
+            return;
+        }
+        if (saved === "denied") {
+            return;
+        }
+
         Dev.requestPermission()
-            .then((s) => s === "granted" && window.addEventListener("deviceorientation", handleOrientation))
+            .then((s) => {
+                try {
+                    if (window.localStorage) window.localStorage.setItem(KEY, s || "denied");
+                } catch (e) {
+                }
+                if (s === "granted") {
+                    window.addEventListener("deviceorientation", handleOrientation);
+                }
+            })
             .catch(() => {
+                try {
+                    if (window.localStorage) window.localStorage.setItem(KEY, "denied");
+                } catch (e) {
+                }
             });
     } else {
         window.addEventListener("deviceorientation", handleOrientation);
@@ -351,6 +387,7 @@ function updateGroundMapMarkers(rLat, rLon, uLat, uLon) {
     api.makeEmojiIcon = makeEmojiIcon;
     api.makeUserIcon = makeUserIcon;
     api.updateUserMarkerRotation = updateUserMarkerRotation;
+    api.setGroundMapUserHeading = setGroundMapUserHeading;
 
     // Pin state too (lets you debug on-device):
     api.state = api.state || {};
@@ -400,6 +437,7 @@ function updateGroundMapMarkers(rLat, rLon, uLat, uLon) {
     window.centerGroundMapOn = api.centerGroundMapOn;
     window.getLastUserLatLng = api.getLastUserLatLng;
     window.initCompassOnce = api.initCompassOnce;
+    window.setGroundMapUserHeading = api.setGroundMapUserHeading;
 
     // “Loaded” flag
     window.__gs26_ground_station_loaded = true;

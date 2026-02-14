@@ -3,6 +3,8 @@
 use crate::telemetry_dashboard::{
     js_eval, js_is_ground_map_ready, js_read_window_string, map_tiles_url,
 };
+#[cfg(target_os = "ios")]
+use crate::telemetry_dashboard::gps_apple;
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 
@@ -19,6 +21,10 @@ pub fn MapTab(
     user_gps: Signal<Option<(f64, f64)>>,
 ) -> Element {
     let mut is_fullscreen = use_signal(|| false);
+    #[cfg(target_os = "ios")]
+    let mut show_enable_compass = use_signal(|| false);
+    #[cfg(not(target_os = "ios"))]
+    let show_enable_compass = use_signal(|| false);
 
     // Browser-derived location (from navigator.geolocation inside the webview/page)
     let mut browser_user_gps = use_signal(|| None::<(f64, f64)>);
@@ -27,8 +33,10 @@ pub fn MapTab(
     // --- 0) One-time JS setup (iOS/native safe: JS owns resize/orientation detection) ---
     {
         let tiles = tiles_url();
+        #[cfg(target_os = "ios")]
+        let mut show_enable_compass = show_enable_compass;
         use_effect(move || {
-            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            #[cfg(target_os = "ios")]
             js_eval(
                 r#"
                 (function() {
@@ -37,6 +45,10 @@ pub fn MapTab(
                 })();
                 "#,
             );
+            #[cfg(target_os = "ios")]
+            {
+                *show_enable_compass.write() = js_is_compass_denied();
+            }
 
             js_setup_map_touch_guard();
             js_setup_map_size_guard();
@@ -98,11 +110,19 @@ pub fn MapTab(
                     }
                 }
 
-                #[cfg(target_arch = "wasm32")]
-                gloo_timers::future::TimeoutFuture::new(700).await;
+                #[cfg(target_os = "ios")]
+                if let Some(deg) = gps_apple::latest_heading_deg() {
+                    js_set_user_heading(deg);
+                }
 
-                #[cfg(not(target_arch = "wasm32"))]
-                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                #[cfg(target_arch = "wasm32")]
+                gloo_timers::future::TimeoutFuture::new(20).await;
+
+                #[cfg(target_os = "ios")]
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+                #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         });
     }
@@ -142,6 +162,32 @@ pub fn MapTab(
         // use_effect will fire -> js_force_map_reinit_now(...)
     };
 
+    let on_enable_compass = move |_| {
+        #[cfg(target_os = "ios")]
+        {
+            js_eval(
+                r#"
+                (function() {
+                  try {
+                    window.__gs26_disable_compass = false;
+                    if (typeof window.initCompassOnce === "function") {
+                      window.initCompassOnce();
+                    }
+                  } catch (e) {
+                    console.warn("Enable compass failed:", e);
+                  }
+                })();
+                "#,
+            );
+            *show_enable_compass.write() = js_is_compass_denied();
+        }
+
+        #[cfg(not(target_os = "ios"))]
+        {
+            // no-op on non-iOS
+        }
+    };
+
     rsx! {
         if *is_fullscreen.read() {
             div { style: "position:fixed; inset:0; z-index:9999; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
@@ -152,6 +198,13 @@ pub fn MapTab(
                             style: "padding:6px 12px; border-radius:999px; border:1px solid #22c55e; background:#022c22; color:#bbf7d0; font-size:0.85rem; cursor:pointer;",
                             onclick: on_center_me,
                             "Center on Me"
+                        }
+                        if cfg!(target_os = "ios") && *show_enable_compass.read() {
+                            button {
+                                style: "padding:6px 12px; border-radius:999px; border:1px solid #f59e0b; background:#3f2a06; color:#fde68a; font-size:0.85rem; cursor:pointer;",
+                                onclick: on_enable_compass,
+                                "Enable Compass"
+                            }
                         }
                         button {
                             style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
@@ -188,6 +241,13 @@ pub fn MapTab(
                         style: "padding:6px 12px; border-radius:999px; border:1px solid #22c55e; background:#022c22; color:#bbf7d0; font-size:0.85rem; cursor:pointer;",
                         onclick: on_center_me,
                         "Center on Me"
+                    }
+                    if cfg!(target_os = "ios") && *show_enable_compass.read() {
+                        button {
+                            style: "padding:6px 12px; border-radius:999px; border:1px solid #f59e0b; background:#3f2a06; color:#fde68a; font-size:0.85rem; cursor:pointer;",
+                            onclick: on_enable_compass,
+                            "Enable Compass"
+                        }
                     }
                     button {
                         style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
@@ -612,6 +672,24 @@ fn js_center_on(lat: f64, lon: f64) {
     ));
 }
 
+#[cfg(target_os = "ios")]
+fn js_set_user_heading(deg: f64) {
+    js_eval(&format!(
+        r#"
+        (function() {{
+          try {{
+            if (typeof window.setGroundMapUserHeading === "function") {{
+              window.setGroundMapUserHeading({deg});
+            }}
+          }} catch (e) {{
+            console.warn("setGroundMapUserHeading threw:", e);
+          }}
+        }})();
+        "#,
+        deg = deg
+    ));
+}
+
 fn js_cached_user_latlon() -> Option<(f64, f64)> {
     js_eval(
         r#"
@@ -645,6 +723,26 @@ fn js_read_user_latlon_from_window() -> Option<(f64, f64)> {
     let lat = js_read_window_f64("__gs26_user_lat")?;
     let lon = js_read_window_f64("__gs26_user_lon")?;
     Some((lat, lon))
+}
+
+#[cfg(target_os = "ios")]
+fn js_is_compass_denied() -> bool {
+    js_eval(
+        r#"
+        (function() {
+          try {
+            const k = "gs26_compass_permission_v1";
+            const v = (window.localStorage && window.localStorage.getItem(k)) || "";
+            window.__gs26_compass_perm_state = v;
+          } catch (e) {
+            window.__gs26_compass_perm_state = "";
+          }
+        })();
+        "#,
+    );
+    js_read_window_string("__gs26_compass_perm_state")
+        .map(|v| v == "denied")
+        .unwrap_or(false)
 }
 
 fn js_read_window_f64(key: &str) -> Option<f64> {

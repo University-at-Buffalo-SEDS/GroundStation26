@@ -27,10 +27,12 @@
 #pragma mark - Location shim
 
 typedef void (*LocationCallback)(double lat, double lon);
+typedef void (*HeadingCallback)(double heading_deg);
 
 @interface GS26LocationShim : NSObject <CLLocationManagerDelegate>
 @property(nonatomic, strong) CLLocationManager *mgr;
 @property(nonatomic, assign) LocationCallback cb;
+@property(nonatomic, assign) HeadingCallback headingCb;
 @end
 
 @implementation GS26LocationShim
@@ -45,6 +47,7 @@ typedef void (*LocationCallback)(double lat, double lon);
   _mgr = [[CLLocationManager alloc] init];
   _mgr.delegate = self;
   _mgr.desiredAccuracy = kCLLocationAccuracyBest;
+  _mgr.headingFilter = kCLHeadingFilterNone;
 
   CLAuthorizationStatus status;
   if ([_mgr respondsToSelector:@selector(authorizationStatus)]) {
@@ -62,6 +65,9 @@ typedef void (*LocationCallback)(double lat, double lon);
   }
 
   [_mgr startUpdatingLocation];
+  if ([CLLocationManager headingAvailable]) {
+    [_mgr startUpdatingHeading];
+  }
   return self;
 }
 
@@ -80,6 +86,22 @@ typedef void (*LocationCallback)(double lat, double lon);
   (void)error;
 }
 
+- (void)locationManager:(CLLocationManager *)manager
+       didUpdateHeading:(CLHeading *)newHeading {
+  (void)manager;
+  if (!self.headingCb || !newHeading)
+    return;
+
+  CLLocationDirection heading = newHeading.trueHeading;
+  if (heading < 0) {
+    heading = newHeading.magneticHeading;
+  }
+  if (heading < 0)
+    return;
+
+  self.headingCb((double)heading);
+}
+
 @end
 
 static GS26LocationShim *g_shim = nil;
@@ -88,6 +110,18 @@ static GS26LocationShim *g_shim = nil;
 void gs26_location_start(LocationCallback cb) {
   @autoreleasepool {
     g_shim = [[GS26LocationShim alloc] initWithCallback:cb];
+  }
+}
+
+void gs26_heading_start(HeadingCallback cb) {
+  @autoreleasepool {
+    if (!g_shim) {
+      g_shim = [[GS26LocationShim alloc] initWithCallback:NULL];
+    }
+    g_shim.headingCb = cb;
+    if ([CLLocationManager headingAvailable]) {
+      [g_shim.mgr startUpdatingHeading];
+    }
   }
 }
 
