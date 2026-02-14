@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import multiprocessing as mp
 import json
+import multiprocessing as mp
 import os
 import platform
 import plistlib

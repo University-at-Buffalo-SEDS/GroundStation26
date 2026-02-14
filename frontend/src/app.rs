@@ -445,15 +445,15 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl, skip_tls_verify: bool) -> Resu
                 false,
                 Some(tokio_tungstenite::Connector::NativeTls(tls)),
             )
-            .await
-            .map_err(|e| format!("{e}"))
+                .await
+                .map_err(|e| format!("{e}"))
         } else {
             tokio_tungstenite::connect_async(ws_url.clone())
                 .await
                 .map_err(|e| format!("{e}"))
         }
     })
-    .await;
+        .await;
 
     match res {
         Err(_) => Err(format!(
