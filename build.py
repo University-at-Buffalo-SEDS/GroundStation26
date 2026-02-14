@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import multiprocessing as mp
+import json
 import os
 import platform
+import plistlib
 import re
 import shutil
 import subprocess
@@ -745,6 +747,83 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
     return ipa_out
 
 
+def _simctl_booted_device_udid(frontend_dir: Path) -> Optional[str]:
+    try:
+        out = run_capture(["xcrun", "simctl", "list", "devices", "booted", "-j"], cwd=frontend_dir)
+        data = json.loads(out)
+    except Exception:
+        return None
+
+    devices = data.get("devices", {})
+    for _runtime, arr in devices.items():
+        for dev in arr or []:
+            if dev.get("state") == "Booted":
+                udid = dev.get("udid")
+                if udid:
+                    return str(udid)
+    return None
+
+
+def _simctl_first_available_iphone_udid(frontend_dir: Path) -> Optional[str]:
+    try:
+        out = run_capture(["xcrun", "simctl", "list", "devices", "available", "-j"], cwd=frontend_dir)
+        data = json.loads(out)
+    except Exception:
+        return None
+
+    devices = data.get("devices", {})
+    for _runtime, arr in devices.items():
+        for dev in arr or []:
+            if dev.get("isAvailable") is False:
+                continue
+            name = str(dev.get("name", "")).lower()
+            if "iphone" not in name:
+                continue
+            udid = dev.get("udid")
+            if udid:
+                return str(udid)
+    return None
+
+
+def _bundle_id_from_app(app: Path) -> str:
+    plist_path = app / "Info.plist"
+    if not plist_path.exists():
+        raise FileNotFoundError(f"Info.plist not found in app bundle: {plist_path}")
+    with plist_path.open("rb") as f:
+        info = plistlib.load(f)
+    bundle_id = info.get("CFBundleIdentifier")
+    if not bundle_id:
+        raise RuntimeError(f"CFBundleIdentifier missing in {plist_path}")
+    return str(bundle_id)
+
+
+def ios_sim_deploy(frontend_dir: Path) -> tuple[str, str]:
+    if platform.system() != "Darwin":
+        print("Error: iOS simulator deploy requires macOS.", file=sys.stderr)
+        sys.exit(1)
+
+    app = app_bundle_path(frontend_dir)
+    if not app.exists():
+        raise FileNotFoundError(f"Simulator app bundle not found: {app}")
+
+    udid = _simctl_booted_device_udid(frontend_dir)
+    if not udid:
+        udid = _simctl_first_available_iphone_udid(frontend_dir)
+        if not udid:
+            raise RuntimeError("No available iPhone simulator found.")
+        print(f"Booting iOS simulator device: {udid}")
+        run(["xcrun", "simctl", "boot", udid], cwd=frontend_dir)
+        run(["xcrun", "simctl", "bootstatus", udid, "-b"], cwd=frontend_dir)
+
+    print(f"Installing app in simulator ({udid}): {app}")
+    run(["xcrun", "simctl", "install", udid, str(app)], cwd=frontend_dir)
+
+    bundle_id = _bundle_id_from_app(app)
+    print(f"Launching simulator app: {bundle_id}")
+    run(["xcrun", "simctl", "launch", udid, bundle_id], cwd=frontend_dir)
+    return udid, bundle_id
+
+
 def macos_deploy(frontend_dir: Path) -> Path:
     if platform.system() != "Darwin":
         print("Error: macos_deploy requires macOS.", file=sys.stderr)
@@ -845,7 +924,9 @@ def build_frontend(
         if platform_name:
             cmd.extend(["--platform", platform_name])
             if platform_name == "ios":
-                cmd.extend(["--device", "true"])
+                is_ios_sim_target = bool(rust_target and ("ios-sim" in rust_target or "simulator" in rust_target))
+                if not is_ios_sim_target:
+                    cmd.extend(["--device", "true"])
             elif platform_name == "windows":
                 cmd.extend(["--windows-subsystem", "WINDOWS"])
         else:
@@ -936,6 +1017,7 @@ def print_usage() -> None:
     print("")
     print("Frontend actions:")
     print("  ./build.py ios_deploy              # build ios + patch + package+sign (Distribution) -> IPA")
+    print("  ./build.py ios_sim_deploy          # build ios_sim + install + launch in iOS simulator")
     print("  ./build.py ios_sign                # package+sign (Dev) existing dist app -> IPA")
     print("  ./build.py ios_dist_sign           # package+sign (Distribution) existing dist app -> IPA")
     print("  ./build.py macos_deploy            # build macos + copy .app into /Applications")
@@ -987,7 +1069,15 @@ def main() -> None:
         "linux": ("linux", None),
     }
 
-    actions = {"ios_deploy", "ios_sign", "ios_dist_sign", "macos_deploy", "macos_sign", "macos_notarize"}
+    actions = {
+        "ios_deploy",
+        "ios_sim_deploy",
+        "ios_sign",
+        "ios_dist_sign",
+        "macos_deploy",
+        "macos_sign",
+        "macos_notarize",
+    }
 
     for arg in args:
         if arg == "pi_build":
@@ -1039,6 +1129,18 @@ def main() -> None:
                 )
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
             print(f"✅ Distribution IPA created: {ipa}")
+            return
+
+        if action == "ios_sim_deploy":
+            if not use_existing:
+                build_frontend(
+                    frontend_dir,
+                    platform_name="ios",
+                    rust_target="aarch64-apple-ios-sim",
+                    debug_mode=debug_mode,
+                )
+            udid, bundle_id = ios_sim_deploy(frontend_dir)
+            print(f"✅ Simulator deploy complete ({udid}) for {bundle_id}")
             return
 
         if action == "iosDRY_RUN":

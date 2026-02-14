@@ -2,20 +2,11 @@ mod app;
 mod telemetry_dashboard;
 
 use dioxus::prelude::*;
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(target_os = "macos", target_os = "windows", target_os = "linux")
-))]
+#[cfg(not(target_arch = "wasm32"))]
 use dioxus_desktop::wry::http::{Request as HttpRequest, Response as HttpResponse};
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(target_os = "macos", target_os = "windows", target_os = "linux")
-))]
+#[cfg(not(target_arch = "wasm32"))]
 use dioxus_desktop::RequestAsyncResponder;
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(target_os = "macos", target_os = "windows", target_os = "linux")
-))]
+#[cfg(not(target_arch = "wasm32"))]
 use std::borrow::Cow;
 
 #[cfg(target_arch = "wasm32")]
@@ -36,7 +27,6 @@ fn main() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn main() {
     init_panic_hook();
     let cfg = dioxus_desktop::Config::new()
@@ -47,16 +37,6 @@ fn main() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-fn main() {
-    init_panic_hook();
-    launch(app::App);
-}
-
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(target_os = "macos", target_os = "windows", target_os = "linux")
-))]
 fn handle_gs26_protocol(request: HttpRequest<Vec<u8>>) -> HttpResponse<Cow<'static, [u8]>> {
     fn build_response(
         status: u16,
@@ -76,9 +56,22 @@ fn handle_gs26_protocol(request: HttpRequest<Vec<u8>>) -> HttpResponse<Cow<'stat
     }
 
     let path = request.uri().path();
-    let trimmed = path.trim_start_matches('/');
-    let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts.len() != 4 || parts[0] != "tiles" || !parts[3].ends_with(".jpg") {
+    let segs: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Accept either:
+    // - /tiles/{z}/{x}/{y}.jpg
+    // - /{host}/tiles/{z}/{x}/{y}.jpg
+    let parts: &[&str] = if segs.len() >= 4 && segs[segs.len() - 4] == "tiles" {
+        &segs[segs.len() - 4..]
+    } else {
+        &[]
+    };
+
+    if parts.len() != 4 || !parts[3].ends_with(".jpg") {
         return build_response(404, None, Vec::new());
     }
 
@@ -126,10 +119,7 @@ fn handle_gs26_protocol(request: HttpRequest<Vec<u8>>) -> HttpResponse<Cow<'stat
     build_response(status, content_type.as_deref(), bytes)
 }
 
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(target_os = "macos", target_os = "windows", target_os = "linux")
-))]
+#[cfg(not(target_arch = "wasm32"))]
 fn handle_gs26_protocol_async(request: HttpRequest<Vec<u8>>, responder: RequestAsyncResponder) {
     let _ = std::thread::Builder::new()
         .name("gs26-proto-req".to_string())

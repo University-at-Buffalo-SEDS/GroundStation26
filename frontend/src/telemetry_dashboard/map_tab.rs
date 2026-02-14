@@ -28,6 +28,16 @@ pub fn MapTab(
     {
         let tiles = tiles_url();
         use_effect(move || {
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            js_eval(
+                r#"
+                (function() {
+                  window.__gs26_disable_browser_geo = true;
+                  window.__gs26_disable_compass = true;
+                })();
+                "#,
+            );
+
             js_setup_map_touch_guard();
             js_setup_map_size_guard();
             js_setup_js_init_retry(&tiles);
@@ -354,6 +364,7 @@ fn js_setup_js_geolocation_watch() {
     js_eval(
         r#"
         (function() {
+          if (window.__gs26_disable_browser_geo === true) return;
           if (window.__gs26_geo_watch_started) return;
           window.__gs26_geo_watch_started = true;
           if (!navigator || !navigator.geolocation) return;

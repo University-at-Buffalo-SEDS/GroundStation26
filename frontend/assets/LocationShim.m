@@ -46,7 +46,18 @@ typedef void (*LocationCallback)(double lat, double lon);
   _mgr.delegate = self;
   _mgr.desiredAccuracy = kCLLocationAccuracyBest;
 
-  if ([_mgr respondsToSelector:@selector(requestWhenInUseAuthorization)]) {
+  CLAuthorizationStatus status;
+  if ([_mgr respondsToSelector:@selector(authorizationStatus)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+    status = _mgr.authorizationStatus;
+#pragma clang diagnostic pop
+  } else {
+    status = [CLLocationManager authorizationStatus];
+  }
+
+  if (status == kCLAuthorizationStatusNotDetermined &&
+      [_mgr respondsToSelector:@selector(requestWhenInUseAuthorization)]) {
     [_mgr requestWhenInUseAuthorization];
   }
 

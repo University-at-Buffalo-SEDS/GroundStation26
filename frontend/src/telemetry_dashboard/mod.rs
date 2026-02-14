@@ -333,10 +333,7 @@ pub fn abs_http(path: &str) -> String {
 }
 
 pub fn map_tiles_url() -> String {
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        any(target_os = "macos", target_os = "windows", target_os = "linux")
-    ))]
+    #[cfg(not(target_arch = "wasm32"))]
     {
         if UrlConfig::_skip_tls_verify() {
             return "gs26://local/tiles/{z}/{x}/{y}.jpg".to_string();

@@ -223,6 +223,7 @@ function handleOrientation(event) {
 function initCompassOnce() {
     if (compassInitialized) return;
     compassInitialized = true;
+    if (window.__gs26_disable_compass === true) return;
 
     if (!window.DeviceOrientationEvent) return;
 
