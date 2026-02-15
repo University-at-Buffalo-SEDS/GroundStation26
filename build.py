@@ -681,6 +681,43 @@ def _find_dx(path_value: str) -> Optional[Path]:
     return _which_in_path("dx", path_value)
 
 
+def _find_newest_wasm_asset(frontend_dir: Path) -> Optional[Path]:
+    assets_dir = frontend_dir / "dist" / "public" / "assets"
+    if not assets_dir.exists():
+        return None
+    candidates = sorted(
+        assets_dir.glob("groundstation_frontend_bg-*.wasm"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _manual_optimize_web_wasm(frontend_dir: Path, env: Optional[dict[str, str]]) -> None:
+    path_value = (env or {}).get("PATH", os.environ.get("PATH", ""))
+    wasm_opt = _find_wasm_opt(path_value)
+    if not wasm_opt:
+        print("Warning: wasm-opt not found; skipping manual -O3 optimization.", file=sys.stderr)
+        return
+
+    targets: list[Path] = []
+    canonical = frontend_dir / "dist" / "public" / "wasm" / "groundstation_frontend_bg.wasm"
+    if canonical.exists():
+        targets.append(canonical)
+
+    newest_asset = _find_newest_wasm_asset(frontend_dir)
+    if newest_asset and newest_asset not in targets:
+        targets.append(newest_asset)
+
+    if not targets:
+        print("Warning: no web wasm artifacts found to optimize.", file=sys.stderr)
+        return
+
+    for wasm in targets:
+        print(f"Manual wasm-opt -O3: {wasm}")
+        run([str(wasm_opt), "-O3", str(wasm), "-o", str(wasm)], cwd=frontend_dir, env=env)
+
+
 def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
     """
     Construct an environment that:
@@ -990,6 +1027,9 @@ def build_frontend(
             cmd.extend(["--target", rust_target])
 
         run(cmd, cwd=frontend_dir, env=env)
+
+        if platform_name in {None, "web"}:
+            _manual_optimize_web_wasm(frontend_dir, env)
 
         if platform_name == "macos":
             rename_macos_app_bundle(frontend_dir)
@@ -1307,6 +1347,7 @@ def main() -> None:
                 force_pi = True
             pi_build_flag = force_pi
         use_plain = plain_mode or (LOG_FILE is not None)
+        print("Note: docker image builds cannot be post-processed with host wasm-opt; optimize in Dockerfile for image artifacts.")
         build_docker(repo_root=repo_root, pi_build=pi_build_flag, testing=testing_mode, plain_progress=use_plain)
         return
 
