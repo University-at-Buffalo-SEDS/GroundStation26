@@ -1468,7 +1468,9 @@ def main() -> None:
                 force_pi = True
             pi_build_flag = force_pi
         use_plain = plain_mode or (LOG_FILE is not None)
-        print("Note: docker image builds cannot be post-processed with host wasm-opt; optimize in Dockerfile for image artifacts.")
+        print(
+            "Note: docker image builds cannot be post-processed with host wasm-opt; optimize in Dockerfile for image "
+            "artifacts.")
         build_docker(repo_root=repo_root, pi_build=pi_build_flag, testing=testing_mode, plain_progress=use_plain)
         return
 

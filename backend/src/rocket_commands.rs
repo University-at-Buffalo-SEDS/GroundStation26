@@ -26,5 +26,4 @@ pub enum ActuatorBoardCommands {
     NitrousClose = 12,
     #[allow(unused)]
     IgniterSequence = 13,
-
 }

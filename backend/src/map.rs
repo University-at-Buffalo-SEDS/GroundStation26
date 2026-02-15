@@ -26,7 +26,6 @@ pub async fn ensure_map_data(region: &str) -> anyhow::Result<()> {
     );
 }
 
-
 /// Service that serves `/tiles/{z}/{x}/{y}.png` for a region.
 pub fn tile_service(region: &str) -> ServeDir {
     let tiles_dir = format!("./backend/data/maps/{region}/tiles");

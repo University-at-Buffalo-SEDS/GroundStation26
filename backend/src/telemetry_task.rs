@@ -15,7 +15,7 @@ use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
 use groundstation_shared::Board;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::{interval, Duration};
 
 const TIMESYNC_PRIORITY: u64 = 50;
@@ -67,6 +67,7 @@ pub async fn telemetry_task(
     router: Arc<sedsprintf_rs_2026::router::Router>,
     radio: Vec<Arc<Mutex<Box<dyn RadioDevice>>>>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
+    mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     let mut radio_interval = interval(Duration::from_millis(2));
     let mut handle_interval = interval(Duration::from_millis(1));
@@ -253,6 +254,13 @@ pub async fn telemetry_task(
                         handle_timesync_tick(&router, &timesync_state);
                     }
                 }
+                recv = shutdown_rx.recv() => {
+                    match recv {
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
+                    }
+                }
         }
     }
 }
@@ -307,7 +315,7 @@ const DB_RETRY_DELAY_MS: u64 = 50;
 async fn insert_with_retry<F, Fut>(mut f: F) -> Result<(), sqlx::Error>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output=Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
+    Fut: Future<Output = Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
 {
     let mut delay = DB_RETRY_DELAY_MS;
     let mut last_err: Option<sqlx::Error> = None;
@@ -379,7 +387,7 @@ pub async fn handle_packet(
                 .bind(pkt_data as i64)
                 .execute(&state.db)
         })
-            .await
+        .await
         {
             eprintln!("DB insert into flight_state failed after retry: {e}");
         }
@@ -408,7 +416,7 @@ pub async fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                    .ok();
+                .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 if let Err(e) = insert_with_retry(|| {

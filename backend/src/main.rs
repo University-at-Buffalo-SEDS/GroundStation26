@@ -34,8 +34,10 @@ use sqlx::Row;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
-// use std::time::Duration;
+use tokio::sync::Notify;
+use tokio::time::Duration;
 
 use crate::web::emit_error;
 use tokio::sync::{broadcast, mpsc};
@@ -43,6 +45,73 @@ use tokio::sync::{broadcast, mpsc};
 fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
     Box::new(get_current_timestamp_ms)
 }
+
+async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
+    // If DB is in WAL mode, this checkpoints all frames and truncates WAL to 0 bytes.
+    if let Err(err) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
+        .execute(db)
+        .await
+    {
+        eprintln!("SQLite wal_checkpoint(TRUNCATE) failed: {err}");
+    }
+
+    // Optional lightweight cleanup/analysis pass.
+    if let Err(err) = sqlx::query("PRAGMA optimize;").execute(db).await {
+        eprintln!("SQLite PRAGMA optimize failed: {err}");
+    }
+}
+
+fn remove_empty_sqlite_sidecars(db_path: &str) {
+    for suffix in [".wal", ".shm", "-wal", "-shm", "-journal", ".journal"] {
+        let sidecar = format!("{db_path}{suffix}");
+        match std::fs::metadata(&sidecar) {
+            Ok(meta) => {
+                if meta.len() == 0 {
+                    if let Err(err) = std::fs::remove_file(&sidecar) {
+                        eprintln!("Failed removing empty SQLite sidecar {sidecar}: {err}");
+                    }
+                }
+            }
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("Failed to stat SQLite sidecar {sidecar}: {err}");
+                }
+            }
+        }
+    }
+}
+
+async fn shutdown_signal(state: Arc<AppState>) {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            eprintln!("Failed to install Ctrl+C handler: {err}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(err) => {
+                eprintln!("Failed to install SIGTERM handler: {err}");
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
+
+    state.request_shutdown();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize GPIO
@@ -76,20 +145,24 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     // Add values_json column for older DBs.
     let cols = sqlx::query("PRAGMA table_info(telemetry)")
         .fetch_all(&db)
         .await?;
-    let has_values_json = cols.iter().any(|row| row.get::<String, _>("name") == "values_json");
+    let has_values_json = cols
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "values_json");
     if !has_values_json {
         sqlx::query("ALTER TABLE telemetry ADD COLUMN values_json TEXT")
             .execute(&db)
             .await?;
     }
-    let has_payload_json = cols.iter().any(|row| row.get::<String, _>("name") == "payload_json");
+    let has_payload_json = cols
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "payload_json");
     if !has_payload_json {
         sqlx::query("ALTER TABLE telemetry ADD COLUMN payload_json TEXT")
             .execute(&db)
@@ -106,8 +179,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     sqlx::query(
         r#"
@@ -118,13 +191,14 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (ws_tx, _ws_rx) = broadcast::channel(512);
     let (board_status_tx, _board_status_rx) = broadcast::channel(64);
+    let (shutdown_tx, _shutdown_rx) = broadcast::channel(8);
 
     // --- Shared state ---
     let mut board_status = HashMap::new();
@@ -152,10 +226,12 @@ async fn main() -> anyhow::Result<()> {
         board_status_tx,
         umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+        shutdown_tx,
+        pending_db_writes: Arc::new(AtomicUsize::new(0)),
+        db_write_notify: Arc::new(Notify::new()),
     });
 
-    gpio_panel::setup_gpio_panel(state.clone())
-        .expect("failed to setup gpio panel");
+    gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
 
     // --- Router endpoint handlers ---
     let ground_station_handler_state_clone = state.clone();
@@ -278,19 +354,61 @@ async fn main() -> anyhow::Result<()> {
     router.log_queue(DataType::FlightState, &[FlightStateMode::Startup as u8])?;
 
     // --- Background tasks ---
-    let _tt = tokio::spawn(telemetry_task(
+    let telemetry_shutdown_rx = state.shutdown_subscribe();
+    let safety_shutdown_rx = state.shutdown_subscribe();
+    let tt = tokio::spawn(telemetry_task(
         state.clone(),
         router.clone(),
         vec![rocket_radio, umbilical_radio],
         cmd_rx,
+        telemetry_shutdown_rx,
     ));
-    let _st = tokio::spawn(safety_task(state.clone(), router.clone()));
+    let st = tokio::spawn(safety_task(
+        state.clone(),
+        router.clone(),
+        safety_shutdown_rx,
+    ));
 
     // --- Webserver ---
-    let app: Router = web::router(state);
+    let app: Router = web::router(state.clone());
 
     let addr = "0.0.0.0:3000";
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(state.clone()))
+        .await?;
+
+    // Ensure background tasks are signaled even if server exits unexpectedly.
+    state.request_shutdown();
+
+    let task_shutdown_timeout = Duration::from_secs(5);
+    match tokio::time::timeout(task_shutdown_timeout, tt).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("Telemetry task ended with error: {e}"),
+        Err(_) => eprintln!(
+            "Telemetry task did not shut down within {:?}",
+            task_shutdown_timeout
+        ),
+    }
+    match tokio::time::timeout(task_shutdown_timeout, st).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("Safety task ended with error: {e}"),
+        Err(_) => eprintln!(
+            "Safety task did not shut down within {:?}",
+            task_shutdown_timeout
+        ),
+    }
+
+    let db_drain_timeout = Duration::from_secs(10);
+    if !state.wait_for_db_writes(db_drain_timeout).await {
+        eprintln!(
+            "Timed out waiting for DB writes. Pending writes remaining: {}",
+            state.pending_db_write_count()
+        );
+    }
+
+    flush_sqlite_journals(&state.db).await;
+    state.db.close().await;
+    remove_empty_sqlite_sidecars(db_path);
     Ok(())
 }

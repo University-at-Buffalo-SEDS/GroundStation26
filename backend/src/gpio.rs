@@ -111,10 +111,14 @@ mod real {
 
             let pi_trigger = Self::to_pi_trigger(trigger);
 
-            pin.set_async_interrupt(pi_trigger, Some(debounce), move |event: rppal::gpio::Event| {
-                let level = event.trigger;
-                callback(level == rppal::gpio::Trigger::RisingEdge);
-            })?;
+            pin.set_async_interrupt(
+                pi_trigger,
+                Some(debounce),
+                move |event: rppal::gpio::Event| {
+                    let level = event.trigger;
+                    callback(level == rppal::gpio::Trigger::RisingEdge);
+                },
+            )?;
 
             Ok(())
         }
@@ -155,7 +159,10 @@ mod dummy {
                 .lock()
                 .expect("failed to get lock")
                 .insert(pin_number, false);
-            println!("Input pin {} is configured (no gpio is actually attached)", pin_number);
+            println!(
+                "Input pin {} is configured (no gpio is actually attached)",
+                pin_number
+            );
             Ok(())
         }
 
@@ -164,7 +171,10 @@ mod dummy {
                 .lock()
                 .expect("failed to get lock")
                 .insert(pin_number, false);
-            println!("Output pin {} is configured (no gpio is actually attached)", pin_number);
+            println!(
+                "Output pin {} is configured (no gpio is actually attached)",
+                pin_number
+            );
             Ok(())
         }
 
@@ -203,7 +213,10 @@ mod dummy {
             F: Fn(bool) + Send + 'static,
         {
             // No-op in dummy implementation
-            println!("Setting up callback on pin {} (dummy, no actual effect)", _pin_number);
+            println!(
+                "Setting up callback on pin {} (dummy, no actual effect)",
+                _pin_number
+            );
             Ok(())
         }
     }

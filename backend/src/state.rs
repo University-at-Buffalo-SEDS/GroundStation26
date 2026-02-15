@@ -1,12 +1,16 @@
 use crate::gpio::GpioPins;
 use crate::ring_buffer::RingBuffer;
 use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
-use groundstation_shared::{Board, BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
+use groundstation_shared::{
+    Board, BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow,
+};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct BoardStatus {
@@ -54,6 +58,15 @@ pub struct AppState {
 
     /// Latest fuel tank pressure (psi)
     pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
+
+    /// Broadcast shutdown notifications to long-running background tasks.
+    pub shutdown_tx: broadcast::Sender<()>,
+
+    /// Number of in-flight async DB writes (alerts/warnings/errors).
+    pub pending_db_writes: Arc<AtomicUsize>,
+
+    /// Notifies waiters when pending DB writes changes.
+    pub db_write_notify: Arc<Notify>,
 }
 
 impl AppState {
@@ -103,5 +116,49 @@ impl AppState {
     pub fn get_umbilical_valve_state(&self, cmd_id: u8) -> Option<bool> {
         let map = self.umbilical_valve_states.lock().unwrap();
         map.get(&cmd_id).copied()
+    }
+
+    pub fn shutdown_subscribe(&self) -> broadcast::Receiver<()> {
+        self.shutdown_tx.subscribe()
+    }
+
+    pub fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
+    }
+
+    pub fn begin_db_write(&self) {
+        self.pending_db_writes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn end_db_write(&self) {
+        if self.pending_db_writes.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.db_write_notify.notify_waiters();
+        }
+    }
+
+    pub fn pending_db_write_count(&self) -> usize {
+        self.pending_db_writes.load(Ordering::SeqCst)
+    }
+
+    pub async fn wait_for_db_writes(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.pending_db_write_count() == 0 {
+                return true;
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            if tokio::time::timeout(remaining, self.db_write_notify.notified())
+                .await
+                .is_err()
+            {
+                return self.pending_db_write_count() == 0;
+            }
+        }
     }
 }

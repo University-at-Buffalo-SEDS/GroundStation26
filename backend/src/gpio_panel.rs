@@ -29,7 +29,7 @@ pub const RETRACT_PIN: u8 = 17;
 pub const RETRACT_PIN_LED: u8 = 18;
 
 pub const PILOT_VALVE_PIN: u8 = 27;
-pub const PILOT_VALVE_LED: u8 = 16;          // was 28 (invalid)
+pub const PILOT_VALVE_LED: u8 = 16; // was 28 (invalid)
 
 pub const NITROGEN_TANK_VALVE_PIN: u8 = 22;
 pub const NITROGEN_TANK_VALVE_LED: u8 = 23;
@@ -38,7 +38,7 @@ pub const NITROUS_TANK_VALVE_PIN: u8 = 24;
 pub const NITROUS_TANK_VALVE_LED: u8 = 14;
 
 pub const NORMALLY_OPEN_PIN: u8 = 26;
-pub const NORMALLY_OPEN_LED: u8 = 15;        // was 7 (spi0 CS1 used)
+pub const NORMALLY_OPEN_LED: u8 = 15; // was 7 (spi0 CS1 used)
 
 //####################################################################
 

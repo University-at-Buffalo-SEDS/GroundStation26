@@ -1,10 +1,10 @@
 // frontend/src/telemetry_dashboard/map_tab.rs
 
+#[cfg(target_os = "ios")]
+use crate::telemetry_dashboard::gps_apple;
 use crate::telemetry_dashboard::{
     js_eval, js_is_ground_map_ready, js_read_window_string, map_tiles_url,
 };
-#[cfg(target_os = "ios")]
-use crate::telemetry_dashboard::gps_apple;
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 

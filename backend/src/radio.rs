@@ -1,7 +1,10 @@
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
-use sedsprintf_rs_2026::{router::{Router, RouterSideId}, TelemetryError, TelemetryResult};
+use sedsprintf_rs_2026::{
+    router::{Router, RouterSideId}, TelemetryError,
+    TelemetryResult,
+};
 use serial::{SerialPort, SystemPort};
 use std::error::Error;
 use std::io::{Read, Write};
@@ -53,9 +56,9 @@ impl Radio {
 impl RadioDevice for Radio {
     /// Blocking receive of one TelemetryPacket
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
-        let side_id = self.side_id.ok_or(TelemetryError::HandlerError(
-            "radio side id not set",
-        ))?;
+        let side_id = self
+            .side_id
+            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
 
         // read length prefix
         let mut len_buf = [0u8; 2];
@@ -120,9 +123,9 @@ impl DummyRadio {
 #[cfg(feature = "testing")]
 impl RadioDevice for DummyRadio {
     fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
-        let side_id = self.side_id.ok_or(TelemetryError::HandlerError(
-            "radio side id not set",
-        ))?;
+        let side_id = self
+            .side_id
+            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
         let pkt = get_dummy_packet()?;
         return _router.rx_queue_from_side(pkt, side_id);
 

@@ -82,10 +82,7 @@ fn next_dummy_sender() -> &'static str {
     sender
 }
 
-fn next_umbilical_status(
-    state: &mut DummyState,
-    rng: &mut impl Rng,
-) -> (u8, bool, &'static str) {
+fn next_umbilical_status(state: &mut DummyState, rng: &mut impl Rng) -> (u8, bool, &'static str) {
     let valve_cmds = [
         ValveBoardCommands::PilotOpen as u8,
         ValveBoardCommands::NormallyOpenOpen as u8,
@@ -115,14 +112,23 @@ fn next_umbilical_status(
         };
 
         if cmd_id == ActuatorBoardCommands::RetractPlumbing as u8 {
-            if state.umbilical_states.get(&cmd_id).copied().unwrap_or(false) {
+            if state
+                .umbilical_states
+                .get(&cmd_id)
+                .copied()
+                .unwrap_or(false)
+            {
                 continue;
             }
         }
         break;
     }
 
-    let current = state.umbilical_states.get(&cmd_id).copied().unwrap_or(false);
+    let current = state
+        .umbilical_states
+        .get(&cmd_id)
+        .copied()
+        .unwrap_or(false);
     let next = if cmd_id == ActuatorBoardCommands::RetractPlumbing as u8 {
         true
     } else {
@@ -172,7 +178,6 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
             // Grab the state we advanced to.
             let flight_state = &FLIGHT_STATES[state_guard.idx];
 
-
             // Encode FlightState into payload; here as a single u8.
             // If you have a helper like flight_state_to_u8, use that instead.
             let state_code = *flight_state as u8;
@@ -195,7 +200,8 @@ pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
         if since >= state_guard.next_umbilical_ms {
             let (cmd_id, on, sender_id) = next_umbilical_status(&mut state_guard, &mut rng);
             state_guard.last_umbilical_ms = now_ms as i64;
-            state_guard.next_umbilical_ms = rng.random_range(UMBILICAL_MIN_INTERVAL_MS..=UMBILICAL_MAX_INTERVAL_MS);
+            state_guard.next_umbilical_ms =
+                rng.random_range(UMBILICAL_MIN_INTERVAL_MS..=UMBILICAL_MAX_INTERVAL_MS);
             drop(state_guard);
 
             return TelemetryPacket::new(

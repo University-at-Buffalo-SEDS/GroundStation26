@@ -31,11 +31,10 @@ fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
         .ok()
         .flatten()
         .and_then(|raw| serde_json::from_str::<Vec<Option<f64>>>(&raw).ok());
-    if let Some(values) = values_from_json && !values.is_empty() {
-        return values
-            .into_iter()
-            .map(|v| v.map(|n| n as f32))
-            .collect();
+    if let Some(values) = values_from_json
+        && !values.is_empty()
+    {
+        return values.into_iter().map(|v| v.map(|n| n as f32)).collect();
     }
 
     if let Ok(raw) = row.try_get::<Option<String>, _>("payload_json")
@@ -162,9 +161,9 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
@@ -197,9 +196,9 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
         let values = values_from_row(&r);
@@ -270,12 +269,12 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         ORDER BY f.timestamp_ms ASC
         "#,
     )
-        .bind(BUCKET_MS)
-        .bind(cutoff)
-        .bind(now_ms)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(BUCKET_MS)
+    .bind(cutoff)
+    .bind(now_ms)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -466,10 +465,10 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-        .bind(cutoff)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -497,6 +496,32 @@ fn now_ms_i64() -> i64 {
         .unwrap_or(0)
 }
 
+fn spawn_alert_insert(
+    state: &AppState,
+    timestamp_ms: i64,
+    severity: &'static str,
+    message: String,
+) {
+    state.begin_db_write();
+    let db = state.db.clone();
+    let state_for_task = state.clone();
+
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO alerts (timestamp_ms, severity, message)
+            VALUES (?, ?, ?)
+            "#,
+        )
+        .bind(timestamp_ms)
+        .bind(severity)
+        .bind(message)
+        .execute(&db)
+        .await;
+        state_for_task.end_db_write();
+    });
+}
+
 /// PUBLIC HELPERS — can be called from *any thread* that has &AppState
 ///
 /// Example usage from anywhere:
@@ -515,20 +540,8 @@ pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
     };
     let _ = state.warnings_tx.send(ws_msg);
 
-    // 2) Insert into DB asynchronously
-    let db = state.db.clone();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO alerts (timestamp_ms, severity, message)
-            VALUES (?, 'warning', ?)
-            "#,
-        )
-            .bind(timestamp)
-            .bind(msg_string)
-            .execute(&db)
-            .await;
-    });
+    // 2) Insert into DB asynchronously (tracked for graceful shutdown)
+    spawn_alert_insert(state, timestamp, "warning", msg_string);
 }
 
 /// Log a warning to the DB without sending it to the frontend.
@@ -536,19 +549,8 @@ pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
     let msg_string = message.into();
     let timestamp = now_ms_i64();
 
-    let db = state.db.clone();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO alerts (timestamp_ms, severity, message)
-            VALUES (?, 'warning', ?)
-            "#,
-        )
-            .bind(timestamp)
-            .bind(msg_string)
-            .execute(&db)
-            .await;
-    });
+    // Insert into DB asynchronously (tracked for graceful shutdown)
+    spawn_alert_insert(state, timestamp, "warning", msg_string);
 }
 
 pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
@@ -562,18 +564,6 @@ pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
     };
     let _ = state.errors_tx.send(ws_msg);
 
-    // 2) Insert into DB asynchronously
-    let db = state.db.clone();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO alerts (timestamp_ms, severity, message)
-            VALUES (?, 'error', ?)
-            "#,
-        )
-            .bind(timestamp)
-            .bind(msg_string)
-            .execute(&db)
-            .await;
-    });
+    // 2) Insert into DB asynchronously (tracked for graceful shutdown)
+    spawn_alert_insert(state, timestamp, "error", msg_string);
 }
