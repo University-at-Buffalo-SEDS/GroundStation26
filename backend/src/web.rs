@@ -61,8 +61,9 @@ fn value_at(values: &[Option<f32>], idx: usize) -> Option<f32> {
 
 /// Public router constructor
 pub fn router(state: Arc<AppState>) -> Router {
-    let static_dir = ServeDir::new("./frontend/dist/public");
-    // let vendor_dir = ServeDir::new("../../frontend/static/vendor/leaflet");
+    let static_dir = ServeDir::new("./frontend/dist/public")
+        .precompressed_br()
+        .precompressed_gzip();
     let tiles_dir = tile_service(DEFAULT_MAP_REGION); // NEW
 
     Router::new()

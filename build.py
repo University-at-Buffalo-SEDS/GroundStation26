@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import gzip
 import json
 import multiprocessing as mp
 import os
@@ -668,6 +669,18 @@ def _find_wasm_bindgen(path_value: str) -> Optional[Path]:
     return _which_in_path("wasm-bindgen", path_value)
 
 
+def _find_brotli(path_value: str) -> Optional[Path]:
+    candidates = [
+        Path("/usr/local/bin/brotli"),
+        Path("/usr/bin/brotli"),
+        Path(str(Path.home() / ".cargo" / "bin" / "brotli")),
+    ]
+    for cand in candidates:
+        if cand.exists() and os.access(cand, os.X_OK):
+            return cand
+    return _which_in_path("brotli", path_value)
+
+
 def _find_dx(path_value: str) -> Optional[Path]:
     candidates = [
         Path("/root/.cargo/bin/dx"),
@@ -693,7 +706,7 @@ def _find_newest_wasm_asset(frontend_dir: Path) -> Optional[Path]:
     return candidates[0] if candidates else None
 
 
-def _manual_optimize_web_wasm(frontend_dir: Path, env: Optional[dict[str, str]]) -> None:
+def _manual_optimize_web_wasm(frontend_dir: Path, env: Optional[dict[str, str]], max_size: bool) -> None:
     path_value = (env or {}).get("PATH", os.environ.get("PATH", ""))
     wasm_opt = _find_wasm_opt(path_value)
     if not wasm_opt:
@@ -714,8 +727,80 @@ def _manual_optimize_web_wasm(frontend_dir: Path, env: Optional[dict[str, str]])
         return
 
     for wasm in targets:
-        print(f"Manual wasm-opt -O3: {wasm}")
-        run([str(wasm_opt), "-O3", str(wasm), "-o", str(wasm)], cwd=frontend_dir, env=env)
+        opt_cmd = [
+            str(wasm_opt),
+            "-O3",
+            "--strip-debug",
+            "--strip-producers",
+        ]
+        if max_size:
+            opt_cmd.append("--converge")
+        opt_cmd.extend([str(wasm), "-o", str(wasm)])
+        print(f"Manual wasm-opt {' '.join(opt_cmd[1:])}: {wasm}")
+        run(opt_cmd, cwd=frontend_dir, env=env)
+
+
+def _compress_web_assets(frontend_dir: Path, env: Optional[dict[str, str]]) -> None:
+    public_dir = frontend_dir / "dist" / "public"
+    if not public_dir.exists():
+        print("Warning: dist/public not found; skipping precompression.", file=sys.stderr)
+        return
+
+    exts = {".wasm", ".js", ".css", ".html", ".json", ".svg", ".txt", ".xml", ".map"}
+    path_value = (env or {}).get("PATH", os.environ.get("PATH", ""))
+    brotli_bin = _find_brotli(path_value)
+
+    gz_count = 0
+    br_count = 0
+    for src in public_dir.rglob("*"):
+        if not src.is_file():
+            continue
+        if src.suffix in {".gz", ".br"}:
+            continue
+        if src.suffix.lower() not in exts:
+            continue
+
+        gz = src.with_name(f"{src.name}.gz")
+        if (not gz.exists()) or (gz.stat().st_mtime < src.stat().st_mtime):
+            gz.write_bytes(gzip.compress(src.read_bytes(), compresslevel=9, mtime=0))
+            gz_count += 1
+
+        if brotli_bin is not None:
+            br = src.with_name(f"{src.name}.br")
+            if (not br.exists()) or (br.stat().st_mtime < src.stat().st_mtime):
+                run(
+                    [str(brotli_bin), "-f", "-q", "11", "-o", str(br), str(src)],
+                    cwd=frontend_dir,
+                    env=env,
+                )
+                br_count += 1
+
+    if brotli_bin is None:
+        print("Info: `brotli` binary not found; generated gzip assets only.")
+    print(f"Precompression complete: gzip={gz_count}, brotli={br_count}")
+
+
+def _clear_dx_web_cache(frontend_dir: Path) -> None:
+    """
+    Dioxus can reuse cached web/public asset dirs from target/, which may
+    repopulate stale hashed assets into dist/public on rebuild.
+    """
+    target_dir = frontend_dir / "target"
+    if not target_dir.exists():
+        return
+
+    removed = 0
+    for p in target_dir.rglob("web/public/assets"):
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            removed += 1
+    for p in target_dir.rglob("web/public/wasm"):
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            removed += 1
+
+    if removed:
+        print(f"Cleared stale Dioxus web cache dirs: {removed}")
 
 
 def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
@@ -978,8 +1063,16 @@ def build_frontend(
         *,
         rust_target: Optional[str] = None,
         debug_mode: bool = False,
+        max_size: bool = False,
 ) -> None:
     try:
+        public_dir = frontend_dir / "dist" / "public"
+        if public_dir.exists():
+            print(f"Removing existing public artifacts: {public_dir}")
+            shutil.rmtree(public_dir)
+        if platform_name in {None, "web"}:
+            _clear_dx_web_cache(frontend_dir)
+
         clear_app_bundle(frontend_dir)
 
         env = _dx_bundle_env(frontend_dir) if (is_container() or in_docker_build()) else None
@@ -1029,7 +1122,8 @@ def build_frontend(
         run(cmd, cwd=frontend_dir, env=env)
 
         if platform_name in {None, "web"}:
-            _manual_optimize_web_wasm(frontend_dir, env)
+            _manual_optimize_web_wasm(frontend_dir, env, max_size=max_size)
+            _compress_web_assets(frontend_dir, env)
 
         if platform_name == "macos":
             rename_macos_app_bundle(frontend_dir)
@@ -1095,6 +1189,7 @@ def print_usage() -> None:
     print("  ./build.py no_pi                   # local: backend w/o raspberry_pi feature")
     print("  ./build.py testing                 # local: backend w/ testing feature")
     print("  ./build.py debug                   # local: build frontend+backend in debug mode")
+    print("  ./build.py max_size                # web wasm: add wasm-opt --converge (slower, smaller)")
     print("  ./build.py plain                   # docker only: pass --progress plain")
     print("  ./build.py log=build.log           # tee command output into a log file")
     print("  ./build.py docker [pi_build|no_pi] [testing]")
@@ -1145,6 +1240,7 @@ def main() -> None:
     docker_mode = False
     testing_mode = False
     debug_mode = False
+    max_size_mode = False
     plain_mode = False
     use_existing = False
     backend_only = False
@@ -1195,6 +1291,8 @@ def main() -> None:
             testing_mode = True
         elif arg == "debug":
             debug_mode = True
+        elif arg == "max_size":
+            max_size_mode = True
         elif arg in {"backend_only", "backend"}:
             backend_only = True
         elif arg == "existing":
@@ -1248,6 +1346,7 @@ def main() -> None:
                     platform_name="ios",
                     rust_target="aarch64-apple-ios",
                     debug_mode=debug_mode,
+                    max_size=max_size_mode,
                 )
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
             print(f"✅ Distribution IPA created: {ipa}")
@@ -1260,6 +1359,7 @@ def main() -> None:
                     platform_name="ios",
                     rust_target="aarch64-apple-ios-sim",
                     debug_mode=debug_mode,
+                    max_size=max_size_mode,
                 )
             udid, bundle_id = ios_sim_deploy(frontend_dir)
             print(f"✅ Simulator deploy complete ({udid}) for {bundle_id}")
@@ -1275,6 +1375,7 @@ def main() -> None:
                     platform_name="ios",
                     rust_target="aarch64-apple-ios",
                     debug_mode=debug_mode,
+                    max_size=max_size_mode,
                 )
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="development")
             print(f"✅ Dev IPA created: {ipa}")
@@ -1287,6 +1388,7 @@ def main() -> None:
                     platform_name="ios",
                     rust_target="aarch64-apple-ios",
                     debug_mode=debug_mode,
+                    max_size=max_size_mode,
                 )
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
             print(f"✅ Distribution IPA created: {ipa}")
@@ -1294,7 +1396,13 @@ def main() -> None:
 
         if action == "macos_deploy":
             if not use_existing:
-                build_frontend(frontend_dir, platform_name="macos", rust_target=None, debug_mode=debug_mode)
+                build_frontend(
+                    frontend_dir,
+                    platform_name="macos",
+                    rust_target=None,
+                    debug_mode=debug_mode,
+                    max_size=max_size_mode,
+                )
             sign_macos_app_and_dmg(frontend_dir)
             deployed = macos_deploy(frontend_dir)
             print(f"✅ Installed into /Applications: {deployed}")
@@ -1302,14 +1410,26 @@ def main() -> None:
 
         if action == "macos_sign":
             if not use_existing:
-                build_frontend(frontend_dir, platform_name="macos", rust_target=None, debug_mode=debug_mode)
+                build_frontend(
+                    frontend_dir,
+                    platform_name="macos",
+                    rust_target=None,
+                    debug_mode=debug_mode,
+                    max_size=max_size_mode,
+                )
             sign_macos_app_and_dmg(frontend_dir)
             print("✅ Signed macOS app and dmg")
             return
 
         if action == "macos_notarize":
             if not use_existing:
-                build_frontend(frontend_dir, platform_name="macos", rust_target=None, debug_mode=debug_mode)
+                build_frontend(
+                    frontend_dir,
+                    platform_name="macos",
+                    rust_target=None,
+                    debug_mode=debug_mode,
+                    max_size=max_size_mode,
+                )
             notarize_macos(frontend_dir)
             print("✅ Notarized macOS artifact")
             return
@@ -1329,6 +1449,7 @@ def main() -> None:
             platform_name=frontend_only_platform,
             rust_target=frontend_rust_target,
             debug_mode=debug_mode,
+            max_size=max_size_mode,
         )
         return
 
@@ -1353,14 +1474,14 @@ def main() -> None:
 
     if in_docker_build():
         print("Sequential build")
-        build_frontend(frontend_dir, None, debug_mode=debug_mode)
+        build_frontend(frontend_dir, None, debug_mode=debug_mode, max_size=max_size_mode)
         build_backend(backend_dir, force_pi, force_no_pi, testing_mode, debug_mode)
         return
 
     bfe = mp.Process(
         target=build_frontend,
         args=(frontend_dir, None),
-        kwargs={"debug_mode": debug_mode},
+        kwargs={"debug_mode": debug_mode, "max_size": max_size_mode},
     )
     bbe = mp.Process(
         target=build_backend,
