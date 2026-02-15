@@ -623,6 +623,19 @@ def _find_wasm_opt(path_value: str) -> Optional[Path]:
     return _which_in_path("wasm-opt", path_value)
 
 
+def _find_wasm_bindgen(path_value: str) -> Optional[Path]:
+    candidates = [
+        Path("/usr/local/bin/wasm-bindgen"),
+        Path("/usr/bin/wasm-bindgen"),
+        Path("/root/.cargo/bin/wasm-bindgen"),
+        Path(str(Path.home() / ".cargo" / "bin" / "wasm-bindgen")),
+    ]
+    for cand in candidates:
+        if cand.exists() and os.access(cand, os.X_OK):
+            return cand
+    return _which_in_path("wasm-bindgen", path_value)
+
+
 def _find_dx(path_value: str) -> Optional[Path]:
     candidates = [
         Path("/root/.cargo/bin/dx"),
@@ -665,8 +678,8 @@ def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
     env["PATH"] = os.pathsep.join(extra_paths + [base_path])
 
     # CRITICAL: tell dx to trust the environment and NOT auto-download wasm-opt/wasm-bindgen, etc.
-    # (Dioxus CLI supports NO_DOWNLOADS=1 and a runtime no_downloads setting). :contentReference[oaicite:1]{index=1}
-    if is_container():
+    # (Dioxus CLI supports NO_DOWNLOADS=1 and a runtime no_downloads setting).
+    if in_docker_build() or is_container():
         env["NO_DOWNLOADS"] = "1"
 
     wasm_opt = _find_wasm_opt(env["PATH"])
@@ -676,6 +689,12 @@ def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
         env["WASMOPT"] = str(wasm_opt)
         env["DIOXUS_WASM_OPT"] = str(wasm_opt)
         env["DIOXUS_WASM_OPT_PATH"] = str(wasm_opt)
+
+    wasm_bindgen = _find_wasm_bindgen(env["PATH"])
+    if wasm_bindgen:
+        env["WASM_BINDGEN"] = str(wasm_bindgen)
+        env["DIOXUS_WASM_BINDGEN"] = str(wasm_bindgen)
+        env["DIOXUS_WASM_BINDGEN_PATH"] = str(wasm_bindgen)
 
     return env
 
@@ -894,7 +913,7 @@ def build_frontend(
     try:
         clear_app_bundle(frontend_dir)
 
-        env = _dx_bundle_env(frontend_dir) if is_container() else None
+        env = _dx_bundle_env(frontend_dir) if (is_container() or in_docker_build()) else None
 
         if is_container():
             _prebuild_frontend_for_container(frontend_dir)
