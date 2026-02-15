@@ -28,14 +28,44 @@ LEGACY_APP_BUNDLE_NAME = f"{LEGACY_APP_NAME}.app"
 # fixed provisioning profile path (repo-local)
 FIXED_MOBILEPROVISION_REL = Path("Groundstation_26.mobileprovision")
 
+LOG_FILE: Optional[Path] = None
+
+
+def _append_log(line: str) -> None:
+    if LOG_FILE is None:
+        return
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(line)
+
 
 def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None:
     cmd = [str(part) for part in cmd]
-    print(f"Running: {' '.join(cmd)} (cwd={cwd})")
+    cmd_line = f"Running: {' '.join(cmd)} (cwd={cwd})"
+    print(cmd_line)
+    _append_log(cmd_line + "\n")
     merged = os.environ.copy()
     if env:
         merged.update(env)
-    subprocess.run(cmd, cwd=cwd, check=True, env=merged)
+    if LOG_FILE is None:
+        subprocess.run(cmd, cwd=cwd, check=True, env=merged)
+        return
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=merged,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="")
+        _append_log(line)
+    rc = proc.wait()
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd)
 
 
 def run_capture(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> str:
@@ -187,9 +217,11 @@ def get_compose_base_cmd() -> list[str]:
         sys.exit(1)
 
 
-def build_docker(repo_root: Path, pi_build: bool, testing: bool) -> None:
+def build_docker(repo_root: Path, pi_build: bool, testing: bool, plain_progress: bool) -> None:
     compose_cmd = get_compose_base_cmd()
     cmd: list[str] = [*compose_cmd, "build"]
+    if plain_progress and compose_cmd == ["docker", "compose"]:
+        cmd.extend(["--progress", "plain"])
 
     if pi_build:
         print("Pi build (docker) → passing --build-arg PI_BUILD=TRUE")
@@ -1023,7 +1055,11 @@ def print_usage() -> None:
     print("  ./build.py no_pi                   # local: backend w/o raspberry_pi feature")
     print("  ./build.py testing                 # local: backend w/ testing feature")
     print("  ./build.py debug                   # local: build frontend+backend in debug mode")
+    print("  ./build.py plain                   # docker only: pass --progress plain")
+    print("  ./build.py log=build.log           # tee command output into a log file")
     print("  ./build.py docker [pi_build|no_pi] [testing]")
+    print("  ./build.py backend_only            # local: build backend only")
+    print("  ./build.py frontend_web            # local: build frontend web only")
     print("")
     print("Frontend-only builds:")
     print("  ./build.py ios                     # iPhoneOS build (UNSIGNED; patched)")
@@ -1062,20 +1098,25 @@ def print_usage() -> None:
 
 
 def main() -> None:
+    global LOG_FILE
+
     force_pi = False
     force_no_pi = False
     docker_mode = False
     testing_mode = False
     debug_mode = False
+    plain_mode = False
     use_existing = False
+    backend_only = False
+    log_file_arg: Optional[str] = None
 
     frontend_only_platform: Optional[str] = None
     frontend_rust_target: Optional[str] = None
     action: Optional[str] = None
 
-    args = [a.strip().lower() for a in sys.argv[1:]]
+    raw_args = [a.strip() for a in sys.argv[1:]]
 
-    if len(args) > 5:
+    if len(raw_args) > 8:
         print("Error: Too many arguments.", file=sys.stderr)
         print_usage()
 
@@ -1086,6 +1127,8 @@ def main() -> None:
         "windows": ("windows", None),
         "android": ("android", None),
         "linux": ("linux", None),
+        "web": ("web", None),
+        "frontend_web": ("web", None),
     }
 
     actions = {
@@ -1098,26 +1141,37 @@ def main() -> None:
         "macos_notarize",
     }
 
-    for arg in args:
+    for raw_arg in raw_args:
+        arg = raw_arg.lower()
         if arg == "pi_build":
             force_pi = True
         elif arg == "no_pi":
             force_no_pi = True
         elif arg == "docker":
             docker_mode = True
+        elif arg == "plain":
+            plain_mode = True
         elif arg == "testing":
             testing_mode = True
         elif arg == "debug":
             debug_mode = True
+        elif arg in {"backend_only", "backend"}:
+            backend_only = True
         elif arg == "existing":
             use_existing = True
+        elif arg.startswith("log="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: log= requires a filepath.", file=sys.stderr)
+                print_usage()
+            log_file_arg = value
         elif arg in actions:
-            if action or frontend_only_platform:
+            if action or frontend_only_platform or backend_only:
                 print("Error: Only one frontend action/build may be specified.", file=sys.stderr)
                 print_usage()
             action = arg
         elif arg in frontend_platform_map:
-            if frontend_only_platform or action:
+            if frontend_only_platform or action or backend_only:
                 print("Error: Only one frontend action/build may be specified.", file=sys.stderr)
                 print_usage()
             frontend_only_platform, frontend_rust_target = frontend_platform_map[arg]
@@ -1132,6 +1186,15 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parent
     frontend_dir = repo_root / "frontend"
     backend_dir = repo_root / "backend"
+
+    if log_file_arg:
+        log_path = Path(log_file_arg)
+        if not log_path.is_absolute():
+            log_path = repo_root / log_path
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("", encoding="utf-8")
+        LOG_FILE = log_path
+        print(f"Logging command output to: {LOG_FILE}")
 
     if action:
         if docker_mode or force_pi or force_no_pi or testing_mode:
@@ -1229,6 +1292,13 @@ def main() -> None:
         )
         return
 
+    if backend_only:
+        if docker_mode:
+            print("Error: backend_only cannot be combined with docker mode.", file=sys.stderr)
+            print_usage()
+        build_backend(backend_dir, force_pi, force_no_pi, testing_mode, debug_mode)
+        return
+
     if docker_mode:
         if force_no_pi:
             pi_build_flag = False
@@ -1236,7 +1306,8 @@ def main() -> None:
             if not force_pi and is_raspberry_pi():
                 force_pi = True
             pi_build_flag = force_pi
-        build_docker(repo_root=repo_root, pi_build=pi_build_flag, testing=testing_mode)
+        use_plain = plain_mode or (LOG_FILE is not None)
+        build_docker(repo_root=repo_root, pi_build=pi_build_flag, testing=testing_mode, plain_progress=use_plain)
         return
 
     if in_docker_build():
