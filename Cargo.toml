@@ -11,10 +11,10 @@ description = "The ground station software for SEDS' 2026 irec competition."
 repository = "https://github.com/University-at-Buffalo-SEDS/GroundStation26"
 
 [workspace.dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1", features = ["full"] }
-axum = "0.8.7"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.49.0", features = ["full"] }
+axum = "0.8.8"
 
 
 [profile.release]

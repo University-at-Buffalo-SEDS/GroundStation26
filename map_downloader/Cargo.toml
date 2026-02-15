@@ -7,11 +7,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1"
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "time", "fs"] }
-reqwest = { version = "0.13", features = ["rustls"] }
-indicatif = "0.18.3"
-futures = "0.3"
+anyhow = "1.0.101"
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "fs"] }
+reqwest = { version = "0.13.2", features = ["rustls"] }
+indicatif = "0.18.4"
+futures = "0.3.31"
 
 [[bin]]
 name = "map_downloader"
