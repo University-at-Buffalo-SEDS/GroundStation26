@@ -119,10 +119,10 @@ pub fn MapTab(
                 gloo_timers::future::TimeoutFuture::new(20).await;
 
                 #[cfg(target_os = "ios")]
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
                 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         });
     }

@@ -9,7 +9,6 @@ use axum::{
     Json,
     Router,
 };
-use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
 use serde::{Deserialize, Serialize};
@@ -24,7 +23,7 @@ use tower_http::services::ServeDir;
 
 // NEW
 
-static FAVICON_DATA: OnceCell<Bytes> = OnceCell::const_new();
+static FAVICON_DATA: OnceCell<Vec<u8>> = OnceCell::const_new();
 
 fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
     let values_from_json = row
@@ -295,10 +294,9 @@ async fn get_favicon() -> impl IntoResponse {
         .get_or_init(|| async {
             // Adjust this path if needed
             let path: PathBuf = "./frontend/assets/icon.png".into();
-            let data = tokio::fs::read(&path)
+            tokio::fs::read(&path)
                 .await
-                .unwrap_or_else(|e| panic!("failed to read favicon at {:?}: {e}", path));
-            Bytes::from(data)
+                .unwrap_or_else(|e| panic!("failed to read favicon at {:?}: {e}", path))
         })
         .await
         .clone();
