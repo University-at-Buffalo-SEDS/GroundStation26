@@ -1,24 +1,25 @@
 use crate::state::AppState;
 use groundstation_shared::TelemetryRow;
-use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
-use sedsprintf_rs_2026::config::DataType;
+use groundstation_shared::{TelemetryCommand, u8_to_flight_state};
 use sedsprintf_rs_2026::config::DEVICE_IDENTIFIER;
+use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::timesync::{
-    compute_offset_delay, decode_timesync_request, decode_timesync_response, TimeSyncConfig, TimeSyncRole,
-    TimeSyncTracker, TimeSyncUpdate,
+    TimeSyncConfig, TimeSyncRole, TimeSyncTracker, TimeSyncUpdate, compute_offset_delay,
+    decode_timesync_request, decode_timesync_response,
 };
 
 use crate::gpio_panel::IGNITION_PIN;
 use crate::radio::RadioDevice;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
-use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
+use crate::web::{FlightStateMsg, emit_warning, emit_warning_db_only};
 use groundstation_shared::Board;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 
 const TIMESYNC_PRIORITY: u64 = 50;
 const TIMESYNC_SOURCE_TIMEOUT_MS: u64 = 5_000;
@@ -27,6 +28,8 @@ const TIMESYNC_REQUEST_INTERVAL_MS: u64 = 1_000;
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
 const DB_WORK_QUEUE_SIZE: usize = 8_192;
+const WS_PUBLISH_FLUSH_MS_DEFAULT: u64 = 50;
+const WS_PUBLISH_MAX_PER_FLUSH_DEFAULT: usize = 24;
 
 static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 
@@ -114,17 +117,63 @@ pub async fn telemetry_task(
         let router = router.clone();
         let timesync_state = timesync_state.clone();
         let db_tx = db_tx.clone();
+        let ws_publish_flush_ms: u64 = std::env::var("GS_WS_PUBLISH_FLUSH_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(WS_PUBLISH_FLUSH_MS_DEFAULT)
+            .clamp(10, 1000);
+        let ws_publish_max_per_flush: usize = std::env::var("GS_WS_PUBLISH_MAX_PER_FLUSH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(WS_PUBLISH_MAX_PER_FLUSH_DEFAULT)
+            .clamp(1, 512);
         tokio::spawn(async move {
             let mut db_queue_full_warned = false;
-            while let Some(pkt) = packet_rx.recv().await {
-                handle_packet(
-                    &state,
-                    &router,
-                    &timesync_state,
-                    &db_tx,
-                    &mut db_queue_full_warned,
-                    pkt,
-                );
+            let mut ws_latest_by_type: HashMap<String, TelemetryRow> = HashMap::new();
+            let mut ws_flush = tokio::time::interval(Duration::from_millis(ws_publish_flush_ms));
+            loop {
+                tokio::select! {
+                    maybe_pkt = packet_rx.recv() => {
+                        let Some(pkt) = maybe_pkt else {
+                            break;
+                        };
+                        if let Some(row) = handle_packet(
+                            &state,
+                            &router,
+                            &timesync_state,
+                            &db_tx,
+                            &mut db_queue_full_warned,
+                            pkt,
+                        ) {
+                            ws_latest_by_type.insert(row.data_type.clone(), row);
+                        }
+                    }
+                    _ = ws_flush.tick() => {
+                        if ws_latest_by_type.is_empty() {
+                            continue;
+                        }
+                        let mut rows: Vec<TelemetryRow> = ws_latest_by_type.drain().map(|(_, row)| row).collect();
+                        rows.sort_by_key(|r| r.timestamp_ms);
+                        if rows.len() > ws_publish_max_per_flush {
+                            rows.drain(0..(rows.len() - ws_publish_max_per_flush));
+                        }
+                        for row in rows {
+                            let _ = state.ws_tx.send(row);
+                        }
+                    }
+                }
+            }
+
+            if !ws_latest_by_type.is_empty() {
+                let mut rows: Vec<TelemetryRow> =
+                    ws_latest_by_type.drain().map(|(_, row)| row).collect();
+                rows.sort_by_key(|r| r.timestamp_ms);
+                if rows.len() > ws_publish_max_per_flush {
+                    rows.drain(0..(rows.len() - ws_publish_max_per_flush));
+                }
+                for row in rows {
+                    let _ = state.ws_tx.send(row);
+                }
             }
         })
     };
@@ -495,7 +544,7 @@ fn handle_packet(
     db_tx: &mpsc::Sender<DbWrite>,
     db_queue_full_warned: &mut bool,
     pkt: TelemetryPacket,
-) {
+) -> Option<TelemetryRow> {
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
 
     if pkt.data_type() == DataType::Warning {
@@ -504,24 +553,24 @@ fn handle_packet(
         } else {
             emit_warning(state, "Warning packet with invalid UTF-8 payload");
         }
-        return;
+        return None;
     }
 
     if handle_timesync_packet(router, timesync_state, &pkt) {
-        return;
+        return None;
     }
 
     if pkt.data_type() == DataType::FlightState {
         if !cfg!(feature = "testing") && !state.all_boards_seen() {
-            return;
+            return None;
         }
         let pkt_data = match pkt.data_as_u8() {
             Ok(data) => *data.first().expect("index 0 does not exist"),
-            Err(_) => return,
+            Err(_) => return None,
         };
         let new_flight_state = match u8_to_flight_state(pkt_data) {
             Some(flight_state) => flight_state,
-            None => return,
+            None => return None,
         };
         {
             let mut fs = state.state.lock().unwrap();
@@ -541,7 +590,7 @@ fn handle_packet(
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
         });
-        return;
+        return None;
     }
 
     if pkt.data_type() == DataType::UmbilicalStatus {
@@ -562,7 +611,7 @@ fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                    .ok();
+                .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 queue_db_write(
@@ -582,10 +631,10 @@ fn handle_packet(
                     data_type: VALVE_STATE_DATA_TYPE.to_string(),
                     values: values_vec,
                 };
-                let _ = state.ws_tx.send(row);
+                return Some(row);
             }
         }
-        return;
+        return None;
     }
 
     let ts_ms = pkt.timestamp() as i64;
@@ -601,7 +650,7 @@ fn handle_packet(
                 .map(|v| v.map(|n| n as f64))
                 .collect::<Vec<_>>(),
         )
-            .ok();
+        .ok();
 
         queue_db_write(
             state,
@@ -621,7 +670,7 @@ fn handle_packet(
             values: values_vec,
         };
 
-        let _ = state.ws_tx.send(row);
+        Some(row)
     } else {
         queue_db_write(
             state,
@@ -634,6 +683,7 @@ fn handle_packet(
             },
             db_queue_full_warned,
         );
+        None
     }
 }
 

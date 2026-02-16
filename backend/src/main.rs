@@ -14,7 +14,7 @@ mod state;
 mod telemetry_task;
 mod web;
 
-use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
+use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::state::{AppState, BoardStatus};
@@ -22,14 +22,14 @@ use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
 #[cfg(feature = "testing")]
 use crate::radio::DummyRadio;
-use crate::radio::{Radio, RadioDevice, RADIO_BAUD_RATE, ROCKET_RADIO_PORT, UMBILICAL_RADIO_PORT};
+use crate::radio::{RADIO_BAUD_RATE, ROCKET_RADIO_PORT, Radio, RadioDevice, UMBILICAL_RADIO_PORT};
 use axum::Router;
 use groundstation_shared::{Board, FlightState as FlightStateMode};
+use sedsprintf_rs_2026::TelemetryError;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
-use sedsprintf_rs_2026::TelemetryError;
 use sqlx::Row;
 use std::collections::HashMap;
 use std::fs;
@@ -44,6 +44,14 @@ use tokio::sync::{broadcast, mpsc};
 
 fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
     Box::new(get_current_timestamp_ms)
+}
+
+fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
@@ -145,8 +153,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     // Add values_json column for older DBs.
     let cols = sqlx::query("PRAGMA table_info(telemetry)")
@@ -179,8 +187,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     sqlx::query(
         r#"
@@ -191,13 +199,16 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
-    let (ws_tx, _ws_rx) = broadcast::channel(512);
-    let (board_status_tx, _board_status_rx) = broadcast::channel(64);
+    let ws_broadcast_capacity = env_usize("GS_WS_BROADCAST_CAPACITY", 8192, 512, 262_144);
+    let board_status_capacity = env_usize("GS_BOARD_STATUS_BROADCAST_CAPACITY", 256, 64, 4096);
+    let alerts_capacity = env_usize("GS_ALERTS_BROADCAST_CAPACITY", 1024, 128, 8192);
+    let (ws_tx, _ws_rx) = broadcast::channel(ws_broadcast_capacity);
+    let (board_status_tx, _board_status_rx) = broadcast::channel(board_status_capacity);
     let (shutdown_tx, _shutdown_rx) = broadcast::channel(8);
 
     // --- Shared state ---
@@ -217,8 +228,8 @@ async fn main() -> anyhow::Result<()> {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(1024))),
         cmd_tx,
         ws_tx,
-        warnings_tx: broadcast::channel(256).0,
-        errors_tx: broadcast::channel(256).0,
+        warnings_tx: broadcast::channel(alerts_capacity).0,
+        errors_tx: broadcast::channel(alerts_capacity).0,
         db,
         state: Arc::new(Mutex::new(FlightStateMode::Startup)),
         state_tx: broadcast::channel(16).0,

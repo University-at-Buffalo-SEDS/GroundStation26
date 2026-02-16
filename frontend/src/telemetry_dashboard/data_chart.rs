@@ -606,9 +606,9 @@ pub fn series_color(i: usize) -> &'static str {
     [
         "#f97316", "#22d3ee", "#a3e635", "#f43f5e", "#8b5cf6", "#e879f9", "#10b981", "#fbbf24",
     ]
-        .get(i)
-        .copied()
-        .unwrap_or("#9ca3af")
+    .get(i)
+    .copied()
+    .unwrap_or("#9ca3af")
 }
 
 pub fn labels_for_datatype(dt: &str) -> [&'static str; 8] {

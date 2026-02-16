@@ -7,7 +7,7 @@ use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::Client;
 use tokio::fs as async_fs;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 /// Region name (used for directory layout)
 const REGION: &str = "north_america";
@@ -129,7 +129,7 @@ async fn fetch_tiles_for_zoom_async(
         ProgressStyle::with_template(
             "{prefix} [{bar:40.cyan/blue}] {msg}\n{prefix} {pos}/{len} ({percent}%) ETA {eta}",
         )?
-            .progress_chars("##-"),
+        .progress_chars("##-"),
     );
     pb.set_message("                    ");
     pb.set_draw_target(ProgressDrawTarget::stdout_with_hz(10));

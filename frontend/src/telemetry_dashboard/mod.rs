@@ -39,8 +39,8 @@ use warnings_tab::WarningsTab;
 
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, Ordering}, Arc,
-    Mutex,
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 
 use once_cell::sync::Lazy;
@@ -224,6 +224,7 @@ mod persist {
 #[serde(tag = "ty", content = "data")]
 enum WsInMsg {
     Telemetry(TelemetryRow),
+    TelemetryBatch(Vec<TelemetryRow>),
     FlightState(FlightStateMsg),
     Warning(AlertMsg),
     Error(AlertMsg),
@@ -887,7 +888,7 @@ fn TelemetryDashboardInner() -> Element {
                     &mut ack_error_ts_s,
                     alive.clone(),
                 )
-                    .await
+                .await
                     && alive.load(Ordering::Relaxed)
                     && *WS_EPOCH.read() == epoch
                 {
@@ -946,10 +947,10 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
-        || *warning_event_counter.read() > *ack_warning_count.read());
+            || *warning_event_counter.read() > *ack_warning_count.read());
     let has_unacked_errors = latest_error_ts > 0
         && (latest_error_ts > *ack_error_ts.read()
-        || *error_event_counter.read() > *ack_error_count.read());
+            || *error_event_counter.read() > *ack_error_count.read());
 
     let border_style = if has_unacked_errors && *flash_on.read() {
         "2px solid #ef4444"
@@ -1026,7 +1027,7 @@ fn TelemetryDashboardInner() -> Element {
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
                     && alive.load(Ordering::Relaxed)
                 {
                     log!("[WS] supervisor ended: {e}");
@@ -1765,7 +1766,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -1783,7 +1784,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
         };
 
@@ -1915,7 +1916,7 @@ async fn connect_ws_once_wasm(
             &mut closed_rx,
             gloo_timers::future::TimeoutFuture::new(150),
         )
-            .await;
+        .await;
 
         match done {
             futures_util::future::Either::Left((_closed, _timeout)) => break,
@@ -1974,9 +1975,9 @@ async fn connect_ws_once_native(
             false,
             Some(tokio_tungstenite::Connector::NativeTls(tls)),
         )
-            .await
-            .map_err(|e| format!("[WS] connect failed: {e}"))?
-            .0
+        .await
+        .map_err(|e| format!("[WS] connect failed: {e}"))?
+        .0
     } else {
         tokio_tungstenite::connect_async(ws_url.as_str())
             .await
@@ -2070,6 +2071,26 @@ fn handle_ws_message(
                 q.push_back(row);
 
                 // Safety cap if UI stalls
+                const MAX_QUEUE: usize = 30_000;
+                while q.len() > MAX_QUEUE {
+                    q.pop_front();
+                }
+            }
+        }
+
+        WsInMsg::TelemetryBatch(batch) => {
+            if batch.is_empty() {
+                return;
+            }
+            if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
+                for row in batch {
+                    charts_cache_ingest_row(&row);
+                    if let Some((lat, lon)) = row_to_gps(&row) {
+                        rocket_gps.set(Some((lat, lon)));
+                    }
+                    q.push_back(row);
+                }
+
                 const MAX_QUEUE: usize = 30_000;
                 while q.len() > MAX_QUEUE {
                     q.pop_front();

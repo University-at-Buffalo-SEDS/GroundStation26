@@ -3,9 +3,9 @@ use crate::telemetry_task::get_current_timestamp_ms;
 use groundstation_shared::{Board, FlightState};
 use rand::Rng;
 use rand::RngExt;
+use sedsprintf_rs_2026::TelemetryResult;
 use sedsprintf_rs_2026::config::DataEndpoint;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
-use sedsprintf_rs_2026::TelemetryResult;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 // ---------------------------------------------------------------------------------------------

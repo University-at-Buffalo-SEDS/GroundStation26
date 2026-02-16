@@ -2,8 +2,8 @@
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
 use sedsprintf_rs_2026::{
-    router::{Router, RouterSideId}, TelemetryError,
-    TelemetryResult,
+    TelemetryError, TelemetryResult,
+    router::{Router, RouterSideId},
 };
 use serial::{SerialPort, SystemPort};
 use std::error::Error;
