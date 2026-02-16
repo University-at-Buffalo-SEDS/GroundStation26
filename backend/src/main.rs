@@ -207,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
             *board,
             BoardStatus {
                 last_seen_ms: None,
+                ema_gap_ms: None,
                 warned: false,
             },
         );

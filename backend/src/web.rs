@@ -349,12 +349,19 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Task: server -> client (all streams multiplexed)
     let send_task = async move {
-        const BUCKET_MS: i64 = 20;
-        const TELEMETRY_FLUSH_MS: u64 = 50;
-        const MAX_TELEMETRY_PER_FLUSH: usize = 24;
+        let telemetry_flush_ms: u64 = std::env::var("GS_WS_TELEMETRY_FLUSH_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(50)
+            .clamp(10, 1000);
+        let max_telemetry_per_flush: usize = std::env::var("GS_WS_MAX_TELEMETRY_PER_FLUSH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(24)
+            .clamp(1, 512);
         let mut telemetry_latest_by_type: HashMap<String, TelemetryRow> = HashMap::new();
         let mut telemetry_flush =
-            tokio::time::interval(std::time::Duration::from_millis(TELEMETRY_FLUSH_MS));
+            tokio::time::interval(std::time::Duration::from_millis(telemetry_flush_ms));
 
         loop {
             tokio::select! {
@@ -427,15 +434,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                 recv = telemetry_rx.recv() => {
                     match recv {
                         Ok(pkt) => {
-                            let bucket_id = pkt.timestamp_ms / BUCKET_MS;
                             let key = pkt.data_type.clone();
-                            let replace = telemetry_latest_by_type
-                                .get(&key)
-                                .map(|prev| (prev.timestamp_ms / BUCKET_MS) != bucket_id)
-                                .unwrap_or(true);
-                            if replace {
-                                telemetry_latest_by_type.insert(key, pkt);
-                            }
+                            telemetry_latest_by_type.insert(key, pkt);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             // On lag, keep going and send most recent snapshots at next flush.
@@ -453,8 +453,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         telemetry_latest_by_type.drain().map(|(_, row)| row).collect();
                     rows.sort_by_key(|r| r.timestamp_ms);
 
-                    if rows.len() > MAX_TELEMETRY_PER_FLUSH {
-                        rows.drain(0..(rows.len() - MAX_TELEMETRY_PER_FLUSH));
+                    if rows.len() > max_telemetry_per_flush {
+                        rows.drain(0..(rows.len() - max_telemetry_per_flush));
                     }
 
                     for row in rows {

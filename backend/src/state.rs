@@ -15,6 +15,7 @@ use tokio::time::{Duration, Instant};
 #[derive(Debug, Clone)]
 pub struct BoardStatus {
     pub last_seen_ms: Option<u64>,
+    pub ema_gap_ms: Option<u64>,
     pub warned: bool,
 }
 
@@ -79,6 +80,14 @@ impl AppState {
         };
         let mut map = self.board_status.lock().unwrap();
         if let Some(status) = map.get_mut(&board) {
+            if let Some(last_seen) = status.last_seen_ms {
+                let gap_ms = timestamp_ms.saturating_sub(last_seen);
+                let ema = status
+                    .ema_gap_ms
+                    .map(|prev| ((prev * 7) + gap_ms) / 8)
+                    .unwrap_or(gap_ms);
+                status.ema_gap_ms = Some(ema.clamp(10, 60_000));
+            }
             status.last_seen_ms = Some(timestamp_ms);
             status.warned = false;
         }
