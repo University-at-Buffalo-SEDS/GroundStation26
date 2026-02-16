@@ -353,24 +353,25 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         let telemetry_flush_ms: u64 = std::env::var("GS_WS_TELEMETRY_FLUSH_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(50)
+            .unwrap_or(33)
             .clamp(10, 1000);
         let max_telemetry_per_flush_cap: usize = std::env::var("GS_WS_MAX_TELEMETRY_PER_FLUSH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(24)
+            .unwrap_or(96)
             .clamp(1, 512);
         let min_telemetry_per_flush: usize = std::env::var("GS_WS_MIN_TELEMETRY_PER_FLUSH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4)
+            .unwrap_or(12)
             .clamp(1, max_telemetry_per_flush_cap);
         let send_target_ms: u64 = std::env::var("GS_WS_SEND_TARGET_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(20)
+            .unwrap_or(15)
             .clamp(1, 2000);
-        let mut dynamic_max_per_flush = max_telemetry_per_flush_cap.clamp(1, 128);
+        let mut dynamic_max_per_flush = (max_telemetry_per_flush_cap / 2)
+            .clamp(min_telemetry_per_flush, max_telemetry_per_flush_cap);
         let mut telemetry_latest_by_type: HashMap<String, TelemetryRow> = HashMap::new();
         let mut telemetry_flush =
             tokio::time::interval(std::time::Duration::from_millis(telemetry_flush_ms));
@@ -488,16 +489,17 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                     let send_elapsed_ms = send_start.elapsed().as_millis() as u64;
 
                     if adaptive_rate {
-                        let congested = send_elapsed_ms > send_target_ms.saturating_mul(2)
-                            || pending_before >= max_this_flush;
+                        let congested = send_elapsed_ms > send_target_ms.saturating_mul(2);
                         if congested {
-                            dynamic_max_per_flush =
-                                ((dynamic_max_per_flush * 3) / 4).max(min_telemetry_per_flush);
+                            dynamic_max_per_flush = (dynamic_max_per_flush / 2).max(min_telemetry_per_flush);
+                        } else if send_elapsed_ms <= send_target_ms.saturating_div(2).max(1)
+                            && pending_before >= max_this_flush.saturating_sub(1)
+                        {
+                            dynamic_max_per_flush = (dynamic_max_per_flush + 4).min(max_telemetry_per_flush_cap);
                         } else if send_elapsed_ms <= send_target_ms
                             && pending_before >= max_this_flush.saturating_sub(1)
                         {
-                            dynamic_max_per_flush =
-                                (dynamic_max_per_flush + 1).min(max_telemetry_per_flush_cap);
+                            dynamic_max_per_flush = (dynamic_max_per_flush + 1).min(max_telemetry_per_flush_cap);
                         }
                     }
                 }

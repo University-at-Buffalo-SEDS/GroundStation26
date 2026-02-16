@@ -14,7 +14,6 @@ use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCo
 use crate::web::{emit_warning, FlightStateMsg};
 use groundstation_shared::Board;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::TrySendError;
@@ -28,11 +27,6 @@ const TIMESYNC_REQUEST_INTERVAL_MS: u64 = 1_000;
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
 const DB_WORK_QUEUE_SIZE: usize = 8_192;
-const WS_PUBLISH_FLUSH_MS_DEFAULT: u64 = 100;
-const WS_PUBLISH_MAX_PER_FLUSH_DEFAULT: usize = 8;
-const WS_SEND_MIN_INTERVAL_MS_DEFAULT: u64 = 100;
-const WS_SEND_MAX_SILENCE_MS_DEFAULT: u64 = 2000;
-const WS_VALUE_EPSILON_DEFAULT: f32 = 0.05;
 const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
 
 static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
@@ -121,102 +115,11 @@ pub async fn telemetry_task(
         let router = router.clone();
         let timesync_state = timesync_state.clone();
         let db_tx = db_tx.clone();
-        let ws_publish_flush_ms: u64 = std::env::var("GS_WS_PUBLISH_FLUSH_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(WS_PUBLISH_FLUSH_MS_DEFAULT)
-            .clamp(10, 1000);
-        let ws_publish_max_per_flush: usize = std::env::var("GS_WS_PUBLISH_MAX_PER_FLUSH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(WS_PUBLISH_MAX_PER_FLUSH_DEFAULT)
-            .clamp(1, 512);
-        let ws_send_min_interval_ms: u64 = std::env::var("GS_WS_SEND_MIN_INTERVAL_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(WS_SEND_MIN_INTERVAL_MS_DEFAULT)
-            .clamp(10, 5000);
-        let ws_send_max_silence_ms: u64 = std::env::var("GS_WS_SEND_MAX_SILENCE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(WS_SEND_MAX_SILENCE_MS_DEFAULT)
-            .clamp(ws_send_min_interval_ms, 30_000);
-        let ws_value_epsilon: f32 = std::env::var("GS_WS_VALUE_EPSILON")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(WS_VALUE_EPSILON_DEFAULT)
-            .max(0.0);
         tokio::spawn(async move {
-            let mut ws_latest_by_type: HashMap<String, TelemetryRow> = HashMap::new();
-            let mut ws_last_sent_by_type: HashMap<String, TelemetryRow> = HashMap::new();
-            let mut ws_last_sent_ms_by_type: HashMap<String, u64> = HashMap::new();
-            let mut ws_flush = tokio::time::interval(Duration::from_millis(ws_publish_flush_ms));
-            loop {
-                tokio::select! {
-                    maybe_pkt = packet_rx.recv() => {
-                        let Some(pkt) = maybe_pkt else {
-                            break;
-                        };
-                        if let Some(row) = handle_packet(
-                            &state,
-                            &router,
-                            &timesync_state,
-                            &db_tx,
-                            pkt,
-                        ).await {
-                            ws_latest_by_type.insert(row.data_type.clone(), row);
-                        }
-                    }
-                    _ = ws_flush.tick() => {
-                        if ws_latest_by_type.is_empty() {
-                            continue;
-                        }
-                        let mut rows: Vec<TelemetryRow> = ws_latest_by_type.drain().map(|(_, row)| row).collect();
-                        rows.sort_by_key(|r| r.timestamp_ms);
-                        if rows.len() > ws_publish_max_per_flush {
-                            rows.drain(0..(rows.len() - ws_publish_max_per_flush));
-                        }
-                        let now_ms = get_current_timestamp_ms();
-                        for row in rows {
-                            let key = row.data_type.clone();
-                            let recently_sent = ws_last_sent_ms_by_type
-                                .get(&key)
-                                .copied()
-                                .map(|last_ms| now_ms.saturating_sub(last_ms) < ws_send_min_interval_ms)
-                                .unwrap_or(false);
-                            let very_similar = ws_last_sent_by_type
-                                .get(&key)
-                                .map(|prev| telemetry_rows_similar(prev, &row, ws_value_epsilon))
-                                .unwrap_or(false);
-                            let overdue_keepalive = ws_last_sent_ms_by_type
-                                .get(&key)
-                                .copied()
-                                .map(|last_ms| now_ms.saturating_sub(last_ms) >= ws_send_max_silence_ms)
-                                .unwrap_or(true);
-
-                            if (recently_sent && very_similar) && !overdue_keepalive {
-                                continue;
-                            }
-
-                            ws_last_sent_by_type.insert(key.clone(), row.clone());
-                            ws_last_sent_ms_by_type.insert(key, now_ms);
-                            let _ = state.ws_tx.send(row);
-                        }
-                    }
-                }
-            }
-
-            if !ws_latest_by_type.is_empty() {
-                let mut rows: Vec<TelemetryRow> =
-                    ws_latest_by_type.drain().map(|(_, row)| row).collect();
-                rows.sort_by_key(|r| r.timestamp_ms);
-                if rows.len() > ws_publish_max_per_flush {
-                    rows.drain(0..(rows.len() - ws_publish_max_per_flush));
-                }
-                let now_ms = get_current_timestamp_ms();
-                for row in rows {
-                    ws_last_sent_ms_by_type.insert(row.data_type.clone(), now_ms);
-                    ws_last_sent_by_type.insert(row.data_type.clone(), row.clone());
+            while let Some(pkt) = packet_rx.recv().await {
+                if let Some(row) =
+                    handle_packet(&state, &router, &timesync_state, &db_tx, pkt).await
+                {
                     let _ = state.ws_tx.send(row);
                 }
             }
@@ -740,24 +643,6 @@ fn log_telemetry_error(context: &str, err: sedsprintf_rs_2026::TelemetryError) {
 fn payload_json_from_pkt(pkt: &sedsprintf_rs_2026::telemetry_packet::TelemetryPacket) -> String {
     let bytes = pkt.payload();
     serde_json::to_string(&bytes).unwrap_or_else(|_| "[]".to_string())
-}
-
-fn telemetry_rows_similar(a: &TelemetryRow, b: &TelemetryRow, epsilon: f32) -> bool {
-    if a.data_type != b.data_type || a.values.len() != b.values.len() {
-        return false;
-    }
-    for (av, bv) in a.values.iter().zip(b.values.iter()) {
-        match (av, bv) {
-            (None, None) => {}
-            (Some(x), Some(y)) => {
-                if (x - y).abs() > epsilon {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
 }
 
 fn handle_timesync_tick(
