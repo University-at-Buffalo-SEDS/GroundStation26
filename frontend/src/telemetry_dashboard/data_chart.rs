@@ -48,6 +48,8 @@ const MAX_BUCKETS_PER_TYPE: usize = (HISTORY_MS as usize / BUCKET_MS as usize) +
 // Only recent buckets are mutable. Older buckets are frozen.
 // Allow a few buckets for packet jitter/reordering on slower devices.
 const LIVE_BUCKETS_BACK: i64 = 3;
+// Interpolate through short gaps, but break long gaps to avoid large flat bridges.
+const MAX_CONNECT_GAP_MS: i64 = 2_000;
 
 // Avoid zero span
 const MIN_SPAN_MS: i64 = 1_000;
@@ -556,8 +558,9 @@ impl CachedChart {
         }
 
         // Build paths by iterating stable bucket ids in order.
-        // Plot only real samples and linearly connect across missing bucket gaps.
+        // Interpolate through short gaps; break long gaps.
         let mut segment_open: Vec<bool> = vec![false; self.channel_count];
+        let mut last_bucket_id_drawn: Vec<Option<i64>> = vec![None; self.channel_count];
 
         let total = (newest_bid - start_bid + 1).max(1) as f32;
 
@@ -575,6 +578,12 @@ impl CachedChart {
                 }
                 let v = b.last[ch];
                 let y = map_y(v);
+                if let Some(prev_bid) = last_bucket_id_drawn[ch] {
+                    let max_gap_buckets = (MAX_CONNECT_GAP_MS / BUCKET_MS).max(1);
+                    if b.id - prev_bid > max_gap_buckets {
+                        segment_open[ch] = false;
+                    }
+                }
 
                 let out = &mut self.paths[ch];
                 if !segment_open[ch] {
@@ -583,6 +592,7 @@ impl CachedChart {
                 } else {
                     out.push_str(&format!("L {:.2} {:.2} ", x, y));
                 }
+                last_bucket_id_drawn[ch] = Some(b.id);
             }
         }
 

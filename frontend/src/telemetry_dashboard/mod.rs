@@ -1623,10 +1623,21 @@ async fn seed_from_db(
         }
 
         // Preserve continuity across reseed by merging DB snapshot with current
-        // in-memory rows across the full history window.
+        // in-memory rows, but prefer live rows near "now" where DB can be sparse
+        // under backpressure.
         let existing_rows = rows.read().clone();
         if !existing_rows.is_empty() {
-            let mut merged: Vec<TelemetryRow> = list;
+            const RESEED_LIVE_PREFERRED_MS: i64 = 10_000;
+            let latest_live_ts = existing_rows
+                .last()
+                .map(|r| r.timestamp_ms)
+                .unwrap_or(i64::MIN);
+            let db_cutoff_ts = latest_live_ts.saturating_sub(RESEED_LIVE_PREFERRED_MS);
+
+            let mut merged: Vec<TelemetryRow> = list
+                .into_iter()
+                .filter(|r| r.timestamp_ms < db_cutoff_ts)
+                .collect();
             merged.extend(existing_rows);
             merged.sort_by(|a, b| {
                 a.timestamp_ms

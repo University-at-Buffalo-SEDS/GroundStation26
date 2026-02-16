@@ -15,11 +15,12 @@ use crate::web::{emit_warning, FlightStateMsg};
 use groundstation_shared::Board;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::time::{interval, Duration};
 
 const TIMESYNC_PRIORITY: u64 = 50;
@@ -35,6 +36,15 @@ static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static DB_BACKPRESSURE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static DB_LAST_BUCKET_BY_TYPE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+static DB_OVERFLOW_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone)]
+struct DbOverflow {
+    queue: Arc<Mutex<VecDeque<DbWrite>>>,
+    notify: Arc<Notify>,
+    running: Arc<AtomicBool>,
+    max_entries: usize,
+}
 
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
@@ -46,7 +56,7 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
 
 fn drop_db_writes_on_backpressure() -> bool {
     static DROP: OnceLock<bool> = OnceLock::new();
-    *DROP.get_or_init(|| std::env::var("GS_DB_DROP_ON_BACKPRESSURE").ok().as_deref() != Some("0"))
+    *DROP.get_or_init(|| std::env::var("GS_DB_DROP_ON_BACKPRESSURE").ok().as_deref() == Some("1"))
 }
 
 fn db_backpressure_log_interval_ms() -> u64 {
@@ -168,6 +178,12 @@ pub async fn telemetry_task(
     let packet_enqueue_burst = env_usize("GS_PACKET_ENQUEUE_BURST", PACKET_ENQUEUE_BURST, 32, 4096);
     let (packet_tx, mut packet_rx) = mpsc::channel::<TelemetryPacket>(packet_work_queue_size);
     let (db_tx, mut db_rx) = mpsc::channel::<DbWrite>(db_work_queue_size);
+    let db_overflow = DbOverflow {
+        queue: Arc::new(Mutex::new(VecDeque::new())),
+        notify: Arc::new(Notify::new()),
+        running: Arc::new(AtomicBool::new(true)),
+        max_entries: env_usize("GS_DB_OVERFLOW_MAX", 250_000, 1024, 5_000_000),
+    };
 
     let db_worker = {
         let db = state.db.clone();
@@ -180,15 +196,38 @@ pub async fn telemetry_task(
         })
     };
 
+    let db_overflow_worker = {
+        let db_tx = db_tx.clone();
+        let db_overflow = db_overflow.clone();
+        tokio::spawn(async move {
+            while db_overflow.running.load(Ordering::Relaxed) {
+                db_overflow.notify.notified().await;
+                loop {
+                    let next = {
+                        let mut q = db_overflow.queue.lock().unwrap();
+                        q.pop_front()
+                    };
+                    let Some(write) = next else {
+                        break;
+                    };
+                    if db_tx.send(write).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+    };
+
     let packet_worker = {
         let state = state.clone();
         let router = router.clone();
         let timesync_state = timesync_state.clone();
         let db_tx = db_tx.clone();
+        let db_overflow = db_overflow.clone();
         tokio::spawn(async move {
             while let Some(pkt) = packet_rx.recv().await {
                 if let Some(row) =
-                    handle_packet(&state, &router, &timesync_state, &db_tx, pkt).await
+                    handle_packet(&state, &router, &timesync_state, &db_tx, &db_overflow, pkt).await
                 {
                     let _ = state.ws_tx.send(row);
                 }
@@ -428,6 +467,17 @@ pub async fn telemetry_task(
         ),
     }
 
+    db_overflow.running.store(false, Ordering::Relaxed);
+    db_overflow.notify.notify_waiters();
+    match tokio::time::timeout(worker_shutdown_timeout, db_overflow_worker).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("DB overflow worker ended with error: {e}"),
+        Err(_) => eprintln!(
+            "DB overflow worker did not shut down within {:?}",
+            worker_shutdown_timeout
+        ),
+    }
+
     // Packet worker is done producing DB writes; now drain DB queue.
     drop(db_tx);
     match tokio::time::timeout(worker_shutdown_timeout, db_worker).await {
@@ -534,7 +584,12 @@ async fn insert_db_write_with_retry(
     Err(last_err.unwrap())
 }
 
-async fn queue_db_write(state: &AppState, db_tx: &mpsc::Sender<DbWrite>, write: DbWrite) {
+async fn queue_db_write(
+    state: &AppState,
+    db_tx: &mpsc::Sender<DbWrite>,
+    db_overflow: &DbOverflow,
+    write: DbWrite,
+) {
     if drop_db_writes_on_backpressure() {
         match db_tx.try_send(write) {
             Ok(()) => {}
@@ -558,8 +613,41 @@ async fn queue_db_write(state: &AppState, db_tx: &mpsc::Sender<DbWrite>, write: 
                 emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
             }
         }
-    } else if db_tx.send(write).await.is_err() {
-        emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
+        return;
+    }
+
+    match db_tx.try_send(write) {
+        Ok(()) => {}
+        Err(TrySendError::Full(write)) => {
+            let mut write_opt = Some(write);
+            let mut queued_len = 0usize;
+            let mut pushed = false;
+            {
+                let mut q = db_overflow.queue.lock().unwrap();
+                if q.len() < db_overflow.max_entries {
+                    q.push_back(write_opt.take().unwrap());
+                    queued_len = q.len();
+                    pushed = true;
+                }
+            }
+            if pushed {
+                db_overflow.notify.notify_one();
+                let now_ms = get_current_timestamp_ms();
+                let prev = DB_OVERFLOW_LAST_LOG_MS.load(Ordering::Relaxed);
+                if now_ms.saturating_sub(prev) >= 60_000 {
+                    DB_OVERFLOW_LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+                    eprintln!(
+                        "Telemetry DB overflow queue buffered {} pending rows (no drop mode)",
+                        queued_len
+                    );
+                }
+            } else if db_tx.send(write_opt.take().unwrap()).await.is_err() {
+                emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
+            }
+        }
+        Err(TrySendError::Closed(_)) => {
+            emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
+        }
     }
 }
 
@@ -568,6 +656,7 @@ async fn handle_packet(
     router: &Arc<sedsprintf_rs_2026::router::Router>,
     timesync_state: &Arc<Mutex<TimeSyncState>>,
     db_tx: &mpsc::Sender<DbWrite>,
+    db_overflow: &DbOverflow,
     pkt: TelemetryPacket,
 ) -> Option<TelemetryRow> {
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
@@ -605,6 +694,7 @@ async fn handle_packet(
         queue_db_write(
             state,
             db_tx,
+            db_overflow,
             DbWrite::FlightState {
                 timestamp_ms: ts_ms,
                 state_code: pkt_data as i64,
@@ -642,6 +732,7 @@ async fn handle_packet(
                 queue_db_write(
                     state,
                     db_tx,
+                    db_overflow,
                     DbWrite::Telemetry {
                         timestamp_ms: ts_ms,
                         data_type: VALVE_STATE_DATA_TYPE.to_string(),
@@ -681,6 +772,7 @@ async fn handle_packet(
             queue_db_write(
                 state,
                 db_tx,
+                db_overflow,
                 DbWrite::Telemetry {
                     timestamp_ms: ts_ms,
                     data_type: data_type_str.clone(),
@@ -703,6 +795,7 @@ async fn handle_packet(
             queue_db_write(
                 state,
                 db_tx,
+                db_overflow,
                 DbWrite::Telemetry {
                     timestamp_ms: ts_ms,
                     data_type: data_type_str,
