@@ -1622,20 +1622,11 @@ async fn seed_from_db(
             }
         }
 
-        // Preserve continuity across reseed:
-        // - If live rows already exist, do NOT replace the active timeline.
-        // - Only backfill OLDER history from DB so reseed cannot punch holes in
-        //   the current on-screen segment.
+        // Preserve continuity across reseed by merging DB snapshot with current
+        // in-memory rows across the full history window.
         let existing_rows = rows.read().clone();
         if !existing_rows.is_empty() {
-            let oldest_live_ts = existing_rows
-                .first()
-                .map(|r| r.timestamp_ms)
-                .unwrap_or(i64::MIN);
-            let mut merged: Vec<TelemetryRow> = list
-                .into_iter()
-                .filter(|r| r.timestamp_ms < oldest_live_ts)
-                .collect();
+            let mut merged: Vec<TelemetryRow> = list;
             merged.extend(existing_rows);
             merged.sort_by(|a, b| {
                 a.timestamp_ms
