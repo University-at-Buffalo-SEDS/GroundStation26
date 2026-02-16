@@ -1623,14 +1623,20 @@ async fn seed_from_db(
         }
 
         // Preserve continuity across reseed:
-        // - DB snapshot can lag or drop rows under pressure
-        // - Keep currently buffered live rows and merge without key-based dedupe,
-        //   because high-rate streams can legitimately have multiple rows with the
-        //   same timestamp/data_type.
+        // - If live rows already exist, do NOT replace the active timeline.
+        // - Only backfill OLDER history from DB so reseed cannot punch holes in
+        //   the current on-screen segment.
         let existing_rows = rows.read().clone();
         if !existing_rows.is_empty() {
-            let mut merged = existing_rows;
-            merged.extend(list);
+            let oldest_live_ts = existing_rows
+                .first()
+                .map(|r| r.timestamp_ms)
+                .unwrap_or(i64::MIN);
+            let mut merged: Vec<TelemetryRow> = list
+                .into_iter()
+                .filter(|r| r.timestamp_ms < oldest_live_ts)
+                .collect();
+            merged.extend(existing_rows);
             merged.sort_by(|a, b| {
                 a.timestamp_ms
                     .cmp(&b.timestamp_ms)
