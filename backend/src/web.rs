@@ -1,13 +1,13 @@
 use crate::layout;
-use crate::map::{DEFAULT_MAP_REGION, tile_service};
+use crate::map::{tile_service, DEFAULT_MAP_REGION};
 use crate::state::AppState;
-use axum::http::{StatusCode, header};
+use axum::http::{header, StatusCode};
 use axum::{
-    Json, Router,
-    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
-    extract::{Query, State},
+    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade}, extract::{Query, State},
     response::IntoResponse,
     routing::{get, post},
+    Json,
+    Router,
 };
 use futures::{SinkExt, StreamExt};
 use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
@@ -160,9 +160,9 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
 
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
@@ -195,9 +195,9 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
         let values = values_from_row(&r);
@@ -268,12 +268,12 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         ORDER BY f.timestamp_ms ASC
         "#,
     )
-    .bind(BUCKET_MS)
-    .bind(cutoff)
-    .bind(now_ms)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(BUCKET_MS)
+        .bind(cutoff)
+        .bind(now_ms)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -516,10 +516,10 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-    .bind(cutoff)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -561,11 +561,11 @@ fn spawn_alert_insert(
             VALUES (?, ?, ?)
             "#,
         )
-        .bind(timestamp_ms)
-        .bind(severity)
-        .bind(message)
-        .execute(&db)
-        .await;
+            .bind(timestamp_ms)
+            .bind(severity)
+            .bind(message)
+            .execute(&db)
+            .await;
         state_for_task.end_db_write();
     });
 }

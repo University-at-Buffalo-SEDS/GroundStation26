@@ -1,17 +1,17 @@
 use crate::state::AppState;
 use groundstation_shared::TelemetryRow;
-use groundstation_shared::{TelemetryCommand, u8_to_flight_state};
-use sedsprintf_rs_2026::config::DEVICE_IDENTIFIER;
+use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
 use sedsprintf_rs_2026::config::DataType;
+use sedsprintf_rs_2026::config::DEVICE_IDENTIFIER;
 use sedsprintf_rs_2026::timesync::{
-    TimeSyncConfig, TimeSyncRole, TimeSyncTracker, TimeSyncUpdate, compute_offset_delay,
-    decode_timesync_request, decode_timesync_response,
+    compute_offset_delay, decode_timesync_request, decode_timesync_response, TimeSyncConfig, TimeSyncRole,
+    TimeSyncTracker, TimeSyncUpdate,
 };
 
 use crate::gpio_panel::IGNITION_PIN;
 use crate::radio::RadioDevice;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
-use crate::web::{FlightStateMsg, emit_warning, emit_warning_db_only};
+use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
 use groundstation_shared::Board;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use std::collections::HashMap;
@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::{Duration, interval};
+use tokio::time::{interval, Duration};
 
 const TIMESYNC_PRIORITY: u64 = 50;
 const TIMESYNC_SOURCE_TIMEOUT_MS: u64 = 5_000;
@@ -611,7 +611,7 @@ fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                .ok();
+                    .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 queue_db_write(
@@ -650,7 +650,7 @@ fn handle_packet(
                 .map(|v| v.map(|n| n as f64))
                 .collect::<Vec<_>>(),
         )
-        .ok();
+            .ok();
 
         queue_db_write(
             state,
