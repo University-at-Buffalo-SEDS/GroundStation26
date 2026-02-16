@@ -14,6 +14,7 @@ use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCo
 use crate::web::{emit_warning, FlightStateMsg};
 use groundstation_shared::Board;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,7 @@ const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
 static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static DB_BACKPRESSURE_DROPPED: AtomicU64 = AtomicU64::new(0);
+static DB_LAST_BUCKET_BY_TYPE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
@@ -61,6 +63,34 @@ fn db_backpressure_log_interval_ms() -> u64 {
 fn db_backpressure_log_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("GS_DB_BACKPRESSURE_LOG").ok().as_deref() != Some("0"))
+}
+
+fn db_bucket_ms() -> i64 {
+    static BUCKET_MS: OnceLock<i64> = OnceLock::new();
+    *BUCKET_MS.get_or_init(|| {
+        std::env::var("GS_DB_BUCKET_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(20)
+            .clamp(1, 1_000)
+    })
+}
+
+fn should_persist_telemetry_sample(data_type: &str, ts_ms: i64) -> bool {
+    let bucket_ms = db_bucket_ms();
+    if bucket_ms <= 1 {
+        return true;
+    }
+    let bucket_id = ts_ms.div_euclid(bucket_ms);
+    let map = DB_LAST_BUCKET_BY_TYPE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut by_type = map.lock().unwrap();
+    match by_type.get(data_type).copied() {
+        Some(prev) if prev == bucket_id => false,
+        _ => {
+            by_type.insert(data_type.to_string(), bucket_id);
+            true
+        }
+    }
 }
 
 enum DbWrite {
@@ -647,17 +677,19 @@ async fn handle_packet(
         )
             .ok();
 
-        queue_db_write(
-            state,
-            db_tx,
-            DbWrite::Telemetry {
-                timestamp_ms: ts_ms,
-                data_type: data_type_str.clone(),
-                values_json,
-                payload_json: payload_json.clone(),
-            },
-        )
-            .await;
+        if should_persist_telemetry_sample(&data_type_str, ts_ms) {
+            queue_db_write(
+                state,
+                db_tx,
+                DbWrite::Telemetry {
+                    timestamp_ms: ts_ms,
+                    data_type: data_type_str.clone(),
+                    values_json,
+                    payload_json: payload_json.clone(),
+                },
+            )
+                .await;
+        }
 
         let row = TelemetryRow {
             timestamp_ms: ts_ms,
@@ -667,17 +699,19 @@ async fn handle_packet(
 
         Some(row)
     } else {
-        queue_db_write(
-            state,
-            db_tx,
-            DbWrite::Telemetry {
-                timestamp_ms: ts_ms,
-                data_type: data_type_str,
-                values_json: None,
-                payload_json,
-            },
-        )
-            .await;
+        if should_persist_telemetry_sample(&data_type_str, ts_ms) {
+            queue_db_write(
+                state,
+                db_tx,
+                DbWrite::Telemetry {
+                    timestamp_ms: ts_ms,
+                    data_type: data_type_str,
+                    values_json: None,
+                    payload_json,
+                },
+            )
+                .await;
+        }
         None
     }
 }
