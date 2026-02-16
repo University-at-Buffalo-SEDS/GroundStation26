@@ -14,7 +14,8 @@ use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCo
 use crate::web::{emit_warning, FlightStateMsg};
 use groundstation_shared::Board;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
@@ -28,8 +29,23 @@ const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
 const DB_WORK_QUEUE_SIZE: usize = 8_192;
 const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
+const DB_BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
 
 static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
+static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn drop_db_writes_on_backpressure() -> bool {
+    static DROP: OnceLock<bool> = OnceLock::new();
+    *DROP.get_or_init(|| std::env::var("GS_DB_DROP_ON_BACKPRESSURE").ok().as_deref() != Some("0"))
+}
 
 enum DbWrite {
     FlightState {
@@ -96,8 +112,16 @@ pub async fn telemetry_task(
     let mut heartbeat_failed = false;
     let mut last_backpressure_log_ms: u64 = 0;
     let timesync_state = Arc::new(Mutex::new(TimeSyncState::new()));
-    let (packet_tx, mut packet_rx) = mpsc::channel::<TelemetryPacket>(PACKET_WORK_QUEUE_SIZE);
-    let (db_tx, mut db_rx) = mpsc::channel::<DbWrite>(DB_WORK_QUEUE_SIZE);
+    let packet_work_queue_size = env_usize(
+        "GS_PACKET_WORK_QUEUE_SIZE",
+        PACKET_WORK_QUEUE_SIZE,
+        1024,
+        262_144,
+    );
+    let db_work_queue_size = env_usize("GS_DB_WORK_QUEUE_SIZE", DB_WORK_QUEUE_SIZE, 1024, 262_144);
+    let packet_enqueue_burst = env_usize("GS_PACKET_ENQUEUE_BURST", PACKET_ENQUEUE_BURST, 32, 4096);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<TelemetryPacket>(packet_work_queue_size);
+    let (db_tx, mut db_rx) = mpsc::channel::<DbWrite>(db_work_queue_size);
 
     let db_worker = {
         let db = state.db.clone();
@@ -296,7 +320,7 @@ pub async fn telemetry_task(
                     }
                 }
                 _ = handle_interval.tick() => {
-                    for _ in 0..PACKET_ENQUEUE_BURST {
+                    for _ in 0..packet_enqueue_burst {
                         match packet_tx.try_reserve() {
                             Ok(permit) => {
                                 let pkt = {
@@ -465,7 +489,24 @@ async fn insert_db_write_with_retry(
 }
 
 async fn queue_db_write(state: &AppState, db_tx: &mpsc::Sender<DbWrite>, write: DbWrite) {
-    if db_tx.send(write).await.is_err() {
+    if drop_db_writes_on_backpressure() {
+        match db_tx.try_send(write) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let now_ms = get_current_timestamp_ms();
+                let prev = DB_BACKPRESSURE_LAST_LOG_MS.load(Ordering::Relaxed);
+                if now_ms.saturating_sub(prev) >= DB_BACKPRESSURE_LOG_INTERVAL_MS {
+                    DB_BACKPRESSURE_LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+                    eprintln!(
+                        "Telemetry DB backpressured: dropping DB rows to keep realtime ingest healthy"
+                    );
+                }
+            }
+            Err(TrySendError::Closed(_)) => {
+                emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
+            }
+        }
+    } else if db_tx.send(write).await.is_err() {
         emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
     }
 }
