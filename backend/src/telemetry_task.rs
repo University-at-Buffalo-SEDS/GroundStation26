@@ -128,7 +128,6 @@ pub async fn telemetry_task(
             .unwrap_or(WS_PUBLISH_MAX_PER_FLUSH_DEFAULT)
             .clamp(1, 512);
         tokio::spawn(async move {
-            let mut db_queue_full_warned = false;
             let mut ws_latest_by_type: HashMap<String, TelemetryRow> = HashMap::new();
             let mut ws_flush = tokio::time::interval(Duration::from_millis(ws_publish_flush_ms));
             loop {
@@ -142,9 +141,8 @@ pub async fn telemetry_task(
                             &router,
                             &timesync_state,
                             &db_tx,
-                            &mut db_queue_full_warned,
                             pkt,
-                        ) {
+                        ).await {
                             ws_latest_by_type.insert(row.data_type.clone(), row);
                         }
                     }
@@ -349,15 +347,16 @@ pub async fn telemetry_task(
                 }
                 _ = handle_interval.tick() => {
                     for _ in 0..PACKET_ENQUEUE_BURST {
-                        let pkt = {
-                            let mut rb = state.ring_buffer.lock().unwrap();
-                            rb.pop_oldest()
-                        };
-                        let Some(pkt) = pkt else {
-                            break;
-                        };
-                        match packet_tx.try_send(pkt) {
-                            Ok(_) => {
+                        match packet_tx.try_reserve() {
+                            Ok(permit) => {
+                                let pkt = {
+                                    let mut rb = state.ring_buffer.lock().unwrap();
+                                    rb.pop_oldest()
+                                };
+                                let Some(pkt) = pkt else {
+                                    break;
+                                };
+                                permit.send(pkt);
                                 packet_queue_full_warned = false;
                             }
                             Err(TrySendError::Full(_)) => {
@@ -514,35 +513,17 @@ async fn insert_db_write_with_retry(
     Err(last_err.unwrap())
 }
 
-fn queue_db_write(
-    state: &AppState,
-    db_tx: &mpsc::Sender<DbWrite>,
-    write: DbWrite,
-    db_queue_full_warned: &mut bool,
-) {
-    match db_tx.try_send(write) {
-        Ok(_) => *db_queue_full_warned = false,
-        Err(TrySendError::Full(_)) => {
-            if !*db_queue_full_warned {
-                emit_warning_db_only(
-                    state,
-                    "Warning: telemetry DB queue is full; dropping DB rows",
-                );
-                *db_queue_full_warned = true;
-            }
-        }
-        Err(TrySendError::Closed(_)) => {
-            emit_warning_db_only(state, "Warning: telemetry DB worker stopped unexpectedly");
-        }
+async fn queue_db_write(state: &AppState, db_tx: &mpsc::Sender<DbWrite>, write: DbWrite) {
+    if db_tx.send(write).await.is_err() {
+        emit_warning_db_only(state, "Warning: telemetry DB worker stopped unexpectedly");
     }
 }
 
-fn handle_packet(
+async fn handle_packet(
     state: &Arc<AppState>,
     router: &Arc<sedsprintf_rs_2026::router::Router>,
     timesync_state: &Arc<Mutex<TimeSyncState>>,
     db_tx: &mpsc::Sender<DbWrite>,
-    db_queue_full_warned: &mut bool,
     pkt: TelemetryPacket,
 ) -> Option<TelemetryRow> {
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
@@ -584,8 +565,8 @@ fn handle_packet(
                 timestamp_ms: ts_ms,
                 state_code: pkt_data as i64,
             },
-            db_queue_full_warned,
-        );
+        )
+            .await;
 
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
@@ -623,8 +604,8 @@ fn handle_packet(
                         values_json,
                         payload_json,
                     },
-                    db_queue_full_warned,
-                );
+                )
+                    .await;
 
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
@@ -661,8 +642,8 @@ fn handle_packet(
                 values_json,
                 payload_json: payload_json.clone(),
             },
-            db_queue_full_warned,
-        );
+        )
+            .await;
 
         let row = TelemetryRow {
             timestamp_ms: ts_ms,
@@ -681,8 +662,8 @@ fn handle_packet(
                 values_json: None,
                 payload_json,
             },
-            db_queue_full_warned,
-        );
+        )
+            .await;
         None
     }
 }

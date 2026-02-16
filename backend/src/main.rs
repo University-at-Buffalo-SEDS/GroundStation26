@@ -224,8 +224,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
     let state = Arc::new(AppState {
-        ring_buffer: Arc::new(Mutex::new(RingBuffer::new(1024))),
+        ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
         ws_tx,
         warnings_tx: broadcast::channel(alerts_capacity).0,

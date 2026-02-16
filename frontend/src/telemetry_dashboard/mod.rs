@@ -855,20 +855,8 @@ fn TelemetryDashboardInner() -> Element {
             }
             last_seed_epoch.set(Some(current_seed));
 
-            // Clear graphs immediately before re-seeding.
-            rows_s.set(Vec::new());
-
-            // Tell charts to refit their time window to whatever history we load next
-            // (smooth shrink on demand; does nothing during normal live updates)
-            charts_cache_request_refit();
-
-            // Reset chart cache too (so DataTab doesn't show stale lines)
-            charts_cache_reset_and_ingest(&[]);
-
-            // Also clear any queued telemetry to avoid mixing old/new epochs
-            if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
-                q.clear();
-            }
+            // Keep current in-memory rows visible until reseed data arrives.
+            // This avoids visible graph "blanking" during reconnect/reseed.
 
             let alive = alive.clone();
             let epoch = *WS_EPOCH.read();
