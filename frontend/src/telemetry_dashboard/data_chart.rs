@@ -558,8 +558,9 @@ impl CachedChart {
         // Build paths by iterating stable bucket ids in order.
         // If a bucket is missing (pruned gaps), we just skip it.
         //
-        // Break line segments on missing buckets so outages render as gaps instead of flat lines.
-        let mut segment_open: Vec<bool> = vec![false; self.channel_count];
+        // Also: to keep line continuity, we carry-forward last_seen if a bucket has no value.
+        // This does NOT mutate historical bucket values; it's just how we draw gaps.
+        let mut last_seen: Vec<Option<f32>> = vec![None; self.channel_count];
 
         let total = (newest_bid - start_bid + 1).max(1) as f32;
 
@@ -572,17 +573,20 @@ impl CachedChart {
             let x = left + pw * ((i + 0.5) / total);
 
             for ch in 0..self.channel_count {
-                if !b.has[ch] {
-                    segment_open[ch] = false;
-                    continue;
-                }
-                let v = b.last[ch];
+                let v_opt = if b.has[ch] {
+                    let v = b.last[ch];
+                    last_seen[ch] = Some(v);
+                    Some(v)
+                } else {
+                    last_seen[ch]
+                };
+
+                let Some(v) = v_opt else { continue };
                 let y = map_y(v);
 
                 let out = &mut self.paths[ch];
-                if !segment_open[ch] {
+                if out.is_empty() {
                     out.push_str(&format!("M {:.2} {:.2} ", x, y));
-                    segment_open[ch] = true;
                 } else {
                     out.push_str(&format!("L {:.2} {:.2} ", x, y));
                 }
