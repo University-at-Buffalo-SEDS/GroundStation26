@@ -682,6 +682,10 @@ def _find_brotli(path_value: str) -> Optional[Path]:
 
 
 def _find_dx(path_value: str) -> Optional[Path]:
+    path_dx = _which_in_path("dx", path_value)
+    if path_dx:
+        return path_dx
+
     candidates = [
         Path("/root/.cargo/bin/dx"),
         Path("/usr/local/bin/dx"),
@@ -691,7 +695,7 @@ def _find_dx(path_value: str) -> Optional[Path]:
     for cand in candidates:
         if cand.exists() and os.access(cand, os.X_OK):
             return cand
-    return _which_in_path("dx", path_value)
+    return None
 
 
 def _find_newest_wasm_asset(frontend_dir: Path) -> Optional[Path]:
