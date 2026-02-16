@@ -16,7 +16,7 @@ use sqlx::Row;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::OnceCell;
+use tokio::sync::{mpsc, OnceCell};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 
@@ -345,9 +345,28 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let mut board_status_rx = state.board_status_tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
-    let (mut sender, mut receiver) = socket.split();
+    let (mut socket_sender, mut receiver) = socket.split();
+    let ws_out_queue_cap: usize = std::env::var("GS_WS_OUT_QUEUE_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512)
+        .clamp(32, 8192);
+    let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<String>(ws_out_queue_cap);
 
-    // Task: server -> client (all streams multiplexed)
+    // Dedicated writer: continuously drains queued outbound messages.
+    let write_task = tokio::spawn(async move {
+        while let Some(text) = ws_out_rx.recv().await {
+            if socket_sender
+                .send(Message::Text(Utf8Bytes::from(text)))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Task: collect, batch, and enqueue outbound messages.
     let send_task = async move {
         let adaptive_rate = std::env::var("GS_WS_ADAPTIVE_RATE").ok().as_deref() != Some("0");
         let telemetry_flush_ms: u64 = std::env::var("GS_WS_TELEMETRY_FLUSH_MS")
@@ -365,11 +384,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(64)
             .clamp(1, max_telemetry_per_flush_cap);
-        let send_target_ms: u64 = std::env::var("GS_WS_SEND_TARGET_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(40)
-            .clamp(1, 2000);
         let telemetry_pending_cap: usize = std::env::var("GS_WS_PENDING_CAP")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -390,11 +404,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         Ok(warn) => {
                             let msg = WsOutMsg::Warning(warn);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
-                            if sender
-                                .send(Message::Text(Utf8Bytes::from(text)))
-                                .await
-                                .is_err()
-                            {
+                            if ws_out_tx.send(text).await.is_err() {
                                 break;
                             }
                         }
@@ -408,7 +418,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         Ok(err) => {
                             let msg = WsOutMsg::Error(err);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
-                            if sender.send(Message::Text(Utf8Bytes::from(text))).await.is_err() {
+                            if ws_out_tx.send(text).await.is_err() {
                                 break;
                             }
                         }
@@ -422,7 +432,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         Ok(fs) => {
                             let msg = WsOutMsg::FlightState(fs);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
-                            if sender.send(Message::Text(Utf8Bytes::from(text))).await.is_err() {
+                            if ws_out_tx.send(text).await.is_err() {
                                 break;
                             }
                         }
@@ -436,11 +446,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         Ok(status) => {
                             let msg = WsOutMsg::BoardStatus(status);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
-                            if sender
-                                .send(Message::Text(Utf8Bytes::from(text)))
-                                .await
-                                .is_err()
-                            {
+                            if ws_out_tx.send(text).await.is_err() {
                                 break;
                             }
                         }
@@ -485,29 +491,19 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
                     let msg = WsOutMsg::TelemetryBatch(rows);
                     let text = serde_json::to_string(&msg).unwrap_or_default();
-                    let send_start = std::time::Instant::now();
-                    if sender
-                        .send(Message::Text(Utf8Bytes::from(text)))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    let send_elapsed_ms = send_start.elapsed().as_millis() as u64;
+                    let queue_was_full = match ws_out_tx.try_send(text) {
+                        Ok(()) => false,
+                        Err(mpsc::error::TrySendError::Full(_)) => true,
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    };
 
                     if adaptive_rate {
-                        let congested = pending_before >= max_this_flush
-                            && send_elapsed_ms > send_target_ms.saturating_mul(4);
+                        let congested = queue_was_full && pending_before >= max_this_flush;
                         if congested {
                             dynamic_max_per_flush = (dynamic_max_per_flush / 2).max(min_telemetry_per_flush);
-                        } else if send_elapsed_ms <= send_target_ms.saturating_div(2).max(1)
-                            && pending_before >= max_this_flush.saturating_sub(1)
+                        } else if pending_before >= max_this_flush.saturating_sub(1)
                         {
                             dynamic_max_per_flush = (dynamic_max_per_flush + 8).min(max_telemetry_per_flush_cap);
-                        } else if send_elapsed_ms <= send_target_ms
-                            && pending_before >= max_this_flush.saturating_sub(1)
-                        {
-                            dynamic_max_per_flush = (dynamic_max_per_flush + 2).min(max_telemetry_per_flush_cap);
                         }
                     }
                 }
@@ -535,6 +531,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Run both directions until one side ends
     tokio::join!(send_task, recv_task);
+    write_task.abort();
 }
 
 #[derive(Deserialize)]

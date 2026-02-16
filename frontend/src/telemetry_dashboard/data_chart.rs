@@ -48,6 +48,8 @@ const MAX_BUCKETS_PER_TYPE: usize = (HISTORY_MS as usize / BUCKET_MS as usize) +
 // Only recent buckets are mutable. Older buckets are frozen.
 // Allow a few buckets for packet jitter/reordering on slower devices.
 const LIVE_BUCKETS_BACK: i64 = 3;
+// Carry forward for very short gaps only, then break line segments.
+const INTERPOLATE_GAP_BUCKETS: usize = 3;
 
 // Avoid zero span
 const MIN_SPAN_MS: i64 = 1_000;
@@ -556,11 +558,10 @@ impl CachedChart {
         }
 
         // Build paths by iterating stable bucket ids in order.
-        // If a bucket is missing (pruned gaps), we just skip it.
-        //
-        // Also: to keep line continuity, we carry-forward last_seen if a bucket has no value.
-        // This does NOT mutate historical bucket values; it's just how we draw gaps.
+        // If a bucket is missing, interpolate for a short gap and then break.
         let mut last_seen: Vec<Option<f32>> = vec![None; self.channel_count];
+        let mut missing_streak: Vec<usize> = vec![0; self.channel_count];
+        let mut segment_open: Vec<bool> = vec![false; self.channel_count];
 
         let total = (newest_bid - start_bid + 1).max(1) as f32;
 
@@ -576,17 +577,29 @@ impl CachedChart {
                 let v_opt = if b.has[ch] {
                     let v = b.last[ch];
                     last_seen[ch] = Some(v);
+                    missing_streak[ch] = 0;
                     Some(v)
                 } else {
-                    last_seen[ch]
+                    let Some(prev) = last_seen[ch] else {
+                        segment_open[ch] = false;
+                        continue;
+                    };
+                    let streak = missing_streak[ch].saturating_add(1);
+                    missing_streak[ch] = streak;
+                    if streak > INTERPOLATE_GAP_BUCKETS {
+                        segment_open[ch] = false;
+                        continue;
+                    }
+                    Some(prev)
                 };
 
                 let Some(v) = v_opt else { continue };
                 let y = map_y(v);
 
                 let out = &mut self.paths[ch];
-                if out.is_empty() {
+                if !segment_open[ch] {
                     out.push_str(&format!("M {:.2} {:.2} ", x, y));
+                    segment_open[ch] = true;
                 } else {
                     out.push_str(&format!("L {:.2} {:.2} ", x, y));
                 }
