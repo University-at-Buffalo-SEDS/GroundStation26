@@ -139,11 +139,31 @@ impl RadioDevice for DummyRadio {
         if peek_envelope(payload).unwrap().ty == DataType::Heartbeat {
             return Ok(());
         }
-        println!(
-            "DummyRadio: dropping {} bytes of outgoing telemetry send from {}",
-            payload.len(),
-            self.name
-        );
+        static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static LOG_INTERVAL_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        static LOG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+        let enabled = *LOG_ENABLED
+            .get_or_init(|| std::env::var("GS_DUMMY_RADIO_LOG").ok().as_deref() != Some("0"));
+        if enabled {
+            let interval_ms = *LOG_INTERVAL_MS.get_or_init(|| {
+                std::env::var("GS_DUMMY_RADIO_LOG_INTERVAL_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(60_000)
+                    .clamp(1_000, 3_600_000)
+            });
+            let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+            let prev = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if now_ms.saturating_sub(prev) >= interval_ms {
+                LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "DummyRadio: dropping {} bytes of outgoing telemetry send from {}",
+                    payload.len(),
+                    self.name
+                );
+            }
+        }
         Ok(())
     }
 

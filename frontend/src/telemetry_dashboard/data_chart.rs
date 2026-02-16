@@ -48,8 +48,8 @@ const MAX_BUCKETS_PER_TYPE: usize = (HISTORY_MS as usize / BUCKET_MS as usize) +
 // Only recent buckets are mutable. Older buckets are frozen.
 // Allow a few buckets for packet jitter/reordering on slower devices.
 const LIVE_BUCKETS_BACK: i64 = 3;
-// Carry forward for very short gaps only, then break line segments.
-const INTERPOLATE_GAP_BUCKETS: usize = 3;
+// Carry forward across short/medium gaps before breaking line segments.
+const INTERPOLATE_GAP_MS: i64 = 10_000;
 
 // Avoid zero span
 const MIN_SPAN_MS: i64 = 1_000;
@@ -586,7 +586,8 @@ impl CachedChart {
                     };
                     let streak = missing_streak[ch].saturating_add(1);
                     missing_streak[ch] = streak;
-                    if streak > INTERPOLATE_GAP_BUCKETS {
+                    let allowed_gap_buckets = (INTERPOLATE_GAP_MS / BUCKET_MS).max(1) as usize;
+                    if streak > allowed_gap_buckets {
                         segment_open[ch] = false;
                         continue;
                     }

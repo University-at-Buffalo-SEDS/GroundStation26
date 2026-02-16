@@ -29,10 +29,10 @@ const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
 const DB_WORK_QUEUE_SIZE: usize = 8_192;
 const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
-const DB_BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
 
 static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static DB_BACKPRESSURE_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
@@ -45,6 +45,22 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
 fn drop_db_writes_on_backpressure() -> bool {
     static DROP: OnceLock<bool> = OnceLock::new();
     *DROP.get_or_init(|| std::env::var("GS_DB_DROP_ON_BACKPRESSURE").ok().as_deref() != Some("0"))
+}
+
+fn db_backpressure_log_interval_ms() -> u64 {
+    static INTERVAL: OnceLock<u64> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("GS_DB_BACKPRESSURE_LOG_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60_000)
+            .clamp(1_000, 3_600_000)
+    })
+}
+
+fn db_backpressure_log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GS_DB_BACKPRESSURE_LOG").ok().as_deref() != Some("0"))
 }
 
 enum DbWrite {
@@ -493,12 +509,18 @@ async fn queue_db_write(state: &AppState, db_tx: &mpsc::Sender<DbWrite>, write: 
         match db_tx.try_send(write) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                DB_BACKPRESSURE_DROPPED.fetch_add(1, Ordering::Relaxed);
+                if !db_backpressure_log_enabled() {
+                    return;
+                }
                 let now_ms = get_current_timestamp_ms();
                 let prev = DB_BACKPRESSURE_LAST_LOG_MS.load(Ordering::Relaxed);
-                if now_ms.saturating_sub(prev) >= DB_BACKPRESSURE_LOG_INTERVAL_MS {
+                if now_ms.saturating_sub(prev) >= db_backpressure_log_interval_ms() {
                     DB_BACKPRESSURE_LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+                    let dropped = DB_BACKPRESSURE_DROPPED.swap(0, Ordering::Relaxed);
                     eprintln!(
-                        "Telemetry DB backpressured: dropping DB rows to keep realtime ingest healthy"
+                        "Telemetry DB backpressured: dropped {} DB rows (realtime ingest preserved)",
+                        dropped
                     );
                 }
             }

@@ -37,7 +37,7 @@ use state_tab::StateTab;
 use types::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
 use warnings_tab::WarningsTab;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering}, Arc,
     Mutex,
@@ -1622,15 +1622,20 @@ async fn seed_from_db(
             }
         }
 
-        const MAX_INIT_POINTS: usize = 5000;
-        let n = list.len();
-        if n > MAX_INIT_POINTS {
-            let stride = (n as f32 / MAX_INIT_POINTS as f32).ceil() as usize;
-            list = list
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, row)| (i % stride == 0).then_some(row))
-                .collect();
+        // Preserve continuity across reseed:
+        // - DB snapshot can lag or drop rows under pressure
+        // - Keep currently buffered live rows and merge by (timestamp, data_type)
+        //   so reseed does not introduce artificial holes.
+        let existing_rows = rows.read().clone();
+        if !existing_rows.is_empty() {
+            let mut merged = BTreeMap::<(i64, String), TelemetryRow>::new();
+            for row in existing_rows {
+                merged.insert((row.timestamp_ms, row.data_type.clone()), row);
+            }
+            for row in list {
+                merged.insert((row.timestamp_ms, row.data_type.clone()), row);
+            }
+            list = merged.into_values().collect();
         }
 
         if let Some(gps) = list.iter().rev().find_map(row_to_gps) {
