@@ -5,6 +5,7 @@ use groundstation_shared::{Board, FlightState};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
 use sqlx::SqlitePool;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::time::{sleep, Duration};
@@ -69,6 +70,14 @@ const BOARD_TIMEOUT_MS: u64 = 500;
 const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 3000;
 const FLIGHT_STATE_DB_RETRIES: usize = 5;
 const FLIGHT_STATE_DB_RETRY_DELAY_MS: u64 = 50;
+const SAFETY_WARNING_COOLDOWN_MS_DEFAULT: u64 = 5_000;
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
 
 async fn insert_flight_state_with_retry(
     db: &SqlitePool,
@@ -108,6 +117,11 @@ pub async fn safety_task(
 ) {
     let mut abort = false;
     let mut last_no_packet_warning_ms: u64 = 0;
+    let warning_cooldown_ms = env_u64(
+        "GS_SAFETY_WARNING_COOLDOWN_MS",
+        SAFETY_WARNING_COOLDOWN_MS_DEFAULT,
+    );
+    let mut last_warning_emit_ms: HashMap<&'static str, u64> = HashMap::new();
     loop {
         tokio::select! {
             _ = sleep(Duration::from_millis(500)) => {}
@@ -257,6 +271,8 @@ pub async fn safety_task(
             continue;
         }
 
+        let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
+
         for pkt in packets {
             match pkt.data_type() {
                 DataType::AccelData => {
@@ -267,7 +283,7 @@ pub async fn safety_task(
                         && ((ACCELERATION_X_MIN_THRESHOLD > *accel_x)
                         || (*accel_x > ACCELERATION_X_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Acceleration X threshold exceeded!");
+                        cycle_warnings.insert("Critical: Acceleration X threshold exceeded!");
                     }
 
                     // Y axis
@@ -275,7 +291,7 @@ pub async fn safety_task(
                         && ((ACCELERATION_Y_MIN_THRESHOLD > *accel_y)
                         || (*accel_y > ACCELERATION_Y_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Acceleration Y threshold exceeded!");
+                        cycle_warnings.insert("Critical: Acceleration Y threshold exceeded!");
                     }
 
                     // Z axis
@@ -283,7 +299,7 @@ pub async fn safety_task(
                         && ((ACCELERATION_Z_MIN_THRESHOLD > *accel_z)
                         || (*accel_z > ACCELERATION_Z_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Acceleration Z threshold exceeded!");
+                        cycle_warnings.insert("Critical: Acceleration Z threshold exceeded!");
                     }
                 }
 
@@ -294,21 +310,21 @@ pub async fn safety_task(
                     if let Some(gyro_x) = values.first()
                         && ((GYRO_X_MIN_THRESHOLD > *gyro_x) || (*gyro_x > GYRO_X_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Gyro X threshold exceeded!");
+                        cycle_warnings.insert("Critical: Gyro X threshold exceeded!");
                     }
 
                     // Y axis
                     if let Some(gyro_y) = values.get(1)
                         && ((GYRO_Y_MIN_THRESHOLD > *gyro_y) || (*gyro_y > GYRO_Y_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Gyro Y threshold exceeded!");
+                        cycle_warnings.insert("Critical: Gyro Y threshold exceeded!");
                     }
 
                     // Z axis
                     if let Some(gyro_z) = values.get(2)
                         && ((GYRO_Z_MIN_THRESHOLD > *gyro_z) || (*gyro_z > GYRO_Z_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Gyro Z threshold exceeded!");
+                        cycle_warnings.insert("Critical: Gyro Z threshold exceeded!");
                     }
                 }
 
@@ -321,7 +337,7 @@ pub async fn safety_task(
                         && ((BARO_PRESSURE_MIN_THRESHOLD > *pressure)
                         || (*pressure > BARO_PRESSURE_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Barometer pressure threshold exceeded!");
+                        cycle_warnings.insert("Critical: Barometer pressure threshold exceeded!");
                     }
 
                     // Temperature
@@ -329,10 +345,8 @@ pub async fn safety_task(
                         && ((BARO_TEMPERATURE_MIN_THRESHOLD > *temp)
                         || (*temp > BARO_TEMPERATURE_MAX_THRESHOLD))
                     {
-                        emit_warning(
-                            &state,
-                            "Critical: Barometer temperature threshold exceeded!",
-                        );
+                        cycle_warnings
+                            .insert("Critical: Barometer temperature threshold exceeded!");
                     }
 
                     // Altitude
@@ -340,7 +354,7 @@ pub async fn safety_task(
                         && ((BARO_ALTITUDE_MIN_THRESHOLD > *alt)
                         || (*alt > BARO_ALTITUDE_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Barometer altitude threshold exceeded!");
+                        cycle_warnings.insert("Critical: Barometer altitude threshold exceeded!");
                     }
                 }
 
@@ -353,10 +367,8 @@ pub async fn safety_task(
                         && ((GPS_LATITUDE_MIN_THRESHOLD > *lat)
                         || (*lat > GPS_LATITUDE_MAX_THRESHOLD))
                     {
-                        emit_warning(
-                            &state,
-                            "Critical: GPS latitude out of bounds (Texas check)!",
-                        );
+                        cycle_warnings
+                            .insert("Critical: GPS latitude out of bounds (Texas check)!");
                     }
 
                     // Longitude (y)
@@ -364,10 +376,8 @@ pub async fn safety_task(
                         && ((GPS_LONGITUDE_MIN_THRESHOLD > *lon)
                         || (*lon > GPS_LONGITUDE_MAX_THRESHOLD))
                     {
-                        emit_warning(
-                            &state,
-                            "Critical: GPS longitude out of bounds (Texas check)!",
-                        );
+                        cycle_warnings
+                            .insert("Critical: GPS longitude out of bounds (Texas check)!");
                     }
                 }
 
@@ -379,7 +389,7 @@ pub async fn safety_task(
                         && ((BATTERY_CURRENT_MIN_THRESHOLD > *current)
                         || (*current > BATTERY_CURRENT_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Battery current out of range!");
+                        cycle_warnings.insert("Critical: Battery current out of range!");
                     }
                 }
 
@@ -390,7 +400,7 @@ pub async fn safety_task(
                         && ((BATTERY_VOLTAGE_MIN_THRESHOLD > *voltage)
                         || (*voltage > BATTERY_VOLTAGE_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Battery voltage out of range!");
+                        cycle_warnings.insert("Critical: Battery voltage out of range!");
                     }
                 }
 
@@ -401,7 +411,7 @@ pub async fn safety_task(
                     if let Some(flow) = values.first()
                         && ((FUEL_FLOW_MIN_THRESHOLD > *flow) || (*flow > FUEL_FLOW_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Fuel flow out of range!");
+                        cycle_warnings.insert("Critical: Fuel flow out of range!");
                     }
                 }
 
@@ -413,7 +423,7 @@ pub async fn safety_task(
                         && ((FUEL_TANK_PRESSURE_MIN_THRESHOLD > *pressure)
                         || (*pressure > FUEL_TANK_PRESSURE_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Fuel tank pressure out of range!");
+                        cycle_warnings.insert("Critical: Fuel tank pressure out of range!");
                     }
                 }
 
@@ -426,31 +436,43 @@ pub async fn safety_task(
                     if let Some(kx) = values.first()
                         && ((KALMAN_X_MIN_THRESHOLD > *kx) || (*kx > KALMAN_X_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Kalman X state out of range!");
+                        cycle_warnings.insert("Critical: Kalman X state out of range!");
                     }
 
                     // Y
                     if let Some(ky) = values.get(1)
                         && ((KALMAN_Y_MIN_THRESHOLD > *ky) || (*ky > KALMAN_Y_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Kalman Y state out of range!");
+                        cycle_warnings.insert("Critical: Kalman Y state out of range!");
                     }
 
                     // Z
                     if let Some(kz) = values.get(2)
                         && ((KALMAN_Z_MIN_THRESHOLD > *kz) || (*kz > KALMAN_Z_MAX_THRESHOLD))
                     {
-                        emit_warning(&state, "Critical: Kalman Z state out of range!");
+                        cycle_warnings.insert("Critical: Kalman Z state out of range!");
                     }
                 }
 
                 DataType::GenericError => {
                     abort = true;
-                    emit_warning(&state, "Generic Error received from vehicle!");
+                    cycle_warnings.insert("Generic Error received from vehicle!");
                     println!("Safety: Generic Error packet received");
                 }
 
                 _ => {}
+            }
+        }
+
+        if !cycle_warnings.is_empty() {
+            let mut emitted = cycle_warnings.into_iter().collect::<Vec<_>>();
+            emitted.sort_unstable();
+            for msg in emitted {
+                let last_ms = last_warning_emit_ms.get(msg).copied().unwrap_or(0);
+                if now_ms.saturating_sub(last_ms) >= warning_cooldown_ms {
+                    emit_warning(&state, msg);
+                    last_warning_emit_ms.insert(msg, now_ms);
+                }
             }
         }
 

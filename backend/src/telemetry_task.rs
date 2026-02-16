@@ -11,7 +11,7 @@ use sedsprintf_rs_2026::timesync::{
 use crate::gpio_panel::IGNITION_PIN;
 use crate::radio::RadioDevice;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
-use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
+use crate::web::{emit_warning, FlightStateMsg};
 use groundstation_shared::Board;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use std::collections::HashMap;
@@ -28,8 +28,12 @@ const TIMESYNC_REQUEST_INTERVAL_MS: u64 = 1_000;
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
 const DB_WORK_QUEUE_SIZE: usize = 8_192;
-const WS_PUBLISH_FLUSH_MS_DEFAULT: u64 = 50;
-const WS_PUBLISH_MAX_PER_FLUSH_DEFAULT: usize = 24;
+const WS_PUBLISH_FLUSH_MS_DEFAULT: u64 = 100;
+const WS_PUBLISH_MAX_PER_FLUSH_DEFAULT: usize = 8;
+const WS_SEND_MIN_INTERVAL_MS_DEFAULT: u64 = 300;
+const WS_SEND_MAX_SILENCE_MS_DEFAULT: u64 = 2000;
+const WS_VALUE_EPSILON_DEFAULT: f32 = 0.05;
+const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
 
 static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 
@@ -96,7 +100,7 @@ pub async fn telemetry_task(
     let mut heartbeat_interval = interval(Duration::from_millis(500));
     let mut timesync_interval = interval(Duration::from_millis(100));
     let mut heartbeat_failed = false;
-    let mut packet_queue_full_warned = false;
+    let mut last_backpressure_log_ms: u64 = 0;
     let timesync_state = Arc::new(Mutex::new(TimeSyncState::new()));
     let (packet_tx, mut packet_rx) = mpsc::channel::<TelemetryPacket>(PACKET_WORK_QUEUE_SIZE);
     let (db_tx, mut db_rx) = mpsc::channel::<DbWrite>(DB_WORK_QUEUE_SIZE);
@@ -127,8 +131,25 @@ pub async fn telemetry_task(
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(WS_PUBLISH_MAX_PER_FLUSH_DEFAULT)
             .clamp(1, 512);
+        let ws_send_min_interval_ms: u64 = std::env::var("GS_WS_SEND_MIN_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(WS_SEND_MIN_INTERVAL_MS_DEFAULT)
+            .clamp(10, 5000);
+        let ws_send_max_silence_ms: u64 = std::env::var("GS_WS_SEND_MAX_SILENCE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(WS_SEND_MAX_SILENCE_MS_DEFAULT)
+            .clamp(ws_send_min_interval_ms, 30_000);
+        let ws_value_epsilon: f32 = std::env::var("GS_WS_VALUE_EPSILON")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(WS_VALUE_EPSILON_DEFAULT)
+            .max(0.0);
         tokio::spawn(async move {
             let mut ws_latest_by_type: HashMap<String, TelemetryRow> = HashMap::new();
+            let mut ws_last_sent_by_type: HashMap<String, TelemetryRow> = HashMap::new();
+            let mut ws_last_sent_ms_by_type: HashMap<String, u64> = HashMap::new();
             let mut ws_flush = tokio::time::interval(Duration::from_millis(ws_publish_flush_ms));
             loop {
                 tokio::select! {
@@ -155,7 +176,30 @@ pub async fn telemetry_task(
                         if rows.len() > ws_publish_max_per_flush {
                             rows.drain(0..(rows.len() - ws_publish_max_per_flush));
                         }
+                        let now_ms = get_current_timestamp_ms();
                         for row in rows {
+                            let key = row.data_type.clone();
+                            let recently_sent = ws_last_sent_ms_by_type
+                                .get(&key)
+                                .copied()
+                                .map(|last_ms| now_ms.saturating_sub(last_ms) < ws_send_min_interval_ms)
+                                .unwrap_or(false);
+                            let very_similar = ws_last_sent_by_type
+                                .get(&key)
+                                .map(|prev| telemetry_rows_similar(prev, &row, ws_value_epsilon))
+                                .unwrap_or(false);
+                            let overdue_keepalive = ws_last_sent_ms_by_type
+                                .get(&key)
+                                .copied()
+                                .map(|last_ms| now_ms.saturating_sub(last_ms) >= ws_send_max_silence_ms)
+                                .unwrap_or(true);
+
+                            if (recently_sent && very_similar) && !overdue_keepalive {
+                                continue;
+                            }
+
+                            ws_last_sent_by_type.insert(key.clone(), row.clone());
+                            ws_last_sent_ms_by_type.insert(key, now_ms);
                             let _ = state.ws_tx.send(row);
                         }
                     }
@@ -169,7 +213,10 @@ pub async fn telemetry_task(
                 if rows.len() > ws_publish_max_per_flush {
                     rows.drain(0..(rows.len() - ws_publish_max_per_flush));
                 }
+                let now_ms = get_current_timestamp_ms();
                 for row in rows {
+                    ws_last_sent_ms_by_type.insert(row.data_type.clone(), now_ms);
+                    ws_last_sent_by_type.insert(row.data_type.clone(), row.clone());
                     let _ = state.ws_tx.send(row);
                 }
             }
@@ -337,7 +384,7 @@ pub async fn telemetry_task(
                         );
                         heartbeat_failed = false;
                     } else if !heartbeat_failed {
-                            emit_warning_db_only(
+                            emit_warning(
                                 &state,
                                 "Warning: Ground Station heartbeat send failed",
                             );
@@ -357,20 +404,21 @@ pub async fn telemetry_task(
                                     break;
                                 };
                                 permit.send(pkt);
-                                packet_queue_full_warned = false;
                             }
                             Err(TrySendError::Full(_)) => {
-                                if !packet_queue_full_warned {
-                                    emit_warning_db_only(
-                                        &state,
-                                        "Warning: telemetry processing queue is full; dropping packets",
+                                let now_ms = get_current_timestamp_ms();
+                                if now_ms.saturating_sub(last_backpressure_log_ms)
+                                    >= BACKPRESSURE_LOG_INTERVAL_MS
+                                {
+                                    eprintln!(
+                                        "Telemetry ingest backpressured: processing queue is full"
                                     );
-                                    packet_queue_full_warned = true;
+                                    last_backpressure_log_ms = now_ms;
                                 }
                                 break;
                             }
                             Err(TrySendError::Closed(_)) => {
-                                emit_warning_db_only(
+                                emit_warning(
                                     &state,
                                     "Warning: telemetry processing worker stopped unexpectedly",
                                 );
@@ -515,7 +563,7 @@ async fn insert_db_write_with_retry(
 
 async fn queue_db_write(state: &AppState, db_tx: &mpsc::Sender<DbWrite>, write: DbWrite) {
     if db_tx.send(write).await.is_err() {
-        emit_warning_db_only(state, "Warning: telemetry DB worker stopped unexpectedly");
+        emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
     }
 }
 
@@ -692,6 +740,24 @@ fn log_telemetry_error(context: &str, err: sedsprintf_rs_2026::TelemetryError) {
 fn payload_json_from_pkt(pkt: &sedsprintf_rs_2026::telemetry_packet::TelemetryPacket) -> String {
     let bytes = pkt.payload();
     serde_json::to_string(&bytes).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn telemetry_rows_similar(a: &TelemetryRow, b: &TelemetryRow, epsilon: f32) -> bool {
+    if a.data_type != b.data_type || a.values.len() != b.values.len() {
+        return false;
+    }
+    for (av, bv) in a.values.iter().zip(b.values.iter()) {
+        match (av, bv) {
+            (None, None) => {}
+            (Some(x), Some(y)) => {
+                if (x - y).abs() > epsilon {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn handle_timesync_tick(
