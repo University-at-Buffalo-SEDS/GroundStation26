@@ -13,7 +13,7 @@ use futures::{SinkExt, StreamExt};
 use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -353,26 +353,31 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         let telemetry_flush_ms: u64 = std::env::var("GS_WS_TELEMETRY_FLUSH_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(33)
-            .clamp(10, 1000);
+            .unwrap_or(20)
+            .clamp(5, 1000);
         let max_telemetry_per_flush_cap: usize = std::env::var("GS_WS_MAX_TELEMETRY_PER_FLUSH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(96)
-            .clamp(1, 512);
+            .unwrap_or(256)
+            .clamp(8, 2048);
         let min_telemetry_per_flush: usize = std::env::var("GS_WS_MIN_TELEMETRY_PER_FLUSH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(12)
+            .unwrap_or(64)
             .clamp(1, max_telemetry_per_flush_cap);
         let send_target_ms: u64 = std::env::var("GS_WS_SEND_TARGET_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(15)
+            .unwrap_or(40)
             .clamp(1, 2000);
-        let mut dynamic_max_per_flush = (max_telemetry_per_flush_cap / 2)
+        let telemetry_pending_cap: usize = std::env::var("GS_WS_PENDING_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(16_384)
+            .clamp(256, 262_144);
+        let mut dynamic_max_per_flush = ((max_telemetry_per_flush_cap * 3) / 4)
             .clamp(min_telemetry_per_flush, max_telemetry_per_flush_cap);
-        let mut telemetry_latest_by_type: HashMap<String, TelemetryRow> = HashMap::new();
+        let mut telemetry_pending: VecDeque<TelemetryRow> = VecDeque::new();
         let mut telemetry_flush =
             tokio::time::interval(std::time::Duration::from_millis(telemetry_flush_ms));
 
@@ -447,34 +452,36 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                 recv = telemetry_rx.recv() => {
                     match recv {
                         Ok(pkt) => {
-                            let key = pkt.data_type.clone();
-                            telemetry_latest_by_type.insert(key, pkt);
+                            telemetry_pending.push_back(pkt);
+                            while telemetry_pending.len() > telemetry_pending_cap {
+                                telemetry_pending.pop_front();
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            // On lag, keep going and send most recent snapshots at next flush.
+                            // On lag, keep going and flush what we already have.
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
 
                 _ = telemetry_flush.tick() => {
-                    if telemetry_latest_by_type.is_empty() {
+                    if telemetry_pending.is_empty() {
                         continue;
                     }
 
-                    let pending_before = telemetry_latest_by_type.len();
-                    let mut rows: Vec<TelemetryRow> =
-                        telemetry_latest_by_type.drain().map(|(_, row)| row).collect();
-                    rows.sort_by_key(|r| r.timestamp_ms);
+                    let pending_before = telemetry_pending.len();
 
                     let max_this_flush = if adaptive_rate {
                         dynamic_max_per_flush
                     } else {
                         max_telemetry_per_flush_cap
                     };
-                    if rows.len() > max_this_flush {
-                        rows.drain(0..(rows.len() - max_this_flush));
+                    if telemetry_pending.len() > max_this_flush {
+                        let drop_n = telemetry_pending.len() - max_this_flush;
+                        telemetry_pending.drain(0..drop_n);
                     }
+                    let mut rows: Vec<TelemetryRow> = telemetry_pending.drain(..).collect();
+                    rows.sort_by_key(|r| r.timestamp_ms);
 
                     let msg = WsOutMsg::TelemetryBatch(rows);
                     let text = serde_json::to_string(&msg).unwrap_or_default();
@@ -489,17 +496,18 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                     let send_elapsed_ms = send_start.elapsed().as_millis() as u64;
 
                     if adaptive_rate {
-                        let congested = send_elapsed_ms > send_target_ms.saturating_mul(2);
+                        let congested = pending_before >= max_this_flush
+                            && send_elapsed_ms > send_target_ms.saturating_mul(4);
                         if congested {
                             dynamic_max_per_flush = (dynamic_max_per_flush / 2).max(min_telemetry_per_flush);
                         } else if send_elapsed_ms <= send_target_ms.saturating_div(2).max(1)
                             && pending_before >= max_this_flush.saturating_sub(1)
                         {
-                            dynamic_max_per_flush = (dynamic_max_per_flush + 4).min(max_telemetry_per_flush_cap);
+                            dynamic_max_per_flush = (dynamic_max_per_flush + 8).min(max_telemetry_per_flush_cap);
                         } else if send_elapsed_ms <= send_target_ms
                             && pending_before >= max_this_flush.saturating_sub(1)
                         {
-                            dynamic_max_per_flush = (dynamic_max_per_flush + 1).min(max_telemetry_per_flush_cap);
+                            dynamic_max_per_flush = (dynamic_max_per_flush + 2).min(max_telemetry_per_flush_cap);
                         }
                     }
                 }

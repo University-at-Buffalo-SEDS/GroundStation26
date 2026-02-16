@@ -45,9 +45,9 @@ const BUCKET_MS: i64 = 20;
 // Keep enough to cover the full HISTORY_MS window at BUCKET_MS granularity.
 const MAX_BUCKETS_PER_TYPE: usize = (HISTORY_MS as usize / BUCKET_MS as usize) + 500;
 
-// Only the newest bucket is mutable. Older buckets are frozen.
-// If you want to allow small reordering/late packets, set this to 2 or 3.
-const LIVE_BUCKETS_BACK: i64 = 1;
+// Only recent buckets are mutable. Older buckets are frozen.
+// Allow a few buckets for packet jitter/reordering on slower devices.
+const LIVE_BUCKETS_BACK: i64 = 3;
 
 // Avoid zero span
 const MIN_SPAN_MS: i64 = 1_000;
@@ -558,9 +558,8 @@ impl CachedChart {
         // Build paths by iterating stable bucket ids in order.
         // If a bucket is missing (pruned gaps), we just skip it.
         //
-        // Also: to keep line continuity, we carry-forward last_seen if a bucket has no value.
-        // This does NOT mutate historical bucket values; it's just how we draw gaps.
-        let mut last_seen: Vec<Option<f32>> = vec![None; self.channel_count];
+        // Break line segments on missing buckets so outages render as gaps instead of flat lines.
+        let mut segment_open: Vec<bool> = vec![false; self.channel_count];
 
         let total = (newest_bid - start_bid + 1).max(1) as f32;
 
@@ -573,20 +572,17 @@ impl CachedChart {
             let x = left + pw * ((i + 0.5) / total);
 
             for ch in 0..self.channel_count {
-                let v_opt = if b.has[ch] {
-                    let v = b.last[ch];
-                    last_seen[ch] = Some(v);
-                    Some(v)
-                } else {
-                    last_seen[ch]
-                };
-
-                let Some(v) = v_opt else { continue };
+                if !b.has[ch] {
+                    segment_open[ch] = false;
+                    continue;
+                }
+                let v = b.last[ch];
                 let y = map_y(v);
 
                 let out = &mut self.paths[ch];
-                if out.is_empty() {
+                if !segment_open[ch] {
                     out.push_str(&format!("M {:.2} {:.2} ", x, y));
+                    segment_open[ch] = true;
                 } else {
                     out.push_str(&format!("L {:.2} {:.2} ", x, y));
                 }
