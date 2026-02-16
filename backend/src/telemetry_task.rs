@@ -24,8 +24,24 @@ const TIMESYNC_PRIORITY: u64 = 50;
 const TIMESYNC_SOURCE_TIMEOUT_MS: u64 = 5_000;
 const TIMESYNC_ANNOUNCE_INTERVAL_MS: u64 = 1_000;
 const TIMESYNC_REQUEST_INTERVAL_MS: u64 = 1_000;
+const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
+const PACKET_ENQUEUE_BURST: usize = 256;
+const DB_WORK_QUEUE_SIZE: usize = 8_192;
 
 static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
+
+enum DbWrite {
+    FlightState {
+        timestamp_ms: i64,
+        state_code: i64,
+    },
+    Telemetry {
+        timestamp_ms: i64,
+        data_type: String,
+        values_json: Option<String>,
+        payload_json: String,
+    },
+}
 
 pub struct TimeSyncState {
     tracker: TimeSyncTracker,
@@ -79,18 +95,39 @@ pub async fn telemetry_task(
     let mut heartbeat_failed = false;
     let mut packet_queue_full_warned = false;
     let timesync_state = Arc::new(Mutex::new(TimeSyncState::new()));
-    let (packet_tx, mut packet_rx) = mpsc::channel::<TelemetryPacket>(1024);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<TelemetryPacket>(PACKET_WORK_QUEUE_SIZE);
+    let (db_tx, mut db_rx) = mpsc::channel::<DbWrite>(DB_WORK_QUEUE_SIZE);
 
-    {
+    let db_worker = {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            while let Some(write) = db_rx.recv().await {
+                if let Err(e) = insert_db_write_with_retry(&db, &write).await {
+                    eprintln!("DB insert failed after retry: {e}");
+                }
+            }
+        })
+    };
+
+    let packet_worker = {
         let state = state.clone();
         let router = router.clone();
         let timesync_state = timesync_state.clone();
+        let db_tx = db_tx.clone();
         tokio::spawn(async move {
+            let mut db_queue_full_warned = false;
             while let Some(pkt) = packet_rx.recv().await {
-                handle_packet(&state, &router, &timesync_state, pkt).await;
+                handle_packet(
+                    &state,
+                    &router,
+                    &timesync_state,
+                    &db_tx,
+                    &mut db_queue_full_warned,
+                    pkt,
+                );
             }
-        });
-    }
+        })
+    };
 
     loop {
         tokio::select! {
@@ -262,11 +299,14 @@ pub async fn telemetry_task(
                     }
                 }
                 _ = handle_interval.tick() => {
-                    let pkt = {
-                        let mut rb = state.ring_buffer.lock().unwrap();
-                        rb.pop_oldest()
-                    };
-                    if let Some(pkt) = pkt {
+                    for _ in 0..PACKET_ENQUEUE_BURST {
+                        let pkt = {
+                            let mut rb = state.ring_buffer.lock().unwrap();
+                            rb.pop_oldest()
+                        };
+                        let Some(pkt) = pkt else {
+                            break;
+                        };
                         match packet_tx.try_send(pkt) {
                             Ok(_) => {
                                 packet_queue_full_warned = false;
@@ -279,12 +319,14 @@ pub async fn telemetry_task(
                                     );
                                     packet_queue_full_warned = true;
                                 }
+                                break;
                             }
                             Err(TrySendError::Closed(_)) => {
                                 emit_warning_db_only(
                                     &state,
                                     "Warning: telemetry processing worker stopped unexpectedly",
                                 );
+                                break;
                             }
                         }
                     }
@@ -302,6 +344,30 @@ pub async fn telemetry_task(
                     }
                 }
         }
+    }
+
+    let worker_shutdown_timeout = Duration::from_secs(10);
+
+    // Stop intake first, then wait for packet worker to drain packet queue.
+    drop(packet_tx);
+    match tokio::time::timeout(worker_shutdown_timeout, packet_worker).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("Packet worker ended with error: {e}"),
+        Err(_) => eprintln!(
+            "Packet worker did not shut down within {:?}",
+            worker_shutdown_timeout
+        ),
+    }
+
+    // Packet worker is done producing DB writes; now drain DB queue.
+    drop(db_tx);
+    match tokio::time::timeout(worker_shutdown_timeout, db_worker).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("DB worker ended with error: {e}"),
+        Err(_) => eprintln!(
+            "DB worker did not shut down within {:?}",
+            worker_shutdown_timeout
+        ),
     }
 }
 
@@ -352,16 +418,41 @@ fn valve_state_values(state: &AppState) -> [Option<f32>; 8] {
 const DB_RETRIES: usize = 5;
 const DB_RETRY_DELAY_MS: u64 = 50;
 
-async fn insert_with_retry<F, Fut>(mut f: F) -> Result<(), sqlx::Error>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output=Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
-{
+async fn insert_db_write_with_retry(
+    db: &sqlx::SqlitePool,
+    write: &DbWrite,
+) -> Result<(), sqlx::Error> {
     let mut delay = DB_RETRY_DELAY_MS;
     let mut last_err: Option<sqlx::Error> = None;
 
     for _ in 0..=DB_RETRIES {
-        match f().await {
+        let result = match write {
+            DbWrite::FlightState {
+                timestamp_ms,
+                state_code,
+            } => sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
+                .bind(*timestamp_ms)
+                .bind(*state_code)
+                .execute(db)
+                .await,
+            DbWrite::Telemetry {
+                timestamp_ms,
+                data_type,
+                values_json,
+                payload_json,
+            } => {
+                sqlx::query(
+                    "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json) VALUES (?, ?, ?, ?)",
+                )
+                    .bind(*timestamp_ms)
+                    .bind(data_type.as_str())
+                    .bind(values_json.as_deref())
+                    .bind(payload_json.as_str())
+                    .execute(db)
+                    .await
+            }
+        };
+        match result {
             Ok(_) => return Ok(()),
             Err(e) => {
                 last_err = Some(e);
@@ -374,10 +465,35 @@ where
     Err(last_err.unwrap())
 }
 
-pub async fn handle_packet(
+fn queue_db_write(
+    state: &AppState,
+    db_tx: &mpsc::Sender<DbWrite>,
+    write: DbWrite,
+    db_queue_full_warned: &mut bool,
+) {
+    match db_tx.try_send(write) {
+        Ok(_) => *db_queue_full_warned = false,
+        Err(TrySendError::Full(_)) => {
+            if !*db_queue_full_warned {
+                emit_warning_db_only(
+                    state,
+                    "Warning: telemetry DB queue is full; dropping DB rows",
+                );
+                *db_queue_full_warned = true;
+            }
+        }
+        Err(TrySendError::Closed(_)) => {
+            emit_warning_db_only(state, "Warning: telemetry DB worker stopped unexpectedly");
+        }
+    }
+}
+
+fn handle_packet(
     state: &Arc<AppState>,
     router: &Arc<sedsprintf_rs_2026::router::Router>,
     timesync_state: &Arc<Mutex<TimeSyncState>>,
+    db_tx: &mpsc::Sender<DbWrite>,
+    db_queue_full_warned: &mut bool,
     pkt: TelemetryPacket,
 ) {
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
@@ -412,16 +528,15 @@ pub async fn handle_packet(
             *fs = new_flight_state;
         }
         let ts_ms = get_current_timestamp_ms() as i64;
-        if let Err(e) = insert_with_retry(|| {
-            sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
-                .bind(ts_ms)
-                .bind(pkt_data as i64)
-                .execute(&state.db)
-        })
-            .await
-        {
-            eprintln!("DB insert into flight_state failed after retry: {e}");
-        }
+        queue_db_write(
+            state,
+            db_tx,
+            DbWrite::FlightState {
+                timestamp_ms: ts_ms,
+                state_code: pkt_data as i64,
+            },
+            db_queue_full_warned,
+        );
 
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
@@ -450,20 +565,17 @@ pub async fn handle_packet(
                     .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
-                if let Err(e) = insert_with_retry(|| {
-                    sqlx::query(
-                        "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json) VALUES (?, ?, ?, ?)",
-                    )
-                        .bind(ts_ms)
-                        .bind(VALVE_STATE_DATA_TYPE)
-                        .bind(values_json.as_deref())
-                        .bind(payload_json.as_str())
-                        .execute(&state.db)
-                })
-                    .await
-                {
-                    eprintln!("DB insert into telemetry failed after retry: {e}");
-                }
+                queue_db_write(
+                    state,
+                    db_tx,
+                    DbWrite::Telemetry {
+                        timestamp_ms: ts_ms,
+                        data_type: VALVE_STATE_DATA_TYPE.to_string(),
+                        values_json,
+                        payload_json,
+                    },
+                    db_queue_full_warned,
+                );
 
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
@@ -484,24 +596,24 @@ pub async fn handle_packet(
     if let Ok(values) = pkt.data_as_f32() {
         let values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
         let values_json = serde_json::to_string(
-            &values_vec.iter().map(|v| v.map(|n| n as f64)).collect::<Vec<_>>(),
+            &values_vec
+                .iter()
+                .map(|v| v.map(|n| n as f64))
+                .collect::<Vec<_>>(),
         )
             .ok();
 
-        if let Err(e) = insert_with_retry(|| {
-            sqlx::query(
-                "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json) VALUES (?, ?, ?, ?)",
-            )
-                .bind(ts_ms)
-                .bind(&data_type_str)
-                .bind(values_json.as_deref())
-                .bind(payload_json.as_str())
-                .execute(&state.db)
-        })
-            .await
-        {
-            eprintln!("DB insert into telemetry failed after retry: {e}");
-        }
+        queue_db_write(
+            state,
+            db_tx,
+            DbWrite::Telemetry {
+                timestamp_ms: ts_ms,
+                data_type: data_type_str.clone(),
+                values_json,
+                payload_json: payload_json.clone(),
+            },
+            db_queue_full_warned,
+        );
 
         let row = TelemetryRow {
             timestamp_ms: ts_ms,
@@ -510,19 +622,18 @@ pub async fn handle_packet(
         };
 
         let _ = state.ws_tx.send(row);
-    } else if let Err(e) = insert_with_retry(|| {
-        sqlx::query(
-            "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json) VALUES (?, ?, ?, ?)",
-        )
-            .bind(ts_ms)
-            .bind(&data_type_str)
-            .bind(Option::<String>::None)
-            .bind(payload_json.as_str())
-            .execute(&state.db)
-    })
-        .await
-    {
-        eprintln!("DB insert into telemetry failed after retry: {e}");
+    } else {
+        queue_db_write(
+            state,
+            db_tx,
+            DbWrite::Telemetry {
+                timestamp_ms: ts_ms,
+                data_type: data_type_str,
+                values_json: None,
+                payload_json,
+            },
+            db_queue_full_warned,
+        );
     }
 }
 
