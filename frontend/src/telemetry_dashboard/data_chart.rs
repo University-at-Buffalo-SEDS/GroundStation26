@@ -48,8 +48,8 @@ const MAX_BUCKETS_PER_TYPE: usize = (HISTORY_MS as usize / BUCKET_MS as usize) +
 // Only recent buckets are mutable. Older buckets are frozen.
 // Allow a few buckets for packet jitter/reordering on slower devices.
 const LIVE_BUCKETS_BACK: i64 = 3;
-// Carry forward across short/medium gaps before breaking line segments.
-const INTERPOLATE_GAP_MS: i64 = 10_000;
+// Keep continuity across reseed-induced sparse regions.
+const INTERPOLATE_GAP_MS: i64 = HISTORY_MS;
 
 // Avoid zero span
 const MIN_SPAN_MS: i64 = 1_000;

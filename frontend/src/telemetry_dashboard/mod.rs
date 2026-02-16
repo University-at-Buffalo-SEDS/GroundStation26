@@ -37,7 +37,7 @@ use state_tab::StateTab;
 use types::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
 use warnings_tab::WarningsTab;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering}, Arc,
     Mutex,
@@ -1624,18 +1624,27 @@ async fn seed_from_db(
 
         // Preserve continuity across reseed:
         // - DB snapshot can lag or drop rows under pressure
-        // - Keep currently buffered live rows and merge by (timestamp, data_type)
-        //   so reseed does not introduce artificial holes.
+        // - Keep currently buffered live rows and merge without key-based dedupe,
+        //   because high-rate streams can legitimately have multiple rows with the
+        //   same timestamp/data_type.
         let existing_rows = rows.read().clone();
         if !existing_rows.is_empty() {
-            let mut merged = BTreeMap::<(i64, String), TelemetryRow>::new();
-            for row in existing_rows {
-                merged.insert((row.timestamp_ms, row.data_type.clone()), row);
+            let mut merged = existing_rows;
+            merged.extend(list);
+            merged.sort_by(|a, b| {
+                a.timestamp_ms
+                    .cmp(&b.timestamp_ms)
+                    .then_with(|| a.data_type.cmp(&b.data_type))
+            });
+
+            if let Some(last) = merged.last() {
+                let cutoff = last.timestamp_ms - HISTORY_MS;
+                let start = merged.partition_point(|r| r.timestamp_ms < cutoff);
+                if start > 0 {
+                    merged.drain(0..start);
+                }
             }
-            for row in list {
-                merged.insert((row.timestamp_ms, row.data_type.clone()), row);
-            }
-            list = merged.into_values().collect();
+            list = merged;
         }
 
         if let Some(gps) = list.iter().rev().find_map(row_to_gps) {
