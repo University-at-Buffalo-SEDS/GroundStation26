@@ -631,13 +631,23 @@ def _bash_login_path(cwd: Path) -> Optional[str]:
 
 
 def _which_in_path(exe: str, path_value: str) -> Optional[Path]:
+    def _is_executable(path: Path) -> bool:
+        try:
+            return path.exists() and os.access(path, os.X_OK)
+        except OSError:
+            return False
+
     for raw_dir in path_value.split(os.pathsep):
         if not raw_dir:
             continue
         candidate = Path(raw_dir) / exe
-        if candidate.exists() and os.access(candidate, os.X_OK):
+        if _is_executable(candidate):
             return candidate
     return None
+
+
+def _is_root_user() -> bool:
+    return bool(hasattr(os, "geteuid") and os.geteuid() == 0)
 
 
 def _find_wasm_opt(path_value: str) -> Optional[Path]:
@@ -651,11 +661,16 @@ def _find_wasm_opt(path_value: str) -> Optional[Path]:
         Path("/usr/bin/wasm-opt"),
         Path("/opt/binaryen/bin/wasm-opt"),
         Path("/usr/local/bin/binaryen/bin/wasm-opt"),
-        Path("/root/.cargo/bin/wasm-opt"),
         Path(str(Path.home() / ".cargo" / "bin" / "wasm-opt")),
     ]
+    if _is_root_user():
+        candidates.append(Path("/root/.cargo/bin/wasm-opt"))
     for cand in candidates:
-        if cand.exists() and os.access(cand, os.X_OK):
+        try:
+            is_executable = cand.exists() and os.access(cand, os.X_OK)
+        except OSError:
+            is_executable = False
+        if is_executable:
             return cand
     return None
 
@@ -664,11 +679,16 @@ def _find_wasm_bindgen(path_value: str) -> Optional[Path]:
     candidates = [
         Path("/usr/local/bin/wasm-bindgen"),
         Path("/usr/bin/wasm-bindgen"),
-        Path("/root/.cargo/bin/wasm-bindgen"),
         Path(str(Path.home() / ".cargo" / "bin" / "wasm-bindgen")),
     ]
+    if _is_root_user():
+        candidates.append(Path("/root/.cargo/bin/wasm-bindgen"))
     for cand in candidates:
-        if cand.exists() and os.access(cand, os.X_OK):
+        try:
+            is_executable = cand.exists() and os.access(cand, os.X_OK)
+        except OSError:
+            is_executable = False
+        if is_executable:
             return cand
     return _which_in_path("wasm-bindgen", path_value)
 
@@ -680,7 +700,11 @@ def _find_brotli(path_value: str) -> Optional[Path]:
         Path(str(Path.home() / ".cargo" / "bin" / "brotli")),
     ]
     for cand in candidates:
-        if cand.exists() and os.access(cand, os.X_OK):
+        try:
+            is_executable = cand.exists() and os.access(cand, os.X_OK)
+        except OSError:
+            is_executable = False
+        if is_executable:
             return cand
     return _which_in_path("brotli", path_value)
 
@@ -691,13 +715,18 @@ def _find_dx(path_value: str) -> Optional[Path]:
         return path_dx
 
     candidates = [
-        Path("/root/.cargo/bin/dx"),
         Path("/usr/local/bin/dx"),
         Path("/usr/bin/dx"),
         Path(str(Path.home() / ".cargo" / "bin" / "dx")),
     ]
+    if _is_root_user():
+        candidates.append(Path("/root/.cargo/bin/dx"))
     for cand in candidates:
-        if cand.exists() and os.access(cand, os.X_OK):
+        try:
+            is_executable = cand.exists() and os.access(cand, os.X_OK)
+        except OSError:
+            is_executable = False
+        if is_executable:
             return cand
     return None
 
