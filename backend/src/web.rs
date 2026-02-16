@@ -350,69 +350,123 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     // Task: server -> client (all streams multiplexed)
     let send_task = async move {
         const BUCKET_MS: i64 = 20;
-        let mut last_bucket_by_type: HashMap<String, i64> = HashMap::new();
+        const TELEMETRY_FLUSH_MS: u64 = 50;
+        const MAX_TELEMETRY_PER_FLUSH: usize = 24;
+        let mut telemetry_latest_by_type: HashMap<String, TelemetryRow> = HashMap::new();
+        let mut telemetry_flush =
+            tokio::time::interval(std::time::Duration::from_millis(TELEMETRY_FLUSH_MS));
 
         loop {
             tokio::select! {
-                Ok(pkt) = telemetry_rx.recv() => {
-                    let bucket_id = pkt.timestamp_ms / BUCKET_MS;
-                    let key = pkt.data_type.clone();
-                    if last_bucket_by_type.get(&key).copied() == Some(bucket_id) {
+                biased;
+
+                recv = warnings_rx.recv() => {
+                    match recv {
+                        Ok(warn) => {
+                            let msg = WsOutMsg::Warning(warn);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if sender
+                                .send(Message::Text(Utf8Bytes::from(text)))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = errors_rx.recv() => {
+                    match recv {
+                        Ok(err) => {
+                            let msg = WsOutMsg::Error(err);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if sender.send(Message::Text(Utf8Bytes::from(text))).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = state_rx.recv() => {
+                    match recv {
+                        Ok(fs) => {
+                            let msg = WsOutMsg::FlightState(fs);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if sender.send(Message::Text(Utf8Bytes::from(text))).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = board_status_rx.recv() => {
+                    match recv {
+                        Ok(status) => {
+                            let msg = WsOutMsg::BoardStatus(status);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if sender
+                                .send(Message::Text(Utf8Bytes::from(text)))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = telemetry_rx.recv() => {
+                    match recv {
+                        Ok(pkt) => {
+                            let bucket_id = pkt.timestamp_ms / BUCKET_MS;
+                            let key = pkt.data_type.clone();
+                            let replace = telemetry_latest_by_type
+                                .get(&key)
+                                .map(|prev| (prev.timestamp_ms / BUCKET_MS) != bucket_id)
+                                .unwrap_or(true);
+                            if replace {
+                                telemetry_latest_by_type.insert(key, pkt);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // On lag, keep going and send most recent snapshots at next flush.
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                _ = telemetry_flush.tick() => {
+                    if telemetry_latest_by_type.is_empty() {
                         continue;
                     }
-                    last_bucket_by_type.insert(key, bucket_id);
-                    let msg = WsOutMsg::Telemetry(pkt);
-                    let text = serde_json::to_string(&msg).unwrap_or_default();
-                    if sender
-                        .send(Message::Text(Utf8Bytes::from(text)))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
 
-                Ok(fs) = state_rx.recv() => {
-                    let msg  = WsOutMsg::FlightState(fs);
-                    let text = serde_json::to_string(&msg).unwrap_or_default();
-                    if sender.send(Message::Text(Utf8Bytes::from(text))).await.is_err() {
-                        break;
-                    }
-                }
+                    let mut rows: Vec<TelemetryRow> =
+                        telemetry_latest_by_type.drain().map(|(_, row)| row).collect();
+                    rows.sort_by_key(|r| r.timestamp_ms);
 
-                Ok(warn) = warnings_rx.recv() => {
-                    let msg = WsOutMsg::Warning(warn);
-                    let text = serde_json::to_string(&msg).unwrap_or_default();
-                    if sender
-                        .send(Message::Text(Utf8Bytes::from(text)))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    if rows.len() > MAX_TELEMETRY_PER_FLUSH {
+                        rows.drain(0..(rows.len() - MAX_TELEMETRY_PER_FLUSH));
                     }
-                }
 
-                Ok(err) = errors_rx.recv() => {
-                    let msg = WsOutMsg::Error(err);
-                    let text = serde_json::to_string(&msg).unwrap_or_default();
-                    if sender
-                        .send(Message::Text(Utf8Bytes::from(text)))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-
-                Ok(status) = board_status_rx.recv() => {
-                    let msg = WsOutMsg::BoardStatus(status);
-                    let text = serde_json::to_string(&msg).unwrap_or_default();
-                    if sender
-                        .send(Message::Text(Utf8Bytes::from(text)))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    for row in rows {
+                        let msg = WsOutMsg::Telemetry(row);
+                        let text = serde_json::to_string(&msg).unwrap_or_default();
+                        if sender
+                            .send(Message::Text(Utf8Bytes::from(text)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
