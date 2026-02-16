@@ -641,7 +641,11 @@ def _which_in_path(exe: str, path_value: str) -> Optional[Path]:
 
 
 def _find_wasm_opt(path_value: str) -> Optional[Path]:
-    # Prefer explicit common locations, then PATH scan using the provided PATH value.
+    path_wasm_opt = _which_in_path("wasm-opt", path_value)
+    if path_wasm_opt:
+        return path_wasm_opt
+
+    # Fall back to explicit common locations if PATH lookup fails.
     candidates = [
         Path("/usr/local/bin/wasm-opt"),
         Path("/usr/bin/wasm-opt"),
@@ -653,7 +657,7 @@ def _find_wasm_opt(path_value: str) -> Optional[Path]:
     for cand in candidates:
         if cand.exists() and os.access(cand, os.X_OK):
             return cand
-    return _which_in_path("wasm-opt", path_value)
+    return None
 
 
 def _find_wasm_bindgen(path_value: str) -> Optional[Path]:
