@@ -16,7 +16,6 @@ use sqlx::Row;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
@@ -161,9 +160,9 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
 
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
@@ -196,9 +195,9 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
         let values = values_from_row(&r);
@@ -269,12 +268,12 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         ORDER BY f.timestamp_ms ASC
         "#,
     )
-    .bind(BUCKET_MS)
-    .bind(cutoff)
-    .bind(now_ms)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(BUCKET_MS)
+        .bind(cutoff)
+        .bind(now_ms)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -465,10 +464,10 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-    .bind(cutoff)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -490,10 +489,7 @@ async fn get_boards(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 /// Helper: current timestamp in ms (i64) for warnings/errors/etc.
 fn now_ms_i64() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    crate::telemetry_task::get_current_timestamp_ms() as i64
 }
 
 fn spawn_alert_insert(
@@ -513,11 +509,11 @@ fn spawn_alert_insert(
             VALUES (?, ?, ?)
             "#,
         )
-        .bind(timestamp_ms)
-        .bind(severity)
-        .bind(message)
-        .execute(&db)
-        .await;
+            .bind(timestamp_ms)
+            .bind(severity)
+            .bind(message)
+            .execute(&db)
+            .await;
         state_for_task.end_db_write();
     });
 }

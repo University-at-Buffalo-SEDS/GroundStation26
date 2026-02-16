@@ -68,9 +68,7 @@ async fn main() -> Result<()> {
             println!("----");
         }
         if let Err(e) = fetch_tiles_for_zoom_async(z, &tiles_root, &client).await {
-            eprintln!(
-                "fetch_gibs_tiles_async: WARNING: failed to fetch tiles for z={z}: {e}"
-            );
+            eprintln!("fetch_gibs_tiles_async: WARNING: failed to fetch tiles for z={z}: {e}");
         }
     }
 

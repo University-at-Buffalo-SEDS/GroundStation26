@@ -29,10 +29,12 @@ fn main() {
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
     init_panic_hook();
-    let cfg = dioxus_desktop::Config::new()
-        .with_asynchronous_custom_protocol("gs26", |_id, request, responder| {
+    let cfg = dioxus_desktop::Config::new().with_asynchronous_custom_protocol(
+        "gs26",
+        |_id, request, responder| {
             handle_gs26_protocol_async(request, responder);
-        });
+        },
+    );
     LaunchBuilder::desktop().with_cfg(cfg).launch(app::App);
 }
 

@@ -13,8 +13,10 @@ use crate::radio::RadioDevice;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 use crate::web::{emit_warning, emit_warning_db_only, FlightStateMsg};
 use groundstation_shared::Board;
+use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{interval, Duration};
 
@@ -75,7 +77,20 @@ pub async fn telemetry_task(
     let mut heartbeat_interval = interval(Duration::from_millis(500));
     let mut timesync_interval = interval(Duration::from_millis(100));
     let mut heartbeat_failed = false;
+    let mut packet_queue_full_warned = false;
     let timesync_state = Arc::new(Mutex::new(TimeSyncState::new()));
+    let (packet_tx, mut packet_rx) = mpsc::channel::<TelemetryPacket>(1024);
+
+    {
+        let state = state.clone();
+        let router = router.clone();
+        let timesync_state = timesync_state.clone();
+        tokio::spawn(async move {
+            while let Some(pkt) = packet_rx.recv().await {
+                handle_packet(&state, &router, &timesync_state, pkt).await;
+            }
+        });
+    }
 
     loop {
         tokio::select! {
@@ -247,7 +262,32 @@ pub async fn telemetry_task(
                     }
                 }
                 _ = handle_interval.tick() => {
-                    handle_packet(&state, &router, &timesync_state).await;
+                    let pkt = {
+                        let mut rb = state.ring_buffer.lock().unwrap();
+                        rb.pop_oldest()
+                    };
+                    if let Some(pkt) = pkt {
+                        match packet_tx.try_send(pkt) {
+                            Ok(_) => {
+                                packet_queue_full_warned = false;
+                            }
+                            Err(TrySendError::Full(_)) => {
+                                if !packet_queue_full_warned {
+                                    emit_warning_db_only(
+                                        &state,
+                                        "Warning: telemetry processing queue is full; dropping packets",
+                                    );
+                                    packet_queue_full_warned = true;
+                                }
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                emit_warning_db_only(
+                                    &state,
+                                    "Warning: telemetry processing worker stopped unexpectedly",
+                                );
+                            }
+                        }
+                    }
                 }
                 _ = timesync_interval.tick() => {
                     if timesync_enabled() {
@@ -315,7 +355,7 @@ const DB_RETRY_DELAY_MS: u64 = 50;
 async fn insert_with_retry<F, Fut>(mut f: F) -> Result<(), sqlx::Error>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
+    Fut: Future<Output=Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
 {
     let mut delay = DB_RETRY_DELAY_MS;
     let mut last_err: Option<sqlx::Error> = None;
@@ -338,17 +378,8 @@ pub async fn handle_packet(
     state: &Arc<AppState>,
     router: &Arc<sedsprintf_rs_2026::router::Router>,
     timesync_state: &Arc<Mutex<TimeSyncState>>,
+    pkt: TelemetryPacket,
 ) {
-    // Keep raw packet in ring buffer if you still want it
-    let pkt = {
-        //get the most recent packet from the ring buffer
-        let mut rb = state.ring_buffer.lock().unwrap();
-        match rb.pop_oldest() {
-            Some(pkt) => pkt,
-            None => return, // No packet to process
-        }
-    };
-
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
 
     if pkt.data_type() == DataType::Warning {
@@ -387,7 +418,7 @@ pub async fn handle_packet(
                 .bind(pkt_data as i64)
                 .execute(&state.db)
         })
-        .await
+            .await
         {
             eprintln!("DB insert into flight_state failed after retry: {e}");
         }
@@ -416,7 +447,7 @@ pub async fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                .ok();
+                    .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 if let Err(e) = insert_with_retry(|| {

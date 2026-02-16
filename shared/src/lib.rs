@@ -51,8 +51,15 @@ pub enum Board {
 }
 
 impl Board {
-    pub const ALL: &'static [Board] = &[Board::GroundStation, Board::FlightComputer, Board::RFBoard,
-        Board::PowerBoard, Board::ValveBoard, Board::GatewayBoard, Board::ActuatorBoard, Board::DaqBoard
+    pub const ALL: &'static [Board] = &[
+        Board::GroundStation,
+        Board::FlightComputer,
+        Board::RFBoard,
+        Board::PowerBoard,
+        Board::ValveBoard,
+        Board::GatewayBoard,
+        Board::ActuatorBoard,
+        Board::DaqBoard,
     ];
 
     pub fn as_str(&self) -> &'static str {

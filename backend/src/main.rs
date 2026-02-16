@@ -34,7 +34,7 @@ use sqlx::Row;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::time::Duration;
@@ -145,8 +145,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     // Add values_json column for older DBs.
     let cols = sqlx::query("PRAGMA table_info(telemetry)")
@@ -179,8 +179,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     sqlx::query(
         r#"
@@ -191,8 +191,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -224,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
         gpio,
         board_status: Arc::new(Mutex::new(board_status)),
         board_status_tx,
+        last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
         umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
         shutdown_tx,
@@ -242,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
         EndpointHandler::new_packet_handler(GroundStation, move |pkt: &TelemetryPacket| {
             ground_station_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+            ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
             let mut rb = ground_station_handler_state_clone
                 .ring_buffer
                 .lock()
@@ -254,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
         EndpointHandler::new_packet_handler(FlightState, move |pkt: &TelemetryPacket| {
             flight_state_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+            flight_state_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
             let mut rb = flight_state_handler_state_clone.ring_buffer.lock().unwrap();
             rb.push(pkt.clone());
             Ok(())
@@ -261,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
 
     let abort_handler = EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket| {
         abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+        abort_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
         let error_msg = pkt
             .data_as_string()
             .expect("Abort packet with invalid UTF-8");

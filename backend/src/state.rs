@@ -7,7 +7,7 @@ use groundstation_shared::{
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::time::{Duration, Instant};
@@ -52,6 +52,9 @@ pub struct AppState {
 
     /// Board status updates → frontend
     pub board_status_tx: broadcast::Sender<BoardStatusMsg>,
+
+    /// Last time (ms) any telemetry packet was received by the router.
+    pub last_packet_rx_ms: Arc<AtomicU64>,
 
     /// Umbilical valve states keyed by command id (u8)
     pub umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
@@ -111,6 +114,15 @@ impl AppState {
     pub fn set_umbilical_valve_state(&self, cmd_id: u8, on: bool) {
         let mut map = self.umbilical_valve_states.lock().unwrap();
         map.insert(cmd_id, on);
+    }
+
+    pub fn mark_packet_received(&self, timestamp_ms: u64) {
+        self.last_packet_rx_ms
+            .store(timestamp_ms, Ordering::Relaxed);
+    }
+
+    pub fn last_packet_received_ms(&self) -> u64 {
+        self.last_packet_rx_ms.load(Ordering::Relaxed)
     }
 
     pub fn get_umbilical_valve_state(&self, cmd_id: u8) -> Option<bool> {
