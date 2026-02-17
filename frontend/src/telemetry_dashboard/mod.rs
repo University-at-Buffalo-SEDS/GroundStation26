@@ -1719,8 +1719,19 @@ async fn seed_from_db(
             rocket_gps.set(Some(gps));
         }
 
-        // IMPORTANT: keep chart cache in sync with seeded history
-        charts_cache_reset_and_ingest(&list);
+        // IMPORTANT:
+        // - On cold start, seed chart cache from DB snapshot.
+        // - Once live telemetry is flowing, never hard-reset chart cache from reseed,
+        //   because sparse DB snapshots can erase good live buckets and create gaps.
+        //   Instead, incrementally backfill DB rows into the existing cache.
+        let has_live_rows = !rows.read().is_empty();
+        if has_live_rows {
+            for row in &list {
+                charts_cache_ingest_row(row);
+            }
+        } else {
+            charts_cache_reset_and_ingest(&list);
+        }
         rows.set(list);
     }
 

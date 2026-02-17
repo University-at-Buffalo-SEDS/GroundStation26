@@ -48,8 +48,10 @@ const MAX_BUCKETS_PER_TYPE: usize = (HISTORY_MS as usize / BUCKET_MS as usize) +
 // Only recent buckets are mutable. Older buckets are frozen.
 // Allow a few buckets for packet jitter/reordering on slower devices.
 const LIVE_BUCKETS_BACK: i64 = 3;
-// Keep graph continuous across reseed gaps by interpolating between known points.
-const MAX_CONNECT_GAP_MS: i64 = HISTORY_MS;
+// Interpolate short gaps only; long gaps should render as discontinuities.
+const MIN_CONNECT_GAP_MS: i64 = 500;
+const MAX_CONNECT_GAP_MS_CAP: i64 = 5_000;
+const CONNECT_GAP_SPAN_DIVISOR: i64 = 120;
 
 // Avoid zero span
 const MIN_SPAN_MS: i64 = 1_000;
@@ -563,6 +565,9 @@ impl CachedChart {
         let mut last_bucket_id_drawn: Vec<Option<i64>> = vec![None; self.channel_count];
 
         let total = (newest_bid - start_bid + 1).max(1) as f32;
+        let max_connect_gap_ms =
+            (span_ms / CONNECT_GAP_SPAN_DIVISOR).clamp(MIN_CONNECT_GAP_MS, MAX_CONNECT_GAP_MS_CAP);
+        let max_gap_buckets = (max_connect_gap_ms / BUCKET_MS).max(1);
 
         for b in self.buckets.iter() {
             if b.id < start_bid || b.id > newest_bid {
@@ -579,7 +584,6 @@ impl CachedChart {
                 let v = b.last[ch];
                 let y = map_y(v);
                 if let Some(prev_bid) = last_bucket_id_drawn[ch] {
-                    let max_gap_buckets = (MAX_CONNECT_GAP_MS / BUCKET_MS).max(1);
                     if b.id - prev_bid > max_gap_buckets {
                         segment_open[ch] = false;
                     }
