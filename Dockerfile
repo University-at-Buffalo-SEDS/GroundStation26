@@ -22,13 +22,15 @@ COPY backend/Cargo.toml backend/
 COPY backend/src backend/src
 COPY backend/layout backend/layout
 
-# Map downloader crate
 RUN mkdir -p map_downloader/src
+RUN mkdir -p frontend/dist
+RUN mkdir -p shared/src
+
+# Map downloader crate
 COPY map_downloader/Cargo.toml map_downloader/
 COPY map_downloader/src map_downloader/src
 
 # Frontend
-RUN mkdir -p frontend/dist
 COPY frontend/src frontend/src
 COPY frontend/build.rs frontend/
 COPY frontend/Cargo.toml frontend/
@@ -39,12 +41,11 @@ COPY frontend/static frontend/static
 COPY frontend/Dioxus.toml frontend/
 
 # Shared
-RUN mkdir -p shared/src
 COPY shared/Cargo.toml shared/
 COPY shared/src shared/src
-RUN cd frontend && cargo update && cargo fetch && cd ..
-
 COPY build.py ./
+
+RUN cargo update && cargo fetch
 
 # Build args:
 # - PI_BUILD="pi_build" -> ./build.py pi_build
