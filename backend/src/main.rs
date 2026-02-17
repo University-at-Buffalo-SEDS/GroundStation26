@@ -105,22 +105,34 @@ async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
     if let Err(err) = sqlx::query("PRAGMA optimize;").execute(db).await {
         eprintln!("SQLite PRAGMA optimize failed: {err}");
     }
+
+    // On shutdown, switch out of WAL to reduce chance of lingering -wal/-shm files.
+    let switch_to_delete = std::env::var("GS_SQLITE_SHUTDOWN_JOURNAL_DELETE")
+        .ok()
+        .as_deref()
+        != Some("0");
+    if switch_to_delete
+        && let Err(err) = sqlx::query("PRAGMA journal_mode=DELETE;").execute(db).await
+    {
+        eprintln!("SQLite PRAGMA journal_mode=DELETE failed: {err}");
+    }
 }
 
-fn remove_empty_sqlite_sidecars(db_path: &str) {
+async fn remove_sqlite_sidecars(db_path: &str) {
+    let retries = env_usize("GS_SQLITE_SIDECAR_DELETE_RETRIES", 12, 1, 120);
+    let retry_delay_ms = env_i64("GS_SQLITE_SIDECAR_DELETE_DELAY_MS", 100, 10, 2_000) as u64;
     for suffix in [".wal", ".shm", "-wal", "-shm", "-journal", ".journal"] {
         let sidecar = format!("{db_path}{suffix}");
-        match std::fs::metadata(&sidecar) {
-            Ok(meta) => {
-                if meta.len() == 0 {
-                    if let Err(err) = std::fs::remove_file(&sidecar) {
-                        eprintln!("Failed removing empty SQLite sidecar {sidecar}: {err}");
+        for attempt in 0..retries {
+            match std::fs::remove_file(&sidecar) {
+                Ok(()) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                Err(err) => {
+                    if attempt + 1 >= retries {
+                        eprintln!("Failed removing SQLite sidecar {sidecar}: {err}");
+                        break;
                     }
-                }
-            }
-            Err(err) => {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("Failed to stat SQLite sidecar {sidecar}: {err}");
+                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
                 }
             }
         }
@@ -465,6 +477,6 @@ async fn main() -> anyhow::Result<()> {
 
     flush_sqlite_journals(&state.db).await;
     state.db.close().await;
-    remove_empty_sqlite_sidecars(db_path);
+    remove_sqlite_sidecars(db_path).await;
     Ok(())
 }
