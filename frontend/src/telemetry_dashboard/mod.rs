@@ -37,7 +37,7 @@ use state_tab::StateTab;
 use types::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
 use warnings_tab::WarningsTab;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering}, Arc,
     Mutex,
@@ -1610,21 +1610,6 @@ async fn seed_from_db(
         }
     };
 
-    let merge_non_overlapping = |base: &mut Vec<TelemetryRow>, extra: Vec<TelemetryRow>| {
-        if extra.is_empty() {
-            return;
-        }
-        let keys: HashSet<(i64, String)> = base
-            .iter()
-            .map(|r| (r.timestamp_ms, r.data_type.clone()))
-            .collect();
-        base.extend(
-            extra
-                .into_iter()
-                .filter(|r| !keys.contains(&(r.timestamp_ms, r.data_type.clone()))),
-        );
-    };
-
     if !alive.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -1650,7 +1635,7 @@ async fn seed_from_db(
         let existing_rows = rows.read().clone();
         let queued_rows = queue_snapshot();
         let mut live_rows = existing_rows;
-        merge_non_overlapping(&mut live_rows, queued_rows);
+        live_rows.extend(queued_rows);
         live_rows.sort_by(|a, b| {
             a.timestamp_ms
                 .cmp(&b.timestamp_ms)
@@ -1674,16 +1659,8 @@ async fn seed_from_db(
                 out.extend(live_rows);
                 out
             } else {
-                let db_keys: HashSet<(i64, String)> = list
-                    .iter()
-                    .map(|r| (r.timestamp_ms, r.data_type.clone()))
-                    .collect();
                 let mut out: Vec<TelemetryRow> = list;
-                out.extend(
-                    live_rows
-                        .into_iter()
-                        .filter(|r| !db_keys.contains(&(r.timestamp_ms, r.data_type.clone()))),
-                );
+                out.extend(live_rows);
                 out
             };
             merged.sort_by(|a, b| {
@@ -1706,36 +1683,36 @@ async fn seed_from_db(
         let latest_rows = rows.read().clone();
         let latest_queued_rows = queue_snapshot();
         if !latest_rows.is_empty() {
-            let seeded_keys: HashSet<(i64, String)> = list
-                .iter()
-                .map(|r| (r.timestamp_ms, r.data_type.clone()))
-                .collect();
             let mut merged = list;
-            merged.extend(
-                latest_rows
-                    .into_iter()
-                    .filter(|r| !seeded_keys.contains(&(r.timestamp_ms, r.data_type.clone()))),
-            );
-            let seeded_keys_after_rows: HashSet<(i64, String)> = merged
-                .iter()
-                .map(|r| (r.timestamp_ms, r.data_type.clone()))
-                .collect();
-            merged.extend(latest_queued_rows.into_iter().filter(|r| {
-                !seeded_keys_after_rows.contains(&(r.timestamp_ms, r.data_type.clone()))
-            }));
+            merged.extend(latest_rows);
+            merged.extend(latest_queued_rows);
             merged.sort_by(|a, b| {
                 a.timestamp_ms
                     .cmp(&b.timestamp_ms)
                     .then_with(|| a.data_type.cmp(&b.data_type))
             });
+            if let Some(last) = merged.last() {
+                let cutoff = last.timestamp_ms - HISTORY_MS;
+                let start = merged.partition_point(|r| r.timestamp_ms < cutoff);
+                if start > 0 {
+                    merged.drain(0..start);
+                }
+            }
             list = merged;
         } else if !latest_queued_rows.is_empty() {
-            merge_non_overlapping(&mut list, latest_queued_rows);
+            list.extend(latest_queued_rows);
             list.sort_by(|a, b| {
                 a.timestamp_ms
                     .cmp(&b.timestamp_ms)
                     .then_with(|| a.data_type.cmp(&b.data_type))
             });
+            if let Some(last) = list.last() {
+                let cutoff = last.timestamp_ms - HISTORY_MS;
+                let start = list.partition_point(|r| r.timestamp_ms < cutoff);
+                if start > 0 {
+                    list.drain(0..start);
+                }
+            }
         }
 
         if let Some(gps) = list.iter().rev().find_map(row_to_gps) {
