@@ -819,22 +819,28 @@ def _compress_web_assets(frontend_dir: Path, env: Optional[dict[str, str]]) -> N
 
 def _clear_dx_web_cache(frontend_dir: Path) -> None:
     """
-    Dioxus can reuse cached web/public asset dirs from target/, which may
-    repopulate stale hashed assets into dist/public on rebuild.
+    Dioxus can reuse cached web/public asset dirs from both crate-local and
+    workspace-root target/ paths, which may repopulate stale hashed assets
+    into dist/public on rebuild.
     """
-    target_dir = frontend_dir / "target"
-    if not target_dir.exists():
-        return
+    workspace_root = frontend_dir.parent
+    target_dirs = {
+        frontend_dir / "target",
+        workspace_root / "target",
+    }
 
     removed = 0
-    for p in target_dir.rglob("web/public/assets"):
-        if p.is_dir():
-            shutil.rmtree(p, ignore_errors=True)
-            removed += 1
-    for p in target_dir.rglob("web/public/wasm"):
-        if p.is_dir():
-            shutil.rmtree(p, ignore_errors=True)
-            removed += 1
+    for target_dir in target_dirs:
+        if not target_dir.exists():
+            continue
+        for p in target_dir.rglob("web/public/assets"):
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+                removed += 1
+        for p in target_dir.rglob("web/public/wasm"):
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+                removed += 1
 
     if removed:
         print(f"Cleared stale Dioxus web cache dirs: {removed}")
