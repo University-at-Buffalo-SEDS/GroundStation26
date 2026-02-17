@@ -1719,18 +1719,29 @@ async fn seed_from_db(
             rocket_gps.set(Some(gps));
         }
 
-        // IMPORTANT:
-        // - On cold start, seed chart cache from DB snapshot.
-        // - Once live telemetry is flowing, never hard-reset chart cache from reseed,
-        //   because sparse DB snapshots can erase good live buckets and create gaps.
-        //   Instead, incrementally backfill DB rows into the existing cache.
-        let has_live_rows = !rows.read().is_empty();
-        if has_live_rows {
-            for row in &list {
-                charts_cache_ingest_row(row);
+        // Rebuild chart cache from the merged list (DB + live + queued snapshots).
+        // This ensures DB reseed contributes historical points while preserving live continuity.
+        charts_cache_reset_and_ingest(&list);
+        // Replay whatever is currently queued right after reset so points that arrive
+        // around reseed commit are not visually lost in the chart cache.
+        let post_reset_queued_rows = queue_snapshot();
+        for row in &post_reset_queued_rows {
+            charts_cache_ingest_row(row);
+        }
+        if !post_reset_queued_rows.is_empty() {
+            list.extend(post_reset_queued_rows);
+            list.sort_by(|a, b| {
+                a.timestamp_ms
+                    .cmp(&b.timestamp_ms)
+                    .then_with(|| a.data_type.cmp(&b.data_type))
+            });
+            if let Some(last) = list.last() {
+                let cutoff = last.timestamp_ms - HISTORY_MS;
+                let start = list.partition_point(|r| r.timestamp_ms < cutoff);
+                if start > 0 {
+                    list.drain(0..start);
+                }
             }
-        } else {
-            charts_cache_reset_and_ingest(&list);
         }
         rows.set(list);
     }
