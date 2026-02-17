@@ -853,8 +853,12 @@ def _prune_stale_hashed_assets(frontend_dir: Path) -> None:
         return
 
     hashed_re = re.compile(r"^(?P<base>.+)-dxh(?P<hash>[0-9a-f]+)(?P<ext>\.[^.]+)(?P<comp>\.gz|\.br)?$")
-    # key: (base, ext) -> best hash by newest mtime
-    keep_hash_for_key: dict[tuple[str, str], tuple[str, float]] = {}
+    # Allow short overlap between deploys/cached HTML by keeping several hash generations.
+    keep_generations = int(os.environ.get("GS_ASSET_HASH_KEEP", "3"))
+    keep_generations = max(1, min(keep_generations, 20))
+
+    # key: (base, ext, hash) -> newest mtime among compressed/uncompressed siblings
+    hash_mtime: dict[tuple[str, str, str], float] = {}
     parsed: list[tuple[Path, str, str, str]] = []
 
     for p in assets_dir.iterdir():
@@ -867,16 +871,40 @@ def _prune_stale_hashed_assets(frontend_dir: Path) -> None:
         h = m.group("hash")
         ext = m.group("ext")
         parsed.append((p, base, ext, h))
-        key = (base, ext)
         mtime = p.stat().st_mtime
-        prev = keep_hash_for_key.get(key)
-        if prev is None or mtime > prev[1]:
-            keep_hash_for_key[key] = (h, mtime)
+        key = (base, ext, h)
+        prev = hash_mtime.get(key)
+        if prev is None or mtime > prev:
+            hash_mtime[key] = mtime
+
+    # Hashes referenced by current HTML entrypoints are always kept.
+    referenced_hashes: set[tuple[str, str, str]] = set()
+    html_ref_re = re.compile(r"/(?:\./)?assets/([^\"'?#\s]+)")
+    for html in (frontend_dir / "dist" / "public").glob("*.html"):
+        try:
+            txt = html.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in html_ref_re.finditer(txt):
+            name = m.group(1)
+            hm = hashed_re.match(name)
+            if not hm:
+                continue
+            referenced_hashes.add((hm.group("base"), hm.group("ext"), hm.group("hash")))
+
+    # Keep top-N recent hashes per (base, ext), plus any HTML-referenced hash.
+    keep_hashes: set[tuple[str, str, str]] = set(referenced_hashes)
+    by_family: dict[tuple[str, str], list[tuple[str, float]]] = {}
+    for (base, ext, h), mtime in hash_mtime.items():
+        by_family.setdefault((base, ext), []).append((h, mtime))
+    for (base, ext), arr in by_family.items():
+        arr.sort(key=lambda x: x[1], reverse=True)
+        for h, _ in arr[:keep_generations]:
+            keep_hashes.add((base, ext, h))
 
     removed = 0
     for p, base, ext, h in parsed:
-        keep = keep_hash_for_key.get((base, ext))
-        if keep is not None and h != keep[0]:
+        if (base, ext, h) not in keep_hashes:
             try:
                 p.unlink()
                 removed += 1
@@ -884,7 +912,7 @@ def _prune_stale_hashed_assets(frontend_dir: Path) -> None:
                 pass
 
     if removed:
-        print(f"Pruned stale hashed assets: {removed}")
+        print(f"Pruned stale hashed assets: {removed} (kept {keep_generations} generations)")
 
 
 def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
