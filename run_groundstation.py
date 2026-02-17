@@ -53,6 +53,22 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except FileNotFoundError as e:
+        missing = e.filename or "<unknown>"
+        print("\nError: run_groundstation failed because a required tool/file is missing.", file=sys.stderr)
+        print(f"  Missing: {missing}", file=sys.stderr)
+        print("Hint: ensure Rust toolchain is installed (`cargo`) and repo paths are valid.", file=sys.stderr)
+        sys.exit(127)
+    except subprocess.CalledProcessError as e:
+        print("\nError: run_groundstation command failed.", file=sys.stderr)
+        print(f"  Command : {' '.join(str(x) for x in e.cmd)}", file=sys.stderr)
+        print(f"  Exit    : {e.returncode}", file=sys.stderr)
+        print("Hint: rerun the printed command directly for full output.", file=sys.stderr)
+        sys.exit(e.returncode)
+    except Exception as e:
+        print(f"\nError: run_groundstation failed unexpectedly: {e}", file=sys.stderr)
+        print("Hint: run with a clean build (`python3 build.py`) and retry.", file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\n\nexiting...")
         exit(0)

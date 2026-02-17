@@ -2,6 +2,7 @@
 import argparse
 import csv
 import sqlite3
+import sys
 from pathlib import Path
 
 script_dir = Path(__file__).parent.resolve()
@@ -53,4 +54,20 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except sqlite3.OperationalError as e:
+        print(f"Error: SQLite operation failed: {e}", file=sys.stderr)
+        print("Hint: ensure the DB file exists and is not locked by another process.", file=sys.stderr)
+        raise SystemExit(1)
+    except PermissionError as e:
+        print(f"Error: Permission denied: {e}", file=sys.stderr)
+        print("Hint: verify read access to DB path and write access to output directory.", file=sys.stderr)
+        raise SystemExit(1)
+    except FileNotFoundError as e:
+        missing = e.filename or "<unknown>"
+        print(f"Error: Missing file: {missing}", file=sys.stderr)
+        raise SystemExit(1)
+    except Exception as e:
+        print(f"Error: export_telemetry_csv failed unexpectedly: {e}", file=sys.stderr)
+        raise SystemExit(1)

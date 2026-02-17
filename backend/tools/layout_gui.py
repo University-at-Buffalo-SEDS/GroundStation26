@@ -1532,5 +1532,19 @@ class LayoutEditor(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = LayoutEditor()
-    app.mainloop()
+    try:
+        app = LayoutEditor()
+        app.mainloop()
+    except FileNotFoundError as e:
+        missing = e.filename or "<unknown>"
+        print(f"Error: Required file not found: {missing}", file=sys.stderr)
+        print("Hint: verify backend/layout/layout.json exists and paths are correct.", file=sys.stderr)
+        sys.exit(1)
+    except PermissionError as e:
+        print(f"Error: Permission denied: {e}", file=sys.stderr)
+        print("Hint: check read/write permissions for the selected layout file.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: layout_gui failed unexpectedly: {e}", file=sys.stderr)
+        print("Hint: try validating your JSON layout file and retry.", file=sys.stderr)
+        sys.exit(1)

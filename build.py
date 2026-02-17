@@ -39,6 +39,49 @@ def _append_log(line: str) -> None:
         f.write(line)
 
 
+def _cmd_to_str(cmd: object) -> str:
+    if isinstance(cmd, (list, tuple)):
+        return " ".join(str(x) for x in cmd)
+    return str(cmd)
+
+
+def _print_command_failure(context: str, err: subprocess.CalledProcessError, cwd: Path) -> None:
+    print(f"\nError: {context} failed.", file=sys.stderr)
+    print(f"  Command : {_cmd_to_str(err.cmd)}", file=sys.stderr)
+    print(f"  CWD     : {cwd}", file=sys.stderr)
+    print(f"  Exit    : {err.returncode}", file=sys.stderr)
+    if LOG_FILE is not None:
+        print(f"  Log file: {LOG_FILE}", file=sys.stderr)
+
+    cmd_s = _cmd_to_str(err.cmd).lower()
+    if "dx bundle" in cmd_s:
+        print("Hint: check that `dx` is installed and matches your project setup.", file=sys.stderr)
+        print("      If needed: `cargo install dioxus-cli`.", file=sys.stderr)
+    elif "cargo build" in cmd_s:
+        print("Hint: run `cargo build` directly in the same cwd for full compiler diagnostics.", file=sys.stderr)
+    elif "docker" in cmd_s:
+        print("Hint: verify Docker daemon is running and build context paths are valid.", file=sys.stderr)
+
+
+def _print_missing_tool(context: str, err: FileNotFoundError, cwd: Path) -> None:
+    missing = err.filename or "<unknown>"
+    print(f"\nError: {context} could not start because a required tool is missing.", file=sys.stderr)
+    print(f"  Missing : {missing}", file=sys.stderr)
+    print(f"  CWD     : {cwd}", file=sys.stderr)
+    if LOG_FILE is not None:
+        print(f"  Log file: {LOG_FILE}", file=sys.stderr)
+
+    low = str(missing).lower()
+    if low.endswith("/dx") or low == "dx":
+        print("Hint: install Dioxus CLI and ensure `dx` is on PATH.", file=sys.stderr)
+        print("      Example: `cargo install dioxus-cli`", file=sys.stderr)
+    elif low == "cargo":
+        print("Hint: install Rust via rustup and ensure cargo is on PATH.", file=sys.stderr)
+        print("      Example: https://rustup.rs", file=sys.stderr)
+    elif low in {"bash", "/bin/bash"}:
+        print("Hint: bash is required by parts of the build scripts.", file=sys.stderr)
+
+
 def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None:
     cmd = [str(part) for part in cmd]
     cmd_line = f"Running: {' '.join(cmd)} (cwd={cwd})"
@@ -1255,8 +1298,11 @@ def build_frontend(
         if platform_name == "ios":
             patch_plist(frontend_dir)
 
+    except FileNotFoundError as e:
+        _print_missing_tool("Frontend build", e, frontend_dir)
+        sys.exit(127)
     except subprocess.CalledProcessError as e:
-        print("Frontend build failed.", file=sys.stderr)
+        _print_command_failure("Frontend build", e, frontend_dir)
         sys.exit(e.returncode)
 
 
@@ -1296,8 +1342,11 @@ def build_backend(
 
     try:
         run(cmd, cwd=backend_dir)
+    except FileNotFoundError as e:
+        _print_missing_tool("Backend build", e, backend_dir)
+        sys.exit(127)
     except subprocess.CalledProcessError as e:
-        print("Backend exited with error.", file=sys.stderr)
+        _print_command_failure("Backend build", e, backend_dir)
         sys.exit(e.returncode)
 
 
@@ -1617,6 +1666,22 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except FileNotFoundError as e:
+        missing = e.filename or "<unknown>"
+        print("\nError: build failed because a required tool/file is missing.", file=sys.stderr)
+        print(f"  Missing: {missing}", file=sys.stderr)
+        if str(missing).lower() in {"cargo", "dx"}:
+            print("Hint: ensure required tooling is installed and on PATH.", file=sys.stderr)
+        sys.exit(127)
+    except subprocess.CalledProcessError as e:
+        _print_command_failure("Build", e, Path(__file__).resolve().parent)
+        sys.exit(e.returncode)
+    except Exception as e:
+        print(f"\nError: build failed unexpectedly: {e}", file=sys.stderr)
+        if LOG_FILE is not None:
+            print(f"  Log file: {LOG_FILE}", file=sys.stderr)
+        print("Hint: rerun with `log=build.log` to capture full command output.", file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\n\nexiting...")
         sys.exit(0)
