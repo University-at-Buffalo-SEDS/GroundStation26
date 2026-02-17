@@ -5,26 +5,23 @@ ARG BINARYEN_VERSION=117
 
 LABEL authors="rylan"
 
-WORKDIR /app
-
-# wasm-opt + wasm-pack for dx bundle --release (install via cargo).
+# Install dependencies for build script and map downloader
 RUN set -e; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl xz-utils; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
-# Top-level workspace manifests
-COPY Cargo.toml ./
-
-# Backend crate (no data/)
-RUN mkdir -p backend/src
-COPY backend/Cargo.toml backend/
-COPY backend/src backend/src
-COPY backend/layout backend/layout
-
+# Directory creation
+WORKDIR /app
+RUN mkdir -p backend/sr
 RUN mkdir -p map_downloader/src
 RUN mkdir -p frontend/dist
 RUN mkdir -p shared/src
+
+# Backend crate (no data/)
+COPY backend/Cargo.toml backend/
+COPY backend/src backend/src
+COPY backend/layout backend/layout
 
 # Map downloader crate
 COPY map_downloader/Cargo.toml map_downloader/
@@ -43,7 +40,14 @@ COPY frontend/Dioxus.toml frontend/
 # Shared
 COPY shared/Cargo.toml shared/
 COPY shared/src shared/src
+
+# Top-level workspace manifest and main build script
+COPY Cargo.toml ./
 COPY build.py ./
+COPY entrypoint.sh ./
+
+# Run all builds for the workspace
+RUN chmod +x entrypoint.sh
 
 RUN cargo update && cargo fetch
 
@@ -75,18 +79,16 @@ RUN set -e; \
 
 RUN cargo build --release -p map_downloader
 
-COPY entrypoint.sh ./
-RUN chmod +x entrypoint.sh
 
 FROM debian:stable-slim
 
 LABEL authors="rylan"
 
-WORKDIR /app
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
+WORKDIR /app
 
 COPY --from=builder /app/backend/layout /app/backend/layout/
 COPY --from=builder /app/target/release/groundstation_backend /app/
