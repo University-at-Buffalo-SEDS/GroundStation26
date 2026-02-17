@@ -1602,6 +1602,29 @@ async fn seed_from_db(
     ack_error_ts: &mut Signal<i64>,
     alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    let queue_snapshot = || -> Vec<TelemetryRow> {
+        if let Ok(q) = TELEMETRY_QUEUE.lock() {
+            q.iter().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    };
+
+    let merge_non_overlapping = |base: &mut Vec<TelemetryRow>, extra: Vec<TelemetryRow>| {
+        if extra.is_empty() {
+            return;
+        }
+        let keys: HashSet<(i64, String)> = base
+            .iter()
+            .map(|r| (r.timestamp_ms, r.data_type.clone()))
+            .collect();
+        base.extend(
+            extra
+                .into_iter()
+                .filter(|r| !keys.contains(&(r.timestamp_ms, r.data_type.clone()))),
+        );
+    };
+
     if !alive.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -1625,14 +1648,20 @@ async fn seed_from_db(
         // Merge DB snapshot with current in-memory rows.
         // If DB is stale vs live stream, keep live data authoritative near "now".
         let existing_rows = rows.read().clone();
-        if !existing_rows.is_empty() {
+        let queued_rows = queue_snapshot();
+        let mut live_rows = existing_rows;
+        merge_non_overlapping(&mut live_rows, queued_rows);
+        live_rows.sort_by(|a, b| {
+            a.timestamp_ms
+                .cmp(&b.timestamp_ms)
+                .then_with(|| a.data_type.cmp(&b.data_type))
+        });
+
+        if !live_rows.is_empty() {
             const RESEED_DB_STALE_LAG_MS: i64 = 3_000;
             const RESEED_LIVE_PREFERRED_MS: i64 = 30_000;
 
-            let live_latest_ts = existing_rows
-                .last()
-                .map(|r| r.timestamp_ms)
-                .unwrap_or(i64::MIN);
+            let live_latest_ts = live_rows.last().map(|r| r.timestamp_ms).unwrap_or(i64::MIN);
             let db_latest_ts = list.last().map(|r| r.timestamp_ms).unwrap_or(i64::MIN);
             let db_lag_ms = live_latest_ts.saturating_sub(db_latest_ts);
 
@@ -1642,7 +1671,7 @@ async fn seed_from_db(
                     .into_iter()
                     .filter(|r| r.timestamp_ms < db_cutoff_ts)
                     .collect();
-                out.extend(existing_rows);
+                out.extend(live_rows);
                 out
             } else {
                 let db_keys: HashSet<(i64, String)> = list
@@ -1651,7 +1680,7 @@ async fn seed_from_db(
                     .collect();
                 let mut out: Vec<TelemetryRow> = list;
                 out.extend(
-                    existing_rows
+                    live_rows
                         .into_iter()
                         .filter(|r| !db_keys.contains(&(r.timestamp_ms, r.data_type.clone()))),
                 );
@@ -1675,6 +1704,7 @@ async fn seed_from_db(
 
         // Capture rows that arrived while reseed was running and keep them.
         let latest_rows = rows.read().clone();
+        let latest_queued_rows = queue_snapshot();
         if !latest_rows.is_empty() {
             let seeded_keys: HashSet<(i64, String)> = list
                 .iter()
@@ -1686,12 +1716,26 @@ async fn seed_from_db(
                     .into_iter()
                     .filter(|r| !seeded_keys.contains(&(r.timestamp_ms, r.data_type.clone()))),
             );
+            let seeded_keys_after_rows: HashSet<(i64, String)> = merged
+                .iter()
+                .map(|r| (r.timestamp_ms, r.data_type.clone()))
+                .collect();
+            merged.extend(latest_queued_rows.into_iter().filter(|r| {
+                !seeded_keys_after_rows.contains(&(r.timestamp_ms, r.data_type.clone()))
+            }));
             merged.sort_by(|a, b| {
                 a.timestamp_ms
                     .cmp(&b.timestamp_ms)
                     .then_with(|| a.data_type.cmp(&b.data_type))
             });
             list = merged;
+        } else if !latest_queued_rows.is_empty() {
+            merge_non_overlapping(&mut list, latest_queued_rows);
+            list.sort_by(|a, b| {
+                a.timestamp_ms
+                    .cmp(&b.timestamp_ms)
+                    .then_with(|| a.data_type.cmp(&b.data_type))
+            });
         }
 
         if let Some(gps) = list.iter().rev().find_map(row_to_gps) {
