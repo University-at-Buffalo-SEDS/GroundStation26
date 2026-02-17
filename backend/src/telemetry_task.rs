@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
 use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::time::{interval, Duration};
 
@@ -31,6 +31,8 @@ const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
 const DB_WORK_QUEUE_SIZE: usize = 8_192;
 const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
+const DB_BATCH_MAX_DEFAULT: usize = 256;
+const DB_BATCH_WAIT_MS_DEFAULT: u64 = 8;
 
 static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
@@ -160,7 +162,7 @@ pub async fn telemetry_task(
     mut rx: mpsc::Receiver<TelemetryCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    let mut radio_interval = interval(Duration::from_millis(2));
+    let mut radio_interval = interval(Duration::from_millis(10));
     let mut handle_interval = interval(Duration::from_millis(1));
     let mut router_interval = interval(Duration::from_millis(10));
     let mut heartbeat_interval = interval(Duration::from_millis(500));
@@ -187,9 +189,39 @@ pub async fn telemetry_task(
 
     let db_worker = {
         let db = state.db.clone();
+        let db_batch_max = env_usize("GS_DB_BATCH_MAX", DB_BATCH_MAX_DEFAULT, 1, 4096);
+        let db_batch_wait_ms = std::env::var("GS_DB_BATCH_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DB_BATCH_WAIT_MS_DEFAULT)
+            .clamp(1, 250);
         tokio::spawn(async move {
-            while let Some(write) = db_rx.recv().await {
-                if let Err(e) = insert_db_write_with_retry(&db, &write).await {
+            while let Some(first) = db_rx.recv().await {
+                let mut batch: Vec<DbWrite> = Vec::with_capacity(db_batch_max);
+                batch.push(first);
+                let deadline =
+                    tokio::time::Instant::now() + Duration::from_millis(db_batch_wait_ms);
+
+                while batch.len() < db_batch_max {
+                    match db_rx.try_recv() {
+                        Ok(write) => batch.push(write),
+                        Err(MpscTryRecvError::Disconnected) => break,
+                        Err(MpscTryRecvError::Empty) => {
+                            let now = tokio::time::Instant::now();
+                            if now >= deadline {
+                                break;
+                            }
+                            let remaining = deadline.saturating_duration_since(now);
+                            match tokio::time::timeout(remaining, db_rx.recv()).await {
+                                Ok(Some(write)) => batch.push(write),
+                                Ok(None) => break,
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+
+                if let Err(e) = insert_db_batch_with_retry(&db, &batch).await {
                     eprintln!("DB insert failed after retry: {e}");
                 }
             }
@@ -537,23 +569,23 @@ fn valve_state_values(state: &AppState) -> [Option<f32>; 8] {
 const DB_RETRIES: usize = 5;
 const DB_RETRY_DELAY_MS: u64 = 50;
 
-async fn insert_db_write_with_retry(
+async fn insert_db_batch_once(
     db: &sqlx::SqlitePool,
-    write: &DbWrite,
+    writes: &[DbWrite],
 ) -> Result<(), sqlx::Error> {
-    let mut delay = DB_RETRY_DELAY_MS;
-    let mut last_err: Option<sqlx::Error> = None;
-
-    for _ in 0..=DB_RETRIES {
-        let result = match write {
+    let mut tx = db.begin().await?;
+    for write in writes {
+        match write {
             DbWrite::FlightState {
                 timestamp_ms,
                 state_code,
-            } => sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
-                .bind(*timestamp_ms)
-                .bind(*state_code)
-                .execute(db)
-                .await,
+            } => {
+                sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
+                    .bind(*timestamp_ms)
+                    .bind(*state_code)
+                    .execute(&mut *tx)
+                    .await?;
+            }
             DbWrite::Telemetry {
                 timestamp_ms,
                 data_type,
@@ -567,10 +599,23 @@ async fn insert_db_write_with_retry(
                     .bind(data_type.as_str())
                     .bind(values_json.as_deref())
                     .bind(payload_json.as_str())
-                    .execute(db)
-                    .await
+                    .execute(&mut *tx)
+                    .await?;
             }
-        };
+        }
+    }
+    tx.commit().await
+}
+
+async fn insert_db_batch_with_retry(
+    db: &sqlx::SqlitePool,
+    writes: &[DbWrite],
+) -> Result<(), sqlx::Error> {
+    let mut delay = DB_RETRY_DELAY_MS;
+    let mut last_err: Option<sqlx::Error> = None;
+
+    for _ in 0..=DB_RETRIES {
+        let result = insert_db_batch_once(db, writes).await;
         match result {
             Ok(_) => return Ok(()),
             Err(e) => {

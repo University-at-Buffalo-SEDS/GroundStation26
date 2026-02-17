@@ -37,7 +37,7 @@ use state_tab::StateTab;
 use types::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
 use warnings_tab::WarningsTab;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering}, Arc,
     Mutex,
@@ -1622,23 +1622,41 @@ async fn seed_from_db(
             }
         }
 
-        // Preserve continuity across reseed by merging DB snapshot with current
-        // in-memory rows, but prefer live rows near "now" where DB can be sparse
-        // under backpressure.
+        // Merge DB snapshot with current in-memory rows.
+        // If DB is stale vs live stream, keep live data authoritative near "now".
         let existing_rows = rows.read().clone();
         if !existing_rows.is_empty() {
-            const RESEED_LIVE_PREFERRED_MS: i64 = 10_000;
-            let latest_live_ts = existing_rows
+            const RESEED_DB_STALE_LAG_MS: i64 = 3_000;
+            const RESEED_LIVE_PREFERRED_MS: i64 = 30_000;
+
+            let live_latest_ts = existing_rows
                 .last()
                 .map(|r| r.timestamp_ms)
                 .unwrap_or(i64::MIN);
-            let db_cutoff_ts = latest_live_ts.saturating_sub(RESEED_LIVE_PREFERRED_MS);
+            let db_latest_ts = list.last().map(|r| r.timestamp_ms).unwrap_or(i64::MIN);
+            let db_lag_ms = live_latest_ts.saturating_sub(db_latest_ts);
 
-            let mut merged: Vec<TelemetryRow> = list
-                .into_iter()
-                .filter(|r| r.timestamp_ms < db_cutoff_ts)
-                .collect();
-            merged.extend(existing_rows);
+            let mut merged: Vec<TelemetryRow> = if db_lag_ms > RESEED_DB_STALE_LAG_MS {
+                let db_cutoff_ts = live_latest_ts.saturating_sub(RESEED_LIVE_PREFERRED_MS);
+                let mut out: Vec<TelemetryRow> = list
+                    .into_iter()
+                    .filter(|r| r.timestamp_ms < db_cutoff_ts)
+                    .collect();
+                out.extend(existing_rows);
+                out
+            } else {
+                let db_keys: HashSet<(i64, String)> = list
+                    .iter()
+                    .map(|r| (r.timestamp_ms, r.data_type.clone()))
+                    .collect();
+                let mut out: Vec<TelemetryRow> = list;
+                out.extend(
+                    existing_rows
+                        .into_iter()
+                        .filter(|r| !db_keys.contains(&(r.timestamp_ms, r.data_type.clone()))),
+                );
+                out
+            };
             merged.sort_by(|a, b| {
                 a.timestamp_ms
                     .cmp(&b.timestamp_ms)
@@ -1652,6 +1670,27 @@ async fn seed_from_db(
                     merged.drain(0..start);
                 }
             }
+            list = merged;
+        }
+
+        // Capture rows that arrived while reseed was running and keep them.
+        let latest_rows = rows.read().clone();
+        if !latest_rows.is_empty() {
+            let seeded_keys: HashSet<(i64, String)> = list
+                .iter()
+                .map(|r| (r.timestamp_ms, r.data_type.clone()))
+                .collect();
+            let mut merged = list;
+            merged.extend(
+                latest_rows
+                    .into_iter()
+                    .filter(|r| !seeded_keys.contains(&(r.timestamp_ms, r.data_type.clone()))),
+            );
+            merged.sort_by(|a, b| {
+                a.timestamp_ms
+                    .cmp(&b.timestamp_ms)
+                    .then_with(|| a.data_type.cmp(&b.data_type))
+            });
             list = merged;
         }
 

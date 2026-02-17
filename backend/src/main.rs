@@ -54,6 +54,44 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .clamp(min, max)
 }
 
+fn env_i64(name: &str, default: i64, min: i64, max: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+async fn apply_sqlite_pragmas(db: &sqlx::SqlitePool) {
+    let synchronous = std::env::var("GS_SQLITE_SYNCHRONOUS")
+        .unwrap_or_else(|_| "NORMAL".to_string())
+        .to_uppercase();
+    let synchronous = match synchronous.as_str() {
+        "OFF" | "NORMAL" | "FULL" | "EXTRA" => synchronous,
+        _ => "NORMAL".to_string(),
+    };
+
+    let busy_timeout_ms = env_i64("GS_SQLITE_BUSY_TIMEOUT_MS", 5_000, 100, 120_000);
+    let wal_autocheckpoint = env_i64("GS_SQLITE_WAL_AUTOCHECKPOINT", 1_000, 100, 100_000);
+    let cache_kib = env_i64("GS_SQLITE_CACHE_SIZE_KIB", 32 * 1024, 1 * 1024, 512 * 1024);
+    let cache_pages = -cache_kib; // negative => kibibytes
+
+    let pragmas = [
+        "PRAGMA journal_mode=WAL;".to_string(),
+        format!("PRAGMA synchronous={synchronous};"),
+        "PRAGMA temp_store=MEMORY;".to_string(),
+        format!("PRAGMA busy_timeout={busy_timeout_ms};"),
+        format!("PRAGMA wal_autocheckpoint={wal_autocheckpoint};"),
+        format!("PRAGMA cache_size={cache_pages};"),
+    ];
+
+    for stmt in pragmas {
+        if let Err(err) = sqlx::query(&stmt).execute(db).await {
+            eprintln!("SQLite pragma failed ({stmt}): {err}");
+        }
+    }
+}
+
 async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
     // If DB is in WAL mode, this checkpoints all frames and truncates WAL to 0 bytes.
     if let Err(err) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -140,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path)).await?;
+    apply_sqlite_pragmas(&db).await;
 
     // --- Tables ---
     sqlx::query(

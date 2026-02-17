@@ -840,6 +840,53 @@ def _clear_dx_web_cache(frontend_dir: Path) -> None:
         print(f"Cleared stale Dioxus web cache dirs: {removed}")
 
 
+def _prune_stale_hashed_assets(frontend_dir: Path) -> None:
+    """
+    Keep only the newest hash generation per asset family in dist/public/assets.
+    Example:
+      groundstation_frontend-dxh<hash>.js
+      groundstation_frontend_bg-dxh<hash>.wasm
+    Old hash generations (and their .gz/.br variants) are removed.
+    """
+    assets_dir = frontend_dir / "dist" / "public" / "assets"
+    if not assets_dir.exists():
+        return
+
+    hashed_re = re.compile(r"^(?P<base>.+)-dxh(?P<hash>[0-9a-f]+)(?P<ext>\.[^.]+)(?P<comp>\.gz|\.br)?$")
+    # key: (base, ext) -> best hash by newest mtime
+    keep_hash_for_key: dict[tuple[str, str], tuple[str, float]] = {}
+    parsed: list[tuple[Path, str, str, str]] = []
+
+    for p in assets_dir.iterdir():
+        if not p.is_file():
+            continue
+        m = hashed_re.match(p.name)
+        if not m:
+            continue
+        base = m.group("base")
+        h = m.group("hash")
+        ext = m.group("ext")
+        parsed.append((p, base, ext, h))
+        key = (base, ext)
+        mtime = p.stat().st_mtime
+        prev = keep_hash_for_key.get(key)
+        if prev is None or mtime > prev[1]:
+            keep_hash_for_key[key] = (h, mtime)
+
+    removed = 0
+    for p, base, ext, h in parsed:
+        keep = keep_hash_for_key.get((base, ext))
+        if keep is not None and h != keep[0]:
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                pass
+
+    if removed:
+        print(f"Pruned stale hashed assets: {removed}")
+
+
 def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
     """
     Construct an environment that:
@@ -1160,6 +1207,7 @@ def build_frontend(
 
         if platform_name in {None, "web"}:
             _manual_optimize_web_wasm(frontend_dir, env, max_size=max_size)
+            _prune_stale_hashed_assets(frontend_dir)
             _compress_web_assets(frontend_dir, env)
 
         if platform_name == "macos":
