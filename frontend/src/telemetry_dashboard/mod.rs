@@ -283,6 +283,7 @@ macro_rules! log {
 
 pub const HISTORY_MS: i64 = 60_000 * 20; // 20 minutes
 const RESEED_BUCKET_MS: i64 = 20;
+const STARTUP_SEED_DELAY_MS: u64 = 1_200;
 
 // unified storage keys
 const WARNING_ACK_STORAGE_KEY: &str = "gs_last_warning_ack_ts";
@@ -535,6 +536,13 @@ fn reconnect_and_reload_ui() {
     }
 }
 
+fn clear_telemetry_runtime_buffers() {
+    if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
+        q.clear();
+    }
+    charts_cache_reset_and_ingest(&[]);
+}
+
 // ---------- Cross-platform WS handle ----------
 #[derive(Clone)]
 struct WsSender {
@@ -601,6 +609,7 @@ fn TelemetryDashboardInner() -> Element {
     let layout_loading = use_signal(|| true);
     let layout_error = use_signal(|| None::<String>);
     let did_request_layout = use_signal(|| false);
+    let startup_seed_ready = use_signal(|| false);
 
     let parse_i64 = |s: &str| s.parse::<i64>().unwrap_or(0);
 
@@ -705,6 +714,41 @@ fn TelemetryDashboardInner() -> Element {
                         }
                     }
                 }
+            });
+        });
+    }
+
+    // Delay the first DB seed until initial UI/layout load has settled.
+    // Subsequent reseeds (button/reconnect) remain immediate.
+    {
+        let mut startup_seed_ready = startup_seed_ready;
+        let layout_loading = layout_loading;
+        let alive = alive.clone();
+
+        use_effect(move || {
+            if *startup_seed_ready.read() || *layout_loading.read() {
+                return;
+            }
+
+            let alive = alive.clone();
+            let epoch = *WS_EPOCH.read();
+            spawn(async move {
+                let delay_ms: u64 = std::env::var("GS_UI_STARTUP_SEED_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(STARTUP_SEED_DELAY_MS)
+                    .clamp(0, 15_000);
+
+                #[cfg(target_arch = "wasm32")]
+                gloo_timers::future::TimeoutFuture::new(delay_ms as u32).await;
+
+                #[cfg(not(target_arch = "wasm32"))]
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+
+                if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
+                    return;
+                }
+                startup_seed_ready.set(true);
             });
         });
     }
@@ -848,10 +892,17 @@ fn TelemetryDashboardInner() -> Element {
         let mut ack_error_ts_s = ack_error_ts;
 
         let alive = alive.clone();
+        let startup_seed_ready = startup_seed_ready;
 
         use_effect(move || {
             let current_seed = *SEED_EPOCH.read();
             if last_seed_epoch.read().as_ref() == Some(&current_seed) {
+                return;
+            }
+
+            // Startup seed waits until layout has loaded and a short settle delay completes.
+            // Explicit reseeds (seed epoch > 0) bypass this gate.
+            if current_seed == 0 && !*startup_seed_ready.read() {
                 return;
             }
             last_seed_epoch.set(Some(current_seed));
@@ -1118,6 +1169,7 @@ fn TelemetryDashboardInner() -> Element {
     };
 
     // Reload button (web: full reload, native: remount inner UI)
+    let mut rows = rows;
     let mut warnings = warnings;
     let mut errors = errors;
     let mut _refresh_layout = refresh_layout;
@@ -1133,13 +1185,16 @@ fn TelemetryDashboardInner() -> Element {
                 cursor:pointer;
             ",
             onclick: move |_| {
-                    charts_cache_request_refit();
-                    warnings.set(Vec::new());
-                    errors.set(Vec::new());
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
+                // Clear live/frontend caches first so native reload starts from a clean slate.
+                clear_telemetry_runtime_buffers();
+                rows.set(Vec::new());
+                charts_cache_request_refit();
+                warnings.set(Vec::new());
+                errors.set(Vec::new());
+                #[cfg(not(target_arch = "wasm32"))]
+                {
                     _refresh_layout();
-                    }
+                }
                 reconnect_and_reload_ui();
             },
             "RELOAD"
