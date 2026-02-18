@@ -37,7 +37,7 @@ use state_tab::StateTab;
 use types::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
 use warnings_tab::WarningsTab;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering}, Arc,
     Mutex,
@@ -282,6 +282,7 @@ macro_rules! log {
 }
 
 pub const HISTORY_MS: i64 = 60_000 * 20; // 20 minutes
+const RESEED_BUCKET_MS: i64 = 20;
 
 // unified storage keys
 const WARNING_ACK_STORAGE_KEY: &str = "gs_last_warning_ack_ts";
@@ -1602,6 +1603,78 @@ async fn seed_from_db(
     ack_error_ts: &mut Signal<i64>,
     alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    fn sort_rows(rows: &mut [TelemetryRow]) {
+        rows.sort_by(|a, b| {
+            a.timestamp_ms
+                .cmp(&b.timestamp_ms)
+                .then_with(|| a.data_type.cmp(&b.data_type))
+        });
+    }
+
+    fn prune_history(rows: &mut Vec<TelemetryRow>) {
+        if let Some(last) = rows.last() {
+            let cutoff = last.timestamp_ms - HISTORY_MS;
+            let start = rows.partition_point(|r| r.timestamp_ms < cutoff);
+            if start > 0 {
+                rows.drain(0..start);
+            }
+        }
+    }
+
+    fn compact_rows_by_bucket(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
+        let mut by_bucket: HashMap<(String, i64), TelemetryRow> = HashMap::new();
+        for row in rows {
+            let bid = row.timestamp_ms.div_euclid(RESEED_BUCKET_MS);
+            let key = (row.data_type.clone(), bid);
+            match by_bucket.get_mut(&key) {
+                Some(existing) => {
+                    if row.timestamp_ms >= existing.timestamp_ms {
+                        *existing = row;
+                    }
+                }
+                None => {
+                    by_bucket.insert(key, row);
+                }
+            }
+        }
+        let mut out: Vec<TelemetryRow> = by_bucket.into_values().collect();
+        sort_rows(&mut out);
+        out
+    }
+
+    fn merge_db_and_live(
+        mut db_rows: Vec<TelemetryRow>,
+        live_rows: Vec<TelemetryRow>,
+    ) -> Vec<TelemetryRow> {
+        // For each data type, DB supplies only buckets older than the oldest in-memory live bucket.
+        // Live rows own the overlap boundary so reseed handoff cannot create a bucket mismatch gap.
+        let mut live_oldest_bid_by_type: HashMap<String, i64> = HashMap::new();
+        for row in &live_rows {
+            let bid = row.timestamp_ms.div_euclid(RESEED_BUCKET_MS);
+            live_oldest_bid_by_type
+                .entry(row.data_type.clone())
+                .and_modify(|oldest| {
+                    if bid < *oldest {
+                        *oldest = bid;
+                    }
+                })
+                .or_insert(bid);
+        }
+
+        db_rows.retain(|row| {
+            let bid = row.timestamp_ms.div_euclid(RESEED_BUCKET_MS);
+            match live_oldest_bid_by_type.get(&row.data_type) {
+                Some(oldest_live_bid) => bid < *oldest_live_bid,
+                None => true,
+            }
+        });
+
+        db_rows.extend(live_rows);
+        let mut merged = compact_rows_by_bucket(db_rows);
+        prune_history(&mut merged);
+        merged
+    }
+
     let queue_snapshot = || -> Vec<TelemetryRow> {
         if let Ok(q) = TELEMETRY_QUEUE.lock() {
             q.iter().cloned().collect()
@@ -1620,99 +1693,20 @@ async fn seed_from_db(
             return Ok(());
         }
 
-        list.sort_by_key(|r| r.timestamp_ms);
-
-        if let Some(last) = list.last() {
-            let cutoff = last.timestamp_ms - HISTORY_MS;
-            let start = list.partition_point(|r| r.timestamp_ms < cutoff);
-            if start > 0 {
-                list.drain(0..start);
-            }
-        }
-
-        // Merge DB snapshot with current in-memory rows.
-        // If DB is stale vs live stream, keep live data authoritative near "now".
-        let existing_rows = rows.read().clone();
-        let queued_rows = queue_snapshot();
-        let mut live_rows = existing_rows;
-        live_rows.extend(queued_rows);
-        live_rows.sort_by(|a, b| {
-            a.timestamp_ms
-                .cmp(&b.timestamp_ms)
-                .then_with(|| a.data_type.cmp(&b.data_type))
-        });
-
-        if !live_rows.is_empty() {
-            const RESEED_DB_STALE_LAG_MS: i64 = 3_000;
-            const RESEED_LIVE_PREFERRED_MS: i64 = 30_000;
-
-            let live_latest_ts = live_rows.last().map(|r| r.timestamp_ms).unwrap_or(i64::MIN);
-            let db_latest_ts = list.last().map(|r| r.timestamp_ms).unwrap_or(i64::MIN);
-            let db_lag_ms = live_latest_ts.saturating_sub(db_latest_ts);
-
-            let mut merged: Vec<TelemetryRow> = if db_lag_ms > RESEED_DB_STALE_LAG_MS {
-                let db_cutoff_ts = live_latest_ts.saturating_sub(RESEED_LIVE_PREFERRED_MS);
-                let mut out: Vec<TelemetryRow> = list
-                    .into_iter()
-                    .filter(|r| r.timestamp_ms < db_cutoff_ts)
-                    .collect();
-                out.extend(live_rows);
-                out
-            } else {
-                let mut out: Vec<TelemetryRow> = list;
-                out.extend(live_rows);
-                out
-            };
-            merged.sort_by(|a, b| {
-                a.timestamp_ms
-                    .cmp(&b.timestamp_ms)
-                    .then_with(|| a.data_type.cmp(&b.data_type))
-            });
-
-            if let Some(last) = merged.last() {
-                let cutoff = last.timestamp_ms - HISTORY_MS;
-                let start = merged.partition_point(|r| r.timestamp_ms < cutoff);
-                if start > 0 {
-                    merged.drain(0..start);
-                }
-            }
-            list = merged;
-        }
+        sort_rows(&mut list);
+        prune_history(&mut list);
+        list = compact_rows_by_bucket(list);
 
         // Capture rows that arrived while reseed was running and keep them.
-        let latest_rows = rows.read().clone();
-        let latest_queued_rows = queue_snapshot();
-        if !latest_rows.is_empty() {
-            let mut merged = list;
-            merged.extend(latest_rows);
-            merged.extend(latest_queued_rows);
-            merged.sort_by(|a, b| {
-                a.timestamp_ms
-                    .cmp(&b.timestamp_ms)
-                    .then_with(|| a.data_type.cmp(&b.data_type))
-            });
-            if let Some(last) = merged.last() {
-                let cutoff = last.timestamp_ms - HISTORY_MS;
-                let start = merged.partition_point(|r| r.timestamp_ms < cutoff);
-                if start > 0 {
-                    merged.drain(0..start);
-                }
-            }
-            list = merged;
-        } else if !latest_queued_rows.is_empty() {
-            list.extend(latest_queued_rows);
-            list.sort_by(|a, b| {
-                a.timestamp_ms
-                    .cmp(&b.timestamp_ms)
-                    .then_with(|| a.data_type.cmp(&b.data_type))
-            });
-            if let Some(last) = list.last() {
-                let cutoff = last.timestamp_ms - HISTORY_MS;
-                let start = list.partition_point(|r| r.timestamp_ms < cutoff);
-                if start > 0 {
-                    list.drain(0..start);
-                }
-            }
+        let mut live_rows = rows.read().clone();
+        live_rows.extend(queue_snapshot());
+        live_rows.extend(rows.read().clone());
+        live_rows.extend(queue_snapshot());
+        if !live_rows.is_empty() {
+            sort_rows(&mut live_rows);
+            prune_history(&mut live_rows);
+            live_rows = compact_rows_by_bucket(live_rows);
+            list = merge_db_and_live(list, live_rows);
         }
 
         if let Some(gps) = list.iter().rev().find_map(row_to_gps) {
@@ -1730,18 +1724,8 @@ async fn seed_from_db(
         }
         if !post_reset_queued_rows.is_empty() {
             list.extend(post_reset_queued_rows);
-            list.sort_by(|a, b| {
-                a.timestamp_ms
-                    .cmp(&b.timestamp_ms)
-                    .then_with(|| a.data_type.cmp(&b.data_type))
-            });
-            if let Some(last) = list.last() {
-                let cutoff = last.timestamp_ms - HISTORY_MS;
-                let start = list.partition_point(|r| r.timestamp_ms < cutoff);
-                if start > 0 {
-                    list.drain(0..start);
-                }
-            }
+            list = compact_rows_by_bucket(list);
+            prune_history(&mut list);
         }
         rows.set(list);
     }
