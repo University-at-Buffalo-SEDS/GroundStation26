@@ -731,7 +731,6 @@ fn TelemetryDashboardInner() -> Element {
             }
 
             let alive = alive.clone();
-            let epoch = *WS_EPOCH.read();
             spawn(async move {
                 let delay_ms: u64 = std::env::var("GS_UI_STARTUP_SEED_DELAY_MS")
                     .ok()
@@ -745,7 +744,7 @@ fn TelemetryDashboardInner() -> Element {
                 #[cfg(not(target_arch = "wasm32"))]
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
-                if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
+                if !alive.load(Ordering::Relaxed) {
                     return;
                 }
                 startup_seed_ready.set(true);
