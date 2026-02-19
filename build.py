@@ -674,18 +674,35 @@ def _bash_login_path(cwd: Path) -> Optional[str]:
 
 
 def _which_in_path(exe: str, path_value: str) -> Optional[Path]:
+    found = shutil.which(exe, path=path_value)
+    if found:
+        return Path(found)
+
     def _is_executable(path: Path) -> bool:
         try:
             return path.exists() and os.access(path, os.X_OK)
         except OSError:
             return False
 
+    exes = [exe]
+    if os.name == "nt":
+        pathext = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+        for ext in pathext.split(";"):
+            ext = ext.strip()
+            if not ext:
+                continue
+            if not ext.startswith("."):
+                ext = f".{ext}"
+            exes.append(f"{exe}{ext.lower()}")
+            exes.append(f"{exe}{ext.upper()}")
+
     for raw_dir in path_value.split(os.pathsep):
         if not raw_dir:
             continue
-        candidate = Path(raw_dir) / exe
-        if _is_executable(candidate):
-            return candidate
+        for name in exes:
+            candidate = Path(raw_dir) / name
+            if _is_executable(candidate):
+                return candidate
     return None
 
 
@@ -764,6 +781,14 @@ def _find_dx(path_value: str) -> Optional[Path]:
     ]
     if _is_root_user():
         candidates.append(Path("/root/.cargo/bin/dx"))
+    if os.name == "nt":
+        candidates.extend(
+            [
+                Path(str(Path.home() / ".cargo" / "bin" / "dx.exe")),
+                Path(str(Path.home() / ".cargo" / "bin" / "dx.cmd")),
+                Path(str(Path.home() / ".cargo" / "bin" / "dx.bat")),
+            ]
+        )
     for cand in candidates:
         try:
             is_executable = cand.exists() and os.access(cand, os.X_OK)
