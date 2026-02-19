@@ -674,9 +674,7 @@ def _bash_login_path(cwd: Path) -> Optional[str]:
 
 
 def _which_in_path(exe: str, path_value: str) -> Optional[Path]:
-    found = shutil.which(exe, path=path_value)
-    if found:
-        return Path(found)
+    exe_str = os.fspath(exe)
 
     def _is_executable(path: Path) -> bool:
         try:
@@ -684,7 +682,7 @@ def _which_in_path(exe: str, path_value: str) -> Optional[Path]:
         except OSError:
             return False
 
-    exes = [exe]
+    exes = [exe_str]
     if os.name == "nt":
         pathext = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
         for ext in pathext.split(";"):
@@ -693,8 +691,8 @@ def _which_in_path(exe: str, path_value: str) -> Optional[Path]:
                 continue
             if not ext.startswith("."):
                 ext = f".{ext}"
-            exes.append(f"{exe}{ext.lower()}")
-            exes.append(f"{exe}{ext.upper()}")
+            exes.append(f"{exe_str}{ext.lower()}")
+            exes.append(f"{exe_str}{ext.upper()}")
 
     for raw_dir in path_value.split(os.pathsep):
         if not raw_dir:
