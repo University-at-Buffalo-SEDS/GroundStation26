@@ -37,7 +37,7 @@ fn main() {
     let cfg = dioxus_desktop::Config::new().with_asynchronous_custom_protocol(
         "gs26",
         |_id, request, responder| {
-            handle_gs26_protocol_async(request, responder);
+            _handle_gs26_protocol_async(request, responder);
         },
     );
     LaunchBuilder::desktop().with_cfg(cfg).launch(app::App);
@@ -127,7 +127,7 @@ fn handle_gs26_protocol(request: HttpRequest<Vec<u8>>) -> HttpResponse<Cow<'stat
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn handle_gs26_protocol_async(request: HttpRequest<Vec<u8>>, responder: RequestAsyncResponder) {
+fn _handle_gs26_protocol_async(request: HttpRequest<Vec<u8>>, responder: RequestAsyncResponder) {
     let _ = std::thread::Builder::new()
         .name("gs26-proto-req".to_string())
         .spawn(move || {
