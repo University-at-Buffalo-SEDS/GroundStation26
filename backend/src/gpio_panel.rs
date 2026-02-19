@@ -307,6 +307,10 @@ fn led_for(policy: &ActionPolicyMsg, cmd: &str, tick_count: u64) -> bool {
     if !control.enabled {
         return false;
     }
+    if matches!(control.blink, BlinkMode::None) {
+        // Enabled but non-prompting controls stay dark unless currently actuated.
+        return control.actuated.unwrap_or(false);
+    }
     blink_to_level(
         control.blink.clone(),
         control.actuated.unwrap_or(false),

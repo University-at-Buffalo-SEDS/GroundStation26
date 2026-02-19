@@ -72,6 +72,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alerts", get(get_alerts))
         .route("/api/boards", get(get_boards))
         .route("/api/layout", get(get_layout))
+        .route("/api/network_time", get(get_network_time))
         .route("/api/notifications", get(get_notifications))
         .route(
             "/api/notifications/{id}/dismiss",
@@ -105,6 +106,7 @@ pub enum WsOutMsg {
     BoardStatus(BoardStatusMsg),
     Notifications(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
+    NetworkTime(NetworkTimeMsg),
 }
 
 #[derive(Clone, Serialize)]
@@ -158,6 +160,11 @@ pub struct GpsResponse {
     pub rocket: Option<GpsPoint>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NetworkTimeMsg {
+    pub timestamp_ms: i64,
+}
+
 async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Latest valve state row: data_type = 'VALVE_STATE'
     let row = sqlx::query(
@@ -169,9 +176,9 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
 
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
@@ -204,9 +211,9 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
         let values = values_from_row(&r);
@@ -277,12 +284,12 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         ORDER BY f.timestamp_ms ASC
         "#,
     )
-    .bind(BUCKET_MS)
-    .bind(cutoff)
-    .bind(now_ms)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(BUCKET_MS)
+        .bind(cutoff)
+        .bind(now_ms)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -325,6 +332,12 @@ async fn get_flight_state(State(state): State<Arc<AppState>>) -> impl IntoRespon
     let flight_state = groundstation_shared::u8_to_flight_state(flight_state as u8)
         .unwrap_or(FlightState::Startup);
     Json(flight_state)
+}
+
+async fn get_network_time() -> impl IntoResponse {
+    Json(NetworkTimeMsg {
+        timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+    })
 }
 
 async fn get_notifications(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -410,8 +423,16 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         if ws_out_tx.send(initial_action_policy).await.is_err() {
             return;
         }
+        let initial_network_time = serde_json::to_string(&WsOutMsg::NetworkTime(NetworkTimeMsg {
+            timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+        }))
+            .unwrap_or_default();
+        if ws_out_tx.send(initial_network_time).await.is_err() {
+            return;
+        }
 
         let adaptive_rate = std::env::var("GS_WS_ADAPTIVE_RATE").ok().as_deref() != Some("0");
+        let mut network_time_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         let telemetry_flush_ms: u64 = std::env::var("GS_WS_TELEMETRY_FLUSH_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -526,6 +547,16 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                     }
                 }
 
+                _ = network_time_tick.tick() => {
+                    let msg = WsOutMsg::NetworkTime(NetworkTimeMsg {
+                        timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+                    });
+                    let text = serde_json::to_string(&msg).unwrap_or_default();
+                    if ws_out_tx.send(text).await.is_err() {
+                        break;
+                    }
+                }
+
                 recv = telemetry_rx.recv() => {
                     match recv {
                         Ok(pkt) => {
@@ -628,10 +659,10 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-    .bind(cutoff)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     let alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -673,11 +704,11 @@ fn spawn_alert_insert(
             VALUES (?, ?, ?)
             "#,
         )
-        .bind(timestamp_ms)
-        .bind(severity)
-        .bind(message)
-        .execute(&db)
-        .await;
+            .bind(timestamp_ms)
+            .bind(severity)
+            .bind(message)
+            .execute(&db)
+            .await;
         state_for_task.end_db_write();
     });
 }

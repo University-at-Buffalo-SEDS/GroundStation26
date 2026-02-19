@@ -39,8 +39,8 @@ use warnings_tab::WarningsTab;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, Ordering}, Arc,
+    Mutex,
 };
 
 use once_cell::sync::Lazy;
@@ -231,6 +231,7 @@ enum WsInMsg {
     BoardStatus(BoardStatusMsg),
     Notifications(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
+    NetworkTime(NetworkTimeMsg),
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -280,6 +281,11 @@ pub struct PersistentNotification {
     pub id: u64,
     pub timestamp_ms: i64,
     pub message: String,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NetworkTimeMsg {
+    pub timestamp_ms: i64,
 }
 
 // --------------------------
@@ -663,6 +669,7 @@ fn TelemetryDashboardInner() -> Element {
     let errors = use_signal(Vec::<AlertMsg>::new);
     let notifications = use_signal(Vec::<PersistentNotification>::new);
     let action_policy = use_signal(ActionPolicyMsg::default_locked);
+    let network_time = use_signal(|| None::<i64>);
     let flight_state = use_signal(|| FlightState::Startup);
     let board_status = use_signal(Vec::<BoardStatusEntry>::new);
 
@@ -933,6 +940,7 @@ fn TelemetryDashboardInner() -> Element {
         let mut ack_error_ts_s = ack_error_ts;
         let mut notifications_s = notifications;
         let mut action_policy_s = action_policy;
+        let mut network_time_s = network_time;
 
         let alive = alive.clone();
         let startup_seed_ready = startup_seed_ready;
@@ -966,6 +974,7 @@ fn TelemetryDashboardInner() -> Element {
                     &mut errors_s,
                     &mut notifications_s,
                     &mut action_policy_s,
+                    &mut network_time_s,
                     &mut board_status_s,
                     &mut rocket_gps_s,
                     &mut user_gps_s,
@@ -973,7 +982,7 @@ fn TelemetryDashboardInner() -> Element {
                     &mut ack_error_ts_s,
                     alive.clone(),
                 )
-                .await
+                    .await
                     && alive.load(Ordering::Relaxed)
                     && *WS_EPOCH.read() == epoch
                 {
@@ -1032,10 +1041,10 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
-            || *warning_event_counter.read() > *ack_warning_count.read());
+        || *warning_event_counter.read() > *ack_warning_count.read());
     let has_unacked_errors = latest_error_ts > 0
         && (latest_error_ts > *ack_error_ts.read()
-            || *error_event_counter.read() > *ack_error_count.read());
+        || *error_event_counter.read() > *ack_error_count.read());
 
     let border_style = if has_unacked_errors && *flash_on.read() {
         "2px solid #ef4444"
@@ -1106,6 +1115,7 @@ fn TelemetryDashboardInner() -> Element {
                     errors,
                     notifications,
                     action_policy,
+                    network_time,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -1114,7 +1124,7 @@ fn TelemetryDashboardInner() -> Element {
                     user_gps,
                     alive.clone(),
                 )
-                .await
+                    .await
                     && alive.load(Ordering::Relaxed)
                 {
                     log!("[WS] supervisor ended: {e}");
@@ -1262,6 +1272,7 @@ fn TelemetryDashboardInner() -> Element {
     let layout_snapshot = layout_config.read().clone();
     let layout_error_snapshot = layout_error.read().clone();
     let layout_loading_snapshot = *layout_loading.read();
+    let network_time_snapshot = *network_time.read();
 
     // MAIN UI
     rsx! {
@@ -1479,6 +1490,9 @@ fn TelemetryDashboardInner() -> Element {
                         min-width:260px;
                     ",
                     span { style: "color:#9ca3af;", "Status:" }
+                    if let Some(ts) = network_time_snapshot {
+                        span { style: "color:#cbd5e1; margin-left:0.5rem;", "(Net time: {ts} ms)" }
+                    }
 
                     if !has_warnings && !has_errors {
                         span { style: "color:#22c55e; font-weight:600;", "Nominal" }
@@ -1794,6 +1808,7 @@ async fn seed_from_db(
     errors: &mut Signal<Vec<AlertMsg>>,
     notifications: &mut Signal<Vec<PersistentNotification>>,
     action_policy: &mut Signal<ActionPolicyMsg>,
+    network_time: &mut Signal<Option<i64>>,
     board_status: &mut Signal<Vec<BoardStatusEntry>>,
     rocket_gps: &mut Signal<Option<(f64, f64)>>,
     user_gps: &mut Signal<Option<(f64, f64)>>,
@@ -1979,6 +1994,12 @@ async fn seed_from_db(
         action_policy.set(policy);
     }
 
+    if let Ok(nt) = http_get_json::<NetworkTimeMsg>("/api/network_time").await
+        && alive.load(Ordering::Relaxed)
+    {
+        network_time.set(Some(nt.timestamp_ms));
+    }
+
     if !alive.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -2016,6 +2037,7 @@ async fn connect_ws_supervisor(
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
     action_policy: Signal<ActionPolicyMsg>,
+    network_time: Signal<Option<i64>>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2048,6 +2070,7 @@ async fn connect_ws_supervisor(
                     errors,
                     notifications,
                     action_policy,
+                    network_time,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -2056,7 +2079,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                .await
+                    .await
             }
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -2068,6 +2091,7 @@ async fn connect_ws_supervisor(
                     errors,
                     notifications,
                     action_policy,
+                    network_time,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -2076,7 +2100,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                .await
+                    .await
             }
         };
 
@@ -2111,6 +2135,7 @@ async fn connect_ws_once_wasm(
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
     action_policy: Signal<ActionPolicyMsg>,
+    network_time: Signal<Option<i64>>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2159,6 +2184,7 @@ async fn connect_ws_once_wasm(
                     errors,
                     notifications,
                     action_policy,
+                    network_time,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -2212,7 +2238,7 @@ async fn connect_ws_once_wasm(
             &mut closed_rx,
             gloo_timers::future::TimeoutFuture::new(150),
         )
-        .await;
+            .await;
 
         match done {
             futures_util::future::Either::Left((_closed, _timeout)) => break,
@@ -2237,6 +2263,7 @@ async fn connect_ws_once_native(
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
     action_policy: Signal<ActionPolicyMsg>,
+    network_time: Signal<Option<i64>>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2273,9 +2300,9 @@ async fn connect_ws_once_native(
             false,
             Some(tokio_tungstenite::Connector::NativeTls(tls)),
         )
-        .await
-        .map_err(|e| format!("[WS] connect failed: {e}"))?
-        .0
+            .await
+            .map_err(|e| format!("[WS] connect failed: {e}"))?
+            .0
     } else {
         tokio_tungstenite::connect_async(ws_url.as_str())
             .await
@@ -2312,6 +2339,7 @@ async fn connect_ws_once_native(
                 errors,
                 notifications,
                 action_policy,
+                network_time,
                 warning_event_counter,
                 error_event_counter,
                 flight_state,
@@ -2336,6 +2364,7 @@ fn handle_ws_message(
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
     action_policy: Signal<ActionPolicyMsg>,
+    network_time: Signal<Option<i64>>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2349,6 +2378,7 @@ fn handle_ws_message(
     let mut error_event_counter = error_event_counter;
     let mut notifications = notifications;
     let mut action_policy = action_policy;
+    let mut network_time = network_time;
     let mut flight_state = flight_state;
     let mut board_status = board_status;
     let mut rocket_gps = rocket_gps;
@@ -2438,6 +2468,10 @@ fn handle_ws_message(
 
         WsInMsg::ActionPolicy(policy) => {
             action_policy.set(policy);
+        }
+
+        WsInMsg::NetworkTime(t) => {
+            network_time.set(Some(t.timestamp_ms));
         }
     }
 }

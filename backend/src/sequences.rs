@@ -368,7 +368,17 @@ fn build_policy(
     }
 
     if !is_fill_state(flight_state) {
-        return policy_with_overrides(true, valves, HashMap::new());
+        // Idle/other non-fill states: keep controls available with no highlight.
+        // Launch remains enabled by user request once key is installed.
+        // RetractPlumbing is one-way: once actuated, keep it disabled.
+        let mut enabled: HashMap<&'static str, BlinkMode> = HashMap::new();
+        for cmd in all_command_names() {
+            if cmd == "RetractPlumbing" && valves.retract == Some(true) {
+                continue;
+            }
+            enabled.insert(cmd, BlinkMode::None);
+        }
+        return policy_with_overrides(true, valves, enabled);
     }
 
     let mut enabled: HashMap<&'static str, BlinkMode> = HashMap::new();
@@ -420,6 +430,9 @@ fn build_policy(
 }
 
 fn read_key_enabled(state: &AppState, cfg: &SequenceConfig) -> bool {
+    if cfg!(feature = "testing") {
+        return true;
+    }
     if !cfg.key_required {
         return true;
     }

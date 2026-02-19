@@ -1,3 +1,5 @@
+#[cfg(feature = "testing")]
+use crate::flight_sim;
 use crate::state::AppState;
 use groundstation_shared::TelemetryRow;
 use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
@@ -113,6 +115,7 @@ enum DbWrite {
     Telemetry {
         timestamp_ms: i64,
         data_type: String,
+        sender_id: String,
         values_json: Option<String>,
         payload_json: String,
     },
@@ -295,6 +298,12 @@ pub async fn telemetry_task(
                         continue;
                     }
                     state.record_command_accepted(&cmd, get_current_timestamp_ms());
+                    #[cfg(feature = "testing")]
+                    {
+                        if flight_sim::handle_command(&cmd) {
+                            continue;
+                        }
+                    }
                     match cmd {
                         TelemetryCommand::Launch => {
                                 if let Err(e) = router.log_queue(
@@ -597,14 +606,16 @@ async fn insert_db_batch_once(
             DbWrite::Telemetry {
                 timestamp_ms,
                 data_type,
+                sender_id,
                 values_json,
                 payload_json,
             } => {
                 sqlx::query(
-                    "INSERT INTO telemetry (timestamp_ms, data_type, values_json, payload_json) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO telemetry (timestamp_ms, data_type, sender_id, values_json, payload_json) VALUES (?, ?, ?, ?, ?)",
                 )
                     .bind(*timestamp_ms)
                     .bind(data_type.as_str())
+                    .bind(sender_id.as_str())
                     .bind(values_json.as_deref())
                     .bind(payload_json.as_str())
                     .execute(&mut *tx)
@@ -753,7 +764,7 @@ async fn handle_packet(
                 state_code: pkt_data as i64,
             },
         )
-        .await;
+            .await;
 
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
@@ -779,7 +790,7 @@ async fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                .ok();
+                    .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 queue_db_write(
@@ -789,11 +800,12 @@ async fn handle_packet(
                     DbWrite::Telemetry {
                         timestamp_ms: ts_ms,
                         data_type: VALVE_STATE_DATA_TYPE.to_string(),
+                        sender_id: pkt.sender().to_string(),
                         values_json,
                         payload_json,
                     },
                 )
-                .await;
+                    .await;
 
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
@@ -824,7 +836,7 @@ async fn handle_packet(
                 .map(|v| v.map(|n| n as f64))
                 .collect::<Vec<_>>(),
         )
-        .ok();
+            .ok();
 
         if should_persist_telemetry_sample(&data_type_str, ts_ms) {
             queue_db_write(
@@ -834,11 +846,12 @@ async fn handle_packet(
                 DbWrite::Telemetry {
                     timestamp_ms: ts_ms,
                     data_type: data_type_str.clone(),
+                    sender_id: pkt.sender().to_string(),
                     values_json,
                     payload_json: payload_json.clone(),
                 },
             )
-            .await;
+                .await;
         }
 
         let row = TelemetryRow {
@@ -857,11 +870,12 @@ async fn handle_packet(
                 DbWrite::Telemetry {
                     timestamp_ms: ts_ms,
                     data_type: data_type_str,
+                    sender_id: pkt.sender().to_string(),
                     values_json: None,
                     payload_json,
                 },
             )
-            .await;
+                .await;
         }
         None
     }

@@ -2,6 +2,8 @@
 
 #[cfg(feature = "testing")]
 mod dummy_packets;
+#[cfg(feature = "testing")]
+mod flight_sim;
 mod gpio;
 mod gpio_panel;
 mod layout;
@@ -95,17 +97,39 @@ async fn apply_sqlite_pragmas(db: &sqlx::SqlitePool) {
 }
 
 async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
+    async fn exec_pragma_with_retry(
+        db: &sqlx::SqlitePool,
+        stmt: &str,
+        retries: usize,
+        delay_ms: u64,
+    ) -> Result<(), sqlx::Error> {
+        for attempt in 0..retries {
+            match sqlx::query(stmt).execute(db).await {
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    if attempt + 1 >= retries {
+                        return Err(err);
+                    }
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let retries = env_usize("GS_SQLITE_SHUTDOWN_PRAGMA_RETRIES", 8, 1, 60);
+    let delay_ms = env_i64("GS_SQLITE_SHUTDOWN_PRAGMA_RETRY_DELAY_MS", 120, 10, 5_000) as u64;
+
     // If DB is in WAL mode, this checkpoints all frames and truncates WAL to 0 bytes.
-    if let Err(err) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
-        .execute(db)
-        .await
+    if let Err(err) =
+        exec_pragma_with_retry(db, "PRAGMA wal_checkpoint(TRUNCATE);", retries, delay_ms).await
     {
-        eprintln!("SQLite wal_checkpoint(TRUNCATE) failed: {err}");
+        eprintln!("SQLite wal_checkpoint(TRUNCATE) failed after {retries} attempts: {err}");
     }
 
     // Optional lightweight cleanup/analysis pass.
-    if let Err(err) = sqlx::query("PRAGMA optimize;").execute(db).await {
-        eprintln!("SQLite PRAGMA optimize failed: {err}");
+    if let Err(err) = exec_pragma_with_retry(db, "PRAGMA optimize;", retries, delay_ms).await {
+        eprintln!("SQLite PRAGMA optimize failed after {retries} attempts: {err}");
     }
 
     // On shutdown, switch out of WAL to reduce chance of lingering -wal/-shm files.
@@ -114,9 +138,10 @@ async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
         .as_deref()
         != Some("0");
     if switch_to_delete
-        && let Err(err) = sqlx::query("PRAGMA journal_mode=DELETE;").execute(db).await
+        && let Err(err) =
+        exec_pragma_with_retry(db, "PRAGMA journal_mode=DELETE;", retries, delay_ms).await
     {
-        eprintln!("SQLite PRAGMA journal_mode=DELETE failed: {err}");
+        eprintln!("SQLite PRAGMA journal_mode=DELETE failed after {retries} attempts: {err}");
     }
 }
 
@@ -201,13 +226,14 @@ async fn main() -> anyhow::Result<()> {
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp_ms INTEGER NOT NULL,
             data_type    TEXT    NOT NULL,
+            sender_id    TEXT,
             values_json  TEXT,
             payload_json TEXT
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     // Add values_json column for older DBs.
     let cols = sqlx::query("PRAGMA table_info(telemetry)")
@@ -229,6 +255,14 @@ async fn main() -> anyhow::Result<()> {
             .execute(&db)
             .await?;
     }
+    let has_sender_id = cols
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "sender_id");
+    if !has_sender_id {
+        sqlx::query("ALTER TABLE telemetry ADD COLUMN sender_id TEXT")
+            .execute(&db)
+            .await?;
+    }
 
     sqlx::query(
         r#"
@@ -240,8 +274,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     sqlx::query(
         r#"
@@ -252,8 +286,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
