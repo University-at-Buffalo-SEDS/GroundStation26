@@ -36,6 +36,7 @@ pub struct PersistentNotification {
     pub id: u64,
     pub timestamp_ms: i64,
     pub message: String,
+    pub persistent: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,7 +312,7 @@ fn update_sequence_runtime(
                 runtime.pressure_at_close_psi = pressure_psi;
                 runtime.step_started_at = Some(now);
                 runtime.warned_rapid_drop = false;
-                state.add_notification(format!(
+                state.add_temporary_notification(format!(
                     "Nitrogen fill test started. Monitoring pressure hold for {}s.",
                     cfg.leak_check_duration.as_secs()
                 ));
@@ -371,7 +372,7 @@ fn update_sequence_runtime(
         SequenceStep::OpenNitrous => {
             if valves.nitrous_open == Some(true) {
                 runtime.step_started_at = Some(now);
-                state.add_notification(format!(
+                state.add_temporary_notification(format!(
                     "Nitrous settle started. Holding for {}s before close.",
                     cfg.nitrous_soak_duration.as_secs()
                 ));

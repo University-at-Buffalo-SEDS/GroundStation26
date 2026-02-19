@@ -207,6 +207,18 @@ impl AppState {
     }
 
     pub fn add_notification<S: Into<String>>(&self, message: S) -> u64 {
+        self.add_notification_with_persistence(message, true)
+    }
+
+    pub fn add_temporary_notification<S: Into<String>>(&self, message: S) -> u64 {
+        self.add_notification_with_persistence(message, false)
+    }
+
+    pub fn add_notification_with_persistence<S: Into<String>>(
+        &self,
+        message: S,
+        persistent: bool,
+    ) -> u64 {
         let message = message.into();
         let mut notifications = self.notifications.lock().unwrap();
         if let Some(existing) = notifications.iter().find(|n| n.message == message) {
@@ -217,6 +229,7 @@ impl AppState {
             id,
             timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
             message,
+            persistent,
         });
         let snapshot = notifications.clone();
         drop(notifications);
