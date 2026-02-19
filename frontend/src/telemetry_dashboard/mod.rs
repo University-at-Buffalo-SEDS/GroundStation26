@@ -1116,7 +1116,7 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_warnings = warn_count > 0;
     let has_errors = err_count > 0;
-    let has_unread_notifications = !unread_notification_ids.read().is_empty();
+    let has_unread_notifications = !notifications.read().is_empty();
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
@@ -1157,18 +1157,6 @@ fn TelemetryDashboardInner() -> Element {
                     flight_state.set(state);
                 }
             });
-        });
-    }
-
-    // Opening notifications tab clears its unread indicator.
-    {
-        let mut unread_notification_ids = unread_notification_ids;
-        use_effect(move || {
-            if *active_main_tab.read() == MainTab::Notifications
-                && !unread_notification_ids.read().is_empty()
-            {
-                unread_notification_ids.set(Vec::new());
-            }
         });
     }
 
@@ -1531,14 +1519,7 @@ fn TelemetryDashboardInner() -> Element {
                         }
                         button {
                             style: if *active_main_tab.read() == MainTab::Notifications { tab_style_active("#3b82f6") } else { tab_style_inactive.to_string() },
-                            onclick: {
-                                let mut t = active_main_tab;
-                                let mut unread_notification_ids = unread_notification_ids;
-                                move |_| {
-                                    t.set(MainTab::Notifications);
-                                    unread_notification_ids.set(Vec::new());
-                                }
-                            },
+                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Notifications) },
                             span { "Notifications" }
                             if has_unread_notifications {
                                 span { style: "margin-left:6px; color:#93c5fd;", "●" }
@@ -1966,9 +1947,9 @@ fn merge_notification_history(
     history: &mut Vec<PersistentNotification>,
     incoming: &[PersistentNotification],
 ) {
-    let mut seen: HashSet<u64> = history.iter().map(|n| n.id).collect();
+    let mut seen: HashSet<(u64, i64)> = history.iter().map(|n| (n.id, n.timestamp_ms)).collect();
     for n in incoming {
-        if seen.insert(n.id) {
+        if seen.insert((n.id, n.timestamp_ms)) {
             history.push(n.clone());
         }
     }
