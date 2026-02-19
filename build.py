@@ -1243,6 +1243,32 @@ def _default_rust_target_for_frontend(platform_name: Optional[str]) -> Optional[
     return None
 
 
+def _ensure_windows_icon_compat(frontend_dir: Path) -> None:
+    """
+    Some dx/windows bundle paths resolve to legacy/default icon locations.
+    Create compatibility paths so canonicalize does not fail on Windows.
+    """
+    src = frontend_dir / "assets" / "icon.png"
+    if not src.exists():
+        print(f"Warning: Windows icon source not found: {src}", file=sys.stderr)
+        return
+
+    icons_dir = frontend_dir / "icons"
+    icons_dir.mkdir(parents=True, exist_ok=True)
+
+    # Common expected path.
+    dst_ico = icons_dir / "icon.ico"
+    if not dst_ico.exists():
+        shutil.copy2(src, dst_ico)
+
+    # Compatibility for tooling that reports/uses "icons/icon/ico".
+    legacy_dir = icons_dir / "icon"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    legacy_file = legacy_dir / "ico"
+    if not legacy_file.exists():
+        shutil.copy2(src, legacy_file)
+
+
 def build_frontend(
         frontend_dir: Path,
         platform_name: Optional[str] = None,
@@ -1295,6 +1321,7 @@ def build_frontend(
                 if not is_ios_sim_target:
                     cmd.extend(["--device", "true"])
             elif platform_name == "windows":
+                _ensure_windows_icon_compat(frontend_dir)
                 cmd.extend(["--windows-subsystem", "WINDOWS"])
         else:
             cmd.extend(["--platform", "web"])
