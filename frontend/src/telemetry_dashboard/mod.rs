@@ -1116,7 +1116,7 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_warnings = warn_count > 0;
     let has_errors = err_count > 0;
-    let has_unread_notifications = !notifications.read().is_empty();
+    let has_unread_notifications = !unread_notification_ids.read().is_empty();
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
@@ -1157,6 +1157,18 @@ fn TelemetryDashboardInner() -> Element {
                     flight_state.set(state);
                 }
             });
+        });
+    }
+
+    // Checking the Notifications tab clears the indicator.
+    {
+        let mut unread_notification_ids = unread_notification_ids;
+        use_effect(move || {
+            if *active_main_tab.read() == MainTab::Notifications
+                && !unread_notification_ids.read().is_empty()
+            {
+                unread_notification_ids.set(Vec::new());
+            }
         });
     }
 
@@ -1519,7 +1531,14 @@ fn TelemetryDashboardInner() -> Element {
                         }
                         button {
                             style: if *active_main_tab.read() == MainTab::Notifications { tab_style_active("#3b82f6") } else { tab_style_inactive.to_string() },
-                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Notifications) },
+                            onclick: {
+                                let mut t = active_main_tab;
+                                let mut unread_notification_ids = unread_notification_ids;
+                                move |_| {
+                                    t.set(MainTab::Notifications);
+                                    unread_notification_ids.set(Vec::new());
+                                }
+                            },
                             span { "Notifications" }
                             if has_unread_notifications {
                                 span { style: "margin-left:6px; color:#93c5fd;", "●" }
@@ -2011,14 +2030,12 @@ fn apply_notifications_snapshot(
     let prev_ids: HashSet<u64> = { notifications.read().iter().map(|n| n.id).collect() };
     notifications.set(active.clone());
 
-    let active_ids: HashSet<u64> = active.iter().map(|n| n.id).collect();
     let mut unread: HashSet<u64> = unread_notification_ids.read().iter().copied().collect();
     for n in &active {
         if !prev_ids.contains(&n.id) {
             unread.insert(n.id);
         }
     }
-    unread.retain(|id| active_ids.contains(id));
     let mut unread_vec: Vec<u64> = unread.into_iter().collect();
     unread_vec.sort_unstable();
     if *unread_notification_ids.read() != unread_vec {
@@ -2037,7 +2054,6 @@ fn apply_notifications_snapshot(
         let ts = n.timestamp_ms;
         let mut notifications = notifications;
         let mut dismissed_notifications = dismissed_notifications;
-        let mut unread_notification_ids = unread_notification_ids;
         spawn_detached(async move {
             #[cfg(target_arch = "wasm32")]
             gloo_timers::future::TimeoutFuture::new(NOTIFICATION_AUTO_DISMISS_MS).await;
@@ -2056,9 +2072,6 @@ fn apply_notifications_snapshot(
             let mut v = { notifications.read().clone() };
             v.retain(|x| x.id != id);
             notifications.set(v);
-            let mut unread = unread_notification_ids.read().clone();
-            unread.retain(|x| *x != id);
-            unread_notification_ids.set(unread);
 
             let mut ids = { dismissed_notifications.read().clone() };
             let item = DismissedNotification {
