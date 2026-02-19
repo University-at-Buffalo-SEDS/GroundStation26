@@ -8,6 +8,7 @@ use super::layout::{
     StateWidgetKind, SummaryItem, ValveColor, ValveColorSet,
 };
 use super::types::{BoardStatusEntry, FlightState, TelemetryRow};
+use super::{ActionPolicyMsg, BlinkMode};
 
 use crate::telemetry_dashboard::data_chart::{
     charts_cache_get, charts_cache_get_channel_minmax, labels_for_datatype, series_color,
@@ -35,6 +36,7 @@ pub fn StateTab(
     user_gps: Signal<Option<(f64, f64)>>,
     layout: StateTabLayout,
     actions: ActionsTabLayout,
+    action_policy: Signal<ActionPolicyMsg>,
     default_valve_labels: Option<BooleanLabels>,
 ) -> Element {
     // ------------------------------------------------------------
@@ -132,6 +134,7 @@ pub fn StateTab(
     let rows_snapshot = rows.read();
     let boards_snapshot = board_status.read();
     let actions_snapshot = actions.actions.clone();
+    let action_policy_snapshot = action_policy.read().clone();
 
     let content = if let Some(state_layout) = layout
         .states
@@ -145,6 +148,7 @@ pub fn StateTab(
                     &rows_snapshot,
                     &boards_snapshot,
                     &actions_snapshot,
+                    &action_policy_snapshot,
                     default_valve_labels.as_ref(),
                     rocket_gps,
                     user_gps
@@ -185,6 +189,7 @@ fn render_state_section(
     rows: &[TelemetryRow],
     boards: &[BoardStatusEntry],
     actions: &[ActionSpec],
+    action_policy: &ActionPolicyMsg,
     default_valve_labels: Option<&BooleanLabels>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
@@ -205,6 +210,7 @@ fn render_state_section(
                     rows,
                     boards,
                     actions,
+                    action_policy,
                     default_valve_labels,
                     rocket_gps,
                     user_gps
@@ -219,6 +225,7 @@ fn render_state_widget(
     rows: &[TelemetryRow],
     boards: &[BoardStatusEntry],
     actions: &[ActionSpec],
+    action_policy: &ActionPolicyMsg,
     default_valve_labels: Option<&BooleanLabels>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
@@ -255,7 +262,9 @@ fn render_state_widget(
             )} }
         }
         StateWidgetKind::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
-        StateWidgetKind::Actions => rsx! { {action_section(actions, widget.actions.as_deref())} },
+        StateWidgetKind::Actions => {
+            rsx! { {action_section(actions, action_policy, widget.actions.as_deref())} }
+        }
     }
 }
 
@@ -540,7 +549,11 @@ fn widget_valve_labels_at<'a>(
     default_labels.cloned()
 }
 
-fn action_section(actions: &[ActionSpec], selection: Option<&[String]>) -> Element {
+fn action_section(
+    actions: &[ActionSpec],
+    action_policy: &ActionPolicyMsg,
+    selection: Option<&[String]>,
+) -> Element {
     let filtered = filter_actions(actions, selection);
     if filtered.is_empty() {
         return rsx! { div {} };
@@ -549,13 +562,26 @@ fn action_section(actions: &[ActionSpec], selection: Option<&[String]>) -> Eleme
     rsx! {
         div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px;",
             for action in filtered.iter() {
-                button {
-                    style: action_style(&action.border, &action.bg, &action.fg),
-                    onclick: {
-                        let cmd = action.cmd.clone();
-                        move |_| crate::telemetry_dashboard::send_cmd(&cmd)
-                    },
-                    "{action.label}"
+                {
+                    let control = action_policy.controls.iter().find(|c| c.cmd == action.cmd);
+                    let enabled = control.map(|c| c.enabled).unwrap_or(action.cmd == "Abort");
+                    let blink = control.map(|c| c.blink).unwrap_or(BlinkMode::None);
+                    let actuated = control.and_then(|c| c.actuated);
+                    rsx! {
+                        button {
+                            style: action_style(&action.border, &action.bg, &action.fg, enabled, blink, actuated),
+                            disabled: !enabled,
+                            onclick: {
+                                let cmd = action.cmd.clone();
+                                move |_| {
+                                    if enabled {
+                                        crate::telemetry_dashboard::send_cmd(&cmd)
+                                    }
+                                }
+                            },
+                            "{action.label}"
+                        }
+                    }
                 }
             }
         }
@@ -593,9 +619,25 @@ fn has_any_actions(actions: &[ActionSpec], selection: Option<&[String]>) -> bool
         .any(|cmd| actions.iter().any(|a| &a.cmd == cmd))
 }
 
-fn action_style(border: &str, bg: &str, fg: &str) -> String {
+fn action_style(
+    border: &str,
+    bg: &str,
+    fg: &str,
+    enabled: bool,
+    blink: BlinkMode,
+    actuated: Option<bool>,
+) -> String {
+    let cursor = if enabled { "pointer" } else { "not-allowed" };
+    let opacity = if enabled { "1.0" } else { "0.45" };
+    let animation = match (blink, actuated.unwrap_or(false)) {
+        (BlinkMode::None, _) => "none",
+        (BlinkMode::Slow, false) => "gs26-blink-slow-off 1.8s linear infinite",
+        (BlinkMode::Slow, true) => "gs26-blink-slow-on 1.8s linear infinite",
+        (BlinkMode::Fast, false) => "gs26-blink-fast-off 0.6s linear infinite",
+        (BlinkMode::Fast, true) => "gs26-blink-fast-on 0.6s linear infinite",
+    };
     format!(
-        "padding:0.6rem 0.9rem; border-radius:0.75rem; cursor:pointer; width:100%; \
+        "padding:0.6rem 0.9rem; border-radius:0.75rem; cursor:{cursor}; opacity:{opacity}; animation:{animation}; width:100%; \
          text-align:left; border:1px solid {border}; background:{bg}; color:{fg}; \
          font-weight:700;"
     )

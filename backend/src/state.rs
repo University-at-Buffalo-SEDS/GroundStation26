@@ -1,5 +1,6 @@
 use crate::gpio::GpioPins;
 use crate::ring_buffer::RingBuffer;
+use crate::sequences::{command_name, ActionPolicyMsg, PersistentNotification};
 use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
 use groundstation_shared::{
     Board, BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow,
@@ -71,6 +72,24 @@ pub struct AppState {
 
     /// Notifies waiters when pending DB writes changes.
     pub db_write_notify: Arc<Notify>,
+
+    /// Persistent operator notifications shown to all clients until dismissed.
+    pub notifications: Arc<Mutex<Vec<PersistentNotification>>>,
+
+    /// Broadcast whenever notifications list changes.
+    pub notifications_tx: broadcast::Sender<Vec<PersistentNotification>>,
+
+    /// Monotonic ID source for notifications.
+    pub next_notification_id: Arc<AtomicU64>,
+
+    /// Current action policy (enabled/disabled/blink hints) for UI + command gating.
+    pub action_policy: Arc<Mutex<ActionPolicyMsg>>,
+
+    /// Broadcast whenever action policy changes.
+    pub action_policy_tx: broadcast::Sender<ActionPolicyMsg>,
+
+    /// Last accepted command timestamp by command name.
+    pub last_command_ms: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl AppState {
@@ -181,5 +200,77 @@ impl AppState {
                 return self.pending_db_write_count() == 0;
             }
         }
+    }
+
+    pub fn notifications_snapshot(&self) -> Vec<PersistentNotification> {
+        self.notifications.lock().unwrap().clone()
+    }
+
+    pub fn add_notification<S: Into<String>>(&self, message: S) -> u64 {
+        let message = message.into();
+        let mut notifications = self.notifications.lock().unwrap();
+        if let Some(existing) = notifications.iter().find(|n| n.message == message) {
+            return existing.id;
+        }
+        let id = self.next_notification_id.fetch_add(1, Ordering::Relaxed) + 1;
+        notifications.push(PersistentNotification {
+            id,
+            timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+            message,
+        });
+        let snapshot = notifications.clone();
+        drop(notifications);
+        let _ = self.notifications_tx.send(snapshot);
+        id
+    }
+
+    pub fn dismiss_notification(&self, id: u64) -> bool {
+        let mut notifications = self.notifications.lock().unwrap();
+        let before = notifications.len();
+        notifications.retain(|n| n.id != id);
+        if notifications.len() == before {
+            return false;
+        }
+        let snapshot = notifications.clone();
+        drop(notifications);
+        let _ = self.notifications_tx.send(snapshot);
+        true
+    }
+
+    pub fn action_policy_snapshot(&self) -> ActionPolicyMsg {
+        self.action_policy.lock().unwrap().clone()
+    }
+
+    pub fn set_action_policy(&self, policy: ActionPolicyMsg) {
+        let mut slot = self.action_policy.lock().unwrap();
+        if *slot == policy {
+            return;
+        }
+        *slot = policy.clone();
+        drop(slot);
+        let _ = self.action_policy_tx.send(policy);
+    }
+
+    pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
+        if matches!(cmd, TelemetryCommand::Abort) {
+            return true;
+        }
+        let name = command_name(cmd);
+        let policy = self.action_policy.lock().unwrap();
+        policy
+            .controls
+            .iter()
+            .find(|c| c.cmd == name)
+            .map(|c| c.enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn record_command_accepted(&self, cmd: &TelemetryCommand, ts_ms: u64) {
+        let mut map = self.last_command_ms.lock().unwrap();
+        map.insert(command_name(cmd).to_string(), ts_ms);
+    }
+
+    pub fn last_command_timestamp_ms(&self, cmd_name: &str) -> Option<u64> {
+        self.last_command_ms.lock().unwrap().get(cmd_name).copied()
     }
 }

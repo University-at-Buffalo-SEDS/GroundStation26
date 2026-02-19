@@ -10,6 +10,7 @@ mod radio;
 mod ring_buffer;
 mod rocket_commands;
 mod safety_task;
+mod sequences;
 mod state;
 mod telemetry_task;
 mod web;
@@ -17,6 +18,7 @@ mod web;
 use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
 use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
+use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
 use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
@@ -204,8 +206,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     // Add values_json column for older DBs.
     let cols = sqlx::query("PRAGMA table_info(telemetry)")
@@ -238,8 +240,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     sqlx::query(
         r#"
@@ -250,16 +252,20 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let ws_broadcast_capacity = env_usize("GS_WS_BROADCAST_CAPACITY", 8192, 512, 262_144);
     let board_status_capacity = env_usize("GS_BOARD_STATUS_BROADCAST_CAPACITY", 256, 64, 4096);
     let alerts_capacity = env_usize("GS_ALERTS_BROADCAST_CAPACITY", 1024, 128, 8192);
+    let notifications_capacity = env_usize("GS_NOTIFICATIONS_BROADCAST_CAPACITY", 64, 16, 2048);
+    let actions_capacity = env_usize("GS_ACTION_POLICY_BROADCAST_CAPACITY", 64, 16, 2048);
     let (ws_tx, _ws_rx) = broadcast::channel(ws_broadcast_capacity);
     let (board_status_tx, _board_status_rx) = broadcast::channel(board_status_capacity);
+    let (notifications_tx, _notifications_rx) = broadcast::channel(notifications_capacity);
+    let (action_policy_tx, _action_policy_rx) = broadcast::channel(actions_capacity);
     let (shutdown_tx, _shutdown_rx) = broadcast::channel(8);
 
     // --- Shared state ---
@@ -294,9 +300,16 @@ async fn main() -> anyhow::Result<()> {
         shutdown_tx,
         pending_db_writes: Arc::new(AtomicUsize::new(0)),
         db_write_notify: Arc::new(Notify::new()),
+        notifications: Arc::new(Mutex::new(Vec::new())),
+        notifications_tx,
+        next_notification_id: Arc::new(AtomicU64::new(0)),
+        action_policy: Arc::new(Mutex::new(default_action_policy())),
+        action_policy_tx,
+        last_command_ms: Arc::new(Mutex::new(HashMap::new())),
     });
 
     gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
+    start_sequence_task(state.clone());
 
     // --- Router endpoint handlers ---
     let ground_station_handler_state_clone = state.clone();

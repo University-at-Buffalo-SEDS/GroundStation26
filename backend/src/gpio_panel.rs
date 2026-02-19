@@ -1,10 +1,13 @@
 use crate::gpio::Trigger;
-use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
+use crate::sequences::{ActionPolicyMsg, BlinkMode};
 use crate::state::AppState;
-use crate::web::emit_error;
-use groundstation_shared::{FlightState, TelemetryCommand};
+use crate::web::{emit_error, emit_warning};
+use groundstation_shared::TelemetryCommand;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
@@ -42,52 +45,6 @@ pub const NORMALLY_OPEN_LED: u8 = 15; // was 7 (spi0 CS1 used)
 
 //####################################################################
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FillStep {
-    CloseNormallyOpen,
-    CloseDump,
-    OpenNitrogen,
-    WaitForPressure,
-    CloseNitrogen,
-    LeakCheck,
-    OpenDump,
-    DumpWait,
-    OpenNitrous,
-    ReadyToLaunch,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PanelConfig {
-    leak_check: Duration,
-    dump_wait: Duration,
-    pressure_threshold_psi: f32,
-}
-
-impl PanelConfig {
-    fn from_env() -> Self {
-        let leak_check = std::env::var("GPIO_LEAK_CHECK_SEC")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(10));
-        let dump_wait = std::env::var("GPIO_DUMP_WAIT_SEC")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(5));
-        let pressure_threshold_psi = std::env::var("GPIO_PRESSURE_THRESHOLD_PSI")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(10.0);
-
-        Self {
-            leak_check,
-            dump_wait,
-            pressure_threshold_psi,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct AllowedActions {
     abort: bool,
@@ -95,26 +52,14 @@ struct AllowedActions {
     dump: bool,
     normally_open: bool,
     pilot: bool,
-    igniter: bool,
     nitrogen: bool,
     nitrous: bool,
     fill_lines: bool,
 }
 
-#[derive(Debug)]
-struct SequenceState {
-    step: FillStep,
-    step_started_at: Option<Instant>,
-}
-
 pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
     let gpio = state.gpio.clone();
-    let cfg = PanelConfig::from_env();
     let allowed = Arc::new(Mutex::new(AllowedActions::default()));
-    let seq = Arc::new(Mutex::new(SequenceState {
-        step: FillStep::CloseNormallyOpen,
-        step_started_at: None,
-    }));
 
     // Inputs (buttons)
     gpio.setup_input_pin(ABORT_PIN)?;
@@ -139,7 +84,7 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
 
     setup_callbacks(&state, allowed.clone())?;
 
-    tokio::spawn(gpio_led_task(state, cfg, allowed, seq));
+    tokio::spawn(gpio_led_task(state, allowed));
 
     Ok(())
 }
@@ -169,6 +114,7 @@ fn setup_callbacks(
     })?;
 
     setup_button_callback(
+        state.clone(),
         gpio.clone(),
         allowed.clone(),
         tx.clone(),
@@ -178,6 +124,7 @@ fn setup_callbacks(
         debounce,
     )?;
     setup_button_callback(
+        state.clone(),
         gpio.clone(),
         allowed.clone(),
         tx.clone(),
@@ -187,6 +134,7 @@ fn setup_callbacks(
         debounce,
     )?;
     setup_button_callback(
+        state.clone(),
         gpio.clone(),
         allowed.clone(),
         tx.clone(),
@@ -196,6 +144,7 @@ fn setup_callbacks(
         debounce,
     )?;
     setup_button_callback(
+        state.clone(),
         gpio.clone(),
         allowed.clone(),
         tx.clone(),
@@ -205,6 +154,7 @@ fn setup_callbacks(
         debounce,
     )?;
     setup_button_callback(
+        state.clone(),
         gpio.clone(),
         allowed.clone(),
         tx.clone(),
@@ -214,6 +164,7 @@ fn setup_callbacks(
         debounce,
     )?;
     setup_button_callback(
+        state.clone(),
         gpio.clone(),
         allowed.clone(),
         tx.clone(),
@@ -223,6 +174,7 @@ fn setup_callbacks(
         debounce,
     )?;
     setup_button_callback(
+        state.clone(),
         gpio.clone(),
         allowed.clone(),
         tx,
@@ -236,6 +188,7 @@ fn setup_callbacks(
 }
 
 fn setup_button_callback<F>(
+    state: Arc<AppState>,
     gpio: Arc<crate::gpio::GpioPins>,
     allowed: Arc<Mutex<AllowedActions>>,
     tx: mpsc::Sender<TelemetryCommand>,
@@ -247,11 +200,32 @@ fn setup_button_callback<F>(
 where
     F: Fn(&AllowedActions) -> bool + Send + Sync + 'static,
 {
+    static LAST_WARN_MS_BY_CMD: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    static WARN_INTERVAL_MS: AtomicU64 = AtomicU64::new(3_000);
+
     gpio.setup_callback_input_pin(pin, Trigger::RisingEdge, debounce, move |is_high| {
         if !is_high {
             return;
         }
         if !can_press(&allowed.lock().unwrap()) {
+            let policy = state.action_policy_snapshot();
+            if !policy.key_enabled {
+                let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+                let warn_map = LAST_WARN_MS_BY_CMD.get_or_init(|| Mutex::new(HashMap::new()));
+                let mut guard = warn_map.lock().unwrap();
+                let cmd_name = format!("{cmd:?}");
+                let last = guard.get(&cmd_name).copied().unwrap_or(0);
+                if now_ms.saturating_sub(last) >= WARN_INTERVAL_MS.load(Ordering::Relaxed) {
+                    guard.insert(cmd_name.clone(), now_ms);
+                    drop(guard);
+                    emit_warning(
+                        &state,
+                        format!(
+                            "Ignored {cmd_name} button press: safety key is not installed/enabled"
+                        ),
+                    );
+                }
+            }
             return;
         }
         if tx.try_send(cmd.clone()).is_err() {
@@ -261,19 +235,15 @@ where
     Ok(())
 }
 
-async fn gpio_led_task(
-    state: Arc<AppState>,
-    cfg: PanelConfig,
-    allowed: Arc<Mutex<AllowedActions>>,
-    seq: Arc<Mutex<SequenceState>>,
-) {
+async fn gpio_led_task(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>) {
     let mut tick = interval(Duration::from_millis(200));
+    let mut tick_count: u64 = 0;
     loop {
         tick.tick().await;
+        tick_count = tick_count.wrapping_add(1);
 
-        let flight_state = *state.state.lock().unwrap();
-        update_sequence(&state, &cfg, &seq, flight_state);
-        let actions = compute_allowed_actions(&state, flight_state, &cfg, &seq);
+        let policy = state.action_policy_snapshot();
+        let actions = allowed_from_policy(&policy);
 
         {
             let mut slot = allowed.lock().unwrap();
@@ -281,166 +251,81 @@ async fn gpio_led_task(
         }
 
         let gpio = &state.gpio;
-        set_led(gpio, ABORT_PIN_LED, actions.abort);
-        set_led(gpio, LAUNCH_PIN_LED, actions.launch);
-        set_led(gpio, DUMP_PIN_LED, actions.dump);
-        set_led(gpio, NORMALLY_OPEN_LED, actions.normally_open);
-        set_led(gpio, PILOT_VALVE_LED, actions.pilot);
-        set_led(gpio, NITROGEN_TANK_VALVE_LED, actions.nitrogen);
-        set_led(gpio, NITROUS_TANK_VALVE_LED, actions.nitrous);
-        set_led(gpio, RETRACT_PIN_LED, actions.fill_lines);
+        set_led(gpio, ABORT_PIN_LED, led_for(&policy, "Abort", tick_count));
+        set_led(gpio, LAUNCH_PIN_LED, led_for(&policy, "Launch", tick_count));
+        set_led(gpio, DUMP_PIN_LED, led_for(&policy, "Dump", tick_count));
+        set_led(
+            gpio,
+            NORMALLY_OPEN_LED,
+            led_for(&policy, "NormallyOpen", tick_count),
+        );
+        set_led(gpio, PILOT_VALVE_LED, led_for(&policy, "Pilot", tick_count));
+        set_led(
+            gpio,
+            NITROGEN_TANK_VALVE_LED,
+            led_for(&policy, "Nitrogen", tick_count),
+        );
+        set_led(
+            gpio,
+            NITROUS_TANK_VALVE_LED,
+            led_for(&policy, "Nitrous", tick_count),
+        );
+        set_led(
+            gpio,
+            RETRACT_PIN_LED,
+            led_for(&policy, "RetractPlumbing", tick_count),
+        );
     }
 }
 
-fn update_sequence(
-    state: &AppState,
-    cfg: &PanelConfig,
-    seq: &Arc<Mutex<SequenceState>>,
-    flight_state: FlightState,
-) {
-    if !is_fill_state(flight_state) {
-        let mut s = seq.lock().unwrap();
-        s.step = FillStep::CloseNormallyOpen;
-        s.step_started_at = None;
-        return;
-    }
+fn allowed_from_policy(policy: &ActionPolicyMsg) -> AllowedActions {
+    let enabled = |cmd: &str| {
+        policy
+            .controls
+            .iter()
+            .find(|c| c.cmd == cmd)
+            .map(|c| c.enabled)
+            .unwrap_or(false)
+    };
 
-    let now = Instant::now();
-    let valve = |cmd| state.get_umbilical_valve_state(cmd);
-    let normally_open = valve(ValveBoardCommands::NormallyOpenOpen as u8);
-    let dump_open = valve(ValveBoardCommands::DumpOpen as u8);
-    let nitrogen_open = valve(ActuatorBoardCommands::NitrogenOpen as u8);
-    let nitrous_open = valve(ActuatorBoardCommands::NitrousOpen as u8);
-    let pressure = *state.latest_fuel_tank_pressure.lock().unwrap();
-
-    let mut s = seq.lock().unwrap();
-    match s.step {
-        FillStep::CloseNormallyOpen => {
-            if normally_open == Some(false) {
-                s.step = FillStep::CloseDump;
-            }
-        }
-        FillStep::CloseDump => {
-            if dump_open == Some(false) {
-                s.step = FillStep::OpenNitrogen;
-            }
-        }
-        FillStep::OpenNitrogen => {
-            if nitrogen_open == Some(true) {
-                s.step = FillStep::WaitForPressure;
-            }
-        }
-        FillStep::WaitForPressure => {
-            if pressure.is_some_and(|p| p >= cfg.pressure_threshold_psi) {
-                s.step = FillStep::CloseNitrogen;
-            }
-        }
-        FillStep::CloseNitrogen => {
-            if nitrogen_open == Some(false) {
-                s.step = FillStep::LeakCheck;
-                s.step_started_at = Some(now);
-            }
-        }
-        FillStep::LeakCheck => {
-            let elapsed = s.step_started_at.map(|t| now.saturating_duration_since(t));
-            if elapsed.is_some_and(|d| d >= cfg.leak_check) {
-                s.step = FillStep::OpenDump;
-                s.step_started_at = None;
-            }
-        }
-        FillStep::OpenDump => {
-            if dump_open == Some(true) {
-                s.step = FillStep::DumpWait;
-                s.step_started_at = Some(now);
-            }
-        }
-        FillStep::DumpWait => {
-            let elapsed = s.step_started_at.map(|t| now.saturating_duration_since(t));
-            if elapsed.is_some_and(|d| d >= cfg.dump_wait) {
-                s.step = FillStep::OpenNitrous;
-                s.step_started_at = None;
-            }
-        }
-        FillStep::OpenNitrous => {
-            if nitrous_open == Some(true) {
-                s.step = FillStep::ReadyToLaunch;
-            }
-        }
-        FillStep::ReadyToLaunch => {}
+    AllowedActions {
+        abort: enabled("Abort"),
+        launch: enabled("Launch"),
+        dump: enabled("Dump"),
+        normally_open: enabled("NormallyOpen"),
+        pilot: enabled("Pilot"),
+        nitrogen: enabled("Nitrogen"),
+        nitrous: enabled("Nitrous"),
+        fill_lines: enabled("RetractPlumbing"),
     }
 }
 
-fn compute_allowed_actions(
-    state: &AppState,
-    flight_state: FlightState,
-    cfg: &PanelConfig,
-    seq: &Arc<Mutex<SequenceState>>,
-) -> AllowedActions {
-    let mut actions = AllowedActions::default();
-    actions.abort = true;
-
-    if flight_state == FlightState::Armed {
-        actions.launch = true;
-        actions.dump = true;
-        return actions;
+fn led_for(policy: &ActionPolicyMsg, cmd: &str, tick_count: u64) -> bool {
+    let Some(control) = policy.controls.iter().find(|c| c.cmd == cmd) else {
+        return false;
+    };
+    if !control.enabled {
+        return false;
     }
-
-    if !is_fill_state(flight_state) {
-        return actions;
-    }
-
-    let valve = |cmd| state.get_umbilical_valve_state(cmd);
-    let normally_open = valve(ValveBoardCommands::NormallyOpenOpen as u8);
-    let dump_open = valve(ValveBoardCommands::DumpOpen as u8);
-    let nitrogen_open = valve(ActuatorBoardCommands::NitrogenOpen as u8);
-    let nitrous_open = valve(ActuatorBoardCommands::NitrousOpen as u8);
-    let pressure = *state.latest_fuel_tank_pressure.lock().unwrap();
-
-    let step = seq.lock().unwrap().step;
-
-    match step {
-        FillStep::CloseNormallyOpen => {
-            actions.normally_open = normally_open != Some(false);
-        }
-        FillStep::CloseDump => {
-            actions.dump = dump_open != Some(false);
-        }
-        FillStep::OpenNitrogen => {
-            actions.nitrogen = nitrogen_open != Some(true);
-        }
-        FillStep::WaitForPressure => {
-            let _ = pressure.filter(|p| *p >= cfg.pressure_threshold_psi);
-        }
-        FillStep::CloseNitrogen => {
-            actions.nitrogen = nitrogen_open != Some(false);
-        }
-        FillStep::LeakCheck => {}
-        FillStep::OpenDump => {
-            actions.dump = dump_open != Some(true);
-        }
-        FillStep::DumpWait => {}
-        FillStep::OpenNitrous => {
-            actions.nitrous = nitrous_open != Some(true);
-        }
-        FillStep::ReadyToLaunch => {}
-    }
-
-    // Keep extra buttons aligned with frontend availability during fill states.
-    actions.pilot = true;
-    actions.igniter = true;
-    actions.fill_lines = true;
-
-    actions
-}
-
-fn is_fill_state(state: FlightState) -> bool {
-    matches!(
-        state,
-        FlightState::PreFill
-            | FlightState::FillTest
-            | FlightState::NitrogenFill
-            | FlightState::NitrousFill
+    blink_to_level(
+        control.blink.clone(),
+        control.actuated.unwrap_or(false),
+        tick_count,
     )
+}
+
+fn blink_to_level(blink: BlinkMode, actuated: bool, tick_count: u64) -> bool {
+    match blink {
+        BlinkMode::None => true,
+        BlinkMode::Slow => {
+            let phase = tick_count % 10;
+            if actuated { phase < 8 } else { phase < 2 }
+        }
+        BlinkMode::Fast => {
+            let phase = tick_count % 4;
+            if actuated { phase < 3 } else { phase < 2 }
+        }
+    }
 }
 
 fn set_led(gpio: &crate::gpio::GpioPins, pin: u8, on: bool) {

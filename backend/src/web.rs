@@ -1,5 +1,6 @@
 use crate::layout;
 use crate::map::{tile_service, DEFAULT_MAP_REGION};
+use crate::sequences::{ActionPolicyMsg, PersistentNotification};
 use crate::state::AppState;
 use axum::http::{header, StatusCode};
 use axum::{
@@ -71,6 +72,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alerts", get(get_alerts))
         .route("/api/boards", get(get_boards))
         .route("/api/layout", get(get_layout))
+        .route("/api/notifications", get(get_notifications))
+        .route(
+            "/api/notifications/{id}/dismiss",
+            post(dismiss_notification),
+        )
+        .route("/api/action_policy", get(get_action_policy))
         .route("/favicon", get(get_favicon))
         .route("/flightstate", get(get_flight_state))
         .route("/api/gps", get(get_gps))
@@ -96,6 +103,8 @@ pub enum WsOutMsg {
     FlightState(FlightStateMsg),
     Error(ErrorMsg),
     BoardStatus(BoardStatusMsg),
+    Notifications(Vec<PersistentNotification>),
+    ActionPolicy(ActionPolicyMsg),
 }
 
 #[derive(Clone, Serialize)]
@@ -160,9 +169,9 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
@@ -195,9 +204,9 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
         let values = values_from_row(&r);
@@ -268,12 +277,12 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         ORDER BY f.timestamp_ms ASC
         "#,
     )
-        .bind(BUCKET_MS)
-        .bind(cutoff)
-        .bind(now_ms)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(BUCKET_MS)
+    .bind(cutoff)
+    .bind(now_ms)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let rows: Vec<TelemetryRow> = rows_db
         .into_iter()
@@ -317,6 +326,25 @@ async fn get_flight_state(State(state): State<Arc<AppState>>) -> impl IntoRespon
         .unwrap_or(FlightState::Startup);
     Json(flight_state)
 }
+
+async fn get_notifications(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.notifications_snapshot())
+}
+
+async fn dismiss_notification(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> impl IntoResponse {
+    if state.dismiss_notification(id) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+async fn get_action_policy(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.action_policy_snapshot())
+}
 async fn send_command(
     State(state): State<Arc<AppState>>,
     Json(cmd): Json<TelemetryCommand>,
@@ -343,6 +371,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let mut errors_rx = state.errors_tx.subscribe();
     let mut state_rx = state.state_tx.subscribe();
     let mut board_status_rx = state.board_status_tx.subscribe();
+    let mut notifications_rx = state.notifications_tx.subscribe();
+    let mut action_policy_rx = state.action_policy_tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
     let (mut socket_sender, mut receiver) = socket.split();
@@ -368,6 +398,19 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Task: collect, batch, and enqueue outbound messages.
     let send_task = async move {
+        let initial_notifications =
+            serde_json::to_string(&WsOutMsg::Notifications(state.notifications_snapshot()))
+                .unwrap_or_default();
+        if ws_out_tx.send(initial_notifications).await.is_err() {
+            return;
+        }
+        let initial_action_policy =
+            serde_json::to_string(&WsOutMsg::ActionPolicy(state.action_policy_snapshot()))
+                .unwrap_or_default();
+        if ws_out_tx.send(initial_action_policy).await.is_err() {
+            return;
+        }
+
         let adaptive_rate = std::env::var("GS_WS_ADAPTIVE_RATE").ok().as_deref() != Some("0");
         let telemetry_flush_ms: u64 = std::env::var("GS_WS_TELEMETRY_FLUSH_MS")
             .ok()
@@ -445,6 +488,34 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                     match recv {
                         Ok(status) => {
                             let msg = WsOutMsg::BoardStatus(status);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = notifications_rx.recv() => {
+                    match recv {
+                        Ok(snapshot) => {
+                            let msg = WsOutMsg::Notifications(snapshot);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = action_policy_rx.recv() => {
+                    match recv {
+                        Ok(policy) => {
+                            let msg = WsOutMsg::ActionPolicy(policy);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;
@@ -557,10 +628,10 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-        .bind(cutoff)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -602,11 +673,11 @@ fn spawn_alert_insert(
             VALUES (?, ?, ?)
             "#,
         )
-            .bind(timestamp_ms)
-            .bind(severity)
-            .bind(message)
-            .execute(&db)
-            .await;
+        .bind(timestamp_ms)
+        .bind(severity)
+        .bind(message)
+        .execute(&db)
+        .await;
         state_for_task.end_db_write();
     });
 }

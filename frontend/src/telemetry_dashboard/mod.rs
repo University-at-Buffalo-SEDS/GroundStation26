@@ -39,8 +39,8 @@ use warnings_tab::WarningsTab;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
-    atomic::{AtomicBool, Ordering}, Arc,
-    Mutex,
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 
 use once_cell::sync::Lazy;
@@ -229,6 +229,8 @@ enum WsInMsg {
     Warning(AlertMsg),
     Error(AlertMsg),
     BoardStatus(BoardStatusMsg),
+    Notifications(Vec<PersistentNotification>),
+    ActionPolicy(ActionPolicyMsg),
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -238,6 +240,44 @@ struct FlightStateMsg {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct AlertMsg {
+    pub timestamp_ms: i64,
+    pub message: String,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BlinkMode {
+    None,
+    Slow,
+    Fast,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ActionControl {
+    pub cmd: String,
+    pub enabled: bool,
+    pub blink: BlinkMode,
+    pub actuated: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ActionPolicyMsg {
+    pub key_enabled: bool,
+    pub controls: Vec<ActionControl>,
+}
+
+impl ActionPolicyMsg {
+    fn default_locked() -> Self {
+        Self {
+            key_enabled: false,
+            controls: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PersistentNotification {
+    pub id: u64,
     pub timestamp_ms: i64,
     pub message: String,
 }
@@ -621,6 +661,8 @@ fn TelemetryDashboardInner() -> Element {
     let active_data_tab = use_signal(|| st_data_tab.read().clone());
     let warnings = use_signal(Vec::<AlertMsg>::new);
     let errors = use_signal(Vec::<AlertMsg>::new);
+    let notifications = use_signal(Vec::<PersistentNotification>::new);
+    let action_policy = use_signal(ActionPolicyMsg::default_locked);
     let flight_state = use_signal(|| FlightState::Startup);
     let board_status = use_signal(Vec::<BoardStatusEntry>::new);
 
@@ -889,6 +931,8 @@ fn TelemetryDashboardInner() -> Element {
         let mut user_gps_s = user_gps;
         let mut ack_warning_ts_s = ack_warning_ts;
         let mut ack_error_ts_s = ack_error_ts;
+        let mut notifications_s = notifications;
+        let mut action_policy_s = action_policy;
 
         let alive = alive.clone();
         let startup_seed_ready = startup_seed_ready;
@@ -920,6 +964,8 @@ fn TelemetryDashboardInner() -> Element {
                     &mut rows_s,
                     &mut warnings_s,
                     &mut errors_s,
+                    &mut notifications_s,
+                    &mut action_policy_s,
                     &mut board_status_s,
                     &mut rocket_gps_s,
                     &mut user_gps_s,
@@ -927,7 +973,7 @@ fn TelemetryDashboardInner() -> Element {
                     &mut ack_error_ts_s,
                     alive.clone(),
                 )
-                    .await
+                .await
                     && alive.load(Ordering::Relaxed)
                     && *WS_EPOCH.read() == epoch
                 {
@@ -986,10 +1032,10 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
-        || *warning_event_counter.read() > *ack_warning_count.read());
+            || *warning_event_counter.read() > *ack_warning_count.read());
     let has_unacked_errors = latest_error_ts > 0
         && (latest_error_ts > *ack_error_ts.read()
-        || *error_event_counter.read() > *ack_error_count.read());
+            || *error_event_counter.read() > *ack_error_count.read());
 
     let border_style = if has_unacked_errors && *flash_on.read() {
         "2px solid #ef4444"
@@ -1058,6 +1104,8 @@ fn TelemetryDashboardInner() -> Element {
                     rows,
                     warnings,
                     errors,
+                    notifications,
+                    action_policy,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -1066,7 +1114,7 @@ fn TelemetryDashboardInner() -> Element {
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
                     && alive.load(Ordering::Relaxed)
                 {
                     log!("[WS] supervisor ended: {e}");
@@ -1171,6 +1219,7 @@ fn TelemetryDashboardInner() -> Element {
     let mut rows = rows;
     let mut warnings = warnings;
     let mut errors = errors;
+    let mut notifications = notifications;
     let mut _refresh_layout = refresh_layout;
     let reload_button: Element = rsx! {
         button {
@@ -1190,6 +1239,7 @@ fn TelemetryDashboardInner() -> Element {
                 charts_cache_request_refit();
                 warnings.set(Vec::new());
                 errors.set(Vec::new());
+                notifications.set(Vec::new());
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     _refresh_layout();
@@ -1220,6 +1270,12 @@ fn TelemetryDashboardInner() -> Element {
         // Only needed if you want to gate geolocation until the JS is ready on wasm:
         js_ready: Some(start_gps_js()),
     }
+        style {
+            "@keyframes gs26-blink-slow-off {{ 0%, 100% {{ opacity: 0.2; }} 18% {{ opacity: 1.0; }} }}
+             @keyframes gs26-blink-slow-on  {{ 0%, 100% {{ opacity: 1.0; }} 82% {{ opacity: 0.25; }} }}
+             @keyframes gs26-blink-fast-off {{ 0%, 100% {{ opacity: 0.15; }} 45% {{ opacity: 1.0; }} }}
+             @keyframes gs26-blink-fast-on  {{ 0%, 100% {{ opacity: 1.0; }} 55% {{ opacity: 0.2; }} }}"
+        }
         if layout_loading_snapshot && layout_snapshot.is_none() {
             div {
                 style: "
@@ -1496,6 +1552,34 @@ fn TelemetryDashboardInner() -> Element {
             }
 
             // Main body
+            if !notifications.read().is_empty() {
+                div {
+                    style: "display:flex; flex-direction:column; gap:8px; margin-bottom:10px;",
+                    for n in notifications.read().iter() {
+                        div {
+                            style: "display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid #f59e0b; border-radius:10px; background:#2a1a05; color:#fde68a;",
+                            span { style: "flex:1;", "{n.message}" }
+                            button {
+                                style: "padding:0.2rem 0.55rem; border-radius:999px; border:1px solid #92400e; background:#111827; color:#fde68a; font-size:0.75rem; cursor:pointer;",
+                                onclick: {
+                                    let id = n.id;
+                                    let mut notifications = notifications;
+                                    move |_| {
+                                        let mut v = notifications.read().clone();
+                                        v.retain(|x| x.id != id);
+                                        notifications.set(v);
+                                        spawn(async move {
+                                            let _ = dismiss_notification_remote(id).await;
+                                        });
+                                    }
+                                },
+                                "Dismiss"
+                            }
+                        }
+                    }
+                }
+            }
+
             div { style: "flex:1; min-height:0; overflow:hidden;",
                 match *active_main_tab.read() {
                     MainTab::State => rsx! {
@@ -1508,6 +1592,7 @@ fn TelemetryDashboardInner() -> Element {
                                     user_gps: user_gps,
                                     layout: layout.state_tab.clone(),
                                     actions: layout.actions_tab.clone(),
+                                    action_policy: action_policy,
                                     default_valve_labels: layout
                                         .data_tab
                                         .tabs
@@ -1526,7 +1611,7 @@ fn TelemetryDashboardInner() -> Element {
                     MainTab::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
                     MainTab::Actions => rsx! {
                         div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
-                            ActionsTab { layout: layout.actions_tab.clone() }
+                            ActionsTab { layout: layout.actions_tab.clone(), action_policy: action_policy }
                         }
                     },
                     MainTab::Warnings => rsx! {
@@ -1642,6 +1727,63 @@ async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, St
         .map_err(|e| e.to_string())
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn http_post_empty(path: &str) -> Result<(), String> {
+    use gloo_net::http::Request;
+
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+
+    let base = UrlConfig::base_http();
+    let url = if base.is_empty() {
+        let w = web_sys::window().ok_or("no window".to_string())?;
+        let origin = w
+            .location()
+            .origin()
+            .map_err(|_| "failed to read window.location.origin".to_string())?;
+        format!("{origin}{path}")
+    } else {
+        format!("{base}{path}")
+    };
+
+    Request::post(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn http_post_empty(path: &str) -> Result<(), String> {
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+
+    let base = UrlConfig::base_http();
+    let url = if base.is_empty() {
+        format!("http://localhost:3000{path}")
+    } else {
+        format!("{base}{path}")
+    };
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(UrlConfig::_skip_tls_verify())
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    client.post(url).send().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn dismiss_notification_remote(id: u64) -> Result<(), String> {
+    http_post_empty(&format!("/api/notifications/{id}/dismiss")).await
+}
+
 // ------------------------------
 // Seed telemetry/alerts/gps
 // ------------------------------
@@ -1650,6 +1792,8 @@ async fn seed_from_db(
     rows: &mut Signal<Vec<TelemetryRow>>,
     warnings: &mut Signal<Vec<AlertMsg>>,
     errors: &mut Signal<Vec<AlertMsg>>,
+    notifications: &mut Signal<Vec<PersistentNotification>>,
+    action_policy: &mut Signal<ActionPolicyMsg>,
     board_status: &mut Signal<Vec<BoardStatusEntry>>,
     rocket_gps: &mut Signal<Option<(f64, f64)>>,
     user_gps: &mut Signal<Option<(f64, f64)>>,
@@ -1823,6 +1967,18 @@ async fn seed_from_db(
         errors.set(e);
     }
 
+    if let Ok(list) = http_get_json::<Vec<PersistentNotification>>("/api/notifications").await
+        && alive.load(Ordering::Relaxed)
+    {
+        notifications.set(list);
+    }
+
+    if let Ok(policy) = http_get_json::<ActionPolicyMsg>("/api/action_policy").await
+        && alive.load(Ordering::Relaxed)
+    {
+        action_policy.set(policy);
+    }
+
     if !alive.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -1858,6 +2014,8 @@ async fn connect_ws_supervisor(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
+    notifications: Signal<Vec<PersistentNotification>>,
+    action_policy: Signal<ActionPolicyMsg>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -1888,6 +2046,8 @@ async fn connect_ws_supervisor(
                     rows,
                     warnings,
                     errors,
+                    notifications,
+                    action_policy,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -1896,7 +2056,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -1906,6 +2066,8 @@ async fn connect_ws_supervisor(
                     rows,
                     warnings,
                     errors,
+                    notifications,
+                    action_policy,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -1914,7 +2076,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
         };
 
@@ -1947,6 +2109,8 @@ async fn connect_ws_once_wasm(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
+    notifications: Signal<Vec<PersistentNotification>>,
+    action_policy: Signal<ActionPolicyMsg>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -1993,6 +2157,8 @@ async fn connect_ws_once_wasm(
                     rows,
                     warnings,
                     errors,
+                    notifications,
+                    action_policy,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -2046,7 +2212,7 @@ async fn connect_ws_once_wasm(
             &mut closed_rx,
             gloo_timers::future::TimeoutFuture::new(150),
         )
-            .await;
+        .await;
 
         match done {
             futures_util::future::Either::Left((_closed, _timeout)) => break,
@@ -2069,6 +2235,8 @@ async fn connect_ws_once_native(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
+    notifications: Signal<Vec<PersistentNotification>>,
+    action_policy: Signal<ActionPolicyMsg>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2105,9 +2273,9 @@ async fn connect_ws_once_native(
             false,
             Some(tokio_tungstenite::Connector::NativeTls(tls)),
         )
-            .await
-            .map_err(|e| format!("[WS] connect failed: {e}"))?
-            .0
+        .await
+        .map_err(|e| format!("[WS] connect failed: {e}"))?
+        .0
     } else {
         tokio_tungstenite::connect_async(ws_url.as_str())
             .await
@@ -2142,6 +2310,8 @@ async fn connect_ws_once_native(
                 rows,
                 warnings,
                 errors,
+                notifications,
+                action_policy,
                 warning_event_counter,
                 error_event_counter,
                 flight_state,
@@ -2164,6 +2334,8 @@ fn handle_ws_message(
     rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
+    notifications: Signal<Vec<PersistentNotification>>,
+    action_policy: Signal<ActionPolicyMsg>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2175,6 +2347,8 @@ fn handle_ws_message(
     let mut errors = errors;
     let mut warning_event_counter = warning_event_counter;
     let mut error_event_counter = error_event_counter;
+    let mut notifications = notifications;
+    let mut action_policy = action_policy;
     let mut flight_state = flight_state;
     let mut board_status = board_status;
     let mut rocket_gps = rocket_gps;
@@ -2256,6 +2430,14 @@ fn handle_ws_message(
 
         WsInMsg::BoardStatus(status) => {
             board_status.set(status.boards);
+        }
+
+        WsInMsg::Notifications(list) => {
+            notifications.set(list);
+        }
+
+        WsInMsg::ActionPolicy(policy) => {
+            action_policy.set(policy);
         }
     }
 }

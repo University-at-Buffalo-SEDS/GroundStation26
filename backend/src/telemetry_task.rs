@@ -287,6 +287,14 @@ pub async fn telemetry_task(
                     }
                 }
                 Some(cmd) = rx.recv() => {
+                    if !state.is_command_allowed(&cmd) {
+                        emit_warning(
+                            &state,
+                            format!("Command {cmd:?} blocked by sequence/key interlock"),
+                        );
+                        continue;
+                    }
+                    state.record_command_accepted(&cmd, get_current_timestamp_ms());
                     match cmd {
                         TelemetryCommand::Launch => {
                                 if let Err(e) = router.log_queue(
@@ -745,7 +753,7 @@ async fn handle_packet(
                 state_code: pkt_data as i64,
             },
         )
-            .await;
+        .await;
 
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
@@ -771,7 +779,7 @@ async fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                    .ok();
+                .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 queue_db_write(
@@ -785,7 +793,7 @@ async fn handle_packet(
                         payload_json,
                     },
                 )
-                    .await;
+                .await;
 
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
@@ -805,13 +813,18 @@ async fn handle_packet(
 
     if let Ok(values) = pkt.data_as_f32() {
         let values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
+        if pkt.data_type() == DataType::FuelTankPressure {
+            let latest = values_vec.first().copied().flatten();
+            let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
+            *pressure = latest;
+        }
         let values_json = serde_json::to_string(
             &values_vec
                 .iter()
                 .map(|v| v.map(|n| n as f64))
                 .collect::<Vec<_>>(),
         )
-            .ok();
+        .ok();
 
         if should_persist_telemetry_sample(&data_type_str, ts_ms) {
             queue_db_write(
@@ -825,7 +838,7 @@ async fn handle_packet(
                     payload_json: payload_json.clone(),
                 },
             )
-                .await;
+            .await;
         }
 
         let row = TelemetryRow {
@@ -848,7 +861,7 @@ async fn handle_packet(
                     payload_json,
                 },
             )
-                .await;
+            .await;
         }
         None
     }
