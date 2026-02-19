@@ -1251,14 +1251,15 @@ def _ensure_windows_icon_compat(frontend_dir: Path) -> None:
         print(f"Warning: Windows icon source not found: {src_png}", file=sys.stderr)
         return
 
-    icons_dir = frontend_dir / "assets"
+    icons_dir = frontend_dir / "icons"
     icons_dir.mkdir(parents=True, exist_ok=True)
     src_ico = frontend_dir / "assets" / "icon.ico"
     dst_ico = icons_dir / "icon.ico"
 
     if src_ico.exists():
+        dst_ico.parent.mkdir(parents=True, exist_ok=True)
         if not dst_ico.exists():
-            shutil.copytree(src_ico, dst_ico)
+            shutil.copy2(src_ico, dst_ico)
         return
 
     try:
