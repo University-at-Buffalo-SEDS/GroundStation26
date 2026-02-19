@@ -58,7 +58,11 @@ enum SequenceStep {
 struct SequenceConfig {
     leak_check_duration: Duration,
     nitrous_soak_duration: Duration,
+    nitrous_level_duration: Duration,
     pressure_min_psi: f32,
+    nitrous_pressure_min_psi: f32,
+    nitrous_rise_epsilon_psi: f32,
+    dump_pressure_max_psi: f32,
     max_leak_drop_psi: f32,
     pending_fast_window: Duration,
     key_required: bool,
@@ -78,11 +82,32 @@ impl SequenceConfig {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(10.0);
 
+        let nitrous_pressure_min_psi = std::env::var("GS_SEQUENCE_NITROUS_PRESSURE_MIN_PSI")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(pressure_min_psi);
+
+        let dump_pressure_max_psi = std::env::var("GS_SEQUENCE_DUMP_PRESSURE_MAX_PSI")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(5.0);
+
         let nitrous_soak_duration = std::env::var("GS_SEQUENCE_NITROUS_SOAK_SEC")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(30));
+
+        let nitrous_level_duration = std::env::var("GS_SEQUENCE_NITROUS_LEVEL_SEC")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(3));
+
+        let nitrous_rise_epsilon_psi = std::env::var("GS_SEQUENCE_NITROUS_RISE_EPSILON_PSI")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.15);
 
         let max_leak_drop_psi = std::env::var("GS_SEQUENCE_MAX_LEAK_DROP_PSI")
             .ok()
@@ -117,7 +142,11 @@ impl SequenceConfig {
         Self {
             leak_check_duration,
             nitrous_soak_duration,
+            nitrous_level_duration,
             pressure_min_psi,
+            nitrous_pressure_min_psi,
+            nitrous_rise_epsilon_psi,
+            dump_pressure_max_psi,
             max_leak_drop_psi,
             pending_fast_window,
             key_required,
@@ -134,6 +163,10 @@ struct SequenceRuntime {
     notified_leak_pass: bool,
     notified_armed: bool,
     warned_rapid_drop: bool,
+    notified_close_nitrous: bool,
+    nitrous_level_since: Option<Instant>,
+    last_nitrous_pressure_psi: Option<f32>,
+    notified_retract_fill_lines: bool,
 }
 
 impl Default for SequenceRuntime {
@@ -145,6 +178,10 @@ impl Default for SequenceRuntime {
             notified_leak_pass: false,
             notified_armed: false,
             warned_rapid_drop: false,
+            notified_close_nitrous: false,
+            nitrous_level_since: None,
+            last_nitrous_pressure_psi: None,
+            notified_retract_fill_lines: false,
         }
     }
 }
@@ -294,6 +331,7 @@ fn update_sequence_runtime(
     now: Instant,
 ) {
     let at_or_above = |p: Option<f32>, threshold: f32| p.is_some_and(|x| x >= threshold);
+    let at_or_below = |p: Option<f32>, threshold: f32| p.is_some_and(|x| x <= threshold);
 
     match runtime.step {
         SequenceStep::SetupValves => {
@@ -360,7 +398,9 @@ fn update_sequence_runtime(
             }
         }
         SequenceStep::DumpNitrogen => {
-            if valves.dump_open == Some(true) {
+            if valves.dump_open == Some(true)
+                && at_or_below(pressure_psi, cfg.dump_pressure_max_psi)
+            {
                 runtime.step = SequenceStep::CloseDump;
             }
         }
@@ -370,10 +410,50 @@ fn update_sequence_runtime(
             }
         }
         SequenceStep::OpenNitrous => {
-            if valves.nitrous_open == Some(true) {
+            if valves.nitrous_open != Some(true) {
+                runtime.nitrous_level_since = None;
+                runtime.last_nitrous_pressure_psi = None;
+                return;
+            }
+
+            let Some(current_pressure) = pressure_psi else {
+                return;
+            };
+
+            if !at_or_above(Some(current_pressure), cfg.nitrous_pressure_min_psi) {
+                runtime.nitrous_level_since = None;
+                runtime.last_nitrous_pressure_psi = Some(current_pressure);
+                return;
+            }
+
+            let rising = runtime
+                .last_nitrous_pressure_psi
+                .is_some_and(|prev| current_pressure > prev + cfg.nitrous_rise_epsilon_psi);
+
+            runtime.last_nitrous_pressure_psi = Some(current_pressure);
+
+            if rising {
+                runtime.nitrous_level_since = None;
+                return;
+            }
+
+            let leveled_since = runtime.nitrous_level_since.get_or_insert(now);
+            if now.saturating_duration_since(*leveled_since) >= cfg.nitrous_level_duration {
+                runtime.notified_close_nitrous = false;
+                runtime.step = SequenceStep::CloseNitrous;
+            }
+        }
+        SequenceStep::CloseNitrous => {
+            if !runtime.notified_close_nitrous {
+                state.add_notification(
+                    "Nitrous pressure has leveled. Close Nitrous valve to start settle timer.",
+                );
+                runtime.notified_close_nitrous = true;
+            }
+            if valves.nitrous_open == Some(false) {
                 runtime.step_started_at = Some(now);
                 state.add_temporary_notification(format!(
-                    "Nitrous settle started. Holding for {}s before close.",
+                    "Nitrous settle started. Waiting {}s before fill line removal.",
                     cfg.nitrous_soak_duration.as_secs()
                 ));
                 runtime.step = SequenceStep::NitrousSoak;
@@ -385,15 +465,15 @@ fn update_sequence_runtime(
                 return;
             };
             if now.saturating_duration_since(started) >= cfg.nitrous_soak_duration {
-                runtime.step = SequenceStep::CloseNitrous;
-            }
-        }
-        SequenceStep::CloseNitrous => {
-            if valves.nitrous_open == Some(false) {
+                runtime.notified_retract_fill_lines = false;
                 runtime.step = SequenceStep::RetractFillLines;
             }
         }
         SequenceStep::RetractFillLines => {
+            if !runtime.notified_retract_fill_lines {
+                state.add_notification("Nitrous settle complete. Remove fill lines.");
+                runtime.notified_retract_fill_lines = true;
+            }
             if valves.retract == Some(true) {
                 runtime.step = SequenceStep::ArmedReady;
             }
@@ -494,12 +574,12 @@ fn build_policy(
                 recommended.insert("Nitrous", pending_mode(state, "Nitrous", now_ms, cfg));
             }
         }
-        SequenceStep::NitrousSoak => {}
         SequenceStep::CloseNitrous => {
             if valves.nitrous_open != Some(false) {
                 recommended.insert("Nitrous", pending_mode(state, "Nitrous", now_ms, cfg));
             }
         }
+        SequenceStep::NitrousSoak => {}
         SequenceStep::RetractFillLines => {
             if valves.retract != Some(true) {
                 recommended.insert(

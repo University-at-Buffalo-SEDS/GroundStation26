@@ -48,10 +48,8 @@ const MAX_BUCKETS_PER_TYPE: usize = (HISTORY_MS as usize / BUCKET_MS as usize) +
 // Only recent buckets are mutable. Older buckets are frozen.
 // Allow a few buckets for packet jitter/reordering on slower devices.
 const LIVE_BUCKETS_BACK: i64 = 3;
-// Interpolate short gaps only; long gaps should render as discontinuities.
-const MIN_CONNECT_GAP_MS: i64 = 500;
-const MAX_CONNECT_GAP_MS_CAP: i64 = 5_000;
-const CONNECT_GAP_SPAN_DIVISOR: i64 = 120;
+// Always bridge gaps for continuous display, but cap inserted points per gap for performance.
+const MAX_INTERP_POINTS_PER_GAP: i64 = 64;
 
 // Avoid zero span
 const MIN_SPAN_MS: i64 = 1_000;
@@ -560,14 +558,12 @@ impl CachedChart {
         }
 
         // Build paths by iterating stable bucket ids in order.
-        // Interpolate through short gaps; break long gaps.
+        // Interpolate through gaps to keep plots visually continuous.
         let mut segment_open: Vec<bool> = vec![false; self.channel_count];
         let mut last_bucket_id_drawn: Vec<Option<i64>> = vec![None; self.channel_count];
+        let mut last_point_drawn: Vec<Option<(f32, f32)>> = vec![None; self.channel_count];
 
         let total = (newest_bid - start_bid + 1).max(1) as f32;
-        let max_connect_gap_ms =
-            (span_ms / CONNECT_GAP_SPAN_DIVISOR).clamp(MIN_CONNECT_GAP_MS, MAX_CONNECT_GAP_MS_CAP);
-        let max_gap_buckets = (max_connect_gap_ms / BUCKET_MS).max(1);
 
         for b in self.buckets.iter() {
             if b.id < start_bid || b.id > newest_bid {
@@ -584,8 +580,19 @@ impl CachedChart {
                 let v = b.last[ch];
                 let y = map_y(v);
                 if let Some(prev_bid) = last_bucket_id_drawn[ch] {
-                    if b.id - prev_bid > max_gap_buckets {
-                        segment_open[ch] = false;
+                    let gap_buckets = b.id - prev_bid;
+                    if gap_buckets > 1 && segment_open[ch] {
+                        if let Some((prev_x, prev_y)) = last_point_drawn[ch] {
+                            let out = &mut self.paths[ch];
+                            let missing = gap_buckets - 1;
+                            let interp_pts = missing.min(MAX_INTERP_POINTS_PER_GAP).max(1);
+                            for j in 1..=interp_pts {
+                                let t = j as f32 / (interp_pts + 1) as f32;
+                                let xi = prev_x + (x - prev_x) * t;
+                                let yi = prev_y + (y - prev_y) * t;
+                                out.push_str(&format!("L {:.2} {:.2} ", xi, yi));
+                            }
+                        }
                     }
                 }
 
@@ -597,6 +604,7 @@ impl CachedChart {
                     out.push_str(&format!("L {:.2} {:.2} ", x, y));
                 }
                 last_bucket_id_drawn[ch] = Some(b.id);
+                last_point_drawn[ch] = Some((x, y));
             }
         }
 

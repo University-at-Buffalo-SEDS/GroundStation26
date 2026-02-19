@@ -1160,14 +1160,19 @@ fn TelemetryDashboardInner() -> Element {
         });
     }
 
-    // Checking the Notifications tab clears the indicator.
+    // Checking the Notifications tab dismisses currently active notifications
+    // and clears the unread indicator.
     {
-        let mut unread_notification_ids = unread_notification_ids;
+        let notifications = notifications;
+        let dismissed_notifications = dismissed_notifications;
+        let unread_notification_ids = unread_notification_ids;
         use_effect(move || {
-            if *active_main_tab.read() == MainTab::Notifications
-                && !unread_notification_ids.read().is_empty()
-            {
-                unread_notification_ids.set(Vec::new());
+            if *active_main_tab.read() == MainTab::Notifications {
+                dismiss_all_active_notifications_local_and_remote(
+                    notifications,
+                    dismissed_notifications,
+                    unread_notification_ids,
+                );
             }
         });
     }
@@ -1533,10 +1538,16 @@ fn TelemetryDashboardInner() -> Element {
                             style: if *active_main_tab.read() == MainTab::Notifications { tab_style_active("#3b82f6") } else { tab_style_inactive.to_string() },
                             onclick: {
                                 let mut t = active_main_tab;
-                                let mut unread_notification_ids = unread_notification_ids;
+                                let notifications = notifications;
+                                let dismissed_notifications = dismissed_notifications;
+                                let unread_notification_ids = unread_notification_ids;
                                 move |_| {
                                     t.set(MainTab::Notifications);
-                                    unread_notification_ids.set(Vec::new());
+                                    dismiss_all_active_notifications_local_and_remote(
+                                        notifications,
+                                        dismissed_notifications,
+                                        unread_notification_ids,
+                                    );
                                 }
                             },
                             span { "Notifications" }
@@ -1962,6 +1973,58 @@ fn persist_dismissed_notifications(items: &[DismissedNotification]) {
     }
 }
 
+async fn cooperative_yield() {
+    #[cfg(target_arch = "wasm32")]
+    gloo_timers::future::TimeoutFuture::new(0).await;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::task::yield_now().await;
+}
+
+fn dismiss_all_active_notifications_local_and_remote(
+    notifications: Signal<Vec<PersistentNotification>>,
+    dismissed_notifications: Signal<Vec<DismissedNotification>>,
+    unread_notification_ids: Signal<Vec<u64>>,
+) {
+    let mut notifications = notifications;
+    let mut dismissed_notifications = dismissed_notifications;
+    let mut unread_notification_ids = unread_notification_ids;
+
+    let active = { notifications.read().clone() };
+    if active.is_empty() {
+        unread_notification_ids.set(Vec::new());
+        return;
+    }
+
+    notifications.set(Vec::new());
+    unread_notification_ids.set(Vec::new());
+
+    let mut ids = { dismissed_notifications.read().clone() };
+    let mut changed = false;
+    for n in &active {
+        let item = DismissedNotification {
+            id: n.id,
+            timestamp_ms: n.timestamp_ms,
+        };
+        if !ids.contains(&item) {
+            ids.push(item);
+            changed = true;
+        }
+    }
+    if changed {
+        ids.sort_by_key(|x| (x.id, x.timestamp_ms));
+        dismissed_notifications.set(ids.clone());
+        persist_dismissed_notifications(&ids);
+    }
+
+    for n in active {
+        let id = n.id;
+        spawn_detached(async move {
+            let _ = dismiss_notification_remote(id).await;
+        });
+    }
+}
+
 fn merge_notification_history(
     history: &mut Vec<PersistentNotification>,
     incoming: &[PersistentNotification],
@@ -2154,29 +2217,8 @@ async fn seed_from_db(
         mut db_rows: Vec<TelemetryRow>,
         live_rows: Vec<TelemetryRow>,
     ) -> Vec<TelemetryRow> {
-        // For each data type, DB supplies only buckets older than the oldest in-memory live bucket.
-        // Live rows own the overlap boundary so reseed handoff cannot create a bucket mismatch gap.
-        let mut live_oldest_bid_by_type: HashMap<String, i64> = HashMap::new();
-        for row in &live_rows {
-            let bid = row.timestamp_ms.div_euclid(RESEED_BUCKET_MS);
-            live_oldest_bid_by_type
-                .entry(row.data_type.clone())
-                .and_modify(|oldest| {
-                    if bid < *oldest {
-                        *oldest = bid;
-                    }
-                })
-                .or_insert(bid);
-        }
-
-        db_rows.retain(|row| {
-            let bid = row.timestamp_ms.div_euclid(RESEED_BUCKET_MS);
-            match live_oldest_bid_by_type.get(&row.data_type) {
-                Some(oldest_live_bid) => bid < *oldest_live_bid,
-                None => true,
-            }
-        });
-
+        // Keep full overlap and dedupe by timestamp bucket.
+        // This lets DB reseed fill small continuity holes while live rows still win when newer.
         db_rows.extend(live_rows);
         let mut merged = compact_rows_by_bucket(db_rows);
         prune_history(&mut merged);
@@ -2222,8 +2264,15 @@ async fn seed_from_db(
         }
 
         // Rebuild chart cache from the merged list (DB + live + queued snapshots).
-        // This ensures DB reseed contributes historical points while preserving live continuity.
-        charts_cache_reset_and_ingest(&list);
+        // Chunk + yield so WS/UI processing remains responsive during large reseeds.
+        charts_cache_reset_and_ingest(&[]);
+        const RESEED_INGEST_CHUNK: usize = 1024;
+        for (i, row) in list.iter().enumerate() {
+            charts_cache_ingest_row(row);
+            if i % RESEED_INGEST_CHUNK == 0 {
+                cooperative_yield().await;
+            }
+        }
         // Replay whatever is currently queued right after reset so points that arrive
         // around reseed commit are not visually lost in the chart cache.
         let post_reset_queued_rows = queue_snapshot();
@@ -2736,7 +2785,7 @@ fn handle_ws_message(
                 q.push_back(row);
 
                 // Safety cap if UI stalls
-                const MAX_QUEUE: usize = 30_000;
+                const MAX_QUEUE: usize = 120_000;
                 while q.len() > MAX_QUEUE {
                     q.pop_front();
                 }
@@ -2756,7 +2805,7 @@ fn handle_ws_message(
                     q.push_back(row);
                 }
 
-                const MAX_QUEUE: usize = 30_000;
+                const MAX_QUEUE: usize = 120_000;
                 while q.len() > MAX_QUEUE {
                     q.pop_front();
                 }
