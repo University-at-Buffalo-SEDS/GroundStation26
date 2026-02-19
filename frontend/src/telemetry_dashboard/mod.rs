@@ -669,18 +669,24 @@ struct WsSender {
 }
 
 impl WsSender {
-    fn send_cmd(&self, cmd: &str) {
+    fn send_cmd(&self, cmd: &str) -> Result<(), String> {
         let msg = format!(r#"{{"cmd":"{}"}}"#, cmd);
 
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = self.ws.send_with_str(&msg);
+            self.ws
+                .send_with_str(&msg)
+                .map_err(|_| "ws send failed".to_string())?;
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = self.tx.send(msg);
+            self.tx
+                .send(msg)
+                .map_err(|_| "ws channel closed".to_string())?;
         }
+
+        Ok(())
     }
 }
 
@@ -1800,8 +1806,10 @@ fn TelemetryDashboardInner() -> Element {
 }
 
 fn send_cmd(cmd: &str) {
-    if let Some(sender) = WS_SENDER.read().clone() {
-        sender.send_cmd(cmd);
+    if let Some(sender) = WS_SENDER.read().clone()
+        && let Err(e) = sender.send_cmd(cmd)
+    {
+        log!("[CMD] ws send failed for '{cmd}': {e}");
     }
 }
 
@@ -2725,7 +2733,11 @@ async fn connect_ws_once_native(
     }
 
     writer.abort();
-    *WS_SENDER.write() = None;
+    // Only clear sender if this task still owns the active epoch.
+    // Prevents old-epoch teardown from clobbering a freshly reconnected sender.
+    if *WS_EPOCH.read() == epoch {
+        *WS_SENDER.write() = None;
+    }
 
     Err("websocket closed".to_string())
 }
