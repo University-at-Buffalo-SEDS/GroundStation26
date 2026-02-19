@@ -1253,9 +1253,14 @@ def _ensure_windows_icon_compat(frontend_dir: Path) -> None:
 
     icons_dir = frontend_dir / "assets"
     icons_dir.mkdir(parents=True, exist_ok=True)
+    src_ico = frontend_dir / "assets" / "icon.ico"
     dst_ico = icons_dir / "icon.ico"
 
-    generated = False
+    if src_ico.exists():
+        if not dst_ico.exists():
+            shutil.copytree(src_ico, dst_ico)
+        return
+
     try:
         from PIL import Image  # type: ignore
 
