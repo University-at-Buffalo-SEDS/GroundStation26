@@ -54,15 +54,15 @@ const FUEL_FLOW_MIN_THRESHOLD: f32 = 0.0; // L/h
 const FUEL_FLOW_MAX_THRESHOLD: f32 = 200.0; // L/h
 // Fuel Tank Pressure thresholds (psi)
 const FUEL_TANK_PRESSURE_MIN_THRESHOLD: f32 = 0.0; // psi
-const FUEL_TANK_PRESSURE_MAX_THRESHOLD: f32 = 50.0; // psi
+const FUEL_TANK_PRESSURE_MAX_THRESHOLD: f32 = 3000.0; // psi
 
 // Kalman Filter thresholds
-const KALMAN_X_MIN_THRESHOLD: f32 = -1000.0; // arbitrary units
-const KALMAN_X_MAX_THRESHOLD: f32 = 1000.0; // arbitrary units
-const KALMAN_Y_MIN_THRESHOLD: f32 = -1000.0; // arbitrary units
-const KALMAN_Y_MAX_THRESHOLD: f32 = 1000.0; // arbitrary units
-const KALMAN_Z_MIN_THRESHOLD: f32 = -1000.0; // arbitrary units
-const KALMAN_Z_MAX_THRESHOLD: f32 = 1000.0; // arbitrary units
+const KALMAN_X_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
+const KALMAN_X_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
+const KALMAN_Y_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
+const KALMAN_Y_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
+const KALMAN_Z_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
+const KALMAN_Z_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
 
 #[cfg(not(feature = "testing"))]
 const BOARD_TIMEOUT_MS: u64 = 500;

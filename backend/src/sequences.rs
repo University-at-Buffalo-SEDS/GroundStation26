@@ -1,5 +1,6 @@
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 use crate::state::AppState;
+use crate::web::emit_warning;
 use groundstation_shared::{FlightState, TelemetryCommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -46,12 +47,16 @@ enum SequenceStep {
     DumpNitrogen,
     CloseDump,
     OpenNitrous,
+    NitrousSoak,
+    CloseNitrous,
+    RetractFillLines,
     ArmedReady,
 }
 
 #[derive(Clone, Debug)]
 struct SequenceConfig {
     leak_check_duration: Duration,
+    nitrous_soak_duration: Duration,
     pressure_min_psi: f32,
     max_leak_drop_psi: f32,
     pending_fast_window: Duration,
@@ -71,6 +76,12 @@ impl SequenceConfig {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(10.0);
+
+        let nitrous_soak_duration = std::env::var("GS_SEQUENCE_NITROUS_SOAK_SEC")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(30));
 
         let max_leak_drop_psi = std::env::var("GS_SEQUENCE_MAX_LEAK_DROP_PSI")
             .ok()
@@ -104,6 +115,7 @@ impl SequenceConfig {
 
         Self {
             leak_check_duration,
+            nitrous_soak_duration,
             pressure_min_psi,
             max_leak_drop_psi,
             pending_fast_window,
@@ -120,6 +132,7 @@ struct SequenceRuntime {
     pressure_at_close_psi: Option<f32>,
     notified_leak_pass: bool,
     notified_armed: bool,
+    warned_rapid_drop: bool,
 }
 
 impl Default for SequenceRuntime {
@@ -130,6 +143,7 @@ impl Default for SequenceRuntime {
             pressure_at_close_psi: None,
             notified_leak_pass: false,
             notified_armed: false,
+            warned_rapid_drop: false,
         }
     }
 }
@@ -230,14 +244,22 @@ pub fn default_action_policy() -> ActionPolicyMsg {
 fn policy_with_overrides(
     key_enabled: bool,
     valves: ValveSnapshot,
-    enabled: HashMap<&'static str, BlinkMode>,
+    recommended: HashMap<&'static str, BlinkMode>,
 ) -> ActionPolicyMsg {
     let controls = all_command_names()
         .into_iter()
         .map(|cmd| ActionControl {
             cmd: cmd.to_string(),
-            enabled: cmd == "Abort" || enabled.contains_key(cmd),
-            blink: enabled.get(cmd).cloned().unwrap_or(BlinkMode::None),
+            // Keep controls pressable while key is enabled; blink indicates recommendation.
+            enabled: if cmd == "Abort" {
+                true
+            } else if cmd == "RetractPlumbing" && valves.retract == Some(true) {
+                // Fill lines are one-way: once retracted, do not re-enable.
+                false
+            } else {
+                key_enabled
+            },
+            blink: recommended.get(cmd).cloned().unwrap_or(BlinkMode::None),
             actuated: valves.actuated_for_cmd(cmd),
         })
         .collect();
@@ -288,6 +310,11 @@ fn update_sequence_runtime(
             if valves.nitrogen_open == Some(false) {
                 runtime.pressure_at_close_psi = pressure_psi;
                 runtime.step_started_at = Some(now);
+                runtime.warned_rapid_drop = false;
+                state.add_notification(format!(
+                    "Nitrogen fill test started. Monitoring pressure hold for {}s.",
+                    cfg.leak_check_duration.as_secs()
+                ));
                 runtime.step = SequenceStep::NitrogenLeakCheck;
             }
         }
@@ -296,12 +323,22 @@ fn update_sequence_runtime(
                 runtime.step_started_at = Some(now);
                 return;
             };
+            let baseline = runtime.pressure_at_close_psi.unwrap_or(0.0);
+            let current = pressure_psi.unwrap_or(0.0);
+            let drop_psi = (baseline - current).max(0.0);
+            if !runtime.warned_rapid_drop && drop_psi > cfg.max_leak_drop_psi {
+                runtime.warned_rapid_drop = true;
+                emit_warning(
+                    state,
+                    format!(
+                        "Rapid pressure drop detected during fill test: -{drop_psi:.2} psi from hold baseline"
+                    ),
+                );
+            }
             if now.saturating_duration_since(started) < cfg.leak_check_duration {
                 return;
             }
 
-            let baseline = runtime.pressure_at_close_psi.unwrap_or(0.0);
-            let current = pressure_psi.unwrap_or(0.0);
             let pressure_ok = current >= baseline - cfg.max_leak_drop_psi;
 
             if pressure_ok {
@@ -333,13 +370,37 @@ fn update_sequence_runtime(
         }
         SequenceStep::OpenNitrous => {
             if valves.nitrous_open == Some(true) {
+                runtime.step_started_at = Some(now);
+                state.add_notification(format!(
+                    "Nitrous settle started. Holding for {}s before close.",
+                    cfg.nitrous_soak_duration.as_secs()
+                ));
+                runtime.step = SequenceStep::NitrousSoak;
+            }
+        }
+        SequenceStep::NitrousSoak => {
+            let Some(started) = runtime.step_started_at else {
+                runtime.step_started_at = Some(now);
+                return;
+            };
+            if now.saturating_duration_since(started) >= cfg.nitrous_soak_duration {
+                runtime.step = SequenceStep::CloseNitrous;
+            }
+        }
+        SequenceStep::CloseNitrous => {
+            if valves.nitrous_open == Some(false) {
+                runtime.step = SequenceStep::RetractFillLines;
+            }
+        }
+        SequenceStep::RetractFillLines => {
+            if valves.retract == Some(true) {
                 runtime.step = SequenceStep::ArmedReady;
             }
         }
         SequenceStep::ArmedReady => {
             if !runtime.notified_armed {
                 state.add_notification(
-                    "Nitrous fill complete. Key is accepted; launch can proceed when enabled.",
+                    "Fill sequence complete: nitrous closed, fill lines removed. Launch state is ready.",
                 );
                 runtime.notified_armed = true;
             }
@@ -378,58 +439,86 @@ fn build_policy(
             }
             enabled.insert(cmd, BlinkMode::None);
         }
+        // In Idle, make the first fill-transition action the only illuminated action.
+        // All other controls remain available (dimmed client-side when not blinking).
+        if flight_state == FlightState::Idle && valves.normally_open != Some(false) {
+            enabled.insert(
+                "NormallyOpen",
+                pending_mode(state, "NormallyOpen", now_ms, cfg),
+            );
+        }
+        if flight_state == FlightState::Idle && valves.dump_open != Some(false) {
+            enabled.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
+        }
         return policy_with_overrides(true, valves, enabled);
     }
 
-    let mut enabled: HashMap<&'static str, BlinkMode> = HashMap::new();
+    let mut recommended: HashMap<&'static str, BlinkMode> = HashMap::new();
 
     match runtime.step {
         SequenceStep::SetupValves => {
             if valves.normally_open != Some(false) {
-                enabled.insert(
+                recommended.insert(
                     "NormallyOpen",
                     pending_mode(state, "NormallyOpen", now_ms, cfg),
                 );
             }
             if valves.dump_open != Some(false) {
-                enabled.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
+                recommended.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
             }
         }
         SequenceStep::NitrogenFill => {
             if valves.nitrogen_open != Some(true) {
-                enabled.insert("Nitrogen", pending_mode(state, "Nitrogen", now_ms, cfg));
+                recommended.insert("Nitrogen", pending_mode(state, "Nitrogen", now_ms, cfg));
             }
         }
         SequenceStep::CloseNitrogen => {
             if valves.nitrogen_open != Some(false) {
-                enabled.insert("Nitrogen", pending_mode(state, "Nitrogen", now_ms, cfg));
+                recommended.insert("Nitrogen", pending_mode(state, "Nitrogen", now_ms, cfg));
             }
         }
         SequenceStep::NitrogenLeakCheck => {}
         SequenceStep::DumpNitrogen => {
             if valves.dump_open != Some(true) {
-                enabled.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
+                recommended.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
             }
         }
         SequenceStep::CloseDump => {
             if valves.dump_open != Some(false) {
-                enabled.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
+                recommended.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
             }
         }
         SequenceStep::OpenNitrous => {
             if valves.nitrous_open != Some(true) {
-                enabled.insert("Nitrous", pending_mode(state, "Nitrous", now_ms, cfg));
+                recommended.insert("Nitrous", pending_mode(state, "Nitrous", now_ms, cfg));
+            }
+        }
+        SequenceStep::NitrousSoak => {}
+        SequenceStep::CloseNitrous => {
+            if valves.nitrous_open != Some(false) {
+                recommended.insert("Nitrous", pending_mode(state, "Nitrous", now_ms, cfg));
+            }
+        }
+        SequenceStep::RetractFillLines => {
+            if valves.retract != Some(true) {
+                recommended.insert(
+                    "RetractPlumbing",
+                    pending_mode(state, "RetractPlumbing", now_ms, cfg),
+                );
             }
         }
         SequenceStep::ArmedReady => {
-            enabled.insert("Launch", BlinkMode::Slow);
+            recommended.insert("Launch", BlinkMode::Slow);
         }
     }
 
-    policy_with_overrides(true, valves, enabled)
+    policy_with_overrides(true, valves, recommended)
 }
 
 fn read_key_enabled(state: &AppState, cfg: &SequenceConfig) -> bool {
+    if crate::flight_sim::sim_mode_enabled() {
+        return true;
+    }
     if cfg!(feature = "testing") {
         return true;
     }

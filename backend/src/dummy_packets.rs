@@ -1,4 +1,4 @@
-use crate::flight_sim::next_state_aware_packet;
+use crate::flight_sim::{next_state_aware_packet, sim_mode_enabled};
 use crate::telemetry_task::get_current_timestamp_ms;
 use groundstation_shared::Board;
 use rand::RngExt;
@@ -6,11 +6,6 @@ use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sedsprintf_rs_2026::TelemetryResult;
 use std::sync::Arc;
-
-// Switch between legacy random telemetry and realistic state-aware flight sim.
-// `true`  => command-driven fill states + manual launch + realistic 10k ft profile.
-// `false` => random standalone telemetry values.
-const USE_STATE_AWARE_SIM: bool = true;
 
 const BASE_LAT: f32 = 31.7619;
 const BASE_LON: f32 = -106.4850;
@@ -94,7 +89,7 @@ fn random_packet() -> TelemetryResult<TelemetryPacket> {
 }
 
 pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
-    if USE_STATE_AWARE_SIM {
+    if sim_mode_enabled() {
         next_state_aware_packet()
     } else {
         random_packet()

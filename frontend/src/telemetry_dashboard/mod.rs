@@ -9,6 +9,7 @@ mod gps;
 mod gps_android;
 mod latency_chart;
 pub mod layout;
+mod notifications_tab;
 pub mod types;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -32,12 +33,13 @@ use dioxus_signals::Signal;
 use errors_tab::ErrorsTab;
 use layout::LayoutConfig;
 use map_tab::MapTab;
+use notifications_tab::NotificationsTab;
 use serde::Deserialize;
 use state_tab::StateTab;
 use types::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
 use warnings_tab::WarningsTab;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering}, Arc,
     Mutex,
@@ -288,6 +290,54 @@ pub struct NetworkTimeMsg {
     pub timestamp_ms: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NetworkTimeSync {
+    network_ms: i64,
+    received_mono_ms: f64,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn monotonic_now_ms() -> f64 {
+    js_sys::Date::now()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn monotonic_now_ms() -> f64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+#[inline]
+fn compensated_network_time_ms(sync: NetworkTimeSync) -> i64 {
+    let elapsed_ms = (monotonic_now_ms() - sync.received_mono_ms)
+        .max(0.0)
+        .round() as i64;
+    sync.network_ms.saturating_add(elapsed_ms)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn format_network_time(ms_epoch: i64) -> String {
+    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms_epoch as f64));
+    let h = d.get_hours();
+    let m = d.get_minutes();
+    let s = d.get_seconds();
+    let cs = (d.get_milliseconds() / 10).clamp(0, 99);
+    format!("{h:02}:{m:02}:{s:02}:{cs:02}")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn format_network_time(ms_epoch: i64) -> String {
+    use chrono::{Local, TimeZone};
+    let Some(dt) = Local.timestamp_millis_opt(ms_epoch).single() else {
+        return "--:--:--:--".to_string();
+    };
+    let cs = dt.timestamp_subsec_millis() / 10;
+    format!("{}:{cs:02}", dt.format("%H:%M:%S"))
+}
+
 // --------------------------
 // DB alert DTO (/api/alerts)
 // --------------------------
@@ -315,6 +365,7 @@ enum MainTab {
     ConnectionStatus,
     Map,
     Actions,
+    Notifications,
     Warnings,
     Errors,
     Data,
@@ -337,8 +388,12 @@ const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
 const MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
 const DATA_TAB_STORAGE_KEY: &str = "gs_data_tab";
 const BASE_URL_STORAGE_KEY: &str = "gs_base_url";
-const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v1";
+const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v4";
+const NOTIFICATION_DISMISSED_STORAGE_KEY: &str = "gs_notification_dismissed_ids_v1";
 const _SKIP_TLS_VERIFY_KEY_PREFIX: &str = "gs_skip_tls_verify_";
+const NOTIFICATION_AUTO_DISMISS_MS: u32 = 5_000;
+const MAX_ACTIVE_NOTIFICATIONS: usize = 2;
+const MAX_NOTIFICATION_HISTORY: usize = 500;
 
 // When this number changes, we tear down and rebuild the websocket connection.
 static WS_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
@@ -434,6 +489,7 @@ fn _main_tab_to_str(tab: MainTab) -> &'static str {
         MainTab::ConnectionStatus => "connection-status",
         MainTab::Map => "map",
         MainTab::Actions => "actions",
+        MainTab::Notifications => "notifications",
         MainTab::Warnings => "warnings",
         MainTab::Errors => "errors",
         MainTab::Data => "data",
@@ -445,6 +501,7 @@ fn _main_tab_from_str(s: &str) -> MainTab {
         "connection-status" => MainTab::ConnectionStatus,
         "map" => MainTab::Map,
         "actions" => MainTab::Actions,
+        "notifications" => MainTab::Notifications,
         "warnings" => MainTab::Warnings,
         "errors" => MainTab::Errors,
         "data" => MainTab::Data,
@@ -668,8 +725,10 @@ fn TelemetryDashboardInner() -> Element {
     let warnings = use_signal(Vec::<AlertMsg>::new);
     let errors = use_signal(Vec::<AlertMsg>::new);
     let notifications = use_signal(Vec::<PersistentNotification>::new);
+    let notification_history = use_signal(Vec::<PersistentNotification>::new);
+    let dismissed_notification_ids = use_signal(load_dismissed_notification_ids);
     let action_policy = use_signal(ActionPolicyMsg::default_locked);
-    let network_time = use_signal(|| None::<i64>);
+    let network_time = use_signal(|| None::<NetworkTimeSync>);
     let flight_state = use_signal(|| FlightState::Startup);
     let board_status = use_signal(Vec::<BoardStatusEntry>::new);
 
@@ -939,6 +998,8 @@ fn TelemetryDashboardInner() -> Element {
         let mut ack_warning_ts_s = ack_warning_ts;
         let mut ack_error_ts_s = ack_error_ts;
         let mut notifications_s = notifications;
+        let mut notification_history_s = notification_history;
+        let mut dismissed_notification_ids_s = dismissed_notification_ids;
         let mut action_policy_s = action_policy;
         let mut network_time_s = network_time;
 
@@ -973,6 +1034,8 @@ fn TelemetryDashboardInner() -> Element {
                     &mut warnings_s,
                     &mut errors_s,
                     &mut notifications_s,
+                    &mut notification_history_s,
+                    &mut dismissed_notification_ids_s,
                     &mut action_policy_s,
                     &mut network_time_s,
                     &mut board_status_s,
@@ -1038,6 +1101,7 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_warnings = warn_count > 0;
     let has_errors = err_count > 0;
+    let has_notification_history = !notification_history.read().is_empty();
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
@@ -1114,6 +1178,8 @@ fn TelemetryDashboardInner() -> Element {
                     warnings,
                     errors,
                     notifications,
+                    notification_history,
+                    dismissed_notification_ids,
                     action_policy,
                     network_time,
                     warning_event_counter,
@@ -1272,7 +1338,12 @@ fn TelemetryDashboardInner() -> Element {
     let layout_snapshot = layout_config.read().clone();
     let layout_error_snapshot = layout_error.read().clone();
     let layout_loading_snapshot = *layout_loading.read();
-    let network_time_snapshot = *network_time.read();
+    let network_time_snapshot = network_time
+        .read()
+        .as_ref()
+        .copied()
+        .map(compensated_network_time_ms)
+        .map(format_network_time);
 
     // MAIN UI
     rsx! {
@@ -1431,6 +1502,14 @@ fn TelemetryDashboardInner() -> Element {
                             "Actions"
                         }
                         button {
+                            style: if *active_main_tab.read() == MainTab::Notifications { tab_style_active("#3b82f6") } else { tab_style_inactive.to_string() },
+                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Notifications) },
+                            span { "Notifications" }
+                            if has_notification_history {
+                                span { style: "margin-left:6px; color:#93c5fd;", "●" }
+                            }
+                        }
+                        button {
                             style: if *active_main_tab.read() == MainTab::Warnings { tab_style_active("#facc15") } else { tab_style_inactive.to_string() },
                             onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Warnings) },
                             span { "Warnings" }
@@ -1491,7 +1570,7 @@ fn TelemetryDashboardInner() -> Element {
                     ",
                     span { style: "color:#9ca3af;", "Status:" }
                     if let Some(ts) = network_time_snapshot {
-                        span { style: "color:#cbd5e1; margin-left:0.5rem;", "(Net time: {ts} ms)" }
+                        span { style: "color:#cbd5e1; margin-left:0.5rem;", "(Net time: {ts})" }
                     }
 
                     if !has_warnings && !has_errors {
@@ -1571,17 +1650,25 @@ fn TelemetryDashboardInner() -> Element {
                     style: "display:flex; flex-direction:column; gap:8px; margin-bottom:10px;",
                     for n in notifications.read().iter() {
                         div {
-                            style: "display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid #f59e0b; border-radius:10px; background:#2a1a05; color:#fde68a;",
+                            style: "display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid #2563eb; border-radius:10px; background:#0b1f4d; color:#bfdbfe;",
                             span { style: "flex:1;", "{n.message}" }
                             button {
-                                style: "padding:0.2rem 0.55rem; border-radius:999px; border:1px solid #92400e; background:#111827; color:#fde68a; font-size:0.75rem; cursor:pointer;",
+                                style: "padding:0.2rem 0.55rem; border-radius:999px; border:1px solid #1d4ed8; background:#111827; color:#bfdbfe; font-size:0.75rem; cursor:pointer;",
                                 onclick: {
                                     let id = n.id;
                                     let mut notifications = notifications;
+                                    let mut dismissed_notification_ids = dismissed_notification_ids;
                                     move |_| {
                                         let mut v = notifications.read().clone();
                                         v.retain(|x| x.id != id);
                                         notifications.set(v);
+                                        let mut ids = dismissed_notification_ids.read().clone();
+                                        if !ids.contains(&id) {
+                                            ids.push(id);
+                                            ids.sort_unstable();
+                                            dismissed_notification_ids.set(ids.clone());
+                                            persist_dismissed_notification_ids(&ids);
+                                        }
                                         spawn(async move {
                                             let _ = dismiss_notification_remote(id).await;
                                         });
@@ -1626,6 +1713,11 @@ fn TelemetryDashboardInner() -> Element {
                     MainTab::Actions => rsx! {
                         div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
                             ActionsTab { layout: layout.actions_tab.clone(), action_policy: action_policy }
+                        }
+                    },
+                    MainTab::Notifications => rsx! {
+                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                            NotificationsTab { history: notification_history }
                         }
                     },
                     MainTab::Warnings => rsx! {
@@ -1798,6 +1890,150 @@ async fn dismiss_notification_remote(id: u64) -> Result<(), String> {
     http_post_empty(&format!("/api/notifications/{id}/dismiss")).await
 }
 
+#[cfg(target_arch = "wasm32")]
+fn spawn_detached<F>(fut: F)
+where
+    F: std::future::Future<Output=()> + 'static,
+{
+    wasm_bindgen_futures::spawn_local(fut);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_detached<F>(fut: F)
+where
+    F: std::future::Future<Output=()> + 'static,
+{
+    spawn(fut);
+}
+
+fn load_dismissed_notification_ids() -> Vec<u64> {
+    persist::get_string(NOTIFICATION_DISMISSED_STORAGE_KEY)
+        .and_then(|raw| serde_json::from_str::<Vec<u64>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn persist_dismissed_notification_ids(ids: &[u64]) {
+    if let Ok(raw) = serde_json::to_string(ids) {
+        persist::set_string(NOTIFICATION_DISMISSED_STORAGE_KEY, &raw);
+    }
+}
+
+fn merge_notification_history(
+    history: &mut Vec<PersistentNotification>,
+    incoming: &[PersistentNotification],
+) {
+    let mut seen: HashSet<u64> = history.iter().map(|n| n.id).collect();
+    for n in incoming {
+        if seen.insert(n.id) {
+            history.push(n.clone());
+        }
+    }
+    history.sort_by_key(|n| -n.timestamp_ms);
+    if history.len() > MAX_NOTIFICATION_HISTORY {
+        history.truncate(MAX_NOTIFICATION_HISTORY);
+    }
+}
+
+fn apply_notifications_snapshot(
+    incoming: Vec<PersistentNotification>,
+    notifications: Signal<Vec<PersistentNotification>>,
+    notification_history: Signal<Vec<PersistentNotification>>,
+    dismissed_notification_ids: Signal<Vec<u64>>,
+) {
+    let mut notification_history = notification_history;
+    let mut notifications = notifications;
+    let mut dismissed_notification_ids = dismissed_notification_ids;
+
+    // Always keep local history of all notifications (active + dismissed).
+    let mut history = { notification_history.read().clone() };
+    merge_notification_history(&mut history, &incoming);
+    notification_history.set(history);
+
+    let mut dismissed_set: HashSet<u64> = {
+        dismissed_notification_ids
+            .read()
+            .iter()
+            .copied()
+            .collect()
+    };
+    let mut active: Vec<PersistentNotification> = incoming
+        .into_iter()
+        .filter(|n| !dismissed_set.contains(&n.id))
+        .collect();
+    active.sort_by_key(|n| n.timestamp_ms);
+
+    // Keep only latest N active notifications and auto-dismiss oldest overflow.
+    if active.len() > MAX_ACTIVE_NOTIFICATIONS {
+        let overflow = active.len() - MAX_ACTIVE_NOTIFICATIONS;
+        let overflow_ids: Vec<u64> = active.iter().take(overflow).map(|n| n.id).collect();
+        for id in overflow_ids {
+            dismissed_set.insert(id);
+            spawn_detached(async move {
+                let _ = dismiss_notification_remote(id).await;
+            });
+        }
+        active = active.split_off(overflow);
+    }
+
+    let prev_ids: HashSet<u64> = {
+        notifications
+            .read()
+            .iter()
+            .map(|n| n.id)
+            .collect()
+    };
+    notifications.set(active.clone());
+
+    let mut dismissed_vec: Vec<u64> = dismissed_set.into_iter().collect();
+    dismissed_vec.sort_unstable();
+    let prev_dismissed = { dismissed_notification_ids.read().clone() };
+    if prev_dismissed != dismissed_vec {
+        dismissed_notification_ids.set(dismissed_vec.clone());
+        persist_dismissed_notification_ids(&dismissed_vec);
+    }
+
+    // Auto-dismiss new visible notifications after timeout.
+    for n in active {
+        if prev_ids.contains(&n.id) {
+            continue;
+        }
+        let id = n.id;
+        let mut notifications = notifications;
+        let mut dismissed_notification_ids = dismissed_notification_ids;
+        spawn_detached(async move {
+            #[cfg(target_arch = "wasm32")]
+            gloo_timers::future::TimeoutFuture::new(NOTIFICATION_AUTO_DISMISS_MS).await;
+
+            #[cfg(not(target_arch = "wasm32"))]
+            tokio::time::sleep(std::time::Duration::from_millis(
+                NOTIFICATION_AUTO_DISMISS_MS as u64,
+            ))
+                .await;
+
+            let still_visible = {
+                notifications.read().iter().any(|x| x.id == id)
+            };
+            if !still_visible {
+                return;
+            }
+
+            let mut v = { notifications.read().clone() };
+            v.retain(|x| x.id != id);
+            notifications.set(v);
+
+            let mut ids = { dismissed_notification_ids.read().clone() };
+            if !ids.contains(&id) {
+                ids.push(id);
+                ids.sort_unstable();
+                dismissed_notification_ids.set(ids.clone());
+                persist_dismissed_notification_ids(&ids);
+            }
+
+            let _ = dismiss_notification_remote(id).await;
+        });
+    }
+}
+
 // ------------------------------
 // Seed telemetry/alerts/gps
 // ------------------------------
@@ -1807,8 +2043,10 @@ async fn seed_from_db(
     warnings: &mut Signal<Vec<AlertMsg>>,
     errors: &mut Signal<Vec<AlertMsg>>,
     notifications: &mut Signal<Vec<PersistentNotification>>,
+    notification_history: &mut Signal<Vec<PersistentNotification>>,
+    dismissed_notification_ids: &mut Signal<Vec<u64>>,
     action_policy: &mut Signal<ActionPolicyMsg>,
-    network_time: &mut Signal<Option<i64>>,
+    network_time: &mut Signal<Option<NetworkTimeSync>>,
     board_status: &mut Signal<Vec<BoardStatusEntry>>,
     rocket_gps: &mut Signal<Option<(f64, f64)>>,
     user_gps: &mut Signal<Option<(f64, f64)>>,
@@ -1985,7 +2223,12 @@ async fn seed_from_db(
     if let Ok(list) = http_get_json::<Vec<PersistentNotification>>("/api/notifications").await
         && alive.load(Ordering::Relaxed)
     {
-        notifications.set(list);
+        apply_notifications_snapshot(
+            list,
+            *notifications,
+            *notification_history,
+            *dismissed_notification_ids,
+        );
     }
 
     if let Ok(policy) = http_get_json::<ActionPolicyMsg>("/api/action_policy").await
@@ -1997,7 +2240,10 @@ async fn seed_from_db(
     if let Ok(nt) = http_get_json::<NetworkTimeMsg>("/api/network_time").await
         && alive.load(Ordering::Relaxed)
     {
-        network_time.set(Some(nt.timestamp_ms));
+        network_time.set(Some(NetworkTimeSync {
+            network_ms: nt.timestamp_ms,
+            received_mono_ms: monotonic_now_ms(),
+        }));
     }
 
     if !alive.load(Ordering::Relaxed) {
@@ -2036,8 +2282,10 @@ async fn connect_ws_supervisor(
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
+    notification_history: Signal<Vec<PersistentNotification>>,
+    dismissed_notification_ids: Signal<Vec<u64>>,
     action_policy: Signal<ActionPolicyMsg>,
-    network_time: Signal<Option<i64>>,
+    network_time: Signal<Option<NetworkTimeSync>>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2069,6 +2317,8 @@ async fn connect_ws_supervisor(
                     warnings,
                     errors,
                     notifications,
+                    notification_history,
+                    dismissed_notification_ids,
                     action_policy,
                     network_time,
                     warning_event_counter,
@@ -2090,6 +2340,8 @@ async fn connect_ws_supervisor(
                     warnings,
                     errors,
                     notifications,
+                    notification_history,
+                    dismissed_notification_ids,
                     action_policy,
                     network_time,
                     warning_event_counter,
@@ -2134,8 +2386,10 @@ async fn connect_ws_once_wasm(
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
+    notification_history: Signal<Vec<PersistentNotification>>,
+    dismissed_notification_ids: Signal<Vec<u64>>,
     action_policy: Signal<ActionPolicyMsg>,
-    network_time: Signal<Option<i64>>,
+    network_time: Signal<Option<NetworkTimeSync>>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2183,6 +2437,8 @@ async fn connect_ws_once_wasm(
                     warnings,
                     errors,
                     notifications,
+                    notification_history,
+                    dismissed_notification_ids,
                     action_policy,
                     network_time,
                     warning_event_counter,
@@ -2262,8 +2518,10 @@ async fn connect_ws_once_native(
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
+    notification_history: Signal<Vec<PersistentNotification>>,
+    dismissed_notification_ids: Signal<Vec<u64>>,
     action_policy: Signal<ActionPolicyMsg>,
-    network_time: Signal<Option<i64>>,
+    network_time: Signal<Option<NetworkTimeSync>>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2338,6 +2596,8 @@ async fn connect_ws_once_native(
                 warnings,
                 errors,
                 notifications,
+                notification_history,
+                dismissed_notification_ids,
                 action_policy,
                 network_time,
                 warning_event_counter,
@@ -2363,8 +2623,10 @@ fn handle_ws_message(
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
+    notification_history: Signal<Vec<PersistentNotification>>,
+    dismissed_notification_ids: Signal<Vec<u64>>,
     action_policy: Signal<ActionPolicyMsg>,
-    network_time: Signal<Option<i64>>,
+    network_time: Signal<Option<NetworkTimeSync>>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2376,7 +2638,9 @@ fn handle_ws_message(
     let mut errors = errors;
     let mut warning_event_counter = warning_event_counter;
     let mut error_event_counter = error_event_counter;
-    let mut notifications = notifications;
+    let notifications = notifications;
+    let notification_history = notification_history;
+    let dismissed_notification_ids = dismissed_notification_ids;
     let mut action_policy = action_policy;
     let mut network_time = network_time;
     let mut flight_state = flight_state;
@@ -2463,7 +2727,12 @@ fn handle_ws_message(
         }
 
         WsInMsg::Notifications(list) => {
-            notifications.set(list);
+            apply_notifications_snapshot(
+                list,
+                notifications,
+                notification_history,
+                dismissed_notification_ids,
+            );
         }
 
         WsInMsg::ActionPolicy(policy) => {
@@ -2471,7 +2740,10 @@ fn handle_ws_message(
         }
 
         WsInMsg::NetworkTime(t) => {
-            network_time.set(Some(t.timestamp_ms));
+            network_time.set(Some(NetworkTimeSync {
+                network_ms: t.timestamp_ms,
+                received_mono_ms: monotonic_now_ms(),
+            }));
         }
     }
 }

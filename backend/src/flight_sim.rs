@@ -9,14 +9,13 @@ use groundstation_shared::{Board, FlightState};
 use rand::RngExt;
 #[cfg(feature = "testing")]
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
-#[cfg(feature = "testing")]
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
-#[cfg(feature = "testing")]
 use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use std::collections::{HashMap, VecDeque};
+use std::sync::OnceLock;
 #[cfg(feature = "testing")]
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "testing")]
 const BASE_LAT: f32 = 31.7619;
@@ -53,12 +52,35 @@ struct FlightSimState {
     valves: HashMap<u8, bool>,
     saw_dump_open_after_n2: bool,
     saw_dump_closed_after_n2: bool,
+    nitrous_fill_started_ms: Option<u64>,
     queued: VecDeque<TelemetryPacket>,
+}
+
+#[cfg(feature = "testing")]
+fn valve_board_disconnected_for_state(state: FlightState) -> bool {
+    matches!(
+        state,
+        FlightState::Launch
+            | FlightState::Ascent
+            | FlightState::Coast
+            | FlightState::Apogee
+            | FlightState::ParachuteDeploy
+            | FlightState::Descent
+            | FlightState::Landed
+            | FlightState::Recovery
+    )
 }
 
 #[cfg(feature = "testing")]
 impl FlightSimState {
     fn new() -> Self {
+        let mut valves = HashMap::new();
+        // Start in idle with fill lines installed and both NO + dump open.
+        // Closing both is required before entering fill sequence.
+        valves.insert(ValveBoardCommands::NormallyOpenOpen as u8, true);
+        valves.insert(ValveBoardCommands::DumpOpen as u8, true);
+        valves.insert(ActuatorBoardCommands::RetractPlumbing as u8, false);
+
         Self {
             flight_state: FlightState::Idle,
             launch_time_ms: None,
@@ -77,9 +99,10 @@ impl FlightSimState {
             roll_dps: 0.0,
             pitch_dps: 0.0,
             yaw_dps: 0.0,
-            valves: HashMap::new(),
+            valves,
             saw_dump_open_after_n2: false,
             saw_dump_closed_after_n2: false,
+            nitrous_fill_started_ms: None,
             queued: VecDeque::new(),
         }
     }
@@ -138,19 +161,32 @@ impl FlightSimState {
     }
 
     fn queue_housekeeping(&mut self, now_ms: u64) {
+        let valve_board_online = !valve_board_disconnected_for_state(self.flight_state);
         for board in Board::ALL {
+            if *board == Board::ValveBoard && !valve_board_online {
+                continue;
+            }
             self.queue_board_heartbeat(*board, now_ms);
         }
 
-        let keys = [
-            ValveBoardCommands::PilotOpen as u8,
-            ValveBoardCommands::NormallyOpenOpen as u8,
-            ValveBoardCommands::DumpOpen as u8,
-            ActuatorBoardCommands::IgniterOn as u8,
-            ActuatorBoardCommands::NitrogenOpen as u8,
-            ActuatorBoardCommands::NitrousOpen as u8,
-            ActuatorBoardCommands::RetractPlumbing as u8,
-        ];
+        let keys: &[u8] = if valve_board_online {
+            &[
+                ValveBoardCommands::PilotOpen as u8,
+                ValveBoardCommands::NormallyOpenOpen as u8,
+                ValveBoardCommands::DumpOpen as u8,
+                ActuatorBoardCommands::IgniterOn as u8,
+                ActuatorBoardCommands::NitrogenOpen as u8,
+                ActuatorBoardCommands::NitrousOpen as u8,
+                ActuatorBoardCommands::RetractPlumbing as u8,
+            ]
+        } else {
+            &[
+                ActuatorBoardCommands::IgniterOn as u8,
+                ActuatorBoardCommands::NitrogenOpen as u8,
+                ActuatorBoardCommands::NitrousOpen as u8,
+                ActuatorBoardCommands::RetractPlumbing as u8,
+            ]
+        };
         let key = keys[self.next_valve_emit_idx % keys.len()];
         self.next_valve_emit_idx = (self.next_valve_emit_idx + 1) % keys.len();
         let on = self.valve_on(key);
@@ -233,6 +269,7 @@ impl FlightSimState {
         let dump_closed = !self.valve_on(ValveBoardCommands::DumpOpen as u8);
         let n2_open = self.valve_on(ActuatorBoardCommands::NitrogenOpen as u8);
         let n2o_open = self.valve_on(ActuatorBoardCommands::NitrousOpen as u8);
+        let fill_lines_removed = self.valve_on(ActuatorBoardCommands::RetractPlumbing as u8);
 
         match self.flight_state {
             FlightState::Idle => {
@@ -253,6 +290,19 @@ impl FlightSimState {
             FlightState::FillTest => {
                 if self.saw_dump_open_after_n2 && self.saw_dump_closed_after_n2 && n2o_open {
                     self.set_flight_state(FlightState::NitrousFill, now_ms);
+                    self.nitrous_fill_started_ms.get_or_insert(now_ms);
+                }
+            }
+            FlightState::NitrousFill => {
+                if n2o_open {
+                    self.nitrous_fill_started_ms.get_or_insert(now_ms);
+                }
+                if !n2o_open
+                    && fill_lines_removed
+                    && self
+                    .nitrous_fill_started_ms
+                    .is_some_and(|t0| now_ms.saturating_sub(t0) >= 30_000)
+                {
                     self.set_flight_state(FlightState::Armed, now_ms);
                 }
             }
@@ -263,16 +313,20 @@ impl FlightSimState {
     fn update_physics(&mut self, now_ms: u64) {
         let n2_open = self.valve_on(ActuatorBoardCommands::NitrogenOpen as u8);
         let n2o_open = self.valve_on(ActuatorBoardCommands::NitrousOpen as u8);
+        let no_open = self.valve_on(ValveBoardCommands::NormallyOpenOpen as u8);
         let dump_open = self.valve_on(ValveBoardCommands::DumpOpen as u8);
 
-        if n2_open {
+        if dump_open || no_open {
+            // Any vent path open should cause fast pressure bleed.
+            let bleed = if dump_open && no_open { 2.2 } else { 1.8 };
+            self.fuel_tank_pressure_psi = (self.fuel_tank_pressure_psi - bleed).max(0.0);
+        } else if n2_open {
             self.fuel_tank_pressure_psi = (self.fuel_tank_pressure_psi + 0.9).min(125.0);
-        } else if n2o_open && !dump_open {
+        } else if n2o_open {
             self.fuel_tank_pressure_psi = (self.fuel_tank_pressure_psi + 0.45).min(210.0);
-        } else if dump_open {
-            self.fuel_tank_pressure_psi = (self.fuel_tank_pressure_psi - 1.8).max(0.0);
         } else {
-            self.fuel_tank_pressure_psi = (self.fuel_tank_pressure_psi - 0.03).max(0.0);
+            // With vent paths closed and no fill command active, hold pressure steady.
+            self.fuel_tank_pressure_psi = self.fuel_tank_pressure_psi.max(0.0);
         }
 
         if let Some(t0_ms) = self.launch_time_ms {
@@ -460,8 +514,25 @@ fn sim() -> &'static Mutex<FlightSimState> {
     SIM.get_or_init(|| Mutex::new(FlightSimState::new()))
 }
 
+pub fn sim_mode_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !cfg!(feature = "testing") {
+            return false;
+        }
+        std::env::var("GS_SIM_MODE")
+            .ok()
+            .as_deref()
+            .map(|v| !matches!(v, "0" | "false" | "FALSE" | "off" | "OFF"))
+            .unwrap_or(true)
+    })
+}
+
 #[cfg(feature = "testing")]
 pub fn handle_command(cmd: &TelemetryCommand) -> bool {
+    if !sim_mode_enabled() {
+        return false;
+    }
     let now_ms = get_current_timestamp_ms();
     let mut s = sim().lock().expect("flight sim mutex poisoned");
     s.apply_command(cmd, now_ms);

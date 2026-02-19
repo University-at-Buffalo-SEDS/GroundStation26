@@ -628,7 +628,26 @@ fn action_style(
     actuated: Option<bool>,
 ) -> String {
     let cursor = if enabled { "pointer" } else { "not-allowed" };
-    let opacity = if enabled { "1.0" } else { "0.45" };
+    let recommended = enabled && blink != BlinkMode::None;
+    let opacity = if !enabled {
+        "0.45"
+    } else if recommended {
+        "1.0"
+    } else {
+        "0.62"
+    };
+    let filter = if !enabled {
+        "grayscale(0.25) brightness(0.9)"
+    } else if recommended {
+        "none"
+    } else {
+        "saturate(0.58) brightness(0.82)"
+    };
+    let box_shadow = if recommended {
+        "0 10px 25px rgba(0,0,0,0.25)"
+    } else {
+        "0 4px 12px rgba(0,0,0,0.16)"
+    };
     let animation = match (blink, actuated.unwrap_or(false)) {
         (BlinkMode::None, _) => "none",
         (BlinkMode::Slow, false) => "gs26-blink-slow-off 1.8s linear infinite",
@@ -637,9 +656,9 @@ fn action_style(
         (BlinkMode::Fast, true) => "gs26-blink-fast-on 0.6s linear infinite",
     };
     format!(
-        "padding:0.6rem 0.9rem; border-radius:0.75rem; cursor:{cursor}; opacity:{opacity}; animation:{animation}; width:100%; \
+        "padding:0.6rem 0.9rem; border-radius:0.75rem; cursor:{cursor}; opacity:{opacity}; filter:{filter}; animation:{animation}; width:100%; \
          text-align:left; border:1px solid {border}; background:{bg}; color:{fg}; \
-         font-weight:700;"
+         font-weight:700; box-shadow:{box_shadow};"
     )
 }
 

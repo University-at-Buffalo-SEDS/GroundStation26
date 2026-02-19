@@ -1,4 +1,3 @@
-#[cfg(feature = "testing")]
 use crate::flight_sim;
 use crate::state::AppState;
 use groundstation_shared::TelemetryRow;
@@ -298,11 +297,8 @@ pub async fn telemetry_task(
                         continue;
                     }
                     state.record_command_accepted(&cmd, get_current_timestamp_ms());
-                    #[cfg(feature = "testing")]
-                    {
-                        if flight_sim::handle_command(&cmd) {
-                            continue;
-                        }
+                    if flight_sim::handle_command(&cmd) {
+                        continue;
                     }
                     match cmd {
                         TelemetryCommand::Launch => {

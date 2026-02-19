@@ -225,8 +225,8 @@
             "unknown_label": "Unknown"
           },
           {
-            "true_label": "Installed",
-            "false_label": "Removed",
+            "true_label": "Removed",
+            "false_label": "Installed",
             "unknown_label": "Unknown"
           }
         ]
@@ -347,8 +347,8 @@
                     "unknown_label": "Unknown"
                   },
                   {
-                    "true_label": "Installed",
-                    "false_label": "Removed",
+                    "true_label": "Removed",
+                    "false_label": "Installed",
                     "unknown_label": "Unknown"
                   }
                 ]
@@ -365,7 +365,8 @@
                   "NormallyOpen",
                   "Nitrogen",
                   "Nitrous",
-                  "Pilot"
+                  "Pilot",
+                  "RetractPlumbing"
                 ]
               }
             ]
@@ -436,8 +437,8 @@
                     "unknown_label": "Unknown"
                   },
                   {
-                    "true_label": "Installed",
-                    "false_label": "Removed",
+                    "true_label": "Removed",
+                    "false_label": "Installed",
                     "unknown_label": "Unknown"
                   }
                 ]
@@ -601,6 +602,22 @@
                     "label": "Tank Pressure",
                     "index": 0
                   }
+                ]
+              }
+            ]
+          },
+          {
+            "title": "Actions",
+            "widgets": [
+              {
+                "kind": "actions",
+                "actions": [
+                  "Dump",
+                  "NormallyOpen",
+                  "Nitrogen",
+                  "Nitrous",
+                  "Pilot",
+                  "RetractPlumbing"
                 ]
               }
             ]

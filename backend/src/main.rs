@@ -2,7 +2,6 @@
 
 #[cfg(feature = "testing")]
 mod dummy_packets;
-#[cfg(feature = "testing")]
 mod flight_sim;
 mod gpio;
 mod gpio_panel;
