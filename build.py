@@ -1230,7 +1230,7 @@ def _host_macos_target() -> str:
 
 
 def _windows_target_default() -> str:
-    return os.environ.get("GS26_WINDOWS_TARGET", "x86_64-pc-windows-gnu").strip()
+    return os.environ.get("GS26_WINDOWS_TARGET", "x86_64-pc-windows-msvc").strip()
 
 
 def _default_rust_target_for_frontend(platform_name: Optional[str]) -> Optional[str]:
@@ -1420,7 +1420,7 @@ def print_usage() -> None:
     print("  NOTARY_PASSWORD=...                # notarytool app-specific password (alt auth)")
     print("  existing                           # skip build step for frontend actions/builds")
     print("  GROUNDSTATION_NO_PARALLEL=1        # force sequential build")
-    print("  GS26_WINDOWS_TARGET=...            # override windows Rust target (default x86_64-pc-windows-gnu)")
+    print("  GS26_WINDOWS_TARGET=...            # override windows Rust target (default x86_64-pc-windows-msvc)")
     print("  GS26_MACOS_TARGET=...              # override macos Rust target (auto-detects by default)")
     sys.exit(1)
 
