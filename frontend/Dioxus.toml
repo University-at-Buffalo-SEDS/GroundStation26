@@ -27,6 +27,7 @@ publisher = "UBSEDS"
 icon = ["assets/icon.png"]
 
 [bundle.windows]
+name = "UBSEDS GS"
 icon = "assets/icon.ico"
 
 [bundle.macos]

@@ -1253,7 +1253,7 @@ def _ensure_windows_icon_compat(frontend_dir: Path) -> None:
         print(f"Warning: Windows icon source not found: {src_png}", file=sys.stderr)
         return
 
-    icons_dir = frontend_dir / "icons"
+    icons_dir = frontend_dir / "assets"
     icons_dir.mkdir(parents=True, exist_ok=True)
     dst_ico = icons_dir / "icon.ico"
 
@@ -1278,12 +1278,6 @@ def _ensure_windows_icon_compat(frontend_dir: Path) -> None:
             "Install Pillow for a proper Windows icon.",
             file=sys.stderr,
         )
-
-    # Compatibility for tooling that reports/uses "icons/icon/ico".
-    legacy_dir = icons_dir / "icon"
-    legacy_dir.mkdir(parents=True, exist_ok=True)
-    legacy_file = legacy_dir / "ico"
-    shutil.copy2(dst_ico, legacy_file)
 
 
 def build_frontend(

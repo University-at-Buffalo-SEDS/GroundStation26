@@ -29,6 +29,11 @@ fn main() {
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
     init_panic_hook();
+    #[cfg(target_os = "windows")]
+    let cfg = dioxus_desktop::Config::new()
+        .with_custom_protocol("gs26", move |request| handle_gs26_protocol(request));
+
+    #[cfg(not(target_os = "windows"))]
     let cfg = dioxus_desktop::Config::new().with_asynchronous_custom_protocol(
         "gs26",
         |_id, request, responder| {
