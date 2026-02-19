@@ -26,6 +26,9 @@ identifier = "com.UBSEDS.GS26"
 publisher = "UBSEDS"
 icon = ["assets/icon.png"]
 
+[bundle.windows]
+icon = "assets/icon.png"
+
 [bundle.macos]
 # Used for BOTH macOS and iOS bundles
 info_plist_path = "platform/macos/Info.plist"
