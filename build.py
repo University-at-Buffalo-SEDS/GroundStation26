@@ -1248,25 +1248,42 @@ def _ensure_windows_icon_compat(frontend_dir: Path) -> None:
     Some dx/windows bundle paths resolve to legacy/default icon locations.
     Create compatibility paths so canonicalize does not fail on Windows.
     """
-    src = frontend_dir / "assets" / "icon.png"
-    if not src.exists():
-        print(f"Warning: Windows icon source not found: {src}", file=sys.stderr)
+    src_png = frontend_dir / "assets" / "icon.png"
+    if not src_png.exists():
+        print(f"Warning: Windows icon source not found: {src_png}", file=sys.stderr)
         return
 
     icons_dir = frontend_dir / "icons"
     icons_dir.mkdir(parents=True, exist_ok=True)
-
-    # Common expected path.
     dst_ico = icons_dir / "icon.ico"
-    if not dst_ico.exists():
-        shutil.copy2(src, dst_ico)
+
+    generated = False
+    try:
+        from PIL import Image  # type: ignore
+
+        img = Image.open(src_png)
+        # Include common Windows icon sizes.
+        sizes = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+        img.save(dst_ico, format="ICO", sizes=sizes)
+        generated = True
+    except Exception:
+        generated = False
+
+    if not generated:
+        # Last-resort fallback if PIL is unavailable.
+        # This may not produce a valid ICO for all tooling.
+        shutil.copy2(src_png, dst_ico)
+        print(
+            "Warning: Pillow not available; copied PNG bytes to icon.ico. "
+            "Install Pillow for a proper Windows icon.",
+            file=sys.stderr,
+        )
 
     # Compatibility for tooling that reports/uses "icons/icon/ico".
     legacy_dir = icons_dir / "icon"
     legacy_dir.mkdir(parents=True, exist_ok=True)
     legacy_file = legacy_dir / "ico"
-    if not legacy_file.exists():
-        shutil.copy2(src, legacy_file)
+    shutil.copy2(dst_ico, legacy_file)
 
 
 def build_frontend(

@@ -27,7 +27,7 @@ publisher = "UBSEDS"
 icon = ["assets/icon.png"]
 
 [bundle.windows]
-icon = "assets/icon.png"
+icon = "assets/icon.ico"
 
 [bundle.macos]
 # Used for BOTH macOS and iOS bundles
