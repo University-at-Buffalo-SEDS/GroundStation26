@@ -426,8 +426,12 @@ fn js_setup_js_geolocation_watch() {
         (function() {
           if (window.__gs26_disable_browser_geo === true) return;
           if (window.__gs26_geo_watch_started) return;
-          window.__gs26_geo_watch_started = true;
+          if (typeof window.isSecureContext === "boolean" && window.isSecureContext !== true) {
+            // WebViews on insecure origins cannot use navigator.geolocation.
+            return;
+          }
           if (!navigator || !navigator.geolocation) return;
+          window.__gs26_geo_watch_started = true;
 
           try {
             navigator.geolocation.watchPosition(
@@ -436,7 +440,12 @@ fn js_setup_js_geolocation_watch() {
                 window.__gs26_user_lat = c.latitude;
                 window.__gs26_user_lon = c.longitude;
               },
-              (err) => console.warn("geolocation watch error:", err),
+              (err) => {
+                try {
+                  if (err && (err.code === 1 || err.code === 2 || err.code === 3)) return;
+                } catch (e) {}
+                console.warn("geolocation watch error:", err);
+              },
               { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
             );
           } catch (e) {}

@@ -31,7 +31,10 @@ fn main() {
     init_panic_hook();
     #[cfg(target_os = "windows")]
     let cfg = dioxus_desktop::Config::new()
-        .with_custom_protocol("gs26", move |_id, request| handle_gs26_protocol(request));
+        .with_custom_protocol("gs26", move |_id, request| handle_gs26_protocol(request))
+        .with_windows_browser_args(
+            "--unsafely-treat-insecure-origin-as-secure=http://dioxus.index.html,http://dioxus.localhost,http://gs26.localhost",
+        );
 
     #[cfg(not(target_os = "windows"))]
     let cfg = dioxus_desktop::Config::new().with_asynchronous_custom_protocol(
