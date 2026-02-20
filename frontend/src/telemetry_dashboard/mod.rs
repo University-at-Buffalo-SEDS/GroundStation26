@@ -449,16 +449,7 @@ pub fn abs_http(path: &str) -> String {
 }
 
 pub fn map_tiles_url() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        if UrlConfig::_skip_tls_verify() {
-            // WRY/WebView2 maps custom protocols to http(s) hosts on Windows.
-            // Keep using the gs26 protocol handler, but through its Windows URL form.
-            return "http://gs26.local/tiles/{z}/{x}/{y}.jpg".to_string();
-        }
-    }
-
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+    #[cfg(not(target_arch = "wasm32"))]
     {
         if UrlConfig::_skip_tls_verify() {
             return "gs26://local/tiles/{z}/{x}/{y}.jpg".to_string();
