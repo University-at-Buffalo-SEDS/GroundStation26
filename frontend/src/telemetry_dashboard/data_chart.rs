@@ -75,6 +75,7 @@ pub fn charts_cache_request_refit() {
 
 thread_local! {
     static CHARTS_CACHE: RefCell<ChartsCache> = RefCell::new(ChartsCache::new());
+    static RESEED_CACHE: RefCell<Option<ChartsCache>> = const { RefCell::new(None) };
 }
 
 pub fn _charts_cache_is_dirty(data_type: &str) -> bool {
@@ -82,6 +83,36 @@ pub fn _charts_cache_is_dirty(data_type: &str) -> bool {
         let c = c.borrow();
         c.charts.get(data_type).map(|ch| ch.dirty).unwrap_or(false)
     })
+}
+
+pub fn charts_cache_begin_reseed_build() {
+    RESEED_CACHE.with(|c| {
+        *c.borrow_mut() = Some(ChartsCache::new());
+    });
+}
+
+pub fn charts_cache_cancel_reseed_build() {
+    RESEED_CACHE.with(|c| {
+        c.borrow_mut().take();
+    });
+}
+
+pub fn charts_cache_reseed_ingest_row(row: &TelemetryRow) {
+    RESEED_CACHE.with(|c| {
+        if let Some(cache) = c.borrow_mut().as_mut() {
+            cache.ingest_row(row);
+        }
+    });
+}
+
+pub fn charts_cache_finish_reseed_build() {
+    RESEED_CACHE.with(|slot| {
+        if let Some(new_cache) = slot.borrow_mut().take() {
+            CHARTS_CACHE.with(|active| {
+                *active.borrow_mut() = new_cache;
+            });
+        }
+    });
 }
 
 pub fn charts_cache_reset_and_ingest(rows: &[TelemetryRow]) {

@@ -22,7 +22,9 @@ pub mod warnings_tab;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::Route;
 use data_chart::{
-    charts_cache_ingest_row, charts_cache_request_refit, charts_cache_reset_and_ingest,
+    charts_cache_begin_reseed_build, charts_cache_cancel_reseed_build,
+    charts_cache_finish_reseed_build, charts_cache_ingest_row, charts_cache_request_refit,
+    charts_cache_reseed_ingest_row, charts_cache_reset_and_ingest,
 };
 
 use crate::telemetry_dashboard::actions_tab::ActionsTab;
@@ -55,6 +57,7 @@ use once_cell::sync::Lazy;
 static TELEMETRY_QUEUE: Lazy<Mutex<VecDeque<TelemetryRow>>> =
     Lazy::new(|| Mutex::new(VecDeque::new()));
 static RESEED_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static RESEED_LIVE_BUFFER: Lazy<Mutex<Vec<TelemetryRow>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 // ============================================================================
 // Dashboard lifetime: STATIC + ALWAYS PRESENT (never Option)
@@ -2246,9 +2249,17 @@ async fn seed_from_db(
     impl Drop for ReseedGuard {
         fn drop(&mut self) {
             RESEED_IN_PROGRESS.store(false, Ordering::Relaxed);
+            if let Ok(mut v) = RESEED_LIVE_BUFFER.lock() {
+                v.clear();
+            }
+            charts_cache_cancel_reseed_build();
         }
     }
     RESEED_IN_PROGRESS.store(true, Ordering::Relaxed);
+    if let Ok(mut v) = RESEED_LIVE_BUFFER.lock() {
+        v.clear();
+    }
+    charts_cache_begin_reseed_build();
     let _reseed_guard = ReseedGuard;
 
     fn sort_rows(rows: &mut [TelemetryRow]) {
@@ -2342,28 +2353,45 @@ async fn seed_from_db(
                 // Treat empty reseed as transient and keep already-visible history.
                 list = existing_rows_before_seed;
             } else {
-                // Rebuild chart cache from the merged list (DB + live + queued snapshots).
-                // Chunk + yield so WS/UI processing remains responsive during large reseeds.
-                charts_cache_reset_and_ingest(&[]);
+                // Build reseed cache in a double buffer while active cache keeps live updates.
                 const RESEED_INGEST_CHUNK: usize = 1024;
                 for (i, row) in list.iter().enumerate() {
-                    charts_cache_ingest_row(row);
+                    charts_cache_reseed_ingest_row(row);
                     if i % RESEED_INGEST_CHUNK == 0 {
                         cooperative_yield().await;
                     }
                 }
 
-                // Replay whatever is currently queued right after reset so points that arrive
-                // around reseed commit are not visually lost in the chart cache.
+                // Replay queued rows into reseed cache as a second safety net.
                 let post_reset_queued_rows = queue_snapshot();
                 for row in &post_reset_queued_rows {
-                    charts_cache_ingest_row(row);
+                    charts_cache_reseed_ingest_row(row);
                 }
                 if !post_reset_queued_rows.is_empty() {
                     list.extend(post_reset_queued_rows);
                     list = dedupe_rows_exact(list);
                     prune_history(&mut list);
                 }
+
+                // Replay live rows received during reseed build.
+                let reseed_live_rows = if let Ok(mut v) = RESEED_LIVE_BUFFER.lock() {
+                    let rows = v.clone();
+                    v.clear();
+                    rows
+                } else {
+                    Vec::new()
+                };
+                if !reseed_live_rows.is_empty() {
+                    for row in &reseed_live_rows {
+                        charts_cache_reseed_ingest_row(row);
+                    }
+                    list.extend(reseed_live_rows);
+                    list = dedupe_rows_exact(list);
+                    prune_history(&mut list);
+                }
+
+                // Atomically swap the prepared reseed cache in.
+                charts_cache_finish_reseed_build();
             }
             rows.set(list);
         }
@@ -2865,9 +2893,11 @@ fn handle_ws_message(
 
     match msg {
         WsInMsg::Telemetry(row) => {
-            if !RESEED_IN_PROGRESS.load(Ordering::Relaxed) {
-                // Keep chart cache hot when not reseeding.
-                charts_cache_ingest_row(&row);
+            charts_cache_ingest_row(&row);
+            if RESEED_IN_PROGRESS.load(Ordering::Relaxed)
+                && let Ok(mut v) = RESEED_LIVE_BUFFER.lock()
+            {
+                v.push(row.clone());
             }
 
             if let Some((lat, lon)) = row_to_gps(&row) {
@@ -2892,8 +2922,11 @@ fn handle_ws_message(
             }
             if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
                 for row in batch {
-                    if !RESEED_IN_PROGRESS.load(Ordering::Relaxed) {
-                        charts_cache_ingest_row(&row);
+                    charts_cache_ingest_row(&row);
+                    if RESEED_IN_PROGRESS.load(Ordering::Relaxed)
+                        && let Ok(mut v) = RESEED_LIVE_BUFFER.lock()
+                    {
+                        v.push(row.clone());
                     }
                     if let Some((lat, lon)) = row_to_gps(&row) {
                         rocket_gps.set(Some((lat, lon)));
