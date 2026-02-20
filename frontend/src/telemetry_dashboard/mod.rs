@@ -1389,6 +1389,7 @@ fn TelemetryDashboardInner() -> Element {
     };
 
     // Reload button (web: full reload, native: remount inner UI)
+    let mut rows = rows;
     let mut _refresh_layout = refresh_layout;
     let reload_button: Element = rsx! {
         button {
@@ -1402,9 +1403,17 @@ fn TelemetryDashboardInner() -> Element {
                 cursor:pointer;
             ",
             onclick: move |_| {
-                // Keep current history visible; reseed will replace it when data arrives.
+                // Clear transient telemetry buffers first.
                 clear_telemetry_runtime_buffers();
                 charts_cache_request_refit();
+
+                // Native reload should visibly clear graph history immediately.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    rows.set(Vec::new());
+                    charts_cache_reset_and_ingest(&[]);
+                }
+
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     _refresh_layout();
