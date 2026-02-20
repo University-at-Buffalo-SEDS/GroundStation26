@@ -14,7 +14,7 @@ use futures::{SinkExt, StreamExt};
 use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, OnceCell};
@@ -237,68 +237,65 @@ async fn get_layout() -> impl IntoResponse {
 }
 
 async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let latest_ts: Option<i64> = sqlx::query_scalar("SELECT MAX(timestamp_ms) FROM telemetry")
+    let latest_db_ts: Option<i64> = sqlx::query_scalar("SELECT MAX(timestamp_ms) FROM telemetry")
         .fetch_one(&state.db)
         .await
         .ok()
         .flatten();
+    let cache_snapshot = state.recent_telemetry_snapshot();
+    let latest_cache_ts = cache_snapshot.iter().map(|r| r.timestamp_ms).max();
 
-    let Some(now_ms) = latest_ts else {
-        return Json(Vec::<TelemetryRow>::new());
+    let now_ms = match (latest_db_ts, latest_cache_ts) {
+        (Some(a), Some(b)) => a.max(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => return Json(Vec::<TelemetryRow>::new()),
     };
 
     let cutoff = now_ms - 20 * 60 * 1000; // 20 minutes
 
-    // Match frontend bucket grid (frontend BUCKET_MS = 20).
-    // This returns at most 1 row per (data_type, 20ms bucket) in the window:
-    // - Uses REAL rows (no averaging).
-    // - Picks the latest timestamp within each bucket for each data_type.
-    // - Keeps chronological order for the frontend.
-    const BUCKET_MS: i64 = 20;
-
     let rows_db = sqlx::query(
         r#"
-        WITH filtered AS (
-            SELECT
-                timestamp_ms,
-                data_type,
-                values_json,
-                payload_json,
-                (timestamp_ms / ?) AS bucket_id
-            FROM telemetry
-            WHERE timestamp_ms BETWEEN ? AND ?
-        ),
-        latest AS (
-            SELECT data_type, bucket_id, MAX(timestamp_ms) AS ts
-            FROM filtered
-            GROUP BY data_type, bucket_id
-        )
         SELECT
-            f.timestamp_ms, f.data_type,
-            f.values_json, f.payload_json
-        FROM filtered f
-        JOIN latest l
-          ON l.data_type = f.data_type
-         AND l.bucket_id = f.bucket_id
-         AND l.ts = f.timestamp_ms
-        ORDER BY f.timestamp_ms ASC
+            timestamp_ms,
+            data_type,
+            values_json,
+            payload_json
+        FROM telemetry
+        WHERE timestamp_ms BETWEEN ? AND ?
+        ORDER BY timestamp_ms ASC
         "#,
     )
-        .bind(BUCKET_MS)
         .bind(cutoff)
         .bind(now_ms)
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
 
-    let rows: Vec<TelemetryRow> = rows_db
-        .into_iter()
-        .map(|row| TelemetryRow {
+    let mut by_key: HashMap<(String, i64), TelemetryRow> = HashMap::new();
+    for row in rows_db {
+        let item = TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             data_type: row.get::<String, _>("data_type"),
             values: values_from_row(&row),
-        })
-        .collect();
+        };
+        by_key.insert((item.data_type.clone(), item.timestamp_ms), item);
+    }
+
+    for row in cache_snapshot {
+        if row.timestamp_ms < cutoff || row.timestamp_ms > now_ms {
+            continue;
+        }
+        // Cache rows are newest realtime view and should win over stale DB rows.
+        by_key.insert((row.data_type.clone(), row.timestamp_ms), row);
+    }
+
+    let mut rows: Vec<TelemetryRow> = by_key.into_values().collect();
+    rows.sort_by(|a, b| {
+        a.timestamp_ms
+            .cmp(&b.timestamp_ms)
+            .then_with(|| a.data_type.cmp(&b.data_type))
+    });
 
     Json(rows)
 }

@@ -147,7 +147,12 @@ pub async fn safety_task(
         );
         let suppress_disconnect_warnings = matches!(
             current_state,
-            FlightState::Descent
+            FlightState::Launch
+                | FlightState::Ascent
+                | FlightState::Coast
+                | FlightState::Apogee
+                | FlightState::ParachuteDeploy
+                | FlightState::Descent
                 | FlightState::Landed
                 | FlightState::Recovery
                 | FlightState::Aborted

@@ -7,7 +7,7 @@ use groundstation_shared::{
 };
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, Notify};
@@ -90,6 +90,9 @@ pub struct AppState {
 
     /// Last accepted command timestamp by command name.
     pub last_command_ms: Arc<Mutex<HashMap<String, u64>>>,
+
+    /// In-memory recent telemetry cache used to bridge DB write lag during reseed.
+    pub recent_telemetry_cache: Arc<Mutex<VecDeque<TelemetryRow>>>,
 }
 
 impl AppState {
@@ -285,5 +288,36 @@ impl AppState {
 
     pub fn last_command_timestamp_ms(&self, cmd_name: &str) -> Option<u64> {
         self.last_command_ms.lock().unwrap().get(cmd_name).copied()
+    }
+
+    pub fn cache_recent_telemetry(&self, row: TelemetryRow) {
+        const CACHE_WINDOW_MS: i64 = 20 * 60 * 1000;
+        const CACHE_MAX_ROWS: usize = 250_000;
+
+        let mut q = self.recent_telemetry_cache.lock().unwrap();
+        q.push_back(row);
+
+        let newest_ts = q.back().map(|r| r.timestamp_ms).unwrap_or(0);
+        let cutoff = newest_ts.saturating_sub(CACHE_WINDOW_MS);
+        while let Some(front) = q.front() {
+            if front.timestamp_ms < cutoff {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        while q.len() > CACHE_MAX_ROWS {
+            q.pop_front();
+        }
+    }
+
+    pub fn recent_telemetry_snapshot(&self) -> Vec<TelemetryRow> {
+        self.recent_telemetry_cache
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
     }
 }

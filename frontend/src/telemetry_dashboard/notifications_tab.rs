@@ -1,4 +1,4 @@
-use super::PersistentNotification;
+use super::{format_timestamp_ms_clock, PersistentNotification};
 use dioxus::prelude::*;
 
 #[component]
@@ -11,7 +11,7 @@ pub fn NotificationsTab(history: Signal<Vec<PersistentNotification>>) -> Element
                 for n in history.read().iter() {
                     div {
                         style: "border:1px solid #2563eb; background:#0b1f4d; color:#bfdbfe; padding:12px; border-radius:12px;",
-                        div { style: "font-size:12px; opacity:0.85;", "{n.timestamp_ms}" }
+                        div { style: "font-size:12px; opacity:0.85;", "{format_timestamp_ms_clock(n.timestamp_ms)}" }
                         div { style: "font-size:14px;", "{n.message}" }
                     }
                 }

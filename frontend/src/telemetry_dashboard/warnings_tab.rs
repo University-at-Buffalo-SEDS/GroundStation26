@@ -1,4 +1,4 @@
-use super::AlertMsg;
+use super::{format_timestamp_ms_clock, AlertMsg};
 use dioxus::prelude::*;
 
 #[component]
@@ -11,7 +11,7 @@ pub fn WarningsTab(warnings: Signal<Vec<AlertMsg>>) -> Element {
                 for w in warnings.read().iter() {
                     div {
                         style: "border:1px solid #a16207; background:#2a1a04; color:#fde68a; padding:12px; border-radius:12px;",
-                        div { style: "font-size:12px; opacity:0.85;", "{w.timestamp_ms}" }
+                        div { style: "font-size:12px; opacity:0.85;", "{format_timestamp_ms_clock(w.timestamp_ms)}" }
                         div { style: "font-size:14px;", "{w.message}" }
                     }
                 }

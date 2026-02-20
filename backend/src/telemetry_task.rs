@@ -263,6 +263,7 @@ pub async fn telemetry_task(
                 if let Some(row) =
                     handle_packet(&state, &router, &timesync_state, &db_tx, &db_overflow, pkt).await
                 {
+                    state.cache_recent_telemetry(row.clone());
                     let _ = state.ws_tx.send(row);
                 }
             }

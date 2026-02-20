@@ -339,6 +339,7 @@ async fn main() -> anyhow::Result<()> {
         action_policy: Arc::new(Mutex::new(default_action_policy())),
         action_policy_tx,
         last_command_ms: Arc::new(Mutex::new(HashMap::new())),
+        recent_telemetry_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
     });
 
     gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");

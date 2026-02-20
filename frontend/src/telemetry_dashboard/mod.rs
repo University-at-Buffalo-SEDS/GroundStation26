@@ -54,6 +54,7 @@ use once_cell::sync::Lazy;
 // ============================================================================
 static TELEMETRY_QUEUE: Lazy<Mutex<VecDeque<TelemetryRow>>> =
     Lazy::new(|| Mutex::new(VecDeque::new()));
+static RESEED_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
 // Dashboard lifetime: STATIC + ALWAYS PRESENT (never Option)
@@ -331,23 +332,33 @@ fn compensated_network_time_ms(sync: NetworkTimeSync) -> i64 {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn format_network_time(ms_epoch: i64) -> String {
+pub(crate) fn format_timestamp_ms_clock(ms_epoch: i64) -> String {
     let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms_epoch as f64));
-    let h = d.get_hours();
+    let h24 = d.get_hours();
+    let (h, am_pm) = match h24 {
+        0 => (12, "AM"),
+        1..=11 => (h24, "AM"),
+        12 => (12, "PM"),
+        _ => (h24 - 12, "PM"),
+    };
     let m = d.get_minutes();
     let s = d.get_seconds();
     let cs = (d.get_milliseconds() / 10).clamp(0, 99);
-    format!("{h:02}:{m:02}:{s:02}:{cs:02}")
+    format!("{h:02}:{m:02}:{s:02}:{cs:02} {am_pm}")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn format_network_time(ms_epoch: i64) -> String {
+pub(crate) fn format_timestamp_ms_clock(ms_epoch: i64) -> String {
     use chrono::{Local, TimeZone};
     let Some(dt) = Local.timestamp_millis_opt(ms_epoch).single() else {
         return "--:--:--:--".to_string();
     };
     let cs = dt.timestamp_subsec_millis() / 10;
-    format!("{}:{cs:02}", dt.format("%H:%M:%S"))
+    format!("{}:{cs:02} {}", dt.format("%I:%M:%S"), dt.format("%p"))
+}
+
+fn format_network_time(ms_epoch: i64) -> String {
+    format_timestamp_ms_clock(ms_epoch)
 }
 
 // --------------------------
@@ -391,7 +402,6 @@ macro_rules! log {
 }
 
 pub const HISTORY_MS: i64 = 60_000 * 20; // 20 minutes
-const RESEED_BUCKET_MS: i64 = 20;
 const STARTUP_SEED_DELAY_MS: u64 = 1_200;
 
 // unified storage keys
@@ -485,10 +495,6 @@ fn bump_ws_epoch() {
     }
 
     *WS_EPOCH.write() += 1;
-}
-
-fn _bump_ui_epoch() {
-    *UI_EPOCH.write() += 1;
 }
 
 fn bump_seed_epoch() {
@@ -644,18 +650,13 @@ fn reconnect_and_reload_ui() {
         hard_reload_app_web();
     }
 
-    // Native: soft “reload” by remounting ONLY the inner dashboard subtree
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        _bump_ui_epoch();
-    }
+    // Native: keep current UI mounted so charts/history remain visible while reseed runs.
 }
 
 fn clear_telemetry_runtime_buffers() {
     if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
         q.clear();
     }
-    charts_cache_reset_and_ingest(&[]);
 }
 
 // ---------- Cross-platform WS handle ----------
@@ -778,6 +779,7 @@ fn TelemetryDashboardInner() -> Element {
     let ack_error_count = use_signal(|| 0u64);
 
     let flash_on = use_signal(|| false);
+    let clock_tick = use_signal(|| 0u64);
 
     let rocket_gps = use_signal(|| None::<(f64, f64)>);
     let user_gps = use_signal(|| None::<(f64, f64)>);
@@ -1049,28 +1051,57 @@ fn TelemetryDashboardInner() -> Element {
                     return;
                 }
 
-                if let Err(e) = seed_from_db(
-                    &mut rows_s,
-                    &mut warnings_s,
-                    &mut errors_s,
-                    &mut notifications_s,
-                    &mut notification_history_s,
-                    &mut dismissed_notifications_s,
-                    &mut unread_notification_ids_s,
-                    &mut action_policy_s,
-                    &mut network_time_s,
-                    &mut board_status_s,
-                    &mut rocket_gps_s,
-                    &mut user_gps_s,
-                    &mut ack_warning_ts_s,
-                    &mut ack_error_ts_s,
-                    alive.clone(),
-                )
-                    .await
+                let mut last_err: Option<String> = None;
+                const RESEED_ATTEMPTS: usize = 3;
+                for attempt in 1..=RESEED_ATTEMPTS {
+                    let res = seed_from_db(
+                        &mut rows_s,
+                        &mut warnings_s,
+                        &mut errors_s,
+                        &mut notifications_s,
+                        &mut notification_history_s,
+                        &mut dismissed_notifications_s,
+                        &mut unread_notification_ids_s,
+                        &mut action_policy_s,
+                        &mut network_time_s,
+                        &mut board_status_s,
+                        &mut rocket_gps_s,
+                        &mut user_gps_s,
+                        &mut ack_warning_ts_s,
+                        &mut ack_error_ts_s,
+                        alive.clone(),
+                    )
+                        .await;
+
+                    match res {
+                        Ok(()) => {
+                            last_err = None;
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            if attempt < RESEED_ATTEMPTS
+                                && alive.load(Ordering::Relaxed)
+                                && *WS_EPOCH.read() == epoch
+                            {
+                                #[cfg(target_arch = "wasm32")]
+                                gloo_timers::future::TimeoutFuture::new(400 * attempt as u32).await;
+
+                                #[cfg(not(target_arch = "wasm32"))]
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    400 * attempt as u64,
+                                ))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(e) = last_err
                     && alive.load(Ordering::Relaxed)
                     && *WS_EPOCH.read() == epoch
                 {
-                    log!("seed_from_db failed: {e}");
+                    log!("seed_from_db failed after retries: {e}");
                 }
             });
         });
@@ -1098,6 +1129,33 @@ fn TelemetryDashboardInner() -> Element {
 
                     let next = !*flash_on.read();
                     flash_on.set(next);
+                }
+            });
+        });
+    }
+
+    // Rocket clock loop: keep header time moving even when no other UI state changes.
+    {
+        let mut clock_tick = clock_tick;
+        let alive = alive.clone();
+
+        use_effect(move || {
+            let alive = alive.clone();
+            let epoch = *WS_EPOCH.read();
+            spawn(async move {
+                while alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
+                    #[cfg(target_arch = "wasm32")]
+                    gloo_timers::future::TimeoutFuture::new(100).await;
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                    if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
+                        break;
+                    }
+
+                    let next = clock_tick.read().saturating_add(1);
+                    clock_tick.set(next);
                 }
             });
         });
@@ -1331,10 +1389,6 @@ fn TelemetryDashboardInner() -> Element {
     };
 
     // Reload button (web: full reload, native: remount inner UI)
-    let mut rows = rows;
-    let mut warnings = warnings;
-    let mut errors = errors;
-    let mut notifications = notifications;
     let mut _refresh_layout = refresh_layout;
     let reload_button: Element = rsx! {
         button {
@@ -1348,13 +1402,9 @@ fn TelemetryDashboardInner() -> Element {
                 cursor:pointer;
             ",
             onclick: move |_| {
-                // Clear live/frontend caches first so native reload starts from a clean slate.
+                // Keep current history visible; reseed will replace it when data arrives.
                 clear_telemetry_runtime_buffers();
-                rows.set(Vec::new());
                 charts_cache_request_refit();
-                warnings.set(Vec::new());
-                errors.set(Vec::new());
-                notifications.set(Vec::new());
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     _refresh_layout();
@@ -1377,6 +1427,7 @@ fn TelemetryDashboardInner() -> Element {
     let layout_snapshot = layout_config.read().clone();
     let layout_error_snapshot = layout_error.read().clone();
     let layout_loading_snapshot = *layout_loading.read();
+    let _clock_tick_snapshot = *clock_tick.read();
     let network_time_snapshot = network_time
         .read()
         .as_ref()
@@ -2182,6 +2233,15 @@ async fn seed_from_db(
     ack_error_ts: &mut Signal<i64>,
     alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    struct ReseedGuard;
+    impl Drop for ReseedGuard {
+        fn drop(&mut self) {
+            RESEED_IN_PROGRESS.store(false, Ordering::Relaxed);
+        }
+    }
+    RESEED_IN_PROGRESS.store(true, Ordering::Relaxed);
+    let _reseed_guard = ReseedGuard;
+
     fn sort_rows(rows: &mut [TelemetryRow]) {
         rows.sort_by(|a, b| {
             a.timestamp_ms
@@ -2200,23 +2260,20 @@ async fn seed_from_db(
         }
     }
 
-    fn compact_rows_by_bucket(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
-        let mut by_bucket: HashMap<(String, i64), TelemetryRow> = HashMap::new();
+    fn dedupe_rows_exact(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
+        let mut by_key: HashMap<(String, i64), TelemetryRow> = HashMap::new();
         for row in rows {
-            let bid = row.timestamp_ms.div_euclid(RESEED_BUCKET_MS);
-            let key = (row.data_type.clone(), bid);
-            match by_bucket.get_mut(&key) {
+            let key = (row.data_type.clone(), row.timestamp_ms);
+            match by_key.get_mut(&key) {
                 Some(existing) => {
-                    if row.timestamp_ms >= existing.timestamp_ms {
-                        *existing = row;
-                    }
+                    *existing = row;
                 }
                 None => {
-                    by_bucket.insert(key, row);
+                    by_key.insert(key, row);
                 }
             }
         }
-        let mut out: Vec<TelemetryRow> = by_bucket.into_values().collect();
+        let mut out: Vec<TelemetryRow> = by_key.into_values().collect();
         sort_rows(&mut out);
         out
     }
@@ -2225,10 +2282,9 @@ async fn seed_from_db(
         mut db_rows: Vec<TelemetryRow>,
         live_rows: Vec<TelemetryRow>,
     ) -> Vec<TelemetryRow> {
-        // Keep full overlap and dedupe by timestamp bucket.
-        // This lets DB reseed fill small continuity holes while live rows still win when newer.
+        // Keep full overlap and only dedupe exact duplicates to avoid losing sparse history.
         db_rows.extend(live_rows);
-        let mut merged = compact_rows_by_bucket(db_rows);
+        let mut merged = dedupe_rows_exact(db_rows);
         prune_history(&mut merged);
         merged
     }
@@ -2246,53 +2302,68 @@ async fn seed_from_db(
     }
 
     // ---- Telemetry history (/api/recent) ----
-    if let Ok(mut list) = http_get_json::<Vec<TelemetryRow>>("/api/recent").await {
-        if !alive.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        sort_rows(&mut list);
-        prune_history(&mut list);
-        list = compact_rows_by_bucket(list);
-
-        // Capture rows that arrived while reseed was running and keep them.
-        let mut live_rows = rows.read().clone();
-        live_rows.extend(queue_snapshot());
-        live_rows.extend(rows.read().clone());
-        live_rows.extend(queue_snapshot());
-        if !live_rows.is_empty() {
-            sort_rows(&mut live_rows);
-            prune_history(&mut live_rows);
-            live_rows = compact_rows_by_bucket(live_rows);
-            list = merge_db_and_live(list, live_rows);
-        }
-
-        if let Some(gps) = list.iter().rev().find_map(row_to_gps) {
-            rocket_gps.set(Some(gps));
-        }
-
-        // Rebuild chart cache from the merged list (DB + live + queued snapshots).
-        // Chunk + yield so WS/UI processing remains responsive during large reseeds.
-        charts_cache_reset_and_ingest(&[]);
-        const RESEED_INGEST_CHUNK: usize = 1024;
-        for (i, row) in list.iter().enumerate() {
-            charts_cache_ingest_row(row);
-            if i % RESEED_INGEST_CHUNK == 0 {
-                cooperative_yield().await;
+    let existing_rows_before_seed = rows.read().clone();
+    match http_get_json::<Vec<TelemetryRow>>("/api/recent").await {
+        Ok(mut list) => {
+            if !alive.load(Ordering::Relaxed) {
+                return Ok(());
             }
-        }
-        // Replay whatever is currently queued right after reset so points that arrive
-        // around reseed commit are not visually lost in the chart cache.
-        let post_reset_queued_rows = queue_snapshot();
-        for row in &post_reset_queued_rows {
-            charts_cache_ingest_row(row);
-        }
-        if !post_reset_queued_rows.is_empty() {
-            list.extend(post_reset_queued_rows);
-            list = compact_rows_by_bucket(list);
+
+            sort_rows(&mut list);
             prune_history(&mut list);
+            list = dedupe_rows_exact(list);
+
+            // Capture rows that arrived while reseed was running and keep them.
+            let mut live_rows = rows.read().clone();
+            live_rows.extend(queue_snapshot());
+            live_rows.extend(rows.read().clone());
+            live_rows.extend(queue_snapshot());
+            if !live_rows.is_empty() {
+                sort_rows(&mut live_rows);
+                prune_history(&mut live_rows);
+                live_rows = dedupe_rows_exact(live_rows);
+                list = merge_db_and_live(list, live_rows);
+            }
+
+            if let Some(gps) = list.iter().rev().find_map(row_to_gps) {
+                rocket_gps.set(Some(gps));
+            }
+
+            if list.is_empty() && !existing_rows_before_seed.is_empty() {
+                // Treat empty reseed as transient and keep already-visible history.
+                list = existing_rows_before_seed;
+            } else {
+                // Rebuild chart cache from the merged list (DB + live + queued snapshots).
+                // Chunk + yield so WS/UI processing remains responsive during large reseeds.
+                charts_cache_reset_and_ingest(&[]);
+                const RESEED_INGEST_CHUNK: usize = 1024;
+                for (i, row) in list.iter().enumerate() {
+                    charts_cache_ingest_row(row);
+                    if i % RESEED_INGEST_CHUNK == 0 {
+                        cooperative_yield().await;
+                    }
+                }
+
+                // Replay whatever is currently queued right after reset so points that arrive
+                // around reseed commit are not visually lost in the chart cache.
+                let post_reset_queued_rows = queue_snapshot();
+                for row in &post_reset_queued_rows {
+                    charts_cache_ingest_row(row);
+                }
+                if !post_reset_queued_rows.is_empty() {
+                    list.extend(post_reset_queued_rows);
+                    list = dedupe_rows_exact(list);
+                    prune_history(&mut list);
+                }
+            }
+            rows.set(list);
         }
-        rows.set(list);
+        Err(err) => {
+            if existing_rows_before_seed.is_empty() {
+                return Err(format!("telemetry reseed failed: {err}"));
+            }
+            log!("telemetry reseed failed (keeping existing history): {err}");
+        }
     }
 
     if !alive.load(Ordering::Relaxed) {
@@ -2785,8 +2856,10 @@ fn handle_ws_message(
 
     match msg {
         WsInMsg::Telemetry(row) => {
-            // Always keep chart cache hot (cheap, incremental)
-            charts_cache_ingest_row(&row);
+            if !RESEED_IN_PROGRESS.load(Ordering::Relaxed) {
+                // Keep chart cache hot when not reseeding.
+                charts_cache_ingest_row(&row);
+            }
 
             if let Some((lat, lon)) = row_to_gps(&row) {
                 rocket_gps.set(Some((lat, lon)));
@@ -2810,7 +2883,9 @@ fn handle_ws_message(
             }
             if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
                 for row in batch {
-                    charts_cache_ingest_row(&row);
+                    if !RESEED_IN_PROGRESS.load(Ordering::Relaxed) {
+                        charts_cache_ingest_row(&row);
+                    }
                     if let Some((lat, lon)) = row_to_gps(&row) {
                         rocket_gps.set(Some((lat, lon)));
                     }

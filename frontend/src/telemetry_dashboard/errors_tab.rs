@@ -1,4 +1,4 @@
-use super::AlertMsg;
+use super::{format_timestamp_ms_clock, AlertMsg};
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 
@@ -12,7 +12,7 @@ pub fn ErrorsTab(errors: Signal<Vec<AlertMsg>>) -> Element {
                 for e in errors.read().iter() {
                     div {
                         style: "border:1px solid #ef4444; background:#450a0a; color:#fecaca; padding:12px; border-radius:12px;",
-                        div { style: "font-size:12px; opacity:0.85;", "{e.timestamp_ms}" }
+                        div { style: "font-size:12px; opacity:0.85;", "{format_timestamp_ms_clock(e.timestamp_ms)}" }
                         div { style: "font-size:14px;", "{e.message}" }
                     }
                 }
