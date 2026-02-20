@@ -53,6 +53,7 @@ pub fn MapTab(
             js_setup_map_touch_guard();
             js_setup_map_size_guard();
             js_setup_js_init_retry(&tiles);
+            #[cfg(not(target_os = "windows"))]
             js_setup_js_geolocation_watch();
 
             // Debounced resize/orientation/visualViewport reinit path
@@ -145,6 +146,8 @@ pub fn MapTab(
     }
 
     let on_center_me = move |_| {
+        js_request_user_geolocation_once();
+
         // Refresh from JS at click-time
         if let Some((lat, lon)) = js_cached_user_latlon().or_else(js_read_user_latlon_from_window) {
             browser_user_gps.set(Some((lat, lon)));
@@ -446,6 +449,30 @@ fn js_setup_js_geolocation_watch() {
                 } catch (e) {}
                 console.warn("geolocation watch error:", err);
               },
+              { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
+            );
+          } catch (e) {}
+        })();
+        "#,
+    );
+}
+
+fn js_request_user_geolocation_once() {
+    js_eval(
+        r#"
+        (function() {
+          if (window.__gs26_disable_browser_geo === true) return;
+          if (typeof window.isSecureContext === "boolean" && window.isSecureContext !== true) return;
+          if (!navigator || !navigator.geolocation) return;
+
+          try {
+            navigator.geolocation.getCurrentPosition(
+              (pos) => {
+                const c = pos.coords;
+                window.__gs26_user_lat = c.latitude;
+                window.__gs26_user_lon = c.longitude;
+              },
+              () => {},
               { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
             );
           } catch (e) {}
