@@ -751,6 +751,147 @@ def _find_wasm_bindgen(path_value: str) -> Optional[Path]:
     return _which_in_path("wasm-bindgen", path_value)
 
 
+def _parse_semver_triplet(version: str) -> Optional[tuple[int, int, int]]:
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", version)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _wasm_bindgen_cli_version(bin_path: Path, frontend_dir: Path, env: Optional[dict[str, str]]) -> Optional[str]:
+    try:
+        out = run_capture([str(bin_path), "--version"], cwd=frontend_dir, env=env).strip()
+    except Exception:
+        return None
+    m = re.search(r"(\d+\.\d+\.\d+)", out)
+    return m.group(1) if m else None
+
+
+def _required_wasm_bindgen_cli_version(frontend_dir: Path) -> Optional[str]:
+    # Explicit override wins.
+    override = os.environ.get("GS_WASM_BINDGEN_CLI_VERSION", "").strip()
+    if override:
+        return override
+
+    lock_path = frontend_dir.parent / "Cargo.lock"
+    if not lock_path.exists():
+        return None
+
+    raw = lock_path.read_text(encoding="utf-8", errors="replace")
+    versions: list[str] = []
+
+    if tomllib is not None:
+        try:
+            data = tomllib.loads(raw)
+            for pkg in data.get("package", []):
+                if pkg.get("name") == "wasm-bindgen":
+                    v = str(pkg.get("version", "")).strip()
+                    if v:
+                        versions.append(v)
+        except Exception:
+            pass
+
+    if not versions:
+        # Fallback parser for lockfile text if tomllib is unavailable/failed.
+        blocks = raw.split("[[package]]")
+        for block in blocks:
+            if 'name = "wasm-bindgen"' not in block:
+                continue
+            m = re.search(r'version\s*=\s*"([^"]+)"', block)
+            if m:
+                versions.append(m.group(1))
+
+    if not versions:
+        return None
+
+    versions = sorted(
+        set(versions),
+        key=lambda v: (_parse_semver_triplet(v) or (0, 0, 0), v),
+    )
+    return versions[-1]
+
+
+def _ensure_wasm_bindgen_cli(frontend_dir: Path, env: Optional[dict[str, str]]) -> Optional[Path]:
+    required = _required_wasm_bindgen_cli_version(frontend_dir)
+    path_value = (env or {}).get("PATH", os.environ.get("PATH", ""))
+    installed_path = _find_wasm_bindgen(path_value)
+
+    if required is None:
+        return installed_path
+
+    installed_version = (
+        _wasm_bindgen_cli_version(installed_path, frontend_dir, env) if installed_path else None
+    )
+
+    if installed_version == required and installed_path is not None:
+        return installed_path
+
+    if installed_path is None:
+        print(f"wasm-bindgen-cli not found; installing required version {required}")
+        run(
+            ["cargo", "install", "--locked", "wasm-bindgen-cli", "--version", required],
+            cwd=frontend_dir.parent,
+            env=env,
+        )
+    else:
+        print(
+            f"wasm-bindgen-cli version mismatch (have {installed_version or 'unknown'}, "
+            f"want {required}); reinstalling"
+        )
+        run(
+            ["cargo", "install", "--locked", "wasm-bindgen-cli", "--version", required, "--force"],
+            cwd=frontend_dir.parent,
+            env=env,
+        )
+
+    refreshed_path = _find_wasm_bindgen((env or {}).get("PATH", os.environ.get("PATH", "")))
+    if refreshed_path is None:
+        raise RuntimeError("wasm-bindgen-cli install completed but `wasm-bindgen` is still not on PATH")
+    return refreshed_path
+
+
+def _tail_log_text(max_bytes: int = 131072) -> str:
+    if LOG_FILE is None or not LOG_FILE.exists():
+        return ""
+    try:
+        size = LOG_FILE.stat().st_size
+        with LOG_FILE.open("rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _extract_wasm_bindgen_version_hint(text: str) -> Optional[str]:
+    patterns = [
+        r"wasm-bindgen(?:-cli)?[^\d]*(\d+\.\d+\.\d+)",
+        r"update to [`'\"]?wasm-bindgen[`'\"]?\s+v?(\d+\.\d+\.\d+)",
+        r"requires wasm-bindgen(?:-cli)?\s+v?(\d+\.\d+\.\d+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _looks_like_wasm_bindgen_failure(text: str) -> bool:
+    low = text.lower()
+    if "wasm-bindgen" not in low:
+        return False
+    signals = [
+        "version",
+        "mismatch",
+        "incompatible",
+        "please update",
+        "older versions",
+        "out of date",
+    ]
+    return any(s in low for s in signals)
+
+
 def _find_brotli(path_value: str) -> Optional[Path]:
     candidates = [
         Path("/usr/local/bin/brotli"),
@@ -1304,6 +1445,12 @@ def build_frontend(
 
         env = _dx_bundle_env(frontend_dir) if (is_container() or in_docker_build()) else None
 
+        ensured_wasm_bindgen = _ensure_wasm_bindgen_cli(frontend_dir, env)
+        if env is not None and ensured_wasm_bindgen is not None:
+            env["WASM_BINDGEN"] = str(ensured_wasm_bindgen)
+            env["DIOXUS_WASM_BINDGEN"] = str(ensured_wasm_bindgen)
+            env["DIOXUS_WASM_BINDGEN_PATH"] = str(ensured_wasm_bindgen)
+
         if is_container():
             _prebuild_frontend_for_container(frontend_dir)
 
@@ -1347,7 +1494,35 @@ def build_frontend(
         if rust_target:
             cmd.extend(["--target", rust_target])
 
-        run(cmd, cwd=frontend_dir, env=env)
+        try:
+            run(cmd, cwd=frontend_dir, env=env)
+        except subprocess.CalledProcessError:
+            err_text = _tail_log_text()
+            if not err_text:
+                # Fallback: try to grab current stderr context if no logfile is configured.
+                err_text = "dx bundle failed"
+
+            if _looks_like_wasm_bindgen_failure(err_text):
+                hinted = _extract_wasm_bindgen_version_hint(err_text)
+                prior_override = os.environ.get("GS_WASM_BINDGEN_CLI_VERSION")
+                if hinted:
+                    os.environ["GS_WASM_BINDGEN_CLI_VERSION"] = hinted
+                try:
+                    ensured = _ensure_wasm_bindgen_cli(frontend_dir, env)
+                    if env is not None and ensured is not None:
+                        env["WASM_BINDGEN"] = str(ensured)
+                        env["DIOXUS_WASM_BINDGEN"] = str(ensured)
+                        env["DIOXUS_WASM_BINDGEN_PATH"] = str(ensured)
+                    print("Retrying frontend build after wasm-bindgen-cli fix")
+                    run(cmd, cwd=frontend_dir, env=env)
+                finally:
+                    if hinted:
+                        if prior_override is None:
+                            os.environ.pop("GS_WASM_BINDGEN_CLI_VERSION", None)
+                        else:
+                            os.environ["GS_WASM_BINDGEN_CLI_VERSION"] = prior_override
+            else:
+                raise
 
         if platform_name in {None, "web"}:
             _manual_optimize_web_wasm(frontend_dir, env, max_size=max_size)

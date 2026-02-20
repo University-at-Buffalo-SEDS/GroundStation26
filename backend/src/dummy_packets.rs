@@ -1,4 +1,3 @@
-
 use crate::flight_sim::{_next_state_aware_packet, sim_mode_enabled};
 use crate::telemetry_task::get_current_timestamp_ms;
 use groundstation_shared::Board;
