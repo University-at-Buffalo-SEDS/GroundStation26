@@ -1,4 +1,5 @@
-use crate::flight_sim::{next_state_aware_packet, sim_mode_enabled};
+
+use crate::flight_sim::{_next_state_aware_packet, sim_mode_enabled};
 use crate::telemetry_task::get_current_timestamp_ms;
 use groundstation_shared::Board;
 use rand::RngExt;
@@ -90,7 +91,7 @@ fn random_packet() -> TelemetryResult<TelemetryPacket> {
 
 pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
     if sim_mode_enabled() {
-        next_state_aware_packet()
+        _next_state_aware_packet()
     } else {
         random_packet()
     }

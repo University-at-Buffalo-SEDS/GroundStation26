@@ -540,7 +540,7 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
 }
 
 #[cfg(feature = "testing")]
-pub fn next_state_aware_packet() -> TelemetryResult<TelemetryPacket> {
+pub fn _next_state_aware_packet() -> TelemetryResult<TelemetryPacket> {
     let now_ms = get_current_timestamp_ms();
     let mut s = sim().lock().expect("flight sim mutex poisoned");
 
@@ -579,6 +579,6 @@ pub fn handle_command(_cmd: &TelemetryCommand) -> bool {
 }
 
 #[cfg(not(feature = "testing"))]
-pub fn next_state_aware_packet() -> TelemetryResult<TelemetryPacket> {
+pub fn _next_state_aware_packet() -> TelemetryResult<TelemetryPacket> {
     unreachable!("flight sim only available with testing feature")
 }

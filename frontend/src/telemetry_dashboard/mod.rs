@@ -24,8 +24,10 @@ use crate::app::Route;
 use data_chart::{
     charts_cache_begin_reseed_build, charts_cache_cancel_reseed_build,
     charts_cache_finish_reseed_build, charts_cache_ingest_row, charts_cache_request_refit,
-    charts_cache_reseed_ingest_row, charts_cache_reset_and_ingest,
+    charts_cache_reseed_ingest_row,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use data_chart::charts_cache_reset_and_ingest;
 
 use crate::telemetry_dashboard::actions_tab::ActionsTab;
 use connection_status_tab::ConnectionStatusTab;
@@ -1392,6 +1394,7 @@ fn TelemetryDashboardInner() -> Element {
     };
 
     // Reload button (web: full reload, native: remount inner UI)
+    #[cfg(not(target_arch = "wasm32"))]
     let mut rows = rows;
     let mut _refresh_layout = refresh_layout;
     let reload_button: Element = rsx! {

@@ -115,10 +115,11 @@ pub fn charts_cache_finish_reseed_build() {
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn charts_cache_reset_and_ingest(rows: &[TelemetryRow]) {
     CHARTS_CACHE.with(|c| {
         let mut c = c.borrow_mut();
-        c.clear();
+        c._clear();
         for r in rows {
             c.ingest_row(r);
         }
@@ -173,7 +174,7 @@ impl ChartsCache {
         }
     }
 
-    fn clear(&mut self) {
+    fn _clear(&mut self) {
         self.charts.clear();
     }
 
