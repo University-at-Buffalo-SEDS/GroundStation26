@@ -36,12 +36,19 @@ pub fn GpsDriver(
     user_gps: Signal<Option<(f64, f64)>>,
     #[props(optional)] js_ready: Option<bool>,
 ) -> Element {
-    // wasm/windows: hook-based SDK (no globals, no stop needed)
-    #[cfg(any(target_arch = "wasm32", target_os = "windows"))]
+    // Windows: avoid dioxus geolocation hook instability and rely on JS watchPosition path.
+    #[cfg(target_os = "windows")]
+    {
+        let _ = user_gps;
+        let _ = js_ready;
+        return rsx!(div {});
+    }
+
+    // wasm: hook-based SDK (no globals, no stop needed)
+    #[cfg(target_arch = "wasm32")]
     {
         use dioxus_sdk_geolocation::use_geolocation;
 
-        #[cfg(target_arch = "wasm32")]
         if let Some(false) = js_ready {
             return rsx!(div {});
         }
@@ -120,7 +127,7 @@ mod imp {
     }
 }
 
-// wasm/windows imperative: no-op (GpsDriver does hook-based work)
+// wasm/windows imperative: no-op
 #[cfg(any(target_arch = "wasm32", target_os = "windows"))]
 mod imp {
     use super::*;
