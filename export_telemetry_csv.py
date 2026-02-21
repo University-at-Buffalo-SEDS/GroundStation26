@@ -34,13 +34,19 @@ def main() -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    query = (
-        "SELECT timestamp_ms, data_type, values_json, payload_json "
-        "FROM telemetry ORDER BY timestamp_ms"
-    )
-
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
+        table_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(telemetry)").fetchall()
+        }
+        has_sender_id = "sender_id" in table_cols
+        query = (
+            "SELECT timestamp_ms, data_type, "
+            + ("sender_id, " if has_sender_id else "NULL AS sender_id, ")
+            + "values_json, payload_json "
+            "FROM telemetry ORDER BY timestamp_ms"
+        )
         cursor = conn.execute(query)
         col_names = [col[0] for col in cursor.description]
 
