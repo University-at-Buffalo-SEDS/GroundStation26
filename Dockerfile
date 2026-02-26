@@ -82,7 +82,7 @@ RUN cargo build --release -p map_downloader
 
 FROM debian:stable-slim
 
-LABEL authors="rylan"
+LABEL authors="Rylan Meiluits"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
