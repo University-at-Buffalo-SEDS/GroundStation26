@@ -16,10 +16,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Cross-platform time helpers
-web-sys = "0.3.90"
+web-sys = "0.3.91"
 gloo-net = "0.6.0"
-wasm-bindgen = "0.2.113"
-js-sys = "0.3.90"
+wasm-bindgen = "0.2.114"
+js-sys = "0.3.91"
 console_error_panic_hook = "0.1.7"
 gloo-timers = "0.3.0"
 dirs = "6.0.0"
@@ -35,10 +35,10 @@ dioxus-sdk-geolocation = "0.7.0"
 gloo-net = { version = "0.6.0", features = ["http"] }
 gloo-timers = { version = "0.3.0", features = ["futures"] }
 
-wasm-bindgen = "0.2.113"
+wasm-bindgen = "0.2.114"
 futures-util = "0.3.32"
-wasm-bindgen-futures = "0.4.63"
-web-sys = { version = "0.3.90", features = [
+wasm-bindgen-futures = "0.4.64"
+web-sys = { version = "0.3.91", features = [
     "Window",
     "Location",
     "WebSocket",
