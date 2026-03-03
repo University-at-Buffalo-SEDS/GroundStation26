@@ -62,7 +62,7 @@ dioxus = { version = "0.7.3", features = ["desktop", "macro"] }
 dioxus-signals = "0.7.3"
 dioxus-desktop = "0.7.3"
 chrono = { version = "0.4.44", default-features = false, features = ["std", "clock"] }
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "time"] }
 reqwest = { version = "0.13.2", default-features = true, features = ["json", "rustls", "blocking"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots", "native-tls"] }
 native-tls = "0.2.18"
