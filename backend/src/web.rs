@@ -1,14 +1,14 @@
 use crate::layout;
-use crate::map::{tile_service, DEFAULT_MAP_REGION};
+use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_service};
 use crate::sequences::{ActionPolicyMsg, PersistentNotification};
 use crate::state::AppState;
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::{
-    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade}, extract::{Query, State},
+    Json, Router,
+    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+    extract::{Query, State},
     response::IntoResponse,
     routing::{get, post},
-    Json,
-    Router,
 };
 use futures::{SinkExt, StreamExt};
 use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
@@ -17,7 +17,7 @@ use sqlx::Row;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::{OnceCell, mpsc};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 
@@ -72,6 +72,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alerts", get(get_alerts))
         .route("/api/boards", get(get_boards))
         .route("/api/layout", get(get_layout))
+        .route("/api/map_config", get(get_map_config))
         .route("/api/network_time", get(get_network_time))
         .route("/api/notifications", get(get_notifications))
         .route(
@@ -176,9 +177,9 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
@@ -211,9 +212,9 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
         let values = values_from_row(&r);
@@ -234,6 +235,24 @@ async fn get_layout() -> impl IntoResponse {
         Ok(layout) => Json(layout).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
+}
+
+#[derive(Serialize)]
+struct MapConfigDto {
+    max_native_zoom: u32,
+}
+
+async fn get_map_config() -> impl IntoResponse {
+    let max_native_zoom = match detect_max_native_zoom(DEFAULT_MAP_REGION).await {
+        Ok(Some(z)) => z,
+        Ok(None) => 12,
+        Err(e) => {
+            eprintln!("WARNING: failed to detect max native zoom: {e:#}");
+            12
+        }
+    };
+
+    Json(MapConfigDto { max_native_zoom })
 }
 
 async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -266,11 +285,11 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         ORDER BY timestamp_ms ASC
         "#,
     )
-        .bind(cutoff)
-        .bind(now_ms)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .bind(now_ms)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let mut by_key: HashMap<(String, i64), TelemetryRow> = HashMap::new();
     for row in rows_db {
@@ -423,7 +442,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         let initial_network_time = serde_json::to_string(&WsOutMsg::NetworkTime(NetworkTimeMsg {
             timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
         }))
-            .unwrap_or_default();
+        .unwrap_or_default();
         if ws_out_tx.send(initial_network_time).await.is_err() {
             return;
         }
@@ -656,10 +675,10 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-        .bind(cutoff)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -701,11 +720,11 @@ fn spawn_alert_insert(
             VALUES (?, ?, ?)
             "#,
         )
-            .bind(timestamp_ms)
-            .bind(severity)
-            .bind(message)
-            .execute(&db)
-            .await;
+        .bind(timestamp_ms)
+        .bind(severity)
+        .bind(message)
+        .execute(&db)
+        .await;
         state_for_task.end_db_write();
     });
 }

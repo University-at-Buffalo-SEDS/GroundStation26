@@ -196,7 +196,7 @@ fn download_leaflet_file(
         return Ok(());
     }
 
-    let url = format!("https://unpkg.com/leaflet@{version}/dist/leaflet.{kind}", );
+    let url = format!("https://unpkg.com/leaflet@{version}/dist/leaflet.{kind}",);
     log(format!("Downloading {url} -> {}", out_path.display()).as_ref());
 
     let resp = reqwest::blocking::get(&url)?;

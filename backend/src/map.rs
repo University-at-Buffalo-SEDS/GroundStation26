@@ -26,6 +26,34 @@ pub async fn ensure_map_data(region: &str) -> anyhow::Result<()> {
     );
 }
 
+/// Detect the highest zoom level present under ./backend/data/maps/<region>/tiles/<z>/...
+/// Returns None when no numeric zoom directories are found.
+pub async fn detect_max_native_zoom(region: &str) -> anyhow::Result<Option<u32>> {
+    let tiles_dir = PathBuf::from(format!("./backend/data/maps/{region}/tiles"));
+    if !fs::try_exists(&tiles_dir).await.unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let mut max_zoom: Option<u32> = None;
+    let mut entries = fs::read_dir(&tiles_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Ok(z) = name.parse::<u32>() else {
+            continue;
+        };
+        max_zoom = Some(max_zoom.map_or(z, |prev| prev.max(z)));
+    }
+
+    Ok(max_zoom)
+}
+
 /// Service that serves `/tiles/{z}/{x}/{y}.png` for a region.
 pub fn tile_service(region: &str) -> ServeDir {
     let tiles_dir = format!("./backend/data/maps/{region}/tiles");

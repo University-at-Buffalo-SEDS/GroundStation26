@@ -45,8 +45,8 @@ use warnings_tab::WarningsTab;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    atomic::{AtomicBool, Ordering}, Arc,
-    Mutex,
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 
 use once_cell::sync::Lazy;
@@ -1085,7 +1085,7 @@ fn TelemetryDashboardInner() -> Element {
                         &mut ack_error_ts_s,
                         alive.clone(),
                     )
-                        .await;
+                    .await;
 
                     match res {
                         Ok(()) => {
@@ -1105,7 +1105,7 @@ fn TelemetryDashboardInner() -> Element {
                                 tokio::time::sleep(std::time::Duration::from_millis(
                                     400 * attempt as u64,
                                 ))
-                                    .await;
+                                .await;
                             }
                         }
                     }
@@ -1198,10 +1198,10 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
-        || *warning_event_counter.read() > *ack_warning_count.read());
+            || *warning_event_counter.read() > *ack_warning_count.read());
     let has_unacked_errors = latest_error_ts > 0
         && (latest_error_ts > *ack_error_ts.read()
-        || *error_event_counter.read() > *ack_error_count.read());
+            || *error_event_counter.read() > *ack_error_count.read());
 
     let border_style = if has_unacked_errors && *flash_on.read() {
         "2px solid #ef4444"
@@ -1301,7 +1301,7 @@ fn TelemetryDashboardInner() -> Element {
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
                     && alive.load(Ordering::Relaxed)
                 {
                     log!("[WS] supervisor ended: {e}");
@@ -1910,7 +1910,7 @@ fn log(msg: &str) {
 
 // ---------- HTTP helpers ----------
 #[cfg(target_arch = "wasm32")]
-async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, String> {
+pub(crate) async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, String> {
     use gloo_net::http::Request;
 
     let path = if path.starts_with('/') {
@@ -1942,7 +1942,7 @@ async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, St
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, String> {
+pub(crate) async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, String> {
     let path = if path.starts_with('/') {
         path.to_string()
     } else {
@@ -2031,7 +2031,7 @@ async fn dismiss_notification_remote(id: u64) -> Result<(), String> {
 #[cfg(target_arch = "wasm32")]
 fn spawn_detached<F>(fut: F)
 where
-    F: std::future::Future<Output=()> + 'static,
+    F: std::future::Future<Output = ()> + 'static,
 {
     wasm_bindgen_futures::spawn_local(fut);
 }
@@ -2039,7 +2039,7 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_detached<F>(fut: F)
 where
-    F: std::future::Future<Output=()> + 'static,
+    F: std::future::Future<Output = ()> + 'static,
 {
     spawn(fut);
 }
@@ -2208,7 +2208,7 @@ fn apply_notifications_snapshot(
             tokio::time::sleep(std::time::Duration::from_millis(
                 NOTIFICATION_AUTO_DISMISS_MS as u64,
             ))
-                .await;
+            .await;
 
             let still_visible = { notifications.read().iter().any(|x| x.id == id) };
             if !still_visible {
@@ -2566,7 +2566,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -2590,7 +2590,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
         };
 
@@ -2734,7 +2734,7 @@ async fn connect_ws_once_wasm(
             &mut closed_rx,
             gloo_timers::future::TimeoutFuture::new(150),
         )
-            .await;
+        .await;
 
         match done {
             futures_util::future::Either::Left((_closed, _timeout)) => break,
@@ -2799,9 +2799,9 @@ async fn connect_ws_once_native(
             false,
             Some(tokio_tungstenite::Connector::NativeTls(tls)),
         )
-            .await
-            .map_err(|e| format!("[WS] connect failed: {e}"))?
-            .0
+        .await
+        .map_err(|e| format!("[WS] connect failed: {e}"))?
+        .0
     } else {
         tokio_tungstenite::connect_async(ws_url.as_str())
             .await

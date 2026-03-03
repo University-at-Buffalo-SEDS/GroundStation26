@@ -7,10 +7,10 @@ use groundstation_shared::TelemetryCommand;
 use groundstation_shared::{Board, FlightState};
 #[cfg(feature = "testing")]
 use rand::RngExt;
+use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
-use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
@@ -300,8 +300,8 @@ impl FlightSimState {
                 if !n2o_open
                     && fill_lines_removed
                     && self
-                    .nitrous_fill_started_ms
-                    .is_some_and(|t0| now_ms.saturating_sub(t0) >= 30_000)
+                        .nitrous_fill_started_ms
+                        .is_some_and(|t0| now_ms.saturating_sub(t0) >= 30_000)
                 {
                     self.set_flight_state(FlightState::Armed, now_ms);
                 }

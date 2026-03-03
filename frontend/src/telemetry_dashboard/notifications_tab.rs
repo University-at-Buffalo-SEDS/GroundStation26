@@ -1,4 +1,4 @@
-use super::{format_timestamp_ms_clock, PersistentNotification};
+use super::{PersistentNotification, format_timestamp_ms_clock};
 use dioxus::prelude::*;
 
 #[component]

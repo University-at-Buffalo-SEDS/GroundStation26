@@ -1,28 +1,28 @@
 use crate::flight_sim;
 use crate::state::AppState;
 use groundstation_shared::TelemetryRow;
-use groundstation_shared::{u8_to_flight_state, TelemetryCommand};
-use sedsprintf_rs_2026::config::DataType;
+use groundstation_shared::{TelemetryCommand, u8_to_flight_state};
 use sedsprintf_rs_2026::config::DEVICE_IDENTIFIER;
+use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::timesync::{
-    compute_offset_delay, decode_timesync_request, decode_timesync_response, TimeSyncConfig, TimeSyncRole,
-    TimeSyncTracker, TimeSyncUpdate,
+    TimeSyncConfig, TimeSyncRole, TimeSyncTracker, TimeSyncUpdate, compute_offset_delay,
+    decode_timesync_request, decode_timesync_response,
 };
 
 use crate::gpio_panel::IGNITION_PIN;
 use crate::radio::RadioDevice;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
-use crate::web::{emit_warning, FlightStateMsg};
+use crate::web::{FlightStateMsg, emit_warning};
 use groundstation_shared::Board;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
-use tokio::sync::{broadcast, mpsc, Notify};
-use tokio::time::{interval, Duration};
+use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::time::{Duration, interval};
 
 const TIMESYNC_PRIORITY: u64 = 50;
 const TIMESYNC_SOURCE_TIMEOUT_MS: u64 = 5_000;
@@ -761,7 +761,7 @@ async fn handle_packet(
                 state_code: pkt_data as i64,
             },
         )
-            .await;
+        .await;
 
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
@@ -787,7 +787,7 @@ async fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                    .ok();
+                .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 queue_db_write(
@@ -802,7 +802,7 @@ async fn handle_packet(
                         payload_json,
                     },
                 )
-                    .await;
+                .await;
 
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
@@ -833,7 +833,7 @@ async fn handle_packet(
                 .map(|v| v.map(|n| n as f64))
                 .collect::<Vec<_>>(),
         )
-            .ok();
+        .ok();
 
         if should_persist_telemetry_sample(&data_type_str, ts_ms) {
             queue_db_write(
@@ -848,7 +848,7 @@ async fn handle_packet(
                     payload_json: payload_json.clone(),
                 },
             )
-                .await;
+            .await;
         }
 
         let row = TelemetryRow {
@@ -872,7 +872,7 @@ async fn handle_packet(
                     payload_json,
                 },
             )
-                .await;
+            .await;
         }
         None
     }

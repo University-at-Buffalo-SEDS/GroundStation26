@@ -1,6 +1,6 @@
 use crate::gpio::GpioPins;
 use crate::ring_buffer::RingBuffer;
-use crate::sequences::{command_name, ActionPolicyMsg, PersistentNotification};
+use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
 use groundstation_shared::{
     Board, BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow,
@@ -10,7 +10,7 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]

@@ -3,13 +3,15 @@
 #[cfg(target_os = "ios")]
 use crate::telemetry_dashboard::gps_apple;
 use crate::telemetry_dashboard::{
-    js_eval, js_is_ground_map_ready, js_read_window_string, map_tiles_url,
+    http_get_json, js_eval, js_is_ground_map_ready, js_read_window_string, map_tiles_url,
 };
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
+use serde::Deserialize;
 
 const RESIZE_DEBOUNCE_MS: u64 = 250;
 const FULLSCREEN_REINIT_DELAY_MS: u64 = 80;
+const DEFAULT_MAX_NATIVE_ZOOM: u32 = 12;
 
 fn tiles_url() -> String {
     map_tiles_url()
@@ -29,13 +31,25 @@ pub fn MapTab(
     // Browser-derived location (from navigator.geolocation inside the webview/page)
     let mut browser_user_gps = use_signal(|| None::<(f64, f64)>);
     let has_centered_on_user = use_signal(|| false);
+    let max_native_zoom = use_signal(|| DEFAULT_MAX_NATIVE_ZOOM);
+
+    {
+        let mut max_native_zoom = max_native_zoom;
+        use_future(move || async move {
+            if let Ok(cfg) = http_get_json::<MapConfig>("/api/map_config").await {
+                max_native_zoom.set(cfg.max_native_zoom.max(1));
+            }
+        });
+    }
 
     // --- 0) One-time JS setup (iOS/native safe: JS owns resize/orientation detection) ---
     {
         let tiles = tiles_url();
+        let max_native_zoom_sig = max_native_zoom;
         #[cfg(target_os = "ios")]
         let mut show_enable_compass = show_enable_compass;
         use_effect(move || {
+            let max_native_zoom = *max_native_zoom_sig.read();
             #[cfg(target_os = "ios")]
             js_eval(
                 r#"
@@ -52,25 +66,27 @@ pub fn MapTab(
 
             js_setup_map_touch_guard();
             js_setup_map_size_guard();
-            js_setup_js_init_retry(&tiles);
+            js_setup_js_init_retry(&tiles, max_native_zoom);
             #[cfg(not(target_os = "windows"))]
             js_setup_js_geolocation_watch();
 
             // Debounced resize/orientation/visualViewport reinit path
-            js_setup_js_resize_reinit(&tiles, RESIZE_DEBOUNCE_MS);
+            js_setup_js_resize_reinit(&tiles, max_native_zoom, RESIZE_DEBOUNCE_MS);
 
             // Fullscreen enter/exit explicit reinit hook (independent of rotation)
-            js_setup_js_fullscreen_reinit(&tiles);
+            js_setup_js_fullscreen_reinit(&tiles, max_native_zoom);
         });
     }
 
     // --- 1) Fullscreen enter/exit ALWAYS forces a reinit + invalidate (independent of rotation) ---
     {
         let tiles = tiles_url();
+        let max_native_zoom_sig = max_native_zoom;
         let is_fullscreen_sig = is_fullscreen;
         use_effect(move || {
+            let max_native_zoom = *max_native_zoom_sig.read();
             let fs = *is_fullscreen_sig.read();
-            js_force_map_reinit_now(&tiles, fs, FULLSCREEN_REINIT_DELAY_MS);
+            js_force_map_reinit_now(&tiles, max_native_zoom, fs, FULLSCREEN_REINIT_DELAY_MS);
         });
     }
 
@@ -281,8 +297,9 @@ pub fn MapTab(
  * JS bridge helpers (no wasm-bindgen imports)
  * ============================================================================================== */
 
-fn js_setup_js_fullscreen_reinit(tiles: &str) {
+fn js_setup_js_fullscreen_reinit(tiles: &str, max_native_zoom: u32) {
     let tiles_js = serde_json::to_string(tiles).unwrap_or_else(|_| "\"\"".to_string());
+    let max_native_zoom_js = max_native_zoom.to_string();
 
     let script = r#"
     (function() {
@@ -290,6 +307,7 @@ fn js_setup_js_fullscreen_reinit(tiles: &str) {
       window.__gs26_fullscreen_reinit_installed = true;
 
       window.__gs26_tiles_url = __TILES__;
+      window.__gs26_max_native_zoom = __MAX_NATIVE_ZOOM__;
 
       function doInvalidateMulti() {
         try {
@@ -324,7 +342,7 @@ fn js_setup_js_fullscreen_reinit(tiles: &str) {
             try {
               if (window.__gs26_ground_station_loaded === true &&
                   typeof window.initGroundMap === "function") {
-                window.initGroundMap(window.__gs26_tiles_url, 31.0, -99.0, 7.0);
+                window.initGroundMap(window.__gs26_tiles_url, 31.0, -99.0, 7.0, window.__gs26_max_native_zoom);
               }
             } catch(e) {}
 
@@ -342,11 +360,16 @@ fn js_setup_js_fullscreen_reinit(tiles: &str) {
     })();
     "#;
 
-    js_eval(&script.replace("__TILES__", &tiles_js));
+    js_eval(
+        &script
+            .replace("__TILES__", &tiles_js)
+            .replace("__MAX_NATIVE_ZOOM__", &max_native_zoom_js),
+    );
 }
 
-fn js_force_map_reinit_now(tiles: &str, is_fullscreen: bool, delay_ms: u64) {
+fn js_force_map_reinit_now(tiles: &str, max_native_zoom: u32, is_fullscreen: bool, delay_ms: u64) {
     let tiles_js = serde_json::to_string(tiles).unwrap_or_else(|_| "\"\"".to_string());
+    let max_native_zoom_js = max_native_zoom.to_string();
     let fs_js = if is_fullscreen { "true" } else { "false" };
     let delay_js = delay_ms.to_string();
 
@@ -354,6 +377,7 @@ fn js_force_map_reinit_now(tiles: &str, is_fullscreen: bool, delay_ms: u64) {
     (function() {
       try {
         window.__gs26_tiles_url = __TILES__;
+        window.__gs26_max_native_zoom = __MAX_NATIVE_ZOOM__;
         if (typeof window.__gs26_force_map_reinit === "function") {
           window.__gs26_force_map_reinit(__FS__, __DELAY__);
         }
@@ -364,13 +388,15 @@ fn js_force_map_reinit_now(tiles: &str, is_fullscreen: bool, delay_ms: u64) {
     js_eval(
         &script
             .replace("__TILES__", &tiles_js)
+            .replace("__MAX_NATIVE_ZOOM__", &max_native_zoom_js)
             .replace("__FS__", fs_js)
             .replace("__DELAY__", &delay_js),
     );
 }
 
-fn js_setup_js_init_retry(tiles: &str) {
+fn js_setup_js_init_retry(tiles: &str, max_native_zoom: u32) {
     let tiles_js = serde_json::to_string(tiles).unwrap_or_else(|_| "\"\"".to_string());
+    let max_native_zoom_js = max_native_zoom.to_string();
 
     let script = r#"
     (function() {
@@ -378,6 +404,7 @@ fn js_setup_js_init_retry(tiles: &str) {
       window.__gs26_init_retry_installed = true;
 
       window.__gs26_tiles_url = __TILES__;
+      window.__gs26_max_native_zoom = __MAX_NATIVE_ZOOM__;
 
       let tries = 0;
       const maxTries = 200; // ~10s at 50ms
@@ -391,7 +418,7 @@ fn js_setup_js_init_retry(tiles: &str) {
           if (window.__gs26_ground_station_loaded === true &&
               typeof window.initGroundMap === "function") {
 
-            window.initGroundMap(window.__gs26_tiles_url, 31.0, -99.0, 7.0);
+            window.initGroundMap(window.__gs26_tiles_url, 31.0, -99.0, 7.0, window.__gs26_max_native_zoom);
 
             try {
               if (typeof window.__gs26_map_size_hook_update === "function") {
@@ -420,7 +447,11 @@ fn js_setup_js_init_retry(tiles: &str) {
     })();
     "#;
 
-    js_eval(&script.replace("__TILES__", &tiles_js));
+    js_eval(
+        &script
+            .replace("__TILES__", &tiles_js)
+            .replace("__MAX_NATIVE_ZOOM__", &max_native_zoom_js),
+    );
 }
 
 fn js_setup_js_geolocation_watch() {
@@ -481,8 +512,9 @@ fn js_request_user_geolocation_once() {
     );
 }
 
-fn js_setup_js_resize_reinit(tiles: &str, debounce_ms: u64) {
+fn js_setup_js_resize_reinit(tiles: &str, max_native_zoom: u32, debounce_ms: u64) {
     let tiles_js = serde_json::to_string(tiles).unwrap_or_else(|_| "\"\"".to_string());
+    let max_native_zoom_js = max_native_zoom.to_string();
     let debounce_js = debounce_ms.to_string();
 
     let script = r#"
@@ -491,6 +523,7 @@ fn js_setup_js_resize_reinit(tiles: &str, debounce_ms: u64) {
       window.__gs26_resize_reinit_installed = true;
 
       window.__gs26_tiles_url = __TILES__;
+      window.__gs26_max_native_zoom = __MAX_NATIVE_ZOOM__;
       const DEBOUNCE = __DEBOUNCE__;
 
       function doInvalidateMulti() {
@@ -522,7 +555,7 @@ fn js_setup_js_resize_reinit(tiles: &str, debounce_ms: u64) {
         try {
           if (window.__gs26_ground_station_loaded === true &&
               typeof window.initGroundMap === "function") {
-            window.initGroundMap(window.__gs26_tiles_url, 31.0, -99.0, 7.0);
+            window.initGroundMap(window.__gs26_tiles_url, 31.0, -99.0, 7.0, window.__gs26_max_native_zoom);
           }
         } catch (e) {}
 
@@ -571,6 +604,7 @@ fn js_setup_js_resize_reinit(tiles: &str, debounce_ms: u64) {
     js_eval(
         &script
             .replace("__TILES__", &tiles_js)
+            .replace("__MAX_NATIVE_ZOOM__", &max_native_zoom_js)
             .replace("__DEBOUNCE__", &debounce_js),
     );
 }
@@ -759,6 +793,11 @@ fn js_read_user_latlon_from_window() -> Option<(f64, f64)> {
     let lat = js_read_window_f64("__gs26_user_lat")?;
     let lon = js_read_window_f64("__gs26_user_lon")?;
     Some((lat, lon))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MapConfig {
+    max_native_zoom: u32,
 }
 
 #[cfg(target_os = "ios")]

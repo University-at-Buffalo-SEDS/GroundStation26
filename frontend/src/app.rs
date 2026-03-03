@@ -270,9 +270,8 @@ struct RouteCheck {
 #[cfg(not(target_arch = "wasm32"))]
 fn status_ok_for_path(path: &str, status: u16) -> (bool, &'static str) {
     match path {
-        "/api/recent" | "/api/alerts" | "/api/layout" | "/flightstate" | "/api/gps" => {
-            (status == 200, "expected 200")
-        }
+        "/api/recent" | "/api/alerts" | "/api/layout" | "/api/map_config" | "/flightstate"
+        | "/api/gps" => (status == 200, "expected 200"),
         "/ws" => match status {
             101 | 400 | 426 => (true, "reachable (ws upgrade required)"),
             _ => (false, "unexpected status for ws route"),
@@ -364,6 +363,7 @@ async fn test_routes_host_only(base: &str, skip_tls_verify: bool) -> Vec<RouteCh
         "/api/recent",
         "/api/alerts",
         "/api/layout",
+        "/api/map_config",
         "/flightstate",
         "/api/gps",
         "/tiles",
@@ -445,15 +445,15 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl, skip_tls_verify: bool) -> Resu
                 false,
                 Some(tokio_tungstenite::Connector::NativeTls(tls)),
             )
-                .await
-                .map_err(|e| format!("{e}"))
+            .await
+            .map_err(|e| format!("{e}"))
         } else {
             tokio_tungstenite::connect_async(ws_url.clone())
                 .await
                 .map_err(|e| format!("{e}"))
         }
     })
-        .await;
+    .await;
 
     match res {
         Err(_) => Err(format!(

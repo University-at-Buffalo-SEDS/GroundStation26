@@ -16,7 +16,7 @@ mod state;
 mod telemetry_task;
 mod web;
 
-use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
+use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
@@ -25,14 +25,14 @@ use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
 #[cfg(feature = "testing")]
 use crate::radio::DummyRadio;
-use crate::radio::{Radio, RadioDevice, RADIO_BAUD_RATE, ROCKET_RADIO_PORT, UMBILICAL_RADIO_PORT};
+use crate::radio::{RADIO_BAUD_RATE, ROCKET_RADIO_PORT, Radio, RadioDevice, UMBILICAL_RADIO_PORT};
 use axum::Router;
 use groundstation_shared::{Board, FlightState as FlightStateMode};
+use sedsprintf_rs_2026::TelemetryError;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
-use sedsprintf_rs_2026::TelemetryError;
 use sqlx::Row;
 use std::collections::HashMap;
 use std::fs;
@@ -138,7 +138,7 @@ async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
         != Some("0");
     if switch_to_delete
         && let Err(err) =
-        exec_pragma_with_retry(db, "PRAGMA journal_mode=DELETE;", retries, delay_ms).await
+            exec_pragma_with_retry(db, "PRAGMA journal_mode=DELETE;", retries, delay_ms).await
     {
         eprintln!("SQLite PRAGMA journal_mode=DELETE failed after {retries} attempts: {err}");
     }
@@ -231,8 +231,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     // Add values_json column for older DBs.
     let cols = sqlx::query("PRAGMA table_info(telemetry)")
@@ -273,8 +273,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     sqlx::query(
         r#"
@@ -285,8 +285,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);

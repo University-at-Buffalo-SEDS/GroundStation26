@@ -3,15 +3,15 @@ mod telemetry_dashboard;
 
 use dioxus::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
-use dioxus_desktop::wry::http::{Request as HttpRequest, Response as HttpResponse};
-#[cfg(not(target_arch = "wasm32"))]
 use dioxus_desktop::RequestAsyncResponder;
+#[cfg(not(target_arch = "wasm32"))]
+use dioxus_desktop::wry::http::{Request as HttpRequest, Response as HttpResponse};
 #[cfg(not(target_arch = "wasm32"))]
 use std::backtrace::Backtrace;
 #[cfg(not(target_arch = "wasm32"))]
 use std::borrow::Cow;
 #[cfg(not(target_arch = "wasm32"))]
-use std::fs::{create_dir_all, OpenOptions};
+use std::fs::{OpenOptions, create_dir_all};
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
 #[cfg(not(target_arch = "wasm32"))]
@@ -192,17 +192,17 @@ fn _handle_gs26_protocol_async(request: HttpRequest<Vec<u8>>, responder: Request
     let _ = std::thread::Builder::new()
         .name("gs26-proto-req".to_string())
         .spawn(move || {
-            let response = match panic::catch_unwind(AssertUnwindSafe(|| handle_gs26_protocol(request)))
-            {
-                Ok(resp) => resp,
-                Err(_) => {
-                    append_native_log("[protocol] panic in protocol handler thread");
-                    HttpResponse::builder()
-                        .status(500)
-                        .body(Cow::Owned(Vec::new()))
-                        .unwrap_or_else(|_| HttpResponse::new(Cow::Owned(Vec::new())))
-                }
-            };
+            let response =
+                match panic::catch_unwind(AssertUnwindSafe(|| handle_gs26_protocol(request))) {
+                    Ok(resp) => resp,
+                    Err(_) => {
+                        append_native_log("[protocol] panic in protocol handler thread");
+                        HttpResponse::builder()
+                            .status(500)
+                            .body(Cow::Owned(Vec::new()))
+                            .unwrap_or_else(|_| HttpResponse::new(Cow::Owned(Vec::new())))
+                    }
+                };
             responder.respond(response);
         });
 }
