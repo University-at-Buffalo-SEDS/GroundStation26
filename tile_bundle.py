@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import sqlite3
+import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -61,6 +63,29 @@ def render_progress(prefix: str, done: int, total: int, start_t: float) -> str:
         f"{prefix}: {pct:6.2f}% ({done}/{total}) "
         f"{rate:,.1f} tiles/s ETA {eta_m:02d}:{eta_s:02d}"
     )
+
+def render_progress_bar(prefix: str, done: int, total: int, start_t: float, unique_blobs: int | None = None) -> str:
+    elapsed = max(time.time() - start_t, 0.001)
+    pct = 100.0 if total <= 0 else (done * 100.0 / total)
+    rate = done / elapsed
+    remain = max(total - done, 0)
+    eta = int(remain / max(rate, 0.001))
+    eta_m, eta_s = divmod(eta, 60)
+
+    cols = shutil.get_terminal_size((120, 20)).columns
+    bar_width = max(10, min(50, cols - 85))
+    fill = 0 if total <= 0 else int((done / total) * bar_width)
+    bar = "#" * fill + "-" * (bar_width - fill)
+    extra = f" unique={unique_blobs:,}" if unique_blobs is not None else ""
+    return (
+        f"\r{prefix} [{bar}] {pct:6.2f}% "
+        f"{done:,}/{total:,} {rate:,.1f}/s ETA {eta_m:02d}:{eta_s:02d}{extra}"
+    )
+
+def print_progress_bar(prefix: str, done: int, total: int, start_t: float, unique_blobs: int | None = None) -> None:
+    line = render_progress_bar(prefix, done, total, start_t, unique_blobs)
+    sys.stdout.write(line)
+    sys.stdout.flush()
 
 
 def configure_conn(conn: sqlite3.Connection) -> None:
@@ -157,10 +182,7 @@ def build_bundle(tiles_dir: Path, bundle: Path, remove_source: bool) -> None:
             inserted_tiles += 1
             now = time.time()
             if inserted_tiles % 5000 == 0 or (now - last_print_t) >= 1.0:
-                print(
-                    render_progress("bundle progress", inserted_tiles, total_tiles, start_t)
-                    + f" unique_blobs={unique_blobs:,}"
-                )
+                print_progress_bar("bundle", inserted_tiles, total_tiles, start_t, unique_blobs)
                 last_print_t = now
 
     conn.executescript("ANALYZE; PRAGMA optimize; VACUUM;")
@@ -169,7 +191,8 @@ def build_bundle(tiles_dir: Path, bundle: Path, remove_source: bool) -> None:
     if bundle.exists():
         bundle.unlink()
     tmp_bundle.rename(bundle)
-    print(render_progress("bundle final", inserted_tiles, total_tiles, start_t))
+    print_progress_bar("bundle", inserted_tiles, total_tiles, start_t, unique_blobs)
+    print()
     print(
         f"bundle complete: {bundle} ({inserted_tiles} tiles, {unique_blobs} unique blobs)"
     )
@@ -216,11 +239,12 @@ def extract_bundle(bundle: Path, output_dir: Path) -> None:
         extracted += 1
         now = time.time()
         if extracted % 5000 == 0 or (now - last_print_t) >= 1.0:
-            print(render_progress("extract progress", extracted, total_rows, start_t))
+            print_progress_bar("extract", extracted, total_rows, start_t)
             last_print_t = now
 
     conn.close()
-    print(render_progress("extract final", extracted, total_rows, start_t))
+    print_progress_bar("extract", extracted, total_rows, start_t)
+    print()
     print(f"extract complete: {output_dir} ({extracted} tiles)")
 
 
