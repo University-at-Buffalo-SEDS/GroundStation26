@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::Result;
+use blake3::Hasher;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::Client;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::sync::{
@@ -51,9 +53,8 @@ const DEFAULT_MAX_CONCURRENT: usize = 1024;
 const PROGRESS_PERCENT_STEP: u64 = 10;
 const DEFAULT_MAX_BANDWIDTH_MIBPS: f64 = 2.5;
 
-
 const MAX_RETRY_ATTEMPTS: u32 = 40;
-
+const DEFAULT_BUILD_BUNDLE: bool = true;
 
 fn log_progress_error(pb: Option<&ProgressBar>, msg: String) {
     if let Some(pb) = pb {
@@ -160,6 +161,190 @@ fn max_bandwidth_mibps() -> Option<f64> {
     if v <= 0.0 { None } else { Some(v) }
 }
 
+fn should_build_bundle() -> bool {
+    match env::var("MAP_BUILD_BUNDLE") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"),
+        Err(_) => DEFAULT_BUILD_BUNDLE,
+    }
+}
+
+fn bundle_path_for(data_dir: &Path) -> PathBuf {
+    match env::var("MAP_BUNDLE_PATH") {
+        Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
+        _ => data_dir.join("tiles.sqlite"),
+    }
+}
+
+async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Result<()> {
+    let parent = bundle_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid bundle path: {}", bundle_path.display()))?;
+    fs::create_dir_all(parent)?;
+
+    let tmp_path = bundle_path.with_extension("sqlite.tmp");
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path)?;
+    }
+
+    println!(
+        "building tile bundle sqlite from {} -> {}",
+        tiles_root.display(),
+        bundle_path.display()
+    );
+
+    let url = format!("sqlite://{}", tmp_path.to_string_lossy());
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await?;
+    sqlx::query("PRAGMA journal_mode = OFF;")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA synchronous = OFF;")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA locking_mode = EXCLUSIVE;")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA temp_store = MEMORY;")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA cache_size = -262144;")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA page_size = 8192;")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS tile_blobs (
+            id INTEGER PRIMARY KEY,
+            hash BLOB NOT NULL UNIQUE,
+            image BLOB NOT NULL
+        );",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS tiles (
+            z INTEGER NOT NULL,
+            x INTEGER NOT NULL,
+            y INTEGER NOT NULL,
+            blob_id INTEGER NOT NULL,
+            PRIMARY KEY (z, x, y)
+        ) WITHOUT ROWID;",
+    )
+    .execute(&pool)
+    .await?;
+
+    let mut tx = pool.begin().await?;
+
+    let mut inserted: u64 = 0;
+    let mut z_dirs: Vec<_> = fs::read_dir(tiles_root)?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .collect();
+    z_dirs.sort_by_key(|e| e.file_name());
+
+    for z_entry in z_dirs {
+        let z_name = z_entry.file_name();
+        let Some(z_str) = z_name.to_str() else {
+            continue;
+        };
+        let Ok(z) = z_str.parse::<u32>() else {
+            continue;
+        };
+
+        let mut x_dirs: Vec<_> = fs::read_dir(z_entry.path())?
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .collect();
+        x_dirs.sort_by_key(|e| e.file_name());
+
+        for x_entry in x_dirs {
+            let x_name = x_entry.file_name();
+            let Some(x_str) = x_name.to_str() else {
+                continue;
+            };
+            let Ok(x) = x_str.parse::<u32>() else {
+                continue;
+            };
+
+            let mut y_files: Vec<_> = fs::read_dir(x_entry.path())?
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .collect();
+            y_files.sort_by_key(|e| e.file_name());
+
+            for y_entry in y_files {
+                let path = y_entry.path();
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if ext != TILE_EXT {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Ok(y) = stem.parse::<u32>() else {
+                    continue;
+                };
+                let bytes = fs::read(&path)?;
+                let mut hasher = Hasher::new();
+                hasher.update(&bytes);
+                let hash = hasher.finalize();
+                let hash_bytes = hash.as_bytes().to_vec();
+                let blob_id = sqlx::query_scalar::<_, i64>(
+                    "INSERT INTO tile_blobs (hash, image)
+                     VALUES (?, ?)
+                     ON CONFLICT(hash) DO UPDATE SET hash = excluded.hash
+                     RETURNING id",
+                )
+                .bind(&hash_bytes)
+                .bind(&bytes)
+                .fetch_one(&mut *tx)
+                .await?;
+
+                sqlx::query("INSERT OR REPLACE INTO tiles (z, x, y, blob_id) VALUES (?, ?, ?, ?)")
+                    .bind(i64::from(z))
+                    .bind(i64::from(x))
+                    .bind(i64::from(y))
+                    .bind(blob_id)
+                    .execute(&mut *tx)
+                    .await?;
+                inserted += 1;
+                if inserted.is_multiple_of(50_000) {
+                    println!("bundle progress: inserted {inserted} tiles");
+                }
+            }
+        }
+    }
+
+    tx.commit().await?;
+    sqlx::query("ANALYZE;").execute(&pool).await?;
+    sqlx::query("PRAGMA optimize;").execute(&pool).await?;
+    sqlx::query("VACUUM;").execute(&pool).await?;
+    let unique_blobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tile_blobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+    pool.close().await;
+
+    if bundle_path.exists() {
+        fs::remove_file(bundle_path)?;
+    }
+    fs::rename(&tmp_path, bundle_path)?;
+    println!(
+        "tile bundle ready: {} ({} tiles, {} unique blobs)",
+        bundle_path.display(),
+        inserted,
+        unique_blobs
+    );
+    Ok(())
+}
+
 struct BandwidthLimiter {
     bytes_per_sec: f64,
     next_slot: AsyncMutex<Instant>,
@@ -230,8 +415,22 @@ async fn main() -> Result<()> {
             println!();
             println!("----");
         }
-        if fetch_tiles_for_zoom_async(z, &tiles_root, &client).await.is_err() {
+        if fetch_tiles_for_zoom_async(z, &tiles_root, &client)
+            .await
+            .is_err()
+        {}
+    }
+
+    if should_build_bundle() {
+        let bundle_path = bundle_path_for(&data_dir);
+        if let Err(e) = build_tile_bundle_sqlite(&tiles_root, &bundle_path).await {
+            eprintln!(
+                "WARNING: failed building tile bundle {}: {e:#}",
+                bundle_path.display()
+            );
         }
+    } else {
+        println!("Skipping tile bundle generation (MAP_BUILD_BUNDLE disabled).");
     }
 
     println!("fetch_satellite_tiles_async: done populating satellite tiles.");

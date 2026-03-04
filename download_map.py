@@ -25,6 +25,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Set MAP_MAX_BANDWIDTH_MIBPS (MiB/s). <=0 disables cap.",
     )
+    parser.add_argument(
+        "--no-bundle",
+        action="store_true",
+        help="Disable automatic generation of backend/data/maps/<region>/tiles.sqlite.",
+    )
+    parser.add_argument(
+        "--bundle-path",
+        type=Path,
+        default=None,
+        help="Set MAP_BUNDLE_PATH output path for generated tile sqlite bundle.",
+    )
     return parser.parse_args()
 
 
@@ -39,6 +50,12 @@ def main() -> None:
     if args.max_bandwidth_mibps is not None:
         env["MAP_MAX_BANDWIDTH_MIBPS"] = str(args.max_bandwidth_mibps)
         print(f"Using MAP_MAX_BANDWIDTH_MIBPS={env['MAP_MAX_BANDWIDTH_MIBPS']}")
+    if args.no_bundle:
+        env["MAP_BUILD_BUNDLE"] = "0"
+        print("Using MAP_BUILD_BUNDLE=0")
+    if args.bundle_path is not None:
+        env["MAP_BUNDLE_PATH"] = str(args.bundle_path)
+        print(f"Using MAP_BUNDLE_PATH={env['MAP_BUNDLE_PATH']}")
 
     try:
         run(

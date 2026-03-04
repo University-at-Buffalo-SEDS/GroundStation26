@@ -1,5 +1,5 @@
 use crate::layout;
-use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom};
+use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_bundle_path};
 use crate::sequences::{ActionPolicyMsg, PersistentNotification};
 use crate::state::AppState;
 use axum::http::{StatusCode, header};
@@ -17,6 +17,7 @@ use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -28,6 +29,14 @@ use tower_http::services::ServeDir;
 // NEW
 
 static FAVICON_DATA: OnceCell<Vec<u8>> = OnceCell::const_new();
+static TILE_DB_POOL: OnceCell<Option<sqlx::SqlitePool>> = OnceCell::const_new();
+static TILE_DB_MODE: OnceCell<TileDbMode> = OnceCell::const_new();
+
+#[derive(Clone, Copy)]
+enum TileDbMode {
+    LegacyInline,
+    Deduped,
+}
 
 fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
     let values_from_json = row
@@ -275,14 +284,114 @@ fn tile_path(z: u32, x: u32, y: u32) -> PathBuf {
     format!("./backend/data/maps/{DEFAULT_MAP_REGION}/tiles/{z}/{x}/{y}.jpg").into()
 }
 
-async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
+async fn tile_db_pool() -> Option<sqlx::SqlitePool> {
+    TILE_DB_POOL
+        .get_or_init(|| async {
+            let path = tile_bundle_path(DEFAULT_MAP_REGION);
+            let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
+            if !exists {
+                return None;
+            }
+            let url = format!("sqlite://{}?mode=ro", path.to_string_lossy());
+            match SqlitePoolOptions::new()
+                .max_connections(4)
+                .connect(&url)
+                .await
+            {
+                Ok(pool) => Some(pool),
+                Err(e) => {
+                    eprintln!(
+                        "WARNING: failed to open tile bundle {}: {e}",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        })
+        .await
+        .clone()
+}
+
+async fn tile_db_mode() -> TileDbMode {
+    *TILE_DB_MODE
+        .get_or_init(|| async {
+            let Some(pool) = tile_db_pool().await else {
+                return TileDbMode::LegacyInline;
+            };
+            let Ok(rows) = sqlx::query("PRAGMA table_info(tiles)")
+                .fetch_all(&pool)
+                .await
+            else {
+                return TileDbMode::LegacyInline;
+            };
+            let has_blob_id = rows.iter().any(|r| {
+                r.try_get::<String, _>("name")
+                    .map(|n| n == "blob_id")
+                    .unwrap_or(false)
+            });
+            if has_blob_id {
+                TileDbMode::Deduped
+            } else {
+                TileDbMode::LegacyInline
+            }
+        })
+        .await
+}
+
+async fn read_exact_tile(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
+    if let Some(pool) = tile_db_pool().await {
+        match tile_db_mode().await {
+            TileDbMode::LegacyInline => {
+                match sqlx::query_scalar::<_, Vec<u8>>(
+                    "SELECT image FROM tiles WHERE z = ? AND x = ? AND y = ? LIMIT 1",
+                )
+                .bind(i64::from(z))
+                .bind(i64::from(x))
+                .bind(i64::from(y))
+                .fetch_optional(&pool)
+                .await
+                {
+                    Ok(Some(bytes)) => return Some(bytes),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("WARNING: failed reading tile from bundle: {e}"),
+                }
+            }
+            TileDbMode::Deduped => {
+                match sqlx::query_scalar::<_, Vec<u8>>(
+                    "SELECT b.image
+                     FROM tiles t
+                     JOIN tile_blobs b ON b.id = t.blob_id
+                     WHERE t.z = ? AND t.x = ? AND t.y = ?
+                     LIMIT 1",
+                )
+                .bind(i64::from(z))
+                .bind(i64::from(x))
+                .bind(i64::from(y))
+                .fetch_optional(&pool)
+                .await
+                {
+                    Ok(Some(bytes)) => return Some(bytes),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("WARNING: failed reading deduped tile from bundle: {e}"),
+                }
+            }
+        }
+    }
+
     let exact_path = tile_path(z, x, y);
     match tokio::fs::read(&exact_path).await {
-        Ok(bytes) => return Some(bytes),
+        Ok(bytes) => Some(bytes),
         Err(e) if e.kind() != ErrorKind::NotFound => {
             eprintln!("WARNING: failed reading tile {}: {e}", exact_path.display());
+            None
         }
-        Err(_) => {}
+        Err(_) => None,
+    }
+}
+
+async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
+    if let Some(bytes) = read_exact_tile(z, x, y).await {
+        return Some(bytes);
     }
 
     let mut az = z;
@@ -292,8 +401,7 @@ async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
         az -= 1;
         ax /= 2;
         ay /= 2;
-        let path = tile_path(az, ax, ay);
-        let Ok(parent_bytes) = tokio::fs::read(&path).await else {
+        let Some(parent_bytes) = read_exact_tile(az, ax, ay).await else {
             continue;
         };
         match synthesize_zoom_tile_from_ancestor(&parent_bytes, az, ax, ay, z, x, y) {
