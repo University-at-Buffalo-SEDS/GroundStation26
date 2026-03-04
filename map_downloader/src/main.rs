@@ -52,7 +52,7 @@ const PROGRESS_PERCENT_STEP: u64 = 10;
 const DEFAULT_MAX_BANDWIDTH_MIBPS: f64 = 2.5;
 
 
-const MAX_RETRY_ATTEMPTS: u32 = 20;
+const MAX_RETRY_ATTEMPTS: u32 = 40;
 
 
 fn log_progress_error(pb: Option<&ProgressBar>, msg: String) {
@@ -60,6 +60,87 @@ fn log_progress_error(pb: Option<&ProgressBar>, msg: String) {
         pb.println(msg);
     } else {
         eprintln!("{msg}");
+    }
+}
+
+async fn fetch_tile_with_retries(
+    z: u32,
+    x: u32,
+    y: u32,
+    z_dir: &Path,
+    client: &Client,
+    bytes_downloaded: &Arc<AtomicU64>,
+    pb: Option<&ProgressBar>,
+    limiter: Option<&Arc<BandwidthLimiter>>,
+    max_attempts: u32,
+) -> bool {
+    let tile_path = z_dir.join(format!("{x}/{y}.{TILE_EXT}"));
+    let part_path = tile_path.with_extension(format!("{}.part", TILE_EXT));
+
+    // Skip if final tile already exists
+    if async_fs::try_exists(&tile_path).await.unwrap_or(false) {
+        return true;
+    }
+
+    // Remove any leftover .part file
+    if async_fs::try_exists(&part_path).await.unwrap_or(false) {
+        let _ = async_fs::remove_file(&part_path).await;
+    }
+
+    let url = format!(
+        "{base}/{z}/{y}/{x}",
+        base = SATELLITE_BASE_URL,
+        z = z,
+        y = y,
+        x = x,
+    );
+
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    match resp.bytes().await {
+                        Ok(bytes) => {
+                            if let Some(lim) = limiter {
+                                lim.throttle_bytes(bytes.len()).await;
+                            }
+                            bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                            if write_tile_atomic_async(&tile_path, &bytes).await.is_ok() {
+                                return true;
+                            }
+                        }
+                        Err(e) => {
+                            log_progress_error(
+                                pb,
+                                format!(
+                                    "fetch_satellite_tiles_async: failed reading bytes for {} (attempt {attempts}/{max_attempts}): {e}",
+                                    url
+                                ),
+                            );
+                        }
+                    }
+                } else if status.as_u16() == 404 {
+                    // Fine: no tile for this location (e.g. ocean).
+                    return true;
+                }
+            }
+            Err(_e) => {}
+        }
+
+        if attempts >= max_attempts {
+            log_progress_error(
+                pb,
+                format!(
+                    "fetch_satellite_tiles_async: giving up on tile z={z}, x={x}, y={y} after {} attempts",
+                    attempts
+                ),
+            );
+            return false;
+        }
+        sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -285,6 +366,8 @@ async fn fetch_tiles_for_zoom_async(
     let bytes_downloaded_clone = bytes_downloaded.clone();
     let pb_for_workers = pb.clone();
     let limiter_for_workers = bandwidth_limiter.clone();
+    let failed_coords = Arc::new(AsyncMutex::new(Vec::<(u32, u32)>::new()));
+    let failed_coords_for_workers = failed_coords.clone();
     // Build an async stream of all coordinate tasks
     stream::iter(coords)
         .for_each_concurrent(max_concurrent, move |(x, y)| {
@@ -294,103 +377,85 @@ async fn fetch_tiles_for_zoom_async(
             let bytes_downloaded = bytes_downloaded_clone.clone();
             let pb_for_worker = pb_for_workers.clone();
             let limiter_for_worker = limiter_for_workers.clone();
+            let failed_coords = failed_coords_for_workers.clone();
 
             async move {
-                let tile_path = z_dir.join(format!("{x}/{y}.{TILE_EXT}"));
-                let part_path = tile_path.with_extension(format!("{}.part", TILE_EXT));
-
-                // Skip if final tile already exists
-                if async_fs::try_exists(&tile_path).await.unwrap_or(false) {
-                    done_count.fetch_add(1, Ordering::Relaxed);
-                    return;
+                let ok = fetch_tile_with_retries(
+                    z,
+                    x,
+                    y,
+                    &z_dir,
+                    &client,
+                    &bytes_downloaded,
+                    pb_for_worker.as_ref(),
+                    limiter_for_worker.as_ref(),
+                    MAX_RETRY_ATTEMPTS,
+                )
+                .await;
+                if !ok {
+                    failed_coords.lock().await.push((x, y));
                 }
-
-                // Remove any leftover .part file
-                if async_fs::try_exists(&part_path).await.unwrap_or(false) {
-                    let _ = async_fs::remove_file(&part_path).await;
-                }
-
-                let url = format!(
-                    "{base}/{z}/{y}/{x}",
-                    base = SATELLITE_BASE_URL,
-                    z = z,
-                    y = y,
-                    x = x,
-                );
-
-                let mut attempts: u32 = 0;
-
-                loop {
-                    attempts += 1;
-
-                    match client.get(&url).send().await {
-                        Ok(resp) => {
-                            let status = resp.status();
-
-                            if status.is_success() {
-                                match resp.bytes().await {
-                                    Ok(bytes) => {
-                                        if let Some(limiter) = &limiter_for_worker {
-                                            limiter.throttle_bytes(bytes.len()).await;
-                                        }
-                                        bytes_downloaded
-                                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                                        if write_tile_atomic_async(&tile_path, &bytes).await.is_err()
-                                        {
-                                            // log_progress_error(
-                                            //     pb_for_worker.as_ref(),
-                                            //     format!(
-                                            //         "fetch_satellite_tiles_async: failed to write tile {} (attempt {attempts}/{MAX_RETRY_ATTEMPTS}): {e}",
-                                            //         tile_path.display(),
-                                            //     ),
-                                            // );
-                                        } else {
-                                            break; // success
-                                        }
-                                    }
-                                    Err(_) => {
-                                        // log_progress_error(
-                                        //     pb_for_worker.as_ref(),
-                                        //     format!(
-                                        //         "fetch_satellite_tiles_async: failed reading bytes for {} (attempt {attempts}/{MAX_RETRY_ATTEMPTS}): {e}",
-                                        //         url,
-                                        //     ),
-                                        // );
-                                    }
-                                }
-                                // Decode/write failures retry via loop.
-                                continue;
-                            }
-
-                            // 404: tile doesn't exist, never retry
-                            if status.as_u16() == 404 {
-                                // fine: no tile for this location (e.g. ocean)
-                                break;
-                            }
-                        }
-
-                        Err(_e) => {}
-                    }
-
-                    if attempts >= MAX_RETRY_ATTEMPTS {
-                        log_progress_error(
-                            pb_for_worker.as_ref(),
-                            format!(
-                                "fetch_satellite_tiles_async: giving up on tile z={z}, x={x}, y={y} after {} attempts",
-                                attempts
-                            ),
-                        );
-                        break;
-                    }
-
-                    // Backoff — can tweak lower/higher depending on how aggressive you want to be
-                    sleep(Duration::from_millis(5)).await;
-                }
-
                 done_count.fetch_add(1, Ordering::Relaxed);
             }
         })
         .await;
+
+    let retry_coords = {
+        let mut failed = failed_coords.lock().await;
+        std::mem::take(&mut *failed)
+    };
+    if !retry_coords.is_empty() {
+        log_progress_error(
+            pb.as_ref(),
+            format!(
+                "z={z}: second-pass retry for {} tiles that failed in main pass",
+                retry_coords.len()
+            ),
+        );
+
+        let retry_failures = Arc::new(AsyncMutex::new(Vec::<(u32, u32)>::new()));
+        let retry_failures_workers = retry_failures.clone();
+        let z_dir_retry = z_dir.clone();
+        let client_retry = client.clone();
+        let bytes_retry = bytes_downloaded.clone();
+        let pb_retry = pb.clone();
+        let limiter_retry = bandwidth_limiter.clone();
+        stream::iter(retry_coords)
+            .for_each_concurrent(max_concurrent, move |(x, y)| {
+                let z_dir = z_dir_retry.clone();
+                let client = client_retry.clone();
+                let bytes_downloaded = bytes_retry.clone();
+                let pb = pb_retry.clone();
+                let limiter = limiter_retry.clone();
+                let retry_failures = retry_failures_workers.clone();
+                async move {
+                    let ok = fetch_tile_with_retries(
+                        z,
+                        x,
+                        y,
+                        &z_dir,
+                        &client,
+                        &bytes_downloaded,
+                        pb.as_ref(),
+                        limiter.as_ref(),
+                        MAX_RETRY_ATTEMPTS,
+                    )
+                    .await;
+                    if !ok {
+                        retry_failures.lock().await.push((x, y));
+                    }
+                }
+            })
+            .await;
+
+        let final_failed_count = retry_failures.lock().await.len();
+        if final_failed_count > 0 {
+            log_progress_error(
+                pb.as_ref(),
+                format!("z={z}: {final_failed_count} tiles still failed after second-pass retry"),
+            );
+        }
+    }
 
     done_count.store(total, Ordering::Relaxed);
     stop_rate_updater.store(true, Ordering::Relaxed);
