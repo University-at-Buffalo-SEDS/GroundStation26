@@ -51,6 +51,10 @@ const DEFAULT_MAX_CONCURRENT: usize = 1024;
 const PROGRESS_PERCENT_STEP: u64 = 10;
 const DEFAULT_MAX_BANDWIDTH_MIBPS: f64 = 2.5;
 
+
+const MAX_RETRY_ATTEMPTS: u32 = 20;
+
+
 fn log_progress_error(pb: Option<&ProgressBar>, msg: String) {
     if let Some(pb) = pb {
         pb.println(msg);
@@ -113,7 +117,6 @@ async fn main() -> Result<()> {
     let max_zoom = env::var("MAP_MAX_ZOOM")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .map(|z| z.max(MIN_ZOOM))
         .unwrap_or(DEFAULT_MAX_ZOOM);
 
     // Use CARGO_MANIFEST_DIR if present (when run via `cargo run`),
@@ -146,8 +149,7 @@ async fn main() -> Result<()> {
             println!();
             println!("----");
         }
-        if let Err(e) = fetch_tiles_for_zoom_async(z, &tiles_root, &client).await {
-            eprintln!("fetch_satellite_tiles_async: WARNING: failed to fetch tiles for z={z}: {e}");
+        if fetch_tiles_for_zoom_async(z, &tiles_root, &client).await.is_err() {
         }
     }
 
@@ -317,7 +319,6 @@ async fn fetch_tiles_for_zoom_async(
                 );
 
                 let mut attempts: u32 = 0;
-                const MAX_ATTEMPTS: u32 = 5;
 
                 loop {
                     attempts += 1;
@@ -340,7 +341,7 @@ async fn fetch_tiles_for_zoom_async(
                                             log_progress_error(
                                                 pb_for_worker.as_ref(),
                                                 format!(
-                                                    "fetch_satellite_tiles_async: failed to write tile {} (attempt {attempts}/{MAX_ATTEMPTS}): {e}",
+                                                    "fetch_satellite_tiles_async: failed to write tile {} (attempt {attempts}/{MAX_RETRY_ATTEMPTS}): {e}",
                                                     tile_path.display(),
                                                 ),
                                             );
@@ -352,7 +353,7 @@ async fn fetch_tiles_for_zoom_async(
                                         log_progress_error(
                                             pb_for_worker.as_ref(),
                                             format!(
-                                                "fetch_satellite_tiles_async: failed reading bytes for {} (attempt {attempts}/{MAX_ATTEMPTS}): {e}",
+                                                "fetch_satellite_tiles_async: failed reading bytes for {} (attempt {attempts}/{MAX_RETRY_ATTEMPTS}): {e}",
                                                 url,
                                             ),
                                         );
@@ -372,7 +373,7 @@ async fn fetch_tiles_for_zoom_async(
                         Err(_e) => {}
                     }
 
-                    if attempts >= MAX_ATTEMPTS {
+                    if attempts >= MAX_RETRY_ATTEMPTS {
                         log_progress_error(
                             pb_for_worker.as_ref(),
                             format!(

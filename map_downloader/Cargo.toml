@@ -15,4 +15,4 @@ futures = "0.3.32"
 
 [[bin]]
 name = "map_downloader"
-path = "src/fetch_gibs_tiles.rs"
+path = "src/main.rs"
