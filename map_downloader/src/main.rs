@@ -335,28 +335,27 @@ async fn fetch_tiles_for_zoom_async(
                                         }
                                         bytes_downloaded
                                             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                                        if let Err(e) =
-                                            write_tile_atomic_async(&tile_path, &bytes).await
+                                        if write_tile_atomic_async(&tile_path, &bytes).await.is_err()
                                         {
-                                            log_progress_error(
-                                                pb_for_worker.as_ref(),
-                                                format!(
-                                                    "fetch_satellite_tiles_async: failed to write tile {} (attempt {attempts}/{MAX_RETRY_ATTEMPTS}): {e}",
-                                                    tile_path.display(),
-                                                ),
-                                            );
+                                            // log_progress_error(
+                                            //     pb_for_worker.as_ref(),
+                                            //     format!(
+                                            //         "fetch_satellite_tiles_async: failed to write tile {} (attempt {attempts}/{MAX_RETRY_ATTEMPTS}): {e}",
+                                            //         tile_path.display(),
+                                            //     ),
+                                            // );
                                         } else {
                                             break; // success
                                         }
                                     }
-                                    Err(e) => {
-                                        log_progress_error(
-                                            pb_for_worker.as_ref(),
-                                            format!(
-                                                "fetch_satellite_tiles_async: failed reading bytes for {} (attempt {attempts}/{MAX_RETRY_ATTEMPTS}): {e}",
-                                                url,
-                                            ),
-                                        );
+                                    Err(_) => {
+                                        // log_progress_error(
+                                        //     pb_for_worker.as_ref(),
+                                        //     format!(
+                                        //         "fetch_satellite_tiles_async: failed reading bytes for {} (attempt {attempts}/{MAX_RETRY_ATTEMPTS}): {e}",
+                                        //         url,
+                                        //     ),
+                                        // );
                                     }
                                 }
                                 // Decode/write failures retry via loop.
