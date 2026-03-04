@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import subprocess
 import sys
 from pathlib import Path
@@ -11,25 +12,27 @@ def run(cmd: list[str], cwd: Path) -> None:
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
-def print_usage() -> None:
-    print("Usage: run_groundstation.py [testing]")
-    sys.exit(1)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build frontend and run groundstation backend."
+    )
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=["testing"],
+        help="Legacy positional mode. Use 'testing' to enable backend testing feature.",
+    )
+    parser.add_argument(
+        "--testing",
+        action="store_true",
+        help="Enable backend 'testing' feature.",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
-
-    testing_mode = False
-    args = [a.strip().lower() for a in sys.argv[1:]]
-    if len(args) > 3:
-        print("Error: Too many arguments.", file=sys.stderr)
-        print_usage()
-
-    for arg in args:
-        if arg == "testing":
-            testing_mode = True
-        else:
-            print(f"Error: Invalid argument '{arg}'.", file=sys.stderr)
-            print_usage()
+    args = parse_args()
+    testing_mode = args.testing or args.mode == "testing"
 
     cmd = ["cargo", "run", "--release", "-p", "groundstation_backend"]
     if testing_mode:

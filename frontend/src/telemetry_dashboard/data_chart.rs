@@ -665,28 +665,3 @@ pub fn series_color(i: usize) -> &'static str {
     .copied()
     .unwrap_or("#9ca3af")
 }
-
-pub fn labels_for_datatype(dt: &str) -> [&'static str; 8] {
-    match dt {
-        "GYRO_DATA" => ["Roll", "Pitch", "Yaw", "", "", "", "", ""],
-        "ACCEL_DATA" => ["X Accel", "Y Accel", "Z Accel", "", "", "", "", ""],
-        "BAROMETER_DATA" => ["Pressure", "Temp", "Altitude", "", "", "", "", ""],
-        "KALMAN_FILTER_DATA" => ["X", "Y", "Z", "", "", "", "", ""],
-        "GPS_DATA" => ["Lat", "Lon", "", "", "", "", "", ""],
-        "FUEL_TANK_PRESSURE" => ["Tank Pressure", "", "", "", "", "", "", ""],
-        "BATTERY_VOLTAGE" => ["Voltage", "", "", "", "", "", "", ""],
-        "BATTERY_CURRENT" => ["Current", "", "", "", "", "", "", ""],
-        "FUEL_FLOW" => ["Flow Rate", "", "", "", "", "", "", ""],
-        "VALVE_STATE" => [
-            "Pilot",
-            "NormallyOpen",
-            "Dump",
-            "Igniter",
-            "Nitrogen",
-            "Nitrous",
-            "Fill Lines",
-            "",
-        ],
-        _ => ["", "", "", "", "", "", "", ""],
-    }
-}

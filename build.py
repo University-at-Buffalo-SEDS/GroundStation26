@@ -1592,7 +1592,7 @@ def build_backend(
         sys.exit(e.returncode)
 
 
-def print_usage() -> None:
+def print_usage(exit_code: int = 1) -> None:
     print("Usage:")
     print("  ./build.py                         # local: build frontend+backend (parallel)")
     print("  ./build.py pi_build                # local: backend w/ raspberry_pi feature")
@@ -1639,7 +1639,7 @@ def print_usage() -> None:
     print("  GROUNDSTATION_NO_PARALLEL=1        # force sequential build")
     print("  GS26_WINDOWS_TARGET=...            # override windows Rust target (default x86_64-pc-windows-msvc)")
     print("  GS26_MACOS_TARGET=...              # override macos Rust target (auto-detects by default)")
-    sys.exit(1)
+    sys.exit(exit_code)
 
 
 def main() -> None:
@@ -1661,6 +1661,9 @@ def main() -> None:
     action: Optional[str] = None
 
     raw_args = [a.strip() for a in sys.argv[1:]]
+
+    if any(a in {"-h", "--help", "help"} for a in raw_args):
+        print_usage(0)
 
     if len(raw_args) > 8:
         print("Error: Too many arguments.", file=sys.stderr)

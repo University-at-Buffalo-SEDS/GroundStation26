@@ -1828,6 +1828,7 @@ fn TelemetryDashboardInner() -> Element {
                                     rocket_gps: rocket_gps,
                                     user_gps: user_gps,
                                     layout: layout.state_tab.clone(),
+                                    data_layout: layout.data_tab.clone(),
                                     actions: layout.actions_tab.clone(),
                                     action_policy: action_policy,
                                     default_valve_labels: layout

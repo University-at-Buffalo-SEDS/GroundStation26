@@ -9,6 +9,8 @@ pub struct LayoutConfig {
     pub actions_tab: ActionsTabLayout,
     pub data_tab: DataTabLayout,
     pub state_tab: StateTabLayout,
+    #[serde(default)]
+    pub battery: BatteryLayoutConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,6 +44,63 @@ pub struct DataTabSpec {
     pub chart: Option<DataTabChart>,
     pub boolean_labels: Option<BooleanLabels>,
     pub channel_boolean_labels: Option<Vec<BooleanLabels>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BatteryLayoutConfig {
+    #[serde(default)]
+    pub estimator: BatteryEstimatorConfig,
+    #[serde(default)]
+    pub sources: Vec<BatterySourceConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatteryEstimatorConfig {
+    #[serde(default = "default_battery_window_seconds")]
+    pub window_seconds: u64,
+    #[serde(default = "default_battery_min_drop_rate_v_per_min")]
+    pub min_drop_rate_v_per_min: f32,
+}
+
+impl Default for BatteryEstimatorConfig {
+    fn default() -> Self {
+        Self {
+            window_seconds: default_battery_window_seconds(),
+            min_drop_rate_v_per_min: default_battery_min_drop_rate_v_per_min(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatterySourceConfig {
+    pub id: String,
+    pub label: String,
+    pub sender_id: String,
+    #[serde(default = "default_battery_input_data_type")]
+    pub input_data_type: String,
+    pub percent_data_type: String,
+    pub drop_rate_data_type: String,
+    pub remaining_minutes_data_type: String,
+    pub empty_voltage: f32,
+    pub full_voltage: f32,
+    #[serde(default = "default_battery_curve_exponent")]
+    pub curve_exponent: f32,
+}
+
+fn default_battery_window_seconds() -> u64 {
+    300
+}
+
+fn default_battery_min_drop_rate_v_per_min() -> f32 {
+    0.005
+}
+
+fn default_battery_input_data_type() -> String {
+    "BATTERY_VOLTAGE".to_string()
+}
+
+fn default_battery_curve_exponent() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

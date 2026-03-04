@@ -28,6 +28,10 @@ const SENSOR_PERIOD_MS: u64 = 25;
 const FLIGHT_STATE_PERIOD_MS: u64 = 1_000;
 #[cfg(feature = "testing")]
 const HOUSEKEEPING_PERIOD_MS: u64 = 900;
+#[cfg(feature = "testing")]
+const BATTERY_CUTOFF_V: f32 = 6.3;
+#[cfg(feature = "testing")]
+const BATTERY_MAX_V: f32 = 8.4;
 
 #[cfg(feature = "testing")]
 #[derive(Debug)]
@@ -49,6 +53,11 @@ struct FlightSimState {
     roll_dps: f32,
     pitch_dps: f32,
     yaw_dps: f32,
+    last_physics_ms: u64,
+    av_bay_battery_v: f32,
+    ground_station_battery_v: f32,
+    ground_station_battery_a: f32,
+    next_battery_sender_gateway: bool,
     valves: HashMap<u8, bool>,
     saw_dump_open_after_n2: bool,
     saw_dump_closed_after_n2: bool,
@@ -91,7 +100,7 @@ impl FlightSimState {
             next_valve_emit_idx: 0,
             fuel_tank_pressure_psi: 5.0,
             fuel_flow_lpm: 0.0,
-            battery_v: 12.4,
+            battery_v: BATTERY_MAX_V,
             battery_a: 1.2,
             altitude_ft: 0.0,
             velocity_fps: 0.0,
@@ -99,6 +108,11 @@ impl FlightSimState {
             roll_dps: 0.0,
             pitch_dps: 0.0,
             yaw_dps: 0.0,
+            last_physics_ms: 0,
+            av_bay_battery_v: BATTERY_MAX_V,
+            ground_station_battery_v: BATTERY_MAX_V,
+            ground_station_battery_a: 0.7,
+            next_battery_sender_gateway: false,
             valves,
             saw_dump_open_after_n2: false,
             saw_dump_closed_after_n2: false,
@@ -311,6 +325,13 @@ impl FlightSimState {
     }
 
     fn update_physics(&mut self, now_ms: u64) {
+        let dt_s = if self.last_physics_ms == 0 {
+            SENSOR_PERIOD_MS as f32 / 1000.0
+        } else {
+            ((now_ms.saturating_sub(self.last_physics_ms)) as f32 / 1000.0).clamp(0.0, 1.0)
+        };
+        self.last_physics_ms = now_ms;
+
         let n2_open = self.valve_on(ActuatorBoardCommands::NitrogenOpen as u8);
         let n2o_open = self.valve_on(ActuatorBoardCommands::NitrousOpen as u8);
         let no_open = self.valve_on(ValveBoardCommands::NormallyOpenOpen as u8);
@@ -343,7 +364,20 @@ impl FlightSimState {
         }
 
         self.battery_a = (1.0 + self.fuel_flow_lpm * 0.12).min(35.0);
-        self.battery_v = (12.6 - self.battery_a * 0.03).max(10.5);
+        self.ground_station_battery_a = if self.launch_time_ms.is_some() {
+            0.95
+        } else {
+            0.7
+        };
+
+        let av_bay_drop_v_per_s = 0.00008 + self.battery_a * 0.00006;
+        let gs_drop_v_per_s = 0.00005 + self.ground_station_battery_a * 0.00003;
+
+        self.av_bay_battery_v =
+            (self.av_bay_battery_v - av_bay_drop_v_per_s * dt_s).max(BATTERY_CUTOFF_V);
+        self.ground_station_battery_v =
+            (self.ground_station_battery_v - gs_drop_v_per_s * dt_s).max(BATTERY_CUTOFF_V);
+        self.battery_v = self.av_bay_battery_v;
     }
 
     fn apply_flight_profile(&mut self, t: f32, now_ms: u64) {
@@ -423,6 +457,7 @@ impl FlightSimState {
         self.next_sensor_idx = (self.next_sensor_idx + 1) % seq.len();
 
         let mut rng = rand::rng();
+        let mut sender = sender_for_datatype(dtype);
         let values: Vec<f32> = match dtype {
             DataType::GyroData => vec![
                 self.roll_dps + rng.random_range(-0.15..0.15),
@@ -450,7 +485,17 @@ impl FlightSimState {
             }
             DataType::FuelTankPressure => vec![self.fuel_tank_pressure_psi],
             DataType::FuelFlow => vec![self.fuel_flow_lpm],
-            DataType::BatteryVoltage => vec![self.battery_v],
+            DataType::BatteryVoltage => {
+                if self.next_battery_sender_gateway {
+                    self.next_battery_sender_gateway = false;
+                    sender = Board::GatewayBoard.sender_id();
+                    vec![self.ground_station_battery_v]
+                } else {
+                    self.next_battery_sender_gateway = true;
+                    sender = Board::PowerBoard.sender_id();
+                    vec![self.av_bay_battery_v]
+                }
+            }
             DataType::BatteryCurrent => vec![self.battery_a],
             DataType::GpsData => {
                 let dlat_deg = (self.altitude_ft / 5_280.0) * 0.00001;
@@ -472,7 +517,7 @@ impl FlightSimState {
         TelemetryPacket::new(
             dtype,
             &[DataEndpoint::GroundStation],
-            sender_for_datatype(dtype),
+            sender,
             now_ms,
             Arc::from(bytes.as_slice()),
         )

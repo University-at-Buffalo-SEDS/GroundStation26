@@ -13,7 +13,8 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::fs as async_fs;
-use tokio::time::{Duration, sleep};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::{Duration, Instant, sleep};
 
 /// Region name (used for directory layout)
 const REGION: &str = "north_america";
@@ -42,12 +43,68 @@ const NEW_YORK_BOUNDS: (f64, f64, f64, f64) = (-79.90, 40.45, -71.75, 45.10);
 
 /// Higher-detail region: Texas area.
 /// lon_min, lat_min, lon_max, lat_max
-const TEXAS_BOUNDS: (f64, f64, f64, f64) = (-106.70, 25.60, -93.40, 36.70);
+const TEXAS_BOUNDS: (f64, f64, f64, f64) = (-107.10, 25.00, -92.90, 37.20);
 
 /// Max concurrent HTTP fetches at a time.
 /// Tune this: higher = faster but more load on remote tile service / network.
-const MAX_CONCURRENT: usize = 1024;
+const DEFAULT_MAX_CONCURRENT: usize = 1024;
 const PROGRESS_PERCENT_STEP: u64 = 10;
+const DEFAULT_MAX_BANDWIDTH_MIBPS: f64 = 2.5;
+
+fn log_progress_error(pb: Option<&ProgressBar>, msg: String) {
+    if let Some(pb) = pb {
+        pb.println(msg);
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
+fn max_concurrent() -> usize {
+    env::var("MAP_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(1, 16_384))
+        .unwrap_or(DEFAULT_MAX_CONCURRENT)
+}
+
+fn max_bandwidth_mibps() -> Option<f64> {
+    let v = env::var("MAP_MAX_BANDWIDTH_MIBPS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_MAX_BANDWIDTH_MIBPS);
+    if v <= 0.0 { None } else { Some(v) }
+}
+
+struct BandwidthLimiter {
+    bytes_per_sec: f64,
+    next_slot: AsyncMutex<Instant>,
+}
+
+impl BandwidthLimiter {
+    fn new(mib_per_sec: f64) -> Self {
+        Self {
+            bytes_per_sec: mib_per_sec * 1024.0 * 1024.0,
+            next_slot: AsyncMutex::new(Instant::now()),
+        }
+    }
+
+    async fn throttle_bytes(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let wait = {
+            let mut next = self.next_slot.lock().await;
+            let now = Instant::now();
+            let start = if *next > now { *next } else { now };
+            let slot = Duration::from_secs_f64(((bytes as f64) / self.bytes_per_sec).max(0.0));
+            *next = start + slot;
+            start.saturating_duration_since(now)
+        };
+        if !wait.is_zero() {
+            sleep(wait).await;
+        }
+    }
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -174,6 +231,9 @@ async fn fetch_tiles_for_zoom_async(
     } else {
         None
     };
+    let max_concurrent = max_concurrent();
+    let max_bandwidth = max_bandwidth_mibps();
+    let bandwidth_limiter = max_bandwidth.map(BandwidthLimiter::new).map(Arc::new);
 
     let done_for_rate = done_count.clone();
     let bytes_for_rate = bytes_downloaded.clone();
@@ -189,7 +249,11 @@ async fn fetch_tiles_for_zoom_async(
             let elapsed_s = start.elapsed().as_secs_f64().max(0.001);
             let bytes = bytes_for_rate.load(Ordering::Relaxed) as f64;
             let mib_per_s = (bytes / elapsed_s) / (1024.0 * 1024.0);
-            let pct = if total == 0 { 100 } else { (done.saturating_mul(100)) / total };
+            let pct = if total == 0 {
+                100
+            } else {
+                (done.saturating_mul(100)) / total
+            };
             let bucket = (pct / PROGRESS_PERCENT_STEP) as i64;
 
             if let Some(pb) = &pb_for_rate {
@@ -217,13 +281,17 @@ async fn fetch_tiles_for_zoom_async(
     let client_arc = client.clone(); // cheap clone
     let done_count_clone = done_count.clone();
     let bytes_downloaded_clone = bytes_downloaded.clone();
+    let pb_for_workers = pb.clone();
+    let limiter_for_workers = bandwidth_limiter.clone();
     // Build an async stream of all coordinate tasks
     stream::iter(coords)
-        .for_each_concurrent(MAX_CONCURRENT, move |(x, y)| {
+        .for_each_concurrent(max_concurrent, move |(x, y)| {
             let z_dir = z_dir_arc.clone();
             let client = client_arc.clone();
             let done_count = done_count_clone.clone();
             let bytes_downloaded = bytes_downloaded_clone.clone();
+            let pb_for_worker = pb_for_workers.clone();
+            let limiter_for_worker = limiter_for_workers.clone();
 
             async move {
                 let tile_path = z_dir.join(format!("{x}/{y}.{TILE_EXT}"));
@@ -261,25 +329,37 @@ async fn fetch_tiles_for_zoom_async(
                             if status.is_success() {
                                 match resp.bytes().await {
                                     Ok(bytes) => {
+                                        if let Some(limiter) = &limiter_for_worker {
+                                            limiter.throttle_bytes(bytes.len()).await;
+                                        }
                                         bytes_downloaded
                                             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                                         if let Err(e) =
                                             write_tile_atomic_async(&tile_path, &bytes).await
                                         {
-                                            eprintln!(
-                                                "fetch_satellite_tiles_async: failed to write tile {}: {e}",
-                                                tile_path.display()
+                                            log_progress_error(
+                                                pb_for_worker.as_ref(),
+                                                format!(
+                                                    "fetch_satellite_tiles_async: failed to write tile {} (attempt {attempts}/{MAX_ATTEMPTS}): {e}",
+                                                    tile_path.display(),
+                                                ),
                                             );
+                                        } else {
+                                            break; // success
                                         }
                                     }
                                     Err(e) => {
-                                        eprintln!(
-                                            "fetch_satellite_tiles_async: failed reading bytes for {}: {e}",
-                                            url
+                                        log_progress_error(
+                                            pb_for_worker.as_ref(),
+                                            format!(
+                                                "fetch_satellite_tiles_async: failed reading bytes for {} (attempt {attempts}/{MAX_ATTEMPTS}): {e}",
+                                                url,
+                                            ),
                                         );
                                     }
                                 }
-                                break; // success
+                                // Decode/write failures retry via loop.
+                                continue;
                             }
 
                             // 404: tile doesn't exist, never retry
@@ -293,9 +373,12 @@ async fn fetch_tiles_for_zoom_async(
                     }
 
                     if attempts >= MAX_ATTEMPTS {
-                        eprintln!(
-                            "fetch_satellite_tiles_async: giving up on tile z={z}, x={x}, y={y} after {} attempts",
-                            attempts
+                        log_progress_error(
+                            pb_for_worker.as_ref(),
+                            format!(
+                                "fetch_satellite_tiles_async: giving up on tile z={z}, x={x}, y={y} after {} attempts",
+                                attempts
+                            ),
                         );
                         break;
                     }

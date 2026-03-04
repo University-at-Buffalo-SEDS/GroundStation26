@@ -83,7 +83,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/flightstate", get(get_flight_state))
         .route("/api/gps", get(get_gps))
         .route("/ws", get(ws_handler))
-        .route("/tiles/{z}/{x}/{y}.jpg", get(get_tile_jpg))
+        .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
         .route("/favicon.ico", get(get_favicon))
         .route("/valvestate", get(get_valve_state))
         // anything that doesn’t match the above routes goes to the static files
@@ -254,7 +254,13 @@ async fn get_map_config() -> impl IntoResponse {
     Json(MapConfigDto { max_native_zoom })
 }
 
-async fn get_tile_jpg(Path((z, x, y)): Path<(u32, u32, u32)>) -> impl IntoResponse {
+async fn get_tile_jpg(Path((z, x, y_raw)): Path<(u32, u32, String)>) -> impl IntoResponse {
+    let y_trimmed = y_raw.trim_end_matches(".jpg");
+    let y: u32 = match y_trimmed.parse() {
+        Ok(v) => v,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
     let path: PathBuf =
         format!("./backend/data/maps/{DEFAULT_MAP_REGION}/tiles/{z}/{x}/{y}.jpg").into();
 

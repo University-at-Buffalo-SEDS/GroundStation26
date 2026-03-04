@@ -1,4 +1,5 @@
 use crate::flight_sim;
+use crate::layout;
 use crate::state::AppState;
 use groundstation_shared::TelemetryRow;
 use groundstation_shared::{TelemetryCommand, u8_to_flight_state};
@@ -40,6 +41,14 @@ static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static DB_BACKPRESSURE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static DB_LAST_BUCKET_BY_TYPE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 static DB_OVERFLOW_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static BATTERY_ESTIMATOR_STATE: OnceLock<Mutex<HashMap<String, BatteryEstimatorState>>> =
+    OnceLock::new();
+static BATTERY_LAYOUT_CFG: OnceLock<layout::BatteryLayoutConfig> = OnceLock::new();
+const BATTERY_VOLTAGE_EMA_ALPHA: f32 = 0.06;
+const BATTERY_DROP_RATE_EMA_ALPHA: f32 = 0.10;
+const BATTERY_MAX_VOLTAGE_SLEW_V_PER_SEC: f32 = 0.035;
+const BATTERY_MIN_VOLTAGE_DEFAULT: f32 = 6.3;
+const BATTERY_MAX_VOLTAGE_DEFAULT: f32 = 8.4;
 
 #[derive(Clone)]
 struct DbOverflow {
@@ -118,6 +127,241 @@ enum DbWrite {
         values_json: Option<String>,
         payload_json: String,
     },
+}
+
+#[derive(Default)]
+struct BatteryEstimatorState {
+    samples: VecDeque<(i64, f32)>,
+    ema_voltage: Option<f32>,
+    ema_drop_rate_v_per_min: Option<f32>,
+    ema_remaining_min: Option<f32>,
+    last_ts_ms: Option<i64>,
+    last_remaining_ts_ms: Option<i64>,
+}
+
+fn battery_layout_cfg() -> &'static layout::BatteryLayoutConfig {
+    BATTERY_LAYOUT_CFG.get_or_init(|| match layout::load_layout() {
+        Ok(cfg) => cfg.battery,
+        Err(err) => {
+            eprintln!("WARNING: failed to load battery layout config: {err}");
+            layout::BatteryLayoutConfig::default()
+        }
+    })
+}
+
+fn push_battery_sample_and_compute_drop_rate(
+    source_id: &str,
+    ts_ms: i64,
+    voltage: f32,
+    window_ms: i64,
+) -> (f32, Option<f32>) {
+    let by_source = BATTERY_ESTIMATOR_STATE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = by_source.lock().unwrap();
+    let state = map.entry(source_id.to_string()).or_default();
+
+    let dt_s = state
+        .last_remaining_ts_ms
+        .map(|t0| ((ts_ms.saturating_sub(t0)) as f32 / 1000.0).clamp(0.0, 10.0))
+        .unwrap_or(0.0);
+    state.last_remaining_ts_ms = Some(ts_ms);
+    state.last_ts_ms = Some(ts_ms);
+
+    // Clamp abrupt jumps first, then apply low-alpha EMA for heavy smoothing.
+    let slewed = if let Some(prev) = state.ema_voltage {
+        let max_step = BATTERY_MAX_VOLTAGE_SLEW_V_PER_SEC * dt_s.max(0.02);
+        voltage.clamp(prev - max_step, prev + max_step)
+    } else {
+        voltage
+    };
+    let smoothed_voltage = state
+        .ema_voltage
+        .map(|prev| prev + BATTERY_VOLTAGE_EMA_ALPHA * (slewed - prev))
+        .unwrap_or(slewed);
+    state.ema_voltage = Some(smoothed_voltage);
+
+    state.samples.push_back((ts_ms, smoothed_voltage));
+    while let Some((old_ts, _)) = state.samples.front().copied() {
+        if ts_ms.saturating_sub(old_ts) <= window_ms {
+            break;
+        }
+        state.samples.pop_front();
+    }
+
+    if state.samples.len() < 2 {
+        return (smoothed_voltage, None);
+    }
+
+    let t0 = state.samples.front().map(|(t, _)| *t).unwrap_or(ts_ms);
+    let n = state.samples.len() as f64;
+    let mut sum_x = 0.0f64;
+    let mut sum_y = 0.0f64;
+    let mut sum_xy = 0.0f64;
+    let mut sum_x2 = 0.0f64;
+
+    for (t, v) in state.samples.iter() {
+        let x = ((*t - t0) as f64) / 1000.0;
+        let y = *v as f64;
+        sum_x += x;
+        sum_y += y;
+        sum_xy += x * y;
+        sum_x2 += x * x;
+    }
+
+    let denom = n * sum_x2 - (sum_x * sum_x);
+    if denom.abs() < f64::EPSILON {
+        return (smoothed_voltage, None);
+    }
+
+    let slope_v_per_sec = (n * sum_xy - (sum_x * sum_y)) / denom;
+    if slope_v_per_sec >= 0.0 {
+        let dr = state
+            .ema_drop_rate_v_per_min
+            .map(|prev| prev + BATTERY_DROP_RATE_EMA_ALPHA * (0.0 - prev))
+            .unwrap_or(0.0);
+        state.ema_drop_rate_v_per_min = Some(dr);
+        return (smoothed_voltage, Some(dr));
+    }
+
+    let raw_drop = (-slope_v_per_sec * 60.0) as f32;
+    let smoothed_drop = state
+        .ema_drop_rate_v_per_min
+        .map(|prev| prev + BATTERY_DROP_RATE_EMA_ALPHA * (raw_drop - prev))
+        .unwrap_or(raw_drop);
+    state.ema_drop_rate_v_per_min = Some(smoothed_drop);
+    (smoothed_voltage, Some(smoothed_drop))
+}
+
+fn battery_percent(voltage: f32, empty: f32, full: f32, exponent: f32) -> f32 {
+    if full <= empty {
+        return 0.0;
+    }
+    let linear = ((voltage - empty) / (full - empty)).clamp(0.0, 1.0);
+    let exp = exponent.max(0.1);
+    (linear.powf(exp) * 100.0).clamp(0.0, 100.0)
+}
+
+fn battery_bounds_for_source(source: &layout::BatterySourceConfig) -> (f32, f32) {
+    let mut empty = if source.empty_voltage.is_finite() {
+        source.empty_voltage
+    } else {
+        BATTERY_MIN_VOLTAGE_DEFAULT
+    };
+    let mut full = if source.full_voltage.is_finite() {
+        source.full_voltage
+    } else {
+        BATTERY_MAX_VOLTAGE_DEFAULT
+    };
+
+    if full <= empty {
+        empty = BATTERY_MIN_VOLTAGE_DEFAULT;
+        full = BATTERY_MAX_VOLTAGE_DEFAULT;
+    }
+    (empty, full)
+}
+
+fn telemetry_values_json(values: &[Option<f32>]) -> Option<String> {
+    serde_json::to_string(
+        &values
+            .iter()
+            .map(|v| v.map(|n| n as f64))
+            .collect::<Vec<_>>(),
+    )
+    .ok()
+}
+
+async fn emit_derived_battery_rows(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbWrite>,
+    db_overflow: &DbOverflow,
+    ts_ms: i64,
+    sender_id: &str,
+    input_data_type: &str,
+    voltage: f32,
+    payload_json: &str,
+) {
+    let cfg = battery_layout_cfg().clone();
+    if cfg.sources.is_empty() {
+        return;
+    }
+
+    let window_ms = (cfg.estimator.window_seconds.max(30) as i64) * 1000;
+    let min_drop_rate = cfg.estimator.min_drop_rate_v_per_min.max(0.0001);
+
+    for source in cfg.sources.iter() {
+        if source.sender_id != sender_id || source.input_data_type != input_data_type {
+            continue;
+        }
+
+        let (smoothed_voltage, drop_rate_v_per_min) =
+            push_battery_sample_and_compute_drop_rate(&source.id, ts_ms, voltage, window_ms);
+
+        let (empty_v, full_v) = battery_bounds_for_source(source);
+        let pct = battery_percent(smoothed_voltage, empty_v, full_v, source.curve_exponent);
+        let raw_remaining_min = drop_rate_v_per_min.and_then(|rate| {
+            if rate < min_drop_rate {
+                return None;
+            }
+            let remaining_voltage = (smoothed_voltage - empty_v).max(0.0);
+            Some(remaining_voltage / rate)
+        });
+        let remaining_min = smooth_remaining_minutes(&source.id, ts_ms, raw_remaining_min);
+
+        let rows: [(&str, Vec<Option<f32>>); 3] = [
+            (&source.percent_data_type, vec![Some(pct)]),
+            (&source.drop_rate_data_type, vec![drop_rate_v_per_min]),
+            (&source.remaining_minutes_data_type, vec![remaining_min]),
+        ];
+
+        for (data_type, values) in rows {
+            if should_persist_telemetry_sample(data_type, ts_ms) {
+                queue_db_write(
+                    state,
+                    db_tx,
+                    db_overflow,
+                    DbWrite::Telemetry {
+                        timestamp_ms: ts_ms,
+                        data_type: data_type.to_string(),
+                        sender_id: sender_id.to_string(),
+                        values_json: telemetry_values_json(&values),
+                        payload_json: payload_json.to_string(),
+                    },
+                )
+                .await;
+            }
+
+            let row = TelemetryRow {
+                timestamp_ms: ts_ms,
+                data_type: data_type.to_string(),
+                values,
+            };
+            state.cache_recent_telemetry(row.clone());
+            let _ = state.ws_tx.send(row);
+        }
+    }
+}
+
+fn smooth_remaining_minutes(source_id: &str, ts_ms: i64, raw: Option<f32>) -> Option<f32> {
+    const REMAINING_EMA_ALPHA: f32 = 0.05;
+    const REMAINING_MAX_STEP_MIN_PER_SEC: f32 = 0.08;
+
+    let by_source = BATTERY_ESTIMATOR_STATE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = by_source.lock().unwrap();
+    let state = map.entry(source_id.to_string()).or_default();
+    let Some(raw_val) = raw else {
+        state.ema_remaining_min = None;
+        return None;
+    };
+
+    let dt_s = state
+        .last_ts_ms
+        .map(|t0| ((ts_ms.saturating_sub(t0)) as f32 / 1000.0).clamp(0.0, 10.0))
+        .unwrap_or(0.0);
+    let prev = state.ema_remaining_min.unwrap_or(raw_val);
+    let max_step = REMAINING_MAX_STEP_MIN_PER_SEC * dt_s.max(0.02);
+    let slewed = raw_val.clamp(prev - max_step, prev + max_step);
+    let smoothed = prev + REMAINING_EMA_ALPHA * (slewed - prev);
+    state.ema_remaining_min = Some(smoothed.max(0.0));
+    state.ema_remaining_min
 }
 
 pub struct TimeSyncState {
@@ -847,6 +1091,21 @@ async fn handle_packet(
                     values_json,
                     payload_json: payload_json.clone(),
                 },
+            )
+            .await;
+        }
+
+        if let Some(voltage) = values_vec.first().copied().flatten() {
+            let derived_ts_ms = get_current_timestamp_ms() as i64;
+            emit_derived_battery_rows(
+                state,
+                db_tx,
+                db_overflow,
+                derived_ts_ms,
+                pkt.sender(),
+                &data_type_str,
+                voltage,
+                &payload_json,
             )
             .await;
         }

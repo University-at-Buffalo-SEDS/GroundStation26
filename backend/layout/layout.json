@@ -230,6 +230,66 @@
             "unknown_label": "Unknown"
           }
         ]
+      },
+      {
+        "id": "AV_BAY_BATTERY_PERCENT",
+        "label": "AV_BAY_BATTERY_PERCENT",
+        "channels": [
+          "Percent"
+        ],
+        "chart": {
+          "enabled": false
+        }
+      },
+      {
+        "id": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+        "label": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+        "channels": [
+          "Drop Rate (V/min)"
+        ],
+        "chart": {
+          "enabled": false
+        }
+      },
+      {
+        "id": "AV_BAY_BATTERY_REMAINING_MINUTES",
+        "label": "AV_BAY_BATTERY_REMAINING_MINUTES",
+        "channels": [
+          "Remaining Minutes"
+        ],
+        "chart": {
+          "enabled": false
+        }
+      },
+      {
+        "id": "GROUND_STATION_BATTERY_PERCENT",
+        "label": "GROUND_STATION_BATTERY_PERCENT",
+        "channels": [
+          "Percent"
+        ],
+        "chart": {
+          "enabled": false
+        }
+      },
+      {
+        "id": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+        "label": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+        "channels": [
+          "Drop Rate (V/min)"
+        ],
+        "chart": {
+          "enabled": false
+        }
+      },
+      {
+        "id": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+        "label": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+        "channels": [
+          "Remaining Minutes"
+        ],
+        "chart": {
+          "enabled": false
+        }
       }
     ]
   },
@@ -245,6 +305,76 @@
             "widgets": [
               {
                 "kind": "board_status"
+              }
+            ]
+          },
+          {
+            "title": "AV Bay Battery (Power Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "title": "Ground Station Battery (Gateway Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
               }
             ]
           }
@@ -370,6 +500,76 @@
                 ]
               }
             ]
+          },
+          {
+            "title": "AV Bay Battery (Power Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "title": "Ground Station Battery (Gateway Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ]
           }
         ]
       },
@@ -461,6 +661,76 @@
                   "Launch",
                   "Dump",
                   "Pilot"
+                ]
+              }
+            ]
+          },
+          {
+            "title": "AV Bay Battery (Power Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "title": "Ground Station Battery (Gateway Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
                 ]
               }
             ]
@@ -582,6 +852,76 @@
                 "kind": "map"
               }
             ]
+          },
+          {
+            "title": "AV Bay Battery (Power Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "title": "Ground Station Battery (Gateway Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ]
           }
         ]
       },
@@ -621,8 +961,110 @@
                 ]
               }
             ]
+          },
+          {
+            "title": "AV Bay Battery (Power Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "title": "Ground Station Battery (Gateway Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ]
           }
         ]
+      }
+    ]
+  },
+  "battery": {
+    "estimator": {
+      "window_seconds": 300,
+      "min_drop_rate_v_per_min": 0.005
+    },
+    "sources": [
+      {
+        "id": "av_bay",
+        "label": "AV Bay Battery",
+        "sender_id": "PB",
+        "input_data_type": "BATTERY_VOLTAGE",
+        "percent_data_type": "AV_BAY_BATTERY_PERCENT",
+        "drop_rate_data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+        "remaining_minutes_data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
+        "empty_voltage": 6.3,
+        "full_voltage": 8.4,
+        "curve_exponent": 1.0
+      },
+      {
+        "id": "ground_station",
+        "label": "Ground Station Battery",
+        "sender_id": "GW",
+        "input_data_type": "BATTERY_VOLTAGE",
+        "percent_data_type": "GROUND_STATION_BATTERY_PERCENT",
+        "drop_rate_data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+        "remaining_minutes_data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+        "empty_voltage": 6.3,
+        "full_voltage": 8.4,
+        "curve_exponent": 1.0
       }
     ]
   }

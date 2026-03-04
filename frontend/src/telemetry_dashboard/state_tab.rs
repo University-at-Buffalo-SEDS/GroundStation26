@@ -4,14 +4,14 @@ use dioxus::prelude::*;
 use dioxus_signals::Signal;
 
 use super::layout::{
-    ActionSpec, ActionsTabLayout, BooleanLabels, StateSection, StateTabLayout, StateWidget,
-    StateWidgetKind, SummaryItem, ValveColor, ValveColorSet,
+    ActionSpec, ActionsTabLayout, BooleanLabels, DataTabLayout, StateSection, StateTabLayout,
+    StateWidget, StateWidgetKind, SummaryItem, ValveColor, ValveColorSet,
 };
 use super::types::{BoardStatusEntry, FlightState, TelemetryRow};
 use super::{ActionPolicyMsg, BlinkMode};
 
 use crate::telemetry_dashboard::data_chart::{
-    charts_cache_get, charts_cache_get_channel_minmax, labels_for_datatype, series_color,
+    charts_cache_get, charts_cache_get_channel_minmax, series_color,
 };
 use crate::telemetry_dashboard::map_tab::MapTab;
 
@@ -35,6 +35,7 @@ pub fn StateTab(
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
     layout: StateTabLayout,
+    data_layout: DataTabLayout,
     actions: ActionsTabLayout,
     action_policy: Signal<ActionPolicyMsg>,
     default_valve_labels: Option<BooleanLabels>,
@@ -147,6 +148,7 @@ pub fn StateTab(
                     section,
                     &rows_snapshot,
                     &boards_snapshot,
+                    &data_layout,
                     &actions_snapshot,
                     &action_policy_snapshot,
                     default_valve_labels.as_ref(),
@@ -188,6 +190,7 @@ fn render_state_section(
     section: &StateSection,
     rows: &[TelemetryRow],
     boards: &[BoardStatusEntry],
+    data_layout: &DataTabLayout,
     actions: &[ActionSpec],
     action_policy: &ActionPolicyMsg,
     default_valve_labels: Option<&BooleanLabels>,
@@ -209,6 +212,7 @@ fn render_state_section(
                     widget,
                     rows,
                     boards,
+                    data_layout,
                     actions,
                     action_policy,
                     default_valve_labels,
@@ -224,6 +228,7 @@ fn render_state_widget(
     widget: &StateWidget,
     rows: &[TelemetryRow],
     boards: &[BoardStatusEntry],
+    data_layout: &DataTabLayout,
     actions: &[ActionSpec],
     action_policy: &ActionPolicyMsg,
     default_valve_labels: Option<&BooleanLabels>,
@@ -248,7 +253,8 @@ fn render_state_widget(
             } else {
                 let w = widget.width.unwrap_or(1200.0);
                 let h = widget.height.unwrap_or(260.0);
-                rsx! { {data_style_chart_cached(dt, w, h, widget.chart_title.as_deref())} }
+                let labels = labels_from_layout(data_layout, dt);
+                rsx! { {data_style_chart_cached(dt, w, h, widget.chart_title.as_deref(), &labels)} }
             }
         }
         StateWidgetKind::ValveState => {
@@ -290,15 +296,17 @@ fn section_has_content(section: &StateSection, actions: &[ActionSpec]) -> bool {
 // cached chart renderer (uses charts_cache_get)
 // ============================================================
 
-fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&str>) -> Element {
+fn data_style_chart_cached(
+    dt: &str,
+    view_w: f64,
+    view_h: f64,
+    title: Option<&str>,
+    labels: &[String],
+) -> Element {
     let w = view_w as f32;
     let h = view_h as f32;
 
     let (paths, y_min, y_max, span_min) = charts_cache_get(dt, w, h);
-    let labels: Vec<String> = labels_for_datatype(dt)
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
 
     let left = 60.0_f64;
     let right = view_w - 20.0_f64;
@@ -376,6 +384,15 @@ fn data_style_chart_cached(dt: &str, view_w: f64, view_h: f64, title: Option<&st
             }
         }
     }
+}
+
+fn labels_from_layout(data_layout: &DataTabLayout, dt: &str) -> Vec<String> {
+    data_layout
+        .tabs
+        .iter()
+        .find(|tab| tab.id == dt)
+        .map(|tab| tab.channels.clone())
+        .unwrap_or_default()
 }
 
 // ============================================================

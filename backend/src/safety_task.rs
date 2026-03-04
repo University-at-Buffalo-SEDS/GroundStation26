@@ -42,8 +42,8 @@ const GPS_LONGITUDE_MIN_THRESHOLD: f32 = -106.5; // degrees
 const GPS_LONGITUDE_MAX_THRESHOLD: f32 = -93.5; // degrees
 
 // Battery voltage thresholds (V)
-const BATTERY_VOLTAGE_MIN_THRESHOLD: f32 = 7.0; // V
-const BATTERY_VOLTAGE_MAX_THRESHOLD: f32 = 12.6; // V
+const BATTERY_VOLTAGE_MIN_THRESHOLD: f32 = 6.4; // V
+const BATTERY_VOLTAGE_MAX_THRESHOLD: f32 = 8.4; // V
 
 // Battery current thresholds (A)
 const BATTERY_CURRENT_MIN_THRESHOLD: f32 = 0.0; // A

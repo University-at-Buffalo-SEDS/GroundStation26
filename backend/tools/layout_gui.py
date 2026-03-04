@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -27,6 +28,10 @@ def default_layout() -> dict:
         "actions_tab": {"actions": []},
         "data_tab": {"tabs": []},
         "state_tab": {"states": []},
+        "battery": {
+            "estimator": {"window_seconds": 300, "min_drop_rate_v_per_min": 0.005},
+            "sources": [],
+        },
     }
 
 
@@ -55,16 +60,20 @@ def validate_layout(data: dict) -> list[str]:
     if not isinstance(state_tab, dict) or not isinstance(state_tab.get("states", []), list):
         errors.append("state_tab.states must be a list.")
 
+    battery = data.get("battery", {})
+    if battery and (not isinstance(battery, dict) or not isinstance(battery.get("sources", []), list)):
+        errors.append("battery.sources must be a list.")
+
     return errors
 
 
 class LayoutEditor(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self, initial_path: Path | None = None) -> None:
         super().__init__()
         self.title("GS26 Layout Editor")
         self.geometry("1100x720")
 
-        self.path = default_layout_path()
+        self.path = initial_path or default_layout_path()
         self.data = default_layout()
 
         toolbar = tk.Frame(self)
@@ -85,11 +94,13 @@ class LayoutEditor(tk.Tk):
         self.connection_tab_frame = ttk.Frame(self.notebook)
         self.actions_tab_frame = ttk.Frame(self.notebook)
         self.state_tab_frame = ttk.Frame(self.notebook)
+        self.battery_tab_frame = ttk.Frame(self.notebook)
 
         self.notebook.add(self.data_tab_frame, text="Data")
         self.notebook.add(self.connection_tab_frame, text="Connection")
         self.notebook.add(self.actions_tab_frame, text="Actions")
         self.notebook.add(self.state_tab_frame, text="State Layout")
+        self.notebook.add(self.battery_tab_frame, text="Battery")
 
         self._suspend_events = False
         self._section_title_loaded = ""
@@ -97,6 +108,7 @@ class LayoutEditor(tk.Tk):
         self._build_connection_tab()
         self._build_actions_tab()
         self._build_state_tab()
+        self._build_battery_tab()
 
         self.load()
         self.after(100, self.focus_force)
@@ -457,6 +469,43 @@ class LayoutEditor(tk.Tk):
         self._set_valve_widget_visibility(False)
 
     # ------------------------
+    # Battery tab editor
+    # ------------------------
+    def _build_battery_tab(self) -> None:
+        frame = self.battery_tab_frame
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self._battery_selected_idx: int | None = None
+
+        self.battery_list = tk.Listbox(frame, height=20)
+        self.battery_list.grid(row=0, column=0, sticky="ns", padx=(0, 10), pady=5)
+        self.battery_list.bind("<<ListboxSelect>>", lambda _: self._on_battery_select())
+
+        form = ttk.Frame(frame)
+        form.grid(row=0, column=1, sticky="nsew")
+        form.columnconfigure(1, weight=1)
+
+        self.battery_window_seconds = self._entry(form, "Window seconds", 0)
+        self.battery_min_drop = self._entry(form, "Min drop rate (V/min)", 1)
+        self.battery_id = self._entry(form, "Source ID", 2)
+        self.battery_label = self._entry(form, "Label", 3)
+        self.battery_sender_id = self._entry(form, "Sender ID", 4)
+        self.battery_input_data_type = self._entry(form, "Input data type", 5)
+        self.battery_percent_data_type = self._entry(form, "Percent data type", 6)
+        self.battery_drop_rate_data_type = self._entry(form, "Drop-rate data type", 7)
+        self.battery_remaining_data_type = self._entry(form, "Remaining-min data type", 8)
+        self.battery_empty_voltage = self._entry(form, "Empty voltage", 9)
+        self.battery_full_voltage = self._entry(form, "Full voltage", 10)
+        self.battery_curve_exponent = self._entry(form, "Curve exponent", 11)
+
+        btns = ttk.Frame(form)
+        btns.grid(row=12, column=1, sticky="w", pady=8)
+        ttk.Button(btns, text="Add", command=self._add_battery_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Remove", command=self._remove_battery_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Up", command=lambda: self._move_battery_item(-1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Down", command=lambda: self._move_battery_item(1)).pack(side=tk.LEFT, padx=4)
+
+    # ------------------------
     # Helpers
     # ------------------------
     def _entry(
@@ -506,6 +555,12 @@ class LayoutEditor(tk.Tk):
             states = ", ".join(entry.get("states", []))
             self.state_entry_list.insert(tk.END, states or "state entry")
 
+        if hasattr(self, "battery_list"):
+            self.battery_list.delete(0, tk.END)
+            for source in self.data.get("battery", {}).get("sources", []):
+                label = source.get("label") or source.get("id") or "battery source"
+                self.battery_list.insert(tk.END, label)
+
         self.section_list.delete(0, tk.END)
         self.widget_list.delete(0, tk.END)
 
@@ -518,6 +573,7 @@ class LayoutEditor(tk.Tk):
             self.data = json.loads(raw)
         else:
             self.data = default_layout()
+        self._ensure_layout_shape()
 
         self.status.set(f"Layout path: {self.path}")
         self._refresh_lists()
@@ -605,6 +661,88 @@ class LayoutEditor(tk.Tk):
 
     def _move_data_item(self, delta: int) -> None:
         self._move_list_item(self.data["data_tab"]["tabs"], self.data_list, delta)
+
+    # ------------------------
+    # Battery tab actions
+    # ------------------------
+    def _ensure_layout_shape(self) -> None:
+        self.data.setdefault("connection_tab", {}).setdefault("sections", [])
+        self.data.setdefault("actions_tab", {}).setdefault("actions", [])
+        self.data.setdefault("data_tab", {}).setdefault("tabs", [])
+        self.data.setdefault("state_tab", {}).setdefault("states", [])
+        battery = self.data.setdefault("battery", {})
+        battery.setdefault("estimator", {})
+        battery.setdefault("sources", [])
+        estimator = battery["estimator"]
+        estimator.setdefault("window_seconds", 300)
+        estimator.setdefault("min_drop_rate_v_per_min", 0.005)
+
+    def _load_battery_item(self) -> None:
+        idx = self._selected_index(self.battery_list)
+        if idx is None:
+            return
+        self._battery_selected_idx = idx
+        battery = self.data.get("battery", {})
+        estimator = battery.get("estimator", {})
+        source = battery.get("sources", [])[idx]
+        self.battery_window_seconds.delete(0, tk.END)
+        self.battery_window_seconds.insert(0, str(estimator.get("window_seconds", 300)))
+        self.battery_min_drop.delete(0, tk.END)
+        self.battery_min_drop.insert(0, str(estimator.get("min_drop_rate_v_per_min", 0.005)))
+        self.battery_id.delete(0, tk.END)
+        self.battery_id.insert(0, source.get("id", ""))
+        self.battery_label.delete(0, tk.END)
+        self.battery_label.insert(0, source.get("label", ""))
+        self.battery_sender_id.delete(0, tk.END)
+        self.battery_sender_id.insert(0, source.get("sender_id", ""))
+        self.battery_input_data_type.delete(0, tk.END)
+        self.battery_input_data_type.insert(0, source.get("input_data_type", "BATTERY_VOLTAGE"))
+        self.battery_percent_data_type.delete(0, tk.END)
+        self.battery_percent_data_type.insert(0, source.get("percent_data_type", ""))
+        self.battery_drop_rate_data_type.delete(0, tk.END)
+        self.battery_drop_rate_data_type.insert(0, source.get("drop_rate_data_type", ""))
+        self.battery_remaining_data_type.delete(0, tk.END)
+        self.battery_remaining_data_type.insert(0, source.get("remaining_minutes_data_type", ""))
+        self.battery_empty_voltage.delete(0, tk.END)
+        self.battery_empty_voltage.insert(0, str(source.get("empty_voltage", "")))
+        self.battery_full_voltage.delete(0, tk.END)
+        self.battery_full_voltage.insert(0, str(source.get("full_voltage", "")))
+        self.battery_curve_exponent.delete(0, tk.END)
+        self.battery_curve_exponent.insert(0, str(source.get("curve_exponent", 1.0)))
+
+    def _battery_from_form(self) -> dict:
+        def _f(v: str, default: float) -> float:
+            try:
+                return float(v.strip())
+            except ValueError:
+                return default
+
+        return {
+            "id": self.battery_id.get().strip(),
+            "label": self.battery_label.get().strip(),
+            "sender_id": self.battery_sender_id.get().strip(),
+            "input_data_type": self.battery_input_data_type.get().strip() or "BATTERY_VOLTAGE",
+            "percent_data_type": self.battery_percent_data_type.get().strip(),
+            "drop_rate_data_type": self.battery_drop_rate_data_type.get().strip(),
+            "remaining_minutes_data_type": self.battery_remaining_data_type.get().strip(),
+            "empty_voltage": _f(self.battery_empty_voltage.get(), 6.3),
+            "full_voltage": _f(self.battery_full_voltage.get(), 8.4),
+            "curve_exponent": _f(self.battery_curve_exponent.get(), 1.0),
+        }
+
+    def _add_battery_item(self) -> None:
+        self.data["battery"]["sources"].append(self._battery_from_form())
+        self._refresh_lists()
+
+    def _remove_battery_item(self) -> None:
+        idx = self._selected_index(self.battery_list)
+        if idx is None:
+            return
+        self.data["battery"]["sources"].pop(idx)
+        self._refresh_lists()
+
+    def _move_battery_item(self, delta: int) -> None:
+        self._move_list_item(self.data["battery"]["sources"], self.battery_list, delta)
 
     # ------------------------
     # Connection tab actions
@@ -1400,6 +1538,8 @@ class LayoutEditor(tk.Tk):
             self._commit_action_form()
         elif current == 3:
             self._commit_state_form()
+        elif current == 4:
+            self._commit_battery_form()
 
     def _on_tab_changed(self, _event=None) -> None:
         if self._suspend_events:
@@ -1456,6 +1596,23 @@ class LayoutEditor(tk.Tk):
             w_idx = self._state_widget_selected_idx
             if w_idx is not None and w_idx < len(widgets):
                 widgets[w_idx] = self._widget_from_form()
+
+    def _commit_battery_form(self) -> None:
+        battery = self.data.setdefault("battery", {})
+        estimator = battery.setdefault("estimator", {})
+        try:
+            estimator["window_seconds"] = max(30, int(self.battery_window_seconds.get().strip()))
+        except ValueError:
+            estimator["window_seconds"] = 300
+        try:
+            estimator["min_drop_rate_v_per_min"] = max(0.0, float(self.battery_min_drop.get().strip()))
+        except ValueError:
+            estimator["min_drop_rate_v_per_min"] = 0.005
+        idx = self._battery_selected_idx
+        sources = battery.setdefault("sources", [])
+        if idx is None or idx >= len(sources):
+            return
+        sources[idx] = self._battery_from_form()
 
     def _on_data_select(self) -> None:
         if self._suspend_events:
@@ -1522,6 +1679,16 @@ class LayoutEditor(tk.Tk):
         self._state_widget_selected_idx = new_idx
         self._load_widget_from_selection()
 
+    def _on_battery_select(self) -> None:
+        if self._suspend_events:
+            return
+        new_idx = self._selected_index(self.battery_list)
+        self._commit_battery_form()
+        if new_idx is None:
+            return
+        self._battery_selected_idx = new_idx
+        self._load_battery_item()
+
     def _with_suspended_events(self, callback) -> None:
         prev = self._suspend_events
         self._suspend_events = True
@@ -1533,7 +1700,16 @@ class LayoutEditor(tk.Tk):
 
 if __name__ == "__main__":
     try:
-        app = LayoutEditor()
+        parser = argparse.ArgumentParser(description="GroundStation layout JSON editor.")
+        parser.add_argument(
+            "--layout",
+            type=Path,
+            default=default_layout_path(),
+            help="Path to layout JSON file (default: backend/layout/layout.json).",
+        )
+        args = parser.parse_args()
+
+        app = LayoutEditor(initial_path=args.layout)
         app.mainloop()
     except FileNotFoundError as e:
         missing = e.filename or "<unknown>"
