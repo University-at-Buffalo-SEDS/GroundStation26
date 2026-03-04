@@ -9,7 +9,7 @@ Optimized schema (deduplicated image blobs):
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import os
 import sqlite3
@@ -21,7 +21,7 @@ from pathlib import Path
 
 DEFAULT_REGION = "north_america"
 DEFAULT_MAP_ROOT = Path("backend/data/maps")
-DEFAULT_WORKERS = max(1, os.cpu_count() or 1)
+DEFAULT_WORKERS = max(1, (os.cpu_count() - 1) or 1)
 
 
 def iter_tile_files(tiles_dir: Path):
@@ -197,6 +197,7 @@ def build_bundle(tiles_dir: Path, bundle: Path, remove_source: bool, workers: in
 
     total_tiles = count_tiles(tiles_dir)
     print(f"found {total_tiles:,} tiles to bundle")
+    print(f"starting bundle writes with workers={workers}")
 
     inserted_tiles = 0
     unique_blobs = 0
@@ -211,7 +212,28 @@ def build_bundle(tiles_dir: Path, bundle: Path, remove_source: bool, workers: in
             executor = None
         else:
             executor = ThreadPoolExecutor(max_workers=workers)
-            prepared_iter = executor.map(prepare_tile, source_iter, chunksize=256)
+            max_in_flight = max(workers * 8, 64)
+
+            def bounded_prepared():
+                pending = set()
+                source_exhausted = False
+                while True:
+                    while not source_exhausted and len(pending) < max_in_flight:
+                        try:
+                            rec = next(source_iter)
+                        except StopIteration:
+                            source_exhausted = True
+                            break
+                        pending.add(executor.submit(prepare_tile, rec))
+
+                    if not pending:
+                        break
+
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        yield fut.result()
+
+            prepared_iter = bounded_prepared()
 
         try:
             for z, x, y, h, data in prepared_iter:
