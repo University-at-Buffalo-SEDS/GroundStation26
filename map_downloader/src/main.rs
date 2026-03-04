@@ -39,7 +39,7 @@ const NA_BOUNDS: (f64, f64, f64, f64) = (-170.0, 5.0, -50.0, 83.0);
 
 /// Higher-detail region: New York area.
 /// lon_min, lat_min, lon_max, lat_max
-const NEW_YORK_BOUNDS: (f64, f64, f64, f64) = (-79.90, 40.45, -71.75, 45.10);
+const NEW_YORK_BOUNDS: (f64, f64, f64, f64) = (-80.20, 40.30, -71.40, 45.25);
 
 /// Higher-detail region: Texas area.
 /// lon_min, lat_min, lon_max, lat_max

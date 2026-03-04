@@ -12,6 +12,9 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{DynamicImage, GenericImageView};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::collections::{HashMap, VecDeque};
@@ -261,17 +264,99 @@ async fn get_tile_jpg(Path((z, x, y_raw)): Path<(u32, u32, String)>) -> impl Int
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    let path: PathBuf =
-        format!("./backend/data/maps/{DEFAULT_MAP_REGION}/tiles/{z}/{x}/{y}.jpg").into();
+    if let Some(bytes) = read_tile_with_fallback(z, x, y).await {
+        return ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response();
+    }
 
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
-        Err(e) if e.kind() == ErrorKind::NotFound => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            eprintln!("WARNING: failed reading tile {}: {e}", path.display());
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn tile_path(z: u32, x: u32, y: u32) -> PathBuf {
+    format!("./backend/data/maps/{DEFAULT_MAP_REGION}/tiles/{z}/{x}/{y}.jpg").into()
+}
+
+async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
+    let exact_path = tile_path(z, x, y);
+    match tokio::fs::read(&exact_path).await {
+        Ok(bytes) => return Some(bytes),
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            eprintln!("WARNING: failed reading tile {}: {e}", exact_path.display());
+        }
+        Err(_) => {}
+    }
+
+    let mut az = z;
+    let mut ax = x;
+    let mut ay = y;
+    while az > 0 {
+        az -= 1;
+        ax /= 2;
+        ay /= 2;
+        let path = tile_path(az, ax, ay);
+        let Ok(parent_bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        match synthesize_zoom_tile_from_ancestor(&parent_bytes, az, ax, ay, z, x, y) {
+            Ok(bytes) => return Some(bytes),
+            Err(err) => {
+                eprintln!(
+                    "WARNING: failed synthesizing fallback tile z={z} x={x} y={y} from ancestor z={az} x={ax} y={ay}: {err}"
+                );
+            }
         }
     }
+    None
+}
+
+fn synthesize_zoom_tile_from_ancestor(
+    ancestor_jpg: &[u8],
+    ancestor_z: u32,
+    ancestor_x: u32,
+    ancestor_y: u32,
+    target_z: u32,
+    target_x: u32,
+    target_y: u32,
+) -> Result<Vec<u8>, String> {
+    if target_z < ancestor_z {
+        return Err("target zoom is lower than ancestor zoom".to_string());
+    }
+    let depth = target_z - ancestor_z;
+    if depth == 0 {
+        return Ok(ancestor_jpg.to_vec());
+    }
+
+    let rel_x = target_x.saturating_sub(ancestor_x << depth);
+    let rel_y = target_y.saturating_sub(ancestor_y << depth);
+
+    let mut img = image::load_from_memory(ancestor_jpg).map_err(|e| e.to_string())?;
+    for bit in (0..depth).rev() {
+        let qx = (rel_x >> bit) & 1;
+        let qy = (rel_y >> bit) & 1;
+        let (w, h) = img.dimensions();
+        if w < 2 || h < 2 {
+            break;
+        }
+        let cw = w / 2;
+        let ch = h / 2;
+        let ox = if qx == 1 { cw } else { 0 };
+        let oy = if qy == 1 { ch } else { 0 };
+
+        let cropped = img.crop_imm(ox, oy, cw.max(1), ch.max(1)).to_rgb8();
+        let resized = image::imageops::resize(&cropped, 256, 256, FilterType::CatmullRom);
+        img = DynamicImage::ImageRgb8(resized);
+    }
+
+    let mut out = Vec::new();
+    let rgb = img.to_rgb8();
+    let mut enc = JpegEncoder::new_with_quality(&mut out, 85);
+    enc.encode(
+        &rgb,
+        rgb.width(),
+        rgb.height(),
+        image::ExtendedColorType::Rgb8,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {

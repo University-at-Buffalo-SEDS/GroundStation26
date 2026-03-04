@@ -29,3 +29,4 @@ rand = "0.10.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serial = "0.4.0"
 futures = "0.3.32"
+image = { version = "0.25.8", default-features = false, features = ["jpeg", "png"] }
