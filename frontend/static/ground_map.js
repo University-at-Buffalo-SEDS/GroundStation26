@@ -19,6 +19,7 @@ let lastMapView = null;
 // you currently have tiles for z = 0..8
 const MIN_ZOOM = 0;
 const DEFAULT_MAX_NATIVE_ZOOM = 12;
+const DEFAULT_MAX_OVERZOOM_DELTA = 4;
 
 // Must match Rust NA_BOUNDS in build.rs
 const NA_BOUNDS = {
@@ -122,7 +123,7 @@ function clampMaxNativeZoom(value) {
     return Math.max(MIN_ZOOM, z);
 }
 
-function createNaTileLayer(tilesUrl, maxNativeZoom) {
+function createNaTileLayer(tilesUrl, maxNativeZoom, maxZoom) {
     const L = getLeaflet();
 
     const naBoundsLatLng = L.latLngBounds(
@@ -133,7 +134,7 @@ function createNaTileLayer(tilesUrl, maxNativeZoom) {
     return L.tileLayer(tilesUrl, {
         bounds: naBoundsLatLng,
         minZoom: MIN_ZOOM,
-        maxZoom: maxNativeZoom,
+        maxZoom: maxZoom,
         maxNativeZoom: maxNativeZoom,
         noWrap: true,
         attribution: "Local tiles",
@@ -299,6 +300,7 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom) {
     ensureMarkerStylesOnce();
     initCompassOnce();
     const effectiveMaxNativeZoom = clampMaxNativeZoom(maxNativeZoom);
+    const effectiveMaxZoom = effectiveMaxNativeZoom + DEFAULT_MAX_OVERZOOM_DELTA;
 
     const el = document.getElementById("ground-map");
     if (!el) return;
@@ -313,10 +315,10 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom) {
         center: lastMapView ? [lastMapView.lat, lastMapView.lon] : [centerLat, centerLon],
         zoom: lastMapView ? lastMapView.zoom : zoom,
         minZoom: MIN_ZOOM,
-        maxZoom: effectiveMaxNativeZoom,
+        maxZoom: effectiveMaxZoom,
     });
 
-    createNaTileLayer(tilesUrl, effectiveMaxNativeZoom).addTo(groundMap);
+    createNaTileLayer(tilesUrl, effectiveMaxNativeZoom, effectiveMaxZoom).addTo(groundMap);
     groundMap.on("moveend zoomend", rememberMapView);
     rememberMapView();
     window.__gs26_ground_map = groundMap;

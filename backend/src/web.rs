@@ -1,12 +1,12 @@
 use crate::layout;
-use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_service};
+use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom};
 use crate::sequences::{ActionPolicyMsg, PersistentNotification};
 use crate::state::AppState;
 use axum::http::{StatusCode, header};
 use axum::{
     Json, Router,
     extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
-    extract::{Query, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -15,6 +15,7 @@ use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, Teleme
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::collections::{HashMap, VecDeque};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{OnceCell, mpsc};
@@ -63,8 +64,6 @@ pub fn router(state: Arc<AppState>) -> Router {
     let static_dir = ServeDir::new("./frontend/dist/public")
         .precompressed_br()
         .precompressed_gzip();
-    let tiles_dir = tile_service(DEFAULT_MAP_REGION); // NEW
-
     Router::new()
         .layer(CompressionLayer::new())
         .route("/api/recent", get(get_recent))
@@ -84,7 +83,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/flightstate", get(get_flight_state))
         .route("/api/gps", get(get_gps))
         .route("/ws", get(ws_handler))
-        .nest_service("/tiles", tiles_dir)
+        .route("/tiles/{z}/{x}/{y}.jpg", get(get_tile_jpg))
         .route("/favicon.ico", get(get_favicon))
         .route("/valvestate", get(get_valve_state))
         // anything that doesn’t match the above routes goes to the static files
@@ -253,6 +252,20 @@ async fn get_map_config() -> impl IntoResponse {
     };
 
     Json(MapConfigDto { max_native_zoom })
+}
+
+async fn get_tile_jpg(Path((z, x, y)): Path<(u32, u32, u32)>) -> impl IntoResponse {
+    let path: PathBuf =
+        format!("./backend/data/maps/{DEFAULT_MAP_REGION}/tiles/{z}/{x}/{y}.jpg").into();
+
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
+        Err(e) if e.kind() == ErrorKind::NotFound => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            eprintln!("WARNING: failed reading tile {}: {e}", path.display());
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {

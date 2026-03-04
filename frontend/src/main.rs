@@ -184,6 +184,10 @@ fn handle_gs26_protocol(request: HttpRequest<Vec<u8>>) -> HttpResponse<Cow<'stat
         Err(_) => return build_response(502, None, Vec::new()),
     };
 
+    if status == 404 {
+        return build_response(204, content_type.as_deref(), Vec::new());
+    }
+
     build_response(status, content_type.as_deref(), bytes)
 }
 

@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use tokio::fs;
-use tower_http::services::ServeDir;
 
 /// Default region for map tiles. Change this to switch regions in code.
 pub const DEFAULT_MAP_REGION: &str = "north_america";
@@ -52,10 +51,4 @@ pub async fn detect_max_native_zoom(region: &str) -> anyhow::Result<Option<u32>>
     }
 
     Ok(max_zoom)
-}
-
-/// Service that serves `/tiles/{z}/{x}/{y}.png` for a region.
-pub fn tile_service(region: &str) -> ServeDir {
-    let tiles_dir = format!("./backend/data/maps/{region}/tiles");
-    ServeDir::new(tiles_dir)
 }

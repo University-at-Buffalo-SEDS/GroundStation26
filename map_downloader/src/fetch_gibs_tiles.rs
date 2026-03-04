@@ -6,36 +6,58 @@ use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::Client;
+use std::collections::HashSet;
+use std::io::IsTerminal;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use tokio::fs as async_fs;
 use tokio::time::{Duration, sleep};
 
 /// Region name (used for directory layout)
 const REGION: &str = "north_america";
 
-/// GIBS layer + WMTS config.
-const GIBS_LAYER: &str = "ASTER_GDEM_Color_Shaded_Relief";
-const GIBS_TILE_MATRIX_SET: &str = "GoogleMapsCompatible_Level12";
-const GIBS_BASE_URL: &str = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best";
+/// ArcGIS World Imagery (satellite) XYZ tile endpoint.
+const SATELLITE_BASE_URL: &str =
+    "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile";
 
 /// File extension for tiles from this layer.
 const TILE_EXT: &str = "jpg";
 
 /// Zoom levels we want to cache.
 const MIN_ZOOM: u32 = 0;
-const MAX_ZOOM: u32 = 12;
+const DEFAULT_MAX_ZOOM: u32 = 16;
+
+/// Full North America coverage up to this zoom.
+const BASE_COVERAGE_MAX_ZOOM: u32 = 8;
 
 /// Approximate North America bounds in lon/lat (WGS84)
 /// lon_min, lat_min, lon_max, lat_max
 const NA_BOUNDS: (f64, f64, f64, f64) = (-170.0, 5.0, -50.0, 83.0);
 
+/// Higher-detail region: New York area.
+/// lon_min, lat_min, lon_max, lat_max
+const NEW_YORK_BOUNDS: (f64, f64, f64, f64) = (-79.90, 40.45, -71.75, 45.10);
+
+/// Higher-detail region: Texas area.
+/// lon_min, lat_min, lon_max, lat_max
+const TEXAS_BOUNDS: (f64, f64, f64, f64) = (-106.70, 25.60, -93.40, 36.70);
+
 /// Max concurrent HTTP fetches at a time.
-/// Tune this: higher = faster but more load on GIBS / network.
+/// Tune this: higher = faster but more load on remote tile service / network.
 const MAX_CONCURRENT: usize = 1024;
+const PROGRESS_PERCENT_STEP: u64 = 10;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     // Optional override for region, but default to north_america
     let region = env::var("MAP_REGION").unwrap_or_else(|_| REGION.to_string());
+    let max_zoom = env::var("MAP_MAX_ZOOM")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|z| z.max(MIN_ZOOM))
+        .unwrap_or(DEFAULT_MAX_ZOOM);
 
     // Use CARGO_MANIFEST_DIR if present (when run via `cargo run`),
     // otherwise fall back to current directory.
@@ -52,7 +74,7 @@ async fn main() -> Result<()> {
 
     fs::create_dir_all(&tiles_root)?;
     println!(
-        "fetch_gibs_tiles_async: populating GIBS tiles for region '{}' into {} (z={MIN_ZOOM}..={MAX_ZOOM})",
+        "fetch_satellite_tiles_async: populating satellite tiles for region '{}' into {} (z={MIN_ZOOM}..={max_zoom})",
         region,
         tiles_root.display()
     );
@@ -62,87 +84,146 @@ async fn main() -> Result<()> {
         .user_agent("GroundStationOfflineTileFetcher/0.1")
         .build()?;
 
-    for z in MIN_ZOOM..=MAX_ZOOM {
+    for z in MIN_ZOOM..=max_zoom {
         if z != MIN_ZOOM {
             println!();
             println!("----");
         }
         if let Err(e) = fetch_tiles_for_zoom_async(z, &tiles_root, &client).await {
-            eprintln!("fetch_gibs_tiles_async: WARNING: failed to fetch tiles for z={z}: {e}");
+            eprintln!("fetch_satellite_tiles_async: WARNING: failed to fetch tiles for z={z}: {e}");
         }
     }
 
-    println!("fetch_gibs_tiles_async: done populating GIBS tiles.");
+    println!("fetch_satellite_tiles_async: done populating satellite tiles.");
     Ok(())
 }
 
-/// Download tiles for North America at zoom level `z`, in parallel with Tokio.
+/// Download satellite tiles at zoom level `z` with tiered coverage:
+/// - z=0..=8: full North America bounds
+/// - z=9..=14: New York + Texas bounds
 async fn fetch_tiles_for_zoom_async(
     z: u32,
     tiles_root: &Path,
     client: &Client,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (lon_min, lat_min, lon_max, lat_max) = NA_BOUNDS;
+    let bounds = if z <= BASE_COVERAGE_MAX_ZOOM {
+        vec![NA_BOUNDS]
+    } else {
+        vec![NEW_YORK_BOUNDS, TEXAS_BOUNDS]
+    };
 
-    // Convert bounding box to tile index ranges at this zoom level
-    let (x_min, y_max) = lonlat_to_tile(lon_min, lat_min, z);
-    let (x_max, y_min) = lonlat_to_tile(lon_max, lat_max, z);
-
-    let x_start = x_min.min(x_max);
-    let x_end = x_min.max(x_max);
-    let y_start = y_min.min(y_max);
-    let y_end = y_min.max(y_max);
-
-    // Enumerate all tile coordinates we want at this zoom
-    let mut coords = Vec::new();
-    for x in x_start..=x_end {
-        for y in y_start..=y_end {
-            coords.push((x, y));
+    // Enumerate + de-duplicate all tile coordinates across selected bounds.
+    let mut coord_set = HashSet::<(u32, u32)>::new();
+    for bbox in &bounds {
+        let (x_start, x_end, y_start, y_end) = tile_range_for_bounds(*bbox, z);
+        for x in x_start..=x_end {
+            for y in y_start..=y_end {
+                coord_set.insert((x, y));
+            }
         }
     }
+    let mut coords: Vec<(u32, u32)> = coord_set.into_iter().collect();
+    coords.sort_unstable();
+
+    let (x_start, x_end, y_start, y_end) = bounds_tile_extent(&coords);
 
     let total = coords.len() as u64;
     println!(
-        "z={z}: fetching tiles x=[{}..={}], y=[{}..={}], total={} tiles",
+        "z={z}: fetching satellite tiles x=[{}..={}], y=[{}..={}], total={} tiles",
         x_start, x_end, y_start, y_end, total
     );
+    let is_tty = std::io::stdout().is_terminal();
 
     // Create the base z directory once (sync is fine here)
     let z_dir = tiles_root.join(format!("{z}"));
     fs::create_dir_all(&z_dir)?;
 
     // Pre-create all x directories once (avoid per-tile mkdir)
-    for x in x_start..=x_end {
+    let mut x_dirs = HashSet::new();
+    for (x, _) in &coords {
+        x_dirs.insert(*x);
+    }
+    for x in x_dirs {
         let x_dir = z_dir.join(format!("{x}"));
         if let Err(e) = fs::create_dir_all(&x_dir) {
             eprintln!(
-                "fetch_gibs_tiles_async: failed to create directory {}: {e}",
+                "fetch_satellite_tiles_async: failed to create directory {}: {e}",
                 x_dir.display()
             );
         }
     }
 
-    // Progress bar for this zoom level
-    let pb = ProgressBar::new(total);
-    pb.set_prefix(format!("z={z}"));
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{prefix} [{bar:40.cyan/blue}] {msg}\n{prefix} {pos}/{len} ({percent}%) ETA {eta}",
-        )?
-        .progress_chars("##-"),
-    );
-    pb.set_message("                    ");
-    pb.set_draw_target(ProgressDrawTarget::stdout_with_hz(10));
+    // Progress reporting: use a live bar on TTY, plain lines otherwise.
+    let start = std::time::Instant::now();
+    let done_count = Arc::new(AtomicU64::new(0));
+    let bytes_downloaded = Arc::new(AtomicU64::new(0));
+    let stop_rate_updater = Arc::new(AtomicBool::new(false));
+    let pb = if is_tty {
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::with_template(
+                &format!(
+                    "z={z} [{{bar:40.cyan/blue}}] {{percent:>3}}% ETA {{eta_precise}} {{msg}} ({{pos}}/{{len}})"
+                ),
+            )?
+            .progress_chars("=> "),
+        );
+        pb.set_draw_target(ProgressDrawTarget::stdout_with_hz(10));
+        pb.set_message("0.00 MiB/s");
+        Some(pb)
+    } else {
+        None
+    };
+
+    let done_for_rate = done_count.clone();
+    let bytes_for_rate = bytes_downloaded.clone();
+    let stop_for_rate = stop_rate_updater.clone();
+    let pb_for_rate = pb.clone();
+    let rate_updater = tokio::spawn(async move {
+        let mut last_bucket: i64 = -1;
+        loop {
+            if stop_for_rate.load(Ordering::Relaxed) {
+                break;
+            }
+            let done = done_for_rate.load(Ordering::Relaxed);
+            let elapsed_s = start.elapsed().as_secs_f64().max(0.001);
+            let bytes = bytes_for_rate.load(Ordering::Relaxed) as f64;
+            let mib_per_s = (bytes / elapsed_s) / (1024.0 * 1024.0);
+            let pct = if total == 0 { 100 } else { (done.saturating_mul(100)) / total };
+            let bucket = (pct / PROGRESS_PERCENT_STEP) as i64;
+
+            if let Some(pb) = &pb_for_rate {
+                pb.set_position(done);
+                pb.set_message(format!("{mib_per_s:.2} MiB/s"));
+            } else if bucket != last_bucket || done == total {
+                let eta_secs = if done == 0 {
+                    0
+                } else {
+                    (((total - done) as f64) / ((done as f64) / elapsed_s)).max(0.0) as u64
+                };
+                let eta_m = eta_secs / 60;
+                let eta_s = eta_secs % 60;
+                println!(
+                    "z={z} {pct}% ETA {eta_m}m{eta_s:02}s {mib_per_s:.2} MiB/s ({done}/{total})"
+                );
+                last_bucket = bucket;
+            }
+
+            sleep(Duration::from_millis(400)).await;
+        }
+    });
 
     let z_dir_arc = z_dir.clone();
     let client_arc = client.clone(); // cheap clone
-    let pb_clone = pb.clone();
+    let done_count_clone = done_count.clone();
+    let bytes_downloaded_clone = bytes_downloaded.clone();
     // Build an async stream of all coordinate tasks
     stream::iter(coords)
         .for_each_concurrent(MAX_CONCURRENT, move |(x, y)| {
             let z_dir = z_dir_arc.clone();
             let client = client_arc.clone();
-            let pb = pb_clone.clone();
+            let done_count = done_count_clone.clone();
+            let bytes_downloaded = bytes_downloaded_clone.clone();
 
             async move {
                 let tile_path = z_dir.join(format!("{x}/{y}.{TILE_EXT}"));
@@ -150,7 +231,7 @@ async fn fetch_tiles_for_zoom_async(
 
                 // Skip if final tile already exists
                 if async_fs::try_exists(&tile_path).await.unwrap_or(false) {
-                    pb.inc(1);
+                    done_count.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
 
@@ -160,18 +241,15 @@ async fn fetch_tiles_for_zoom_async(
                 }
 
                 let url = format!(
-                    "{base}/{layer}/default/{matrix_set}/{z}/{y}/{x}.{ext}",
-                    base = GIBS_BASE_URL,
-                    layer = GIBS_LAYER,
-                    matrix_set = GIBS_TILE_MATRIX_SET,
+                    "{base}/{z}/{y}/{x}",
+                    base = SATELLITE_BASE_URL,
                     z = z,
                     y = y,
                     x = x,
-                    ext = TILE_EXT,
                 );
 
                 let mut attempts: u32 = 0;
-                const MAX_ATTEMPTS: u32 = 3;
+                const MAX_ATTEMPTS: u32 = 5;
 
                 loop {
                     attempts += 1;
@@ -183,18 +261,20 @@ async fn fetch_tiles_for_zoom_async(
                             if status.is_success() {
                                 match resp.bytes().await {
                                     Ok(bytes) => {
+                                        bytes_downloaded
+                                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                                         if let Err(e) =
                                             write_tile_atomic_async(&tile_path, &bytes).await
                                         {
                                             eprintln!(
-                                                "fetch_gibs_tiles_async: failed to write tile {}: {e}",
+                                                "fetch_satellite_tiles_async: failed to write tile {}: {e}",
                                                 tile_path.display()
                                             );
                                         }
                                     }
                                     Err(e) => {
                                         eprintln!(
-                                            "fetch_gibs_tiles_async: failed reading bytes for {}: {e}",
+                                            "fetch_satellite_tiles_async: failed reading bytes for {}: {e}",
                                             url
                                         );
                                     }
@@ -214,7 +294,7 @@ async fn fetch_tiles_for_zoom_async(
 
                     if attempts >= MAX_ATTEMPTS {
                         eprintln!(
-                            "fetch_gibs_tiles_async: giving up on tile z={z}, x={x}, y={y} after {} attempts",
+                            "fetch_satellite_tiles_async: giving up on tile z={z}, x={x}, y={y} after {} attempts",
                             attempts
                         );
                         break;
@@ -224,12 +304,24 @@ async fn fetch_tiles_for_zoom_async(
                     sleep(Duration::from_millis(5)).await;
                 }
 
-                pb.inc(1);
+                done_count.fetch_add(1, Ordering::Relaxed);
             }
         })
         .await;
 
-    pb.finish_with_message(format!("z={z} done"));
+    done_count.store(total, Ordering::Relaxed);
+    stop_rate_updater.store(true, Ordering::Relaxed);
+    let _ = rate_updater.await;
+    let elapsed_s = start.elapsed().as_secs_f64().max(0.001);
+    let bytes = bytes_downloaded.load(Ordering::Relaxed) as f64;
+    let avg_mib_per_s = (bytes / elapsed_s) / (1024.0 * 1024.0);
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+        println!(
+            "z={z} done: {total} tiles in {:.1}s at {:.2} MiB/s",
+            elapsed_s, avg_mib_per_s
+        );
+    }
     Ok(())
 }
 
@@ -261,4 +353,30 @@ fn lonlat_to_tile(lon_deg: f64, lat_deg: f64, zoom: u32) -> (u32, u32) {
     let y = y.max(0.0).min(max_idx) as u32;
 
     (x, y)
+}
+
+fn tile_range_for_bounds(bounds: (f64, f64, f64, f64), z: u32) -> (u32, u32, u32, u32) {
+    let (lon_min, lat_min, lon_max, lat_max) = bounds;
+    let (x_min, y_max) = lonlat_to_tile(lon_min, lat_min, z);
+    let (x_max, y_min) = lonlat_to_tile(lon_max, lat_max, z);
+    (
+        x_min.min(x_max),
+        x_min.max(x_max),
+        y_min.min(y_max),
+        y_min.max(y_max),
+    )
+}
+
+fn bounds_tile_extent(coords: &[(u32, u32)]) -> (u32, u32, u32, u32) {
+    let mut x_min = u32::MAX;
+    let mut x_max = 0u32;
+    let mut y_min = u32::MAX;
+    let mut y_max = 0u32;
+    for (x, y) in coords {
+        x_min = x_min.min(*x);
+        x_max = x_max.max(*x);
+        y_min = y_min.min(*y);
+        y_max = y_max.max(*y);
+    }
+    (x_min, x_max, y_min, y_max)
 }
