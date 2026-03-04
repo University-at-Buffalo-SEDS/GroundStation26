@@ -44,11 +44,30 @@ def iter_tile_files(tiles_dir: Path):
 
 def count_tiles(tiles_dir: Path) -> int:
     total = 0
+    scanned_files = 0
+    start_t = time.time()
+    last_print_t = start_t
     for z_dir in (p for p in tiles_dir.iterdir() if p.is_dir()):
         for x_dir in (p for p in z_dir.iterdir() if p.is_dir()):
             for tile in (p for p in x_dir.iterdir() if p.is_file()):
+                scanned_files += 1
                 if tile.suffix.lower() == ".jpg":
                     total += 1
+                now = time.time()
+                if scanned_files % 10000 == 0 or (now - last_print_t) >= 1.0:
+                    elapsed = max(now - start_t, 0.001)
+                    rate = scanned_files / elapsed
+                    sys.stdout.write(
+                        f"\rcounting tiles... scanned={scanned_files:,} jpg={total:,} rate={rate:,.0f}/s"
+                    )
+                    sys.stdout.flush()
+                    last_print_t = now
+    if scanned_files > 0:
+        sys.stdout.write(
+            f"\rcounting tiles... scanned={scanned_files:,} jpg={total:,} rate={scanned_files/max(time.time()-start_t,0.001):,.0f}/s"
+        )
+        sys.stdout.flush()
+        print()
     return total
 
 
