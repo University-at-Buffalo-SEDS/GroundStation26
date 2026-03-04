@@ -9,7 +9,9 @@ Optimized schema (deduplicated image blobs):
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import os
 import sqlite3
 import shutil
 import sys
@@ -19,27 +21,46 @@ from pathlib import Path
 
 DEFAULT_REGION = "north_america"
 DEFAULT_MAP_ROOT = Path("backend/data/maps")
+DEFAULT_WORKERS = max(1, os.cpu_count() or 1)
 
 
 def iter_tile_files(tiles_dir: Path):
-    for z_dir in sorted((p for p in tiles_dir.iterdir() if p.is_dir()), key=lambda p: p.name):
-        try:
-            z = int(z_dir.name)
-        except ValueError:
-            continue
-        for x_dir in sorted((p for p in z_dir.iterdir() if p.is_dir()), key=lambda p: p.name):
+    with os.scandir(tiles_dir) as z_iter:
+        for z_entry in z_iter:
+            if not z_entry.is_dir(follow_symlinks=False):
+                continue
             try:
-                x = int(x_dir.name)
+                z = int(z_entry.name)
             except ValueError:
                 continue
-            for tile in sorted((p for p in x_dir.iterdir() if p.is_file()), key=lambda p: p.name):
-                if tile.suffix.lower() != ".jpg":
-                    continue
-                try:
-                    y = int(tile.stem)
-                except ValueError:
-                    continue
-                yield z, x, y, tile
+            with os.scandir(z_entry.path) as x_iter:
+                for x_entry in x_iter:
+                    if not x_entry.is_dir(follow_symlinks=False):
+                        continue
+                    try:
+                        x = int(x_entry.name)
+                    except ValueError:
+                        continue
+                    with os.scandir(x_entry.path) as y_iter:
+                        for y_entry in y_iter:
+                            if not y_entry.is_file(follow_symlinks=False):
+                                continue
+                            name = y_entry.name
+                            if not name.lower().endswith(".jpg"):
+                                continue
+                            stem = name[:-4]
+                            try:
+                                y = int(stem)
+                            except ValueError:
+                                continue
+                            yield z, x, y, Path(y_entry.path)
+
+
+def prepare_tile(record: tuple[int, int, int, Path]) -> tuple[int, int, int, bytes, bytes]:
+    z, x, y, tile_path = record
+    data = tile_path.read_bytes()
+    h = hashlib.blake2b(data, digest_size=16).digest()
+    return z, x, y, h, data
 
 
 def count_tiles(tiles_dir: Path) -> int:
@@ -47,21 +68,30 @@ def count_tiles(tiles_dir: Path) -> int:
     scanned_files = 0
     start_t = time.time()
     last_print_t = start_t
-    for z_dir in (p for p in tiles_dir.iterdir() if p.is_dir()):
-        for x_dir in (p for p in z_dir.iterdir() if p.is_dir()):
-            for tile in (p for p in x_dir.iterdir() if p.is_file()):
-                scanned_files += 1
-                if tile.suffix.lower() == ".jpg":
-                    total += 1
-                now = time.time()
-                if scanned_files % 10000 == 0 or (now - last_print_t) >= 1.0:
-                    elapsed = max(now - start_t, 0.001)
-                    rate = scanned_files / elapsed
-                    sys.stdout.write(
-                        f"\rcounting tiles... scanned={scanned_files:,} jpg={total:,} rate={rate:,.0f}/s"
-                    )
-                    sys.stdout.flush()
-                    last_print_t = now
+    with os.scandir(tiles_dir) as z_iter:
+        for z_entry in z_iter:
+            if not z_entry.is_dir(follow_symlinks=False):
+                continue
+            with os.scandir(z_entry.path) as x_iter:
+                for x_entry in x_iter:
+                    if not x_entry.is_dir(follow_symlinks=False):
+                        continue
+                    with os.scandir(x_entry.path) as y_iter:
+                        for tile in y_iter:
+                            if not tile.is_file(follow_symlinks=False):
+                                continue
+                            scanned_files += 1
+                            if tile.name.lower().endswith(".jpg"):
+                                total += 1
+                            now = time.time()
+                            if scanned_files % 10000 == 0 or (now - last_print_t) >= 1.0:
+                                elapsed = max(now - start_t, 0.001)
+                                rate = scanned_files / elapsed
+                                sys.stdout.write(
+                                    f"\rcounting tiles... scanned={scanned_files:,} jpg={total:,} rate={rate:,.0f}/s"
+                                )
+                                sys.stdout.flush()
+                                last_print_t = now
     if scanned_files > 0:
         sys.stdout.write(
             f"\rcounting tiles... scanned={scanned_files:,} jpg={total:,} rate={scanned_files/max(time.time()-start_t,0.001):,.0f}/s"
@@ -103,8 +133,13 @@ def render_progress_bar(prefix: str, done: int, total: int, start_t: float, uniq
 
 def print_progress_bar(prefix: str, done: int, total: int, start_t: float, unique_blobs: int | None = None) -> None:
     line = render_progress_bar(prefix, done, total, start_t, unique_blobs)
-    sys.stdout.write(line)
+    if not hasattr(print_progress_bar, "_last_len"):
+        print_progress_bar._last_len = 0  # type: ignore[attr-defined]
+    last_len = int(print_progress_bar._last_len)  # type: ignore[attr-defined]
+    pad = " " * max(0, last_len - len(line))
+    sys.stdout.write(line + pad)
     sys.stdout.flush()
+    print_progress_bar._last_len = len(line)  # type: ignore[attr-defined]
 
 
 def configure_conn(conn: sqlite3.Connection) -> None:
@@ -145,7 +180,7 @@ def detect_legacy_inline_schema(conn: sqlite3.Connection) -> bool:
     return "image" in names and "blob_id" not in names
 
 
-def build_bundle(tiles_dir: Path, bundle: Path, remove_source: bool) -> None:
+def build_bundle(tiles_dir: Path, bundle: Path, remove_source: bool, workers: int) -> None:
     if not tiles_dir.exists() or not tiles_dir.is_dir():
         raise SystemExit(f"tiles directory not found: {tiles_dir}")
 
@@ -157,6 +192,7 @@ def build_bundle(tiles_dir: Path, bundle: Path, remove_source: bool) -> None:
     print(f"building bundle: {tiles_dir} -> {bundle}")
     conn = sqlite3.connect(tmp_bundle)
     configure_conn(conn)
+    conn.execute(f"PRAGMA threads={max(1, workers)}")
     ensure_dedup_schema(conn)
 
     total_tiles = count_tiles(tiles_dir)
@@ -164,47 +200,49 @@ def build_bundle(tiles_dir: Path, bundle: Path, remove_source: bool) -> None:
 
     inserted_tiles = 0
     unique_blobs = 0
-    hash_to_blob_id: dict[bytes, int] = {}
     start_t = time.time()
     last_print_t = start_t
 
     with conn:
         cur = conn.cursor()
-        for z, x, y, tile_path in iter_tile_files(tiles_dir):
-            data = tile_path.read_bytes()
-            h = hashlib.blake2b(data, digest_size=16).digest()
+        source_iter = iter_tile_files(tiles_dir)
+        if workers <= 1:
+            prepared_iter = (prepare_tile(r) for r in source_iter)
+            executor = None
+        else:
+            executor = ThreadPoolExecutor(max_workers=workers)
+            prepared_iter = executor.map(prepare_tile, source_iter, chunksize=256)
 
-            blob_id = hash_to_blob_id.get(h)
-            if blob_id is None:
-                cur.execute(
-                    "INSERT OR IGNORE INTO tile_blobs (hash, image) VALUES (?, ?)",
+        try:
+            for z, x, y, h, data in prepared_iter:
+                row = cur.execute(
+                    """
+                    INSERT INTO tile_blobs (hash, image) VALUES (?, ?)
+                    ON CONFLICT(hash) DO UPDATE SET hash = excluded.hash
+                    RETURNING id
+                    """,
                     (h, data),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("failed to resolve blob id from upsert")
+                blob_id = int(row[0])
+
+                cur.execute(
+                    "INSERT OR REPLACE INTO tiles (z, x, y, blob_id) VALUES (?, ?, ?, ?)",
+                    (z, x, y, blob_id),
                 )
-                if cur.rowcount == 1:
-                    blob_id = int(cur.lastrowid)
-                    unique_blobs += 1
-                else:
-                    row = cur.execute(
-                        "SELECT id FROM tile_blobs WHERE hash = ?",
-                        (h,),
-                    ).fetchone()
-                    if row is None:
-                        raise RuntimeError("failed to resolve blob_id after insert/ignore")
-                    blob_id = int(row[0])
-                hash_to_blob_id[h] = blob_id
 
-            cur.execute(
-                "INSERT OR REPLACE INTO tiles (z, x, y, blob_id) VALUES (?, ?, ?, ?)",
-                (z, x, y, blob_id),
-            )
-
-            inserted_tiles += 1
-            now = time.time()
-            if inserted_tiles % 5000 == 0 or (now - last_print_t) >= 1.0:
-                print_progress_bar("bundle", inserted_tiles, total_tiles, start_t, unique_blobs)
-                last_print_t = now
+                inserted_tiles += 1
+                now = time.time()
+                if inserted_tiles % 5000 == 0 or (now - last_print_t) >= 1.0:
+                    print_progress_bar("bundle", inserted_tiles, total_tiles, start_t)
+                    last_print_t = now
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
     conn.executescript("ANALYZE; PRAGMA optimize; VACUUM;")
+    unique_blobs = int(conn.execute("SELECT COUNT(*) FROM tile_blobs").fetchone()[0])
     conn.close()
 
     if bundle.exists():
@@ -294,6 +332,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete source tiles directory after successful build",
     )
+    p_build.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Parallel read/hash workers (default: {DEFAULT_WORKERS})",
+    )
 
     p_extract = sub.add_parser("extract", help="Extract tiles from a tiles.sqlite bundle")
     p_extract.add_argument("--bundle", type=Path, required=True, help="Path to bundle sqlite file")
@@ -313,7 +357,12 @@ def main() -> None:
         region_root = DEFAULT_MAP_ROOT / args.region
         tiles_dir = args.tiles_dir or (region_root / "tiles")
         bundle = args.bundle or (region_root / "tiles.sqlite")
-        build_bundle(tiles_dir=tiles_dir, bundle=bundle, remove_source=args.remove_source)
+        build_bundle(
+            tiles_dir=tiles_dir,
+            bundle=bundle,
+            remove_source=args.remove_source,
+            workers=max(1, args.workers),
+        )
         return
 
     if args.cmd == "extract":
