@@ -219,7 +219,7 @@ fn should_resume_bundle() -> bool {
 fn bundle_path_for(data_dir: &Path) -> PathBuf {
     match env::var("MAP_BUNDLE_PATH") {
         Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
-        _ => data_dir.join("tiles.sqlite"),
+        _ => data_dir.join("tiles.sqlite3"),
     }
 }
 
