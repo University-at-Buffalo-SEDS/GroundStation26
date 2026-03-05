@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
+import math
 import os
 import sqlite3
 import shutil
@@ -21,10 +22,50 @@ from pathlib import Path
 
 DEFAULT_REGION = "north_america"
 DEFAULT_MAP_ROOT = Path("backend/data/maps")
-DEFAULT_WORKERS = max(1, (os.cpu_count() - 1) or 1)
+DEFAULT_WORKERS = max(1, min(8, (os.cpu_count() - 1) or 1))
+DEFAULT_COMMIT_EVERY = 10000
+BASE_COVERAGE_MAX_ZOOM = 8
+NA_BOUNDS = (-170.0, 5.0, -50.0, 83.0)
+BUFFALO_ROCHESTER_BOUNDS = (-79.30, 42.70, -77.25, 43.40)
+TEXAS_DESERT_BOUNDS = (-106.80, 29.00, -101.00, 32.60)
 
 
-def iter_tile_files(tiles_dir: Path):
+def clamp_lat(lat: float) -> float:
+    return max(min(lat, 85.05112878), -85.05112878)
+
+
+def lon_lat_to_tile(lon: float, lat: float, z: int) -> tuple[int, int]:
+    n = 1 << z
+    x = int((lon + 180.0) / 360.0 * n)
+    lat_rad = math.radians(clamp_lat(lat))
+    y = int((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
+    x = max(0, min(n - 1, x))
+    y = max(0, min(n - 1, y))
+    return x, y
+
+
+def tile_range_for_bounds(bbox: tuple[float, float, float, float], z: int) -> tuple[int, int, int, int]:
+    lon_min, lat_min, lon_max, lat_max = bbox
+    x1, y1 = lon_lat_to_tile(lon_min, lat_max, z)
+    x2, y2 = lon_lat_to_tile(lon_max, lat_min, z)
+    return min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2)
+
+
+def tile_in_coverage_bounds(z: int, x: int, y: int) -> bool:
+    bboxes = [NA_BOUNDS] if z <= BASE_COVERAGE_MAX_ZOOM else [BUFFALO_ROCHESTER_BOUNDS, TEXAS_DESERT_BOUNDS]
+    for bbox in bboxes:
+        x_min, x_max, y_min, y_max = tile_range_for_bounds(bbox, z)
+        if x_min <= x <= x_max and y_min <= y <= y_max:
+            return True
+    return False
+
+
+def iter_tile_files(
+    tiles_dir: Path,
+    min_zoom: int | None = None,
+    max_zoom: int | None = None,
+    match_downloader_bounds: bool = False,
+):
     with os.scandir(tiles_dir) as z_iter:
         for z_entry in z_iter:
             if not z_entry.is_dir(follow_symlinks=False):
@@ -32,6 +73,10 @@ def iter_tile_files(tiles_dir: Path):
             try:
                 z = int(z_entry.name)
             except ValueError:
+                continue
+            if min_zoom is not None and z < min_zoom:
+                continue
+            if max_zoom is not None and z > max_zoom:
                 continue
             with os.scandir(z_entry.path) as x_iter:
                 for x_entry in x_iter:
@@ -53,6 +98,8 @@ def iter_tile_files(tiles_dir: Path):
                                 y = int(stem)
                             except ValueError:
                                 continue
+                            if match_downloader_bounds and not tile_in_coverage_bounds(z, x, y):
+                                continue
                             yield z, x, y, Path(y_entry.path)
 
 
@@ -63,7 +110,12 @@ def prepare_tile(record: tuple[int, int, int, Path]) -> tuple[int, int, int, byt
     return z, x, y, h, data
 
 
-def count_tiles(tiles_dir: Path) -> int:
+def count_tiles(
+    tiles_dir: Path,
+    min_zoom: int | None = None,
+    max_zoom: int | None = None,
+    match_downloader_bounds: bool = False,
+) -> int:
     total = 0
     scanned_files = 0
     start_t = time.time()
@@ -71,6 +123,14 @@ def count_tiles(tiles_dir: Path) -> int:
     with os.scandir(tiles_dir) as z_iter:
         for z_entry in z_iter:
             if not z_entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                z = int(z_entry.name)
+            except ValueError:
+                continue
+            if min_zoom is not None and z < min_zoom:
+                continue
+            if max_zoom is not None and z > max_zoom:
                 continue
             with os.scandir(z_entry.path) as x_iter:
                 for x_entry in x_iter:
@@ -82,6 +142,18 @@ def count_tiles(tiles_dir: Path) -> int:
                                 continue
                             scanned_files += 1
                             if tile.name.lower().endswith(".jpg"):
+                                if match_downloader_bounds:
+                                    stem = tile.name[:-4]
+                                    try:
+                                        y = int(stem)
+                                    except ValueError:
+                                        continue
+                                    try:
+                                        x = int(x_entry.name)
+                                    except ValueError:
+                                        continue
+                                    if not tile_in_coverage_bounds(z, x, y):
+                                        continue
                                 total += 1
                             now = time.time()
                             if scanned_files % 10000 == 0 or (now - last_print_t) >= 1.0:
@@ -180,96 +252,156 @@ def detect_legacy_inline_schema(conn: sqlite3.Connection) -> bool:
     return "image" in names and "blob_id" not in names
 
 
-def build_bundle(tiles_dir: Path, bundle: Path, remove_source: bool, workers: int) -> None:
+def build_bundle(
+    tiles_dir: Path,
+    bundle: Path,
+    remove_source: bool,
+    workers: int,
+    commit_every: int,
+    max_in_flight: int | None,
+    no_vacuum: bool,
+    resume: bool,
+    min_zoom: int | None,
+    max_zoom: int | None,
+    match_downloader_bounds: bool,
+) -> None:
     if not tiles_dir.exists() or not tiles_dir.is_dir():
         raise SystemExit(f"tiles directory not found: {tiles_dir}")
 
+    bundle = bundle.resolve()
     bundle.parent.mkdir(parents=True, exist_ok=True)
     tmp_bundle = bundle.with_suffix(bundle.suffix + ".tmp")
-    if tmp_bundle.exists():
-        tmp_bundle.unlink()
+    db_path = tmp_bundle
+    resumed = False
+    if resume:
+        if bundle.exists():
+            db_path = bundle
+            resumed = True
+        elif tmp_bundle.exists():
+            db_path = tmp_bundle
+            resumed = True
+    else:
+        if tmp_bundle.exists():
+            tmp_bundle.unlink()
 
     print(f"building bundle: {tiles_dir} -> {bundle}")
-    conn = sqlite3.connect(tmp_bundle)
+    if resumed:
+        print(f"resume enabled: continuing existing database at {db_path}")
+    conn = sqlite3.connect(db_path)
     configure_conn(conn)
     conn.execute(f"PRAGMA threads={max(1, workers)}")
     ensure_dedup_schema(conn)
 
-    total_tiles = count_tiles(tiles_dir)
+    total_tiles = count_tiles(
+        tiles_dir,
+        min_zoom=min_zoom,
+        max_zoom=max_zoom,
+        match_downloader_bounds=match_downloader_bounds,
+    )
     print(f"found {total_tiles:,} tiles to bundle")
+    existing_tiles = int(conn.execute("SELECT COUNT(*) FROM tiles").fetchone()[0])
+    if existing_tiles > 0:
+        print(f"existing rows in bundle: {existing_tiles:,}")
     print(f"starting bundle writes with workers={workers}")
 
-    inserted_tiles = 0
+    inserted_tiles = existing_tiles
     unique_blobs = 0
     start_t = time.time()
     last_print_t = start_t
 
-    with conn:
-        cur = conn.cursor()
-        source_iter = iter_tile_files(tiles_dir)
-        if workers <= 1:
-            prepared_iter = (prepare_tile(r) for r in source_iter)
-            executor = None
-        else:
-            executor = ThreadPoolExecutor(max_workers=workers)
-            max_in_flight = max(workers * 8, 64)
+    cur = conn.cursor()
+    source_iter = iter_tile_files(
+        tiles_dir,
+        min_zoom=min_zoom,
+        max_zoom=max_zoom,
+        match_downloader_bounds=match_downloader_bounds,
+    )
+    if existing_tiles > 0:
+        base_iter = source_iter
+        check_cur = conn.cursor()
 
-            def bounded_prepared():
-                pending = set()
-                source_exhausted = False
-                while True:
-                    while not source_exhausted and len(pending) < max_in_flight:
-                        try:
-                            rec = next(source_iter)
-                        except StopIteration:
-                            source_exhausted = True
-                            break
-                        pending.add(executor.submit(prepare_tile, rec))
+        def missing_tiles():
+            for z, x, y, tile_path in base_iter:
+                if check_cur.execute(
+                    "SELECT 1 FROM tiles WHERE z = ? AND x = ? AND y = ?",
+                    (z, x, y),
+                ).fetchone() is not None:
+                    continue
+                yield z, x, y, tile_path
 
-                    if not pending:
+        source_iter = missing_tiles()
+    if workers <= 1:
+        prepared_iter = (prepare_tile(r) for r in source_iter)
+        executor = None
+    else:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        in_flight_limit = max_in_flight if max_in_flight is not None else max(workers * 2, 16)
+
+        def bounded_prepared():
+            pending = set()
+            source_exhausted = False
+            while True:
+                while not source_exhausted and len(pending) < in_flight_limit:
+                    try:
+                        rec = next(source_iter)
+                    except StopIteration:
+                        source_exhausted = True
                         break
+                    pending.add(executor.submit(prepare_tile, rec))
 
-                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                    for fut in done:
-                        yield fut.result()
+                if not pending:
+                    break
 
-            prepared_iter = bounded_prepared()
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    yield fut.result()
 
-        try:
-            for z, x, y, h, data in prepared_iter:
-                row = cur.execute(
-                    """
-                    INSERT INTO tile_blobs (hash, image) VALUES (?, ?)
-                    ON CONFLICT(hash) DO UPDATE SET hash = excluded.hash
-                    RETURNING id
-                    """,
-                    (h, data),
-                ).fetchone()
-                if row is None:
-                    raise RuntimeError("failed to resolve blob id from upsert")
-                blob_id = int(row[0])
+        prepared_iter = bounded_prepared()
 
-                cur.execute(
-                    "INSERT OR REPLACE INTO tiles (z, x, y, blob_id) VALUES (?, ?, ?, ?)",
-                    (z, x, y, blob_id),
-                )
+    conn.execute("BEGIN")
+    try:
+        for z, x, y, h, data in prepared_iter:
+            row = cur.execute(
+                """
+                INSERT INTO tile_blobs (hash, image) VALUES (?, ?)
+                ON CONFLICT(hash) DO UPDATE SET hash = excluded.hash
+                RETURNING id
+                """,
+                (h, data),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("failed to resolve blob id from upsert")
+            blob_id = int(row[0])
 
-                inserted_tiles += 1
-                now = time.time()
-                if inserted_tiles % 5000 == 0 or (now - last_print_t) >= 1.0:
-                    print_progress_bar("bundle", inserted_tiles, total_tiles, start_t)
-                    last_print_t = now
-        finally:
-            if executor is not None:
-                executor.shutdown(wait=True)
+            cur.execute(
+                "INSERT OR REPLACE INTO tiles (z, x, y, blob_id) VALUES (?, ?, ?, ?)",
+                (z, x, y, blob_id),
+            )
 
-    conn.executescript("ANALYZE; PRAGMA optimize; VACUUM;")
+            inserted_tiles += 1
+            if inserted_tiles % commit_every == 0:
+                conn.commit()
+                conn.execute("BEGIN")
+            now = time.time()
+            if inserted_tiles % 5000 == 0 or (now - last_print_t) >= 1.0:
+                print_progress_bar("bundle", inserted_tiles, total_tiles, start_t)
+                last_print_t = now
+        conn.commit()
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    if no_vacuum:
+        conn.executescript("ANALYZE; PRAGMA optimize;")
+    else:
+        conn.executescript("ANALYZE; PRAGMA optimize; VACUUM;")
     unique_blobs = int(conn.execute("SELECT COUNT(*) FROM tile_blobs").fetchone()[0])
     conn.close()
 
-    if bundle.exists():
-        bundle.unlink()
-    tmp_bundle.rename(bundle)
+    if db_path != bundle:
+        if bundle.exists():
+            bundle.unlink()
+        db_path.rename(bundle)
     print_progress_bar("bundle", inserted_tiles, total_tiles, start_t, unique_blobs)
     print()
     print(
@@ -360,6 +492,45 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_WORKERS,
         help=f"Parallel read/hash workers (default: {DEFAULT_WORKERS})",
     )
+    p_build.add_argument(
+        "--commit-every",
+        type=int,
+        default=DEFAULT_COMMIT_EVERY,
+        help=f"Commit interval in rows to cap memory usage (default: {DEFAULT_COMMIT_EVERY})",
+    )
+    p_build.add_argument(
+        "--max-in-flight",
+        type=int,
+        default=None,
+        help="Maximum prepared tiles buffered from worker threads (default: workers*2).",
+    )
+    p_build.add_argument(
+        "--no-vacuum",
+        action="store_true",
+        help="Skip final VACUUM to reduce memory and temp-disk pressure.",
+    )
+    p_build.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable resume behavior and rebuild from scratch.",
+    )
+    p_build.add_argument(
+        "--min-zoom",
+        type=int,
+        default=None,
+        help="Only include tiles with z >= min-zoom.",
+    )
+    p_build.add_argument(
+        "--max-zoom",
+        type=int,
+        default=None,
+        help="Only include tiles with z <= max-zoom.",
+    )
+    p_build.add_argument(
+        "--match-downloader-bounds",
+        action="store_true",
+        help="Only include tiles within downloader coverage bounds (NA low zoom; Buffalo/Rochester + West Texas high zoom).",
+    )
 
     p_extract = sub.add_parser("extract", help="Extract tiles from a tiles.sqlite bundle")
     p_extract.add_argument("--bundle", type=Path, required=True, help="Path to bundle sqlite file")
@@ -376,6 +547,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.cmd == "build":
+        if (
+            args.min_zoom is not None
+            and args.max_zoom is not None
+            and args.min_zoom > args.max_zoom
+        ):
+            raise SystemExit("--min-zoom cannot be greater than --max-zoom")
         region_root = DEFAULT_MAP_ROOT / args.region
         tiles_dir = args.tiles_dir or (region_root / "tiles")
         bundle = args.bundle or (region_root / "tiles.sqlite")
@@ -384,6 +561,13 @@ def main() -> None:
             bundle=bundle,
             remove_source=args.remove_source,
             workers=max(1, args.workers),
+            commit_every=max(1, args.commit_every),
+            max_in_flight=(max(1, args.max_in_flight) if args.max_in_flight is not None else None),
+            no_vacuum=args.no_vacuum,
+            resume=not args.no_resume,
+            min_zoom=args.min_zoom,
+            max_zoom=args.max_zoom,
+            match_downloader_bounds=args.match_downloader_bounds,
         )
         return
 

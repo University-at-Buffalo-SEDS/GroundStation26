@@ -39,13 +39,13 @@ const BASE_COVERAGE_MAX_ZOOM: u32 = 8;
 /// lon_min, lat_min, lon_max, lat_max
 const NA_BOUNDS: (f64, f64, f64, f64) = (-170.0, 5.0, -50.0, 83.0);
 
-/// Higher-detail region: New York area.
+/// Higher-detail region: Buffalo <-> Rochester corridor.
 /// lon_min, lat_min, lon_max, lat_max
-const NEW_YORK_BOUNDS: (f64, f64, f64, f64) = (-80.20, 40.30, -71.40, 45.25);
+const BUFFALO_ROCHESTER_BOUNDS: (f64, f64, f64, f64) = (-79.30, 42.70, -77.25, 43.40);
 
-/// Higher-detail region: Texas area.
+/// Higher-detail region: West Texas desert / Trans-Pecos area.
 /// lon_min, lat_min, lon_max, lat_max
-const TEXAS_BOUNDS: (f64, f64, f64, f64) = (-107.10, 25.00, -92.90, 37.20);
+const TEXAS_DESERT_BOUNDS: (f64, f64, f64, f64) = (-106.80, 29.00, -101.00, 32.60);
 
 /// Max concurrent HTTP fetches at a time.
 /// Tune this: higher = faster but more load on remote tile service / network.
@@ -439,7 +439,7 @@ async fn main() -> Result<()> {
 
 /// Download satellite tiles at zoom level `z` with tiered coverage:
 /// - z=0..=8: full North America bounds
-/// - z=9..=14: New York + Texas bounds
+/// - z=9..=MAX: Buffalo/Rochester + West Texas desert bounds
 async fn fetch_tiles_for_zoom_async(
     z: u32,
     tiles_root: &Path,
@@ -448,7 +448,7 @@ async fn fetch_tiles_for_zoom_async(
     let bounds = if z <= BASE_COVERAGE_MAX_ZOOM {
         vec![NA_BOUNDS]
     } else {
-        vec![NEW_YORK_BOUNDS, TEXAS_BOUNDS]
+        vec![BUFFALO_ROCHESTER_BOUNDS, TEXAS_DESERT_BOUNDS]
     };
 
     // Enumerate + de-duplicate all tile coordinates across selected bounds.
