@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Set MAP_BUNDLE_PATH output path for generated tile sqlite bundle.",
     )
+    parser.add_argument(
+        "--no-bundle-resume",
+        action="store_true",
+        help="Disable incremental/resumable bundle updates and rebuild bundle DB from scratch.",
+    )
     return parser.parse_args()
 
 
@@ -56,6 +61,9 @@ def main() -> None:
     if args.bundle_path is not None:
         env["MAP_BUNDLE_PATH"] = str(args.bundle_path)
         print(f"Using MAP_BUNDLE_PATH={env['MAP_BUNDLE_PATH']}")
+    if args.no_bundle_resume:
+        env["MAP_BUNDLE_RESUME"] = "0"
+        print("Using MAP_BUNDLE_RESUME=0")
 
     try:
         run(

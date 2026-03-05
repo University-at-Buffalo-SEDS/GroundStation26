@@ -168,6 +168,13 @@ fn should_build_bundle() -> bool {
     }
 }
 
+fn should_resume_bundle() -> bool {
+    match env::var("MAP_BUNDLE_RESUME") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"),
+        Err(_) => true,
+    }
+}
+
 fn bundle_path_for(data_dir: &Path) -> PathBuf {
     match env::var("MAP_BUNDLE_PATH") {
         Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
@@ -181,18 +188,35 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
         .ok_or_else(|| anyhow::anyhow!("invalid bundle path: {}", bundle_path.display()))?;
     fs::create_dir_all(parent)?;
 
+    let resume = should_resume_bundle();
+    let existing_bundle = bundle_path.exists();
     let tmp_path = bundle_path.with_extension("sqlite.tmp");
-    if tmp_path.exists() {
+    if !resume && tmp_path.exists() {
         fs::remove_file(&tmp_path)?;
     }
+
+    let working_path = if resume {
+        bundle_path.to_path_buf()
+    } else {
+        tmp_path.clone()
+    };
 
     println!(
         "building tile bundle sqlite from {} -> {}",
         tiles_root.display(),
         bundle_path.display()
     );
+    if resume {
+        if existing_bundle {
+            println!("bundle resume enabled: appending into existing {}", bundle_path.display());
+        } else {
+            println!("bundle resume enabled: creating new {}", bundle_path.display());
+        }
+    } else {
+        println!("bundle resume disabled: rebuilding from scratch");
+    }
 
-    let url = format!("sqlite://{}", tmp_path.to_string_lossy());
+    let url = format!("sqlite://{}", working_path.to_string_lossy());
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect(&url)
@@ -237,8 +261,11 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
     .await?;
 
     let mut tx = pool.begin().await?;
+    let commit_every: u64 = 10_000;
+    let mut pending_writes: u64 = 0;
 
     let mut inserted: u64 = 0;
+    let mut skipped_existing: u64 = 0;
     let mut z_dirs: Vec<_> = fs::read_dir(tiles_root)?
         .flatten()
         .filter(|e| e.path().is_dir())
@@ -291,6 +318,25 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
                 let Ok(y) = stem.parse::<u32>() else {
                     continue;
                 };
+                if resume {
+                    let present: Option<i64> = sqlx::query_scalar(
+                        "SELECT blob_id FROM tiles WHERE z = ? AND x = ? AND y = ? LIMIT 1",
+                    )
+                    .bind(i64::from(z))
+                    .bind(i64::from(x))
+                    .bind(i64::from(y))
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if present.is_some() {
+                        skipped_existing += 1;
+                        if skipped_existing.is_multiple_of(50_000) {
+                            println!(
+                                "bundle resume progress: skipped existing {skipped_existing} tiles"
+                            );
+                        }
+                        continue;
+                    }
+                }
                 let bytes = fs::read(&path)?;
                 let mut hasher = Hasher::new();
                 hasher.update(&bytes);
@@ -315,6 +361,12 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
                     .execute(&mut *tx)
                     .await?;
                 inserted += 1;
+                pending_writes += 1;
+                if pending_writes >= commit_every {
+                    tx.commit().await?;
+                    tx = pool.begin().await?;
+                    pending_writes = 0;
+                }
                 if inserted.is_multiple_of(50_000) {
                     println!("bundle progress: inserted {inserted} tiles");
                 }
@@ -325,21 +377,28 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
     tx.commit().await?;
     sqlx::query("ANALYZE;").execute(&pool).await?;
     sqlx::query("PRAGMA optimize;").execute(&pool).await?;
-    sqlx::query("VACUUM;").execute(&pool).await?;
+    if !resume || !existing_bundle {
+        sqlx::query("VACUUM;").execute(&pool).await?;
+    } else {
+        println!("bundle resume mode: skipping VACUUM for faster incremental updates");
+    }
     let unique_blobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tile_blobs")
         .fetch_one(&pool)
         .await
         .unwrap_or(0);
     pool.close().await;
 
-    if bundle_path.exists() {
-        fs::remove_file(bundle_path)?;
+    if !resume {
+        if bundle_path.exists() {
+            fs::remove_file(bundle_path)?;
+        }
+        fs::rename(&tmp_path, bundle_path)?;
     }
-    fs::rename(&tmp_path, bundle_path)?;
     println!(
-        "tile bundle ready: {} ({} tiles, {} unique blobs)",
+        "tile bundle ready: {} (inserted {}, skipped existing {}, {} unique blobs)",
         bundle_path.display(),
         inserted,
+        skipped_existing,
         unique_blobs
     );
     Ok(())
