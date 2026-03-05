@@ -308,6 +308,9 @@ def build_bundle(
     unique_blobs = 0
     start_t = time.time()
     last_print_t = start_t
+    if existing_tiles > 0 and total_tiles > 0:
+        print_progress_bar("bundle", min(inserted_tiles, total_tiles), total_tiles, start_t)
+        print()
 
     cur = conn.cursor()
     source_iter = iter_tile_files(
@@ -319,15 +322,41 @@ def build_bundle(
     if existing_tiles > 0:
         base_iter = source_iter
         check_cur = conn.cursor()
+        resume_scanned = 0
+        resume_skipped = 0
+        resume_start_t = time.time()
+        resume_last_print_t = resume_start_t
 
         def missing_tiles():
+            nonlocal resume_scanned, resume_skipped, resume_last_print_t
             for z, x, y, tile_path in base_iter:
+                resume_scanned += 1
                 if check_cur.execute(
                     "SELECT 1 FROM tiles WHERE z = ? AND x = ? AND y = ?",
                     (z, x, y),
                 ).fetchone() is not None:
+                    resume_skipped += 1
+                    now = time.time()
+                    if resume_scanned % 5000 == 0 or (now - resume_last_print_t) >= 1.0:
+                        pct = 100.0 * (resume_scanned / max(total_tiles, 1))
+                        rate = resume_scanned / max(now - resume_start_t, 0.001)
+                        sys.stdout.write(
+                            f"\rresume scan: {pct:6.2f}% scanned={resume_scanned:,}/{total_tiles:,} "
+                            f"skipped_existing={resume_skipped:,} rate={rate:,.0f}/s"
+                        )
+                        sys.stdout.flush()
+                        resume_last_print_t = now
                     continue
                 yield z, x, y, tile_path
+            if resume_scanned > 0:
+                now = time.time()
+                rate = resume_scanned / max(now - resume_start_t, 0.001)
+                sys.stdout.write(
+                    f"\rresume scan: 100.00% scanned={resume_scanned:,}/{total_tiles:,} "
+                    f"skipped_existing={resume_skipped:,} rate={rate:,.0f}/s"
+                )
+                sys.stdout.flush()
+                print()
 
         source_iter = missing_tiles()
     if workers <= 1:
@@ -384,7 +413,7 @@ def build_bundle(
                 conn.execute("BEGIN")
             now = time.time()
             if inserted_tiles % 5000 == 0 or (now - last_print_t) >= 1.0:
-                print_progress_bar("bundle", inserted_tiles, total_tiles, start_t)
+                print_progress_bar("bundle", min(inserted_tiles, total_tiles), total_tiles, start_t)
                 last_print_t = now
         conn.commit()
     finally:
@@ -402,7 +431,7 @@ def build_bundle(
         if bundle.exists():
             bundle.unlink()
         db_path.rename(bundle)
-    print_progress_bar("bundle", inserted_tiles, total_tiles, start_t, unique_blobs)
+    print_progress_bar("bundle", min(inserted_tiles, total_tiles), total_tiles, start_t, unique_blobs)
     print()
     print(
         f"bundle complete: {bundle} ({inserted_tiles} tiles, {unique_blobs} unique blobs)"
