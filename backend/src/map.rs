@@ -10,7 +10,7 @@ pub fn map_region_base_dir(region: &str) -> PathBuf {
 }
 
 pub fn tile_bundle_path(region: &str) -> PathBuf {
-    map_region_base_dir(region).join("tiles.sqlite")
+    map_region_base_dir(region).join("tiles.sqlite3")
 }
 
 /// Ensure tiles for a given region are available locally.

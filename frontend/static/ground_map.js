@@ -19,7 +19,7 @@ let lastMapView = null;
 // you currently have tiles for z = 0..8
 const MIN_ZOOM = 0;
 const DEFAULT_MAX_NATIVE_ZOOM = 12;
-const DEFAULT_MAX_OVERZOOM_DELTA = 4;
+const DEFAULT_MAX_OVERZOOM_DELTA = 0;
 
 // Must match Rust NA_BOUNDS in build.rs
 const NA_BOUNDS = {
@@ -301,6 +301,8 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom) {
     initCompassOnce();
     const effectiveMaxNativeZoom = clampMaxNativeZoom(maxNativeZoom);
     const effectiveMaxZoom = effectiveMaxNativeZoom + DEFAULT_MAX_OVERZOOM_DELTA;
+    const desiredZoom = lastMapView ? lastMapView.zoom : zoom;
+    const clampedZoom = Math.min(effectiveMaxZoom, Math.max(MIN_ZOOM, desiredZoom));
 
     const el = document.getElementById("ground-map");
     if (!el) return;
@@ -313,7 +315,7 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom) {
 
     groundMap = L.map(el, {
         center: lastMapView ? [lastMapView.lat, lastMapView.lon] : [centerLat, centerLon],
-        zoom: lastMapView ? lastMapView.zoom : zoom,
+        zoom: clampedZoom,
         minZoom: MIN_ZOOM,
         maxZoom: effectiveMaxZoom,
     });
