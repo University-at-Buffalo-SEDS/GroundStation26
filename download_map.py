@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-bundle",
         action="store_true",
-        help="Disable automatic generation of backend/data/maps/<region>/tiles.sqlite.",
+        help="Disable automatic generation of backend/data/maps/<region>/tiles.sqlite3.",
     )
     parser.add_argument(
         "--bundle-path",

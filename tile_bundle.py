@@ -492,7 +492,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build/extract map tile SQLite bundles.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_build = sub.add_parser("build", help="Build a tiles.sqlite bundle from tiles directory")
+    p_build = sub.add_parser("build", help="Build a tiles.sqlite3 bundle from tiles directory")
     p_build.add_argument(
         "--region",
         default=DEFAULT_REGION,
@@ -508,7 +508,7 @@ def parse_args() -> argparse.Namespace:
         "--bundle",
         type=Path,
         default=None,
-        help="Output bundle path override (default: backend/data/maps/<region>/tiles.sqlite)",
+        help="Output bundle path override (default: backend/data/maps/<region>/tiles.sqlite3)",
     )
     p_build.add_argument(
         "--remove-source",
@@ -561,7 +561,7 @@ def parse_args() -> argparse.Namespace:
         help="Only include tiles within downloader coverage bounds (NA low zoom; Buffalo/Rochester + West Texas high zoom).",
     )
 
-    p_extract = sub.add_parser("extract", help="Extract tiles from a tiles.sqlite bundle")
+    p_extract = sub.add_parser("extract", help="Extract tiles from a tiles.sqlite3 bundle")
     p_extract.add_argument("--bundle", type=Path, required=True, help="Path to bundle sqlite file")
     p_extract.add_argument(
         "--output-dir",
@@ -584,7 +584,7 @@ def main() -> None:
             raise SystemExit("--min-zoom cannot be greater than --max-zoom")
         region_root = DEFAULT_MAP_ROOT / args.region
         tiles_dir = args.tiles_dir or (region_root / "tiles")
-        bundle = args.bundle or (region_root / "tiles.sqlite")
+        bundle = args.bundle or (region_root / "tiles.sqlite3")
         build_bundle(
             tiles_dir=tiles_dir,
             bundle=bundle,
