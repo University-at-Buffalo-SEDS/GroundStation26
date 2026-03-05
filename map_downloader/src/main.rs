@@ -30,7 +30,7 @@ const TILE_EXT: &str = "jpg";
 
 /// Zoom levels we want to cache.
 const MIN_ZOOM: u32 = 0;
-const DEFAULT_MAX_ZOOM: u32 = 16;
+const DEFAULT_MAX_ZOOM: u32 = 18;
 
 /// Full North America coverage up to this zoom.
 const BASE_COVERAGE_MAX_ZOOM: u32 = 8;
