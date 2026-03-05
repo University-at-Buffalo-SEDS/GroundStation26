@@ -56,6 +56,15 @@ const DEFAULT_MAX_BANDWIDTH_MIBPS: f64 = 2.5;
 const MAX_RETRY_ATTEMPTS: u32 = 40;
 const DEFAULT_BUILD_BUNDLE: bool = true;
 
+fn retry_backoff_ms(attempt: u32, z: u32, x: u32, y: u32) -> u64 {
+    // Exponential backoff capped at 8s with deterministic per-tile jitter.
+    let exp = attempt.saturating_sub(1).min(8);
+    let base_ms = 100u64.saturating_mul(1u64 << exp);
+    let seed = ((z as u64) << 42) ^ ((x as u64) << 21) ^ (y as u64) ^ (attempt as u64 * 1103515245);
+    let jitter_ms = seed % 125;
+    (base_ms + jitter_ms).min(8_000)
+}
+
 fn log_progress_error(pb: Option<&ProgressBar>, msg: String) {
     if let Some(pb) = pb {
         pb.println(msg);
@@ -99,6 +108,7 @@ async fn fetch_tile_with_retries(
     let mut attempts: u32 = 0;
     loop {
         attempts += 1;
+        let mut should_retry = true;
         match client.get(&url).send().await {
             Ok(resp) => {
                 let status = resp.status();
@@ -126,9 +136,23 @@ async fn fetch_tile_with_retries(
                 } else if status.as_u16() == 404 {
                     // Fine: no tile for this location (e.g. ocean).
                     return true;
+                } else if status.as_u16() == 429 || status.is_server_error() {
+                    should_retry = true;
+                } else if status.is_client_error() {
+                    // Non-retryable client errors (except 404 handled above).
+                    log_progress_error(
+                        pb,
+                        format!(
+                            "fetch_satellite_tiles_async: skipping non-retryable HTTP {} for tile z={z}, x={x}, y={y}",
+                            status.as_u16()
+                        ),
+                    );
+                    return true;
                 }
             }
-            Err(_e) => {}
+            Err(_e) => {
+                should_retry = true;
+            }
         }
 
         if attempts >= max_attempts {
@@ -141,7 +165,10 @@ async fn fetch_tile_with_retries(
             );
             return false;
         }
-        sleep(Duration::from_millis(5)).await;
+        if should_retry {
+            let delay_ms = retry_backoff_ms(attempts, z, x, y);
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
     }
 }
 
