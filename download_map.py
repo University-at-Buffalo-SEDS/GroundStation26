@@ -41,6 +41,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable incremental/resumable bundle updates and rebuild bundle DB from scratch.",
     )
+    parser.add_argument(
+        "--keep-tiles",
+        action="store_true",
+        help="Keep backend/data/maps/<region>/tiles after successful bundle build (default removes tiles and keeps DB).",
+    )
+    parser.add_argument(
+        "--direct-to-db",
+        action="store_true",
+        help="Download tiles directly into the bundle DB (default behavior).",
+    )
+    parser.add_argument(
+        "--via-tiles",
+        action="store_true",
+        help="Use legacy flow: download into tiles directory before bundling.",
+    )
     return parser.parse_args()
 
 
@@ -48,6 +63,12 @@ def main() -> None:
     args = parse_args()
     repo_root = Path(__file__).resolve().parent
     env = os.environ.copy()
+    if args.direct_to_db and args.via_tiles:
+        print("Error: --direct-to-db and --via-tiles are mutually exclusive.", file=sys.stderr)
+        sys.exit(2)
+    if args.direct_to_db and args.no_bundle:
+        print("Error: --direct-to-db requires bundle generation (remove --no-bundle).", file=sys.stderr)
+        sys.exit(2)
 
     if args.max_concurrent is not None:
         env["MAP_MAX_CONCURRENT"] = str(args.max_concurrent)
@@ -64,6 +85,15 @@ def main() -> None:
     if args.no_bundle_resume:
         env["MAP_BUNDLE_RESUME"] = "0"
         print("Using MAP_BUNDLE_RESUME=0")
+    if args.keep_tiles:
+        env["MAP_KEEP_TILES"] = "1"
+        print("Using MAP_KEEP_TILES=1")
+    if args.direct_to_db:
+        env["MAP_DIRECT_TO_BUNDLE"] = "1"
+        print("Using MAP_DIRECT_TO_BUNDLE=1")
+    if args.via_tiles:
+        env["MAP_DIRECT_TO_BUNDLE"] = "0"
+        print("Using MAP_DIRECT_TO_BUNDLE=0")
 
     try:
         run(

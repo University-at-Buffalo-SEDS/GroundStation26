@@ -19,7 +19,7 @@ let lastMapView = null;
 // you currently have tiles for z = 0..8
 const MIN_ZOOM = 0;
 const DEFAULT_MAX_NATIVE_ZOOM = 12;
-const DEFAULT_MAX_OVERZOOM_DELTA = 2;
+const DEFAULT_MAX_OVERZOOM_DELTA = 1;
 
 // Must match Rust NA_BOUNDS in build.rs
 const NA_BOUNDS = {
