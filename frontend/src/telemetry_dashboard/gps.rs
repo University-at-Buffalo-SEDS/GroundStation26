@@ -144,6 +144,8 @@ mod imp {
     target_os = "windows"
 )))]
 mod imp {
+    use dioxus_signals::Signal;
+
     pub fn start(_user_gps: Signal<Option<(f64, f64)>>) {}
     pub fn stop() {}
 }
