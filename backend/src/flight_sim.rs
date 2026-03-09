@@ -29,9 +29,13 @@ const FLIGHT_STATE_PERIOD_MS: u64 = 1_000;
 #[cfg(feature = "testing")]
 const HOUSEKEEPING_PERIOD_MS: u64 = 900;
 #[cfg(feature = "testing")]
-const BATTERY_CUTOFF_V: f32 = 6.3;
+const AV_BAY_BATTERY_CUTOFF_V: f32 = 6.3;
 #[cfg(feature = "testing")]
-const BATTERY_MAX_V: f32 = 8.4;
+const AV_BAY_BATTERY_MAX_V: f32 = 8.4;
+#[cfg(feature = "testing")]
+const GROUND_STATION_BATTERY_CUTOFF_V: f32 = 13.3;
+#[cfg(feature = "testing")]
+const GROUND_STATION_BATTERY_MAX_V: f32 = 15.5;
 
 #[cfg(feature = "testing")]
 #[derive(Debug)]
@@ -100,7 +104,7 @@ impl FlightSimState {
             next_valve_emit_idx: 0,
             fuel_tank_pressure_psi: 5.0,
             fuel_flow_lpm: 0.0,
-            battery_v: BATTERY_MAX_V,
+            battery_v: AV_BAY_BATTERY_MAX_V,
             battery_a: 1.2,
             altitude_ft: 0.0,
             velocity_fps: 0.0,
@@ -109,8 +113,8 @@ impl FlightSimState {
             pitch_dps: 0.0,
             yaw_dps: 0.0,
             last_physics_ms: 0,
-            av_bay_battery_v: BATTERY_MAX_V,
-            ground_station_battery_v: BATTERY_MAX_V,
+            av_bay_battery_v: AV_BAY_BATTERY_MAX_V,
+            ground_station_battery_v: GROUND_STATION_BATTERY_MAX_V,
             ground_station_battery_a: 0.7,
             next_battery_sender_gateway: false,
             valves,
@@ -374,9 +378,10 @@ impl FlightSimState {
         let gs_drop_v_per_s = 0.00005 + self.ground_station_battery_a * 0.00003;
 
         self.av_bay_battery_v =
-            (self.av_bay_battery_v - av_bay_drop_v_per_s * dt_s).max(BATTERY_CUTOFF_V);
+            (self.av_bay_battery_v - av_bay_drop_v_per_s * dt_s).max(AV_BAY_BATTERY_CUTOFF_V);
         self.ground_station_battery_v =
-            (self.ground_station_battery_v - gs_drop_v_per_s * dt_s).max(BATTERY_CUTOFF_V);
+            (self.ground_station_battery_v - gs_drop_v_per_s * dt_s)
+                .max(GROUND_STATION_BATTERY_CUTOFF_V);
         self.battery_v = self.av_bay_battery_v;
     }
 

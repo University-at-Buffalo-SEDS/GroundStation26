@@ -6,7 +6,7 @@ use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio::time::{Duration, sleep};
 
@@ -41,9 +41,11 @@ const GPS_LATITUDE_MAX_THRESHOLD: f32 = 36.5; // degrees
 const GPS_LONGITUDE_MIN_THRESHOLD: f32 = -106.5; // degrees
 const GPS_LONGITUDE_MAX_THRESHOLD: f32 = -93.5; // degrees
 
-// Battery voltage thresholds (V)
-const BATTERY_VOLTAGE_MIN_THRESHOLD: f32 = 6.4; // V
-const BATTERY_VOLTAGE_MAX_THRESHOLD: f32 = 8.4; // V
+// Default battery voltage thresholds (V), used as fallback sender ranges.
+const BATTERY_VOLTAGE_AV_BAY_MIN_THRESHOLD: f32 = 6.3; // V
+const BATTERY_VOLTAGE_AV_BAY_MAX_THRESHOLD: f32 = 8.4; // V
+const BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD: f32 = 13.3; // V
+const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 15.5; // V
 
 // Battery current thresholds (A)
 const BATTERY_CURRENT_MIN_THRESHOLD: f32 = 0.0; // A
@@ -77,6 +79,48 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+fn battery_voltage_bounds_by_sender() -> &'static HashMap<String, (f32, f32)> {
+    static BOUNDS: OnceLock<HashMap<String, (f32, f32)>> = OnceLock::new();
+    BOUNDS.get_or_init(|| {
+        let mut out = HashMap::from([
+            (
+                Board::PowerBoard.sender_id().to_string(),
+                (
+                    BATTERY_VOLTAGE_AV_BAY_MIN_THRESHOLD,
+                    BATTERY_VOLTAGE_AV_BAY_MAX_THRESHOLD,
+                ),
+            ),
+            (
+                Board::GatewayBoard.sender_id().to_string(),
+                (
+                    BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD,
+                    BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD,
+                ),
+            ),
+        ]);
+
+        if let Ok(layout) = crate::layout::load_layout() {
+            for source in &layout.battery.sources {
+                if !source.empty_voltage.is_finite() || !source.full_voltage.is_finite() {
+                    continue;
+                }
+                let (lo, hi) = if source.empty_voltage <= source.full_voltage {
+                    (source.empty_voltage, source.full_voltage)
+                } else {
+                    (source.full_voltage, source.empty_voltage)
+                };
+                out.insert(source.sender_id.clone(), (lo, hi));
+            }
+        } else {
+            eprintln!(
+                "WARNING: safety_task failed to load layout battery bounds; using sender defaults"
+            );
+        }
+
+        out
+    })
 }
 
 async fn insert_flight_state_with_retry(
@@ -401,11 +445,14 @@ pub async fn safety_task(
                 DataType::BatteryVoltage => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
                     // Voltage
-                    if let Some(voltage) = values.first()
-                        && ((BATTERY_VOLTAGE_MIN_THRESHOLD > *voltage)
-                            || (*voltage > BATTERY_VOLTAGE_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Battery voltage out of range!");
+                    if let Some(voltage) = values.first() {
+                        if let Some((min_v, max_v)) = battery_voltage_bounds_by_sender()
+                            .get(pkt.sender())
+                            .copied()
+                            && ((*voltage < min_v) || (*voltage > max_v))
+                        {
+                            cycle_warnings.insert("Critical: Battery voltage out of range!");
+                        }
                     }
                 }
 

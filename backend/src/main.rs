@@ -33,10 +33,11 @@ use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
-use sqlx::Row;
+use sqlx::sqlite::SqliteConnection;
+use sqlx::{Connection, Row};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -131,17 +132,6 @@ async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
         eprintln!("SQLite PRAGMA optimize failed after {retries} attempts: {err}");
     }
 
-    // On shutdown, switch out of WAL to reduce chance of lingering -wal/-shm files.
-    let switch_to_delete = std::env::var("GS_SQLITE_SHUTDOWN_JOURNAL_DELETE")
-        .ok()
-        .as_deref()
-        != Some("0");
-    if switch_to_delete
-        && let Err(err) =
-            exec_pragma_with_retry(db, "PRAGMA journal_mode=DELETE;", retries, delay_ms).await
-    {
-        eprintln!("SQLite PRAGMA journal_mode=DELETE failed after {retries} attempts: {err}");
-    }
 }
 
 async fn remove_sqlite_sidecars(db_path: &str) {
@@ -162,6 +152,56 @@ async fn remove_sqlite_sidecars(db_path: &str) {
                 }
             }
         }
+    }
+}
+
+fn sqlite_sidecars_present(db_path: &str) -> Vec<String> {
+    [".wal", ".shm", "-wal", "-shm", "-journal", ".journal"]
+        .into_iter()
+        .map(|suffix| format!("{db_path}{suffix}"))
+        .filter(|p| Path::new(p).exists())
+        .collect()
+}
+
+async fn finalize_sqlite_after_pool_close(db_path: &str) {
+    let url = format!("sqlite://{db_path}");
+    let mut conn = match SqliteConnection::connect(&url).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("Failed to reopen SQLite DB for finalization ({db_path}): {err}");
+            return;
+        }
+    };
+
+    for stmt in ["PRAGMA busy_timeout=5000;", "PRAGMA wal_checkpoint(TRUNCATE);", "PRAGMA optimize;"]
+    {
+        if let Err(err) = sqlx::query(stmt).execute(&mut conn).await {
+            eprintln!("SQLite finalization pragma failed ({stmt}): {err}");
+        }
+    }
+
+    let retries = env_usize("GS_SQLITE_SHUTDOWN_PRAGMA_RETRIES", 8, 1, 60);
+    let retry_delay_ms = env_i64("GS_SQLITE_SHUTDOWN_PRAGMA_RETRY_DELAY_MS", 120, 10, 5_000) as u64;
+    for attempt in 0..retries {
+        match sqlx::query("PRAGMA journal_mode=DELETE;")
+            .execute(&mut conn)
+            .await
+        {
+            Ok(_) => break,
+            Err(err) => {
+                if attempt + 1 >= retries {
+                    eprintln!(
+                        "SQLite finalization pragma failed (PRAGMA journal_mode=DELETE;): {err}"
+                    );
+                } else {
+                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    if let Err(err) = conn.close().await {
+        eprintln!("Failed closing SQLite finalization connection: {err}");
     }
 }
 
@@ -208,14 +248,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- DB path ---
-    let db_path = "./data/groundstation.db";
-    if !Path::new(db_path).exists() {
-        fs::create_dir_all("./data")?;
-        fs::write(db_path, b"")?;
+    let mut db_path = PathBuf::from("./data/groundstation.db");
+    if !db_path.exists() {
+        fs::create_dir_all(
+            db_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
+        fs::write(&db_path, b"")?;
         println!("Created empty DB file.");
     }
+    db_path = fs::canonicalize(&db_path).unwrap_or(db_path);
+    let db_path_str = db_path.to_string_lossy().to_string();
 
-    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path)).await?;
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path_str)).await?;
     apply_sqlite_pragmas(&db).await;
 
     // --- Tables ---
@@ -343,7 +389,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
-    start_sequence_task(state.clone());
+    let sequence_shutdown_rx = state.shutdown_subscribe();
+    let mut sequence_task = start_sequence_task(state.clone(), sequence_shutdown_rx);
 
     // --- Router endpoint handlers ---
     let ground_station_handler_state_clone = state.clone();
@@ -471,14 +518,14 @@ async fn main() -> anyhow::Result<()> {
     // --- Background tasks ---
     let telemetry_shutdown_rx = state.shutdown_subscribe();
     let safety_shutdown_rx = state.shutdown_subscribe();
-    let tt = tokio::spawn(telemetry_task(
+    let mut tt = tokio::spawn(telemetry_task(
         state.clone(),
         router.clone(),
         vec![rocket_radio, umbilical_radio],
         cmd_rx,
         telemetry_shutdown_rx,
     ));
-    let st = tokio::spawn(safety_task(
+    let mut st = tokio::spawn(safety_task(
         state.clone(),
         router.clone(),
         safety_shutdown_rx,
@@ -496,22 +543,43 @@ async fn main() -> anyhow::Result<()> {
     // Ensure background tasks are signaled even if server exits unexpectedly.
     state.request_shutdown();
 
+    let telemetry_shutdown_timeout = Duration::from_secs(20);
     let task_shutdown_timeout = Duration::from_secs(5);
-    match tokio::time::timeout(task_shutdown_timeout, tt).await {
+    match tokio::time::timeout(telemetry_shutdown_timeout, &mut tt).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("Telemetry task ended with error: {e}"),
         Err(_) => eprintln!(
             "Telemetry task did not shut down within {:?}",
-            task_shutdown_timeout
+            telemetry_shutdown_timeout
         ),
     }
-    match tokio::time::timeout(task_shutdown_timeout, st).await {
+    if !tt.is_finished() {
+        tt.abort();
+        let _ = tt.await;
+    }
+    match tokio::time::timeout(task_shutdown_timeout, &mut st).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("Safety task ended with error: {e}"),
         Err(_) => eprintln!(
             "Safety task did not shut down within {:?}",
             task_shutdown_timeout
         ),
+    }
+    if !st.is_finished() {
+        st.abort();
+        let _ = st.await;
+    }
+    match tokio::time::timeout(task_shutdown_timeout, &mut sequence_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("Sequence task ended with error: {e}"),
+        Err(_) => eprintln!(
+            "Sequence task did not shut down within {:?}",
+            task_shutdown_timeout
+        ),
+    }
+    if !sequence_task.is_finished() {
+        sequence_task.abort();
+        let _ = sequence_task.await;
     }
 
     let db_drain_timeout = Duration::from_secs(10);
@@ -524,6 +592,14 @@ async fn main() -> anyhow::Result<()> {
 
     flush_sqlite_journals(&state.db).await;
     state.db.close().await;
-    remove_sqlite_sidecars(db_path).await;
+    finalize_sqlite_after_pool_close(&db_path_str).await;
+    remove_sqlite_sidecars(&db_path_str).await;
+    let lingering = sqlite_sidecars_present(&db_path_str);
+    if !lingering.is_empty() {
+        eprintln!(
+            "WARNING: SQLite sidecar files still present after shutdown cleanup: {}",
+            lingering.join(", ")
+        );
+    }
     Ok(())
 }

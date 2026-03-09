@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 
 pub const KEY_ENABLE_PIN: u8 = 25;
 
@@ -612,7 +613,10 @@ fn read_key_enabled(state: &AppState, cfg: &SequenceConfig) -> bool {
         .unwrap_or(false)
 }
 
-pub fn start_sequence_task(state: Arc<AppState>) {
+pub fn start_sequence_task(
+    state: Arc<AppState>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
     let cfg = SequenceConfig::from_env();
     if cfg.key_required
         && let Err(err) = state.gpio.setup_input_pin(cfg.key_enable_pin)
@@ -628,7 +632,14 @@ pub fn start_sequence_task(state: Arc<AppState>) {
         let mut runtime = SequenceRuntime::default();
 
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = tick.tick() => {}
+                recv = shutdown_rx.recv() => {
+                    match recv {
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
 
             let flight_state = *state.state.lock().unwrap();
             let valves = ValveSnapshot::read(&state);
@@ -649,5 +660,5 @@ pub fn start_sequence_task(state: Arc<AppState>) {
             );
             state.set_action_policy(policy);
         }
-    });
+    })
 }

@@ -1062,8 +1062,8 @@
         "percent_data_type": "GROUND_STATION_BATTERY_PERCENT",
         "drop_rate_data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
-        "empty_voltage": 6.3,
-        "full_voltage": 8.4,
+        "empty_voltage": 13.3,
+        "full_voltage": 15.5,
         "curve_exponent": 1.0
       }
     ]
