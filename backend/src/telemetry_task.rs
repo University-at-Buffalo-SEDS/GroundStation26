@@ -549,7 +549,7 @@ pub async fn telemetry_task(
                         TelemetryCommand::Launch => {
                                 if let Err(e) = router.log_queue(
                                     DataType::FlightCommand,
-                                    &[FlightCommands::Launch as u8],
+                                    &[FlightCommands::LaunchSignal as u8],
                                 ) {
                                     log_telemetry_error("failed to log Launch command", e);
                                 }
@@ -676,6 +676,7 @@ pub async fn telemetry_task(
                                 }
                                 println!("Nitrous command sent: {:?}", cmd);
                         }
+                        _ => { break; } // TODO prio soon
                     }
                 }
                 _ = heartbeat_interval.tick() => {

@@ -1,7 +1,30 @@
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 pub enum FlightCommands {
-    Launch,
+    DeployParachute = 0,
+    ExpandParachute = 1,
+    ReinitSensors = 2,
+    LaunchSignal = 3,
+    EvaluationRelax = 4,
+    EvaluationFocus = 5,
+    EvaluationAbort = 6,
+    ReinitBarometer = 7,
+    EnableIMU = 8,
+    DisableIMU = 9,
+    MonitorAltitude = 10,
+    RevokeMonitorAltitude = 11,
+    ConsecutiveSamples = 12,
+    RevokeConsecutiveSamples = 13,
+    ResetFailures = 14,
+    RevokeResetFailures = 15,
+    ValidateMeasms = 16,
+    RevokeValidateMeasms = 17,
+    AbortAfter15 = 18,
+    AbortAfter40 = 19,
+    AbortAfter70 = 20,
+    ReinitAfter12 = 21,
+    ReinitAfter26 = 22,
+    ReinitAfter44 = 23,
 }
 
 #[repr(u8)]
