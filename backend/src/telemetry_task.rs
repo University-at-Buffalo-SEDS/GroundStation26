@@ -676,7 +676,214 @@ pub async fn telemetry_task(
                                 }
                                 println!("Nitrous command sent: {:?}", cmd);
                         }
-                        _ => { break; } // TODO prio soon
+                        TelemetryCommand::CO2 => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightCommands::DeployParachute as u8],
+                                ) {
+                                    log_telemetry_error("failed to log DeployParachute command", e);
+                                }
+                                println!("DeployParachute command sent");
+
+                            }
+                        TelemetryCommand::Reef => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::ExpandParachute as u8],
+                            ) {
+                                log_telemetry_error("failed to log ExpandParachute command", e);
+                            }
+                            println!("ExpandParachute command sent");
+                        }
+                        TelemetryCommand::ReinitSensors => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::ReinitSensors as u8],
+                            ) {
+                                log_telemetry_error("failed to log ReinitSensors command", e);
+                            }
+                            println!("ReinitSensors command sent");
+                        }
+                        TelemetryCommand::EvalRelax => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::EvaluationRelax as u8],
+                            ) {
+                                log_telemetry_error("failed to log EvaluationRelax command", e);
+                            }
+                            println!("EvaluationRelax command sent");
+                        }
+                        TelemetryCommand::EvalFocus => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::EvaluationFocus as u8],
+                            ) {
+                                log_telemetry_error("failed to log EvaluationFocus command", e);
+                            }
+                            println!("EvaluationFocus command sent");
+                        }
+                        TelemetryCommand::EvalAbort => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::EvaluationAbort as u8],
+                            ) {
+                                log_telemetry_error("failed to log EvaluationAbort command", e);
+                            }
+                            println!("EvaluationAbort command sent");
+                        }
+                        TelemetryCommand::ReinitBaro => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::ReinitBarometer as u8],
+                            ) {
+                                log_telemetry_error("failed to log ReinitBarometer command", e);
+                            }
+                            println!("ReinitBarometer command sent");
+                        }
+                        TelemetryCommand::EnableIMU => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::EnableIMU as u8],
+                            ) {
+                                log_telemetry_error("failed to log EnableIMU command", e);
+                            }
+                            println!("EnableIMU command sent");
+                        }
+                        TelemetryCommand::DisableIMU => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::DisableIMU as u8],
+                            ) {
+                                log_telemetry_error("failed to log DisableIMU command", e);
+                            }
+                            println!("DisableIMU command sent");
+                        }
+                        TelemetryCommand::VigilantMode => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::MonitorAltitude as u8],
+                            ) {
+                                log_telemetry_error("failed to log MonitorAltitude command", e);
+                            }
+                            println!("MonitorAltitude command sent");
+                        }
+                        TelemetryCommand::SimpletonMode => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::RevokeMonitorAltitude as u8],
+                            ) {
+                                log_telemetry_error("failed to log RevokeMonitorAltitude command", e);
+                            }
+                            println!("RevokeMonitorAltitude command sent");
+                        }
+                        TelemetryCommand::ConsecutiveSamp => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::ConsecutiveSamples as u8],
+                            ) {
+                                log_telemetry_error("failed to log ConsecutiveSamples command", e);
+                            }
+                            println!("ConsecutiveSamples command sent");
+                        }
+                        TelemetryCommand::AccumulativeSamp => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::RevokeConsecutiveSamples as u8],
+                            ) {
+                                log_telemetry_error("failed to log RevokeConsecutiveSamples command", e);
+                            }
+                            println!("RevokeConsecutiveSamples command sent");
+                        }
+                        TelemetryCommand::ResetFailures => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::ResetFailures as u8],
+                            ) {
+                                log_telemetry_error("failed to log ResetFailures command", e);
+                            }
+                            println!("ResetFailures command sent");
+                        }
+                        TelemetryCommand::AccumulateFailures => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::RevokeResetFailures as u8],
+                            ) {
+                                log_telemetry_error("failed to log RevokeResetFailures command", e);
+                            }
+                            println!("RevokeResetFailures command sent");
+                        }
+                        TelemetryCommand::ValidateMeasms => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::ValidateMeasms as u8],
+                            ) {
+                                log_telemetry_error("failed to log ValidateMeasms command", e);
+                            }
+                            println!("ValidateMeasms command sent");
+                        }
+                        TelemetryCommand::SkipValidation => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::RevokeValidateMeasms as u8],
+                            ) {
+                                log_telemetry_error("failed to log RevokeValidateMeasms command", e);
+                            }
+                            println!("RevokeValidateMeasms command sent");
+                        }
+                        TelemetryCommand::ThresAbort15 => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::AbortAfter15 as u8],
+                            ) {
+                                log_telemetry_error("failed to log AbortAfter15 command", e);
+                            }
+                            println!("AbortAfter15 command sent");
+                        }
+                        TelemetryCommand::ThresAbort40 => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::AbortAfter40 as u8],
+                            ) {
+                                log_telemetry_error("failed to log AbortAfter40 command", e);
+                            }
+                            println!("AbortAfter40 command sent");
+                        }
+                        TelemetryCommand::ThresAbort70 => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::AbortAfter70 as u8],
+                            ) {
+                                log_telemetry_error("failed to log AbortAfter70 command", e);
+                            }
+                            println!("AbortAfter70 command sent");
+                        }
+                        TelemetryCommand::ThresReinit12 => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::ReinitAfter12 as u8],
+                            ) {
+                                log_telemetry_error("failed to log ReinitAfter12 command", e);
+                            }
+                            println!("ReinitAfter12 command sent");
+                        }
+                        TelemetryCommand::ThresReinit26 => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::ReinitAfter26 as u8],
+                            ) {
+                                log_telemetry_error("failed to log ReinitAfter26 command", e);
+                            }
+                            println!("ReinitAfter26 command sent");
+                        }
+                        TelemetryCommand::ThresReinit44 => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightCommands::ReinitAfter44 as u8],
+                            ) {
+                                log_telemetry_error("failed to log ReinitAfter44 command", e);
+                            }
+                            println!("ReinitAfter44 command sent");
+                        }
                     }
                 }
                 _ = heartbeat_interval.tick() => {
