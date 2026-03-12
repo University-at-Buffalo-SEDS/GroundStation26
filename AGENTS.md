@@ -2,7 +2,8 @@
 
 ## Project Structure & Module Organization
 
-- `backend/` is the Axum backend (`backend/src`). Runtime data and fixtures live under `backend/data`.
+- `backend/` is the Axum backend (`backend/src`). Runtime data lives under `backend/data`, and calibration files live
+  under `backend/calibration`.
 - `frontend/` is the Dioxus UI (`frontend/src`), with assets in `frontend/assets` and `frontend/static`. Bundled output
   goes to `frontend/dist`.
 - `shared/` contains Rust crates shared by frontend and backend.
@@ -11,11 +12,12 @@
 
 ## Build, Test, and Development Commands
 
-- `python3 build.py` builds frontend (web bundle) and backend in parallel.
+- `python3 build.py` builds the frontend web bundle and backend in parallel.
+- `python3 build.py testing|hitl-mode|debug|backend_only|frontend_web` enables common local build modes.
 - `python3 build.py docker` builds Docker images; add `pi_build` for Raspberry Pi (`python3 build.py docker pi_build`).
-- `python3 build.py ios|macos|windows|android|linux` builds a platform-specific frontend bundle.
-- `python3 run_groundstation.py [testing]` builds the frontend and runs the backend (adds the `testing` feature when
-  supplied).
+- `python3 build.py ios|ios_sim|macos|windows|android|linux` builds a platform-specific frontend bundle.
+- `python3 run_groundstation.py [testing|hitl-mode]` builds the frontend and runs the backend.
+- `python3 run_groundstation.py --testing|--hitl-mode` is the preferred explicit form.
 - `python3 download_map.py` downloads map data needed by the UI.
 - `cargo build -p groundstation_backend --release` builds the backend only.
 - `cargo test` runs workspace tests (add `-p <crate>` for a single crate).
