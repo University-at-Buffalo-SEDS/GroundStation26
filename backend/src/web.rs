@@ -611,6 +611,7 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         SELECT
             timestamp_ms,
             data_type,
+            sender_id,
             values_json,
             payload_json
         FROM telemetry

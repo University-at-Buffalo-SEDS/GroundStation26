@@ -70,6 +70,9 @@ def _print_missing_tool(context: str, err: FileNotFoundError, cwd: Path) -> None
     missing = err.filename or "<unknown>"
     print(f"\nError: {context} could not start because a required tool is missing.", file=sys.stderr)
     print(f"  Missing : {missing}", file=sys.stderr)
+    details = str(err).strip()
+    if details and details != missing:
+        print(f"  Details : {details}", file=sys.stderr)
     print(f"  CWD     : {cwd}", file=sys.stderr)
     if LOG_FILE is not None:
         print(f"  Log file: {LOG_FILE}", file=sys.stderr)
