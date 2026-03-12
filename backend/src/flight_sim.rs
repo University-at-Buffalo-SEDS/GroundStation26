@@ -273,6 +273,35 @@ impl FlightSimState {
                 self.valves.insert(key, next);
                 self.queue_umbilical_status(key, next, now_ms);
             }
+            #[cfg(feature = "hitl_mode")]
+            TelemetryCommand::DeployParachute
+            | TelemetryCommand::ExpandParachute
+            | TelemetryCommand::ReinitSensors
+            | TelemetryCommand::LaunchSignal
+            | TelemetryCommand::EvaluationRelax
+            | TelemetryCommand::EvaluationFocus
+            | TelemetryCommand::EvaluationAbort
+            | TelemetryCommand::ReinitBarometer
+            | TelemetryCommand::EnableIMU
+            | TelemetryCommand::DisableIMU
+            | TelemetryCommand::MonitorAltitude
+            | TelemetryCommand::RevokeMonitorAltitude
+            | TelemetryCommand::ConsecutiveSamples
+            | TelemetryCommand::RevokeConsecutiveSamples
+            | TelemetryCommand::ResetFailures
+            | TelemetryCommand::RevokeResetFailures
+            | TelemetryCommand::ValidateMeasms
+            | TelemetryCommand::RevokeValidateMeasms
+            | TelemetryCommand::AbortAfter15
+            | TelemetryCommand::AbortAfter40
+            | TelemetryCommand::AbortAfter70
+            | TelemetryCommand::ReinitAfter12
+            | TelemetryCommand::ReinitAfter26
+            | TelemetryCommand::ReinitAfter44
+            | TelemetryCommand::AdvanceFlightState
+            | TelemetryCommand::RewindFlightState => {
+                // No-op in simulator mode; these commands are forwarded by telemetry_task.
+            }
         }
 
         self.update_ground_sequence(now_ms);

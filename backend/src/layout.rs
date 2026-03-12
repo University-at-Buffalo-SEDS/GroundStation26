@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const DEFAULT_LAYOUT_PATH: &str = "layout/layout.json";
+#[cfg(feature = "hitl_mode")]
+const DEFAULT_HITL_LAYOUT_PATH: &str = "layout/layout_hitl.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
@@ -197,6 +199,15 @@ pub fn layout_path() -> PathBuf {
     if let Ok(path) = std::env::var("GS_LAYOUT_PATH") {
         return PathBuf::from(path);
     }
+
+    #[cfg(feature = "hitl_mode")]
+    {
+        let hitl = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_HITL_LAYOUT_PATH);
+        if hitl.exists() {
+            return hitl;
+        }
+    }
+
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_LAYOUT_PATH)
 }
 

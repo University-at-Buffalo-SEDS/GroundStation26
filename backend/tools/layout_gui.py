@@ -494,16 +494,25 @@ class LayoutEditor(tk.Tk):
         self.battery_percent_data_type = self._entry(form, "Percent data type", 6)
         self.battery_drop_rate_data_type = self._entry(form, "Drop-rate data type", 7)
         self.battery_remaining_data_type = self._entry(form, "Remaining-min data type", 8)
-        self.battery_empty_voltage = self._entry(form, "Empty voltage", 9)
-        self.battery_full_voltage = self._entry(form, "Full voltage", 10)
-        self.battery_curve_exponent = self._entry(form, "Curve exponent", 11)
+        self.battery_empty_voltage = self._entry(form, "Min voltage (empty)", 9)
+        self.battery_nominal_voltage = self._entry(form, "Nominal voltage (optional)", 10)
+        self.battery_full_voltage = self._entry(form, "Max charged voltage (full)", 11)
+        self.battery_curve_exponent = self._entry(form, "Curve exponent", 12)
 
         btns = ttk.Frame(form)
-        btns.grid(row=12, column=1, sticky="w", pady=8)
+        btns.grid(row=13, column=1, sticky="w", pady=8)
         ttk.Button(btns, text="Add", command=self._add_battery_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove", command=self._remove_battery_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Up", command=lambda: self._move_battery_item(-1)).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Down", command=lambda: self._move_battery_item(1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Add AV Bay Preset", command=self._add_av_bay_battery_preset).pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Button(
+            btns,
+            text="Add Fill Box Preset",
+            command=self._add_fill_box_battery_preset,
+        ).pack(side=tk.LEFT, padx=4)
 
     # ------------------------
     # Helpers
@@ -579,6 +588,7 @@ class LayoutEditor(tk.Tk):
         self._refresh_lists()
 
     def save(self) -> None:
+        self._commit_current_tab()
         errors = validate_layout(self.data)
         if errors:
             messagebox.showerror("Validation errors", "\n".join(errors))
@@ -599,6 +609,7 @@ class LayoutEditor(tk.Tk):
         self.save()
 
     def validate(self) -> None:
+        self._commit_current_tab()
         errors = validate_layout(self.data)
         if errors:
             messagebox.showerror("Validation errors", "\n".join(errors))
@@ -705,6 +716,8 @@ class LayoutEditor(tk.Tk):
         self.battery_remaining_data_type.insert(0, source.get("remaining_minutes_data_type", ""))
         self.battery_empty_voltage.delete(0, tk.END)
         self.battery_empty_voltage.insert(0, str(source.get("empty_voltage", "")))
+        self.battery_nominal_voltage.delete(0, tk.END)
+        self.battery_nominal_voltage.insert(0, str(source.get("nominal_voltage", "")))
         self.battery_full_voltage.delete(0, tk.END)
         self.battery_full_voltage.insert(0, str(source.get("full_voltage", "")))
         self.battery_curve_exponent.delete(0, tk.END)
@@ -717,7 +730,7 @@ class LayoutEditor(tk.Tk):
             except ValueError:
                 return default
 
-        return {
+        source = {
             "id": self.battery_id.get().strip(),
             "label": self.battery_label.get().strip(),
             "sender_id": self.battery_sender_id.get().strip(),
@@ -729,9 +742,52 @@ class LayoutEditor(tk.Tk):
             "full_voltage": _f(self.battery_full_voltage.get(), 8.4),
             "curve_exponent": _f(self.battery_curve_exponent.get(), 1.0),
         }
+        nominal_raw = self.battery_nominal_voltage.get().strip()
+        if nominal_raw:
+            try:
+                source["nominal_voltage"] = float(nominal_raw)
+            except ValueError:
+                pass
+        return source
 
     def _add_battery_item(self) -> None:
         self.data["battery"]["sources"].append(self._battery_from_form())
+        self._refresh_lists()
+
+    def _add_av_bay_battery_preset(self) -> None:
+        self.data["battery"]["sources"].append(
+            {
+                "id": "av_bay",
+                "label": "AV Bay Battery",
+                "sender_id": "PB",
+                "input_data_type": "BATTERY_VOLTAGE",
+                "percent_data_type": "AV_BAY_BATTERY_PERCENT",
+                "drop_rate_data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+                "remaining_minutes_data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
+                "empty_voltage": 6.3,
+                "nominal_voltage": 7.4,
+                "full_voltage": 8.4,
+                "curve_exponent": 1.0,
+            }
+        )
+        self._refresh_lists()
+
+    def _add_fill_box_battery_preset(self) -> None:
+        self.data["battery"]["sources"].append(
+            {
+                "id": "ground_station",
+                "label": "Ground Station Battery",
+                "sender_id": "GW",
+                "input_data_type": "BATTERY_VOLTAGE",
+                "percent_data_type": "GROUND_STATION_BATTERY_PERCENT",
+                "drop_rate_data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+                "remaining_minutes_data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+                "empty_voltage": 13.3,
+                "nominal_voltage": 14.0,
+                "full_voltage": 15.5,
+                "curve_exponent": 1.0,
+            }
+        )
         self._refresh_lists()
 
     def _remove_battery_item(self) -> None:

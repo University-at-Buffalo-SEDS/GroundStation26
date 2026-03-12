@@ -9,6 +9,7 @@ repository.workspace = true
 [features]
 raspberry_pi = ["rppal"]
 testing = []
+hitl_mode = ["groundstation_shared/hitl_mode"]
 
 [dependencies]
 axum = { workspace = true, features = ["ws"] }

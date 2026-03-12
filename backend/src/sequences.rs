@@ -247,11 +247,64 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::RetractPlumbing => "RetractPlumbing",
         TelemetryCommand::Nitrogen => "Nitrogen",
         TelemetryCommand::Nitrous => "Nitrous",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::DeployParachute => "DeployParachute",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ExpandParachute => "ExpandParachute",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ReinitSensors => "ReinitSensors",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::LaunchSignal => "LaunchSignal",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::EvaluationRelax => "EvaluationRelax",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::EvaluationFocus => "EvaluationFocus",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::EvaluationAbort => "EvaluationAbort",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ReinitBarometer => "ReinitBarometer",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::EnableIMU => "EnableIMU",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::DisableIMU => "DisableIMU",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::MonitorAltitude => "MonitorAltitude",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::RevokeConsecutiveSamples => "RevokeConsecutiveSamples",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ResetFailures => "ResetFailures",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::RevokeResetFailures => "RevokeResetFailures",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ValidateMeasms => "ValidateMeasms",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::AbortAfter15 => "AbortAfter15",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::AbortAfter40 => "AbortAfter40",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::AbortAfter70 => "AbortAfter70",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ReinitAfter12 => "ReinitAfter12",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ReinitAfter26 => "ReinitAfter26",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ReinitAfter44 => "ReinitAfter44",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::RewindFlightState => "RewindFlightState",
     }
 }
 
-pub fn all_command_names() -> [&'static str; 9] {
-    [
+#[cfg(not(feature = "hitl_mode"))]
+pub fn all_command_names() -> Vec<&'static str> {
+    vec![
         "Launch",
         "Dump",
         "Abort",
@@ -261,6 +314,47 @@ pub fn all_command_names() -> [&'static str; 9] {
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
+    ]
+}
+
+#[cfg(feature = "hitl_mode")]
+pub fn all_command_names() -> Vec<&'static str> {
+    vec![
+        "Launch",
+        "Dump",
+        "Abort",
+        "NormallyOpen",
+        "Pilot",
+        "Igniter",
+        "RetractPlumbing",
+        "Nitrogen",
+        "Nitrous",
+        "DeployParachute",
+        "ExpandParachute",
+        "ReinitSensors",
+        "LaunchSignal",
+        "EvaluationRelax",
+        "EvaluationFocus",
+        "EvaluationAbort",
+        "ReinitBarometer",
+        "EnableIMU",
+        "DisableIMU",
+        "MonitorAltitude",
+        "RevokeMonitorAltitude",
+        "ConsecutiveSamples",
+        "RevokeConsecutiveSamples",
+        "ResetFailures",
+        "RevokeResetFailures",
+        "ValidateMeasms",
+        "RevokeValidateMeasms",
+        "AbortAfter15",
+        "AbortAfter40",
+        "AbortAfter70",
+        "ReinitAfter12",
+        "ReinitAfter26",
+        "ReinitAfter44",
+        "AdvanceFlightState",
+        "RewindFlightState",
     ]
 }
 

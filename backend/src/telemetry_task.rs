@@ -13,6 +13,8 @@ use sedsprintf_rs_2026::timesync::{
 use crate::gpio_panel::IGNITION_PIN;
 use crate::radio::RadioDevice;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
+#[cfg(feature = "hitl_mode")]
+use crate::rocket_commands::FlightComputerCommands;
 use crate::web::{FlightStateMsg, emit_warning};
 use groundstation_shared::Board;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
@@ -35,6 +37,100 @@ const DB_WORK_QUEUE_SIZE: usize = 8_192;
 const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
 const DB_BATCH_MAX_DEFAULT: usize = 256;
 const DB_BATCH_WAIT_MS_DEFAULT: u64 = 8;
+
+#[cfg(feature = "hitl_mode")]
+fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
+    Some(match cmd {
+        TelemetryCommand::DeployParachute => FlightComputerCommands::DeployParachute as u8,
+        TelemetryCommand::ExpandParachute => FlightComputerCommands::ExpandParachute as u8,
+        TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
+        TelemetryCommand::LaunchSignal => FlightComputerCommands::LaunchSignal as u8,
+        TelemetryCommand::EvaluationRelax => FlightComputerCommands::EvaluationRelax as u8,
+        TelemetryCommand::EvaluationFocus => FlightComputerCommands::EvaluationFocus as u8,
+        TelemetryCommand::EvaluationAbort => FlightComputerCommands::EvaluationAbort as u8,
+        TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
+        TelemetryCommand::EnableIMU => FlightComputerCommands::EnableIMU as u8,
+        TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
+        TelemetryCommand::MonitorAltitude => FlightComputerCommands::MonitorAltitude as u8,
+        TelemetryCommand::RevokeMonitorAltitude => {
+            FlightComputerCommands::RevokeMonitorAltitude as u8
+        }
+        TelemetryCommand::ConsecutiveSamples => FlightComputerCommands::ConsecutiveSamples as u8,
+        TelemetryCommand::RevokeConsecutiveSamples => {
+            FlightComputerCommands::RevokeConsecutiveSamples as u8
+        }
+        TelemetryCommand::ResetFailures => FlightComputerCommands::ResetFailures as u8,
+        TelemetryCommand::RevokeResetFailures => FlightComputerCommands::RevokeResetFailures as u8,
+        TelemetryCommand::ValidateMeasms => FlightComputerCommands::ValidateMeasms as u8,
+        TelemetryCommand::RevokeValidateMeasms => {
+            FlightComputerCommands::RevokeValidateMeasms as u8
+        }
+        TelemetryCommand::AbortAfter15 => FlightComputerCommands::AbortAfter15 as u8,
+        TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
+        TelemetryCommand::AbortAfter70 => FlightComputerCommands::AbortAfter70 as u8,
+        TelemetryCommand::ReinitAfter12 => FlightComputerCommands::ReinitAfter12 as u8,
+        TelemetryCommand::ReinitAfter26 => FlightComputerCommands::ReinitAfter26 as u8,
+        TelemetryCommand::ReinitAfter44 => FlightComputerCommands::ReinitAfter44 as u8,
+        _ => return None,
+    })
+}
+
+#[cfg(feature = "hitl_mode")]
+const HITL_FLIGHT_STATE_ORDER: [groundstation_shared::FlightState; 16] = [
+    groundstation_shared::FlightState::Startup,
+    groundstation_shared::FlightState::Idle,
+    groundstation_shared::FlightState::PreFill,
+    groundstation_shared::FlightState::FillTest,
+    groundstation_shared::FlightState::NitrogenFill,
+    groundstation_shared::FlightState::NitrousFill,
+    groundstation_shared::FlightState::Armed,
+    groundstation_shared::FlightState::Launch,
+    groundstation_shared::FlightState::Ascent,
+    groundstation_shared::FlightState::Coast,
+    groundstation_shared::FlightState::Apogee,
+    groundstation_shared::FlightState::ParachuteDeploy,
+    groundstation_shared::FlightState::Descent,
+    groundstation_shared::FlightState::Landed,
+    groundstation_shared::FlightState::Recovery,
+    groundstation_shared::FlightState::Aborted,
+];
+
+#[cfg(feature = "hitl_mode")]
+fn hitl_adjacent_flight_state(
+    current: groundstation_shared::FlightState,
+    delta: i32,
+) -> groundstation_shared::FlightState {
+    let idx = HITL_FLIGHT_STATE_ORDER
+        .iter()
+        .position(|s| *s == current)
+        .unwrap_or(0) as i32;
+    let next_idx = (idx + delta).clamp(0, (HITL_FLIGHT_STATE_ORDER.len() - 1) as i32) as usize;
+    HITL_FLIGHT_STATE_ORDER[next_idx]
+}
+
+#[cfg(feature = "hitl_mode")]
+async fn set_local_flight_state_for_hitl(
+    state: &Arc<AppState>,
+    next_state: groundstation_shared::FlightState,
+) {
+    {
+        let mut fs = state.state.lock().unwrap();
+        *fs = next_state;
+    }
+    let _ = state.state_tx.send(FlightStateMsg { state: next_state });
+    state.begin_db_write();
+    let db = state.db.clone();
+    let state_for_task = state.clone();
+    let ts_ms = get_current_timestamp_ms() as i64;
+    tokio::spawn(async move {
+        let _ = sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
+            .bind(ts_ms)
+            .bind(next_state as i64)
+            .execute(&db)
+            .await;
+        state_for_task.end_db_write();
+    });
+}
 
 static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
@@ -675,6 +771,52 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Nitrous command", e);
                                 }
                                 println!("Nitrous command sent: {:?}", cmd);
+                        }
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::AdvanceFlightState => {
+                                let current = *state.state.lock().unwrap();
+                                let next = hitl_adjacent_flight_state(current, 1);
+                                set_local_flight_state_for_hitl(&state, next).await;
+                                println!("HITL flight state advanced: {:?} -> {:?}", current, next);
+                        }
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::RewindFlightState => {
+                                let current = *state.state.lock().unwrap();
+                                let next = hitl_adjacent_flight_state(current, -1);
+                                set_local_flight_state_for_hitl(&state, next).await;
+                                println!("HITL flight state rewound: {:?} -> {:?}", current, next);
+                        }
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::DeployParachute
+                        | TelemetryCommand::ExpandParachute
+                        | TelemetryCommand::ReinitSensors
+                        | TelemetryCommand::LaunchSignal
+                        | TelemetryCommand::EvaluationRelax
+                        | TelemetryCommand::EvaluationFocus
+                        | TelemetryCommand::EvaluationAbort
+                        | TelemetryCommand::ReinitBarometer
+                        | TelemetryCommand::EnableIMU
+                        | TelemetryCommand::DisableIMU
+                        | TelemetryCommand::MonitorAltitude
+                        | TelemetryCommand::RevokeMonitorAltitude
+                        | TelemetryCommand::ConsecutiveSamples
+                        | TelemetryCommand::RevokeConsecutiveSamples
+                        | TelemetryCommand::ResetFailures
+                        | TelemetryCommand::RevokeResetFailures
+                        | TelemetryCommand::ValidateMeasms
+                        | TelemetryCommand::RevokeValidateMeasms
+                        | TelemetryCommand::AbortAfter15
+                        | TelemetryCommand::AbortAfter40
+                        | TelemetryCommand::AbortAfter70
+                        | TelemetryCommand::ReinitAfter12
+                        | TelemetryCommand::ReinitAfter26
+                        | TelemetryCommand::ReinitAfter44 => {
+                                if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
+                                    if let Err(e) = router.log_queue(DataType::FlightCommand, &[cmd_id]) {
+                                        log_telemetry_error("failed to log HITL flight command", e);
+                                    }
+                                    println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
+                                }
                         }
                     }
                 }

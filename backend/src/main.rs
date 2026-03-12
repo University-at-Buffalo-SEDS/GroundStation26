@@ -23,7 +23,7 @@ use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
 use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
-#[cfg(feature = "testing")]
+#[cfg(any(feature = "testing", feature = "hitl_mode"))]
 use crate::radio::DummyRadio;
 use crate::radio::{RADIO_BAUD_RATE, ROCKET_RADIO_PORT, Radio, RadioDevice, UMBILICAL_RADIO_PORT};
 use axum::Router;
@@ -38,7 +38,7 @@ use sqlx::{Connection, Row};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::time::Duration;
@@ -386,6 +386,8 @@ async fn main() -> anyhow::Result<()> {
         action_policy_tx,
         last_command_ms: Arc::new(Mutex::new(HashMap::new())),
         recent_telemetry_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        av_bay_radio_connected: Arc::new(AtomicBool::new(false)),
+        fill_radio_connected: Arc::new(AtomicBool::new(false)),
     });
 
     gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
@@ -437,39 +439,61 @@ async fn main() -> anyhow::Result<()> {
     ]);
 
     // --- Radios ---
-    let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
+    let (rocket_radio, av_bay_radio_connected): (Arc<Mutex<Box<dyn RadioDevice>>>, bool) =
         match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUD_RATE) {
             Ok(r) => {
                 println!("Rocket radio online");
-                Arc::new(Mutex::new(Box::new(r)))
+                (Arc::new(Mutex::new(Box::new(r))), true)
             }
             Err(e) => {
                 println!("Rocket radio missing, using DummyRadio: {}", e);
                 #[cfg(feature = "testing")]
                 {
-                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio"))))
+                    (Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))), false)
+                }
+                #[cfg(all(not(feature = "testing"), feature = "hitl_mode"))]
+                {
+                    (Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))), false)
                 }
                 #[cfg(not(feature = "testing"))]
+                #[cfg(not(feature = "hitl_mode"))]
                 panic!("Rocket radio missing and testing mode not enabled")
             }
         };
 
-    let umbilical_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
+    let (umbilical_radio, fill_radio_connected): (Arc<Mutex<Box<dyn RadioDevice>>>, bool) =
         match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUD_RATE) {
             Ok(r) => {
                 println!("Umbilical radio online");
-                Arc::new(Mutex::new(Box::new(r)))
+                (Arc::new(Mutex::new(Box::new(r))), true)
             }
             Err(e) => {
                 println!("Umbilical radio missing, using DummyRadio: {}", e);
                 #[cfg(feature = "testing")]
                 {
-                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio"))))
+                    (
+                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio")))),
+                        false,
+                    )
+                }
+                #[cfg(all(not(feature = "testing"), feature = "hitl_mode"))]
+                {
+                    (
+                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio")))),
+                        false,
+                    )
                 }
                 #[cfg(not(feature = "testing"))]
+                #[cfg(not(feature = "hitl_mode"))]
                 panic!("Umbilical radio missing and testing mode not enabled")
             }
         };
+    state
+        .av_bay_radio_connected
+        .store(av_bay_radio_connected, Ordering::Relaxed);
+    state
+        .fill_radio_connected
+        .store(fill_radio_connected, Ordering::Relaxed);
 
     let router = Arc::new(sedsprintf_rs_2026::router::Router::new(
         RouterMode::Relay,

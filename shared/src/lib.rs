@@ -14,6 +14,58 @@ pub enum TelemetryCommand {
     RetractPlumbing,
     Nitrogen,
     Nitrous,
+    #[cfg(feature = "hitl_mode")]
+    DeployParachute,
+    #[cfg(feature = "hitl_mode")]
+    ExpandParachute,
+    #[cfg(feature = "hitl_mode")]
+    ReinitSensors,
+    #[cfg(feature = "hitl_mode")]
+    LaunchSignal,
+    #[cfg(feature = "hitl_mode")]
+    EvaluationRelax,
+    #[cfg(feature = "hitl_mode")]
+    EvaluationFocus,
+    #[cfg(feature = "hitl_mode")]
+    EvaluationAbort,
+    #[cfg(feature = "hitl_mode")]
+    ReinitBarometer,
+    #[cfg(feature = "hitl_mode")]
+    EnableIMU,
+    #[cfg(feature = "hitl_mode")]
+    DisableIMU,
+    #[cfg(feature = "hitl_mode")]
+    MonitorAltitude,
+    #[cfg(feature = "hitl_mode")]
+    RevokeMonitorAltitude,
+    #[cfg(feature = "hitl_mode")]
+    ConsecutiveSamples,
+    #[cfg(feature = "hitl_mode")]
+    RevokeConsecutiveSamples,
+    #[cfg(feature = "hitl_mode")]
+    ResetFailures,
+    #[cfg(feature = "hitl_mode")]
+    RevokeResetFailures,
+    #[cfg(feature = "hitl_mode")]
+    ValidateMeasms,
+    #[cfg(feature = "hitl_mode")]
+    RevokeValidateMeasms,
+    #[cfg(feature = "hitl_mode")]
+    AbortAfter15,
+    #[cfg(feature = "hitl_mode")]
+    AbortAfter40,
+    #[cfg(feature = "hitl_mode")]
+    AbortAfter70,
+    #[cfg(feature = "hitl_mode")]
+    ReinitAfter12,
+    #[cfg(feature = "hitl_mode")]
+    ReinitAfter26,
+    #[cfg(feature = "hitl_mode")]
+    ReinitAfter44,
+    #[cfg(feature = "hitl_mode")]
+    AdvanceFlightState,
+    #[cfg(feature = "hitl_mode")]
+    RewindFlightState,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]

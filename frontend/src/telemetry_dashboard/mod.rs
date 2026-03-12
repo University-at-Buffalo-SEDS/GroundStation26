@@ -1848,7 +1848,13 @@ fn TelemetryDashboardInner() -> Element {
                             layout: layout.connection_tab.clone(),
                         }
                     },
-                    MainTab::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
+                    MainTab::Map => rsx! {
+                        MapTab {
+                            key: "{*WS_EPOCH.read()}",
+                            rocket_gps: rocket_gps,
+                            user_gps: user_gps
+                        }
+                    },
                     MainTab::Actions => rsx! {
                         div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
                             ActionsTab { layout: layout.actions_tab.clone(), action_policy: action_policy }
