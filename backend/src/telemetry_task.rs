@@ -1,5 +1,6 @@
 use crate::flight_sim;
 use crate::layout;
+use crate::loadcell;
 use crate::state::AppState;
 use groundstation_shared::TelemetryRow;
 use groundstation_shared::{TelemetryCommand, u8_to_flight_state};
@@ -12,6 +13,8 @@ use sedsprintf_rs_2026::timesync::{
 
 use crate::gpio_panel::IGNITION_PIN;
 use crate::radio::RadioDevice;
+#[cfg(feature = "hitl_mode")]
+use crate::rocket_commands::FlightComputerCommands;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 use crate::web::{FlightStateMsg, emit_warning};
 use groundstation_shared::Board;
@@ -35,6 +38,100 @@ const DB_WORK_QUEUE_SIZE: usize = 8_192;
 const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
 const DB_BATCH_MAX_DEFAULT: usize = 256;
 const DB_BATCH_WAIT_MS_DEFAULT: u64 = 8;
+
+#[cfg(feature = "hitl_mode")]
+fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
+    Some(match cmd {
+        TelemetryCommand::DeployParachute => FlightComputerCommands::DeployParachute as u8,
+        TelemetryCommand::ExpandParachute => FlightComputerCommands::ExpandParachute as u8,
+        TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
+        TelemetryCommand::LaunchSignal => FlightComputerCommands::LaunchSignal as u8,
+        TelemetryCommand::EvaluationRelax => FlightComputerCommands::EvaluationRelax as u8,
+        TelemetryCommand::EvaluationFocus => FlightComputerCommands::EvaluationFocus as u8,
+        TelemetryCommand::EvaluationAbort => FlightComputerCommands::EvaluationAbort as u8,
+        TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
+        TelemetryCommand::EnableIMU => FlightComputerCommands::EnableIMU as u8,
+        TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
+        TelemetryCommand::MonitorAltitude => FlightComputerCommands::MonitorAltitude as u8,
+        TelemetryCommand::RevokeMonitorAltitude => {
+            FlightComputerCommands::RevokeMonitorAltitude as u8
+        }
+        TelemetryCommand::ConsecutiveSamples => FlightComputerCommands::ConsecutiveSamples as u8,
+        TelemetryCommand::RevokeConsecutiveSamples => {
+            FlightComputerCommands::RevokeConsecutiveSamples as u8
+        }
+        TelemetryCommand::ResetFailures => FlightComputerCommands::ResetFailures as u8,
+        TelemetryCommand::RevokeResetFailures => FlightComputerCommands::RevokeResetFailures as u8,
+        TelemetryCommand::ValidateMeasms => FlightComputerCommands::ValidateMeasms as u8,
+        TelemetryCommand::RevokeValidateMeasms => {
+            FlightComputerCommands::RevokeValidateMeasms as u8
+        }
+        TelemetryCommand::AbortAfter15 => FlightComputerCommands::AbortAfter15 as u8,
+        TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
+        TelemetryCommand::AbortAfter70 => FlightComputerCommands::AbortAfter70 as u8,
+        TelemetryCommand::ReinitAfter12 => FlightComputerCommands::ReinitAfter12 as u8,
+        TelemetryCommand::ReinitAfter26 => FlightComputerCommands::ReinitAfter26 as u8,
+        TelemetryCommand::ReinitAfter44 => FlightComputerCommands::ReinitAfter44 as u8,
+        _ => return None,
+    })
+}
+
+#[cfg(feature = "hitl_mode")]
+const HITL_FLIGHT_STATE_ORDER: [groundstation_shared::FlightState; 16] = [
+    groundstation_shared::FlightState::Startup,
+    groundstation_shared::FlightState::Idle,
+    groundstation_shared::FlightState::PreFill,
+    groundstation_shared::FlightState::FillTest,
+    groundstation_shared::FlightState::NitrogenFill,
+    groundstation_shared::FlightState::NitrousFill,
+    groundstation_shared::FlightState::Armed,
+    groundstation_shared::FlightState::Launch,
+    groundstation_shared::FlightState::Ascent,
+    groundstation_shared::FlightState::Coast,
+    groundstation_shared::FlightState::Apogee,
+    groundstation_shared::FlightState::ParachuteDeploy,
+    groundstation_shared::FlightState::Descent,
+    groundstation_shared::FlightState::Landed,
+    groundstation_shared::FlightState::Recovery,
+    groundstation_shared::FlightState::Aborted,
+];
+
+#[cfg(feature = "hitl_mode")]
+fn hitl_adjacent_flight_state(
+    current: groundstation_shared::FlightState,
+    delta: i32,
+) -> groundstation_shared::FlightState {
+    let idx = HITL_FLIGHT_STATE_ORDER
+        .iter()
+        .position(|s| *s == current)
+        .unwrap_or(0) as i32;
+    let next_idx = (idx + delta).clamp(0, (HITL_FLIGHT_STATE_ORDER.len() - 1) as i32) as usize;
+    HITL_FLIGHT_STATE_ORDER[next_idx]
+}
+
+#[cfg(feature = "hitl_mode")]
+async fn set_local_flight_state_for_hitl(
+    state: &Arc<AppState>,
+    next_state: groundstation_shared::FlightState,
+) {
+    {
+        let mut fs = state.state.lock().unwrap();
+        *fs = next_state;
+    }
+    let _ = state.state_tx.send(FlightStateMsg { state: next_state });
+    state.begin_db_write();
+    let db = state.db.clone();
+    let state_for_task = state.clone();
+    let ts_ms = get_current_timestamp_ms() as i64;
+    tokio::spawn(async move {
+        let _ = sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
+            .bind(ts_ms)
+            .bind(next_state as i64)
+            .execute(&db)
+            .await;
+        state_for_task.end_db_write();
+    });
+}
 
 static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
@@ -269,6 +366,7 @@ fn telemetry_values_json(values: &[Option<f32>]) -> Option<String> {
     .ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_derived_battery_rows(
     state: &Arc<AppState>,
     db_tx: &mpsc::Sender<DbWrite>,
@@ -337,6 +435,62 @@ async fn emit_derived_battery_rows(
             state.cache_recent_telemetry(row.clone());
             let _ = state.ws_tx.send(row);
         }
+    }
+}
+
+async fn emit_derived_loadcell_rows(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbWrite>,
+    db_overflow: &DbOverflow,
+    ts_ms: i64,
+    sender_id: &str,
+    raw_kg1000: f32,
+    payload_json: &str,
+) {
+    let cfg = state.loadcell_calibration.lock().unwrap().clone();
+    let Some(weight_kg) =
+        loadcell::calibrated_weight_kg(&cfg, loadcell::RAW_LOADCELL_DATA_TYPE_1000KG, raw_kg1000)
+    else {
+        return;
+    };
+    let percent = loadcell::fill_percent(&cfg, weight_kg);
+    {
+        let mut latest = state.latest_fill_mass_kg.lock().unwrap();
+        *latest = Some(weight_kg);
+    }
+
+    let rows: [(&str, Vec<Option<f32>>); 2] = [
+        (loadcell::DERIVED_WEIGHT_DATA_TYPE, vec![Some(weight_kg)]),
+        (
+            loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
+            vec![Some(percent)],
+        ),
+    ];
+
+    for (data_type, values) in rows {
+        if should_persist_telemetry_sample(data_type, ts_ms) {
+            queue_db_write(
+                state,
+                db_tx,
+                db_overflow,
+                DbWrite::Telemetry {
+                    timestamp_ms: ts_ms,
+                    data_type: data_type.to_string(),
+                    sender_id: sender_id.to_string(),
+                    values_json: telemetry_values_json(&values),
+                    payload_json: payload_json.to_string(),
+                },
+            )
+            .await;
+        }
+
+        let row = TelemetryRow {
+            timestamp_ms: ts_ms,
+            data_type: data_type.to_string(),
+            values,
+        };
+        state.cache_recent_telemetry(row.clone());
+        let _ = state.ws_tx.send(row);
     }
 }
 
@@ -650,6 +804,15 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Nitrogen command", e);
                                 }
                                 println!("Nitrogen command sent {:?}", cmd);
+                            }
+                        TelemetryCommand::NitrogenClose => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::ActuatorCommand,
+                                    &[ActuatorBoardCommands::NitrogenClose as u8],
+                                ) {
+                                    log_telemetry_error("failed to log NitrogenClose command", e);
+                                }
+                                println!("Nitrogen explicit close command sent");
                             }
                         TelemetryCommand::RetractPlumbing => {
                                 if let Err(e) = router.log_queue(
@@ -1316,6 +1479,19 @@ async fn handle_packet(
                 &payload_json,
             )
             .await;
+
+            if data_type_str == loadcell::RAW_LOADCELL_DATA_TYPE_1000KG {
+                emit_derived_loadcell_rows(
+                    state,
+                    db_tx,
+                    db_overflow,
+                    derived_ts_ms,
+                    pkt.sender(),
+                    voltage,
+                    &payload_json,
+                )
+                .await;
+            }
         }
 
         let row = TelemetryRow {

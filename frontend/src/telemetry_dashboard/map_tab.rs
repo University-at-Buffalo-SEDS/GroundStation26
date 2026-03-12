@@ -211,7 +211,7 @@ pub fn MapTab(
         if *is_fullscreen.read() {
             div { style: "position:fixed; inset:0; z-index:9999; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
                 div { style: "display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:space-between;",
-                    h2 { style: "margin:0; color:#22c55e;", "Launch Site Map" }
+                    h2 { style: "margin:0; color:#22c55e;", "Rocket Map" }
                     div { style: "display:flex; gap:8px; flex-wrap:wrap;",
                         button {
                             style: "padding:6px 12px; border-radius:999px; border:1px solid #22c55e; background:#022c22; color:#bbf7d0; font-size:0.85rem; cursor:pointer;",

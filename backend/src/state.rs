@@ -1,4 +1,5 @@
 use crate::gpio::GpioPins;
+use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
 use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
@@ -8,7 +9,7 @@ use groundstation_shared::{
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
@@ -64,6 +65,12 @@ pub struct AppState {
     /// Latest fuel tank pressure (psi)
     pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
 
+    /// Latest calibrated fill-mass estimate from 1000kg loadcell.
+    pub latest_fill_mass_kg: Arc<Mutex<Option<f32>>>,
+
+    /// Loadcell calibration data loaded from JSON and editable at runtime.
+    pub loadcell_calibration: Arc<Mutex<LoadcellCalibrationFile>>,
+
     /// Broadcast shutdown notifications to long-running background tasks.
     pub shutdown_tx: broadcast::Sender<()>,
 
@@ -93,6 +100,12 @@ pub struct AppState {
 
     /// In-memory recent telemetry cache used to bridge DB write lag during reseed.
     pub recent_telemetry_cache: Arc<Mutex<VecDeque<TelemetryRow>>>,
+
+    /// Whether the av-bay (rocket) radio link is physically present.
+    pub av_bay_radio_connected: Arc<AtomicBool>,
+
+    /// Whether the fill-system (umbilical) radio link is physically present.
+    pub fill_radio_connected: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -268,7 +281,12 @@ impl AppState {
     }
 
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
-        if matches!(cmd, TelemetryCommand::Abort) {
+        if matches!(
+            cmd,
+            TelemetryCommand::Abort
+                | TelemetryCommand::NitrogenClose
+                | TelemetryCommand::NitrousClose
+        ) {
             return true;
         }
         let name = command_name(cmd);

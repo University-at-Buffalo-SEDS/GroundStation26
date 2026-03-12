@@ -1,0 +1,610 @@
+{
+  "version": 1,
+  "connection_tab": {
+    "sections": [
+      {
+        "kind": "board_status",
+        "title": "Board Status"
+      },
+      {
+        "kind": "latency",
+        "title": "Packet Age (ms)"
+      }
+    ]
+  },
+  "actions_tab": {
+    "actions": [
+      {
+        "label": "Launch",
+        "cmd": "Launch",
+        "border": "#22c55e",
+        "bg": "#022c22",
+        "fg": "#bbf7d0"
+      },
+      {
+        "label": "Dump",
+        "cmd": "Dump",
+        "border": "#ef4444",
+        "bg": "#450a0a",
+        "fg": "#fecaca"
+      },
+      {
+        "label": "Igniter",
+        "cmd": "Igniter",
+        "border": "#60a5fa",
+        "bg": "#0b1220",
+        "fg": "#bfdbfe"
+      },
+      {
+        "label": "Pilot",
+        "cmd": "Pilot",
+        "border": "#a78bfa",
+        "bg": "#111827",
+        "fg": "#ddd6fe"
+      },
+      {
+        "label": "NormallyOpen",
+        "cmd": "NormallyOpen",
+        "border": "#f97316",
+        "bg": "#1f2937",
+        "fg": "#ffedd5"
+      },
+      {
+        "label": "Nitrogen",
+        "cmd": "Nitrogen",
+        "border": "#22d3ee",
+        "bg": "#0b1220",
+        "fg": "#cffafe"
+      },
+      {
+        "label": "Nitrous",
+        "cmd": "Nitrous",
+        "border": "#a3e635",
+        "bg": "#111827",
+        "fg": "#ecfccb"
+      },
+      {
+        "label": "Fill Lines",
+        "cmd": "RetractPlumbing",
+        "border": "#eab308",
+        "bg": "#1f2937",
+        "fg": "#fef9c3"
+      },
+      {
+        "label": "Flight State +1",
+        "cmd": "AdvanceFlightState",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Flight State -1",
+        "cmd": "RewindFlightState",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Deploy Parachute",
+        "cmd": "DeployParachute",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Expand Parachute",
+        "cmd": "ExpandParachute",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Reinit Sensors",
+        "cmd": "ReinitSensors",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Launch Signal",
+        "cmd": "LaunchSignal",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Evaluation Relax",
+        "cmd": "EvaluationRelax",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Evaluation Focus",
+        "cmd": "EvaluationFocus",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Evaluation Abort",
+        "cmd": "EvaluationAbort",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Reinit Barometer",
+        "cmd": "ReinitBarometer",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Enable IMU",
+        "cmd": "EnableIMU",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Disable IMU",
+        "cmd": "DisableIMU",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Monitor Altitude",
+        "cmd": "MonitorAltitude",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Revoke Monitor Alt",
+        "cmd": "RevokeMonitorAltitude",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Consecutive Samples",
+        "cmd": "ConsecutiveSamples",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Revoke Consecutive",
+        "cmd": "RevokeConsecutiveSamples",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Reset Failures",
+        "cmd": "ResetFailures",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Revoke Reset Fail",
+        "cmd": "RevokeResetFailures",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Validate Measms",
+        "cmd": "ValidateMeasms",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Revoke Validate",
+        "cmd": "RevokeValidateMeasms",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Abort After 15",
+        "cmd": "AbortAfter15",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Abort After 40",
+        "cmd": "AbortAfter40",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Abort After 70",
+        "cmd": "AbortAfter70",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Reinit After 12",
+        "cmd": "ReinitAfter12",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Reinit After 26",
+        "cmd": "ReinitAfter26",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Reinit After 44",
+        "cmd": "ReinitAfter44",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      }
+    ]
+  },
+  "data_tab": {
+    "tabs": [
+      {
+        "id": "GYRO_DATA",
+        "label": "GYRO_DATA",
+        "channels": [
+          "Roll",
+          "Pitch",
+          "Yaw"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "ACCEL_DATA",
+        "label": "ACCEL_DATA",
+        "channels": [
+          "X Accel",
+          "Y Accel",
+          "Z Accel"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "BAROMETER_DATA",
+        "label": "BAROMETER_DATA",
+        "channels": [
+          "Pressure",
+          "Temp",
+          "Altitude"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "KALMAN_FILTER_DATA",
+        "label": "KALMAN_FILTER_DATA",
+        "channels": [
+          "X",
+          "Y",
+          "Z"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "GPS_DATA",
+        "label": "GPS_DATA",
+        "channels": [
+          "Lat",
+          "Lon"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "FUEL_TANK_PRESSURE",
+        "label": "FUEL_TANK_PRESSURE",
+        "channels": [
+          "Tank Pressure"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "BATTERY_VOLTAGE",
+        "label": "BATTERY_VOLTAGE",
+        "channels": [
+          "Voltage"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "BATTERY_CURRENT",
+        "label": "BATTERY_CURRENT",
+        "channels": [
+          "Current"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "FUEL_FLOW",
+        "label": "FUEL_FLOW",
+        "channels": [
+          "Flow Rate"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "VALVE_STATE",
+        "label": "VALVE_STATE",
+        "channels": [
+          "Pilot",
+          "NormallyOpen",
+          "Dump",
+          "Igniter",
+          "Nitrogen",
+          "Nitrous",
+          "Fill Lines"
+        ],
+        "chart": {
+          "enabled": false
+        },
+        "boolean_labels": {
+          "true_label": "Open",
+          "false_label": "Closed",
+          "unknown_label": "Unknown"
+        },
+        "channel_boolean_labels": [
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Open",
+            "false_label": "Closed",
+            "unknown_label": "Unknown"
+          },
+          {
+            "true_label": "Removed",
+            "false_label": "Installed",
+            "unknown_label": "Unknown"
+          }
+        ]
+      },
+      {
+        "id": "AV_BAY_BATTERY_PERCENT",
+        "label": "AV_BAY_BATTERY_PERCENT",
+        "channels": [
+          "Percent"
+        ],
+        "chart": {
+          "enabled": false
+        }
+      },
+      {
+        "id": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+        "label": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+        "channels": [
+          "Drop Rate (V/min)"
+        ],
+        "chart": {
+          "enabled": false
+        }
+      },
+      {
+        "id": "AV_BAY_BATTERY_REMAINING_MINUTES",
+        "label": "AV_BAY_BATTERY_REMAINING_MINUTES",
+        "channels": [
+          "Remaining Minutes"
+        ],
+        "chart": {
+          "enabled": false
+        }
+      },
+      {
+        "id": "GROUND_STATION_BATTERY_PERCENT",
+        "label": "GROUND_STATION_BATTERY_PERCENT",
+        "channels": [
+          "Percent"
+        ],
+        "chart": {
+          "enabled": false
+        }
+      },
+      {
+        "id": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+        "label": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+        "channels": [
+          "Drop Rate (V/min)"
+        ],
+        "chart": {
+          "enabled": false
+        }
+      },
+      {
+        "id": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+        "label": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+        "channels": [
+          "Remaining Minutes"
+        ],
+        "chart": {
+          "enabled": false
+        }
+      },
+      {
+        "id": "KG1000",
+        "label": "KG1000",
+        "channels": [
+          "Raw Loadcell"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "LOADCELL_WEIGHT_KG",
+        "label": "LOADCELL_WEIGHT_KG",
+        "channels": [
+          "Weight (kg)"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "LOADCELL_FILL_PERCENT",
+        "label": "LOADCELL_FILL_PERCENT",
+        "channels": [
+          "Fill %"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      }
+    ]
+  },
+  "state_tab": {
+    "states": [
+      {
+        "states": [
+          "Startup",
+          "Idle",
+          "PreFill",
+          "FillTest",
+          "NitrogenFill",
+          "NitrousFill",
+          "Armed",
+          "Launch",
+          "Ascent",
+          "Coast",
+          "Apogee",
+          "ParachuteDeploy",
+          "Descent",
+          "Landed",
+          "Recovery",
+          "Aborted"
+        ],
+        "sections": [
+          {
+            "title": "Actions",
+            "widgets": [
+              {
+                "kind": "actions",
+                "actions": [
+                  "Launch",
+                  "Dump",
+                  "Igniter",
+                  "Pilot",
+                  "NormallyOpen",
+                  "Nitrogen",
+                  "Nitrous",
+                  "RetractPlumbing",
+                  "AdvanceFlightState",
+                  "RewindFlightState",
+                  "DeployParachute",
+                  "ExpandParachute",
+                  "ReinitSensors",
+                  "LaunchSignal",
+                  "EvaluationRelax",
+                  "EvaluationFocus",
+                  "EvaluationAbort",
+                  "ReinitBarometer",
+                  "EnableIMU",
+                  "DisableIMU",
+                  "MonitorAltitude",
+                  "RevokeMonitorAltitude",
+                  "ConsecutiveSamples",
+                  "RevokeConsecutiveSamples",
+                  "ResetFailures",
+                  "RevokeResetFailures",
+                  "ValidateMeasms",
+                  "RevokeValidateMeasms",
+                  "AbortAfter15",
+                  "AbortAfter40",
+                  "AbortAfter70",
+                  "ReinitAfter12",
+                  "ReinitAfter26",
+                  "ReinitAfter44"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "battery": {
+    "estimator": {
+      "window_seconds": 300,
+      "min_drop_rate_v_per_min": 0.005
+    },
+    "sources": [
+      {
+        "id": "av_bay",
+        "label": "AV Bay Battery",
+        "sender_id": "PB",
+        "input_data_type": "BATTERY_VOLTAGE",
+        "percent_data_type": "AV_BAY_BATTERY_PERCENT",
+        "drop_rate_data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+        "remaining_minutes_data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
+        "empty_voltage": 6.3,
+        "full_voltage": 8.4,
+        "curve_exponent": 1.0
+      },
+      {
+        "id": "ground_station",
+        "label": "Ground Station Battery",
+        "sender_id": "GW",
+        "input_data_type": "BATTERY_VOLTAGE",
+        "percent_data_type": "GROUND_STATION_BATTERY_PERCENT",
+        "drop_rate_data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+        "remaining_minutes_data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+        "empty_voltage": 13.3,
+        "full_voltage": 15.5,
+        "curve_exponent": 1.0
+      }
+    ]
+  }
+}

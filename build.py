@@ -1435,13 +1435,16 @@ def build_frontend(
 ) -> None:
     try:
         public_dir = frontend_dir / "dist" / "public"
-        if public_dir.exists():
+        is_web_build = platform_name in {None, "web"}
+
+        if is_web_build and public_dir.exists():
             print(f"Removing existing public artifacts: {public_dir}")
             shutil.rmtree(public_dir)
-        if platform_name in {None, "web"}:
+        if is_web_build:
             _clear_dx_web_cache(frontend_dir)
 
-        clear_app_bundle(frontend_dir)
+        if not is_web_build:
+            clear_app_bundle(frontend_dir)
 
         env = _dx_bundle_env(frontend_dir) if (is_container() or in_docker_build()) else None
 
@@ -1553,6 +1556,7 @@ def build_backend(
         force_pi: bool,
         force_no_pi: bool,
         testing_mode: bool,
+        hitl_mode: bool,
         debug_mode: bool = False,
 ) -> None:
     cmd = ["cargo", "build", "-p", "groundstation_backend"]
@@ -1581,6 +1585,12 @@ def build_backend(
             cmd[cmd.index("--features") + 1] += ",testing"
         else:
             cmd.extend(["--features", "testing"])
+    if hitl_mode:
+        print("HITL mode enabled → adding `hitl_mode` feature.")
+        if "--features" in cmd:
+            cmd[cmd.index("--features") + 1] += ",hitl_mode"
+        else:
+            cmd.extend(["--features", "hitl_mode"])
 
     try:
         run(cmd, cwd=backend_dir)
@@ -1598,6 +1608,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py pi_build                # local: backend w/ raspberry_pi feature")
     print("  ./build.py no_pi                   # local: backend w/o raspberry_pi feature")
     print("  ./build.py testing                 # local: backend w/ testing feature")
+    print("  ./build.py hitl-mode               # local: backend w/ hitl_mode feature")
     print("  ./build.py debug                   # local: build frontend+backend in debug mode")
     print("  ./build.py max_size                # web wasm: add wasm-opt --converge (slower, smaller)")
     print("  ./build.py plain                   # docker only: pass --progress plain")
@@ -1649,6 +1660,7 @@ def main() -> None:
     force_no_pi = False
     docker_mode = False
     testing_mode = False
+    hitl_mode = False
     debug_mode = False
     max_size_mode = False
     plain_mode = False
@@ -1702,6 +1714,8 @@ def main() -> None:
             plain_mode = True
         elif arg == "testing":
             testing_mode = True
+        elif arg == "hitl-mode":
+            hitl_mode = True
         elif arg == "debug":
             debug_mode = True
         elif arg == "max_size":
@@ -1733,6 +1747,9 @@ def main() -> None:
     if force_pi and force_no_pi:
         print("Error: Cannot specify both 'pi_build' and 'no_pi'.", file=sys.stderr)
         sys.exit(1)
+    if testing_mode and hitl_mode:
+        print("Error: Cannot specify both 'testing' and 'hitl-mode'.", file=sys.stderr)
+        sys.exit(1)
 
     repo_root = Path(__file__).resolve().parent
     frontend_dir = repo_root / "frontend"
@@ -1748,8 +1765,8 @@ def main() -> None:
         print(f"Logging command output to: {LOG_FILE}")
 
     if action:
-        if docker_mode or force_pi or force_no_pi or testing_mode:
-            print("Error: Frontend actions cannot be combined with docker/pi_build/no_pi/testing.", file=sys.stderr)
+        if docker_mode or force_pi or force_no_pi or testing_mode or hitl_mode:
+            print("Error: Frontend actions cannot be combined with docker/pi_build/no_pi/testing/hitl-mode.", file=sys.stderr)
             print_usage()
 
         if action == "ios_deploy":
@@ -1851,8 +1868,8 @@ def main() -> None:
         sys.exit(1)
 
     if frontend_only_platform is not None:
-        if docker_mode or force_pi or force_no_pi or testing_mode:
-            print("Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing.", file=sys.stderr)
+        if docker_mode or force_pi or force_no_pi or testing_mode or hitl_mode:
+            print("Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing/hitl-mode.", file=sys.stderr)
             print_usage()
         if use_existing:
             print("Skipping frontend build (existing requested).")
@@ -1870,10 +1887,13 @@ def main() -> None:
         if docker_mode:
             print("Error: backend_only cannot be combined with docker mode.", file=sys.stderr)
             print_usage()
-        build_backend(backend_dir, force_pi, force_no_pi, testing_mode, debug_mode)
+        build_backend(backend_dir, force_pi, force_no_pi, testing_mode, hitl_mode, debug_mode)
         return
 
     if docker_mode:
+        if hitl_mode:
+            print("Error: docker mode currently does not support 'hitl-mode'.", file=sys.stderr)
+            sys.exit(1)
         if force_no_pi:
             pi_build_flag = False
         else:
@@ -1890,7 +1910,7 @@ def main() -> None:
     if in_docker_build():
         print("Sequential build")
         build_frontend(frontend_dir, None, debug_mode=debug_mode, max_size=max_size_mode)
-        build_backend(backend_dir, force_pi, force_no_pi, testing_mode, debug_mode)
+        build_backend(backend_dir, force_pi, force_no_pi, testing_mode, hitl_mode, debug_mode)
         return
 
     bfe = mp.Process(
@@ -1900,7 +1920,7 @@ def main() -> None:
     )
     bbe = mp.Process(
         target=build_backend,
-        args=(backend_dir, force_pi, force_no_pi, testing_mode, debug_mode),
+        args=(backend_dir, force_pi, force_no_pi, testing_mode, hitl_mode, debug_mode),
     )
     bfe.start()
     bbe.start()

@@ -6,6 +6,8 @@ use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "hitl_mode")]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio::time::{Duration, sleep};
@@ -123,6 +125,29 @@ fn battery_voltage_bounds_by_sender() -> &'static HashMap<String, (f32, f32)> {
     })
 }
 
+#[cfg(feature = "hitl_mode")]
+fn ignore_missing_board_in_hitl(state: &AppState, board: Board) -> bool {
+    let av_link_up = state.av_bay_radio_connected.load(Ordering::Relaxed);
+    let fill_link_up = state.fill_radio_connected.load(Ordering::Relaxed);
+    if !av_link_up
+        && matches!(
+            board,
+            Board::FlightComputer | Board::RFBoard | Board::PowerBoard | Board::DaqBoard
+        )
+    {
+        return true;
+    }
+    if !fill_link_up
+        && matches!(
+            board,
+            Board::ValveBoard | Board::ActuatorBoard | Board::GatewayBoard
+        )
+    {
+        return true;
+    }
+    false
+}
+
 async fn insert_flight_state_with_retry(
     db: &SqlitePool,
     timestamp_ms: i64,
@@ -207,6 +232,12 @@ pub async fn safety_task(
         let all_boards_seen = {
             let mut board_status = state.board_status.lock().unwrap();
             for (board, status) in board_status.iter_mut() {
+                #[cfg(feature = "hitl_mode")]
+                if ignore_missing_board_in_hitl(&state, *board) {
+                    status.warned = false;
+                    continue;
+                }
+
                 let offline = match status.last_seen_ms {
                     Some(last_seen_ms) => now_ms.saturating_sub(last_seen_ms) > BOARD_TIMEOUT_MS,
                     None => true,
@@ -253,9 +284,16 @@ pub async fn safety_task(
                     status.warned = false;
                 }
             }
-            board_status
-                .values()
-                .all(|status| status.last_seen_ms.is_some())
+            Board::ALL.iter().all(|board| {
+                #[cfg(feature = "hitl_mode")]
+                if ignore_missing_board_in_hitl(&state, *board) {
+                    return true;
+                }
+                board_status
+                    .get(board)
+                    .and_then(|s| s.last_seen_ms)
+                    .is_some()
+            })
         };
 
         for warning in board_warnings {
@@ -269,7 +307,8 @@ pub async fn safety_task(
             .board_status_tx
             .send(state.board_status_snapshot(now_ms));
 
-        if current_state == FlightState::Startup && all_boards_seen {
+        if current_state == FlightState::Startup && all_boards_seen && !cfg!(feature = "hitl_mode")
+        {
             let should_advance = {
                 let mut fs = state.state.lock().unwrap();
                 if *fs == FlightState::Startup {
@@ -445,14 +484,13 @@ pub async fn safety_task(
                 DataType::BatteryVoltage => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
                     // Voltage
-                    if let Some(voltage) = values.first() {
-                        if let Some((min_v, max_v)) = battery_voltage_bounds_by_sender()
+                    if let Some(voltage) = values.first()
+                        && let Some((min_v, max_v)) = battery_voltage_bounds_by_sender()
                             .get(pkt.sender())
                             .copied()
-                            && ((*voltage < min_v) || (*voltage > max_v))
-                        {
-                            cycle_warnings.insert("Critical: Battery voltage out of range!");
-                        }
+                        && ((*voltage < min_v) || (*voltage > max_v))
+                    {
+                        cycle_warnings.insert("Critical: Battery voltage out of range!");
                     }
                 }
 

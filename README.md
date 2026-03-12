@@ -1,40 +1,45 @@
 # Ground Station 2026
 
-## Required Dependencies,
+## Dependencies
 
-- Rust
+- Rust: install from https://rustup.rs/
+- `dioxus-cli`: install with `cargo install dioxus-cli`
 
-get it from https://rustup.rs/
+The frontend uses Dioxus. No separate WASM toolchain workflow is needed beyond the Rust targets used by `build.py`.
 
-- Dioxus (frontend framework; no separate install required)
+## Configuration
 
-- dioxus-cli
+- Set the device name in `.cargo/config.toml`.
+- Backend runtime data lives under `backend/data/`.
+- Loadcell calibration files live under `backend/calibration/`.
 
-install with `cargo install dioxus-cli`
+## Build
 
-## Setting up the DEVICE_IDENTIFIER
-
-- The device name can be set in the `.cargo/config.toml` file in the root directory of the project.
-
-## Usage
-
-The frontend is built with Dioxus (no direct wasm workflow required).
-After building, the backend needs to be behind a reverse proxy with ssl enabled for geolocation to work properly.
-If using docker compose,
-the provided `docker-compose.yml` file already generates a self-signed certificate for testing purposes.
-
-## Building
-
-Use `build.py` to build the frontend and backend:
+Build the default web frontend plus backend:
 
 ```bash
 python3 build.py
 ```
 
-Platform-specific frontend builds:
+Common local build modes:
 
 ```bash
-python3 build.py ios|macos|windows|android|linux
+python3 build.py testing
+python3 build.py hitl-mode
+python3 build.py backend_only
+python3 build.py frontend_web
+python3 build.py debug
+```
+
+Platform-specific frontend bundles:
+
+```bash
+python3 build.py ios
+python3 build.py ios_sim
+python3 build.py macos
+python3 build.py windows
+python3 build.py android
+python3 build.py linux
 ```
 
 Docker images:
@@ -42,26 +47,59 @@ Docker images:
 ```bash
 python3 build.py docker
 python3 build.py docker pi_build
+python3 build.py docker testing
 ```
 
-## Running
+Build output notes:
 
-Build the frontend and run the backend:
+- Web builds write to `frontend/dist/public`.
+- Native frontend bundles write to `frontend/dist/...`.
+- Web and native builds no longer delete each other's output directories.
+
+## Run
+
+Build the frontend, then run the backend:
 
 ```bash
 python3 run_groundstation.py
 ```
 
-Enable testing features:
+Enable simulator/testing mode:
+
+```bash
+python3 run_groundstation.py --testing
+```
+
+Enable HITL mode:
+
+```bash
+python3 run_groundstation.py --hitl-mode
+```
+
+Legacy positional forms still work:
 
 ```bash
 python3 run_groundstation.py testing
+python3 run_groundstation.py hitl-mode
 ```
 
-To download the map data run the provided python script:
+Mode notes:
+
+- `testing` enables the flight simulator and uses `backend/calibration/loadcell_calibration_testing.json`.
+- `hitl-mode` is for hardware-in-the-loop testing. It uses the HITL layout, ignores the key interlock, starts in `Startup`, and does not run the normal fill sequence state machine.
+
+## Frontend / Backend Notes
+
+- The frontend is served by the backend from `frontend/dist/public`.
+- For geolocation to work correctly in browsers, the backend should be behind HTTPS.
+- `docker-compose.yml` is set up for local TLS testing with a self-signed certificate.
+
+## Map Data
+
+Download map data with:
 
 ```bash
 python3 download_map.py
 ```
 
-This uses the `map_downloader/` crate to fetch map data into `data/` for the UI; rerun to refresh or replace the data.
+This uses the `map_downloader/` crate and writes map data into `data/`.

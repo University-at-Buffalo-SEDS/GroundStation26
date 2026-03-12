@@ -69,13 +69,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=["testing"],
-        help="Legacy positional mode. Use 'testing' to enable backend testing feature.",
+        choices=["testing", "hitl-mode"],
+        help="Legacy positional mode. Use 'testing' or 'hitl-mode' to enable backend features.",
     )
     parser.add_argument(
         "--testing",
         action="store_true",
         help="Enable backend 'testing' feature.",
+    )
+    parser.add_argument(
+        "--hitl-mode",
+        action="store_true",
+        help="Enable backend 'hitl_mode' feature.",
     )
     return parser.parse_args()
 
@@ -83,10 +88,19 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     testing_mode = args.testing or args.mode == "testing"
+    hitl_mode = args.hitl_mode or args.mode == "hitl-mode"
+    if testing_mode and hitl_mode:
+        print("Error: testing mode and hitl-mode are mutually exclusive.", file=sys.stderr)
+        sys.exit(2)
 
     cmd = ["cargo", "run", "--release", "-p", "groundstation_backend"]
+    features: list[str] = []
     if testing_mode:
-        cmd.extend(["--features", "testing"])
+        features.append("testing")
+    if hitl_mode:
+        features.append("hitl_mode")
+    if features:
+        cmd.extend(["--features", ",".join(features)])
     repo_root = Path(__file__).resolve().parent
     build.build_frontend(repo_root / "frontend")
     try:

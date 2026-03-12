@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "full_mass_kg": 10.0,
+  "ch0": {
+    "m": 1.0,
+    "b": 0.0
+  },
+  "ch1": {
+    "m": 1.0,
+    "b": 0.0
+  },
+  "iadc": {
+    "m": 1.0,
+    "b": 0.0
+  },
+  "ch0_zero_raw": null,
+  "ch1_zero_raw": 0.0,
+  "iadc_zero_raw": null,
+  "points": [],
+  "points_ch1": [
+    {
+      "kg": 0.0,
+      "ch1_raw": 0.0
+    },
+    {
+      "kg": 5.0,
+      "ch1_raw": 5.0
+    },
+    {
+      "kg": 10.0,
+      "ch1_raw": 10.0
+    }
+  ],
+  "points_iadc": [],
+  "ch0_fit": {
+    "type": "linear",
+    "a": null,
+    "b": null,
+    "c": null,
+    "d": null,
+    "x0": null
+  },
+  "ch1_fit": {
+    "type": "linear",
+    "a": null,
+    "b": null,
+    "c": null,
+    "d": null,
+    "x0": null
+  },
+  "iadc_fit": {
+    "type": "linear",
+    "a": null,
+    "b": null,
+    "c": null,
+    "d": null,
+    "x0": null
+  },
+  "weights_kg": [
+    5.0,
+    10.0
+  ]
+}

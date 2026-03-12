@@ -102,14 +102,14 @@ impl RadioDevice for Radio {
 // ======================================================================
 //  Dummy Radio (fallback when hardware missing)
 // ======================================================================
-#[cfg(feature = "testing")]
+#[cfg(any(feature = "testing", feature = "hitl_mode"))]
 #[derive(Debug)]
 pub struct DummyRadio {
     name: &'static str,
     side_id: Option<RouterSideId>,
 }
 
-#[cfg(feature = "testing")]
+#[cfg(any(feature = "testing", feature = "hitl_mode"))]
 
 impl DummyRadio {
     pub fn new(name: &'static str) -> Self {
@@ -120,16 +120,27 @@ impl DummyRadio {
     }
 }
 
-#[cfg(feature = "testing")]
+#[cfg(any(feature = "testing", feature = "hitl_mode"))]
 impl RadioDevice for DummyRadio {
     fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
-        let side_id = self
-            .side_id
-            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
-        let pkt = get_dummy_packet()?;
-        return _router.rx_queue_from_side(pkt, side_id);
+        #[cfg(feature = "testing")]
+        {
+            let side_id = self
+                .side_id
+                .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+            let pkt = get_dummy_packet()?;
+            return _router.rx_queue_from_side(pkt, side_id);
+        }
 
-        // No incoming packets in dummy mode
+        #[cfg(not(feature = "testing"))]
+        {
+            let _ = _router;
+            // In hitl_mode, dummy radios are used only as disconnected-link placeholders.
+            return Ok(());
+        }
+
+        #[allow(unreachable_code)]
+        Ok(())
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {

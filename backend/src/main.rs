@@ -6,6 +6,7 @@ mod flight_sim;
 mod gpio;
 mod gpio_panel;
 mod layout;
+mod loadcell;
 mod map;
 mod radio;
 mod ring_buffer;
@@ -23,7 +24,7 @@ use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
 use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
-#[cfg(feature = "testing")]
+#[cfg(any(feature = "testing", feature = "hitl_mode"))]
 use crate::radio::DummyRadio;
 use crate::radio::{RADIO_BAUD_RATE, ROCKET_RADIO_PORT, Radio, RadioDevice, UMBILICAL_RADIO_PORT};
 use axum::Router;
@@ -38,7 +39,7 @@ use sqlx::{Connection, Row};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::time::Duration;
@@ -77,7 +78,7 @@ async fn apply_sqlite_pragmas(db: &sqlx::SqlitePool) {
 
     let busy_timeout_ms = env_i64("GS_SQLITE_BUSY_TIMEOUT_MS", 5_000, 100, 120_000);
     let wal_autocheckpoint = env_i64("GS_SQLITE_WAL_AUTOCHECKPOINT", 1_000, 100, 100_000);
-    let cache_kib = env_i64("GS_SQLITE_CACHE_SIZE_KIB", 32 * 1024, 1 * 1024, 512 * 1024);
+    let cache_kib = env_i64("GS_SQLITE_CACHE_SIZE_KIB", 32 * 1024, 1024, 512 * 1024);
     let cache_pages = -cache_kib; // negative => kibibytes
 
     let pragmas = [
@@ -131,7 +132,6 @@ async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
     if let Err(err) = exec_pragma_with_retry(db, "PRAGMA optimize;", retries, delay_ms).await {
         eprintln!("SQLite PRAGMA optimize failed after {retries} attempts: {err}");
     }
-
 }
 
 async fn remove_sqlite_sidecars(db_path: &str) {
@@ -173,8 +173,11 @@ async fn finalize_sqlite_after_pool_close(db_path: &str) {
         }
     };
 
-    for stmt in ["PRAGMA busy_timeout=5000;", "PRAGMA wal_checkpoint(TRUNCATE);", "PRAGMA optimize;"]
-    {
+    for stmt in [
+        "PRAGMA busy_timeout=5000;",
+        "PRAGMA wal_checkpoint(TRUNCATE);",
+        "PRAGMA optimize;",
+    ] {
         if let Err(err) = sqlx::query(stmt).execute(&mut conn).await {
             eprintln!("SQLite finalization pragma failed ({stmt}): {err}");
         }
@@ -250,11 +253,7 @@ async fn main() -> anyhow::Result<()> {
     // --- DB path ---
     let mut db_path = PathBuf::from("./data/groundstation.db");
     if !db_path.exists() {
-        fs::create_dir_all(
-            db_path
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-        )?;
+        fs::create_dir_all(db_path.parent().unwrap_or_else(|| Path::new(".")))?;
         fs::write(&db_path, b"")?;
         println!("Created empty DB file.");
     }
@@ -361,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
+    let loadcell_calibration = loadcell::load_or_default();
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
@@ -376,6 +376,8 @@ async fn main() -> anyhow::Result<()> {
         last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
         umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+        latest_fill_mass_kg: Arc::new(Mutex::new(None)),
+        loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
         shutdown_tx,
         pending_db_writes: Arc::new(AtomicUsize::new(0)),
         db_write_notify: Arc::new(Notify::new()),
@@ -386,6 +388,8 @@ async fn main() -> anyhow::Result<()> {
         action_policy_tx,
         last_command_ms: Arc::new(Mutex::new(HashMap::new())),
         recent_telemetry_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        av_bay_radio_connected: Arc::new(AtomicBool::new(false)),
+        fill_radio_connected: Arc::new(AtomicBool::new(false)),
     });
 
     gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
@@ -437,39 +441,67 @@ async fn main() -> anyhow::Result<()> {
     ]);
 
     // --- Radios ---
-    let rocket_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
+    let (rocket_radio, av_bay_radio_connected): (Arc<Mutex<Box<dyn RadioDevice>>>, bool) =
         match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUD_RATE) {
             Ok(r) => {
                 println!("Rocket radio online");
-                Arc::new(Mutex::new(Box::new(r)))
+                (Arc::new(Mutex::new(Box::new(r))), true)
             }
             Err(e) => {
                 println!("Rocket radio missing, using DummyRadio: {}", e);
                 #[cfg(feature = "testing")]
                 {
-                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio"))))
+                    (
+                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))),
+                        false,
+                    )
+                }
+                #[cfg(all(not(feature = "testing"), feature = "hitl_mode"))]
+                {
+                    (
+                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))),
+                        false,
+                    )
                 }
                 #[cfg(not(feature = "testing"))]
+                #[cfg(not(feature = "hitl_mode"))]
                 panic!("Rocket radio missing and testing mode not enabled")
             }
         };
 
-    let umbilical_radio: Arc<Mutex<Box<dyn RadioDevice>>> =
+    let (umbilical_radio, fill_radio_connected): (Arc<Mutex<Box<dyn RadioDevice>>>, bool) =
         match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUD_RATE) {
             Ok(r) => {
                 println!("Umbilical radio online");
-                Arc::new(Mutex::new(Box::new(r)))
+                (Arc::new(Mutex::new(Box::new(r))), true)
             }
             Err(e) => {
                 println!("Umbilical radio missing, using DummyRadio: {}", e);
                 #[cfg(feature = "testing")]
                 {
-                    Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio"))))
+                    (
+                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio")))),
+                        false,
+                    )
+                }
+                #[cfg(all(not(feature = "testing"), feature = "hitl_mode"))]
+                {
+                    (
+                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio")))),
+                        false,
+                    )
                 }
                 #[cfg(not(feature = "testing"))]
+                #[cfg(not(feature = "hitl_mode"))]
                 panic!("Umbilical radio missing and testing mode not enabled")
             }
         };
+    state
+        .av_bay_radio_connected
+        .store(av_bay_radio_connected, Ordering::Relaxed);
+    state
+        .fill_radio_connected
+        .store(fill_radio_connected, Ordering::Relaxed);
 
     let router = Arc::new(sedsprintf_rs_2026::router::Router::new(
         RouterMode::Relay,

@@ -25,8 +25,11 @@
 //   for visual stability: once a bucket is in the past, it is frozen.
 
 use super::types::TelemetryRow;
+use dioxus::prelude::*;
+use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::HISTORY_MS;
 
@@ -229,10 +232,10 @@ impl Bucket {
             return;
         }
         let add = channels - self.has.len();
-        self.has.extend(std::iter::repeat(false).take(add));
-        self.last.extend(std::iter::repeat(0.0).take(add));
-        self.min.extend(std::iter::repeat(0.0).take(add));
-        self.max.extend(std::iter::repeat(0.0).take(add));
+        self.has.extend(std::iter::repeat_n(false, add));
+        self.last.extend(std::iter::repeat_n(0.0, add));
+        self.min.extend(std::iter::repeat_n(0.0, add));
+        self.max.extend(std::iter::repeat_n(0.0, add));
     }
 
     fn update(&mut self, v: &[Option<f32>]) {
@@ -397,10 +400,9 @@ impl CachedChart {
         }
         let add = channels - self.channel_count;
         self.channel_count = channels;
-        self.paths
-            .extend(std::iter::repeat(String::new()).take(add));
-        self.chan_min.extend(std::iter::repeat(None).take(add));
-        self.chan_max.extend(std::iter::repeat(None).take(add));
+        self.paths.extend(std::iter::repeat_n(String::new(), add));
+        self.chan_min.extend(std::iter::repeat_n(None, add));
+        self.chan_max.extend(std::iter::repeat_n(None, add));
         for b in self.buckets.iter_mut() {
             b.ensure_channels(channels);
         }
@@ -620,18 +622,19 @@ impl CachedChart {
                 let y = map_y(v);
                 if let Some(prev_bid) = last_bucket_id_drawn[ch] {
                     let gap_buckets = b.id - prev_bid;
-                    if gap_buckets > 1 && gap_buckets <= MAX_INTERP_GAP_BUCKETS && segment_open[ch]
+                    if gap_buckets > 1
+                        && gap_buckets <= MAX_INTERP_GAP_BUCKETS
+                        && segment_open[ch]
+                        && let Some((prev_x, prev_y)) = last_point_drawn[ch]
                     {
-                        if let Some((prev_x, prev_y)) = last_point_drawn[ch] {
-                            let out = &mut self.paths[ch];
-                            let missing = gap_buckets - 1;
-                            let interp_pts = missing.min(MAX_INTERP_POINTS_PER_GAP).max(1);
-                            for j in 1..=interp_pts {
-                                let t = j as f32 / (interp_pts + 1) as f32;
-                                let xi = prev_x + (x - prev_x) * t;
-                                let yi = prev_y + (y - prev_y) * t;
-                                out.push_str(&format!("L {:.2} {:.2} ", xi, yi));
-                            }
+                        let out = &mut self.paths[ch];
+                        let missing = gap_buckets - 1;
+                        let interp_pts = missing.clamp(1, MAX_INTERP_POINTS_PER_GAP);
+                        for j in 1..=interp_pts {
+                            let t = j as f32 / (interp_pts + 1) as f32;
+                            let xi = prev_x + (x - prev_x) * t;
+                            let yi = prev_y + (y - prev_y) * t;
+                            out.push_str(&format!("L {:.2} {:.2} ", xi, yi));
                         }
                     }
                 }
@@ -664,4 +667,153 @@ pub fn series_color(i: usize) -> &'static str {
     .get(i)
     .copied()
     .unwrap_or("#9ca3af")
+}
+
+static NEXT_CANVAS_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Serialize)]
+struct CanvasChartPayload {
+    view_w: f64,
+    view_h: f64,
+    paths: Vec<String>,
+    colors: Vec<&'static str>,
+}
+
+#[component]
+pub fn ChartCanvas(view_w: f64, view_h: f64, paths: Vec<String>, style: String) -> Element {
+    let canvas_id = use_hook(|| {
+        format!(
+            "gs26-chart-canvas-{}",
+            NEXT_CANVAS_ID.fetch_add(1, Ordering::Relaxed)
+        )
+    });
+
+    let payload = CanvasChartPayload {
+        view_w,
+        view_h,
+        colors: (0..paths.len()).map(series_color).collect(),
+        paths,
+    };
+    let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    let id_json = serde_json::to_string(&canvas_id).unwrap_or_else(|_| "\"\"".to_string());
+
+    let draw_js = format!(
+        r##"
+                (function() {{
+                  const canvasId = {id_json};
+                  const data = {payload_json};
+                  const draw = () => {{
+                    const el = document.getElementById(canvasId);
+                    if (!el) return;
+
+                    const rect = el.getBoundingClientRect();
+                    const cssW = Math.max(1, Math.round(rect.width || data.view_w || 1));
+                    const cssH = Math.max(1, Math.round(rect.height || data.view_h || 1));
+                    const dpr = Math.max(1, Math.min(3, (window.devicePixelRatio || 1)));
+                    const pxW = Math.max(1, Math.round(cssW * dpr));
+                    const pxH = Math.max(1, Math.round(cssH * dpr));
+
+                    if (el.width !== pxW) el.width = pxW;
+                    if (el.height !== pxH) el.height = pxH;
+
+                    const ctx = el.getContext("2d", {{ alpha: true, desynchronized: true }});
+                    if (!ctx) return;
+
+                    if (typeof ctx.resetTransform === "function") {{
+                      ctx.resetTransform();
+                    }} else {{
+                      ctx.setTransform(1, 0, 0, 1, 0, 0);
+                    }}
+
+                    ctx.clearRect(0, 0, el.width, el.height);
+                    ctx.scale(pxW / data.view_w, pxH / data.view_h);
+
+                    const left = 60.0;
+                    const right = data.view_w - 20.0;
+                    const top = 20.0;
+                    const bottom = data.view_h - 20.0;
+                    const gridXStep = (right - left) / 6.0;
+                    const gridYStep = (bottom - top) / 6.0;
+
+                    ctx.save();
+                    ctx.strokeStyle = "#1f2937";
+                    ctx.lineWidth = 1;
+                    for (let i = 1; i <= 5; i += 1) {{
+                      const y = top + gridYStep * i;
+                      ctx.beginPath();
+                      ctx.moveTo(left, y);
+                      ctx.lineTo(right, y);
+                      ctx.stroke();
+                    }}
+                    for (let i = 1; i <= 5; i += 1) {{
+                      const x = left + gridXStep * i;
+                      ctx.beginPath();
+                      ctx.moveTo(x, top);
+                      ctx.lineTo(x, bottom);
+                      ctx.stroke();
+                    }}
+
+                    ctx.strokeStyle = "#334155";
+                    ctx.beginPath();
+                    ctx.moveTo(left, top);
+                    ctx.lineTo(left, bottom);
+                    ctx.lineTo(right, bottom);
+                    ctx.stroke();
+                    ctx.restore();
+
+                    function drawPath(path, color) {{
+                      if (!path) return;
+                      const tokens = path.trim().split(/[ \t\r\n]+/);
+                      if (!tokens.length) return;
+                      ctx.beginPath();
+                      let mode = "";
+                      for (let i = 0; i < tokens.length; ) {{
+                        const tok = tokens[i];
+                        if (tok === "M" || tok === "L") {{
+                          mode = tok;
+                          i += 1;
+                          continue;
+                        }}
+                        const x = Number(tok);
+                        const y = Number(tokens[i + 1]);
+                        if (!Number.isFinite(x) || !Number.isFinite(y)) break;
+                        if (mode === "M") {{
+                          ctx.moveTo(x, y);
+                          mode = "L";
+                        }} else {{
+                          ctx.lineTo(x, y);
+                        }}
+                        i += 2;
+                      }}
+                      ctx.strokeStyle = color;
+                      ctx.lineWidth = 2;
+                      ctx.lineJoin = "round";
+                      ctx.lineCap = "round";
+                      ctx.stroke();
+                    }}
+
+                    for (let i = 0; i < data.paths.length; i += 1) {{
+                      drawPath(data.paths[i], data.colors[i] || "#9ca3af");
+                    }}
+                  }};
+
+                  if (typeof requestAnimationFrame === "function") {{
+                    requestAnimationFrame(draw);
+                  }} else {{
+                    setTimeout(draw, 0);
+                  }}
+                }})();
+                "##
+    );
+
+    super::js_eval(&draw_js);
+
+    rsx! {
+        canvas {
+            id: "{canvas_id}",
+            width: "{view_w.round() as u32}",
+            height: "{view_h.round() as u32}",
+            style: "{style}",
+        }
+    }
 }

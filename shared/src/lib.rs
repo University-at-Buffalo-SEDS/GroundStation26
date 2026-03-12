@@ -13,6 +13,7 @@ pub enum TelemetryCommand {
     Igniter,
     RetractPlumbing,
     Nitrogen,
+    NitrogenClose,
     Nitrous,
     CO2,
     Reef,

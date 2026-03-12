@@ -49,10 +49,10 @@ fn init_panic_hook() {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn log_file_path() -> PathBuf {
-    if let Ok(p) = std::env::var("GS26_FRONTEND_LOG") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
+    if let Ok(p) = std::env::var("GS26_FRONTEND_LOG")
+        && !p.trim().is_empty()
+    {
+        return PathBuf::from(p);
     }
     std::env::temp_dir().join("groundstation_frontend.log")
 }

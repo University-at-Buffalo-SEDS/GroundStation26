@@ -1,6 +1,6 @@
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
-pub enum FlightCommands {
+pub enum FlightComputerCommands {
     DeployParachute = 0,
     ExpandParachute = 1,
     ReinitSensors = 2,
@@ -36,17 +36,19 @@ pub enum ValveBoardCommands {
     PilotClose = 3,
     NormallyOpenClose = 4,
     DumpClose = 5,
+    #[allow(unused)]
+    Sequence = 6,
 }
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 pub enum ActuatorBoardCommands {
-    IgniterOn = 6,
-    RetractPlumbing = 7,
-    NitrogenOpen = 8,
-    NitrousOpen = 9,
-    IgniterOff = 10,
-    NitrogenClose = 11,
-    NitrousClose = 12,
+    IgniterOn = 7,
+    RetractPlumbing = 8,
+    NitrogenOpen = 9,
+    NitrousOpen = 10,
+    IgniterOff = 11,
+    NitrogenClose = 12,
+    NitrousClose = 13,
     #[allow(unused)]
-    IgniterSequence = 13,
+    IgniterSequence = 14,
 }
