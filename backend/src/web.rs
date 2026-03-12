@@ -33,45 +33,6 @@ static FAVICON_DATA: OnceCell<Vec<u8>> = OnceCell::const_new();
 static TILE_DB_POOL: OnceCell<Option<sqlx::SqlitePool>> = OnceCell::const_new();
 static TILE_DB_MODE: OnceCell<TileDbMode> = OnceCell::const_new();
 
-#[cfg(feature = "hitl_mode")]
-fn hitl_actions() -> Vec<layout::ActionSpec> {
-    let mk = |label: &str, cmd: &str| layout::ActionSpec {
-        label: label.to_string(),
-        cmd: cmd.to_string(),
-        border: "#38bdf8".to_string(),
-        bg: "#0b1220".to_string(),
-        fg: "#e0f2fe".to_string(),
-    };
-    vec![
-        mk("Deploy Parachute", "DeployParachute"),
-        mk("Expand Parachute", "ExpandParachute"),
-        mk("Reinit Sensors", "ReinitSensors"),
-        mk("Launch Signal", "LaunchSignal"),
-        mk("Evaluation Relax", "EvaluationRelax"),
-        mk("Evaluation Focus", "EvaluationFocus"),
-        mk("Evaluation Abort", "EvaluationAbort"),
-        mk("Reinit Barometer", "ReinitBarometer"),
-        mk("Enable IMU", "EnableIMU"),
-        mk("Disable IMU", "DisableIMU"),
-        mk("Monitor Altitude", "MonitorAltitude"),
-        mk("Revoke Monitor Alt", "RevokeMonitorAltitude"),
-        mk("Consecutive Samples", "ConsecutiveSamples"),
-        mk("Revoke Consecutive", "RevokeConsecutiveSamples"),
-        mk("Reset Failures", "ResetFailures"),
-        mk("Revoke Reset Fail", "RevokeResetFailures"),
-        mk("Validate Measms", "ValidateMeasms"),
-        mk("Revoke Validate", "RevokeValidateMeasms"),
-        mk("Abort After 15", "AbortAfter15"),
-        mk("Abort After 40", "AbortAfter40"),
-        mk("Abort After 70", "AbortAfter70"),
-        mk("Reinit After 12", "ReinitAfter12"),
-        mk("Reinit After 26", "ReinitAfter26"),
-        mk("Reinit After 44", "ReinitAfter44"),
-        mk("Flight State +1", "AdvanceFlightState"),
-        mk("Flight State -1", "RewindFlightState"),
-    ]
-}
-
 #[derive(Clone, Copy)]
 enum TileDbMode {
     LegacyInline,
@@ -307,24 +268,7 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn get_layout() -> impl IntoResponse {
     match layout::load_layout() {
-        Ok(layout) => {
-            #[allow(unused_mut)]
-            let mut layout = layout;
-            #[cfg(feature = "hitl_mode")]
-            {
-                for action in hitl_actions() {
-                    if !layout
-                        .actions_tab
-                        .actions
-                        .iter()
-                        .any(|a| a.cmd == action.cmd)
-                    {
-                        layout.actions_tab.actions.push(action);
-                    }
-                }
-            }
-            Json(layout).into_response()
-        }
+        Ok(layout) => Json(layout).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }
