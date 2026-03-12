@@ -5,10 +5,34 @@ use dioxus::prelude::*;
 use super::layout::ActionsTabLayout;
 use super::{ActionPolicyMsg, BlinkMode};
 
+#[cfg(target_arch = "wasm32")]
+fn blink_epoch_ms() -> u64 {
+    js_sys::Date::now().max(0.0) as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn blink_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn blink_animation(blink: BlinkMode, actuated: Option<bool>) -> (&'static str, u64) {
+    match (blink, actuated.unwrap_or(false)) {
+        (BlinkMode::None, _) => ("none", 0),
+        (BlinkMode::Slow, false) => ("gs26-blink-slow-off 1.8s linear infinite", 1_800),
+        (BlinkMode::Slow, true) => ("gs26-blink-slow-on 1.8s linear infinite", 1_800),
+        (BlinkMode::Fast, false) => ("gs26-blink-fast-off 0.6s linear infinite", 600),
+        (BlinkMode::Fast, true) => ("gs26-blink-fast-on 0.6s linear infinite", 600),
+    }
+}
+
 fn btn_style(
     border: &str,
     bg: &str,
     fg: &str,
+    blink_now_ms: u64,
     enabled: bool,
     blink: BlinkMode,
     actuated: Option<bool>,
@@ -34,15 +58,14 @@ fn btn_style(
     } else {
         "0 4px 12px rgba(0,0,0,0.16)"
     };
-    let animation = match (blink, actuated.unwrap_or(false)) {
-        (BlinkMode::None, _) => "none",
-        (BlinkMode::Slow, false) => "gs26-blink-slow-off 1.8s linear infinite",
-        (BlinkMode::Slow, true) => "gs26-blink-slow-on 1.8s linear infinite",
-        (BlinkMode::Fast, false) => "gs26-blink-fast-off 0.6s linear infinite",
-        (BlinkMode::Fast, true) => "gs26-blink-fast-on 0.6s linear infinite",
+    let (animation, period_ms) = blink_animation(blink, actuated);
+    let animation_delay = if period_ms == 0 {
+        "0s".to_string()
+    } else {
+        format!("-{}s", (blink_now_ms % period_ms) as f64 / 1000.0)
     };
     format!(
-        "padding:0.65rem 1rem; border-radius:0.75rem; cursor:{cursor}; opacity:{opacity}; filter:{filter}; animation:{animation}; width:100%; \
+        "padding:0.65rem 1rem; border-radius:0.75rem; cursor:{cursor}; opacity:{opacity}; filter:{filter}; animation:{animation}; animation-delay:{animation_delay}; width:100%; \
          text-align:left; border:1px solid {border}; background:{bg}; color:{fg}; \
          font-weight:800; box-shadow:{box_shadow};"
     )
@@ -50,6 +73,7 @@ fn btn_style(
 
 #[component]
 pub fn ActionsTab(layout: ActionsTabLayout, action_policy: Signal<ActionPolicyMsg>) -> Element {
+    let blink_now_ms = blink_epoch_ms();
     rsx! {
         div {
             style: "
@@ -83,11 +107,11 @@ pub fn ActionsTab(layout: ActionsTabLayout, action_policy: Signal<ActionPolicyMs
                             .as_ref()
                             .map(|c| c.enabled)
                             .unwrap_or(action.cmd == "Abort");
-                        let blink = control.as_ref().map(|c| c.blink.clone()).unwrap_or(BlinkMode::None);
+                        let blink = control.as_ref().map(|c| c.blink).unwrap_or(BlinkMode::None);
                         let actuated = control.as_ref().and_then(|c| c.actuated);
                         rsx! {
                     button {
-                        style: "{btn_style(&action.border, &action.bg, &action.fg, enabled, blink, actuated)}",
+                        style: "{btn_style(&action.border, &action.bg, &action.fg, blink_now_ms, enabled, blink, actuated)}",
                         disabled: !enabled,
                         onclick: {
                             let cmd = action.cmd.clone();

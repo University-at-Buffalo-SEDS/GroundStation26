@@ -9,6 +9,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 pub const KEY_ENABLE_PIN: u8 = 25;
+const DEFAULT_NITROGEN_PRESSURE_TARGET_PSI: f32 = 120.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NitrogenAutocloseMode {
+    Pressure,
+    Weight,
+    Both,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -60,11 +68,17 @@ struct SequenceConfig {
     leak_check_duration: Duration,
     nitrous_soak_duration: Duration,
     nitrous_level_duration: Duration,
-    pressure_min_psi: f32,
+    nitrogen_pressure_target_psi: f32,
+    nitrogen_target_mass_kg: Option<f32>,
+    nitrogen_autoclose_mode: NitrogenAutocloseMode,
     nitrous_pressure_min_psi: f32,
     nitrous_rise_epsilon_psi: f32,
     dump_pressure_max_psi: f32,
     max_leak_drop_psi: f32,
+    max_leak_mass_delta_kg: f32,
+    allowed_hold_drop_psi_per_min: f32,
+    allowed_hold_mass_drop_kg_per_min: f32,
+    nitrous_weight_rise_epsilon_kg: f32,
     pending_fast_window: Duration,
     key_required: bool,
     key_enable_pin: u8,
@@ -83,10 +97,40 @@ impl SequenceConfig {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(10.0);
 
+        let nitrogen_pressure_target_psi =
+            std::env::var("GS_SEQUENCE_NITROGEN_PRESSURE_TARGET_PSI")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(DEFAULT_NITROGEN_PRESSURE_TARGET_PSI);
+
         let nitrous_pressure_min_psi = std::env::var("GS_SEQUENCE_NITROUS_PRESSURE_MIN_PSI")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(pressure_min_psi);
+
+        let nitrogen_target_mass_kg = std::env::var("GS_SEQUENCE_NITROGEN_TARGET_MASS_KG")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| *v > 0.0);
+
+        let nitrogen_autoclose_mode = std::env::var("GS_SEQUENCE_NITROGEN_AUTOCLOSE_MODE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .and_then(|value| match value.as_str() {
+                "pressure" => Some(NitrogenAutocloseMode::Pressure),
+                "weight" => Some(NitrogenAutocloseMode::Weight),
+                "both" => Some(NitrogenAutocloseMode::Both),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                if nitrogen_target_mass_kg.is_some() {
+                    NitrogenAutocloseMode::Weight
+                } else {
+                    NitrogenAutocloseMode::Pressure
+                }
+            });
 
         let dump_pressure_max_psi = std::env::var("GS_SEQUENCE_DUMP_PRESSURE_MAX_PSI")
             .ok()
@@ -114,6 +158,29 @@ impl SequenceConfig {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(1.0);
+
+        let max_leak_mass_delta_kg = std::env::var("GS_SEQUENCE_MAX_LEAK_MASS_DELTA_KG")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.15);
+
+        let allowed_hold_drop_psi_per_min =
+            std::env::var("GS_SEQUENCE_ALLOWED_HOLD_DROP_PSI_PER_MIN")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.2);
+
+        let allowed_hold_mass_drop_kg_per_min =
+            std::env::var("GS_SEQUENCE_ALLOWED_HOLD_MASS_DROP_KG_PER_MIN")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.03);
+
+        let nitrous_weight_rise_epsilon_kg =
+            std::env::var("GS_SEQUENCE_NITROUS_WEIGHT_RISE_EPSILON_KG")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.03);
 
         let pending_fast_window = std::env::var("GS_SEQUENCE_PENDING_FAST_MS")
             .ok()
@@ -144,11 +211,17 @@ impl SequenceConfig {
             leak_check_duration,
             nitrous_soak_duration,
             nitrous_level_duration,
-            pressure_min_psi,
+            nitrogen_pressure_target_psi,
+            nitrogen_target_mass_kg,
+            nitrogen_autoclose_mode,
             nitrous_pressure_min_psi,
             nitrous_rise_epsilon_psi,
             dump_pressure_max_psi,
             max_leak_drop_psi,
+            max_leak_mass_delta_kg,
+            allowed_hold_drop_psi_per_min,
+            allowed_hold_mass_drop_kg_per_min,
+            nitrous_weight_rise_epsilon_kg,
             pending_fast_window,
             key_required,
             key_enable_pin,
@@ -159,15 +232,20 @@ impl SequenceConfig {
 #[derive(Clone, Debug)]
 struct SequenceRuntime {
     step: SequenceStep,
+    next_step_after_dump: Option<SequenceStep>,
     step_started_at: Option<Instant>,
     pressure_at_close_psi: Option<f32>,
+    mass_at_close_kg: Option<f32>,
     notified_leak_pass: bool,
     notified_armed: bool,
     warned_rapid_drop: bool,
+    warned_mass_shift: bool,
     notified_close_nitrous: bool,
     nitrous_level_since: Option<Instant>,
     last_nitrous_pressure_psi: Option<f32>,
+    last_nitrous_mass_kg: Option<f32>,
     notified_retract_fill_lines: bool,
+    auto_close_nitrogen_sent: bool,
     auto_close_nitrous_sent: bool,
 }
 
@@ -175,15 +253,20 @@ impl Default for SequenceRuntime {
     fn default() -> Self {
         Self {
             step: SequenceStep::SetupValves,
+            next_step_after_dump: None,
             step_started_at: None,
             pressure_at_close_psi: None,
+            mass_at_close_kg: None,
             notified_leak_pass: false,
             notified_armed: false,
             warned_rapid_drop: false,
+            warned_mass_shift: false,
             notified_close_nitrous: false,
             nitrous_level_since: None,
             last_nitrous_pressure_psi: None,
+            last_nitrous_mass_kg: None,
             notified_retract_fill_lines: false,
+            auto_close_nitrogen_sent: false,
             auto_close_nitrous_sent: false,
         }
     }
@@ -247,8 +330,8 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::Pilot => "Pilot",
         TelemetryCommand::Igniter => "Igniter",
         TelemetryCommand::RetractPlumbing => "RetractPlumbing",
-        TelemetryCommand::Nitrogen => "Nitrogen",
-        TelemetryCommand::Nitrous => "Nitrous",
+        TelemetryCommand::Nitrogen | TelemetryCommand::NitrogenClose => "Nitrogen",
+        TelemetryCommand::Nitrous | TelemetryCommand::NitrousClose => "Nitrous",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
         #[cfg(feature = "hitl_mode")]
@@ -419,12 +502,26 @@ fn pending_mode(
     BlinkMode::Slow
 }
 
+fn set_control_enabled(policy: &mut ActionPolicyMsg, cmd: &str, enabled: bool) {
+    if let Some(control) = policy
+        .controls
+        .iter_mut()
+        .find(|control| control.cmd == cmd)
+    {
+        control.enabled = enabled;
+        if !enabled {
+            control.blink = BlinkMode::None;
+        }
+    }
+}
+
 fn update_sequence_runtime(
     state: &AppState,
     runtime: &mut SequenceRuntime,
     cfg: &SequenceConfig,
     valves: ValveSnapshot,
     pressure_psi: Option<f32>,
+    current_mass_kg: Option<f32>,
     now: Instant,
 ) {
     let at_or_above = |p: Option<f32>, threshold: f32| p.is_some_and(|x| x >= threshold);
@@ -437,18 +534,69 @@ fn update_sequence_runtime(
             }
         }
         SequenceStep::NitrogenFill => {
-            if valves.nitrogen_open == Some(true) && at_or_above(pressure_psi, cfg.pressure_min_psi)
-            {
-                runtime.step = SequenceStep::CloseNitrogen;
+            if valves.nitrogen_open != Some(true) {
+                runtime.auto_close_nitrogen_sent = false;
+                return;
+            }
+
+            let pressure_ready = at_or_above(pressure_psi, cfg.nitrogen_pressure_target_psi);
+            let weight_ready = cfg
+                .nitrogen_target_mass_kg
+                .is_some_and(|target_mass_kg| current_mass_kg.is_some_and(|m| m >= target_mass_kg));
+            let should_close = match cfg.nitrogen_autoclose_mode {
+                NitrogenAutocloseMode::Pressure => pressure_ready,
+                NitrogenAutocloseMode::Weight => weight_ready,
+                NitrogenAutocloseMode::Both => pressure_ready && weight_ready,
+            };
+
+            if should_close && !runtime.auto_close_nitrogen_sent {
+                match state.cmd_tx.try_send(TelemetryCommand::NitrogenClose) {
+                    Ok(_) => {
+                        runtime.auto_close_nitrogen_sent = true;
+                        match cfg.nitrogen_autoclose_mode {
+                            NitrogenAutocloseMode::Pressure => {
+                                state.add_notification(format!(
+                                    "Nitrogen pressure target reached ({:.1} psi). Closing nitrogen valve.",
+                                    cfg.nitrogen_pressure_target_psi
+                                ));
+                            }
+                            NitrogenAutocloseMode::Weight => {
+                                let target_mass_kg =
+                                    cfg.nitrogen_target_mass_kg.unwrap_or_default();
+                                state.add_notification(format!(
+                                    "Nitrogen weight target reached ({target_mass_kg:.2} kg). Closing nitrogen valve."
+                                ));
+                            }
+                            NitrogenAutocloseMode::Both => {
+                                let target_mass_kg =
+                                    cfg.nitrogen_target_mass_kg.unwrap_or_default();
+                                state.add_notification(format!(
+                                    "Nitrogen targets reached ({target_mass_kg:.2} kg, {:.1} psi). Closing nitrogen valve.",
+                                    cfg.nitrogen_pressure_target_psi
+                                ));
+                            }
+                        }
+                        runtime.step = SequenceStep::CloseNitrogen;
+                    }
+                    Err(err) => {
+                        emit_warning(
+                            state,
+                            format!("Auto-close nitrogen command failed at loadcell target: {err}"),
+                        );
+                    }
+                }
             }
         }
         SequenceStep::CloseNitrogen => {
             if valves.nitrogen_open == Some(false) {
+                runtime.auto_close_nitrogen_sent = false;
                 runtime.pressure_at_close_psi = pressure_psi;
+                runtime.mass_at_close_kg = current_mass_kg;
                 runtime.step_started_at = Some(now);
                 runtime.warned_rapid_drop = false;
+                runtime.warned_mass_shift = false;
                 state.add_temporary_notification(format!(
-                    "Nitrogen fill test started. Monitoring pressure hold for {}s.",
+                    "Nitrogen fill test started. Monitoring pressure and loadcell hold for {}s.",
                     cfg.leak_check_duration.as_secs()
                 ));
                 runtime.step = SequenceStep::NitrogenLeakCheck;
@@ -462,6 +610,15 @@ fn update_sequence_runtime(
             let baseline = runtime.pressure_at_close_psi.unwrap_or(0.0);
             let current = pressure_psi.unwrap_or(0.0);
             let drop_psi = (baseline - current).max(0.0);
+            let mass_baseline = runtime.mass_at_close_kg.unwrap_or(0.0);
+            let mass_shift_kg = current_mass_kg
+                .map(|m| (m - mass_baseline).abs())
+                .unwrap_or(0.0);
+            let elapsed_min = now.saturating_duration_since(started).as_secs_f32() / 60.0;
+            let allowed_pressure_drop =
+                cfg.max_leak_drop_psi + elapsed_min * cfg.allowed_hold_drop_psi_per_min;
+            let allowed_mass_shift =
+                cfg.max_leak_mass_delta_kg + elapsed_min * cfg.allowed_hold_mass_drop_kg_per_min;
             if !runtime.warned_rapid_drop && drop_psi > cfg.max_leak_drop_psi {
                 runtime.warned_rapid_drop = true;
                 emit_warning(
@@ -471,26 +628,38 @@ fn update_sequence_runtime(
                     ),
                 );
             }
+            if !runtime.warned_mass_shift && mass_shift_kg > cfg.max_leak_mass_delta_kg {
+                runtime.warned_mass_shift = true;
+                emit_warning(
+                    state,
+                    format!(
+                        "Unexpected loadcell change detected during fill test: {mass_shift_kg:.2} kg from hold baseline"
+                    ),
+                );
+            }
             if now.saturating_duration_since(started) < cfg.leak_check_duration {
                 return;
             }
 
-            let pressure_ok = current >= baseline - cfg.max_leak_drop_psi;
+            let pressure_ok = current >= baseline - allowed_pressure_drop;
+            let mass_ok = current_mass_kg.is_none() || mass_shift_kg <= allowed_mass_shift;
 
-            if pressure_ok {
+            if pressure_ok && mass_ok {
                 if !runtime.notified_leak_pass {
                     state.add_notification(
-                        "Nitrogen hold check passed. Good to proceed to nitrous fill.",
+                        "Nitrogen hold check passed. Pressure and loadcell are stable.",
                     );
                     runtime.notified_leak_pass = true;
                 }
+                runtime.next_step_after_dump = Some(SequenceStep::OpenNitrous);
                 runtime.step = SequenceStep::DumpNitrogen;
                 runtime.step_started_at = None;
             } else {
                 state.add_notification(
-                    "Nitrogen hold check failed: pressure dropped. Refill required.",
+                    "Nitrogen hold check failed: pressure or loadcell drifted. Dumping before refill.",
                 );
-                runtime.step = SequenceStep::NitrogenFill;
+                runtime.next_step_after_dump = Some(SequenceStep::NitrogenFill);
+                runtime.step = SequenceStep::DumpNitrogen;
                 runtime.step_started_at = None;
             }
         }
@@ -503,13 +672,17 @@ fn update_sequence_runtime(
         }
         SequenceStep::CloseDump => {
             if valves.dump_open == Some(false) {
-                runtime.step = SequenceStep::OpenNitrous;
+                runtime.step = runtime
+                    .next_step_after_dump
+                    .take()
+                    .unwrap_or(SequenceStep::OpenNitrous);
             }
         }
         SequenceStep::OpenNitrous => {
             if valves.nitrous_open != Some(true) {
                 runtime.nitrous_level_since = None;
                 runtime.last_nitrous_pressure_psi = None;
+                runtime.last_nitrous_mass_kg = None;
                 runtime.auto_close_nitrous_sent = false;
                 return;
             }
@@ -523,10 +696,9 @@ fn update_sequence_runtime(
                     .unwrap_or(crate::loadcell::DEFAULT_FULL_MASS_KG)
                     .max(0.0001)
             };
-            let current_mass_kg = *state.latest_fill_mass_kg.lock().unwrap();
             if current_mass_kg.is_some_and(|m| m >= target_mass_kg) {
                 if !runtime.auto_close_nitrous_sent {
-                    match state.cmd_tx.try_send(TelemetryCommand::Nitrous) {
+                    match state.cmd_tx.try_send(TelemetryCommand::NitrousClose) {
                         Ok(_) => {
                             runtime.auto_close_nitrous_sent = true;
                             state.add_notification(format!(
@@ -555,16 +727,22 @@ fn update_sequence_runtime(
             if !at_or_above(Some(current_pressure), cfg.nitrous_pressure_min_psi) {
                 runtime.nitrous_level_since = None;
                 runtime.last_nitrous_pressure_psi = Some(current_pressure);
+                runtime.last_nitrous_mass_kg = current_mass_kg;
                 return;
             }
 
             let rising = runtime
                 .last_nitrous_pressure_psi
                 .is_some_and(|prev| current_pressure > prev + cfg.nitrous_rise_epsilon_psi);
+            let weight_rising = match (runtime.last_nitrous_mass_kg, current_mass_kg) {
+                (Some(prev), Some(cur)) => cur > prev + cfg.nitrous_weight_rise_epsilon_kg,
+                _ => false,
+            };
 
             runtime.last_nitrous_pressure_psi = Some(current_pressure);
+            runtime.last_nitrous_mass_kg = current_mass_kg;
 
-            if rising {
+            if rising || weight_rising {
                 runtime.nitrous_level_since = None;
                 return;
             }
@@ -578,7 +756,7 @@ fn update_sequence_runtime(
         SequenceStep::CloseNitrous => {
             if !runtime.notified_close_nitrous {
                 state.add_notification(
-                    "Nitrous pressure has leveled. Close Nitrous valve to start settle timer.",
+                    "Nitrous fill has leveled by pressure and loadcell. Close Nitrous valve to start settle timer.",
                 );
                 runtime.notified_close_nitrous = true;
             }
@@ -631,7 +809,9 @@ fn build_policy(
     now_ms: u64,
 ) -> ActionPolicyMsg {
     if !key_enabled {
-        return policy_with_overrides(false, valves, HashMap::new());
+        let mut policy = policy_with_overrides(false, valves, HashMap::new());
+        set_control_enabled(&mut policy, "Abort", true);
+        return policy;
     }
 
     if flight_state == FlightState::Armed {
@@ -643,7 +823,7 @@ fn build_policy(
 
     if !is_fill_state(flight_state) {
         // Idle/other non-fill states: keep controls available with no highlight.
-        // Launch remains enabled by user request once key is installed.
+        // Launch is kept disabled outside the armed state.
         // RetractPlumbing is one-way: once actuated, keep it disabled.
         let mut enabled: HashMap<&'static str, BlinkMode> = HashMap::new();
         for cmd in all_command_names() {
@@ -663,7 +843,9 @@ fn build_policy(
         if flight_state == FlightState::Idle && valves.dump_open != Some(false) {
             enabled.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
         }
-        return policy_with_overrides(true, valves, enabled);
+        let mut policy = policy_with_overrides(true, valves, enabled);
+        set_control_enabled(&mut policy, "Launch", false);
+        return policy;
     }
 
     let mut recommended: HashMap<&'static str, BlinkMode> = HashMap::new();
@@ -725,7 +907,9 @@ fn build_policy(
         }
     }
 
-    policy_with_overrides(true, valves, recommended)
+    let mut policy = policy_with_overrides(true, valves, recommended);
+    set_control_enabled(&mut policy, "Launch", false);
+    policy
 }
 
 fn read_key_enabled(state: &AppState, cfg: &SequenceConfig) -> bool {
@@ -775,11 +959,20 @@ pub fn start_sequence_task(
             let flight_state = *state.state.lock().unwrap();
             let valves = ValveSnapshot::read(&state);
             let pressure_psi = *state.latest_fuel_tank_pressure.lock().unwrap();
+            let current_mass_kg = *state.latest_fill_mass_kg.lock().unwrap();
             let now = Instant::now();
             let now_ms = crate::telemetry_task::get_current_timestamp_ms();
             let key_enabled = read_key_enabled(&state, &cfg);
 
-            update_sequence_runtime(&state, &mut runtime, &cfg, valves, pressure_psi, now);
+            update_sequence_runtime(
+                &state,
+                &mut runtime,
+                &cfg,
+                valves,
+                pressure_psi,
+                current_mass_kg,
+                now,
+            );
             let policy = build_policy(
                 &state,
                 &cfg,

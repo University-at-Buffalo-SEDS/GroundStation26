@@ -4,7 +4,9 @@ use super::types::TelemetryRow;
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 
-use super::data_chart::{charts_cache_get, charts_cache_get_channel_minmax, series_color};
+use super::data_chart::{
+    ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, series_color,
+};
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
 
@@ -73,10 +75,10 @@ pub fn DataTab(
             }
 
             // 2) Fallback: if empty, pick first layout tab
-            if active_tab.read().is_empty() {
-                if let Some(first) = layout_tabs.first() {
-                    active_tab.set(first.id.clone());
-                }
+            if active_tab.read().is_empty()
+                && let Some(first) = layout_tabs.first()
+            {
+                active_tab.set(first.id.clone());
             }
         }
     });
@@ -238,13 +240,8 @@ pub fn DataTab(
     let pad_top = 20.0_f64;
     let pad_bottom = 20.0_f64;
 
-    let inner_w = right - left;
-    let grid_x_step = inner_w / 6.0_f64;
-
     let inner_h = view_h - pad_top - pad_bottom;
     let inner_h_full = view_h_full - pad_top - pad_bottom;
-    let grid_y_step = inner_h / 6.0_f64;
-    let grid_y_step_full = inner_h_full / 6.0_f64;
 
     // Cache fetch (NON-FULLSCREEN)
     //
@@ -263,6 +260,8 @@ pub fn DataTab(
 
     let x_left_s = fmt_span(span_min);
     let x_mid_s = fmt_span(span_min * 0.5);
+    let x_pct = |x: f64, total: f64| format!("{:.4}%", (x / total) * 100.0);
+    let y_pct = |y: f64, total: f64| format!("{:.4}%", (y / total) * 100.0);
 
     let legend_items: Vec<(usize, &str)> = labels
         .iter()
@@ -368,47 +367,20 @@ pub fn DataTab(
 
                         if *show_chart.read() {
                             div { style: "width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
-                                svg {
-                                    style: "width:100%; height:auto; display:block; max-width:100%;",
-                                    view_box: "0 0 {view_w} {view_h}",
-
-                                    for i in 1..=5 {
-                                        line {
-                                            x1:"{left}", y1:"{pad_top + grid_y_step * (i as f64)}",
-                                            x2:"{right}", y2:"{pad_top + grid_y_step * (i as f64)}",
-                                            stroke:"#1f2937", "stroke-width":"1"
-                                        }
+                                div { style: "position:relative; width:100%; aspect-ratio:{view_w}/{view_h};",
+                                    ChartCanvas {
+                                        view_w: view_w,
+                                        view_h: view_h,
+                                        paths: paths.clone(),
+                                        style: "position:absolute; inset:0; width:100%; height:100%; display:block;".to_string(),
                                     }
-                                    for i in 1..=5 {
-                                        line {
-                                            x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
-                                            x2:"{left + grid_x_step * (i as f64)}", y2:"{view_h - pad_bottom}",
-                                            stroke:"#1f2937", "stroke-width":"1"
-                                        }
-                                    }
-
-                                    line { x1:"{left}", y1:"{pad_top}", x2:"{left}",  y2:"{view_h - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
-                                    line { x1:"{left}", y1:"{view_h - pad_bottom}", x2:"{right}", y2:"{view_h - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
-
-                                    text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {y_max_s.clone()} }
-                                    text { x:"10", y:"{pad_top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {y_mid_s.clone()} }
-                                    text { x:"10", y:"{view_h - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {y_min_s.clone()} }
-
-                                    text { x:"{left + 10.0}",  y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {x_left_s.clone()} }
-                                    text { x:"{view_w * 0.5}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {x_mid_s.clone()} }
-                                    text { x:"{right - 60.0}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
-
-                                    for (i, path_d) in paths.iter().enumerate() {
-                                        if !path_d.is_empty() {
-                                            path {
-                                                d: "{path_d}",
-                                                fill: "none",
-                                                stroke: "{series_color(i)}",
-                                                "stroke-width": "2",
-                                                "stroke-linejoin": "round",
-                                                "stroke-linecap": "round",
-                                            }
-                                        }
+                                    div { style: "position:absolute; inset:0; pointer-events:none; font-size:10px; color:#94a3b8;",
+                                        span { style: "position:absolute; left:10px; top:{y_pct(pad_top + 6.0, view_h)};", "{y_max_s.clone()}" }
+                                        span { style: "position:absolute; left:10px; top:{y_pct(pad_top + inner_h / 2.0 + 4.0, view_h)}; transform:translateY(-50%);", "{y_mid_s.clone()}" }
+                                        span { style: "position:absolute; left:10px; top:{y_pct(view_h - pad_bottom + 4.0, view_h)}; transform:translateY(-100%);", "{y_min_s.clone()}" }
+                                        span { style: "position:absolute; left:{x_pct(left + 10.0, view_w)}; bottom:5px;", "{x_left_s.clone()}" }
+                                        span { style: "position:absolute; left:{x_pct(view_w * 0.5, view_w)}; bottom:5px; transform:translateX(-50%);", "{x_mid_s.clone()}" }
+                                        span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "now" }
                                     }
                                 }
 
@@ -452,48 +424,20 @@ pub fn DataTab(
 
                         div {
                             style: "flex:1; min-height:0; width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; align-items:stretch; gap:8px;",
-                            svg {
-                                style: "width:100%; height:auto; display:block;",
-                                view_box: "0 0 {view_w} {view_h_full}",
-                                preserve_aspect_ratio: "none",
-
-                                for i in 1..=5 {
-                                    line {
-                                        x1:"{left}", y1:"{pad_top + grid_y_step_full * (i as f64)}",
-                                        x2:"{right}", y2:"{pad_top + grid_y_step_full * (i as f64)}",
-                                        stroke:"#1f2937", "stroke-width":"1"
-                                    }
+                            div { style: "position:relative; flex:1; min-height:0; width:100%;",
+                                ChartCanvas {
+                                    view_w: view_w,
+                                    view_h: view_h_full,
+                                    paths: paths_full,
+                                    style: "position:absolute; inset:0; width:100%; height:100%; display:block;".to_string(),
                                 }
-                                for i in 1..=5 {
-                                    line {
-                                        x1:"{left + grid_x_step * (i as f64)}", y1:"{pad_top}",
-                                        x2:"{left + grid_x_step * (i as f64)}", y2:"{view_h_full - pad_bottom}",
-                                        stroke:"#1f2937", "stroke-width":"1"
-                                    }
-                                }
-
-                                line { x1:"{left}", y1:"{pad_top}", x2:"{left}", y2:"{view_h_full - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
-                                line { x1:"{left}", y1:"{view_h_full - pad_bottom}", x2:"{right}", y2:"{view_h_full - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
-
-                                text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {y_max_s.clone()} }
-                                text { x:"10", y:"{pad_top + inner_h_full / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {y_mid_s.clone()} }
-                                text { x:"10", y:"{view_h_full - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {y_min_s.clone()} }
-
-                                text { x:"{left + 10.0}",  y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {x_left_s.clone()} }
-                                text { x:"{view_w * 0.5}", y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", {x_mid_s.clone()} }
-                                text { x:"{right - 60.0}", y:"{view_h_full - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
-
-                                for (i, path_d) in paths_full.iter().enumerate() {
-                                    if !path_d.is_empty() {
-                                        path {
-                                            d: "{path_d}",
-                                            fill: "none",
-                                            stroke: "{series_color(i)}",
-                                            "stroke-width": "2",
-                                            "stroke-linejoin": "round",
-                                            "stroke-linecap": "round",
-                                        }
-                                    }
+                                div { style: "position:absolute; inset:0; pointer-events:none; font-size:10px; color:#94a3b8;",
+                                    span { style: "position:absolute; left:10px; top:{y_pct(pad_top + 6.0, view_h_full)};", "{y_max_s.clone()}" }
+                                    span { style: "position:absolute; left:10px; top:{y_pct(pad_top + inner_h_full / 2.0 + 4.0, view_h_full)}; transform:translateY(-50%);", "{y_mid_s.clone()}" }
+                                    span { style: "position:absolute; left:10px; top:{y_pct(view_h_full - pad_bottom + 4.0, view_h_full)}; transform:translateY(-100%);", "{y_min_s.clone()}" }
+                                    span { style: "position:absolute; left:{x_pct(left + 10.0, view_w)}; bottom:5px;", "{x_left_s.clone()}" }
+                                    span { style: "position:absolute; left:{x_pct(view_w * 0.5, view_w)}; bottom:5px; transform:translateX(-50%);", "{x_mid_s.clone()}" }
+                                    span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "now" }
                                 }
                             }
 

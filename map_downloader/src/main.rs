@@ -73,6 +73,7 @@ fn log_progress_error(pb: Option<&ProgressBar>, msg: String) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_tile_with_retries(
     z: u32,
     x: u32,
@@ -967,6 +968,7 @@ async fn write_tile_atomic_async(path: &Path, bytes: &[u8]) -> std::io::Result<(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_tile_with_retries_to_db(
     z: u32,
     x: u32,

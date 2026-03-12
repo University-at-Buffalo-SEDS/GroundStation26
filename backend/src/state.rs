@@ -281,7 +281,12 @@ impl AppState {
     }
 
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
-        if matches!(cmd, TelemetryCommand::Abort) {
+        if matches!(
+            cmd,
+            TelemetryCommand::Abort
+                | TelemetryCommand::NitrogenClose
+                | TelemetryCommand::NitrousClose
+        ) {
             return true;
         }
         let name = command_name(cmd);

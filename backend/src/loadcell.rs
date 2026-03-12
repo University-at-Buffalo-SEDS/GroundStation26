@@ -583,8 +583,8 @@ fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Result<Vec<f64>
             b.swap(i, pivot);
         }
         let pivot_val = a[i][i];
-        for c in i..n {
-            a[i][c] /= pivot_val;
+        for item in a[i].iter_mut().skip(i) {
+            *item /= pivot_val;
         }
         b[i] /= pivot_val;
         for r in 0..n {
@@ -595,8 +595,9 @@ fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Result<Vec<f64>
             if factor.abs() < 1e-18 {
                 continue;
             }
-            for c in i..n {
-                a[r][c] -= factor * a[i][c];
+            let pivot_tail = a[i][i..].to_vec();
+            for (dest, pivot_entry) in a[r].iter_mut().skip(i).zip(pivot_tail.iter()) {
+                *dest -= factor * *pivot_entry;
             }
             b[r] -= factor * b[i];
         }

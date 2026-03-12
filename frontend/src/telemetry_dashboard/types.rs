@@ -53,6 +53,7 @@ impl fmt::Display for FlightState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
+#[allow(clippy::enum_variant_names)]
 pub enum Board {
     GroundStation,
     FlightComputer,

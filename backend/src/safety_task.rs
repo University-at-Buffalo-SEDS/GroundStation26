@@ -483,14 +483,13 @@ pub async fn safety_task(
                 DataType::BatteryVoltage => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
                     // Voltage
-                    if let Some(voltage) = values.first() {
-                        if let Some((min_v, max_v)) = battery_voltage_bounds_by_sender()
+                    if let Some(voltage) = values.first()
+                        && let Some((min_v, max_v)) = battery_voltage_bounds_by_sender()
                             .get(pkt.sender())
                             .copied()
-                            && ((*voltage < min_v) || (*voltage > max_v))
-                        {
-                            cycle_warnings.insert("Critical: Battery voltage out of range!");
-                        }
+                        && ((*voltage < min_v) || (*voltage > max_v))
+                    {
+                        cycle_warnings.insert("Critical: Battery voltage out of range!");
                     }
                 }
 

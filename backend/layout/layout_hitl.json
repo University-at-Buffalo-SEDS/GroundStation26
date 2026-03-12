@@ -441,6 +441,45 @@
             ]
           },
           {
+            "title": "Load Cell",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_WEIGHT_KG",
+                "items": [
+                  {
+                    "label": "Mass (kg)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "items": [
+                  {
+                    "label": "Fill Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "chart",
+                "data_type": "LOADCELL_WEIGHT_KG",
+                "chart_title": "Loadcell Weight",
+                "width": 1200.0,
+                "height": 220.0
+              },
+              {
+                "kind": "chart",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "chart_title": "Loadcell Fill Percent",
+                "width": 1200.0,
+                "height": 220.0
+              }
+            ]
+          },
+          {
             "title": "Valve States",
             "widgets": [
               {

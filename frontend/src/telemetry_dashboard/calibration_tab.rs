@@ -1,3 +1,5 @@
+#![allow(clippy::redundant_locals)]
+
 use super::types::TelemetryRow;
 use super::{http_get_json, http_post_json};
 use dioxus::prelude::*;
@@ -390,7 +392,7 @@ fn reset_channel(cfg: &mut CalibrationFile, channel: Channel) {
     }
 }
 
-fn fit_for_channel<'a>(cfg: &'a CalibrationFile, channel: Channel) -> Option<&'a FitMeta> {
+fn fit_for_channel(cfg: &CalibrationFile, channel: Channel) -> Option<&FitMeta> {
     match channel {
         Channel::Ch0 => cfg.ch0_fit.as_ref(),
         Channel::Ch1 => cfg.ch1_fit.as_ref(),

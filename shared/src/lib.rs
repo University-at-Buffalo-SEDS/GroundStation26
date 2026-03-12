@@ -13,7 +13,9 @@ pub enum TelemetryCommand {
     Igniter,
     RetractPlumbing,
     Nitrogen,
+    NitrogenClose,
     Nitrous,
+    NitrousClose,
     #[cfg(feature = "hitl_mode")]
     DeployParachute,
     #[cfg(feature = "hitl_mode")]

@@ -1,3 +1,5 @@
+#![allow(clippy::redundant_locals)]
+
 // frontend/src/telemetry_dashboard/mod.rs
 
 mod actions_tab;
@@ -479,7 +481,7 @@ pub fn map_tiles_url() -> String {
     {
         // Native WebViews can block plain-http tile fetches; always proxy through
         // our native protocol handler, which performs the upstream HTTP(S) request.
-        return "gs26://local/tiles/{z}/{x}/{y}.jpg".to_string();
+        "gs26://local/tiles/{z}/{x}/{y}.jpg".to_string()
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -840,11 +842,11 @@ fn TelemetryDashboardInner() -> Element {
             }
             did_request_layout.set(true);
 
-            if let Some(cached) = persist::get_string(LAYOUT_CACHE_KEY) {
-                if let Ok(layout) = serde_json::from_str::<LayoutConfig>(&cached) {
-                    layout_config.set(Some(layout));
-                    layout_loading.set(false);
-                }
+            if let Some(cached) = persist::get_string(LAYOUT_CACHE_KEY)
+                && let Ok(layout) = serde_json::from_str::<LayoutConfig>(&cached)
+            {
+                layout_config.set(Some(layout));
+                layout_loading.set(false);
             }
 
             spawn(async move {
@@ -1699,6 +1701,7 @@ fn TelemetryDashboardInner() -> Element {
                         flex:1 1 320px;
                         display:flex;
                         align-items:center;
+                        justify-content:space-between;
                         flex-wrap:wrap;
                         gap:0.5rem;
                         padding:0.35rem 0.7rem;
@@ -1707,89 +1710,94 @@ fn TelemetryDashboardInner() -> Element {
                         border:1px solid #4b5563;
                         min-width:260px;
                     ",
-                    span { style: "color:#9ca3af;", "Status:" }
-                    if let Some(ts) = network_time_snapshot {
-                        span { style: "color:#cbd5e1; margin-left:0.5rem;",
-                            "(Rocket Time: "
-                            span {
-                                style: "display:inline-block; width:12ch; text-align:right; white-space:nowrap; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;",
-                                "{ts}"
+                    div { style: "display:flex; align-items:center; flex-wrap:wrap; gap:0.5rem; min-width:0;",
+                        span { style: "color:#9ca3af;", "Status:" }
+
+                        if !has_warnings && !has_errors {
+                            span { style: "color:#22c55e; font-weight:600; flex:0 0 auto;", "Nominal" }
+                            span { style: "color:#93c5fd; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
+                                "(Flight state:"
+                                span {
+                                    style: "display:inline-flex; align-items:baseline; width:15.5ch; padding-left:0.4ch; white-space:nowrap;",
+                                    span { "{flight_state.read().to_string()}" }
+                                    span { ")" }
+                                }
                             }
-                            ")"
+                        } else {
+                            if has_errors {
+                                span { style: "color:#fecaca; flex:0 0 auto;", {format!("{err_count} error(s)")} }
+                            }
+                            if has_warnings {
+                                span { style: "color:#fecaca; flex:0 0 auto;", {format!("{warn_count} warnings(s)")} }
+                            }
+                            span { style: "color:#93c5fd; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
+                                "(Flight state:"
+                                span {
+                                    style: "display:inline-flex; align-items:baseline; width:15.5ch; padding-left:0.4ch; white-space:nowrap;",
+                                    span { "{flight_state.read().to_string()}" }
+                                    span { ")" }
+                                }
+                            }
+
+                            if *active_main_tab.read() == MainTab::Warnings && has_warnings {
+                                button {
+                                    style: "
+                                        margin-left:auto;
+                                        padding:0.25rem 0.7rem;
+                                        border-radius:999px;
+                                        border:1px solid #4b5563;
+                                        background:#020617;
+                                        color:#e5e7eb;
+                                        font-size:0.75rem;
+                                        cursor:pointer;
+                                    ",
+                                    onclick: {
+                                        let mut ack_warning_ts = ack_warning_ts;
+                                        let mut ack_warning_count = ack_warning_count;
+                                        move |_| {
+                                            ack_warning_ts.set(latest_warning_ts);
+                                            ack_warning_count.set(*warning_event_counter.read());
+                                        }
+                                    },
+                                    "Acknowledge warnings"
+                                }
+                            }
+
+                            if *active_main_tab.read() == MainTab::Errors && has_errors {
+                                button {
+                                    style: "
+                                        margin-left:auto;
+                                        padding:0.25rem 0.7rem;
+                                        border-radius:999px;
+                                        border:1px solid #4b5563;
+                                        background:#020617;
+                                        color:#e5e7eb;
+                                        font-size:0.75rem;
+                                        cursor:pointer;
+                                    ",
+                                    onclick: {
+                                        let mut ack_error_ts = ack_error_ts;
+                                        let mut ack_error_count = ack_error_count;
+                                        move |_| {
+                                            ack_error_ts.set(latest_error_ts);
+                                            ack_error_count.set(*error_event_counter.read());
+                                        }
+                                    },
+                                    "Acknowledge errors"
+                                }
+                            }
                         }
                     }
 
-                    if !has_warnings && !has_errors {
-                        span { style: "color:#22c55e; font-weight:600;", "Nominal" }
-                        span { style: "color:#93c5fd; margin-left:0.75rem;",
-                            "(Flight state: ",
-                            span {
-                                style: "display:inline-block; width:18ch; text-align:left; white-space:nowrap;",
-                                "{flight_state.read().to_string()}"
-                            }
-                            ")"
-                        }
-                    } else {
-                        if has_errors {
-                            span { style: "color:#fecaca;", {format!("{err_count} error(s)")} }
-                        }
-                        if has_warnings {
-                            span { style: "color:#fecaca;", {format!("{warn_count} warnings(s)")} }
-                        }
-                        span { style: "color:#93c5fd; margin-left:0.75rem;",
-                            "(Flight state: ",
-                            span {
-                                style: "display:inline-block; width:18ch; text-align:left; white-space:nowrap;",
-                                "{flight_state.read().to_string()}"
-                            }
-                            ")"
-                        }
-
-                        if *active_main_tab.read() == MainTab::Warnings && has_warnings {
-                            button {
-                                style: "
-                                    margin-left:auto;
-                                    padding:0.25rem 0.7rem;
-                                    border-radius:999px;
-                                    border:1px solid #4b5563;
-                                    background:#020617;
-                                    color:#e5e7eb;
-                                    font-size:0.75rem;
-                                    cursor:pointer;
-                                ",
-                                onclick: {
-                                    let mut ack_warning_ts = ack_warning_ts;
-                                    let mut ack_warning_count = ack_warning_count;
-                                    move |_| {
-                                        ack_warning_ts.set(latest_warning_ts);
-                                        ack_warning_count.set(*warning_event_counter.read());
-                                    }
-                                },
-                                "Acknowledge warnings"
-                            }
-                        }
-
-                        if *active_main_tab.read() == MainTab::Errors && has_errors {
-                            button {
-                                style: "
-                                    margin-left:auto;
-                                    padding:0.25rem 0.7rem;
-                                    border-radius:999px;
-                                    border:1px solid #4b5563;
-                                    background:#020617;
-                                    color:#e5e7eb;
-                                    font-size:0.75rem;
-                                    cursor:pointer;
-                                ",
-                                onclick: {
-                                    let mut ack_error_ts = ack_error_ts;
-                                    let mut ack_error_count = ack_error_count;
-                                    move |_| {
-                                        ack_error_ts.set(latest_error_ts);
-                                        ack_error_count.set(*error_event_counter.read());
-                                    }
-                                },
-                                "Acknowledge errors"
+                    if let Some(ts) = network_time_snapshot {
+                        div { style: "display:flex; align-items:center; flex:0 0 auto; min-width:0;",
+                            span { style: "color:#cbd5e1; display:inline-flex; align-items:baseline; white-space:nowrap;",
+                                "(Rocket Time:"
+                                span {
+                                    style: "display:inline-flex; align-items:baseline; width:16ch; padding-left:0.4ch; white-space:nowrap; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;",
+                                    span { "{ts}" }
+                                    span { ")" }
+                                }
                             }
                         }
                     }
@@ -1931,7 +1939,7 @@ fn row_to_gps(row: &TelemetryRow) -> Option<(f64, f64)> {
         return None;
     }
     Some((
-        row.values.get(0).copied().flatten()? as f64,
+        row.values.first().copied().flatten()? as f64,
         row.values.get(1).copied().flatten()? as f64,
     ))
 }
@@ -3134,12 +3142,12 @@ fn js_read_window_string(key: &str) -> Option<String> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn js_eval(js: &str) {
+pub(crate) fn js_eval(js: &str) {
     let _ = js_sys::eval(js);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn js_eval(js: &str) {
+pub(crate) fn js_eval(js: &str) {
     dioxus::document::eval(js);
 }
 

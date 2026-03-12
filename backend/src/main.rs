@@ -78,7 +78,7 @@ async fn apply_sqlite_pragmas(db: &sqlx::SqlitePool) {
 
     let busy_timeout_ms = env_i64("GS_SQLITE_BUSY_TIMEOUT_MS", 5_000, 100, 120_000);
     let wal_autocheckpoint = env_i64("GS_SQLITE_WAL_AUTOCHECKPOINT", 1_000, 100, 100_000);
-    let cache_kib = env_i64("GS_SQLITE_CACHE_SIZE_KIB", 32 * 1024, 1 * 1024, 512 * 1024);
+    let cache_kib = env_i64("GS_SQLITE_CACHE_SIZE_KIB", 32 * 1024, 1024, 512 * 1024);
     let cache_pages = -cache_kib; // negative => kibibytes
 
     let pragmas = [

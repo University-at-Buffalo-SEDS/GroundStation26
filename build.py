@@ -1435,13 +1435,16 @@ def build_frontend(
 ) -> None:
     try:
         public_dir = frontend_dir / "dist" / "public"
-        if public_dir.exists():
+        is_web_build = platform_name in {None, "web"}
+
+        if is_web_build and public_dir.exists():
             print(f"Removing existing public artifacts: {public_dir}")
             shutil.rmtree(public_dir)
-        if platform_name in {None, "web"}:
+        if is_web_build:
             _clear_dx_web_cache(frontend_dir)
 
-        clear_app_bundle(frontend_dir)
+        if not is_web_build:
+            clear_app_bundle(frontend_dir)
 
         env = _dx_bundle_env(frontend_dir) if (is_container() or in_docker_build()) else None
 

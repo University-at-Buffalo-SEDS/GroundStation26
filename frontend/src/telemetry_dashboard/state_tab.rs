@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 // frontend/src/telemetry_dashboard/state_tab.rs
 
 use dioxus::prelude::*;
@@ -11,9 +13,32 @@ use super::types::{BoardStatusEntry, FlightState, TelemetryRow};
 use super::{ActionPolicyMsg, BlinkMode};
 
 use crate::telemetry_dashboard::data_chart::{
-    charts_cache_get, charts_cache_get_channel_minmax, series_color,
+    ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, series_color,
 };
 use crate::telemetry_dashboard::map_tab::MapTab;
+
+#[cfg(target_arch = "wasm32")]
+fn blink_epoch_ms() -> u64 {
+    js_sys::Date::now().max(0.0) as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn blink_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn blink_animation(blink: BlinkMode, actuated: Option<bool>) -> (&'static str, u64) {
+    match (blink, actuated.unwrap_or(false)) {
+        (BlinkMode::None, _) => ("none", 0),
+        (BlinkMode::Slow, false) => ("gs26-blink-slow-off 1.8s linear infinite", 1_800),
+        (BlinkMode::Slow, true) => ("gs26-blink-slow-on 1.8s linear infinite", 1_800),
+        (BlinkMode::Fast, false) => ("gs26-blink-fast-off 0.6s linear infinite", 600),
+        (BlinkMode::Fast, true) => ("gs26-blink-fast-on 0.6s linear infinite", 600),
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 fn target_frame_duration() -> std::time::Duration {
@@ -313,13 +338,11 @@ fn data_style_chart_cached(
     let top = 20.0_f64;
     let bottom = view_h - 20.0_f64;
 
-    let inner_w = right - left;
     let inner_h = bottom - top;
 
-    let grid_x_step = inner_w / 6.0;
-    let grid_y_step = inner_h / 6.0;
-
     let y_mid = (y_min + y_max) * 0.5;
+    let x_pct = |x: f64, total: f64| format!("{:.4}%", (x / total) * 100.0);
+    let y_pct = |y: f64, total: f64| format!("{:.4}%", (y / total) * 100.0);
 
     rsx! {
         div { style: "width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
@@ -327,46 +350,20 @@ fn data_style_chart_cached(
                 div { style: "color:#e5e7eb; font-weight:700; font-size:14px;", "{t}" }
             }
 
-            svg {
-                style: "width:100%; height:auto; display:block;",
-                view_box: "0 0 {view_w} {view_h}",
-
-                for i in 1..=5 {
-                    line {
-                        x1:"{left}", y1:"{top + grid_y_step * (i as f64)}",
-                        x2:"{right}", y2:"{top + grid_y_step * (i as f64)}",
-                        stroke:"#1f2937", "stroke-width":"1"
-                    }
+            div { style: "position:relative; width:100%; aspect-ratio:{view_w}/{view_h};",
+                ChartCanvas {
+                    view_w: view_w,
+                    view_h: view_h,
+                    paths: paths,
+                    style: "position:absolute; inset:0; width:100%; height:100%; display:block;".to_string(),
                 }
-                for i in 1..=5 {
-                    line {
-                        x1:"{left + grid_x_step * (i as f64)}", y1:"{top}",
-                        x2:"{left + grid_x_step * (i as f64)}", y2:"{bottom}",
-                        stroke:"#1f2937", "stroke-width":"1"
-                    }
-                }
-
-                line { x1:"{left}", y1:"{top}",    x2:"{left}",  y2:"{bottom}", stroke:"#334155", stroke_width:"1" }
-                line { x1:"{left}", y1:"{bottom}", x2:"{right}", y2:"{bottom}", stroke:"#334155", stroke_width:"1" }
-
-                text { x:"10", y:"{top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_max)} }
-                text { x:"10", y:"{top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_mid)} }
-                text { x:"10", y:"{bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{:.2}", y_min)} }
-
-                text { x:"{left + 10.0}",  y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
-                text { x:"{view_w * 0.5}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
-                text { x:"{right - 60.0}", y:"{view_h - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
-
-                for (ch, path_d) in paths.iter().enumerate() {
-                    if !path_d.is_empty() {
-                        path {
-                            d: "{path_d}",
-                            fill: "none",
-                            stroke: "{series_color(ch)}",
-                            stroke_width: "2",
-                            stroke_linecap: "round",
-                        }
-                    }
+                div { style: "position:absolute; inset:0; pointer-events:none; font-size:10px; color:#94a3b8;",
+                    span { style: "position:absolute; left:10px; top:{y_pct(top + 6.0, view_h)};", {format!("{:.2}", y_max)} }
+                    span { style: "position:absolute; left:10px; top:{y_pct(top + inner_h / 2.0 + 4.0, view_h)}; transform:translateY(-50%);", {format!("{:.2}", y_mid)} }
+                    span { style: "position:absolute; left:10px; top:{y_pct(bottom + 4.0, view_h)}; transform:translateY(-100%);", {format!("{:.2}", y_min)} }
+                    span { style: "position:absolute; left:{x_pct(left + 10.0, view_w)}; bottom:5px;", {format!("-{:.1} min", span_min)} }
+                    span { style: "position:absolute; left:{x_pct(view_w * 0.5, view_w)}; bottom:5px; transform:translateX(-50%);", {format!("-{:.1} min", span_min * 0.5)} }
+                    span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "now" }
                 }
             }
 
@@ -558,10 +555,10 @@ fn widget_valve_labels_at<'a>(
     valve_labels: Option<&'a [BooleanLabels]>,
     idx: usize,
 ) -> Option<BooleanLabels> {
-    if let Some(list) = valve_labels {
-        if idx < list.len() {
-            return Some(list[idx].clone());
-        }
+    if let Some(list) = valve_labels
+        && idx < list.len()
+    {
+        return Some(list[idx].clone());
     }
     default_labels.cloned()
 }
@@ -571,6 +568,7 @@ fn action_section(
     action_policy: &ActionPolicyMsg,
     selection: Option<&[String]>,
 ) -> Element {
+    let blink_now_ms = blink_epoch_ms();
     let filtered = filter_actions(actions, selection);
     if filtered.is_empty() {
         return rsx! { div {} };
@@ -586,7 +584,7 @@ fn action_section(
                     let actuated = control.and_then(|c| c.actuated);
                     rsx! {
                         button {
-                            style: action_style(&action.border, &action.bg, &action.fg, enabled, blink, actuated),
+                            style: action_style(&action.border, &action.bg, &action.fg, blink_now_ms, enabled, blink, actuated),
                             disabled: !enabled,
                             onclick: {
                                 let cmd = action.cmd.clone();
@@ -640,6 +638,7 @@ fn action_style(
     border: &str,
     bg: &str,
     fg: &str,
+    blink_now_ms: u64,
     enabled: bool,
     blink: BlinkMode,
     actuated: Option<bool>,
@@ -665,15 +664,14 @@ fn action_style(
     } else {
         "0 4px 12px rgba(0,0,0,0.16)"
     };
-    let animation = match (blink, actuated.unwrap_or(false)) {
-        (BlinkMode::None, _) => "none",
-        (BlinkMode::Slow, false) => "gs26-blink-slow-off 1.8s linear infinite",
-        (BlinkMode::Slow, true) => "gs26-blink-slow-on 1.8s linear infinite",
-        (BlinkMode::Fast, false) => "gs26-blink-fast-off 0.6s linear infinite",
-        (BlinkMode::Fast, true) => "gs26-blink-fast-on 0.6s linear infinite",
+    let (animation, period_ms) = blink_animation(blink, actuated);
+    let animation_delay = if period_ms == 0 {
+        "0s".to_string()
+    } else {
+        format!("-{}s", (blink_now_ms % period_ms) as f64 / 1000.0)
     };
     format!(
-        "padding:0.6rem 0.9rem; border-radius:0.75rem; cursor:{cursor}; opacity:{opacity}; filter:{filter}; animation:{animation}; width:100%; \
+        "padding:0.6rem 0.9rem; border-radius:0.75rem; cursor:{cursor}; opacity:{opacity}; filter:{filter}; animation:{animation}; animation-delay:{animation_delay}; width:100%; \
          text-align:left; border:1px solid {border}; background:{bg}; color:{fg}; \
          font-weight:700; box-shadow:{box_shadow};"
     )

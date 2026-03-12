@@ -366,6 +366,7 @@ fn telemetry_values_json(values: &[Option<f32>]) -> Option<String> {
     .ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_derived_battery_rows(
     state: &Arc<AppState>,
     db_tx: &mpsc::Sender<DbWrite>,
@@ -804,6 +805,15 @@ pub async fn telemetry_task(
                                 }
                                 println!("Nitrogen command sent {:?}", cmd);
                             }
+                        TelemetryCommand::NitrogenClose => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::ActuatorCommand,
+                                    &[ActuatorBoardCommands::NitrogenClose as u8],
+                                ) {
+                                    log_telemetry_error("failed to log NitrogenClose command", e);
+                                }
+                                println!("Nitrogen explicit close command sent");
+                            }
                         TelemetryCommand::RetractPlumbing => {
                                 if let Err(e) = router.log_queue(
                                     DataType::ActuatorCommand,
@@ -828,6 +838,15 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Nitrous command", e);
                                 }
                                 println!("Nitrous command sent: {:?}", cmd);
+                        }
+                        TelemetryCommand::NitrousClose => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::ActuatorCommand,
+                                    &[ActuatorBoardCommands::NitrousClose as u8],
+                                ) {
+                                    log_telemetry_error("failed to log NitrousClose command", e);
+                                }
+                                println!("Nitrous explicit close command sent");
                         }
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::AdvanceFlightState => {

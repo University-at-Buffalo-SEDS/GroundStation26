@@ -187,6 +187,7 @@ fn setup_callbacks(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup_button_callback<F>(
     state: Arc<AppState>,
     gpio: Arc<crate::gpio::GpioPins>,
