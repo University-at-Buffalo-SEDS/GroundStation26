@@ -2039,7 +2039,7 @@ def build_frontend(
             rename_windows_linux_artifacts(frontend_dir, platform_name)
         elif platform_name == "android":
             rename_android_artifacts(frontend_dir)
-            if android_package_type == "apk":
+            if android_package_type != "aab":
                 build_android_universal_apk(frontend_dir)
 
         if platform_name == "ios":
