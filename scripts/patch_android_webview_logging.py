@@ -11,12 +11,28 @@ WEBVIEW_PATH = ANDROID_KOTLIN_DIR / "RustWebView.kt"
 CHROME_PATH = ANDROID_KOTLIN_DIR / "RustWebChromeClient.kt"
 
 
-def patch_once(text: str, old: str, new: str, path: Path) -> str:
+def patch_once(text: str, old: str, new: str, path: Path, *, required: bool = False) -> str:
     if new in text:
         return text
     if old not in text:
-        raise RuntimeError(f"expected snippet not found in {path}")
+        if required:
+            raise RuntimeError(f"expected snippet not found in {path}")
+        return text
     return text.replace(old, new, 1)
+
+
+def dedupe_import_line(text: str, import_line: str) -> str:
+    lines = text.splitlines()
+    seen = False
+    out: list[str] = []
+    for line in lines:
+        if line == import_line:
+            if seen:
+                continue
+            seen = True
+        out.append(line)
+    suffix = "\n" if text.endswith("\n") else ""
+    return "\n".join(out) + suffix
 
 
 def patch_client(text: str) -> str:
@@ -24,6 +40,12 @@ def patch_client(text: str) -> str:
         text,
         "package dev.dioxus.main\n\nimport android.net.Uri\n",
         "package dev.dioxus.main\n\nimport android.util.Log\nimport android.net.Uri\n",
+        CLIENT_PATH,
+    )
+    text = patch_once(
+        text,
+        "import android.net.Uri\nimport android.webkit.*\n",
+        "import android.net.Uri\nimport android.util.Log\nimport android.webkit.*\n",
         CLIENT_PATH,
     )
     text = patch_once(
@@ -80,7 +102,7 @@ def patch_client(text: str) -> str:
         if marker not in text:
             raise RuntimeError(f"expected insertion marker not found in {CLIENT_PATH}")
         text = text.replace(marker, insert + marker, 1)
-    return text
+    return dedupe_import_line(text, "import android.util.Log")
 
 
 def patch_webview(text: str) -> str:
@@ -88,6 +110,12 @@ def patch_webview(text: str) -> str:
         text,
         "import android.annotation.SuppressLint\nimport android.webkit.*\n",
         "import android.annotation.SuppressLint\nimport android.util.Log\nimport android.webkit.*\n",
+        WEBVIEW_PATH,
+    )
+    text = patch_once(
+        text,
+        "import android.annotation.SuppressLint\nimport android.webkit.*\nimport android.content.Context\n",
+        "import android.annotation.SuppressLint\nimport android.util.Log\nimport android.webkit.*\nimport android.content.Context\n",
         WEBVIEW_PATH,
     )
     text = patch_once(
@@ -114,7 +142,7 @@ def patch_webview(text: str) -> str:
         "    override fun loadUrl(url: String, additionalHttpHeaders: Map<String, String>) {\n        Log.e(tag, \"RustWebView loadUrl with headers url=$url\")\n        if (!shouldOverride(url)) {\n",
         WEBVIEW_PATH,
     )
-    return text
+    return dedupe_import_line(text, "import android.util.Log")
 
 
 def patch_chrome(text: str) -> str:
@@ -130,7 +158,7 @@ def patch_chrome(text: str) -> str:
         "  override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {\n    Log.e(\"GS26WebView\", \"console ${consoleMessage.messageLevel()} ${consoleMessage.sourceId()}:${consoleMessage.lineNumber()} ${consoleMessage.message()}\")\n",
         CHROME_PATH,
     )
-    return text
+    return dedupe_import_line(text, "import android.util.Log")
 
 
 def patch_file(path: Path, patcher) -> None:
@@ -142,7 +170,7 @@ def patch_file(path: Path, patcher) -> None:
         path.write_text(patched)
         print(f"patched {path}")
     else:
-        print(f"already patched {path}")
+        print(f"skipped {path}")
 
 
 def main() -> int:

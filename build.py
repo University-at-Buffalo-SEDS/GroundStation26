@@ -496,13 +496,19 @@ def rename_android_artifacts(frontend_dir: Path) -> None:
     for item in sorted(dist.iterdir()):
         name = item.name
         if not (
-            name.startswith(LEGACY_APP_NAME)
+            name.startswith("app-debug")
+            or name.startswith("app-release")
+            or name.startswith(LEGACY_APP_NAME)
             or name.startswith(APP_NAME)
             or name.startswith(ANDROID_APP_NAME)
         ):
             continue
 
-        if name.startswith(LEGACY_APP_NAME):
+        if name.startswith("app-debug"):
+            new_name = ANDROID_APP_NAME + name[len("app-debug"):]
+        elif name.startswith("app-release"):
+            new_name = ANDROID_APP_NAME + name[len("app-release"):]
+        elif name.startswith(LEGACY_APP_NAME):
             new_name = ANDROID_APP_NAME + name[len(LEGACY_APP_NAME):]
         elif name.startswith(APP_NAME):
             new_name = ANDROID_APP_NAME + name[len(APP_NAME):]
@@ -529,6 +535,22 @@ def rename_android_artifacts(frontend_dir: Path) -> None:
 
     if not renamed_any:
         print("Warning: no android artifacts matched legacy name for rename.", file=sys.stderr)
+
+
+def cleanup_android_dist_artifacts(frontend_dir: Path) -> None:
+    dist = dist_dir(frontend_dir)
+    if not dist.exists():
+        return
+
+    canonical_apk = f"{ANDROID_APP_NAME}.apk"
+    for item in sorted(dist.iterdir()):
+        if item.suffix in {".aab", ".apks"}:
+            print(f"Removing android bundle artifact: {item.name}")
+            _remove_path(item)
+            continue
+        if item.suffix == ".apk" and item.name != canonical_apk:
+            print(f"Removing stale android apk artifact: {item.name}")
+            _remove_path(item)
 
 
 def _find_android_aab(frontend_dir: Path) -> Optional[Path]:
@@ -603,7 +625,7 @@ def patch_generated_android_project(frontend_dir: Path, debug_mode: bool) -> Pat
         shutil.copy2(proguard_src, project_dir / "app" / "proguard-rules.pro")
 
     patch_script = frontend_dir.parent / "scripts" / "patch_android_webview_logging.py"
-    if patch_script.exists():
+    if debug_mode and patch_script.exists():
         run([sys.executable, str(patch_script)], cwd=frontend_dir.parent)
     return project_dir
 
@@ -677,8 +699,11 @@ def build_android_universal_apk(frontend_dir: Path) -> Path:
             shutil.copyfileobj(src, dst)
 
     rename_android_artifacts(frontend_dir)
-    final_apks = sorted(dist.glob("*.apk"))
-    final_apk = final_apks[-1] if final_apks else apk_path
+    cleanup_android_dist_artifacts(frontend_dir)
+    final_apk = dist / f"{ANDROID_APP_NAME}.apk"
+    if not final_apk.exists():
+        final_apks = sorted(dist.glob("*.apk"))
+        final_apk = final_apks[-1] if final_apks else apk_path
     print(f"✅ Android APK created: {final_apk}")
     return final_apk
 
