@@ -799,6 +799,27 @@ fn update_sequence_runtime(
     }
 }
 
+fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
+    let controls = all_command_names()
+        .into_iter()
+        .map(|cmd| ActionControl {
+            cmd: cmd.to_string(),
+            enabled: if cmd == "RetractPlumbing" && valves.retract == Some(true) {
+                false
+            } else {
+                true
+            },
+            blink: BlinkMode::None,
+            actuated: valves.actuated_for_cmd(cmd),
+        })
+        .collect();
+
+    ActionPolicyMsg {
+        key_enabled: true,
+        controls,
+    }
+}
+
 fn build_policy(
     state: &AppState,
     cfg: &SequenceConfig,
@@ -919,6 +940,9 @@ fn read_key_enabled(state: &AppState, cfg: &SequenceConfig) -> bool {
     if cfg!(feature = "testing") {
         return true;
     }
+    if cfg!(feature = "hitl_mode") {
+        return true;
+    }
     if !cfg.key_required {
         return true;
     }
@@ -933,7 +957,27 @@ pub fn start_sequence_task(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     let cfg = SequenceConfig::from_env();
+    if cfg!(feature = "hitl_mode") {
+        return tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let valves = ValveSnapshot::read(&state);
+                        state.set_action_policy(hitl_action_policy(valves));
+                    }
+                    recv = shutdown_rx.recv() => {
+                        match recv {
+                            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     if cfg.key_required
+        && !cfg!(feature = "hitl_mode")
         && let Err(err) = state.gpio.setup_input_pin(cfg.key_enable_pin)
     {
         eprintln!(

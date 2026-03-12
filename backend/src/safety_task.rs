@@ -307,7 +307,8 @@ pub async fn safety_task(
             .board_status_tx
             .send(state.board_status_snapshot(now_ms));
 
-        if current_state == FlightState::Startup && all_boards_seen {
+        if current_state == FlightState::Startup && all_boards_seen && !cfg!(feature = "hitl_mode")
+        {
             let should_advance = {
                 let mut fs = state.state.lock().unwrap();
                 if *fs == FlightState::Startup {

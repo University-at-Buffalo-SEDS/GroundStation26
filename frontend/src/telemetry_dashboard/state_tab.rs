@@ -30,13 +30,33 @@ fn blink_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn blink_animation(blink: BlinkMode, actuated: Option<bool>) -> (&'static str, u64) {
-    match (blink, actuated.unwrap_or(false)) {
-        (BlinkMode::None, _) => ("none", 0),
-        (BlinkMode::Slow, false) => ("gs26-blink-slow-off 1.8s linear infinite", 1_800),
-        (BlinkMode::Slow, true) => ("gs26-blink-slow-on 1.8s linear infinite", 1_800),
-        (BlinkMode::Fast, false) => ("gs26-blink-fast-off 0.6s linear infinite", 600),
-        (BlinkMode::Fast, true) => ("gs26-blink-fast-on 0.6s linear infinite", 600),
+fn blink_opacity(blink_now_ms: u64, blink: BlinkMode, actuated: Option<bool>) -> Option<f32> {
+    let (period_ms, dim, bright, invert) = match (blink, actuated.unwrap_or(false)) {
+        (BlinkMode::None, _) => return None,
+        (BlinkMode::Slow, false) => (1_800, 0.2, 1.0, false),
+        (BlinkMode::Slow, true) => (1_800, 0.25, 1.0, true),
+        (BlinkMode::Fast, false) => (600, 0.15, 1.0, false),
+        (BlinkMode::Fast, true) => (600, 0.2, 1.0, true),
+    };
+    let phase = (blink_now_ms % period_ms) as f32 / period_ms as f32;
+    let wave = 0.5 - 0.5 * f32::cos(std::f32::consts::TAU * phase);
+    let pulse = if invert { 1.0 - wave } else { wave };
+    Some(dim + (bright - dim) * pulse)
+}
+
+fn action_opacity(
+    blink_now_ms: u64,
+    enabled: bool,
+    recommended: bool,
+    blink: BlinkMode,
+    actuated: Option<bool>,
+) -> f32 {
+    if !enabled {
+        0.45
+    } else if recommended {
+        blink_opacity(blink_now_ms, blink, actuated).unwrap_or(1.0)
+    } else {
+        0.62
     }
 }
 
@@ -645,13 +665,7 @@ fn action_style(
 ) -> String {
     let cursor = if enabled { "pointer" } else { "not-allowed" };
     let recommended = enabled && blink != BlinkMode::None;
-    let opacity = if !enabled {
-        "0.45"
-    } else if recommended {
-        "1.0"
-    } else {
-        "0.62"
-    };
+    let opacity = action_opacity(blink_now_ms, enabled, recommended, blink, actuated);
     let filter = if !enabled {
         "grayscale(0.25) brightness(0.9)"
     } else if recommended {
@@ -664,14 +678,8 @@ fn action_style(
     } else {
         "0 4px 12px rgba(0,0,0,0.16)"
     };
-    let (animation, period_ms) = blink_animation(blink, actuated);
-    let animation_delay = if period_ms == 0 {
-        "0s".to_string()
-    } else {
-        format!("-{}s", (blink_now_ms % period_ms) as f64 / 1000.0)
-    };
     format!(
-        "padding:0.6rem 0.9rem; border-radius:0.75rem; cursor:{cursor}; opacity:{opacity}; filter:{filter}; animation:{animation}; animation-delay:{animation_delay}; width:100%; \
+        "padding:0.6rem 0.9rem; border-radius:0.75rem; cursor:{cursor}; opacity:{opacity}; filter:{filter}; width:100%; \
          text-align:left; border:1px solid {border}; background:{bg}; color:{fg}; \
          font-weight:700; box-shadow:{box_shadow};"
     )

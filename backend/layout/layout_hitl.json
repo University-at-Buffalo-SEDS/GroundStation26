@@ -69,6 +69,20 @@
         "border": "#eab308",
         "bg": "#1f2937",
         "fg": "#fef9c3"
+      },
+      {
+        "label": "Flight State +1",
+        "cmd": "AdvanceFlightState",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Flight State -1",
+        "cmd": "RewindFlightState",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
       }
     ]
   },
@@ -565,7 +579,9 @@
                   "Nitrogen",
                   "Nitrous",
                   "Pilot",
-                  "RetractPlumbing"
+                  "RetractPlumbing",
+                  "AdvanceFlightState",
+                  "RewindFlightState"
                 ]
               }
             ]
@@ -729,7 +745,9 @@
                 "actions": [
                   "Launch",
                   "Dump",
-                  "Pilot"
+                  "Pilot",
+                  "AdvanceFlightState",
+                  "RewindFlightState"
                 ]
               }
             ]
@@ -1026,7 +1044,9 @@
                   "Nitrogen",
                   "Nitrous",
                   "Pilot",
-                  "RetractPlumbing"
+                  "RetractPlumbing",
+                  "AdvanceFlightState",
+                  "RewindFlightState"
                 ]
               }
             ]
