@@ -249,9 +249,15 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
     );
     if resume {
         if existing_bundle {
-            println!("bundle resume enabled: appending into existing {}", bundle_path.display());
+            println!(
+                "bundle resume enabled: appending into existing {}",
+                bundle_path.display()
+            );
         } else {
-            println!("bundle resume enabled: creating new {}", bundle_path.display());
+            println!(
+                "bundle resume enabled: creating new {}",
+                bundle_path.display()
+            );
         }
     } else {
         println!("bundle resume disabled: rebuilding from scratch");
@@ -460,14 +466,24 @@ async fn init_direct_bundle_pool(bundle_path: &Path, resume: bool) -> Result<Sql
         .connect(&url)
         .await?;
 
-    sqlx::query("PRAGMA journal_mode = OFF;").execute(&pool).await?;
-    sqlx::query("PRAGMA synchronous = OFF;").execute(&pool).await?;
+    sqlx::query("PRAGMA journal_mode = OFF;")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA synchronous = OFF;")
+        .execute(&pool)
+        .await?;
     sqlx::query("PRAGMA locking_mode = EXCLUSIVE;")
         .execute(&pool)
         .await?;
-    sqlx::query("PRAGMA temp_store = MEMORY;").execute(&pool).await?;
-    sqlx::query("PRAGMA cache_size = -262144;").execute(&pool).await?;
-    sqlx::query("PRAGMA page_size = 8192;").execute(&pool).await?;
+    sqlx::query("PRAGMA temp_store = MEMORY;")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA cache_size = -262144;")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA page_size = 8192;")
+        .execute(&pool)
+        .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS tile_blobs (
             id INTEGER PRIMARY KEY,
@@ -511,7 +527,13 @@ async fn bundle_has_tile(pool: &SqlitePool, z: u32, x: u32, y: u32) -> Result<bo
     Ok(present.is_some())
 }
 
-async fn upsert_tile_to_bundle(pool: &SqlitePool, z: u32, x: u32, y: u32, bytes: &[u8]) -> Result<()> {
+async fn upsert_tile_to_bundle(
+    pool: &SqlitePool,
+    z: u32,
+    x: u32,
+    y: u32,
+    bytes: &[u8],
+) -> Result<()> {
     let mut hasher = Hasher::new();
     hasher.update(bytes);
     let hash = hasher.finalize();
@@ -624,7 +646,10 @@ async fn main() -> Result<()> {
                     println!();
                     println!("----");
                 }
-                if fetch_tiles_for_zoom_async_to_db(z, &pool, &client).await.is_err() {}
+                if fetch_tiles_for_zoom_async_to_db(z, &pool, &client)
+                    .await
+                    .is_err()
+                {}
             }
             if let Err(e) = finalize_direct_bundle_pool(&pool, !resume || !existing_bundle).await {
                 eprintln!(
@@ -1107,7 +1132,11 @@ async fn fetch_tiles_for_zoom_async_to_db(
             let elapsed_s = start.elapsed().as_secs_f64().max(0.001);
             let bytes = bytes_for_rate.load(Ordering::Relaxed) as f64;
             let mib_per_s = (bytes / elapsed_s) / (1024.0 * 1024.0);
-            let pct = if total == 0 { 100 } else { (done.saturating_mul(100)) / total };
+            let pct = if total == 0 {
+                100
+            } else {
+                (done.saturating_mul(100)) / total
+            };
             let bucket = (pct / PROGRESS_PERCENT_STEP) as i64;
             if let Some(pb) = &pb_for_rate {
                 pb.set_position(done);
@@ -1120,7 +1149,9 @@ async fn fetch_tiles_for_zoom_async_to_db(
                 };
                 let eta_m = eta_secs / 60;
                 let eta_s = eta_secs % 60;
-                println!("z={z} {pct}% ETA {eta_m}m{eta_s:02}s {mib_per_s:.2} MiB/s ({done}/{total})");
+                println!(
+                    "z={z} {pct}% ETA {eta_m}m{eta_s:02}s {mib_per_s:.2} MiB/s ({done}/{total})"
+                );
                 last_bucket = bucket;
             }
             sleep(Duration::from_millis(400)).await;

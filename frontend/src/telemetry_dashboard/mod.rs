@@ -1,6 +1,7 @@
 // frontend/src/telemetry_dashboard/mod.rs
 
 mod actions_tab;
+mod calibration_tab;
 mod connection_status_tab;
 pub mod data_chart;
 pub mod data_tab;
@@ -30,6 +31,7 @@ use data_chart::{
 };
 
 use crate::telemetry_dashboard::actions_tab::ActionsTab;
+use calibration_tab::CalibrationTab;
 use connection_status_tab::ConnectionStatusTab;
 use data_tab::DataTab;
 use dioxus::prelude::*;
@@ -393,6 +395,7 @@ enum MainTab {
     ConnectionStatus,
     Map,
     Actions,
+    Calibration,
     Notifications,
     Warnings,
     Errors,
@@ -523,6 +526,7 @@ fn _main_tab_to_str(tab: MainTab) -> &'static str {
         MainTab::ConnectionStatus => "connection-status",
         MainTab::Map => "map",
         MainTab::Actions => "actions",
+        MainTab::Calibration => "calibration",
         MainTab::Notifications => "notifications",
         MainTab::Warnings => "warnings",
         MainTab::Errors => "errors",
@@ -535,6 +539,7 @@ fn _main_tab_from_str(s: &str) -> MainTab {
         "connection-status" => MainTab::ConnectionStatus,
         "map" => MainTab::Map,
         "actions" => MainTab::Actions,
+        "calibration" => MainTab::Calibration,
         "notifications" => MainTab::Notifications,
         "warnings" => MainTab::Warnings,
         "errors" => MainTab::Errors,
@@ -1618,6 +1623,11 @@ fn TelemetryDashboardInner() -> Element {
                             "Actions"
                         }
                         button {
+                            style: if *active_main_tab.read() == MainTab::Calibration { tab_style_active("#14b8a6") } else { tab_style_inactive.to_string() },
+                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Calibration) },
+                            "Calibration"
+                        }
+                        button {
                             style: if *active_main_tab.read() == MainTab::Notifications { tab_style_active("#3b82f6") } else { tab_style_inactive.to_string() },
                             onclick: {
                                 let mut t = active_main_tab;
@@ -1699,14 +1709,24 @@ fn TelemetryDashboardInner() -> Element {
                     ",
                     span { style: "color:#9ca3af;", "Status:" }
                     if let Some(ts) = network_time_snapshot {
-                        span { style: "color:#cbd5e1; margin-left:0.5rem;", "(Rocket Time: {ts})" }
+                        span { style: "color:#cbd5e1; margin-left:0.5rem;",
+                            "(Rocket Time: "
+                            span {
+                                style: "display:inline-block; width:12ch; text-align:right; white-space:nowrap; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;",
+                                "{ts}"
+                            }
+                            ")"
+                        }
                     }
 
                     if !has_warnings && !has_errors {
                         span { style: "color:#22c55e; font-weight:600;", "Nominal" }
                         span { style: "color:#93c5fd; margin-left:0.75rem;",
                             "(Flight state: ",
-                            "{flight_state.read().to_string()}",
+                            span {
+                                style: "display:inline-block; width:18ch; text-align:left; white-space:nowrap;",
+                                "{flight_state.read().to_string()}"
+                            }
                             ")"
                         }
                     } else {
@@ -1718,7 +1738,10 @@ fn TelemetryDashboardInner() -> Element {
                         }
                         span { style: "color:#93c5fd; margin-left:0.75rem;",
                             "(Flight state: ",
-                            "{flight_state.read().to_string()}",
+                            span {
+                                style: "display:inline-block; width:18ch; text-align:left; white-space:nowrap;",
+                                "{flight_state.read().to_string()}"
+                            }
                             ")"
                         }
 
@@ -1860,6 +1883,11 @@ fn TelemetryDashboardInner() -> Element {
                             ActionsTab { layout: layout.actions_tab.clone(), action_policy: action_policy }
                         }
                     },
+                    MainTab::Calibration => rsx! {
+                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                            CalibrationTab { rows: rows }
+                        }
+                    },
                     MainTab::Notifications => rsx! {
                         div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
                             NotificationsTab { history: notification_history }
@@ -1972,6 +2000,76 @@ pub(crate) async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> R
 
     client
         .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<T>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn http_post_json<B: Serialize, T: for<'de> Deserialize<'de>>(
+    path: &str,
+    body: &B,
+) -> Result<T, String> {
+    use gloo_net::http::Request;
+
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+
+    let base = UrlConfig::base_http();
+    let url = if base.is_empty() {
+        let w = web_sys::window().ok_or("no window".to_string())?;
+        let origin = w
+            .location()
+            .origin()
+            .map_err(|_| "failed to read window.location.origin".to_string())?;
+        format!("{origin}{path}")
+    } else {
+        format!("{base}{path}")
+    };
+
+    Request::post(&url)
+        .json(body)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<T>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn http_post_json<B: Serialize, T: for<'de> Deserialize<'de>>(
+    path: &str,
+    body: &B,
+) -> Result<T, String> {
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+
+    let base = UrlConfig::base_http();
+    let url = if base.is_empty() {
+        format!("http://localhost:3000{path}")
+    } else {
+        format!("{base}{path}")
+    };
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(UrlConfig::_skip_tls_verify())
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    client
+        .post(url)
+        .json(body)
         .send()
         .await
         .map_err(|e| e.to_string())?

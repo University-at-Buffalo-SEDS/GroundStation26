@@ -6,6 +6,7 @@ mod flight_sim;
 mod gpio;
 mod gpio_panel;
 mod layout;
+mod loadcell;
 mod map;
 mod radio;
 mod ring_buffer;
@@ -131,7 +132,6 @@ async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
     if let Err(err) = exec_pragma_with_retry(db, "PRAGMA optimize;", retries, delay_ms).await {
         eprintln!("SQLite PRAGMA optimize failed after {retries} attempts: {err}");
     }
-
 }
 
 async fn remove_sqlite_sidecars(db_path: &str) {
@@ -173,8 +173,11 @@ async fn finalize_sqlite_after_pool_close(db_path: &str) {
         }
     };
 
-    for stmt in ["PRAGMA busy_timeout=5000;", "PRAGMA wal_checkpoint(TRUNCATE);", "PRAGMA optimize;"]
-    {
+    for stmt in [
+        "PRAGMA busy_timeout=5000;",
+        "PRAGMA wal_checkpoint(TRUNCATE);",
+        "PRAGMA optimize;",
+    ] {
         if let Err(err) = sqlx::query(stmt).execute(&mut conn).await {
             eprintln!("SQLite finalization pragma failed ({stmt}): {err}");
         }
@@ -250,11 +253,7 @@ async fn main() -> anyhow::Result<()> {
     // --- DB path ---
     let mut db_path = PathBuf::from("./data/groundstation.db");
     if !db_path.exists() {
-        fs::create_dir_all(
-            db_path
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-        )?;
+        fs::create_dir_all(db_path.parent().unwrap_or_else(|| Path::new(".")))?;
         fs::write(&db_path, b"")?;
         println!("Created empty DB file.");
     }
@@ -361,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
+    let loadcell_calibration = loadcell::load_or_default();
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
@@ -376,6 +376,8 @@ async fn main() -> anyhow::Result<()> {
         last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
         umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+        latest_fill_mass_kg: Arc::new(Mutex::new(None)),
+        loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
         shutdown_tx,
         pending_db_writes: Arc::new(AtomicUsize::new(0)),
         db_write_notify: Arc::new(Notify::new()),
@@ -449,11 +451,17 @@ async fn main() -> anyhow::Result<()> {
                 println!("Rocket radio missing, using DummyRadio: {}", e);
                 #[cfg(feature = "testing")]
                 {
-                    (Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))), false)
+                    (
+                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))),
+                        false,
+                    )
                 }
                 #[cfg(all(not(feature = "testing"), feature = "hitl_mode"))]
                 {
-                    (Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))), false)
+                    (
+                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))),
+                        false,
+                    )
                 }
                 #[cfg(not(feature = "testing"))]
                 #[cfg(not(feature = "hitl_mode"))]

@@ -138,7 +138,10 @@ fn ignore_missing_board_in_hitl(state: &AppState, board: Board) -> bool {
         return true;
     }
     if !fill_link_up
-        && matches!(board, Board::ValveBoard | Board::ActuatorBoard | Board::GatewayBoard)
+        && matches!(
+            board,
+            Board::ValveBoard | Board::ActuatorBoard | Board::GatewayBoard
+        )
     {
         return true;
     }

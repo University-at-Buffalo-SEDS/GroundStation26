@@ -1,5 +1,6 @@
 use crate::flight_sim;
 use crate::layout;
+use crate::loadcell;
 use crate::state::AppState;
 use groundstation_shared::TelemetryRow;
 use groundstation_shared::{TelemetryCommand, u8_to_flight_state};
@@ -12,9 +13,9 @@ use sedsprintf_rs_2026::timesync::{
 
 use crate::gpio_panel::IGNITION_PIN;
 use crate::radio::RadioDevice;
-use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 #[cfg(feature = "hitl_mode")]
 use crate::rocket_commands::FlightComputerCommands;
+use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 use crate::web::{FlightStateMsg, emit_warning};
 use groundstation_shared::Board;
 use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
@@ -433,6 +434,62 @@ async fn emit_derived_battery_rows(
             state.cache_recent_telemetry(row.clone());
             let _ = state.ws_tx.send(row);
         }
+    }
+}
+
+async fn emit_derived_loadcell_rows(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbWrite>,
+    db_overflow: &DbOverflow,
+    ts_ms: i64,
+    sender_id: &str,
+    raw_kg1000: f32,
+    payload_json: &str,
+) {
+    let cfg = state.loadcell_calibration.lock().unwrap().clone();
+    let Some(weight_kg) =
+        loadcell::calibrated_weight_kg(&cfg, loadcell::RAW_LOADCELL_DATA_TYPE_1000KG, raw_kg1000)
+    else {
+        return;
+    };
+    let percent = loadcell::fill_percent(&cfg, weight_kg);
+    {
+        let mut latest = state.latest_fill_mass_kg.lock().unwrap();
+        *latest = Some(weight_kg);
+    }
+
+    let rows: [(&str, Vec<Option<f32>>); 2] = [
+        (loadcell::DERIVED_WEIGHT_DATA_TYPE, vec![Some(weight_kg)]),
+        (
+            loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
+            vec![Some(percent)],
+        ),
+    ];
+
+    for (data_type, values) in rows {
+        if should_persist_telemetry_sample(data_type, ts_ms) {
+            queue_db_write(
+                state,
+                db_tx,
+                db_overflow,
+                DbWrite::Telemetry {
+                    timestamp_ms: ts_ms,
+                    data_type: data_type.to_string(),
+                    sender_id: sender_id.to_string(),
+                    values_json: telemetry_values_json(&values),
+                    payload_json: payload_json.to_string(),
+                },
+            )
+            .await;
+        }
+
+        let row = TelemetryRow {
+            timestamp_ms: ts_ms,
+            data_type: data_type.to_string(),
+            values,
+        };
+        state.cache_recent_telemetry(row.clone());
+        let _ = state.ws_tx.send(row);
     }
 }
 
@@ -1250,6 +1307,19 @@ async fn handle_packet(
                 &payload_json,
             )
             .await;
+
+            if data_type_str == loadcell::RAW_LOADCELL_DATA_TYPE_1000KG {
+                emit_derived_loadcell_rows(
+                    state,
+                    db_tx,
+                    db_overflow,
+                    derived_ts_ms,
+                    pkt.sender(),
+                    voltage,
+                    &payload_json,
+                )
+                .await;
+            }
         }
 
         let row = TelemetryRow {

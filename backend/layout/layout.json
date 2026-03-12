@@ -290,6 +290,36 @@
         "chart": {
           "enabled": false
         }
+      },
+      {
+        "id": "KG1000",
+        "label": "KG1000",
+        "channels": [
+          "Raw Loadcell"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "LOADCELL_WEIGHT_KG",
+        "label": "LOADCELL_WEIGHT_KG",
+        "channels": [
+          "Weight (kg)"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "LOADCELL_FILL_PERCENT",
+        "label": "LOADCELL_FILL_PERCENT",
+        "channels": [
+          "Fill %"
+        ],
+        "chart": {
+          "enabled": true
+        }
       }
     ]
   },

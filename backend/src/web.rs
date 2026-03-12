@@ -1,4 +1,5 @@
 use crate::layout;
+use crate::loadcell;
 use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_bundle_path};
 use crate::sequences::{ActionPolicyMsg, PersistentNotification};
 use crate::state::AppState;
@@ -122,7 +123,31 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alerts", get(get_alerts))
         .route("/api/boards", get(get_boards))
         .route("/api/layout", get(get_layout))
+        .route("/api/calibration_config", get(get_calibration_config))
         .route("/api/map_config", get(get_map_config))
+        .route(
+            "/api/loadcell_calibration",
+            get(get_loadcell_calibration).post(set_loadcell_calibration),
+        )
+        .route(
+            "/api/loadcell_calibration/capture_zero",
+            post(capture_loadcell_zero),
+        )
+        .route(
+            "/api/loadcell_calibration/capture_span",
+            post(capture_loadcell_span),
+        )
+        .route(
+            "/api/loadcell_calibration/refit",
+            post(refit_loadcell_channel),
+        )
+        .route(
+            "/api/calibration",
+            get(get_loadcell_calibration).post(set_loadcell_calibration),
+        )
+        .route("/api/calibration/capture_zero", post(capture_loadcell_zero))
+        .route("/api/calibration/capture_span", post(capture_loadcell_span))
+        .route("/api/calibration/refit", post(refit_loadcell_channel))
         .route("/api/network_time", get(get_network_time))
         .route("/api/notifications", get(get_notifications))
         .route(
@@ -288,7 +313,12 @@ async fn get_layout() -> impl IntoResponse {
             #[cfg(feature = "hitl_mode")]
             {
                 for action in hitl_actions() {
-                    if !layout.actions_tab.actions.iter().any(|a| a.cmd == action.cmd) {
+                    if !layout
+                        .actions_tab
+                        .actions
+                        .iter()
+                        .any(|a| a.cmd == action.cmd)
+                    {
                         layout.actions_tab.actions.push(action);
                     }
                 }
@@ -297,6 +327,10 @@ async fn get_layout() -> impl IntoResponse {
         }
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
+}
+
+async fn get_calibration_config() -> impl IntoResponse {
+    Json(loadcell::calibration_tab_layout()).into_response()
 }
 
 #[derive(Serialize)]
@@ -315,6 +349,98 @@ async fn get_map_config() -> impl IntoResponse {
     };
 
     Json(MapConfigDto { max_native_zoom })
+}
+
+#[derive(Deserialize)]
+struct CaptureLoadcellPointReq {
+    sensor_id: String,
+    raw: f32,
+}
+
+#[derive(Deserialize)]
+struct CaptureLoadcellSpanReq {
+    sensor_id: String,
+    raw: f32,
+    known_kg: f32,
+}
+
+#[derive(Deserialize)]
+struct RefitLoadcellReq {
+    channel: String,
+    mode: String,
+}
+
+async fn get_loadcell_calibration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.loadcell_calibration.lock().unwrap().clone())
+}
+
+async fn set_loadcell_calibration(
+    State(state): State<Arc<AppState>>,
+    Json(cfg): Json<loadcell::LoadcellCalibrationFile>,
+) -> impl IntoResponse {
+    {
+        let mut slot = state.loadcell_calibration.lock().unwrap();
+        *slot = cfg.clone();
+    }
+    if let Err(err) = loadcell::save(&cfg) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+    }
+    Json(cfg).into_response()
+}
+
+async fn capture_loadcell_zero(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CaptureLoadcellPointReq>,
+) -> impl IntoResponse {
+    let updated = {
+        let mut cfg = state.loadcell_calibration.lock().unwrap();
+        loadcell::capture_zero(&mut cfg, &req.sensor_id, req.raw);
+        cfg.clone()
+    };
+    if let Err(err) = loadcell::save(&updated) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+    }
+    Json(updated).into_response()
+}
+
+async fn capture_loadcell_span(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CaptureLoadcellSpanReq>,
+) -> impl IntoResponse {
+    let updated = {
+        let mut cfg = state.loadcell_calibration.lock().unwrap();
+        loadcell::capture_span(&mut cfg, &req.sensor_id, req.raw, req.known_kg);
+        cfg.clone()
+    };
+    if let Err(err) = loadcell::save(&updated) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+    }
+    Json(updated).into_response()
+}
+
+async fn refit_loadcell_channel(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RefitLoadcellReq>,
+) -> impl IntoResponse {
+    let Some(channel) = loadcell::CalibrationChannel::from_str(req.channel.trim()) else {
+        return (StatusCode::BAD_REQUEST, "invalid channel".to_string()).into_response();
+    };
+    let Some(mode) = loadcell::FitMode::from_str(req.mode.trim()) else {
+        return (StatusCode::BAD_REQUEST, "invalid fit mode".to_string()).into_response();
+    };
+
+    let updated = {
+        let mut cfg = state.loadcell_calibration.lock().unwrap();
+        if let Err(err) = loadcell::refit_channel(&mut cfg, channel, mode) {
+            return (StatusCode::BAD_REQUEST, err).into_response();
+        }
+        cfg.clone()
+    };
+
+    if let Err(err) = loadcell::save(&updated) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+    }
+    Json(updated).into_response()
 }
 
 async fn get_tile_jpg(Path((z, x, y_raw)): Path<(u32, u32, String)>) -> impl IntoResponse {

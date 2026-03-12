@@ -1,4 +1,5 @@
 use crate::gpio::GpioPins;
+use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
 use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
@@ -63,6 +64,12 @@ pub struct AppState {
 
     /// Latest fuel tank pressure (psi)
     pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
+
+    /// Latest calibrated fill-mass estimate from 1000kg loadcell.
+    pub latest_fill_mass_kg: Arc<Mutex<Option<f32>>>,
+
+    /// Loadcell calibration data loaded from JSON and editable at runtime.
+    pub loadcell_calibration: Arc<Mutex<LoadcellCalibrationFile>>,
 
     /// Broadcast shutdown notifications to long-running background tasks.
     pub shutdown_tx: broadcast::Sender<()>,

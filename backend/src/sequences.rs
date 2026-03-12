@@ -168,6 +168,7 @@ struct SequenceRuntime {
     nitrous_level_since: Option<Instant>,
     last_nitrous_pressure_psi: Option<f32>,
     notified_retract_fill_lines: bool,
+    auto_close_nitrous_sent: bool,
 }
 
 impl Default for SequenceRuntime {
@@ -183,6 +184,7 @@ impl Default for SequenceRuntime {
             nitrous_level_since: None,
             last_nitrous_pressure_psi: None,
             notified_retract_fill_lines: false,
+            auto_close_nitrous_sent: false,
         }
     }
 }
@@ -508,6 +510,41 @@ fn update_sequence_runtime(
             if valves.nitrous_open != Some(true) {
                 runtime.nitrous_level_since = None;
                 runtime.last_nitrous_pressure_psi = None;
+                runtime.auto_close_nitrous_sent = false;
+                return;
+            }
+
+            let target_mass_kg = {
+                state
+                    .loadcell_calibration
+                    .lock()
+                    .unwrap()
+                    .full_mass_kg
+                    .unwrap_or(crate::loadcell::DEFAULT_FULL_MASS_KG)
+                    .max(0.0001)
+            };
+            let current_mass_kg = *state.latest_fill_mass_kg.lock().unwrap();
+            if current_mass_kg.is_some_and(|m| m >= target_mass_kg) {
+                if !runtime.auto_close_nitrous_sent {
+                    match state.cmd_tx.try_send(TelemetryCommand::Nitrous) {
+                        Ok(_) => {
+                            runtime.auto_close_nitrous_sent = true;
+                            state.add_notification(format!(
+                                "Loadcell target reached ({target_mass_kg:.2} kg). Closing nitrous valve."
+                            ));
+                        }
+                        Err(err) => {
+                            emit_warning(
+                                state,
+                                format!(
+                                    "Auto-close nitrous command failed at loadcell target: {err}"
+                                ),
+                            );
+                        }
+                    }
+                }
+                runtime.notified_close_nitrous = false;
+                runtime.step = SequenceStep::CloseNitrous;
                 return;
             }
 

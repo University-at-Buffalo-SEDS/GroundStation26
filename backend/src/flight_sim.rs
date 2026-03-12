@@ -1,4 +1,6 @@
 #[cfg(feature = "testing")]
+use crate::loadcell;
+#[cfg(feature = "testing")]
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 #[cfg(feature = "testing")]
 use crate::telemetry_task::get_current_timestamp_ms;
@@ -36,6 +38,19 @@ const AV_BAY_BATTERY_MAX_V: f32 = 8.4;
 const GROUND_STATION_BATTERY_CUTOFF_V: f32 = 13.3;
 #[cfg(feature = "testing")]
 const GROUND_STATION_BATTERY_MAX_V: f32 = 15.5;
+#[cfg(feature = "testing")]
+const LOADCELL_NOISE_KG: f32 = 0.01;
+
+#[cfg(feature = "testing")]
+fn sim_full_mass_kg() -> f32 {
+    static FULL_MASS_KG: OnceLock<f32> = OnceLock::new();
+    *FULL_MASS_KG.get_or_init(|| {
+        loadcell::load_or_default()
+            .full_mass_kg
+            .unwrap_or(loadcell::DEFAULT_FULL_MASS_KG)
+            .max(0.1)
+    })
+}
 
 #[cfg(feature = "testing")]
 #[derive(Debug)]
@@ -62,6 +77,7 @@ struct FlightSimState {
     ground_station_battery_v: f32,
     ground_station_battery_a: f32,
     next_battery_sender_gateway: bool,
+    loadcell_mass_kg: f32,
     valves: HashMap<u8, bool>,
     saw_dump_open_after_n2: bool,
     saw_dump_closed_after_n2: bool,
@@ -117,6 +133,7 @@ impl FlightSimState {
             ground_station_battery_v: GROUND_STATION_BATTERY_MAX_V,
             ground_station_battery_a: 0.7,
             next_battery_sender_gateway: false,
+            loadcell_mass_kg: 0.0,
             valves,
             saw_dump_open_after_n2: false,
             saw_dump_closed_after_n2: false,
@@ -408,10 +425,17 @@ impl FlightSimState {
 
         self.av_bay_battery_v =
             (self.av_bay_battery_v - av_bay_drop_v_per_s * dt_s).max(AV_BAY_BATTERY_CUTOFF_V);
-        self.ground_station_battery_v =
-            (self.ground_station_battery_v - gs_drop_v_per_s * dt_s)
-                .max(GROUND_STATION_BATTERY_CUTOFF_V);
+        self.ground_station_battery_v = (self.ground_station_battery_v - gs_drop_v_per_s * dt_s)
+            .max(GROUND_STATION_BATTERY_CUTOFF_V);
         self.battery_v = self.av_bay_battery_v;
+
+        let fill_target = sim_full_mass_kg();
+        if n2o_open && !dump_open {
+            self.loadcell_mass_kg =
+                (self.loadcell_mass_kg + dt_s * (fill_target / 18.0)).min(fill_target);
+        } else if dump_open || no_open {
+            self.loadcell_mass_kg = (self.loadcell_mass_kg - dt_s * 0.35).max(0.0);
+        }
     }
 
     fn apply_flight_profile(&mut self, t: f32, now_ms: u64) {
@@ -486,6 +510,7 @@ impl FlightSimState {
             DataType::BatteryVoltage,
             DataType::BatteryCurrent,
             DataType::GpsData,
+            DataType::KG1000,
         ];
         let dtype = seq[self.next_sensor_idx % seq.len()];
         self.next_sensor_idx = (self.next_sensor_idx + 1) % seq.len();
@@ -540,6 +565,13 @@ impl FlightSimState {
                     self.altitude_ft * 0.3048,
                 ]
             }
+            DataType::KG1000 => {
+                let raw_kg = (self.loadcell_mass_kg
+                    + rng.random_range(-LOADCELL_NOISE_KG..LOADCELL_NOISE_KG))
+                .max(0.0)
+                .min(sim_full_mass_kg());
+                vec![raw_kg]
+            }
             _ => vec![0.0],
         };
 
@@ -568,6 +600,7 @@ fn sender_for_datatype(dtype: DataType) -> &'static str {
         DataType::BarometerData | DataType::FuelFlow | DataType::FuelTankPressure => {
             Board::DaqBoard.sender_id()
         }
+        DataType::KG1000 => Board::DaqBoard.sender_id(),
         DataType::BatteryVoltage | DataType::BatteryCurrent => Board::PowerBoard.sender_id(),
         DataType::GpsData => Board::GatewayBoard.sender_id(),
         _ => Board::GroundStation.sender_id(),
