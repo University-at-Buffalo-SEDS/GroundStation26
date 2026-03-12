@@ -212,5 +212,7 @@ pub fn u8_to_flight_state(value: u8) -> Option<FlightState> {
 pub struct TelemetryRow {
     pub timestamp_ms: i64,
     pub data_type: String, // "GYRO_DATA", "ACCEL_DATA", etc.
+    #[serde(default)]
+    pub sender_id: String,
     pub values: Vec<Option<f32>>,
 }

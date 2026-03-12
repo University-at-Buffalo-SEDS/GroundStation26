@@ -1,5 +1,7 @@
 // frontend/src/telemetry_dashboard/map_tab.rs
 
+#[cfg(target_os = "android")]
+use crate::telemetry_dashboard::gps_android;
 #[cfg(target_os = "ios")]
 use crate::telemetry_dashboard::gps_apple;
 use crate::telemetry_dashboard::{
@@ -50,6 +52,7 @@ pub fn MapTab(
         let mut show_enable_compass = show_enable_compass;
         use_effect(move || {
             let max_native_zoom = *max_native_zoom_sig.read();
+            js_eval(r#"console.error("[GS26 map] setup effect entered");"#);
             #[cfg(target_os = "ios")]
             js_eval(
                 r#"
@@ -67,7 +70,7 @@ pub fn MapTab(
             js_setup_map_touch_guard();
             js_setup_map_size_guard();
             js_setup_js_init_retry(&tiles, max_native_zoom);
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "android")))]
             js_setup_js_geolocation_watch();
 
             // Debounced resize/orientation/visualViewport reinit path
@@ -75,6 +78,29 @@ pub fn MapTab(
 
             // Fullscreen enter/exit explicit reinit hook (independent of rotation)
             js_setup_js_fullscreen_reinit(&tiles, max_native_zoom);
+
+            js_eval(
+                &format!(
+                    r#"
+                    (function() {{
+                      try {{
+                        console.error("[GS26 map] forcing immediate init attempt");
+                        if (window.__gs26_ground_station_loaded === true &&
+                            typeof window.initGroundMap === "function") {{
+                          window.initGroundMap({tiles:?}, 31.0, -99.0, 7.0, {max_native_zoom});
+                        }} else {{
+                          console.error("[GS26 map] init prerequisites missing", {{
+                            loaded: window.__gs26_ground_station_loaded,
+                            hasInit: typeof window.initGroundMap === "function"
+                          }});
+                        }}
+                      }} catch (e) {{
+                        console.error("[GS26 map] immediate init failed", String(e), e && e.stack ? e.stack : "");
+                      }}
+                    }})();
+                    "#
+                ),
+            );
         });
     }
 
@@ -86,6 +112,7 @@ pub fn MapTab(
         use_effect(move || {
             let max_native_zoom = *max_native_zoom_sig.read();
             let fs = *is_fullscreen_sig.read();
+            js_eval(r#"console.error("[GS26 map] fullscreen/reinit effect entered");"#);
             js_force_map_reinit_now(&tiles, max_native_zoom, fs, FULLSCREEN_REINIT_DELAY_MS);
         });
     }
@@ -132,6 +159,11 @@ pub fn MapTab(
                     js_set_user_heading(deg);
                 }
 
+                #[cfg(target_os = "android")]
+                if let Some(deg) = gps_android::latest_heading_deg() {
+                    js_set_user_heading(deg);
+                }
+
                 #[cfg(target_arch = "wasm32")]
                 gloo_timers::future::TimeoutFuture::new(20).await;
 
@@ -162,6 +194,7 @@ pub fn MapTab(
     }
 
     let on_center_me = move |_| {
+        #[cfg(not(target_os = "android"))]
         js_request_user_geolocation_once();
 
         // Refresh from JS at click-time
@@ -454,6 +487,7 @@ fn js_setup_js_init_retry(tiles: &str, max_native_zoom: u32) {
     );
 }
 
+#[cfg(not(target_os = "android"))]
 fn js_setup_js_geolocation_watch() {
     js_eval(
         r#"
@@ -488,6 +522,7 @@ fn js_setup_js_geolocation_watch() {
     );
 }
 
+#[cfg(not(target_os = "android"))]
 fn js_request_user_geolocation_once() {
     js_eval(
         r#"
@@ -742,7 +777,7 @@ fn js_center_on(lat: f64, lon: f64) {
     ));
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 fn js_set_user_heading(deg: f64) {
     js_eval(&format!(
         r#"

@@ -624,14 +624,18 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     .await
     .unwrap_or_default();
 
-    let mut by_key: HashMap<(String, i64), TelemetryRow> = HashMap::new();
+    let mut by_key: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
     for row in rows_db {
         let item = TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             data_type: row.get::<String, _>("data_type"),
+            sender_id: row.get::<String, _>("sender_id"),
             values: values_from_row(&row),
         };
-        by_key.insert((item.data_type.clone(), item.timestamp_ms), item);
+        by_key.insert(
+            (item.data_type.clone(), item.sender_id.clone(), item.timestamp_ms),
+            item,
+        );
     }
 
     for row in cache_snapshot {
@@ -639,13 +643,14 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             continue;
         }
         // Cache rows are newest realtime view and should win over stale DB rows.
-        by_key.insert((row.data_type.clone(), row.timestamp_ms), row);
+        by_key.insert((row.data_type.clone(), row.sender_id.clone(), row.timestamp_ms), row);
     }
 
     let mut rows: Vec<TelemetryRow> = by_key.into_values().collect();
     rows.sort_by(|a, b| {
         a.timestamp_ms
             .cmp(&b.timestamp_ms)
+            .then_with(|| a.sender_id.cmp(&b.sender_id))
             .then_with(|| a.data_type.cmp(&b.data_type))
     });
 

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use super::types::FlightState;
 
@@ -190,6 +191,47 @@ pub enum StateWidgetKind {
     ValveState,
     Map,
     Actions,
+}
+
+impl LayoutConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let mut tab_ids = HashSet::new();
+        for tab in &self.data_tab.tabs {
+            if tab.id.trim().is_empty() {
+                return Err("layout contains a data tab with an empty id".to_string());
+            }
+            if !tab_ids.insert(tab.id.clone()) {
+                return Err(format!("layout contains duplicate data tab id '{}'", tab.id));
+            }
+            if tab.label.trim().is_empty() {
+                return Err(format!("data tab '{}' has an empty label", tab.id));
+            }
+            if let Some(channel_labels) = &tab.channel_boolean_labels
+                && channel_labels.len() > tab.channels.len()
+            {
+                return Err(format!(
+                    "data tab '{}' has more channel boolean labels than channels",
+                    tab.id
+                ));
+            }
+        }
+
+        for (state_idx, state) in self.state_tab.states.iter().enumerate() {
+            for (section_idx, section) in state.sections.iter().enumerate() {
+                for (widget_idx, widget) in section.widgets.iter().enumerate() {
+                    if matches!(widget.kind, StateWidgetKind::Summary)
+                        && widget.items.as_ref().is_none_or(Vec::is_empty)
+                    {
+                        return Err(format!(
+                            "state layout entry {state_idx}, section {section_idx}, widget {widget_idx} is a summary with no items"
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

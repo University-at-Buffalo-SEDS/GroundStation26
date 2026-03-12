@@ -98,5 +98,7 @@ pub struct BoardStatusMsg {
 pub struct TelemetryRow {
     pub timestamp_ms: i64,
     pub data_type: String,
+    #[serde(default)]
+    pub sender_id: String,
     pub values: Vec<Option<f32>>,
 }

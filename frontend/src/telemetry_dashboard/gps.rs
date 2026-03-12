@@ -2,33 +2,26 @@
 #![allow(dead_code)]
 
 use dioxus::prelude::*;
-#[allow(unused_imports)]
-use dioxus_signals::{Signal, WritableExt};
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static STARTED: AtomicBool = AtomicBool::new(false);
+use dioxus_signals::Signal;
 
 /// Imperative start (only meaningful on platforms that need it).
 /// Safe to call multiple times.
-pub fn start_gps_updates(user_gps: Signal<Option<(f64, f64)>>) {
-    if STARTED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    imp::start(user_gps);
+pub fn start_gps_updates(_user_gps: Signal<Option<(f64, f64)>>) {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+    imp::start(_user_gps);
 }
 
 /// Imperative stop (only meaningful on platforms that need it).
 pub fn stop_gps_updates() {
-    if STARTED.swap(false, Ordering::SeqCst) {
-        imp::stop();
-    }
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+    imp::stop();
 }
 
 /// ONE common interface:
 /// Mount this once in the dashboard and it will:
 /// - connect `user_gps`
 /// - start/stop native backends if needed
-/// - use dioxus_sdk_geolocation on wasm/windows (hook-based)
+/// - use dioxus_sdk_geolocation on wasm
 ///
 /// This component renders nothing visible.
 #[component]
@@ -36,14 +29,6 @@ pub fn GpsDriver(
     user_gps: Signal<Option<(f64, f64)>>,
     #[props(optional)] js_ready: Option<bool>,
 ) -> Element {
-    // Windows: avoid dioxus geolocation hook instability and rely on JS watchPosition path.
-    #[cfg(target_os = "windows")]
-    {
-        let _ = user_gps;
-        let _ = js_ready;
-        return rsx!(div {});
-    }
-
     // wasm: hook-based SDK (no globals, no stop needed)
     #[cfg(target_arch = "wasm32")]
     {
@@ -71,10 +56,33 @@ pub fn GpsDriver(
         return rsx!(div {});
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        let mut watch_task = use_signal(|| None::<Task>);
+
+        use_effect(move || {
+            let task = spawn({
+                let user_gps = user_gps;
+                async move {
+                    crate::telemetry_dashboard::gps_webview::run(user_gps).await;
+                }
+            });
+            watch_task.set(Some(task));
+        });
+
+        use_drop(move || {
+            if let Some(task) = watch_task.take() {
+                task.cancel();
+            }
+            crate::telemetry_dashboard::gps_webview::stop();
+        });
+
+        return rsx!(div {});
+    }
+
     // native imperative backends: start on mount, stop on unmount
     #[cfg(not(any(target_arch = "wasm32", target_os = "windows")))]
     {
-        // Start (idempotent due to STARTED)
         use_effect({
             let user_gps = user_gps;
             move || {
@@ -119,20 +127,8 @@ mod imp {
     }
 
     pub fn stop() {
-        #[allow(unused)]
-        {
-            // If you have it:
-            // crate::telemetry_dashboard::gps_android::stop();
-        }
+        crate::telemetry_dashboard::gps_android::stop();
     }
-}
-
-// wasm/windows imperative: no-op
-#[cfg(any(target_arch = "wasm32", target_os = "windows"))]
-mod imp {
-    use super::*;
-    pub fn start(_user_gps: Signal<Option<(f64, f64)>>) {}
-    pub fn stop() {}
 }
 
 // Everything else native: no-op

@@ -131,7 +131,7 @@ function createNaTileLayer(tilesUrl, maxNativeZoom, maxZoom) {
         [NA_BOUNDS.latMax, NA_BOUNDS.lonMax]
     );
 
-    return L.tileLayer(tilesUrl, {
+    const layer = L.tileLayer(tilesUrl, {
         bounds: naBoundsLatLng,
         minZoom: MIN_ZOOM,
         maxZoom: maxZoom,
@@ -139,6 +139,22 @@ function createNaTileLayer(tilesUrl, maxNativeZoom, maxZoom) {
         noWrap: true,
         attribution: "Local tiles",
     });
+
+    try {
+        console.log("[GS26 map] tile layer created", {
+            tilesUrl,
+            maxNativeZoom,
+            maxZoom,
+        });
+        layer.on("loading", () => console.log("[GS26 map] tiles loading"));
+        layer.on("tileloadstart", (e) => console.log("[GS26 map] tileloadstart", e?.url || ""));
+        layer.on("tileload", (e) => console.log("[GS26 map] tileload", e?.tile?.src || e?.url || ""));
+        layer.on("tileerror", (e) => console.warn("[GS26 map] tileerror", e?.tile?.src || e?.url || "", e));
+    } catch (e) {
+        console.warn("[GS26 map] failed to install tile logging", e);
+    }
+
+    return layer;
 }
 
 function rememberMapView() {
@@ -306,6 +322,16 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom) {
 
     const el = document.getElementById("ground-map");
     if (!el) return;
+
+    try {
+        console.log("[GS26 map] initGroundMap", {
+            tilesUrl,
+            centerLat,
+            centerLon,
+            zoom,
+            maxNativeZoom,
+        });
+    } catch (e) {}
 
     if (groundMap && groundMap.getContainer() === el) return;
     if (groundMap) {

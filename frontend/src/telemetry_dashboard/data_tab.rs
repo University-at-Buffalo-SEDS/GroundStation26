@@ -1,4 +1,4 @@
-use super::layout::{BooleanLabels, DataTabLayout};
+use super::layout::{BatterySourceConfig, BooleanLabels, DataTabLayout};
 use super::types::TelemetryRow;
 // frontend/src/telemetry_dashboard/data_tab.rs
 use dioxus::prelude::*;
@@ -45,6 +45,7 @@ pub fn DataTab(
     rows: Signal<Vec<TelemetryRow>>,
     active_tab: Signal<String>,
     layout: DataTabLayout,
+    battery_sources: Vec<BatterySourceConfig>,
 ) -> Element {
     let mut is_fullscreen = use_signal(|| false);
     let mut show_chart = use_signal(|| true);
@@ -222,11 +223,33 @@ pub fn DataTab(
         .rev()
         .find(|r| r.data_type == current)
         .cloned();
+    let battery_card_rows: Vec<(&BatterySourceConfig, Option<TelemetryRow>)> = battery_sources
+        .iter()
+        .filter(|source| {
+            source.input_data_type == current
+                || source.percent_data_type == current
+                || source.drop_rate_data_type == current
+                || source.remaining_minutes_data_type == current
+        })
+        .map(|source| {
+            let row = rows
+                .read()
+                .iter()
+                .rev()
+                .find(|r| r.data_type == current && r.sender_id == source.sender_id)
+                .cloned();
+            (source, row)
+        })
+        .collect();
 
     let is_valve_state = current == "VALVE_STATE";
     let boolean_labels = current_tab.and_then(|t| t.boolean_labels.as_ref());
     let channel_boolean_labels = current_tab.and_then(|t| t.channel_boolean_labels.as_ref());
-    let has_telemetry = latest_row.is_some();
+    let has_telemetry = if battery_card_rows.is_empty() {
+        latest_row.is_some()
+    } else {
+        battery_card_rows.iter().any(|(_, row)| row.is_some())
+    };
     let is_graph_allowed =
         chart_enabled && has_telemetry && current != "GPS_DATA" && !is_valve_state;
 
@@ -320,21 +343,37 @@ pub fn DataTab(
                         rsx! {
                             div {
                                 style: "display:grid; gap:10px; align-items:stretch; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); width:100%;",
-                                for i in 0..labels.len() {
-                                    if !labels[i].is_empty() {
+                                if battery_card_rows.is_empty() {
+                                    for (i, label) in labels.iter().enumerate() {
+                                        if !label.is_empty() {
+                                            SummaryCard {
+                                                label: label.clone(),
+                                                min: if is_graph_allowed { chan_min.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
+                                                max: if is_graph_allowed { chan_max.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
+                                                value: if let Some(lbls) = channel_boolean_labels
+                                                    .and_then(|list| list.get(i))
+                                                {
+                                                    boolean_value_text(vals.get(i).copied().flatten(), Some(lbls))
+                                                } else if is_valve_state || boolean_labels.is_some() {
+                                                    boolean_value_text(vals.get(i).copied().flatten(), boolean_labels)
+                                                } else {
+                                                    fmt_opt(vals.get(i).copied().flatten())
+                                                },
+                                                color: summary_color(i),
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    for (i, (source, battery_row)) in battery_card_rows.iter().enumerate() {
                                         SummaryCard {
-                                            label: labels[i].clone(),
-                                            min: if is_graph_allowed { chan_min.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
-                                            max: if is_graph_allowed { chan_max.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
-                                            value: if let Some(lbls) = channel_boolean_labels
-                                                .and_then(|list| list.get(i))
-                                            {
-                                                boolean_value_text(vals.get(i).copied().flatten(), Some(lbls))
-                                            } else if is_valve_state || boolean_labels.is_some() {
-                                                boolean_value_text(vals.get(i).copied().flatten(), boolean_labels)
-                                            } else {
-                                                fmt_opt(vals.get(i).copied().flatten())
-                                            },
+                                            label: source.label.clone(),
+                                            min: None,
+                                            max: None,
+                                            value: battery_row
+                                                .as_ref()
+                                                .and_then(|row| row.values.first().copied().flatten())
+                                                .map(|v| format!("{v:.4}"))
+                                                .unwrap_or_else(|| "—".to_string()),
                                             color: summary_color(i),
                                         }
                                     }

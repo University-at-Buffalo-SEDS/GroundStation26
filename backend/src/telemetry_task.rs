@@ -430,6 +430,7 @@ async fn emit_derived_battery_rows(
             let row = TelemetryRow {
                 timestamp_ms: ts_ms,
                 data_type: data_type.to_string(),
+                sender_id: sender_id.to_string(),
                 values,
             };
             state.cache_recent_telemetry(row.clone());
@@ -487,6 +488,7 @@ async fn emit_derived_loadcell_rows(
         let row = TelemetryRow {
             timestamp_ms: ts_ms,
             data_type: data_type.to_string(),
+            sender_id: sender_id.to_string(),
             values,
         };
         state.cache_recent_telemetry(row.clone());
@@ -1269,6 +1271,7 @@ async fn handle_packet(
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
                     data_type: VALVE_STATE_DATA_TYPE.to_string(),
+                    sender_id: pkt.sender().to_string(),
                     values: values_vec,
                 };
                 return Some(row);
@@ -1344,6 +1347,7 @@ async fn handle_packet(
         let row = TelemetryRow {
             timestamp_ms: ts_ms,
             data_type: data_type_str,
+            sender_id: pkt.sender().to_string(),
             values: values_vec,
         };
 

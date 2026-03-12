@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 try:
     import tomllib  # py3.11+
@@ -21,6 +22,8 @@ from subprocess import DEVNULL
 from typing import Optional, Literal
 
 APP_NAME = "UBSEDS GS"
+WINDOWS_APP_NAME = "UBSEDS GroundStation"
+ANDROID_APP_NAME = "SEDS GS"
 LEGACY_APP_NAME = "GroundstationFrontend"
 DIST_DIRNAME = "dist"
 APP_BUNDLE_NAME = f"{APP_NAME}.app"
@@ -387,20 +390,34 @@ def _remove_path(path: Path) -> None:
         path.unlink()
 
 
-def _rename_legacy_binary_in_dir(dir_path: Path) -> None:
+def _rename_binary_in_dir(dir_path: Path, platform_name: str) -> None:
     legacy_exe = dir_path / f"{LEGACY_APP_NAME}.exe"
+    current_exe = dir_path / f"{APP_NAME}.exe"
+    target_exe_name = WINDOWS_APP_NAME if platform_name == "windows" else APP_NAME
     if legacy_exe.exists():
-        dst = dir_path / f"{APP_NAME}.exe"
+        dst = dir_path / f"{target_exe_name}.exe"
         print(f"Renaming Windows binary: {legacy_exe} -> {dst}")
         _remove_path(dst)
         legacy_exe.rename(dst)
+    elif platform_name == "windows" and current_exe.exists() and target_exe_name != APP_NAME:
+        dst = dir_path / f"{target_exe_name}.exe"
+        print(f"Renaming Windows binary: {current_exe} -> {dst}")
+        _remove_path(dst)
+        current_exe.rename(dst)
 
     legacy_bin = dir_path / LEGACY_APP_NAME
+    current_bin = dir_path / APP_NAME
+    target_bin_name = WINDOWS_APP_NAME if platform_name == "windows" else APP_NAME
     if legacy_bin.exists():
-        dst = dir_path / APP_NAME
+        dst = dir_path / target_bin_name
         print(f"Renaming Linux binary: {legacy_bin} -> {dst}")
         _remove_path(dst)
         legacy_bin.rename(dst)
+    elif current_bin.exists() and target_bin_name != APP_NAME:
+        dst = dir_path / target_bin_name
+        print(f"Renaming binary: {current_bin} -> {dst}")
+        _remove_path(dst)
+        current_bin.rename(dst)
 
 
 def _strip_version_from_filename(name: str) -> str:
@@ -414,18 +431,36 @@ def _strip_version_from_filename(name: str) -> str:
     return new
 
 
+def _strip_android_target_suffix(name: str) -> str:
+    return re.sub(r"-(aarch64|armv7|arm|x86_64|i686)-linux-android(?=\.)", "", name)
+
+
 def rename_windows_linux_artifacts(frontend_dir: Path, platform_name: str) -> None:
     dist = dist_dir(frontend_dir)
     if not dist.exists():
         return
 
+    target_name = WINDOWS_APP_NAME if platform_name == "windows" else APP_NAME
     renamed_any = False
     for item in sorted(dist.iterdir()):
         name = item.name
-        if not (name.startswith(LEGACY_APP_NAME) or name.startswith(APP_NAME)):
+        if not (
+            name.startswith(LEGACY_APP_NAME)
+            or name.startswith(APP_NAME)
+            or name.startswith(target_name)
+        ):
             continue
         if name.startswith(LEGACY_APP_NAME):
-            new_name = APP_NAME + name[len(LEGACY_APP_NAME):]
+            new_name = target_name + name[len(LEGACY_APP_NAME):]
+            dst = dist / new_name
+            print(f"Renaming {platform_name} artifact: {name} -> {new_name}")
+            _remove_path(dst)
+            item.rename(dst)
+            item = dst
+            name = new_name
+            renamed_any = True
+        elif name.startswith(APP_NAME) and target_name != APP_NAME:
+            new_name = target_name + name[len(APP_NAME):]
             dst = dist / new_name
             print(f"Renaming {platform_name} artifact: {name} -> {new_name}")
             _remove_path(dst)
@@ -444,12 +479,254 @@ def rename_windows_linux_artifacts(frontend_dir: Path, platform_name: str) -> No
             renamed_any = True
 
         if item.is_dir():
-            _rename_legacy_binary_in_dir(item)
+            _rename_binary_in_dir(item, platform_name)
 
-    _rename_legacy_binary_in_dir(dist)
+    _rename_binary_in_dir(dist, platform_name)
 
     if not renamed_any:
         print(f"Warning: no {platform_name} artifacts matched legacy name for rename.", file=sys.stderr)
+
+
+def rename_android_artifacts(frontend_dir: Path) -> None:
+    dist = dist_dir(frontend_dir)
+    if not dist.exists():
+        return
+
+    renamed_any = False
+    for item in sorted(dist.iterdir()):
+        name = item.name
+        if not (
+            name.startswith(LEGACY_APP_NAME)
+            or name.startswith(APP_NAME)
+            or name.startswith(ANDROID_APP_NAME)
+        ):
+            continue
+
+        if name.startswith(LEGACY_APP_NAME):
+            new_name = ANDROID_APP_NAME + name[len(LEGACY_APP_NAME):]
+        elif name.startswith(APP_NAME):
+            new_name = ANDROID_APP_NAME + name[len(APP_NAME):]
+        else:
+            new_name = name
+
+        if new_name != name:
+            dst = dist / new_name
+            print(f"Renaming android artifact: {name} -> {new_name}")
+            _remove_path(dst)
+            item.rename(dst)
+            item = dst
+            name = new_name
+            renamed_any = True
+
+        stripped = _strip_version_from_filename(name)
+        stripped = _strip_android_target_suffix(stripped)
+        if stripped != name:
+            dst = dist / stripped
+            print(f"Removing version from android artifact: {name} -> {stripped}")
+            _remove_path(dst)
+            item.rename(dst)
+            renamed_any = True
+
+    if not renamed_any:
+        print("Warning: no android artifacts matched legacy name for rename.", file=sys.stderr)
+
+
+def _find_android_aab(frontend_dir: Path) -> Optional[Path]:
+    dist = dist_dir(frontend_dir)
+    if not dist.exists():
+        return None
+    candidates = sorted(dist.glob("*.aab"))
+    return candidates[-1] if candidates else None
+
+
+def _frontend_package_name(frontend_dir: Path) -> str:
+    cargo_toml = frontend_dir / "Cargo.toml"
+    if tomllib is not None and cargo_toml.exists():
+        data = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
+        pkg = data.get("package", {})
+        name = pkg.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return "groundstation_frontend"
+
+
+def _generated_android_app_dir(frontend_dir: Path, debug_mode: bool) -> Path:
+    profile = "debug" if debug_mode else "release"
+    pkg_name = _frontend_package_name(frontend_dir)
+    return frontend_dir.parent / "target" / "dx" / pkg_name / profile / "android" / "app"
+
+
+def clear_generated_android_project(frontend_dir: Path, debug_mode: bool) -> None:
+    project_dir = _generated_android_app_dir(frontend_dir, debug_mode)
+    if project_dir.exists():
+        print(f"Removing existing generated Android project: {project_dir}")
+        shutil.rmtree(project_dir)
+
+
+def _merge_tree(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    for path in src.rglob("*"):
+        rel = path.relative_to(src)
+        target = dst / rel
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+
+
+def patch_generated_android_project(frontend_dir: Path, debug_mode: bool) -> Path:
+    project_dir = _generated_android_app_dir(frontend_dir, debug_mode)
+    app_src_main = project_dir / "app" / "src" / "main"
+    if not app_src_main.exists():
+        raise FileNotFoundError(f"Generated Android app sources not found: {app_src_main}")
+
+    overlay_root = frontend_dir / "platform" / "android"
+    for stale in [
+        app_src_main / "java" / "com" / "ubseds" / "gs26",
+        app_src_main / "kotlin" / "com" / "ubseds" / "gs26",
+    ]:
+        if stale.exists():
+            shutil.rmtree(stale)
+
+    manifest_src = overlay_root / "AndroidManifest.xml"
+    if manifest_src.exists():
+        shutil.copy2(manifest_src, app_src_main / "AndroidManifest.xml")
+
+    _merge_tree(overlay_root / "res", app_src_main / "res")
+    _merge_tree(overlay_root / "java", app_src_main / "java")
+    _merge_tree(overlay_root / "kotlin", app_src_main / "kotlin")
+    _ensure_android_icon_compat(frontend_dir, app_src_main)
+    proguard_src = overlay_root / "proguard-rules.pro"
+    if proguard_src.exists():
+        shutil.copy2(proguard_src, project_dir / "app" / "proguard-rules.pro")
+
+    patch_script = frontend_dir.parent / "scripts" / "patch_android_webview_logging.py"
+    if patch_script.exists():
+        run([sys.executable, str(patch_script)], cwd=frontend_dir.parent)
+    return project_dir
+
+
+def rebuild_patched_android_bundle(frontend_dir: Path, debug_mode: bool, env: Optional[dict[str, str]]) -> Path:
+    project_dir = patch_generated_android_project(frontend_dir, debug_mode)
+    gradlew = project_dir / "gradlew"
+    if not gradlew.exists():
+        raise FileNotFoundError(f"Gradle wrapper not found: {gradlew}")
+
+    task = "bundleDebug" if debug_mode else "bundleRelease"
+    clean_task = "clean"
+    run([str(gradlew), clean_task, task], cwd=project_dir, env=env)
+
+    outputs_dir = project_dir / "app" / "build" / "outputs" / "bundle" / ("debug" if debug_mode else "release")
+    bundles = sorted(outputs_dir.glob("*.aab"))
+    if not bundles:
+        raise FileNotFoundError(f"No rebuilt Android bundle found in {outputs_dir}")
+
+    rebuilt = bundles[-1]
+    dist = dist_dir(frontend_dir)
+    dist.mkdir(parents=True, exist_ok=True)
+    dst = dist / rebuilt.name
+    shutil.copy2(rebuilt, dst)
+    return dst
+
+
+def _resolve_bundletool_command() -> Optional[list[str]]:
+    bundletool_jar = os.environ.get("BUNDLETOOL_JAR", "").strip()
+    if bundletool_jar:
+        jar_path = Path(bundletool_jar).expanduser()
+        if jar_path.is_file():
+            return ["java", "-jar", str(jar_path)]
+
+    bundletool_bin = shutil.which("bundletool")
+    if bundletool_bin:
+        return [bundletool_bin]
+
+    return None
+
+
+def build_android_universal_apk(frontend_dir: Path) -> Path:
+    aab = _find_android_aab(frontend_dir)
+    if aab is None:
+        raise FileNotFoundError("No Android .aab artifact found in frontend/dist")
+
+    bundletool_cmd = _resolve_bundletool_command()
+    if bundletool_cmd is None:
+        raise FileNotFoundError(
+            "bundletool not found. Install bundletool or set BUNDLETOOL_JAR=/path/to/bundletool.jar"
+        )
+
+    dist = dist_dir(frontend_dir)
+    apks_path = dist / f"{aab.stem}.apks"
+    apk_path = dist / f"{aab.stem}.apk"
+
+    cmd = bundletool_cmd + [
+        "build-apks",
+        f"--bundle={aab}",
+        f"--output={apks_path}",
+        "--mode=universal",
+        "--overwrite",
+    ]
+    run(cmd, cwd=frontend_dir)
+
+    with zipfile.ZipFile(apks_path, "r") as zf:
+        apk_member = next((n for n in zf.namelist() if n.endswith("universal.apk")), None)
+        if apk_member is None:
+            raise RuntimeError(f"bundletool output did not contain universal.apk: {apks_path}")
+        with zf.open(apk_member) as src, apk_path.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+    rename_android_artifacts(frontend_dir)
+    final_apks = sorted(dist.glob("*.apk"))
+    final_apk = final_apks[-1] if final_apks else apk_path
+    print(f"✅ Android APK created: {final_apk}")
+    return final_apk
+
+
+def _resolve_adb(env: Optional[dict[str, str]] = None) -> str:
+    merged = dict(os.environ)
+    if env:
+        merged.update(env)
+    adb = shutil.which("adb", path=merged.get("PATH"))
+    if adb:
+        return adb
+    raise FileNotFoundError("adb not found on PATH")
+
+
+def _list_adb_devices(frontend_dir: Path, env: Optional[dict[str, str]] = None) -> list[str]:
+    adb = _resolve_adb(env)
+    out = run_capture([adb, "devices"], cwd=frontend_dir, env=env)
+    serials: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of devices attached"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            serials.append(parts[0])
+    return serials
+
+
+def install_android_apk(frontend_dir: Path, apk_path: Optional[Path] = None) -> tuple[str, Path]:
+    env = _ensure_android_env(frontend_dir, None)
+    devices = _list_adb_devices(frontend_dir, env)
+    if not devices:
+        raise RuntimeError("No Android emulator/device found. Start an emulator or connect a device first.")
+    if len(devices) > 1:
+        raise RuntimeError(f"Multiple Android devices found: {', '.join(devices)}. Leave only one connected.")
+
+    adb = _resolve_adb(env)
+    apk = apk_path
+    if apk is None:
+        candidates = sorted(dist_dir(frontend_dir).glob("*.apk"))
+        apk = candidates[-1] if candidates else None
+    if apk is None or not apk.exists():
+        raise FileNotFoundError("No Android .apk artifact found in frontend/dist")
+
+    serial = devices[0]
+    run([adb, "-s", serial, "install", "-r", str(apk)], cwd=frontend_dir, env=env)
+    print(f"✅ Installed Android APK on {serial}: {apk}")
+    return serial, apk
 
 
 def clear_app_bundle(frontend_dir: Path) -> None:
@@ -1372,6 +1649,112 @@ def _windows_target_default() -> str:
     return os.environ.get("GS26_WINDOWS_TARGET", "x86_64-pc-windows-msvc").strip()
 
 
+def _detect_android_sdk_root() -> Optional[Path]:
+    candidates = [
+        os.environ.get("ANDROID_SDK_ROOT", "").strip(),
+        os.environ.get("ANDROID_HOME", "").strip(),
+        str(Path.home() / "Library" / "Android" / "sdk"),
+        str(Path.home() / "Android" / "Sdk"),
+        "/Library/Android/sdk",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if path.is_dir():
+            return path
+    return None
+
+
+def _detect_android_ndk_root(sdk_root: Optional[Path]) -> Optional[Path]:
+    env_candidates = [
+        os.environ.get("ANDROID_NDK_ROOT", "").strip(),
+        os.environ.get("ANDROID_NDK_HOME", "").strip(),
+        os.environ.get("NDK_HOME", "").strip(),
+    ]
+    for candidate in env_candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if path.is_dir():
+            return path
+
+    if sdk_root is None:
+        return None
+
+    versioned_ndk = sdk_root / "ndk"
+    if versioned_ndk.is_dir():
+        versions = sorted((p for p in versioned_ndk.iterdir() if p.is_dir()), key=lambda p: p.name)
+        if versions:
+            return versions[-1]
+
+    ndk_bundle = sdk_root / "ndk-bundle"
+    if ndk_bundle.is_dir():
+        return ndk_bundle
+
+    return None
+
+
+def _android_tool_paths(sdk_root: Path, ndk_root: Optional[Path]) -> list[Path]:
+    paths: list[Path] = []
+    for rel in [
+        Path("platform-tools"),
+        Path("emulator"),
+        Path("cmdline-tools/latest/bin"),
+        Path("cmdline-tools/bin"),
+        Path("tools/bin"),
+        Path("build-tools"),
+    ]:
+        base = sdk_root / rel
+        if base.is_dir():
+            if rel == Path("build-tools"):
+                versions = sorted((p for p in base.iterdir() if p.is_dir()), key=lambda p: p.name)
+                if versions:
+                    paths.append(versions[-1])
+            else:
+                paths.append(base)
+
+    if ndk_root is not None:
+        for rel in [Path("toolchains/llvm/prebuilt/darwin-x86_64/bin"), Path("toolchains/llvm/prebuilt/darwin-arm64/bin")]:
+            base = ndk_root / rel
+            if base.is_dir():
+                paths.append(base)
+    return paths
+
+
+def _ensure_android_env(frontend_dir: Path, env: Optional[dict[str, str]]) -> dict[str, str]:
+    merged = dict(env or os.environ.copy())
+    sdk_root = _detect_android_sdk_root()
+    if sdk_root is None:
+        print(
+            "Warning: Android SDK not found. Set ANDROID_SDK_ROOT or install it under ~/Library/Android/sdk.",
+            file=sys.stderr,
+        )
+        return merged
+
+    ndk_root = _detect_android_ndk_root(sdk_root)
+    merged["ANDROID_SDK_ROOT"] = str(sdk_root)
+    merged["ANDROID_HOME"] = str(sdk_root)
+    if ndk_root is not None:
+        merged["ANDROID_NDK_ROOT"] = str(ndk_root)
+        merged["ANDROID_NDK_HOME"] = str(ndk_root)
+        merged["NDK_HOME"] = str(ndk_root)
+    else:
+        print(
+            f"Warning: Android NDK not found under {sdk_root}. Native Android builds may fail until it is installed.",
+            file=sys.stderr,
+        )
+
+    tool_paths = [str(p) for p in _android_tool_paths(sdk_root, ndk_root)]
+    if tool_paths:
+        merged["PATH"] = os.pathsep.join(tool_paths + [merged.get("PATH", "")]).rstrip(os.pathsep)
+
+    print(f"Using Android SDK: {sdk_root}")
+    if ndk_root is not None:
+        print(f"Using Android NDK: {ndk_root}")
+    return merged
+
+
 def _default_rust_target_for_frontend(platform_name: Optional[str]) -> Optional[str]:
     if platform_name is None or platform_name == "web":
         return None
@@ -1425,6 +1808,84 @@ def _ensure_windows_icon_compat(frontend_dir: Path) -> None:
         )
 
 
+def _ensure_android_icon_compat(frontend_dir: Path, app_src_main: Path) -> None:
+    src_png = frontend_dir / "assets" / "icon.png"
+    if not src_png.exists():
+        print(f"Warning: Android icon source not found: {src_png}", file=sys.stderr)
+        return
+
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:
+        print(
+            "Warning: Pillow not available; leaving generated Android launcher icon unchanged.",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        img = Image.open(src_png).convert("RGBA")
+    except Exception as exc:
+        print(f"Warning: failed to open Android icon source {src_png}: {exc}", file=sys.stderr)
+        return
+
+    mipmap_sizes = {
+        "mipmap-mdpi": 48,
+        "mipmap-hdpi": 72,
+        "mipmap-xhdpi": 96,
+        "mipmap-xxhdpi": 144,
+        "mipmap-xxxhdpi": 192,
+    }
+    foreground_sizes = {
+        "mipmap-mdpi": 108,
+        "mipmap-hdpi": 162,
+        "mipmap-xhdpi": 216,
+        "mipmap-xxhdpi": 324,
+        "mipmap-xxxhdpi": 432,
+    }
+
+    res_dir = app_src_main / "res"
+    for folder, size in mipmap_sizes.items():
+        out_dir = res_dir / folder
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for ext in ("webp", "png"):
+            p = out_dir / f"ic_launcher.{ext}"
+            if p.exists():
+                p.unlink()
+        img.resize((size, size), Image.LANCZOS).save(out_dir / "ic_launcher.webp", format="WEBP", quality=100)
+
+    for folder, size in foreground_sizes.items():
+        out_dir = res_dir / folder
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for ext in ("webp", "png"):
+            p = out_dir / f"ic_launcher_foreground.{ext}"
+            if p.exists():
+                p.unlink()
+        img.resize((size, size), Image.LANCZOS).save(
+            out_dir / "ic_launcher_foreground.webp", format="WEBP", quality=100
+        )
+
+    drawable_dir = res_dir / "drawable"
+    drawable_dir.mkdir(parents=True, exist_ok=True)
+    foreground_xml = """<?xml version="1.0" encoding="utf-8"?>
+<bitmap xmlns:android="http://schemas.android.com/apk/res/android"
+    android:gravity="center"
+    android:src="@mipmap/ic_launcher_foreground" />
+"""
+    (drawable_dir / "ic_launcher_foreground.xml").write_text(foreground_xml, encoding="utf-8")
+
+    drawable_v24_dir = res_dir / "drawable-v24"
+    drawable_v24_dir.mkdir(parents=True, exist_ok=True)
+    (drawable_v24_dir / "ic_launcher_foreground.xml").write_text(foreground_xml, encoding="utf-8")
+
+    background_xml = """<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#0B1220" />
+</shape>
+"""
+    (drawable_dir / "ic_launcher_background.xml").write_text(background_xml, encoding="utf-8")
+
+
 def build_frontend(
         frontend_dir: Path,
         platform_name: Optional[str] = None,
@@ -1432,6 +1893,7 @@ def build_frontend(
         rust_target: Optional[str] = None,
         debug_mode: bool = False,
         max_size: bool = False,
+        android_package_type: Optional[str] = None,
 ) -> None:
     try:
         public_dir = frontend_dir / "dist" / "public"
@@ -1442,11 +1904,15 @@ def build_frontend(
             shutil.rmtree(public_dir)
         if is_web_build:
             _clear_dx_web_cache(frontend_dir)
+        elif platform_name == "android":
+            clear_generated_android_project(frontend_dir, debug_mode)
 
         if not is_web_build:
             clear_app_bundle(frontend_dir)
 
         env = _dx_bundle_env(frontend_dir) if (is_container() or in_docker_build()) else None
+        if platform_name == "android":
+            env = _ensure_android_env(frontend_dir, env)
 
         ensured_wasm_bindgen = _ensure_wasm_bindgen_cli(frontend_dir, env)
         if env is not None and ensured_wasm_bindgen is not None:
@@ -1488,6 +1954,8 @@ def build_frontend(
             elif platform_name == "windows":
                 _ensure_windows_icon_compat(frontend_dir)
                 cmd.extend(["--windows-subsystem", "WINDOWS"])
+            elif platform_name == "android" and android_package_type == "aab":
+                cmd.extend(["--package-types", android_package_type])
         else:
             cmd.extend(["--platform", "web"])
 
@@ -1531,6 +1999,8 @@ def build_frontend(
             _manual_optimize_web_wasm(frontend_dir, env, max_size=max_size)
             _prune_stale_hashed_assets(frontend_dir)
             _compress_web_assets(frontend_dir, env)
+        elif platform_name == "android":
+            rebuild_patched_android_bundle(frontend_dir, debug_mode, env)
 
         if platform_name == "macos":
             rename_macos_app_bundle(frontend_dir)
@@ -1539,6 +2009,10 @@ def build_frontend(
             sign_macos_app_and_dmg(frontend_dir)
         elif platform_name in {"windows", "linux"}:
             rename_windows_linux_artifacts(frontend_dir, platform_name)
+        elif platform_name == "android":
+            rename_android_artifacts(frontend_dir)
+            if android_package_type == "apk":
+                build_android_universal_apk(frontend_dir)
 
         if platform_name == "ios":
             patch_plist(frontend_dir)
@@ -1622,7 +2096,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py ios_sim                 # iOS simulator build (patched)")
     print("  ./build.py macos")
     print("  ./build.py windows")
-    print("  ./build.py android")
+    print("  ./build.py android [apk|aab]")
     print("  ./build.py linux")
     print("  (add `debug` to frontend/local builds to skip --release)")
     print("")
@@ -1631,6 +2105,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py ios_sim_deploy          # build ios_sim + install + launch in iOS simulator")
     print("  ./build.py ios_sign                # package+sign (Dev) existing dist app -> IPA")
     print("  ./build.py ios_dist_sign           # package+sign (Distribution) existing dist app -> IPA")
+    print("  ./build.py android_install         # build Android APK from AAB, then install via adb")
     print("  ./build.py macos_deploy            # build macos + copy .app into /Applications")
     print("  ./build.py macos_sign              # sign existing macos app + dmg (Developer ID)")
     print("  ./build.py macos_notarize          # build macos + sign + notarize + staple")
@@ -1667,6 +2142,7 @@ def main() -> None:
     use_existing = False
     backend_only = False
     log_file_arg: Optional[str] = None
+    android_package_type: Optional[str] = None
 
     frontend_only_platform: Optional[str] = None
     frontend_rust_target: Optional[str] = None
@@ -1693,6 +2169,7 @@ def main() -> None:
     }
 
     actions = {
+        "android_install",
         "ios_deploy",
         "ios_sim_deploy",
         "ios_sign",
@@ -1718,6 +2195,10 @@ def main() -> None:
             hitl_mode = True
         elif arg == "debug":
             debug_mode = True
+        elif arg == "apk":
+            android_package_type = "apk"
+        elif arg == "aab":
+            android_package_type = "aab"
         elif arg == "max_size":
             max_size_mode = True
         elif arg in {"backend_only", "backend"}:
@@ -1780,6 +2261,23 @@ def main() -> None:
                 )
             ipa = package_ios_ipa_with_script(frontend_dir, sign_kind="distribution")
             print(f"✅ Distribution IPA created: {ipa}")
+            return
+
+        if action == "android_install":
+            apk_path: Optional[Path] = None
+            if not use_existing:
+                build_frontend(
+                    frontend_dir,
+                    platform_name="android",
+                    rust_target=None,
+                    debug_mode=debug_mode,
+                    max_size=max_size_mode,
+                    android_package_type="apk",
+                )
+                apk_candidates = sorted(dist_dir(frontend_dir).glob("*.apk"))
+                apk_path = apk_candidates[-1] if apk_candidates else None
+            serial, installed_apk = install_android_apk(frontend_dir, apk_path=apk_path)
+            print(f"✅ Android install complete ({serial}) for {installed_apk.name}")
             return
 
         if action == "ios_sim_deploy":
@@ -1880,6 +2378,7 @@ def main() -> None:
             rust_target=frontend_rust_target,
             debug_mode=debug_mode,
             max_size=max_size_mode,
+            android_package_type=android_package_type,
         )
         return
 
@@ -1909,14 +2408,24 @@ def main() -> None:
 
     if in_docker_build():
         print("Sequential build")
-        build_frontend(frontend_dir, None, debug_mode=debug_mode, max_size=max_size_mode)
+        build_frontend(
+            frontend_dir,
+            None,
+            debug_mode=debug_mode,
+            max_size=max_size_mode,
+            android_package_type=android_package_type,
+        )
         build_backend(backend_dir, force_pi, force_no_pi, testing_mode, hitl_mode, debug_mode)
         return
 
     bfe = mp.Process(
         target=build_frontend,
         args=(frontend_dir, None),
-        kwargs={"debug_mode": debug_mode, "max_size": max_size_mode},
+        kwargs={
+            "debug_mode": debug_mode,
+            "max_size": max_size_mode,
+            "android_package_type": android_package_type,
+        },
     )
     bbe = mp.Process(
         target=build_backend,
