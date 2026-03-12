@@ -1810,8 +1810,7 @@ def _ensure_windows_icon_compat(frontend_dir: Path) -> None:
 
     if src_ico.exists():
         dst_ico.parent.mkdir(parents=True, exist_ok=True)
-        if not dst_ico.exists():
-            shutil.copy2(src_ico, dst_ico)
+        shutil.copy2(src_ico, dst_ico)
         return
 
     try:
@@ -1820,7 +1819,8 @@ def _ensure_windows_icon_compat(frontend_dir: Path) -> None:
         img = Image.open(src_png)
         # Include common Windows icon sizes.
         sizes = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-        img.save(dst_ico, format="ICO", sizes=sizes)
+        img.save(src_ico, format="ICO", sizes=sizes)
+        shutil.copy2(src_ico, dst_ico)
         generated = True
     except Exception:
         generated = False
@@ -1828,7 +1828,8 @@ def _ensure_windows_icon_compat(frontend_dir: Path) -> None:
     if not generated:
         # Last-resort fallback if PIL is unavailable.
         # This may not produce a valid ICO for all tooling.
-        shutil.copy2(src_png, dst_ico)
+        shutil.copy2(src_png, src_ico)
+        shutil.copy2(src_ico, dst_ico)
         print(
             "Warning: Pillow not available; copied PNG bytes to icon.ico. "
             "Install Pillow for a proper Windows icon.",
