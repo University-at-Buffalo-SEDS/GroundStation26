@@ -71,7 +71,7 @@ pub fn MapTab(
             js_setup_map_size_guard();
             js_setup_js_init_retry(&tiles, max_native_zoom);
             #[cfg(not(any(target_os = "windows", target_os = "android")))]
-            js_setup_js_geolocation_watch();
+            _js_setup_js_geolocation_watch();
 
             // Debounced resize/orientation/visualViewport reinit path
             js_setup_js_resize_reinit(&tiles, max_native_zoom, RESIZE_DEBOUNCE_MS);
@@ -488,7 +488,7 @@ fn js_setup_js_init_retry(tiles: &str, max_native_zoom: u32) {
 }
 
 #[cfg(not(target_os = "android"))]
-fn js_setup_js_geolocation_watch() {
+fn _js_setup_js_geolocation_watch() {
     js_eval(
         r#"
         (function() {
