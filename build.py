@@ -581,6 +581,52 @@ def _generated_android_app_dir(frontend_dir: Path, debug_mode: bool) -> Path:
     return frontend_dir.parent / "target" / "dx" / pkg_name / profile / "android" / "app"
 
 
+def _clear_dioxus_windows_identity_cache(
+        frontend_dir: Path,
+        rust_target: Optional[str],
+        debug_mode: bool,
+) -> None:
+    target_root = frontend_dir.parent / "target"
+    profile = "debug" if debug_mode else "release"
+    desktop_profile = "desktop-debug" if debug_mode else "desktop-release"
+    pkg_name = _frontend_package_name(frontend_dir)
+    removed: list[Path] = []
+
+    def remove_path(path: Path) -> None:
+        if not path.exists():
+            return
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        removed.append(path)
+
+    for path in [
+        target_root / "dx" / pkg_name / profile / "windows",
+        target_root / "dx" / pkg_name / "bundle" / "windows",
+    ]:
+        remove_path(path)
+
+    target_dirs: list[Path] = []
+    if rust_target:
+        target_dirs.append(target_root / rust_target / desktop_profile)
+    target_dirs.append(target_root / desktop_profile)
+
+    for base in target_dirs:
+        for pattern in [
+            "deps/dioxus_cli_config-*",
+            ".fingerprint/dioxus-cli-config-*",
+            "deps/groundstation_frontend-*",
+            ".fingerprint/groundstation_frontend-*",
+        ]:
+            for path in base.glob(pattern):
+                remove_path(path)
+
+    if removed:
+        rel = ", ".join(str(p.relative_to(frontend_dir.parent)) for p in removed)
+        print(f"Cleared stale Windows Dioxus identity cache: {rel}")
+
+
 def clear_generated_android_project(frontend_dir: Path, debug_mode: bool) -> None:
     project_dir = _generated_android_app_dir(frontend_dir, debug_mode)
     if project_dir.exists():
@@ -1995,6 +2041,9 @@ def build_frontend(
 
         if not rust_target:
             rust_target = _default_rust_target_for_frontend(platform_name)
+
+        if platform_name == "windows":
+            _clear_dioxus_windows_identity_cache(frontend_dir, rust_target, debug_mode)
 
         if rust_target:
             cmd.extend(["--target", rust_target])
