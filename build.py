@@ -510,6 +510,21 @@ def _resolve_makensis() -> Optional[str]:
     return None
 
 
+def _resolve_iexpress() -> Optional[str]:
+    candidates = [
+        shutil.which("iexpress"),
+        shutil.which("iexpress.exe"),
+        str(Path("C:/Windows/System32/iexpress.exe")),
+    ]
+    for cand in candidates:
+        if not cand:
+            continue
+        path = Path(cand)
+        if path.exists():
+            return str(path)
+    return None
+
+
 def _is_probable_windows_installer(path: Path) -> bool:
     lowered = path.name.lower()
     return (
@@ -649,15 +664,136 @@ SectionEnd
     script_path.write_text(script, encoding="utf-8")
 
 
+def _write_windows_uninstall_script(script_path: Path) -> None:
+    script = f"""
+$ErrorActionPreference = "Stop"
+$appName = "{WINDOWS_APP_NAME}"
+$installDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+$startMenuDir = Join-Path $env:ProgramData "Microsoft\\Windows\\Start Menu\\Programs\\$appName"
+if (Test-Path $startMenuDir) {{
+    Remove-Item $startMenuDir -Recurse -Force
+}}
+
+$desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "$appName.lnk"
+if (Test-Path $desktopShortcut) {{
+    Remove-Item $desktopShortcut -Force
+}}
+
+$uninstallKey = "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName"
+if (Test-Path $uninstallKey) {{
+    Remove-Item $uninstallKey -Recurse -Force
+}}
+
+$vendorKey = "HKLM:\\Software\\UBSEDS\\$appName"
+if (Test-Path $vendorKey) {{
+    Remove-Item $vendorKey -Recurse -Force
+}}
+
+Set-Location ([System.IO.Path]::GetTempPath())
+Remove-Item $installDir -Recurse -Force
+""".strip()
+    script_path.write_text(script, encoding="utf-8")
+
+
+def _write_windows_install_script(script_path: Path) -> None:
+    script = f"""
+$ErrorActionPreference = "Stop"
+
+$appName = "{WINDOWS_APP_NAME}"
+$installDir = Join-Path $env:ProgramFiles $appName
+$zipPath = Join-Path $PSScriptRoot "payload.zip"
+$uninstallScript = Join-Path $installDir "uninstall.ps1"
+$exePath = Join-Path $installDir "{WINDOWS_APP_NAME}.exe"
+$startMenuDir = Join-Path $env:ProgramData "Microsoft\\Windows\\Start Menu\\Programs\\$appName"
+$desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "$appName.lnk"
+
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Expand-Archive -LiteralPath $zipPath -DestinationPath $installDir -Force
+
+$wsh = New-Object -ComObject WScript.Shell
+New-Item -ItemType Directory -Force -Path $startMenuDir | Out-Null
+
+$startShortcut = $wsh.CreateShortcut((Join-Path $startMenuDir "$appName.lnk"))
+$startShortcut.TargetPath = $exePath
+$startShortcut.WorkingDirectory = $installDir
+$startShortcut.IconLocation = $exePath
+$startShortcut.Save()
+
+$desktop = $wsh.CreateShortcut($desktopShortcut)
+$desktop.TargetPath = $exePath
+$desktop.WorkingDirectory = $installDir
+$desktop.IconLocation = $exePath
+$desktop.Save()
+
+New-Item -Path "HKLM:\\Software\\UBSEDS\\$appName" -Force | Out-Null
+Set-ItemProperty -Path "HKLM:\\Software\\UBSEDS\\$appName" -Name "InstallDir" -Value $installDir
+
+New-Item -Path "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Force | Out-Null
+Set-ItemProperty -Path "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayName" -Value $appName
+Set-ItemProperty -Path "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayIcon" -Value $exePath
+Set-ItemProperty -Path "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "InstallLocation" -Value $installDir
+Set-ItemProperty -Path "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")
+Set-ItemProperty -Path "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoModify" -Type DWord -Value 1
+Set-ItemProperty -Path "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoRepair" -Type DWord -Value 1
+""".strip()
+    script_path.write_text(script, encoding="utf-8")
+
+
+def _write_windows_iexpress_sed(
+        sed_path: Path,
+        source_dir: Path,
+        installer_path: Path,
+) -> None:
+    sed = f"""
+[Version]
+Class=IEXPRESS
+SEDVersion=3
+
+[Options]
+PackagePurpose=InstallApp
+ShowInstallProgramWindow=1
+HideExtractAnimation=0
+UseLongFileName=1
+InsideCompressed=0
+CAB_FixedSize=0
+CAB_ResvCodeSigning=0
+RebootMode=N
+InstallPrompt=
+DisplayLicense=
+FinishMessage=
+TargetName={installer_path}
+FriendlyName={WINDOWS_APP_NAME} Installer
+AppLaunched=powershell.exe -ExecutionPolicy Bypass -File install.ps1
+PostInstallCmd=<None>
+AdminQuietInstCmd=powershell.exe -ExecutionPolicy Bypass -File install.ps1
+UserQuietInstCmd=powershell.exe -ExecutionPolicy Bypass -File install.ps1
+SourceFiles=SourceFiles
+
+[Strings]
+FILE0=payload.zip
+FILE1=install.ps1
+
+[SourceFiles]
+SourceFiles0={source_dir}\\
+
+[SourceFiles0]
+%FILE0%=
+%FILE1%=
+""".strip()
+    sed_path.write_text(sed, encoding="utf-8")
+
+
 def build_manual_windows_installer(
         frontend_dir: Path,
         rust_target: Optional[str],
         debug_mode: bool,
 ) -> Path:
     makensis = _resolve_makensis()
-    if makensis is None:
+    iexpress = _resolve_iexpress()
+    if makensis is None and iexpress is None:
         raise FileNotFoundError(
-            "NSIS makensis not found. Install NSIS or add makensis.exe to PATH to build the Windows installer."
+            "Neither NSIS makensis nor Windows IExpress was found, so the Windows installer cannot be built."
         )
 
     icon_path = frontend_dir / "assets" / "icon.ico"
@@ -676,9 +812,23 @@ def build_manual_windows_installer(
 
     temp_dir, stage_dir, _staged_exe = _stage_windows_app_payload(frontend_dir, rust_target, debug_mode)
     try:
-        script_path = Path(temp_dir.name) / "installer.nsi"
-        _write_windows_nsis_script(script_path, stage_dir, icon_path, installer_path)
-        run([makensis, str(script_path)], cwd=frontend_dir)
+        uninstall_script = stage_dir / "uninstall.ps1"
+        _write_windows_uninstall_script(uninstall_script)
+
+        if makensis is not None:
+            script_path = Path(temp_dir.name) / "installer.nsi"
+            _write_windows_nsis_script(script_path, stage_dir, icon_path, installer_path)
+            run([makensis, str(script_path)], cwd=frontend_dir)
+        else:
+            source_dir = Path(temp_dir.name) / "iexpress-src"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            payload_zip = source_dir / "payload.zip"
+            install_script = source_dir / "install.ps1"
+            _write_windows_install_script(install_script)
+            shutil.make_archive(str(payload_zip.with_suffix("")), "zip", stage_dir)
+            sed_path = Path(temp_dir.name) / "installer.sed"
+            _write_windows_iexpress_sed(sed_path, source_dir, installer_path)
+            run([iexpress, "/N", "/Q", str(sed_path)], cwd=frontend_dir)
     finally:
         temp_dir.cleanup()
 
