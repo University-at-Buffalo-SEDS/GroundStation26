@@ -780,20 +780,28 @@ InsideCompressed=1
 CAB_FixedSize=0
 CAB_ResvCodeSigning=0
 RebootMode=N
+InstallPrompt=%InstallPrompt%
+DisplayLicense=%DisplayLicense%
+FinishMessage=%FinishMessage%
+TargetName=%TargetName%
+FriendlyName=%FriendlyName%
+AppLaunched=%AppLaunched%
+PostInstallCmd=<None>
+AdminQuietInstCmd=%AdminQuietInstCmd%
+UserQuietInstCmd=%UserQuietInstCmd%
+SourceFiles=SourceFiles
+
+[Strings]
 InstallPrompt=Do you want to install {WINDOWS_APP_NAME}?
 DisplayLicense=
 FinishMessage={WINDOWS_APP_NAME} installation completed.
 TargetName={installer_path}
 FriendlyName={WINDOWS_APP_NAME} Installer
-AppLaunched=powershell.exe -ExecutionPolicy Bypass -File install.ps1
-PostInstallCmd=<None>
-AdminQuietInstCmd=powershell.exe -ExecutionPolicy Bypass -File install.ps1
-UserQuietInstCmd=powershell.exe -ExecutionPolicy Bypass -File install.ps1
-SourceFiles=SourceFiles
-
-[Strings]
-FILE0=payload.zip
-FILE1=install.ps1
+AppLaunched=cmd.exe /c powershell.exe -ExecutionPolicy Bypass -File install.ps1
+AdminQuietInstCmd=cmd.exe /c powershell.exe -ExecutionPolicy Bypass -File install.ps1
+UserQuietInstCmd=cmd.exe /c powershell.exe -ExecutionPolicy Bypass -File install.ps1
+FILE0="payload.zip"
+FILE1="install.ps1"
 
 [SourceFiles]
 SourceFiles0={source_dir}\\
