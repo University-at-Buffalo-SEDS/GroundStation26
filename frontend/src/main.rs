@@ -7,6 +7,8 @@ use dioxus_desktop::RequestAsyncResponder;
 #[cfg(not(target_arch = "wasm32"))]
 use dioxus_desktop::wry::http::{Request as HttpRequest, Response as HttpResponse};
 #[cfg(not(target_arch = "wasm32"))]
+use image::ImageFormat;
+#[cfg(not(target_arch = "wasm32"))]
 use std::backtrace::Backtrace;
 #[cfg(not(target_arch = "wasm32"))]
 use std::borrow::Cow;
@@ -86,16 +88,31 @@ fn main() {
 fn main() {
     init_panic_hook();
     append_native_log("[startup] native main entered");
-    let cfg = dioxus_desktop::Config::new().with_asynchronous_custom_protocol(
+    let mut cfg = dioxus_desktop::Config::new().with_asynchronous_custom_protocol(
         "gs26",
         |_id, request, responder| {
             append_native_log("[startup] protocol request dispatched");
             _handle_gs26_protocol_async(request, responder);
         },
     );
+    if let Some(icon) = load_desktop_window_icon() {
+        cfg = cfg.with_icon(icon);
+    }
     append_native_log("[startup] launching desktop app");
     LaunchBuilder::desktop().with_cfg(cfg).launch(app::App);
     append_native_log("[startup] desktop launch returned");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_desktop_window_icon() -> Option<dioxus_desktop::tao::window::Icon> {
+    let image = image::load_from_memory_with_format(
+        include_bytes!("../assets/icon.png"),
+        ImageFormat::Png,
+    )
+    .ok()?
+    .into_rgba8();
+    let (width, height) = image.dimensions();
+    dioxus_desktop::tao::window::Icon::from_rgba(image.into_raw(), width, height).ok()
 }
 
 #[cfg(not(target_arch = "wasm32"))]

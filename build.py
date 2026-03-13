@@ -1942,6 +1942,11 @@ def build_frontend(
         env = _dx_bundle_env(frontend_dir) if (is_container() or in_docker_build()) else None
         if platform_name == "android":
             env = _ensure_android_env(frontend_dir, env)
+        elif platform_name == "windows":
+            if env is None:
+                env = os.environ.copy()
+            env["DIOXUS_PRODUCT_NAME"] = WINDOWS_APP_NAME
+            env["DIOXUS_APP_TITLE"] = WINDOWS_APP_NAME
 
         ensured_wasm_bindgen = _ensure_wasm_bindgen_cli(frontend_dir, env)
         if env is not None and ensured_wasm_bindgen is not None:

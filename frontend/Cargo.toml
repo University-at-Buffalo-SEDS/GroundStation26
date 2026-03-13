@@ -68,6 +68,7 @@ tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots",
 native-tls = "0.2.18"
 futures-util = "0.3.32"
 url = "2.5.8"
+image = { version = "0.25.8", default-features = false, features = ["png"] }
 
 
 [target.'cfg(target_os = "windows")'.dependencies]
