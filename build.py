@@ -535,21 +535,35 @@ def _is_probable_windows_installer(path: Path) -> bool:
     )
 
 
-def _find_windows_app_exe(frontend_dir: Path, rust_target: Optional[str], debug_mode: bool) -> Path:
+def cleanup_windows_installer_artifacts(frontend_dir: Path) -> None:
     dist = dist_dir(frontend_dir)
+    if not dist.exists():
+        return
+
+    canonical = dist / _windows_installer_name()
+    for item in sorted(dist.iterdir()):
+        if item == canonical:
+            continue
+        lowered = item.name.lower()
+        if item.suffix.lower() == ".msi" or "installer" in lowered or "setup" in lowered:
+            print(f"Removing stale Windows installer artifact: {item.name}")
+            _remove_path(item)
+
+
+def _find_windows_app_exe(frontend_dir: Path, rust_target: Optional[str], debug_mode: bool) -> Path:
     preferred_names = [
         f"{WINDOWS_APP_NAME}.exe",
         f"{APP_NAME}.exe",
         f"{LEGACY_APP_NAME}.exe",
         "groundstation_frontend.exe",
     ]
-    search_roots = [dist]
-
     target_root = frontend_dir.parent / "target"
     desktop_profile = "desktop-debug" if debug_mode else "desktop-release"
+    search_roots: list[Path] = []
     if rust_target:
         search_roots.append(target_root / rust_target / desktop_profile)
     search_roots.append(target_root / desktop_profile)
+    search_roots.append(dist_dir(frontend_dir))
 
     for root in search_roots:
         if not root.exists():
@@ -573,6 +587,7 @@ def _stage_windows_app_payload(
 ) -> tuple[tempfile.TemporaryDirectory, Path, Path]:
     app_exe = _find_windows_app_exe(frontend_dir, rust_target, debug_mode)
     source_dir = app_exe.parent
+    print(f"Staging Windows installer payload from: {source_dir}")
     temp_dir = tempfile.TemporaryDirectory(prefix="gs26-win-installer-")
     stage_dir = Path(temp_dir.name) / "payload"
     stage_dir.mkdir(parents=True, exist_ok=True)
@@ -592,6 +607,8 @@ def _stage_windows_app_payload(
         if item.is_dir():
             if item.name in allowed_dirs:
                 shutil.copytree(item, stage_dir / item.name, dirs_exist_ok=True)
+            continue
+        if item.suffix.lower() == ".pdb":
             continue
         if item.suffix.lower() in allowed_suffixes:
             shutil.copy2(item, stage_dir / item.name)
@@ -804,11 +821,10 @@ def build_manual_windows_installer(
     dist.mkdir(parents=True, exist_ok=True)
     installer_path = dist / _windows_installer_name()
 
-    for stale in list(dist.glob("*installer*.exe")) + list(dist.glob("*.msi")):
-        if stale == installer_path:
-            continue
-        print(f"Removing stale Windows installer artifact: {stale.name}")
-        _remove_path(stale)
+    cleanup_windows_installer_artifacts(frontend_dir)
+    if installer_path.exists():
+        print(f"Removing existing Windows installer artifact: {installer_path.name}")
+        _remove_path(installer_path)
 
     temp_dir, stage_dir, _staged_exe = _stage_windows_app_payload(frontend_dir, rust_target, debug_mode)
     try:
@@ -835,6 +851,7 @@ def build_manual_windows_installer(
     if not installer_path.exists():
         raise FileNotFoundError(f"Manual Windows installer was not created: {installer_path}")
 
+    cleanup_windows_installer_artifacts(frontend_dir)
     print(f"✅ Windows installer created: {installer_path}")
     return installer_path
 
