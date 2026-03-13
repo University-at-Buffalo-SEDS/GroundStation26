@@ -613,6 +613,10 @@ def _stage_windows_app_payload(
         if item.suffix.lower() in allowed_suffixes:
             shutil.copy2(item, stage_dir / item.name)
 
+    public_dir = frontend_dir / "dist" / "public"
+    if public_dir.exists():
+        shutil.copytree(public_dir, stage_dir / "public", dirs_exist_ok=True)
+
     staged_exe = stage_dir / f"{WINDOWS_APP_NAME}.exe"
     if not staged_exe.exists():
         raise FileNotFoundError(f"Staged Windows app executable missing: {staged_exe}")
