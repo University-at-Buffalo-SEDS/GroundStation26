@@ -495,6 +495,20 @@ def _windows_installer_name() -> str:
 
 
 def _resolve_makensis() -> Optional[str]:
+    def _recursive_find(root: Path) -> Optional[str]:
+        if not root.exists():
+            return None
+        try:
+            for candidate in root.rglob("makensis.exe"):
+                if candidate.is_file():
+                    return str(candidate)
+            for candidate in root.rglob("makensis"):
+                if candidate.is_file():
+                    return str(candidate)
+        except Exception:
+            return None
+        return None
+
     candidates = [
         shutil.which("makensis"),
         shutil.which("makensis.exe"),
@@ -507,6 +521,46 @@ def _resolve_makensis() -> Optional[str]:
         path = Path(cand)
         if path.exists():
             return str(path)
+
+    search_roots: list[Path] = []
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    app_data = os.environ.get("APPDATA", "").strip()
+    user_profile = os.environ.get("USERPROFILE", "").strip()
+    if local_app_data:
+        search_roots.extend([
+            Path(local_app_data) / "tauri",
+            Path(local_app_data) / "Tauri",
+            Path(local_app_data) / "dioxus",
+            Path(local_app_data) / "Dioxus",
+            Path(local_app_data) / ".tauri",
+        ])
+    if app_data:
+        search_roots.extend([
+            Path(app_data) / "tauri",
+            Path(app_data) / "Tauri",
+            Path(app_data) / "dioxus",
+            Path(app_data) / "Dioxus",
+        ])
+    if user_profile:
+        search_roots.extend([
+            Path(user_profile) / ".cache" / "tauri",
+            Path(user_profile) / ".cache" / "dioxus",
+        ])
+
+    repo_root = Path(__file__).resolve().parent
+    search_roots.extend([
+        repo_root / "target" / ".tauri",
+        repo_root / "target" / "dx",
+    ])
+
+    seen: set[Path] = set()
+    for root in search_roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        found = _recursive_find(root)
+        if found:
+            return found
     return None
 
 
