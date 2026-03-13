@@ -70,7 +70,7 @@ pub fn MapTab(
             js_setup_map_touch_guard();
             js_setup_map_size_guard();
             js_setup_js_init_retry(&tiles, max_native_zoom);
-            #[cfg(not(any(target_os = "windows", target_os = "android")))]
+            #[cfg(not(target_os = "android"))]
             _js_setup_js_geolocation_watch();
 
             // Debounced resize/orientation/visualViewport reinit path
@@ -141,12 +141,16 @@ pub fn MapTab(
     // --- 2b) Keep browser geolocation in sync (watchPosition updates window vars asynchronously) ---
     {
         let mut browser_user_gps = browser_user_gps;
+        let mut user_gps = user_gps;
         let mut has_centered_on_user = has_centered_on_user;
         use_future(move || async move {
             loop {
                 if let Some((lat, lon)) = js_read_user_latlon_from_window() {
                     if *browser_user_gps.read() != Some((lat, lon)) {
                         browser_user_gps.set(Some((lat, lon)));
+                    }
+                    if *user_gps.read() != Some((lat, lon)) {
+                        user_gps.set(Some((lat, lon)));
                     }
                     if !*has_centered_on_user.read() {
                         js_center_on(lat, lon);
