@@ -30,11 +30,10 @@ pub fn GpsDriver(
     #[props(optional)] js_ready: Option<bool>,
 ) -> Element {
     // wasm: hook-based SDK (no globals, no stop needed)
-    #[cfg(any(target_arch = "wasm32", target_os = "windows"))]
+    #[cfg(target_arch = "wasm32")]
     {
         use dioxus_sdk_geolocation::use_geolocation;
 
-        #[cfg(target_arch = "wasm32")]
         if let Some(false) = js_ready {
             return rsx!(div {});
         }
@@ -51,6 +50,26 @@ pub fn GpsDriver(
             } else {
                 // not supported / permission denied / unavailable / etc.
                 // ignore (or log if you want)
+            }
+        });
+
+        return rsx!(div {});
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use dioxus_sdk_geolocation::{PowerMode, init_geolocator, use_geolocation};
+
+        let _geo = init_geolocator(PowerMode::High);
+        let geo = use_geolocation();
+
+        use_effect(move || {
+            if let Ok(pos) = geo() {
+                let lat = pos.latitude;
+                let lon = pos.longitude;
+                if lat.is_finite() && lon.is_finite() {
+                    user_gps.set(Some((lat, lon)));
+                }
             }
         });
 
