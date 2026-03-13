@@ -720,10 +720,19 @@ Remove-Item $installDir -Recurse -Force
 def _write_windows_install_script(script_path: Path) -> None:
     script = f"""
 $ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Windows.Forms
 
 $appName = "{WINDOWS_APP_NAME}"
-$installDir = Join-Path $env:ProgramFiles $appName
+$defaultInstallDir = Join-Path $env:ProgramFiles $appName
 $zipPath = Join-Path $PSScriptRoot "payload.zip"
+$folderDialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$folderDialog.Description = "Choose install folder for $appName"
+$folderDialog.SelectedPath = $defaultInstallDir
+$dialogResult = $folderDialog.ShowDialog()
+if ($dialogResult -ne [System.Windows.Forms.DialogResult]::OK -or [string]::IsNullOrWhiteSpace($folderDialog.SelectedPath)) {{
+    throw "Installation cancelled"
+}}
+$installDir = $folderDialog.SelectedPath
 $uninstallScript = Join-Path $installDir "uninstall.ps1"
 $exePath = Join-Path $installDir "{WINDOWS_APP_NAME}.exe"
 $startMenuDir = Join-Path $env:ProgramData "Microsoft\\Windows\\Start Menu\\Programs\\$appName"
@@ -856,7 +865,7 @@ def build_manual_windows_installer(
             shutil.make_archive(str(payload_zip.with_suffix("")), "zip", stage_dir)
             sed_path = Path(temp_dir.name) / "installer.sed"
             _write_windows_iexpress_sed(sed_path, source_dir, installer_path)
-            run([iexpress, "/N", "/Q", str(sed_path)], cwd=frontend_dir)
+            run([iexpress, "/N", str(sed_path)], cwd=frontend_dir)
     finally:
         temp_dir.cleanup()
 
