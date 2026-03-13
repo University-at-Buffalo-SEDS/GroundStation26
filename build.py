@@ -1212,6 +1212,8 @@ def build_manual_linux_packages(
             deb_path = dist / f"{APP_NAME}_{deb_arch}.deb"
             run([str(dpkg_deb), "--build", "--root-owner-group", str(pkg_root), str(deb_path)], cwd=frontend_dir)
             print(f"✅ Linux deb created: {deb_path}")
+        else:
+            print("Warning: dpkg-deb not found; skipping manual .deb packaging.", file=sys.stderr)
 
         if rpmbuild is not None:
             rpm_root = Path(temp_dir.name) / "rpmbuild"
@@ -1266,6 +1268,8 @@ def build_manual_linux_packages(
             rpm_path = dist / f"{APP_NAME}_{rpm_arch}.rpm"
             shutil.copy2(built_rpms[-1], rpm_path)
             print(f"✅ Linux rpm created: {rpm_path}")
+        else:
+            print("Warning: rpmbuild not found; skipping manual .rpm packaging.", file=sys.stderr)
     finally:
         temp_dir.cleanup()
 
