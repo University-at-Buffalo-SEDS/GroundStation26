@@ -604,6 +604,42 @@ def cleanup_windows_installer_artifacts(frontend_dir: Path) -> None:
             _remove_path(item)
 
 
+def _windows_bundle_search_roots(
+        frontend_dir: Path,
+        rust_target: Optional[str],
+        debug_mode: bool,
+) -> list[Path]:
+    target_root = frontend_dir.parent / "target"
+    desktop_profile = "desktop-debug" if debug_mode else "desktop-release"
+    profile = "debug" if debug_mode else "release"
+    pkg_name = _frontend_package_name(frontend_dir)
+
+    roots: list[Path] = [
+        target_root / "dx" / pkg_name / profile / "windows",
+        target_root / "dx" / pkg_name / profile / "bundle" / "windows",
+        target_root / "dx" / pkg_name / "bundle" / "windows",
+    ]
+
+    dx_pkg_root = target_root / "dx" / pkg_name
+    if dx_pkg_root.exists():
+        for candidate in sorted(dx_pkg_root.glob("**/windows")):
+            roots.append(candidate)
+
+    if rust_target:
+        roots.append(target_root / rust_target / desktop_profile)
+    roots.append(target_root / desktop_profile)
+    roots.append(dist_dir(frontend_dir))
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        deduped.append(root)
+    return deduped
+
+
 def _find_windows_app_exe(frontend_dir: Path, rust_target: Optional[str], debug_mode: bool) -> Path:
     preferred_names = [
         f"{WINDOWS_APP_NAME}.exe",
@@ -611,13 +647,7 @@ def _find_windows_app_exe(frontend_dir: Path, rust_target: Optional[str], debug_
         f"{LEGACY_APP_NAME}.exe",
         "groundstation_frontend.exe",
     ]
-    target_root = frontend_dir.parent / "target"
-    desktop_profile = "desktop-debug" if debug_mode else "desktop-release"
-    search_roots: list[Path] = []
-    if rust_target:
-        search_roots.append(target_root / rust_target / desktop_profile)
-    search_roots.append(target_root / desktop_profile)
-    search_roots.append(dist_dir(frontend_dir))
+    search_roots = _windows_bundle_search_roots(frontend_dir, rust_target, debug_mode)
 
     for root in search_roots:
         if not root.exists():
