@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover
 
 from pathlib import Path
 from subprocess import DEVNULL
-from typing import Optional, Literal
+from typing import Optional, Literal, BinaryIO, cast
 
 APP_NAME = "UBSEDS GS"
 WINDOWS_APP_NAME = "UBSEDS GroundStation"
@@ -510,10 +510,10 @@ def _resolve_makensis() -> Optional[str]:
         return None
 
     candidates = [
-        shutil.which("makensis"),
-        shutil.which("makensis.exe"),
-        str(Path("C:/Program Files (x86)/NSIS/makensis.exe")),
-        str(Path("C:/Program Files/NSIS/makensis.exe")),
+        str(_which_in_path("makensis", os.environ.get("PATH", ""))) if _which_in_path("makensis", os.environ.get("PATH", "")) else None,
+        str(_which_in_path("makensis.exe", os.environ.get("PATH", ""))) if _which_in_path("makensis.exe", os.environ.get("PATH", "")) else None,
+        "C:/Program Files (x86)/NSIS/makensis.exe",
+        "C:/Program Files/NSIS/makensis.exe",
     ]
     for cand in candidates:
         if not cand:
@@ -566,9 +566,9 @@ def _resolve_makensis() -> Optional[str]:
 
 def _resolve_iexpress() -> Optional[str]:
     candidates = [
-        shutil.which("iexpress"),
-        shutil.which("iexpress.exe"),
-        str(Path("C:/Windows/System32/iexpress.exe")),
+        str(_which_in_path("iexpress", os.environ.get("PATH", ""))) if _which_in_path("iexpress", os.environ.get("PATH", "")) else None,
+        str(_which_in_path("iexpress.exe", os.environ.get("PATH", ""))) if _which_in_path("iexpress.exe", os.environ.get("PATH", "")) else None,
+        "C:/Windows/System32/iexpress.exe",
     ]
     for cand in candidates:
         if not cand:
@@ -669,7 +669,12 @@ def _stage_windows_app_payload(
 
     public_dir = frontend_dir / "dist" / "public"
     if public_dir.exists():
-        shutil.copytree(public_dir, stage_dir / "public", dirs_exist_ok=True)
+        for item in sorted(public_dir.iterdir()):
+            target = stage_dir / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target)
 
     staged_exe = stage_dir / f"{WINDOWS_APP_NAME}.exe"
     if not staged_exe.exists():
@@ -1185,7 +1190,8 @@ def build_android_universal_apk(frontend_dir: Path) -> Path:
         apk_member = next((n for n in zf.namelist() if n.endswith("universal.apk")), None)
         if apk_member is None:
             raise RuntimeError(f"bundletool output did not contain universal.apk: {apks_path}")
-        with zf.open(apk_member) as src, apk_path.open("wb") as dst:
+        with zf.open(apk_member) as src, apk_path.open("wb") as raw_dst:
+            dst = cast(BinaryIO, raw_dst)
             shutil.copyfileobj(src, dst)
 
     rename_android_artifacts(frontend_dir)
@@ -1202,7 +1208,8 @@ def _resolve_adb(env: Optional[dict[str, str]] = None) -> str:
     merged = dict(os.environ)
     if env:
         merged.update(env)
-    adb = shutil.which("adb", path=merged.get("PATH"))
+    adb_path = _which_in_path("adb", str(merged.get("PATH", "")))
+    adb = str(adb_path) if adb_path is not None else None
     if adb:
         return adb
     raise FileNotFoundError("adb not found on PATH")
