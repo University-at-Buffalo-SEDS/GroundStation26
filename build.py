@@ -1238,7 +1238,7 @@ def build_manual_linux_packages(
                     "%install",
                     "rm -rf %{buildroot}",
                     "mkdir -p %{buildroot}",
-                    f"cp -a \"{pkg_root}\"/. %{buildroot}/",
+                    f"cp -a \"{pkg_root}\"/. %{{buildroot}}/",
                     "",
                     "%files",
                     f"/usr/bin/{LINUX_PACKAGE_NAME}",
