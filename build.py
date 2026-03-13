@@ -490,6 +490,54 @@ def rename_windows_linux_artifacts(frontend_dir: Path, platform_name: str) -> No
         print(f"Warning: no {platform_name} artifacts matched legacy name for rename.", file=sys.stderr)
 
 
+def patch_linux_bundle_metadata(frontend_dir: Path) -> None:
+    dist = dist_dir(frontend_dir)
+    if not dist.exists():
+        return
+
+    icon_src = frontend_dir / "assets" / "icon.png"
+    desktop_files = sorted(dist.rglob("*.desktop"))
+    for desktop_file in desktop_files:
+        try:
+            original = desktop_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        patched_lines: list[str] = []
+        saw_name = False
+        saw_exec = False
+        saw_icon = False
+
+        for line in original.splitlines():
+            if line.startswith("Name="):
+                patched_lines.append(f"Name={WINDOWS_APP_NAME}")
+                saw_name = True
+            elif line.startswith("Exec="):
+                patched_lines.append(f"Exec={APP_NAME}")
+                saw_exec = True
+            elif line.startswith("Icon="):
+                patched_lines.append(f"Icon={APP_NAME}")
+                saw_icon = True
+            else:
+                patched_lines.append(line)
+
+        if not saw_name:
+            patched_lines.append(f"Name={WINDOWS_APP_NAME}")
+        if not saw_exec:
+            patched_lines.append(f"Exec={APP_NAME}")
+        if not saw_icon:
+            patched_lines.append(f"Icon={APP_NAME}")
+
+        patched = "\n".join(patched_lines) + "\n"
+        if patched != original:
+            print(f"Patching Linux desktop entry: {desktop_file}")
+            desktop_file.write_text(patched, encoding="utf-8")
+
+        if icon_src.exists():
+            icon_dst = desktop_file.parent / f"{APP_NAME}.png"
+            shutil.copy2(icon_src, icon_dst)
+
+
 def _windows_installer_name() -> str:
     return f"{WINDOWS_APP_NAME} Installer.exe"
 
@@ -2486,6 +2534,11 @@ def build_frontend(
                 env = os.environ.copy()
             env["DIOXUS_PRODUCT_NAME"] = WINDOWS_APP_NAME
             env["DIOXUS_APP_TITLE"] = WINDOWS_APP_NAME
+        elif platform_name == "linux":
+            if env is None:
+                env = os.environ.copy()
+            env["DIOXUS_PRODUCT_NAME"] = APP_NAME
+            env["DIOXUS_APP_TITLE"] = WINDOWS_APP_NAME
 
         ensured_wasm_bindgen = _ensure_wasm_bindgen_cli(frontend_dir, env)
         if env is not None and ensured_wasm_bindgen is not None:
@@ -2588,6 +2641,8 @@ def build_frontend(
             rename_windows_linux_artifacts(frontend_dir, platform_name)
             if platform_name == "windows":
                 build_manual_windows_installer(frontend_dir, rust_target, debug_mode)
+            else:
+                patch_linux_bundle_metadata(frontend_dir)
         elif platform_name == "android":
             rename_android_artifacts(frontend_dir)
             if android_package_type != "aab":
