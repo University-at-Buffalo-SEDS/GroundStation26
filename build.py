@@ -490,6 +490,205 @@ def rename_windows_linux_artifacts(frontend_dir: Path, platform_name: str) -> No
         print(f"Warning: no {platform_name} artifacts matched legacy name for rename.", file=sys.stderr)
 
 
+def _windows_installer_name() -> str:
+    return f"{WINDOWS_APP_NAME} Installer.exe"
+
+
+def _resolve_makensis() -> Optional[str]:
+    candidates = [
+        shutil.which("makensis"),
+        shutil.which("makensis.exe"),
+        str(Path("C:/Program Files (x86)/NSIS/makensis.exe")),
+        str(Path("C:/Program Files/NSIS/makensis.exe")),
+    ]
+    for cand in candidates:
+        if not cand:
+            continue
+        path = Path(cand)
+        if path.exists():
+            return str(path)
+    return None
+
+
+def _is_probable_windows_installer(path: Path) -> bool:
+    lowered = path.name.lower()
+    return (
+        "installer" in lowered
+        or "setup" in lowered
+        or lowered.endswith(".msi")
+        or lowered.startswith("uninstall")
+    )
+
+
+def _find_windows_app_exe(frontend_dir: Path, rust_target: Optional[str], debug_mode: bool) -> Path:
+    dist = dist_dir(frontend_dir)
+    preferred_names = [
+        f"{WINDOWS_APP_NAME}.exe",
+        f"{APP_NAME}.exe",
+        f"{LEGACY_APP_NAME}.exe",
+        "groundstation_frontend.exe",
+    ]
+    search_roots = [dist]
+
+    target_root = frontend_dir.parent / "target"
+    desktop_profile = "desktop-debug" if debug_mode else "desktop-release"
+    if rust_target:
+        search_roots.append(target_root / rust_target / desktop_profile)
+    search_roots.append(target_root / desktop_profile)
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for name in preferred_names:
+            for candidate in root.rglob(name):
+                if _is_probable_windows_installer(candidate):
+                    continue
+                return candidate
+
+    raise FileNotFoundError(
+        f"Could not find Windows app executable after bundle. Looked for {preferred_names} under: "
+        + ", ".join(str(p) for p in search_roots)
+    )
+
+
+def _stage_windows_app_payload(
+        frontend_dir: Path,
+        rust_target: Optional[str],
+        debug_mode: bool,
+) -> tuple[tempfile.TemporaryDirectory, Path, Path]:
+    app_exe = _find_windows_app_exe(frontend_dir, rust_target, debug_mode)
+    source_dir = app_exe.parent
+    temp_dir = tempfile.TemporaryDirectory(prefix="gs26-win-installer-")
+    stage_dir = Path(temp_dir.name) / "payload"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    allowed_suffixes = {
+        ".exe", ".dll", ".pak", ".dat", ".bin", ".json", ".txt", ".ico", ".png", ".jpg", ".jpeg",
+        ".svg", ".webp", ".woff", ".woff2", ".ttf", ".otf",
+    }
+    allowed_dirs = {"assets", "public", "locales", "swiftshader"}
+
+    for item in sorted(source_dir.iterdir()):
+        if item == app_exe:
+            shutil.copy2(item, stage_dir / f"{WINDOWS_APP_NAME}.exe")
+            continue
+        if _is_probable_windows_installer(item):
+            continue
+        if item.is_dir():
+            if item.name in allowed_dirs:
+                shutil.copytree(item, stage_dir / item.name, dirs_exist_ok=True)
+            continue
+        if item.suffix.lower() in allowed_suffixes:
+            shutil.copy2(item, stage_dir / item.name)
+
+    staged_exe = stage_dir / f"{WINDOWS_APP_NAME}.exe"
+    if not staged_exe.exists():
+        raise FileNotFoundError(f"Staged Windows app executable missing: {staged_exe}")
+
+    return temp_dir, stage_dir, staged_exe
+
+
+def _write_windows_nsis_script(
+        script_path: Path,
+        stage_dir: Path,
+        icon_path: Path,
+        installer_path: Path,
+) -> None:
+    script = f"""
+Unicode True
+SetCompressor /SOLID lzma
+!include "MUI2.nsh"
+
+Name "{WINDOWS_APP_NAME}"
+OutFile "{installer_path}"
+InstallDir "$PROGRAMFILES64\\{WINDOWS_APP_NAME}"
+InstallDirRegKey HKLM "Software\\UBSEDS\\{WINDOWS_APP_NAME}" "InstallDir"
+RequestExecutionLevel admin
+BrandingText "UBSEDS"
+
+!define MUI_ABORTWARNING
+!define MUI_ICON "{icon_path}"
+!define MUI_UNICON "{icon_path}"
+
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "English"
+
+Section "Install"
+  SetOutPath "$INSTDIR"
+  File /r "{stage_dir}\\*"
+  WriteUninstaller "$INSTDIR\\Uninstall.exe"
+
+  CreateDirectory "$SMPROGRAMS\\{WINDOWS_APP_NAME}"
+  CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\{WINDOWS_APP_NAME}.lnk" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
+  CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk" "$INSTDIR\\Uninstall.exe"
+
+  WriteRegStr HKLM "Software\\UBSEDS\\{WINDOWS_APP_NAME}" "InstallDir" "$INSTDIR"
+  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "{WINDOWS_APP_NAME}"
+  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
+  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" "$INSTDIR\\Uninstall.exe"
+  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" "$INSTDIR"
+  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoModify" 1
+  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoRepair" 1
+SectionEnd
+
+Section "Uninstall"
+  Delete "$DESKTOP\\{WINDOWS_APP_NAME}.lnk"
+  Delete "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\{WINDOWS_APP_NAME}.lnk"
+  Delete "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk"
+  RMDir "$SMPROGRAMS\\{WINDOWS_APP_NAME}"
+  RMDir /r "$INSTDIR"
+  DeleteRegKey HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}"
+  DeleteRegKey HKLM "Software\\UBSEDS\\{WINDOWS_APP_NAME}"
+SectionEnd
+""".strip()
+    script_path.write_text(script, encoding="utf-8")
+
+
+def build_manual_windows_installer(
+        frontend_dir: Path,
+        rust_target: Optional[str],
+        debug_mode: bool,
+) -> Path:
+    makensis = _resolve_makensis()
+    if makensis is None:
+        raise FileNotFoundError(
+            "NSIS makensis not found. Install NSIS or add makensis.exe to PATH to build the Windows installer."
+        )
+
+    icon_path = frontend_dir / "assets" / "icon.ico"
+    if not icon_path.exists():
+        raise FileNotFoundError(f"Windows installer icon not found: {icon_path}")
+
+    dist = dist_dir(frontend_dir)
+    dist.mkdir(parents=True, exist_ok=True)
+    installer_path = dist / _windows_installer_name()
+
+    for stale in list(dist.glob("*installer*.exe")) + list(dist.glob("*.msi")):
+        if stale == installer_path:
+            continue
+        print(f"Removing stale Windows installer artifact: {stale.name}")
+        _remove_path(stale)
+
+    temp_dir, stage_dir, _staged_exe = _stage_windows_app_payload(frontend_dir, rust_target, debug_mode)
+    try:
+        script_path = Path(temp_dir.name) / "installer.nsi"
+        _write_windows_nsis_script(script_path, stage_dir, icon_path, installer_path)
+        run([makensis, str(script_path)], cwd=frontend_dir)
+    finally:
+        temp_dir.cleanup()
+
+    if not installer_path.exists():
+        raise FileNotFoundError(f"Manual Windows installer was not created: {installer_path}")
+
+    print(f"✅ Windows installer created: {installer_path}")
+    return installer_path
+
+
 def rename_android_artifacts(frontend_dir: Path) -> None:
     dist = dist_dir(frontend_dir)
     if not dist.exists():
@@ -2092,6 +2291,8 @@ def build_frontend(
             sign_macos_app_and_dmg(frontend_dir)
         elif platform_name in {"windows", "linux"}:
             rename_windows_linux_artifacts(frontend_dir, platform_name)
+            if platform_name == "windows":
+                build_manual_windows_installer(frontend_dir, rust_target, debug_mode)
         elif platform_name == "android":
             rename_android_artifacts(frontend_dir)
             if android_package_type != "aab":
