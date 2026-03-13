@@ -4,6 +4,9 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 
+#[cfg(target_os = "windows")]
+use dioxus_core::Task;
+
 /// Imperative start (only meaningful on platforms that need it).
 /// Safe to call multiple times.
 pub fn start_gps_updates(_user_gps: Signal<Option<(f64, f64)>>) {
