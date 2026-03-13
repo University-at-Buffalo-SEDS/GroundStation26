@@ -4,9 +4,6 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 
-#[cfg(target_os = "windows")]
-use dioxus_core::Task;
-
 /// Imperative start (only meaningful on platforms that need it).
 /// Safe to call multiple times.
 pub fn start_gps_updates(_user_gps: Signal<Option<(f64, f64)>>) {
@@ -33,10 +30,11 @@ pub fn GpsDriver(
     #[props(optional)] js_ready: Option<bool>,
 ) -> Element {
     // wasm: hook-based SDK (no globals, no stop needed)
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", target_os = "windows"))]
     {
         use dioxus_sdk_geolocation::use_geolocation;
 
+        #[cfg(target_arch = "wasm32")]
         if let Some(false) = js_ready {
             return rsx!(div {});
         }
@@ -54,30 +52,6 @@ pub fn GpsDriver(
                 // not supported / permission denied / unavailable / etc.
                 // ignore (or log if you want)
             }
-        });
-
-        return rsx!(div {});
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let mut watch_task = use_signal(|| None::<Task>);
-
-        use_effect(move || {
-            let task = spawn({
-                let user_gps = user_gps;
-                async move {
-                    crate::telemetry_dashboard::gps_webview::run(user_gps).await;
-                }
-            });
-            watch_task.set(Some(task));
-        });
-
-        use_drop(move || {
-            if let Some(task) = watch_task.take() {
-                task.cancel();
-            }
-            crate::telemetry_dashboard::gps_webview::stop();
         });
 
         return rsx!(div {});
