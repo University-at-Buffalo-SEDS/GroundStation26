@@ -24,6 +24,7 @@ from typing import Optional, Literal, BinaryIO, cast
 APP_NAME = "UBSEDS GS"
 WINDOWS_APP_NAME = "UBSEDS GroundStation"
 ANDROID_APP_NAME = "SEDS GS"
+LINUX_PACKAGE_NAME = "ubseds-groundstation"
 LEGACY_APP_NAME = "GroundstationFrontend"
 DIST_DIRNAME = "dist"
 APP_BUNDLE_NAME = f"{APP_NAME}.app"
@@ -513,10 +514,10 @@ def patch_linux_bundle_metadata(frontend_dir: Path) -> None:
                 patched_lines.append(f"Name={WINDOWS_APP_NAME}")
                 saw_name = True
             elif line.startswith("Exec="):
-                patched_lines.append(f"Exec={APP_NAME}")
+                patched_lines.append(f"Exec={LINUX_PACKAGE_NAME}")
                 saw_exec = True
             elif line.startswith("Icon="):
-                patched_lines.append(f"Icon={APP_NAME}")
+                patched_lines.append(f"Icon={LINUX_PACKAGE_NAME}")
                 saw_icon = True
             else:
                 patched_lines.append(line)
@@ -524,9 +525,9 @@ def patch_linux_bundle_metadata(frontend_dir: Path) -> None:
         if not saw_name:
             patched_lines.append(f"Name={WINDOWS_APP_NAME}")
         if not saw_exec:
-            patched_lines.append(f"Exec={APP_NAME}")
+            patched_lines.append(f"Exec={LINUX_PACKAGE_NAME}")
         if not saw_icon:
-            patched_lines.append(f"Icon={APP_NAME}")
+            patched_lines.append(f"Icon={LINUX_PACKAGE_NAME}")
 
         patched = "\n".join(patched_lines) + "\n"
         if patched != original:
@@ -534,12 +535,20 @@ def patch_linux_bundle_metadata(frontend_dir: Path) -> None:
             desktop_file.write_text(patched, encoding="utf-8")
 
         if icon_src.exists():
-            icon_dst = desktop_file.parent / f"{APP_NAME}.png"
+            icon_dst = desktop_file.parent / f"{LINUX_PACKAGE_NAME}.png"
             shutil.copy2(icon_src, icon_dst)
 
 
 def _windows_installer_name() -> str:
     return f"{WINDOWS_APP_NAME} Installer.exe"
+
+
+def _linux_deb_name() -> str:
+    return "UBSEDS GS_amd64.deb"
+
+
+def _linux_rpm_name() -> str:
+    return "UBSEDS GS_x86_64.rpm"
 
 
 def _resolve_makensis() -> Optional[str]:
@@ -675,6 +684,17 @@ def prepare_windows_dist_for_bundle(frontend_dir: Path) -> None:
             _remove_path(item)
 
 
+def cleanup_linux_package_artifacts(frontend_dir: Path) -> None:
+    dist = dist_dir(frontend_dir)
+    if not dist.exists():
+        return
+
+    for item in sorted(dist.iterdir()):
+        if item.suffix.lower() in {".deb", ".rpm"}:
+            print(f"Removing stale Linux package artifact: {item.name}")
+            _remove_path(item)
+
+
 def _windows_bundle_search_roots(
         frontend_dir: Path,
         rust_target: Optional[str],
@@ -733,6 +753,131 @@ def _find_windows_app_exe(frontend_dir: Path, rust_target: Optional[str], debug_
         f"Could not find Windows app executable after bundle. Looked for {preferred_names} under: "
         + ", ".join(str(p) for p in search_roots)
     )
+
+
+def _linux_architecture(rust_target: Optional[str]) -> tuple[str, str]:
+    target = (rust_target or "").lower()
+    if "aarch64" in target or "arm64" in target:
+        return "arm64", "aarch64"
+    if "armv7" in target or "armhf" in target:
+        return "armhf", "armv7hl"
+    return "amd64", "x86_64"
+
+
+def _read_workspace_description(repo_root: Path) -> str:
+    cargo_toml = repo_root / "Cargo.toml"
+    raw = cargo_toml.read_text(encoding="utf-8")
+    if tomllib is not None:
+        data = tomllib.loads(raw)
+        desc = data.get("workspace", {}).get("package", {}).get("description")
+        if isinstance(desc, str) and desc.strip():
+            return desc.strip()
+    m = re.search(r'description\s*=\s*"([^"]+)"', raw)
+    if m:
+        return m.group(1)
+    return "UBSEDS GroundStation"
+
+
+def _find_linux_app_binary(frontend_dir: Path, rust_target: Optional[str], debug_mode: bool) -> Path:
+    preferred_names = [
+        LINUX_PACKAGE_NAME,
+        APP_NAME,
+        LEGACY_APP_NAME,
+        "groundstation_frontend",
+    ]
+    target_root = frontend_dir.parent / "target"
+    desktop_profile = "desktop-debug" if debug_mode else "desktop-release"
+    search_roots: list[Path] = []
+    if rust_target:
+        search_roots.append(target_root / rust_target / desktop_profile)
+    search_roots.append(target_root / desktop_profile)
+    search_roots.append(dist_dir(frontend_dir))
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for name in preferred_names:
+            for candidate in root.rglob(name):
+                if candidate.is_file() and candidate.suffix.lower() not in {".deb", ".rpm", ".appimage"}:
+                    return candidate
+
+    raise FileNotFoundError(
+        f"Could not find Linux app binary after bundle. Looked for {preferred_names} under: "
+        + ", ".join(str(p) for p in search_roots)
+    )
+
+
+def _stage_linux_app_payload(
+        frontend_dir: Path,
+        rust_target: Optional[str],
+        debug_mode: bool,
+) -> tuple[tempfile.TemporaryDirectory, Path]:
+    app_bin = _find_linux_app_binary(frontend_dir, rust_target, debug_mode)
+    source_dir = app_bin.parent
+    print(f"Staging Linux package payload from: {source_dir}")
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="gs26-linux-pkg-")
+    pkg_root = Path(temp_dir.name) / "pkgroot"
+    app_dir = pkg_root / "usr" / "lib" / LINUX_PACKAGE_NAME
+    app_dir.mkdir(parents=True, exist_ok=True)
+
+    for item in sorted(source_dir.iterdir()):
+        if item.is_dir():
+            shutil.copytree(item, app_dir / item.name, dirs_exist_ok=True)
+            continue
+        if item.suffix.lower() in {".deb", ".rpm", ".appimage", ".pdb"}:
+            continue
+        if item == app_bin:
+            shutil.copy2(item, app_dir / LINUX_PACKAGE_NAME)
+        else:
+            shutil.copy2(item, app_dir / item.name)
+
+    public_dir = frontend_dir / "dist" / "public"
+    if public_dir.exists():
+        for item in sorted(public_dir.iterdir()):
+            target = app_dir / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target)
+
+    bin_dir = pkg_root / "usr" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    launcher = bin_dir / LINUX_PACKAGE_NAME
+    if launcher.exists() or launcher.is_symlink():
+        launcher.unlink()
+    os.symlink(f"../lib/{LINUX_PACKAGE_NAME}/{LINUX_PACKAGE_NAME}", launcher)
+
+    applications_dir = pkg_root / "usr" / "share" / "applications"
+    applications_dir.mkdir(parents=True, exist_ok=True)
+    desktop_file = applications_dir / f"{LINUX_PACKAGE_NAME}.desktop"
+    description = _read_workspace_description(frontend_dir.parent)
+    desktop_file.write_text(
+        "\n".join([
+            "[Desktop Entry]",
+            "Type=Application",
+            f"Name={WINDOWS_APP_NAME}",
+            f"Comment={description}",
+            f"Exec={LINUX_PACKAGE_NAME}",
+            f"Icon={LINUX_PACKAGE_NAME}",
+            "Terminal=false",
+            "Categories=Utility;",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    icon_src = frontend_dir / "assets" / "icon.png"
+    if icon_src.exists():
+        pixmaps_dir = pkg_root / "usr" / "share" / "pixmaps"
+        pixmaps_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(icon_src, pixmaps_dir / f"{LINUX_PACKAGE_NAME}.png")
+
+        icons_dir = pkg_root / "usr" / "share" / "icons" / "hicolor" / "256x256" / "apps"
+        icons_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(icon_src, icons_dir / f"{LINUX_PACKAGE_NAME}.png")
+
+    return temp_dir, pkg_root
 
 
 def _stage_windows_app_payload(
@@ -1027,6 +1172,101 @@ def build_manual_windows_installer(
     cleanup_windows_installer_artifacts(frontend_dir)
     print(f"✅ Windows installer created: {installer_path}")
     return installer_path
+
+
+def build_manual_linux_packages(
+        frontend_dir: Path,
+        rust_target: Optional[str],
+        debug_mode: bool,
+) -> None:
+    dpkg_deb = _which_in_path("dpkg-deb", os.environ.get("PATH", ""))
+    rpmbuild = _which_in_path("rpmbuild", os.environ.get("PATH", ""))
+    if dpkg_deb is None and rpmbuild is None:
+        raise FileNotFoundError("Neither dpkg-deb nor rpmbuild was found, so Linux packages cannot be built.")
+
+    cleanup_linux_package_artifacts(frontend_dir)
+    temp_dir, pkg_root = _stage_linux_app_payload(frontend_dir, rust_target, debug_mode)
+    try:
+        version = _read_frontend_version(frontend_dir)
+        description = _read_workspace_description(frontend_dir.parent)
+        repo_url = "https://github.com/University-at-Buffalo-SEDS/GroundStation26"
+        deb_arch, rpm_arch = _linux_architecture(rust_target)
+        dist = dist_dir(frontend_dir)
+        dist.mkdir(parents=True, exist_ok=True)
+
+        if dpkg_deb is not None:
+            debian_dir = pkg_root / "DEBIAN"
+            debian_dir.mkdir(parents=True, exist_ok=True)
+            control = "\n".join([
+                f"Package: {LINUX_PACKAGE_NAME}",
+                f"Version: {version}",
+                "Section: utils",
+                "Priority: optional",
+                f"Architecture: {deb_arch}",
+                "Maintainer: UBSEDS",
+                f"Description: {description}",
+                "",
+            ])
+            (debian_dir / "control").write_text(control, encoding="utf-8")
+            deb_path = dist / f"{APP_NAME}_{deb_arch}.deb"
+            run([str(dpkg_deb), "--build", "--root-owner-group", str(pkg_root), str(deb_path)], cwd=frontend_dir)
+            print(f"✅ Linux deb created: {deb_path}")
+
+        if rpmbuild is not None:
+            rpm_root = Path(temp_dir.name) / "rpmbuild"
+            for dirname in ["BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"]:
+                (rpm_root / dirname).mkdir(parents=True, exist_ok=True)
+
+            spec_path = rpm_root / "SPECS" / f"{LINUX_PACKAGE_NAME}.spec"
+            spec_path.write_text(
+                "\n".join([
+                    f"Name: {LINUX_PACKAGE_NAME}",
+                    f"Version: {version}",
+                    "Release: 1%{?dist}",
+                    f"Summary: {WINDOWS_APP_NAME}",
+                    "License: LicenseRef-UBSEDS",
+                    f"URL: {repo_url}",
+                    f"BuildArch: {rpm_arch}",
+                    "AutoReqProv: no",
+                    "",
+                    "%description",
+                    description,
+                    "",
+                    "%install",
+                    "rm -rf %{buildroot}",
+                    "mkdir -p %{buildroot}",
+                    f"cp -a \"{pkg_root}\"/. %{buildroot}/",
+                    "",
+                    "%files",
+                    f"/usr/bin/{LINUX_PACKAGE_NAME}",
+                    f"/usr/lib/{LINUX_PACKAGE_NAME}",
+                    f"/usr/share/applications/{LINUX_PACKAGE_NAME}.desktop",
+                    f"/usr/share/pixmaps/{LINUX_PACKAGE_NAME}.png",
+                    f"/usr/share/icons/hicolor/256x256/apps/{LINUX_PACKAGE_NAME}.png",
+                    "",
+                ]),
+                encoding="utf-8",
+            )
+            run(
+                [
+                    str(rpmbuild),
+                    "-bb",
+                    str(spec_path),
+                    "--define",
+                    f"_topdir {rpm_root}",
+                    "--define",
+                    "_build_id_links none",
+                ],
+                cwd=frontend_dir,
+            )
+            built_rpms = sorted((rpm_root / "RPMS" / rpm_arch).glob("*.rpm"))
+            if not built_rpms:
+                raise FileNotFoundError(f"Manual Linux rpm was not created under {(rpm_root / 'RPMS' / rpm_arch)}")
+            rpm_path = dist / f"{APP_NAME}_{rpm_arch}.rpm"
+            shutil.copy2(built_rpms[-1], rpm_path)
+            print(f"✅ Linux rpm created: {rpm_path}")
+    finally:
+        temp_dir.cleanup()
 
 
 def rename_android_artifacts(frontend_dir: Path) -> None:
@@ -2538,7 +2778,7 @@ def build_frontend(
         elif platform_name == "linux":
             if env is None:
                 env = os.environ.copy()
-            env["DIOXUS_PRODUCT_NAME"] = APP_NAME
+            env["DIOXUS_PRODUCT_NAME"] = LINUX_PACKAGE_NAME
             env["DIOXUS_APP_TITLE"] = WINDOWS_APP_NAME
 
         ensured_wasm_bindgen = _ensure_wasm_bindgen_cli(frontend_dir, env)
@@ -2593,6 +2833,8 @@ def build_frontend(
             _clear_dioxus_bundle_identity_cache(frontend_dir, rust_target, debug_mode, platform_name)
         if platform_name == "windows":
             prepare_windows_dist_for_bundle(frontend_dir)
+        elif platform_name == "linux":
+            cleanup_linux_package_artifacts(frontend_dir)
 
         if rust_target:
             cmd.extend(["--target", rust_target])
@@ -2645,6 +2887,7 @@ def build_frontend(
                 build_manual_windows_installer(frontend_dir, rust_target, debug_mode)
             else:
                 patch_linux_bundle_metadata(frontend_dir)
+                build_manual_linux_packages(frontend_dir, rust_target, debug_mode)
         elif platform_name == "android":
             rename_android_artifacts(frontend_dir)
             if android_package_type != "aab":
