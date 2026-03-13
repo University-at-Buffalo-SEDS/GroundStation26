@@ -881,6 +881,12 @@ def _stage_linux_app_payload(
     return temp_dir, pkg_root
 
 
+def _clone_tree(src: Path, dst: Path) -> None:
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+
+
 def _stage_windows_app_payload(
         frontend_dir: Path,
         rust_target: Optional[str],
@@ -1186,7 +1192,7 @@ def build_manual_linux_packages(
         raise FileNotFoundError("Neither dpkg-deb nor rpmbuild was found, so Linux packages cannot be built.")
 
     cleanup_linux_package_artifacts(frontend_dir)
-    temp_dir, pkg_root = _stage_linux_app_payload(frontend_dir, rust_target, debug_mode)
+    temp_dir, base_pkg_root = _stage_linux_app_payload(frontend_dir, rust_target, debug_mode)
     try:
         version = _read_frontend_version(frontend_dir)
         description = _read_workspace_description(frontend_dir.parent)
@@ -1196,8 +1202,8 @@ def build_manual_linux_packages(
         dist.mkdir(parents=True, exist_ok=True)
 
         if dpkg_deb is not None:
-            debian_dir = pkg_root / "DEBIAN"
-            debian_dir.mkdir(parents=True, exist_ok=True)
+            deb_pkg_root = Path(temp_dir.name) / "deb-root"
+            _clone_tree(base_pkg_root, deb_pkg_root)
             control = "\n".join([
                 f"Package: {LINUX_PACKAGE_NAME}",
                 f"Version: {version}",
@@ -1208,14 +1214,18 @@ def build_manual_linux_packages(
                 f"Description: {description}",
                 "",
             ])
+            debian_dir = deb_pkg_root / "DEBIAN"
+            debian_dir.mkdir(parents=True, exist_ok=True)
             (debian_dir / "control").write_text(control, encoding="utf-8")
             deb_path = dist / f"{APP_NAME}_{deb_arch}.deb"
-            run([str(dpkg_deb), "--build", "--root-owner-group", str(pkg_root), str(deb_path)], cwd=frontend_dir)
+            run([str(dpkg_deb), "--build", "--root-owner-group", str(deb_pkg_root), str(deb_path)], cwd=frontend_dir)
             print(f"✅ Linux deb created: {deb_path}")
         else:
             print("Warning: dpkg-deb not found; skipping manual .deb packaging.", file=sys.stderr)
 
         if rpmbuild is not None:
+            rpm_pkg_root = Path(temp_dir.name) / "rpm-root"
+            _clone_tree(base_pkg_root, rpm_pkg_root)
             rpm_root = Path(temp_dir.name) / "rpmbuild"
             for dirname in ["BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"]:
                 (rpm_root / dirname).mkdir(parents=True, exist_ok=True)
@@ -1238,7 +1248,7 @@ def build_manual_linux_packages(
                     "%install",
                     "rm -rf %{buildroot}",
                     "mkdir -p %{buildroot}",
-                    f"cp -a \"{pkg_root}\"/. %{{buildroot}}/",
+                    f"cp -a \"{rpm_pkg_root}\"/. %{{buildroot}}/",
                     "",
                     "%files",
                     f"/usr/bin/{LINUX_PACKAGE_NAME}",
