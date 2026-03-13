@@ -787,9 +787,10 @@ def _find_linux_app_binary(frontend_dir: Path, rust_target: Optional[str], debug
     ]
     target_root = frontend_dir.parent / "target"
     desktop_profile = "desktop-debug" if debug_mode else "desktop-release"
+    effective_target = rust_target or _default_rust_target_for_frontend("linux")
     search_roots: list[Path] = []
-    if rust_target:
-        search_roots.append(target_root / rust_target / desktop_profile)
+    if effective_target:
+        search_roots.append(target_root / effective_target / desktop_profile)
     search_roots.append(target_root / desktop_profile)
     search_roots.append(dist_dir(frontend_dir))
 
@@ -2618,6 +2619,14 @@ def _default_rust_target_for_frontend(platform_name: Optional[str]) -> Optional[
         return _host_macos_target()
     if platform_name == "windows":
         return _windows_target_default()
+    if platform_name == "linux":
+        machine = platform.machine().lower()
+        if machine in {"x86_64", "amd64"}:
+            return "x86_64-unknown-linux-gnu"
+        if machine in {"aarch64", "arm64"}:
+            return "aarch64-unknown-linux-gnu"
+        if machine.startswith("armv7"):
+            return "armv7-unknown-linux-gnueabihf"
     return None
 
 
