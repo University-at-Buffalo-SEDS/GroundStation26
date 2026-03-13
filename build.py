@@ -1120,10 +1120,11 @@ def _generated_android_app_dir(frontend_dir: Path, debug_mode: bool) -> Path:
     return frontend_dir.parent / "target" / "dx" / pkg_name / profile / "android" / "app"
 
 
-def _clear_dioxus_windows_identity_cache(
+def _clear_dioxus_bundle_identity_cache(
         frontend_dir: Path,
         rust_target: Optional[str],
         debug_mode: bool,
+        platform_name: str,
 ) -> None:
     target_root = frontend_dir.parent / "target"
     profile = "debug" if debug_mode else "release"
@@ -1141,8 +1142,8 @@ def _clear_dioxus_windows_identity_cache(
         removed.append(path)
 
     for path in [
-        target_root / "dx" / pkg_name / profile / "windows",
-        target_root / "dx" / pkg_name / "bundle" / "windows",
+        target_root / "dx" / pkg_name / profile / platform_name,
+        target_root / "dx" / pkg_name / "bundle" / platform_name,
     ]:
         remove_path(path)
 
@@ -1163,7 +1164,7 @@ def _clear_dioxus_windows_identity_cache(
 
     if removed:
         rel = ", ".join(str(p.relative_to(frontend_dir.parent)) for p in removed)
-        print(f"Cleared stale Windows Dioxus identity cache: {rel}")
+        print(f"Cleared stale {platform_name} Dioxus identity cache: {rel}")
 
 
 def clear_generated_android_project(frontend_dir: Path, debug_mode: bool) -> None:
@@ -2588,8 +2589,9 @@ def build_frontend(
         if not rust_target:
             rust_target = _default_rust_target_for_frontend(platform_name)
 
+        if platform_name in {"windows", "linux"}:
+            _clear_dioxus_bundle_identity_cache(frontend_dir, rust_target, debug_mode, platform_name)
         if platform_name == "windows":
-            _clear_dioxus_windows_identity_cache(frontend_dir, rust_target, debug_mode)
             prepare_windows_dist_for_bundle(frontend_dir)
 
         if rust_target:
