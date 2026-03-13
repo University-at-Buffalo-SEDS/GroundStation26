@@ -604,6 +604,29 @@ def cleanup_windows_installer_artifacts(frontend_dir: Path) -> None:
             _remove_path(item)
 
 
+def prepare_windows_dist_for_bundle(frontend_dir: Path) -> None:
+    dist = dist_dir(frontend_dir)
+    if not dist.exists():
+        return
+
+    patterns = [
+        "*.msi",
+        "*setup.exe",
+        f"{LEGACY_APP_NAME}*.exe",
+        f"{LEGACY_APP_NAME}*.msi",
+        f"{WINDOWS_APP_NAME}*.exe",
+        f"{WINDOWS_APP_NAME}*.msi",
+    ]
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for item in sorted(dist.glob(pattern)):
+            if item in seen:
+                continue
+            seen.add(item)
+            print(f"Removing pre-bundle Windows artifact: {item.name}")
+            _remove_path(item)
+
+
 def _windows_bundle_search_roots(
         frontend_dir: Path,
         rust_target: Optional[str],
@@ -2514,6 +2537,7 @@ def build_frontend(
 
         if platform_name == "windows":
             _clear_dioxus_windows_identity_cache(frontend_dir, rust_target, debug_mode)
+            prepare_windows_dist_for_bundle(frontend_dir)
 
         if rust_target:
             cmd.extend(["--target", rust_target])
