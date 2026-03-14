@@ -1,14 +1,17 @@
-use super::layout::{BooleanLabels, DataTabLayout};
+use super::layout::{BatterySourceConfig, BooleanLabels, DataTabLayout};
 use super::types::TelemetryRow;
 // frontend/src/telemetry_dashboard/data_tab.rs
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 
 use super::data_chart::{
-    ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, series_color,
+    ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, combined_battery_chart_key,
+    series_color,
 };
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
+const BATTERY_RUNTIME_TAB_ID: &str = "BATTERY_RUNTIME";
+const LOADCELL_TAB_ID: &str = "LOADCELL";
 
 #[cfg(target_arch = "wasm32")]
 fn localstorage_get(key: &str) -> Option<String> {
@@ -45,6 +48,7 @@ pub fn DataTab(
     rows: Signal<Vec<TelemetryRow>>,
     active_tab: Signal<String>,
     layout: DataTabLayout,
+    battery_sources: Vec<BatterySourceConfig>,
 ) -> Element {
     let mut is_fullscreen = use_signal(|| false);
     let mut show_chart = use_signal(|| true);
@@ -203,6 +207,9 @@ pub fn DataTab(
     // Layout-defined data types (for buttons)
     let types = layout.tabs.clone();
     let current = active_tab.read().clone();
+    let is_battery_raw_tab = matches!(current.as_str(), "BATTERY_VOLTAGE" | "BATTERY_CURRENT");
+    let is_battery_runtime_tab = current == BATTERY_RUNTIME_TAB_ID;
+    let is_loadcell_tab = current == LOADCELL_TAB_ID;
 
     let current_tab = types.iter().find(|t| t.id == current);
 
@@ -222,13 +229,55 @@ pub fn DataTab(
         .rev()
         .find(|r| r.data_type == current)
         .cloned();
+    let battery_card_rows: Vec<(&BatterySourceConfig, Option<TelemetryRow>)> = battery_sources
+        .iter()
+        .filter(|source| {
+            (is_battery_raw_tab && source.input_data_type == "BATTERY_VOLTAGE")
+                || source.input_data_type == current
+                || source.percent_data_type == current
+                || source.drop_rate_data_type == current
+                || source.remaining_minutes_data_type == current
+        })
+        .map(|source| {
+            let row = rows
+                .read()
+                .iter()
+                .rev()
+                .find(|r| r.data_type == current && r.sender_id == source.sender_id)
+                .cloned();
+            (source, row)
+        })
+        .collect();
+    let battery_graph_sources: Vec<&BatterySourceConfig> = battery_sources
+        .iter()
+        .filter(|source| {
+            (is_battery_raw_tab && source.input_data_type == "BATTERY_VOLTAGE")
+                || source.input_data_type == current
+        })
+        .collect();
+    let synthetic_cards = if is_battery_runtime_tab {
+        battery_runtime_cards(&rows.read(), &battery_sources)
+    } else if is_loadcell_tab {
+        loadcell_cards(&rows.read())
+    } else {
+        Vec::new()
+    };
 
     let is_valve_state = current == "VALVE_STATE";
     let boolean_labels = current_tab.and_then(|t| t.boolean_labels.as_ref());
     let channel_boolean_labels = current_tab.and_then(|t| t.channel_boolean_labels.as_ref());
-    let has_telemetry = latest_row.is_some();
+    let has_telemetry = if battery_card_rows.is_empty() {
+        latest_row.is_some() || !synthetic_cards.is_empty()
+    } else {
+        battery_card_rows.iter().any(|(_, row)| row.is_some())
+    };
     let is_graph_allowed =
-        chart_enabled && has_telemetry && current != "GPS_DATA" && !is_valve_state;
+        chart_enabled
+            && has_telemetry
+            && current != "GPS_DATA"
+            && !is_valve_state
+            && !is_battery_runtime_tab
+            && !is_loadcell_tab;
 
     // Viewport constants
     let view_w = 1200.0_f64;
@@ -243,40 +292,50 @@ pub fn DataTab(
     let inner_h = view_h - pad_top - pad_bottom;
     let inner_h_full = view_h_full - pad_top - pad_bottom;
 
+    let chart_key = if is_battery_raw_tab {
+        combined_battery_chart_key(&current).unwrap_or_else(|| current.clone())
+    } else {
+        current.clone()
+    };
     // Cache fetch (NON-FULLSCREEN)
     //
     // IMPORTANT: We do NOT fetch fullscreen geometry here anymore.
     // That avoids doing two cache builds every frame (w,h=360 and w,h=full),
     // which can interact badly with "window span" behavior and costs extra CPU.
-    let (paths, y_min, y_max, span_min) = charts_cache_get(&current, view_w as f32, view_h as f32);
+    let (paths, y_min, y_max, span_min) =
+        charts_cache_get(&chart_key, view_w as f32, view_h as f32);
     let (chan_min, chan_max) =
-        charts_cache_get_channel_minmax(&current, view_w as f32, view_h as f32);
-
+        charts_cache_get_channel_minmax(&chart_key, view_w as f32, view_h as f32);
     let y_mid = (y_min + y_max) * 0.5;
-
     let y_max_s = format!("{:.2}", y_max);
     let y_mid_s = format!("{:.2}", y_mid);
     let y_min_s = format!("{:.2}", y_min);
-
     let x_left_s = fmt_span(span_min);
     let x_mid_s = fmt_span(span_min * 0.5);
     let x_pct = |x: f64, total: f64| format!("{:.4}%", (x / total) * 100.0);
     let y_pct = |y: f64, total: f64| format!("{:.4}%", (y / total) * 100.0);
-
-    let legend_items: Vec<(usize, &str)> = labels
-        .iter()
-        .enumerate()
-        .filter_map(|(i, l)| {
-            if l.is_empty() {
-                None
-            } else {
-                Some((i, l.as_str()))
-            }
-        })
-        .collect();
+    let legend_items: Vec<(usize, &str)> = if is_battery_raw_tab && !battery_graph_sources.is_empty()
+    {
+        battery_graph_sources
+            .iter()
+            .enumerate()
+            .map(|(i, source)| (i, source.label.as_str()))
+            .collect()
+    } else {
+        labels
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                if l.is_empty() {
+                    None
+                } else {
+                    Some((i, l.as_str()))
+                }
+            })
+            .collect()
+    };
     let legend_rows: Vec<(usize, &str)> =
         legend_items.iter().map(|(i, label)| (*i, *label)).collect();
-
     let on_toggle_fullscreen = move |_| {
         let next = !*is_fullscreen.read();
         is_fullscreen.set(next);
@@ -284,6 +343,71 @@ pub fn DataTab(
     let on_toggle_chart = move |_| {
         let next = !*show_chart.read();
         show_chart.set(next);
+    };
+    let summary_content = if !synthetic_cards.is_empty() {
+        rsx! {
+            div {
+                style: "display:grid; gap:10px; align-items:stretch; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); width:100%;",
+                for (i, (label, value)) in synthetic_cards.iter().enumerate() {
+                    SummaryCard {
+                        label: label.clone(),
+                        min: None,
+                        max: None,
+                        value: value.clone(),
+                        color: summary_color(i),
+                    }
+                }
+            }
+        }
+    } else {
+        match latest_row {
+            None => rsx! {
+                div { style: "color:#94a3b8; padding:2px 2px;", "Waiting for telemetry…" }
+            },
+            Some(row) => {
+                let vals = row.values.clone();
+                rsx! {
+                    div {
+                        style: "display:grid; gap:10px; align-items:stretch; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); width:100%;",
+                        if battery_card_rows.is_empty() {
+                            for (i, label) in labels.iter().enumerate() {
+                                if !label.is_empty() {
+                                    SummaryCard {
+                                        label: label.clone(),
+                                        min: if is_graph_allowed { chan_min.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
+                                        max: if is_graph_allowed { chan_max.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
+                                        value: if let Some(lbls) = channel_boolean_labels
+                                            .and_then(|list| list.get(i))
+                                        {
+                                            boolean_value_text(vals.get(i).copied().flatten(), Some(lbls))
+                                        } else if is_valve_state || boolean_labels.is_some() {
+                                            boolean_value_text(vals.get(i).copied().flatten(), boolean_labels)
+                                        } else {
+                                            fmt_opt(vals.get(i).copied().flatten())
+                                        },
+                                        color: summary_color(i),
+                                    }
+                                }
+                            }
+                        } else {
+                            for (i, (source, battery_row)) in battery_card_rows.iter().enumerate() {
+                                SummaryCard {
+                                    label: source.label.clone(),
+                                    min: None,
+                                    max: None,
+                                    value: battery_row
+                                        .as_ref()
+                                        .and_then(|row| row.values.first().copied().flatten())
+                                        .map(|v| format!("{v:.4}"))
+                                        .unwrap_or_else(|| "—".to_string()),
+                                    color: summary_color(i),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     };
 
     rsx! {
@@ -310,39 +434,7 @@ pub fn DataTab(
                     }
                 }
 
-                match latest_row {
-                    None => rsx! {
-                        div { style: "color:#94a3b8; padding:2px 2px;", "Waiting for telemetry…" }
-                    },
-                    Some(row) => {
-                        let vals = row.values.clone();
-
-                        rsx! {
-                            div {
-                                style: "display:grid; gap:10px; align-items:stretch; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); width:100%;",
-                                for i in 0..labels.len() {
-                                    if !labels[i].is_empty() {
-                                        SummaryCard {
-                                            label: labels[i].clone(),
-                                            min: if is_graph_allowed { chan_min.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
-                                            max: if is_graph_allowed { chan_max.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
-                                            value: if let Some(lbls) = channel_boolean_labels
-                                                .and_then(|list| list.get(i))
-                                            {
-                                                boolean_value_text(vals.get(i).copied().flatten(), Some(lbls))
-                                            } else if is_valve_state || boolean_labels.is_some() {
-                                                boolean_value_text(vals.get(i).copied().flatten(), boolean_labels)
-                                            } else {
-                                                fmt_opt(vals.get(i).copied().flatten())
-                                            },
-                                            color: summary_color(i),
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                {summary_content}
             }
 
             // =========================
@@ -383,7 +475,6 @@ pub fn DataTab(
                                         span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "now" }
                                     }
                                 }
-
                                 if !legend_rows.is_empty() {
                                     div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
                                         for (i, label) in legend_rows.iter() {
@@ -409,7 +500,7 @@ pub fn DataTab(
         if is_graph_allowed && *is_fullscreen.read() {
             {
                 let (paths_full, _y_min2, _y_max2, _span_min2) =
-                    charts_cache_get(&current, view_w as f32, view_h_full as f32);
+                    charts_cache_get(&chart_key, view_w as f32, view_h_full as f32);
 
                 rsx! {
                     div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
@@ -440,7 +531,6 @@ pub fn DataTab(
                                     span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "now" }
                                 }
                             }
-
                             if !legend_rows.is_empty() {
                                 div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:8px 12px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
                                     for (i, label) in legend_rows.iter() {
@@ -464,6 +554,62 @@ pub fn DataTab(
 fn summary_color(i: usize) -> &'static str {
     series_color(i)
 }
+
+fn latest_value_for(rows: &[TelemetryRow], data_type: &str, sender_id: Option<&str>) -> Option<f32> {
+    rows.iter()
+        .rev()
+        .find(|row| row.data_type == data_type && sender_id.is_none_or(|sender| row.sender_id == sender))
+        .and_then(|row| row.values.first().copied().flatten())
+}
+
+fn battery_runtime_cards(
+    rows: &[TelemetryRow],
+    battery_sources: &[BatterySourceConfig],
+) -> Vec<(String, String)> {
+    let mut cards = Vec::new();
+    for source in battery_sources {
+        let prefix = source.label.clone();
+        cards.push((
+            format!("{prefix} %"),
+            fmt_opt(latest_value_for(rows, &source.percent_data_type, Some(&source.sender_id))),
+        ));
+        cards.push((
+            format!("{prefix} Drop"),
+            fmt_opt(latest_value_for(
+                rows,
+                &source.drop_rate_data_type,
+                Some(&source.sender_id),
+            )),
+        ));
+        cards.push((
+            format!("{prefix} Runtime"),
+            fmt_opt(latest_value_for(
+                rows,
+                &source.remaining_minutes_data_type,
+                Some(&source.sender_id),
+            )),
+        ));
+    }
+    cards
+}
+
+fn loadcell_cards(rows: &[TelemetryRow]) -> Vec<(String, String)> {
+    vec![
+        (
+            "Raw Loadcell".to_string(),
+            fmt_opt(latest_value_for(rows, "KG1000", None)),
+        ),
+        (
+            "Weight (kg)".to_string(),
+            fmt_opt(latest_value_for(rows, "LOADCELL_WEIGHT_KG", None)),
+        ),
+        (
+            "Fill %".to_string(),
+            fmt_opt(latest_value_for(rows, "LOADCELL_FILL_PERCENT", None)),
+        ),
+    ]
+}
+
 
 #[component]
 fn SummaryCard(

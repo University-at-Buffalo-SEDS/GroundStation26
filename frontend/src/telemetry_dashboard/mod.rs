@@ -9,7 +9,8 @@ pub mod data_chart;
 pub mod data_tab;
 pub mod errors_tab;
 mod gps;
-mod gps_android;
+pub(crate) mod gps_android;
+mod gps_webview;
 mod latency_chart;
 pub mod layout;
 mod notifications_tab;
@@ -180,10 +181,52 @@ mod persist {
         use std::collections::HashMap;
         use std::io;
 
-        fn storage_path() -> std::path::PathBuf {
-            let mut base = dirs::data_local_dir()
+        fn fallback_storage_base_dir() -> std::path::PathBuf {
+            dirs::data_local_dir()
                 .or_else(dirs::data_dir)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
+        }
+
+        #[cfg(target_os = "android")]
+        fn android_storage_base_dir() -> Option<std::path::PathBuf> {
+            use jni::objects::{JObject, JString};
+            use jni::JavaVM;
+            use ndk_context::android_context;
+
+            let ctx = android_context();
+            let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
+            let mut env = vm.attach_current_thread().ok()?;
+            let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+            let files_dir = env
+                .call_method(&context, "getFilesDir", "()Ljava/io/File;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            let path_obj = env
+                .call_method(&files_dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            let path = env.get_string(&JString::from(path_obj)).ok()?.to_string_lossy().into_owned();
+
+            let _ = context.into_raw();
+            Some(std::path::PathBuf::from(path))
+        }
+
+        fn storage_base_dir() -> std::path::PathBuf {
+            #[cfg(target_os = "android")]
+            {
+                if let Some(path) = android_storage_base_dir() {
+                    return path;
+                }
+            }
+
+            fallback_storage_base_dir()
+        }
+
+        fn storage_path() -> std::path::PathBuf {
+            let mut base = storage_base_dir();
             base.push("gs26");
             base.push("storage.json");
             base
@@ -477,11 +520,20 @@ pub fn map_tiles_url() -> String {
         return "http://gs26.localhost/tiles/{z}/{x}/{y}.jpg".to_string();
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_os = "android")]
+    {
+        // On Android, WRY rewrites custom protocols into host-mapped HTTP(S) URLs
+        // like `https://gs26.local/...` before handing them back to the request handler.
+        // Use HTTPS here so WebView does not block tile fetches as mixed content from
+        // the secure `https://dioxus.index.html` app origin.
+        return "https://gs26.local/tiles/{z}/{x}/{y}.jpg".to_string();
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows"), not(target_os = "android")))]
     {
         // Native WebViews can block plain-http tile fetches; always proxy through
         // our native protocol handler, which performs the upstream HTTP(S) request.
-        "gs26://local/tiles/{z}/{x}/{y}.jpg".to_string()
+        return "gs26://local/tiles/{z}/{x}/{y}.jpg".to_string();
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -844,6 +896,7 @@ fn TelemetryDashboardInner() -> Element {
 
             if let Some(cached) = persist::get_string(LAYOUT_CACHE_KEY)
                 && let Ok(layout) = serde_json::from_str::<LayoutConfig>(&cached)
+                && let Ok(()) = layout.validate()
             {
                 layout_config.set(Some(layout));
                 layout_loading.set(false);
@@ -852,6 +905,13 @@ fn TelemetryDashboardInner() -> Element {
             spawn(async move {
                 match http_get_json::<LayoutConfig>("/api/layout").await {
                     Ok(layout) => {
+                        if let Err(err) = layout.validate() {
+                            layout_error.set(Some(format!("Layout failed to load: {err}")));
+                            if layout_config.read().is_none() {
+                                layout_loading.set(false);
+                            }
+                            return;
+                        }
                         layout_config.set(Some(layout.clone()));
                         layout_loading.set(false);
                         layout_error.set(None);
@@ -1365,7 +1425,7 @@ fn TelemetryDashboardInner() -> Element {
                         // That prevents the dashboard's WS supervisor effect from spawning
                         // a new epoch while we're navigating away.
                         let was_alive = alive_for_click.swap(false, Ordering::Relaxed);
-                        #[cfg(any(target_os = "macos", target_os = "ios"))]
+                        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                         gps::stop_gps_updates();
                         _set_dashboard_alive(false);
                         if was_alive {
@@ -1394,6 +1454,13 @@ fn TelemetryDashboardInner() -> Element {
         spawn(async move {
             match http_get_json::<LayoutConfig>("/api/layout").await {
                 Ok(layout) => {
+                    if let Err(err) = layout.validate() {
+                        layout_error.set(Some(format!("Layout failed to load: {err}")));
+                        if layout_config.read().is_none() {
+                            layout_loading.set(false);
+                        }
+                        return;
+                    }
                     layout_config.set(Some(layout.clone()));
                     layout_loading.set(false);
                     layout_error.set(None);
@@ -1495,9 +1562,12 @@ fn TelemetryDashboardInner() -> Element {
                     border:{border_style};
                     box-sizing:border-box;
                 ",
-                div { style: "text-align:center; display:flex; flex-direction:column; gap:10px;",
+                div { style: "text-align:center; display:flex; flex-direction:column; gap:10px; align-items:center;",
                     div { style: "font-size:22px; font-weight:800; color:#f97316;", "Loading layout..." }
                     div { style: "font-size:14px; color:#94a3b8;", "Waiting for layout from backend" }
+                    div { style: "display:flex; gap:10px; flex-wrap:wrap; justify-content:center; margin-top:4px;",
+                        {connect_button}
+                    }
                 }
             }
         } else if layout_snapshot.is_none() {
@@ -1916,6 +1986,7 @@ fn TelemetryDashboardInner() -> Element {
                             rows: rows,
                             active_tab: active_data_tab,
                             layout: layout.data_tab.clone(),
+                            battery_sources: layout.battery.sources.clone(),
                         }
                     },
                 }
@@ -2006,14 +2077,23 @@ pub(crate) async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> R
         .build()
         .map_err(|e| e.to_string())?;
 
-    client
+    let response = client
         .get(url)
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .json::<T>()
-        .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("HTTP {}: {}", status, snippet.trim()));
+    }
+
+    serde_json::from_str::<T>(&body).map_err(|e| {
+        let snippet: String = body.chars().take(200).collect();
+        format!("invalid JSON ({e}): {}", snippet.trim())
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2393,6 +2473,7 @@ async fn seed_from_db(
         rows.sort_by(|a, b| {
             a.timestamp_ms
                 .cmp(&b.timestamp_ms)
+                .then_with(|| a.sender_id.cmp(&b.sender_id))
                 .then_with(|| a.data_type.cmp(&b.data_type))
         });
     }
@@ -2408,9 +2489,9 @@ async fn seed_from_db(
     }
 
     fn dedupe_rows_exact(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
-        let mut by_key: HashMap<(String, i64), TelemetryRow> = HashMap::new();
+        let mut by_key: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
         for row in rows {
-            let key = (row.data_type.clone(), row.timestamp_ms);
+            let key = (row.data_type.clone(), row.sender_id.clone(), row.timestamp_ms);
             match by_key.get_mut(&key) {
                 Some(existing) => {
                     *existing = row;

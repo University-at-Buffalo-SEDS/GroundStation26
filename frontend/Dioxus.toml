@@ -7,7 +7,7 @@ out_dir = "dist"
 asset_dir = "assets"
 icon = "assets/icon.png"
 category = "public.app-category.utilities"
-build = "11"
+build = "12"
 
 [web.app]
 title = "UBSEDS GroundStation"
@@ -25,10 +25,10 @@ debug = false
 name = "UBSEDS GS"
 identifier = "com.UBSEDS.GS26"
 publisher = "UBSEDS"
-icon = ["assets/icon.png"]
+icon = ["assets/icon.ico", "assets/icon.png"]
 
 [bundle.windows]
-name = "UBSEDS GS"
+name = "UBSEDS GroundStation"
 icon = "assets/icon.ico"
 
 [bundle.macos]

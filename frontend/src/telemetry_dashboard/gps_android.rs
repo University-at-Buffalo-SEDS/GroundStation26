@@ -1,30 +1,124 @@
-// frontend/src/telemetry_dashboard/gps_android.rs
+#![allow(dead_code)]
 #![cfg(target_os = "android")]
 
 use dioxus_signals::{Signal, WritableExt};
-use std::sync::OnceLock;
+use jni::objects::{JClass, JObject, JString, JValue};
+use jni::sys::{jboolean, jdouble, jfloat};
+use jni::{JNIEnv, JavaVM};
+use ndk_context::android_context;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-static GPS_SIGNAL: OnceLock<Signal<Option<(f64, f64)>>> = OnceLock::new();
+static mut GPS_SIGNAL: Option<Signal<Option<(f64, f64)>>> = None;
+static HEADING_BITS: AtomicU64 = AtomicU64::new(f64::NAN.to_bits());
+
+const LOCATION_SHIM_CLASS_DOT: &str = "com.ubseds.gs26.LocationShim";
+
+fn with_android_env<R>(f: impl FnOnce(&mut JNIEnv<'_>, &JObject<'_>) -> R) -> Option<R> {
+    let ctx = android_context();
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let result = f(&mut env, &context);
+    let _ = context.into_raw();
+    Some(result)
+}
+
+fn call_static_void(method: &str, sig: &str, args: &[JValue<'_, '_>]) {
+    let _ = with_android_env(|env, context| {
+        let class_loader = match env
+            .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+            .and_then(|value| value.l())
+        {
+            Ok(loader) => loader,
+            Err(err) => {
+                eprintln!("Android class loader lookup failed: {err}");
+                return;
+            }
+        };
+        let class_name: JString<'_> = match env.new_string(LOCATION_SHIM_CLASS_DOT) {
+            Ok(name) => name,
+            Err(err) => {
+                eprintln!("Android bridge class name creation failed: {err}");
+                return;
+            }
+        };
+        let class = match env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .and_then(|value| value.l())
+        {
+            Ok(class) => class,
+            Err(err) => {
+                eprintln!("Android bridge class lookup failed: {err}");
+                return;
+            }
+        };
+        let class = JClass::from(class);
+        let mut owned_args = Vec::with_capacity(args.len() + 1);
+        if sig.starts_with("(Landroid/content/Context;") {
+            owned_args.push(JValue::Object(context));
+        }
+        owned_args.extend_from_slice(args);
+        if let Err(err) = env.call_static_method(&class, method, sig, &owned_args) {
+            eprintln!("Android bridge call {method} failed: {err}");
+        }
+    });
+}
 
 pub fn start(user_gps: Signal<Option<(f64, f64)>>) {
-    // store signal so JNI callback can update it
-    let _ = GPS_SIGNAL.set(user_gps);
-
-    // Call into Java/Kotlin to start location updates
-    // This requires a Java class:
-    //   com.ubbeds.groundstation26.LocationShim.start()
-    unsafe { gs26_android_location_start() };
+    unsafe {
+        GPS_SIGNAL = Some(user_gps);
+    }
+    call_static_void("start", "(Landroid/content/Context;)V", &[]);
 }
 
-extern "C" {
-    /// Implemented on the Java/Kotlin side via JNI to start GPS updates.
-    fn gs26_android_location_start();
+pub fn stop() {
+    unsafe {
+        GPS_SIGNAL = None;
+    }
+    call_static_void("stop", "()V", &[]);
 }
 
-/// Called from Java/Kotlin when you receive a location update.
-#[no_mangle]
-pub extern "C" fn gs26_android_location_on_update(lat: f64, lon: f64) {
-    if let Some(sig) = GPS_SIGNAL.get() {
-        sig.set(Some((lat, lon)));
+pub fn set_keep_screen_on(enabled: bool) {
+    call_static_void(
+        "setKeepScreenOn",
+        "(Landroid/content/Context;Z)V",
+        &[JValue::Bool(if enabled { 1 } else { 0 } as jboolean)],
+    );
+}
+
+pub fn latest_heading_deg() -> Option<f64> {
+    let v = f64::from_bits(HEADING_BITS.load(Ordering::Relaxed));
+    if v.is_finite() { Some(v) } else { None }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_ubseds_gs26_LocationShim_nativeOnLocationUpdate(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    lat: jdouble,
+    lon: jdouble,
+) {
+    unsafe {
+        let Some(mut sig) = GPS_SIGNAL else { return };
+        if let Ok(mut w) = sig.try_write() {
+            *w = Some((lat, lon));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_ubseds_gs26_LocationShim_nativeOnHeadingUpdate(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    heading_deg: jfloat,
+) {
+    let deg = f64::from(heading_deg);
+    if deg.is_finite() {
+        HEADING_BITS.store(deg.to_bits(), Ordering::Relaxed);
     }
 }

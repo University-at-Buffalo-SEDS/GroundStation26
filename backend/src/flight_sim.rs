@@ -150,6 +150,7 @@ struct FlightSimState {
     ground_station_battery_v: f32,
     ground_station_battery_a: f32,
     next_battery_sender_gateway: bool,
+    last_battery_sender_gateway: bool,
     loadcell_mass_kg: f32,
     valves: HashMap<u8, bool>,
     saw_dump_open_after_n2: bool,
@@ -206,6 +207,7 @@ impl FlightSimState {
             ground_station_battery_v: GROUND_STATION_BATTERY_MAX_V,
             ground_station_battery_a: 0.7,
             next_battery_sender_gateway: false,
+            last_battery_sender_gateway: false,
             loadcell_mass_kg: 0.0,
             valves,
             saw_dump_open_after_n2: false,
@@ -658,15 +660,25 @@ impl FlightSimState {
             DataType::BatteryVoltage => {
                 if self.next_battery_sender_gateway {
                     self.next_battery_sender_gateway = false;
+                    self.last_battery_sender_gateway = true;
                     sender = Board::GatewayBoard.sender_id();
                     vec![self.ground_station_battery_v]
                 } else {
                     self.next_battery_sender_gateway = true;
+                    self.last_battery_sender_gateway = false;
                     sender = Board::PowerBoard.sender_id();
                     vec![self.av_bay_battery_v]
                 }
             }
-            DataType::BatteryCurrent => vec![self.battery_a],
+            DataType::BatteryCurrent => {
+                if self.last_battery_sender_gateway {
+                    sender = Board::GatewayBoard.sender_id();
+                    vec![self.ground_station_battery_a]
+                } else {
+                    sender = Board::PowerBoard.sender_id();
+                    vec![self.battery_a]
+                }
+            }
             DataType::GpsData => {
                 let dlat_deg = (self.altitude_ft / 5_280.0) * 0.00001;
                 let dlon_deg = dlat_deg * 0.8;

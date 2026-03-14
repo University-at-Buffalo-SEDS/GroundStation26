@@ -94,6 +94,24 @@ fn build_apple_objc(manifest_dir: &Path, target: &str) {
     println!("cargo:rustc-link-lib=objc");
 }
 
+fn build_windows_resources(manifest_dir: &Path, target: &str) {
+    if !target.contains("windows") {
+        return;
+    }
+
+    let icon = manifest_dir.join("assets").join("icon.ico");
+    println!("cargo:rerun-if-changed={}", icon.display());
+    if !icon.exists() {
+        panic!("Windows icon not found: {}", icon.display());
+    }
+
+    let mut res = winres::WindowsResource::new();
+    res.set_icon(icon.to_string_lossy().as_ref());
+    if let Err(err) = res.compile() {
+        panic!("failed to compile Windows resources: {err}");
+    }
+}
+
 fn run(mut cmd: Command) {
     let program = cmd.get_program().to_string_lossy().to_string();
     let args: Vec<String> = cmd
@@ -139,6 +157,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     build_apple_objc(&manifest_dir, &target);
+    build_windows_resources(&manifest_dir, &target);
     // Re-run if this file changes
     println!("cargo:rerun-if-changed=build.rs");
 

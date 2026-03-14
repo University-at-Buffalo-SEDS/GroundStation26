@@ -33,14 +33,8 @@ mod keep_awake {
 
     #[cfg(target_os = "android")]
     mod android {
-        use std::os::raw::c_int;
-
-        unsafe extern "C" {
-            fn gs26_android_set_keep_screen_on(enabled: c_int);
-        }
-
         pub fn set_enabled(enabled: bool) {
-            unsafe { gs26_android_set_keep_screen_on(if enabled { 1 } else { 0 }) };
+            crate::telemetry_dashboard::gps_android::set_keep_screen_on(enabled);
         }
     }
 
@@ -140,11 +134,49 @@ mod persist {
     use super::_CONNECT_SHOWN_KEY;
     use std::io;
 
-    fn storage_dir() -> std::path::PathBuf {
+    fn fallback_storage_dir() -> std::path::PathBuf {
         dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
             .join("gs26")
+    }
+
+    #[cfg(target_os = "android")]
+    fn android_storage_dir() -> Option<std::path::PathBuf> {
+        use jni::objects::{JObject, JString};
+        use jni::JavaVM;
+        use ndk_context::android_context;
+
+        let ctx = android_context();
+        let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
+        let mut env = vm.attach_current_thread().ok()?;
+        let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+        let files_dir = env
+            .call_method(&context, "getFilesDir", "()Ljava/io/File;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let path_obj = env
+            .call_method(&files_dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let path = env.get_string(&JString::from(path_obj)).ok()?.to_string_lossy().into_owned();
+
+        let _ = context.into_raw();
+        Some(std::path::PathBuf::from(path).join("gs26"))
+    }
+
+    fn storage_dir() -> std::path::PathBuf {
+        #[cfg(target_os = "android")]
+        {
+            if let Some(path) = android_storage_dir() {
+                return path;
+            }
+        }
+
+        fallback_storage_dir()
     }
 
     fn path_for(key: &str) -> std::path::PathBuf {
@@ -742,6 +774,13 @@ pub fn Connect() -> Element {
 
                             UrlConfig::set_base_url_and_persist(u_norm.to_string());
                             UrlConfig::_set_skip_tls_verify_for_base(&u_norm, *skip_tls.read());
+                            if UrlConfig::_stored_base_url().as_deref() != Some(u_norm.as_str()) {
+                                test_status.set(
+                                    "Failed to save the backend URL on this device. The app stayed disconnected."
+                                        .to_string(),
+                                );
+                                return;
+                            }
                             let _ = persist::write_connect_shown(true);
                             let _ = nav.replace(Route::Dashboard {});
                         },
@@ -757,6 +796,7 @@ pub fn Connect() -> Element {
 pub fn Dashboard() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let nav = use_navigator();
         if UrlConfig::_stored_base_url().is_none() {
             return rsx! {
                 div {
@@ -764,7 +804,22 @@ pub fn Dashboard() -> Element {
                     div {
                         style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220;",
                         h1 { style: "margin:0 0 12px 0; font-size:18px;", "Not connected" }
-                        p { style: "margin:0; color:#94a3b8;", "Please configure the backend URL on the Connect screen." }
+                        p { style: "margin:0 0 16px 0; color:#94a3b8;", "Please configure the backend URL on the Connect screen." }
+                        button {
+                            style: "
+                                padding:10px 14px;
+                                border-radius:10px;
+                                border:1px solid #334155;
+                                background:#111827;
+                                color:#e5e7eb;
+                                font-weight:700;
+                                cursor:pointer;
+                            ",
+                            onclick: move |_| {
+                                let _ = nav.replace(Route::Connect {});
+                            },
+                            "Back to Connect"
+                        }
                     }
                 }
             };

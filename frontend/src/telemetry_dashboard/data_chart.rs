@@ -33,6 +33,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::HISTORY_MS;
 
+const SENDER_SPLIT_DATA_TYPES: &[&str] = &["BATTERY_VOLTAGE", "BATTERY_CURRENT"];
+const BATTERY_COMBINED_CHANNELS: usize = 2;
+
+pub fn sender_scoped_chart_key(data_type: &str, sender_id: &str) -> String {
+    format!("{data_type}@@{sender_id}")
+}
+
+pub fn combined_battery_chart_key(data_type: &str) -> Option<String> {
+    should_split_sender_chart(data_type).then(|| format!("{data_type}@@combined"))
+}
+
+fn should_split_sender_chart(data_type: &str) -> bool {
+    SENDER_SPLIT_DATA_TYPES.contains(&data_type)
+}
+
+fn battery_sender_channel(sender_id: &str) -> Option<usize> {
+    match sender_id {
+        "PB" => Some(0),
+        "GW" => Some(1),
+        _ => None,
+    }
+}
+
 // -------------------------
 // Bucket grid configuration
 // -------------------------
@@ -104,6 +127,7 @@ pub fn charts_cache_reseed_ingest_row(row: &TelemetryRow) {
     RESEED_CACHE.with(|c| {
         if let Some(cache) = c.borrow_mut().as_mut() {
             cache.ingest_row(row);
+            cache.ingest_sender_scoped_row(row);
         }
     });
 }
@@ -125,13 +149,16 @@ pub fn charts_cache_reset_and_ingest(rows: &[TelemetryRow]) {
         c._clear();
         for r in rows {
             c.ingest_row(r);
+            c.ingest_sender_scoped_row(r);
         }
     });
 }
 
 pub fn charts_cache_ingest_row(row: &TelemetryRow) {
     CHARTS_CACHE.with(|c| {
-        c.borrow_mut().ingest_row(row);
+        let mut cache = c.borrow_mut();
+        cache.ingest_row(row);
+        cache.ingest_sender_scoped_row(row);
     });
 }
 
@@ -187,6 +214,37 @@ impl ChartsCache {
             .entry(r.data_type.clone())
             .or_insert_with(CachedChart::new);
         chart.ingest(r);
+    }
+
+    fn ingest_sender_scoped_row(&mut self, r: &TelemetryRow) {
+        if !should_split_sender_chart(&r.data_type) || r.sender_id.is_empty() {
+            return;
+        }
+        let chart = self
+            .charts
+            .entry(sender_scoped_chart_key(&r.data_type, &r.sender_id))
+            .or_insert_with(CachedChart::new);
+        chart.ingest(r);
+
+        let Some(channel) = battery_sender_channel(&r.sender_id) else {
+            return;
+        };
+        let Some(combined_key) = combined_battery_chart_key(&r.data_type) else {
+            return;
+        };
+        let mut combined_values = vec![None; BATTERY_COMBINED_CHANNELS];
+        combined_values[channel] = r.values.first().copied().flatten();
+        let combined_row = TelemetryRow {
+            timestamp_ms: r.timestamp_ms,
+            data_type: combined_key,
+            sender_id: String::new(),
+            values: combined_values,
+        };
+        let combined_chart = self
+            .charts
+            .entry(combined_row.data_type.clone())
+            .or_insert_with(CachedChart::new);
+        combined_chart.ingest(&combined_row);
     }
 
     fn get(&mut self, dt: &str, w: f32, h: f32) -> (Vec<String>, f32, f32, f32) {

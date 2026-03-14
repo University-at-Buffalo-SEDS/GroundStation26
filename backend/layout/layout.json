@@ -145,7 +145,7 @@
       },
       {
         "id": "BATTERY_VOLTAGE",
-        "label": "BATTERY_VOLTAGE",
+        "label": "Battery Voltage",
         "channels": [
           "Voltage"
         ],
@@ -155,12 +155,27 @@
       },
       {
         "id": "BATTERY_CURRENT",
-        "label": "BATTERY_CURRENT",
+        "label": "Battery Current",
         "channels": [
           "Current"
         ],
         "chart": {
           "enabled": true
+        }
+      },
+      {
+        "id": "BATTERY_RUNTIME",
+        "label": "Battery Runtime",
+        "channels": [
+          "AV Bay %",
+          "AV Bay Drop",
+          "AV Bay Runtime",
+          "Ground Station %",
+          "Ground Station Drop",
+          "Ground Station Runtime"
+        ],
+        "chart": {
+          "enabled": false
         }
       },
       {
@@ -232,93 +247,15 @@
         ]
       },
       {
-        "id": "AV_BAY_BATTERY_PERCENT",
-        "label": "AV_BAY_BATTERY_PERCENT",
+        "id": "LOADCELL",
+        "label": "LOADCELL",
         "channels": [
-          "Percent"
-        ],
-        "chart": {
-          "enabled": false
-        }
-      },
-      {
-        "id": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
-        "label": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
-        "channels": [
-          "Drop Rate (V/min)"
-        ],
-        "chart": {
-          "enabled": false
-        }
-      },
-      {
-        "id": "AV_BAY_BATTERY_REMAINING_MINUTES",
-        "label": "AV_BAY_BATTERY_REMAINING_MINUTES",
-        "channels": [
-          "Remaining Minutes"
-        ],
-        "chart": {
-          "enabled": false
-        }
-      },
-      {
-        "id": "GROUND_STATION_BATTERY_PERCENT",
-        "label": "GROUND_STATION_BATTERY_PERCENT",
-        "channels": [
-          "Percent"
-        ],
-        "chart": {
-          "enabled": false
-        }
-      },
-      {
-        "id": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
-        "label": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
-        "channels": [
-          "Drop Rate (V/min)"
-        ],
-        "chart": {
-          "enabled": false
-        }
-      },
-      {
-        "id": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
-        "label": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
-        "channels": [
-          "Remaining Minutes"
-        ],
-        "chart": {
-          "enabled": false
-        }
-      },
-      {
-        "id": "KG1000",
-        "label": "KG1000",
-        "channels": [
-          "Raw Loadcell"
-        ],
-        "chart": {
-          "enabled": true
-        }
-      },
-      {
-        "id": "LOADCELL_WEIGHT_KG",
-        "label": "LOADCELL_WEIGHT_KG",
-        "channels": [
-          "Weight (kg)"
-        ],
-        "chart": {
-          "enabled": true
-        }
-      },
-      {
-        "id": "LOADCELL_FILL_PERCENT",
-        "label": "LOADCELL_FILL_PERCENT",
-        "channels": [
+          "Raw Loadcell",
+          "Weight (kg)",
           "Fill %"
         ],
         "chart": {
-          "enabled": true
+          "enabled": false
         }
       }
     ]
