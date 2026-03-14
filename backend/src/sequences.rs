@@ -323,7 +323,7 @@ fn is_fill_state(state: FlightState) -> bool {
 
 pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
     match cmd {
-        TelemetryCommand::Launch => "LaunchSignal",
+        TelemetryCommand::LaunchSignal => "LaunchSignal",
         TelemetryCommand::Dump => "Dump",
         TelemetryCommand::Abort => "Abort",
         TelemetryCommand::NormallyOpen => "NormallyOpen",
@@ -335,28 +335,43 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::DeployParachute => "DeployParachute",
         TelemetryCommand::ExpandParachute => "ExpandParachute",
         TelemetryCommand::ReinitSensors => "ReinitSensors",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationRelax => "EvaluationRelax",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationFocus => "EvaluationFocus",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationAbort => "EvaluationAbort",
         TelemetryCommand::ReinitBarometer => "ReinitBarometer",
-        TelemetryCommand::EnableIMU => "EnableIMU",
+        TelemetryCommand::ReinitIMU => "ReinitIMU",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DisableIMU => "DisableIMU",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::RewindFlightState => "RewindFlightState",
         TelemetryCommand::MonitorAltitude => "MonitorAltitude",
         TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::RevokeConsecutiveSamples => "RevokeConsecutiveSamples",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ResetFailures => "ResetFailures",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::RevokeResetFailures => "RevokeResetFailures",
         TelemetryCommand::ValidateMeasms => "ValidateMeasms",
         TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
-        TelemetryCommand::AbortAfter15 => "AbortAfter15",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter40 => "AbortAfter40",
-        TelemetryCommand::AbortAfter70 => "AbortAfter70",
-        TelemetryCommand::ReinitAfter12 => "ReinitAfter12",
-        TelemetryCommand::ReinitAfter26 => "ReinitAfter26",
-        TelemetryCommand::ReinitAfter44 => "ReinitAfter44",
-        TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
-        TelemetryCommand::RewindFlightState => "RewindFlightState",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::AbortAfter100 => "AbortAfter100",
+        TelemetryCommand::AbortAfter250 => "AbortAfter250",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ReinitAfter15 => "ReinitAfter15",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ReinitAfter30 => "ReinitAfter30",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ReinitAfter50 => "ReinitAfter50",
     }
 }
 
