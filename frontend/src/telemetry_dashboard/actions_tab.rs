@@ -142,13 +142,15 @@ pub fn ActionsTab(layout: ActionsTabLayout, action_policy: Signal<ActionPolicyMs
 
                 for action in layout.actions.iter() {
                     {
+                        let software_buttons_enabled = action_policy.read().software_buttons_enabled;
                         let control = action_policy
                             .read()
                             .controls
                             .iter()
                             .find(|c| c.cmd == action.cmd)
                             .cloned();
-                        let enabled = control
+                        let enabled = software_buttons_enabled
+                            && control
                             .as_ref()
                             .map(|c| c.enabled)
                             .unwrap_or(action.cmd == "Abort");

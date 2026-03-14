@@ -79,9 +79,8 @@ pub fn MapTab(
             // Fullscreen enter/exit explicit reinit hook (independent of rotation)
             js_setup_js_fullscreen_reinit(&tiles, max_native_zoom);
 
-            js_eval(
-                &format!(
-                    r#"
+            js_eval(&format!(
+                r#"
                     (function() {{
                       try {{
                         console.error("[GS26 map] forcing immediate init attempt");
@@ -99,8 +98,7 @@ pub fn MapTab(
                       }}
                     }})();
                     "#
-                ),
-            );
+            ));
         });
     }
 

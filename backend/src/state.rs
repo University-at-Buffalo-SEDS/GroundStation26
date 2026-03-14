@@ -291,6 +291,9 @@ impl AppState {
         }
         let name = command_name(cmd);
         let policy = self.action_policy.lock().unwrap();
+        if !policy.software_buttons_enabled {
+            return false;
+        }
         policy
             .controls
             .iter()

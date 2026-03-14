@@ -271,13 +271,12 @@ pub fn DataTab(
     } else {
         battery_card_rows.iter().any(|(_, row)| row.is_some())
     };
-    let is_graph_allowed =
-        chart_enabled
-            && has_telemetry
-            && current != "GPS_DATA"
-            && !is_valve_state
-            && !is_battery_runtime_tab
-            && !is_loadcell_tab;
+    let is_graph_allowed = chart_enabled
+        && has_telemetry
+        && current != "GPS_DATA"
+        && !is_valve_state
+        && !is_battery_runtime_tab
+        && !is_loadcell_tab;
 
     // Viewport constants
     let view_w = 1200.0_f64;
@@ -314,26 +313,26 @@ pub fn DataTab(
     let x_mid_s = fmt_span(span_min * 0.5);
     let x_pct = |x: f64, total: f64| format!("{:.4}%", (x / total) * 100.0);
     let y_pct = |y: f64, total: f64| format!("{:.4}%", (y / total) * 100.0);
-    let legend_items: Vec<(usize, &str)> = if is_battery_raw_tab && !battery_graph_sources.is_empty()
-    {
-        battery_graph_sources
-            .iter()
-            .enumerate()
-            .map(|(i, source)| (i, source.label.as_str()))
-            .collect()
-    } else {
-        labels
-            .iter()
-            .enumerate()
-            .filter_map(|(i, l)| {
-                if l.is_empty() {
-                    None
-                } else {
-                    Some((i, l.as_str()))
-                }
-            })
-            .collect()
-    };
+    let legend_items: Vec<(usize, &str)> =
+        if is_battery_raw_tab && !battery_graph_sources.is_empty() {
+            battery_graph_sources
+                .iter()
+                .enumerate()
+                .map(|(i, source)| (i, source.label.as_str()))
+                .collect()
+        } else {
+            labels
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| {
+                    if l.is_empty() {
+                        None
+                    } else {
+                        Some((i, l.as_str()))
+                    }
+                })
+                .collect()
+        };
     let legend_rows: Vec<(usize, &str)> =
         legend_items.iter().map(|(i, label)| (*i, *label)).collect();
     let on_toggle_fullscreen = move |_| {
@@ -555,10 +554,16 @@ fn summary_color(i: usize) -> &'static str {
     series_color(i)
 }
 
-fn latest_value_for(rows: &[TelemetryRow], data_type: &str, sender_id: Option<&str>) -> Option<f32> {
+fn latest_value_for(
+    rows: &[TelemetryRow],
+    data_type: &str,
+    sender_id: Option<&str>,
+) -> Option<f32> {
     rows.iter()
         .rev()
-        .find(|row| row.data_type == data_type && sender_id.is_none_or(|sender| row.sender_id == sender))
+        .find(|row| {
+            row.data_type == data_type && sender_id.is_none_or(|sender| row.sender_id == sender)
+        })
         .and_then(|row| row.values.first().copied().flatten())
 }
 
@@ -571,7 +576,11 @@ fn battery_runtime_cards(
         let prefix = source.label.clone();
         cards.push((
             format!("{prefix} %"),
-            fmt_opt(latest_value_for(rows, &source.percent_data_type, Some(&source.sender_id))),
+            fmt_opt(latest_value_for(
+                rows,
+                &source.percent_data_type,
+                Some(&source.sender_id),
+            )),
         ));
         cards.push((
             format!("{prefix} Drop"),
@@ -609,7 +618,6 @@ fn loadcell_cards(rows: &[TelemetryRow]) -> Vec<(String, String)> {
         ),
     ]
 }
-
 
 #[component]
 fn SummaryCard(

@@ -634,7 +634,11 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             values: values_from_row(&row),
         };
         by_key.insert(
-            (item.data_type.clone(), item.sender_id.clone(), item.timestamp_ms),
+            (
+                item.data_type.clone(),
+                item.sender_id.clone(),
+                item.timestamp_ms,
+            ),
             item,
         );
     }
@@ -644,7 +648,14 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             continue;
         }
         // Cache rows are newest realtime view and should win over stale DB rows.
-        by_key.insert((row.data_type.clone(), row.sender_id.clone(), row.timestamp_ms), row);
+        by_key.insert(
+            (
+                row.data_type.clone(),
+                row.sender_id.clone(),
+                row.timestamp_ms,
+            ),
+            row,
+        );
     }
 
     let mut rows: Vec<TelemetryRow> = by_key.into_values().collect();
@@ -716,9 +727,16 @@ async fn get_action_policy(State(state): State<Arc<AppState>>) -> impl IntoRespo
 async fn send_command(
     State(state): State<Arc<AppState>>,
     Json(cmd): Json<TelemetryCommand>,
-) -> &'static str {
+) -> (StatusCode, &'static str) {
+    if !state.is_command_allowed(&cmd) {
+        emit_warning(
+            &state,
+            format!("Ignored software command {cmd:?}: command is currently disabled"),
+        );
+        return (StatusCode::FORBIDDEN, "command disabled");
+    }
     let _ = state.cmd_tx.send(cmd).await;
-    "ok"
+    (StatusCode::OK, "ok")
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -743,6 +761,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let mut action_policy_rx = state.action_policy_tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
+    let state_for_send = state.clone();
+    let state_for_recv = state.clone();
     let (mut socket_sender, mut receiver) = socket.split();
     let ws_out_queue_cap: usize = std::env::var("GS_WS_OUT_QUEUE_CAP")
         .ok()
@@ -766,15 +786,17 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Task: collect, batch, and enqueue outbound messages.
     let send_task = async move {
-        let initial_notifications =
-            serde_json::to_string(&WsOutMsg::Notifications(state.notifications_snapshot()))
-                .unwrap_or_default();
+        let initial_notifications = serde_json::to_string(&WsOutMsg::Notifications(
+            state_for_send.notifications_snapshot(),
+        ))
+        .unwrap_or_default();
         if ws_out_tx.send(initial_notifications).await.is_err() {
             return;
         }
-        let initial_action_policy =
-            serde_json::to_string(&WsOutMsg::ActionPolicy(state.action_policy_snapshot()))
-                .unwrap_or_default();
+        let initial_action_policy = serde_json::to_string(&WsOutMsg::ActionPolicy(
+            state_for_send.action_policy_snapshot(),
+        ))
+        .unwrap_or_default();
         if ws_out_tx.send(initial_action_policy).await.is_err() {
             return;
         }
@@ -974,6 +996,16 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             if let Message::Text(text) = msg {
                 match serde_json::from_str::<WsCommand>(&text) {
                     Ok(cmd) => {
+                        if !state_for_recv.is_command_allowed(&cmd.cmd) {
+                            emit_warning(
+                                &state_for_recv,
+                                format!(
+                                    "Ignored software command {:?}: command is currently disabled",
+                                    cmd.cmd
+                                ),
+                            );
+                            continue;
+                        }
                         if let Err(e) = cmd_tx.send(cmd.cmd).await {
                             println!("Failed to forward WS command to cmd_tx: {e}");
                         }

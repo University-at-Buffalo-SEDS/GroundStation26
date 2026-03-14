@@ -201,7 +201,10 @@ impl LayoutConfig {
                 return Err("layout contains a data tab with an empty id".to_string());
             }
             if !tab_ids.insert(tab.id.clone()) {
-                return Err(format!("layout contains duplicate data tab id '{}'", tab.id));
+                return Err(format!(
+                    "layout contains duplicate data tab id '{}'",
+                    tab.id
+                ));
             }
             if tab.label.trim().is_empty() {
                 return Err(format!("data tab '{}' has an empty label", tab.id));

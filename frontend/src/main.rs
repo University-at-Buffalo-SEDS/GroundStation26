@@ -105,12 +105,10 @@ fn main() {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_desktop_window_icon() -> Option<dioxus_desktop::tao::window::Icon> {
-    let image = image::load_from_memory_with_format(
-        include_bytes!("../assets/icon.png"),
-        ImageFormat::Png,
-    )
-    .ok()?
-    .into_rgba8();
+    let image =
+        image::load_from_memory_with_format(include_bytes!("../assets/icon.png"), ImageFormat::Png)
+            .ok()?
+            .into_rgba8();
     let (width, height) = image.dimensions();
     dioxus_desktop::tao::window::Icon::from_rgba(image.into_raw(), width, height).ok()
 }

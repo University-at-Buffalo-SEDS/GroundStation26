@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 pub const KEY_ENABLE_PIN: u8 = 25;
+pub const SOFTWARE_DISABLE_PIN: u8 = 8;
 const DEFAULT_NITROGEN_PRESSURE_TARGET_PSI: f32 = 120.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub struct ActionControl {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionPolicyMsg {
     pub key_enabled: bool,
+    pub software_buttons_enabled: bool,
     pub controls: Vec<ActionControl>,
 }
 
@@ -82,6 +84,7 @@ struct SequenceConfig {
     pending_fast_window: Duration,
     key_required: bool,
     key_enable_pin: u8,
+    software_disable_pin: u8,
 }
 
 impl SequenceConfig {
@@ -207,6 +210,11 @@ impl SequenceConfig {
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(KEY_ENABLE_PIN);
 
+        let software_disable_pin = std::env::var("GS_SOFTWARE_DISABLE_PIN")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(SOFTWARE_DISABLE_PIN);
+
         Self {
             leak_check_duration,
             nitrous_soak_duration,
@@ -225,6 +233,7 @@ impl SequenceConfig {
             pending_fast_window,
             key_required,
             key_enable_pin,
+            software_disable_pin,
         }
     }
 }
@@ -455,12 +464,14 @@ pub fn default_action_policy() -> ActionPolicyMsg {
         .collect();
     ActionPolicyMsg {
         key_enabled: true,
+        software_buttons_enabled: true,
         controls,
     }
 }
 
 fn policy_with_overrides(
     key_enabled: bool,
+    software_buttons_enabled: bool,
     valves: ValveSnapshot,
     recommended: HashMap<&'static str, BlinkMode>,
 ) -> ActionPolicyMsg {
@@ -484,6 +495,7 @@ fn policy_with_overrides(
 
     ActionPolicyMsg {
         key_enabled,
+        software_buttons_enabled,
         controls,
     }
 }
@@ -804,11 +816,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
         .into_iter()
         .map(|cmd| ActionControl {
             cmd: cmd.to_string(),
-            enabled: if cmd == "RetractPlumbing" && valves.retract == Some(true) {
-                false
-            } else {
-                true
-            },
+            enabled: !(cmd == "RetractPlumbing" && valves.retract == Some(true)),
             blink: BlinkMode::None,
             actuated: valves.actuated_for_cmd(cmd),
         })
@@ -816,55 +824,77 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
 
     ActionPolicyMsg {
         key_enabled: true,
+        software_buttons_enabled: true,
         controls,
     }
+}
+
+#[derive(Clone, Copy)]
+struct PolicyInputs {
+    flight_state: FlightState,
+    key_enabled: bool,
+    software_buttons_enabled: bool,
+    valves: ValveSnapshot,
+    now_ms: u64,
 }
 
 fn build_policy(
     state: &AppState,
     cfg: &SequenceConfig,
     runtime: &SequenceRuntime,
-    flight_state: FlightState,
-    key_enabled: bool,
-    valves: ValveSnapshot,
-    now_ms: u64,
+    inputs: PolicyInputs,
 ) -> ActionPolicyMsg {
-    if !key_enabled {
-        let mut policy = policy_with_overrides(false, valves, HashMap::new());
+    if !inputs.key_enabled {
+        let mut policy = policy_with_overrides(
+            false,
+            inputs.software_buttons_enabled,
+            inputs.valves,
+            HashMap::new(),
+        );
         set_control_enabled(&mut policy, "Abort", true);
         return policy;
     }
 
-    if flight_state == FlightState::Armed {
+    if inputs.flight_state == FlightState::Armed {
         let mut enabled = HashMap::new();
         enabled.insert("Launch", BlinkMode::Slow);
         enabled.insert("Dump", BlinkMode::None);
-        return policy_with_overrides(true, valves, enabled);
+        return policy_with_overrides(
+            true,
+            inputs.software_buttons_enabled,
+            inputs.valves,
+            enabled,
+        );
     }
 
-    if !is_fill_state(flight_state) {
+    if !is_fill_state(inputs.flight_state) {
         // Idle/other non-fill states: keep controls available with no highlight.
         // Launch is kept disabled outside the armed state.
         // RetractPlumbing is one-way: once actuated, keep it disabled.
         let mut enabled: HashMap<&'static str, BlinkMode> = HashMap::new();
         for cmd in all_command_names() {
-            if cmd == "RetractPlumbing" && valves.retract == Some(true) {
+            if cmd == "RetractPlumbing" && inputs.valves.retract == Some(true) {
                 continue;
             }
             enabled.insert(cmd, BlinkMode::None);
         }
         // In Idle, make the first fill-transition action the only illuminated action.
         // All other controls remain available (dimmed client-side when not blinking).
-        if flight_state == FlightState::Idle && valves.normally_open != Some(false) {
+        if inputs.flight_state == FlightState::Idle && inputs.valves.normally_open != Some(false) {
             enabled.insert(
                 "NormallyOpen",
-                pending_mode(state, "NormallyOpen", now_ms, cfg),
+                pending_mode(state, "NormallyOpen", inputs.now_ms, cfg),
             );
         }
-        if flight_state == FlightState::Idle && valves.dump_open != Some(false) {
-            enabled.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
+        if inputs.flight_state == FlightState::Idle && inputs.valves.dump_open != Some(false) {
+            enabled.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
         }
-        let mut policy = policy_with_overrides(true, valves, enabled);
+        let mut policy = policy_with_overrides(
+            true,
+            inputs.software_buttons_enabled,
+            inputs.valves,
+            enabled,
+        );
         set_control_enabled(&mut policy, "Launch", false);
         return policy;
     }
@@ -873,53 +903,65 @@ fn build_policy(
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if valves.normally_open != Some(false) {
+            if inputs.valves.normally_open != Some(false) {
                 recommended.insert(
                     "NormallyOpen",
-                    pending_mode(state, "NormallyOpen", now_ms, cfg),
+                    pending_mode(state, "NormallyOpen", inputs.now_ms, cfg),
                 );
             }
-            if valves.dump_open != Some(false) {
-                recommended.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
+            if inputs.valves.dump_open != Some(false) {
+                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
             }
         }
         SequenceStep::NitrogenFill => {
-            if valves.nitrogen_open != Some(true) {
-                recommended.insert("Nitrogen", pending_mode(state, "Nitrogen", now_ms, cfg));
+            if inputs.valves.nitrogen_open != Some(true) {
+                recommended.insert(
+                    "Nitrogen",
+                    pending_mode(state, "Nitrogen", inputs.now_ms, cfg),
+                );
             }
         }
         SequenceStep::CloseNitrogen => {
-            if valves.nitrogen_open != Some(false) {
-                recommended.insert("Nitrogen", pending_mode(state, "Nitrogen", now_ms, cfg));
+            if inputs.valves.nitrogen_open != Some(false) {
+                recommended.insert(
+                    "Nitrogen",
+                    pending_mode(state, "Nitrogen", inputs.now_ms, cfg),
+                );
             }
         }
         SequenceStep::NitrogenLeakCheck => {}
         SequenceStep::DumpNitrogen => {
-            if valves.dump_open != Some(true) {
-                recommended.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
+            if inputs.valves.dump_open != Some(true) {
+                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
             }
         }
         SequenceStep::CloseDump => {
-            if valves.dump_open != Some(false) {
-                recommended.insert("Dump", pending_mode(state, "Dump", now_ms, cfg));
+            if inputs.valves.dump_open != Some(false) {
+                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
             }
         }
         SequenceStep::OpenNitrous => {
-            if valves.nitrous_open != Some(true) {
-                recommended.insert("Nitrous", pending_mode(state, "Nitrous", now_ms, cfg));
+            if inputs.valves.nitrous_open != Some(true) {
+                recommended.insert(
+                    "Nitrous",
+                    pending_mode(state, "Nitrous", inputs.now_ms, cfg),
+                );
             }
         }
         SequenceStep::CloseNitrous => {
-            if valves.nitrous_open != Some(false) {
-                recommended.insert("Nitrous", pending_mode(state, "Nitrous", now_ms, cfg));
+            if inputs.valves.nitrous_open != Some(false) {
+                recommended.insert(
+                    "Nitrous",
+                    pending_mode(state, "Nitrous", inputs.now_ms, cfg),
+                );
             }
         }
         SequenceStep::NitrousSoak => {}
         SequenceStep::RetractFillLines => {
-            if valves.retract != Some(true) {
+            if inputs.valves.retract != Some(true) {
                 recommended.insert(
                     "RetractPlumbing",
-                    pending_mode(state, "RetractPlumbing", now_ms, cfg),
+                    pending_mode(state, "RetractPlumbing", inputs.now_ms, cfg),
                 );
             }
         }
@@ -928,7 +970,12 @@ fn build_policy(
         }
     }
 
-    let mut policy = policy_with_overrides(true, valves, recommended);
+    let mut policy = policy_with_overrides(
+        true,
+        inputs.software_buttons_enabled,
+        inputs.valves,
+        recommended,
+    );
     set_control_enabled(&mut policy, "Launch", false);
     policy
 }
@@ -950,6 +997,23 @@ fn read_key_enabled(state: &AppState, cfg: &SequenceConfig) -> bool {
         .gpio
         .read_input_pin(cfg.key_enable_pin)
         .unwrap_or(false)
+}
+
+fn read_software_buttons_enabled(state: &AppState, cfg: &SequenceConfig) -> bool {
+    if crate::flight_sim::sim_mode_enabled() {
+        return true;
+    }
+    if cfg!(feature = "testing") {
+        return true;
+    }
+    if cfg!(feature = "hitl_mode") {
+        return true;
+    }
+    state
+        .gpio
+        .read_input_pin(cfg.software_disable_pin)
+        .map(|is_high| !is_high)
+        .unwrap_or(true)
 }
 
 pub fn start_sequence_task(
@@ -986,6 +1050,16 @@ pub fn start_sequence_task(
         );
     }
 
+    if !cfg!(feature = "testing")
+        && !cfg!(feature = "hitl_mode")
+        && let Err(err) = state.gpio.setup_input_pin(cfg.software_disable_pin)
+    {
+        eprintln!(
+            "Software disable GPIO setup failed (pin {}): {}",
+            cfg.software_disable_pin, err
+        );
+    }
+
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(200));
         let mut runtime = SequenceRuntime::default();
@@ -1007,6 +1081,7 @@ pub fn start_sequence_task(
             let now = Instant::now();
             let now_ms = crate::telemetry_task::get_current_timestamp_ms();
             let key_enabled = read_key_enabled(&state, &cfg);
+            let software_buttons_enabled = read_software_buttons_enabled(&state, &cfg);
 
             update_sequence_runtime(
                 &state,
@@ -1021,10 +1096,13 @@ pub fn start_sequence_task(
                 &state,
                 &cfg,
                 &runtime,
-                flight_state,
-                key_enabled,
-                valves,
-                now_ms,
+                PolicyInputs {
+                    flight_state,
+                    key_enabled,
+                    software_buttons_enabled,
+                    valves,
+                    now_ms,
+                },
             );
             state.set_action_policy(policy);
         }

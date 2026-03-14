@@ -599,7 +599,8 @@ fn action_section(
             for action in filtered.iter() {
                 {
                     let control = action_policy.controls.iter().find(|c| c.cmd == action.cmd);
-                    let enabled = control.map(|c| c.enabled).unwrap_or(action.cmd == "Abort");
+                    let enabled = action_policy.software_buttons_enabled
+                        && control.map(|c| c.enabled).unwrap_or(action.cmd == "Abort");
                     let blink = control.map(|c| c.blink).unwrap_or(BlinkMode::None);
                     let actuated = control.and_then(|c| c.actuated);
                     rsx! {

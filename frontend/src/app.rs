@@ -143,8 +143,8 @@ mod persist {
 
     #[cfg(target_os = "android")]
     fn android_storage_dir() -> Option<std::path::PathBuf> {
-        use jni::objects::{JObject, JString};
         use jni::JavaVM;
+        use jni::objects::{JObject, JString};
         use ndk_context::android_context;
 
         let ctx = android_context();
@@ -162,7 +162,11 @@ mod persist {
             .ok()?
             .l()
             .ok()?;
-        let path = env.get_string(&JString::from(path_obj)).ok()?.to_string_lossy().into_owned();
+        let path = env
+            .get_string(&JString::from(path_obj))
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
 
         let _ = context.into_raw();
         Some(std::path::PathBuf::from(path).join("gs26"))

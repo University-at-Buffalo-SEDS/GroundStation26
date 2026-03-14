@@ -146,6 +146,14 @@ fn log(msg: &str) {
 
     log_file.write_all(msg.as_ref()).unwrap();
 }
+
+fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<()> {
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == contents => Ok(()),
+        Ok(_) | Err(_) => fs::write(path, contents),
+    }
+}
+
 fn main() {
     let target = env::var("TARGET").unwrap();
     use fs;
@@ -185,7 +193,7 @@ fn main() {
 
     // Create the dir + stamp (dir creation doesn't help Cargo, stamp does)
     fs::create_dir_all(&leaflet_dir).unwrap();
-    fs::write(&stamp, format!("version={}\n", version)).unwrap();
+    write_if_changed(&stamp, &format!("version={}\n", version)).unwrap();
     if let Err(e) = fs::create_dir_all(&leaflet_dir) {
         log(format!("Failed to create Leaflet vendor dir {leaflet_dir:?}: {e}").as_ref());
 

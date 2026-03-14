@@ -189,8 +189,8 @@ mod persist {
 
         #[cfg(target_os = "android")]
         fn android_storage_base_dir() -> Option<std::path::PathBuf> {
-            use jni::objects::{JObject, JString};
             use jni::JavaVM;
+            use jni::objects::{JObject, JString};
             use ndk_context::android_context;
 
             let ctx = android_context();
@@ -208,7 +208,11 @@ mod persist {
                 .ok()?
                 .l()
                 .ok()?;
-            let path = env.get_string(&JString::from(path_obj)).ok()?.to_string_lossy().into_owned();
+            let path = env
+                .get_string(&JString::from(path_obj))
+                .ok()?
+                .to_string_lossy()
+                .into_owned();
 
             let _ = context.into_raw();
             Some(std::path::PathBuf::from(path))
@@ -319,6 +323,8 @@ pub struct ActionControl {
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ActionPolicyMsg {
     pub key_enabled: bool,
+    #[serde(default = "default_software_buttons_enabled")]
+    pub software_buttons_enabled: bool,
     pub controls: Vec<ActionControl>,
 }
 
@@ -326,9 +332,14 @@ impl ActionPolicyMsg {
     fn default_locked() -> Self {
         Self {
             key_enabled: false,
+            software_buttons_enabled: true,
             controls: Vec::new(),
         }
     }
+}
+
+fn default_software_buttons_enabled() -> bool {
+    true
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -517,7 +528,7 @@ pub fn map_tiles_url() -> String {
     {
         // WebView2 cannot always resolve custom subresource schemes directly.
         // WRY maps the custom `gs26://` protocol to this host form on Windows.
-        return "http://gs26.localhost/tiles/{z}/{x}/{y}.jpg".to_string();
+        "http://gs26.localhost/tiles/{z}/{x}/{y}.jpg".to_string()
     }
 
     #[cfg(target_os = "android")]
@@ -526,14 +537,18 @@ pub fn map_tiles_url() -> String {
         // like `https://gs26.local/...` before handing them back to the request handler.
         // Use HTTPS here so WebView does not block tile fetches as mixed content from
         // the secure `https://dioxus.index.html` app origin.
-        return "https://gs26.local/tiles/{z}/{x}/{y}.jpg".to_string();
+        "https://gs26.local/tiles/{z}/{x}/{y}.jpg".to_string()
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows"), not(target_os = "android")))]
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        not(target_os = "windows"),
+        not(target_os = "android")
+    ))]
     {
         // Native WebViews can block plain-http tile fetches; always proxy through
         // our native protocol handler, which performs the upstream HTTP(S) request.
-        return "gs26://local/tiles/{z}/{x}/{y}.jpg".to_string();
+        "gs26://local/tiles/{z}/{x}/{y}.jpg".to_string()
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -1625,18 +1640,44 @@ fn TelemetryDashboardInner() -> Element {
                 h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "Rocket Dashboard" }
 
                 div { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
+                    {
+                        let software_buttons_enabled =
+                            action_policy.read().software_buttons_enabled;
+                        let abort_style = if software_buttons_enabled {
+                            "
+                                padding:0.45rem 0.85rem;
+                                border-radius:0.75rem;
+                                border:1px solid #ef4444;
+                                background:#450a0a;
+                                color:#fecaca;
+                                font-weight:900;
+                                cursor:pointer;
+                            "
+                        } else {
+                            "
+                                padding:0.45rem 0.85rem;
+                                border-radius:0.75rem;
+                                border:1px solid #7f1d1d;
+                                background:#1f2937;
+                                color:#fca5a5;
+                                font-weight:900;
+                                cursor:not-allowed;
+                                opacity:0.55;
+                                filter:grayscale(0.25) brightness(0.9);
+                            "
+                        };
+                        rsx! {
                     button {
-                        style: "
-                            padding:0.45rem 0.85rem;
-                            border-radius:0.75rem;
-                            border:1px solid #ef4444;
-                            background:#450a0a;
-                            color:#fecaca;
-                            font-weight:900;
-                            cursor:pointer;
-                        ",
-                        onclick: move |_| send_cmd("Abort"),
+                        style: "{abort_style}",
+                        disabled: !software_buttons_enabled,
+                        onclick: move |_| {
+                            if software_buttons_enabled {
+                                send_cmd("Abort")
+                            }
+                        },
                         "ABORT"
+                    }
+                        }
                     }
 
                     {reload_button}
@@ -1647,6 +1688,12 @@ fn TelemetryDashboardInner() -> Element {
             if let Some(msg) = layout_error_snapshot.clone() {
                 div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid #ef4444; background:#450a0a; color:#fecaca; font-size:12px;",
                     "{msg}"
+                }
+            }
+
+            if !action_policy.read().software_buttons_enabled {
+                div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid #f59e0b; background:#451a03; color:#fde68a; font-size:12px;",
+                    "Software command buttons are disabled by the hardware GPIO lockout."
                 }
             }
 
@@ -2077,11 +2124,7 @@ pub(crate) async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> R
         .build()
         .map_err(|e| e.to_string())?;
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
 
     let status = response.status();
     let body = response.text().await.map_err(|e| e.to_string())?;
@@ -2234,7 +2277,7 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_detached<F>(fut: F)
 where
-    F: std::future::Future<Output = ()> + 'static,
+    F: Future<Output = ()> + 'static,
 {
     spawn(fut);
 }
@@ -2491,7 +2534,11 @@ async fn seed_from_db(
     fn dedupe_rows_exact(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
         let mut by_key: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
         for row in rows {
-            let key = (row.data_type.clone(), row.sender_id.clone(), row.timestamp_ms);
+            let key = (
+                row.data_type.clone(),
+                row.sender_id.clone(),
+                row.timestamp_ms,
+            );
             match by_key.get_mut(&key) {
                 Some(existing) => {
                     *existing = row;
