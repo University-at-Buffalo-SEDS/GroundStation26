@@ -1,15 +1,12 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
-#[cfg(target_arch = "wasm32")]
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::JsCast;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::closure::Closure;
 
 const GRAPH_VIEWPORT_ID: &str = "network-topology-viewport";
+const GRAPH_SURFACE_ID: &str = "network-topology-surface";
+const GRAPH_CANVAS_ID: &str = "network-topology-canvas";
 
+use super::js_eval;
 use super::layout::NetworkTabLayout;
 use super::types::{
     NetworkTopologyLink, NetworkTopologyMsg, NetworkTopologyNode, NetworkTopologyNodeKind,
@@ -21,19 +18,6 @@ struct NodePlacement {
     x: i32,
     y: i32,
     size: i32,
-}
-
-#[cfg(target_arch = "wasm32")]
-#[derive(Clone, Copy)]
-struct DragState {
-    x: f64,
-    y: f64,
-}
-
-#[cfg(target_arch = "wasm32")]
-thread_local! {
-    static ACTIVE_DRAG: RefCell<Option<DragState>> = const { RefCell::new(None) };
-    static DRAG_HANDLERS: RefCell<Vec<Closure<dyn FnMut(web_sys::MouseEvent)>>> = const { RefCell::new(Vec::new()) };
 }
 
 const GRAPH_WIDTH: i32 = 1320;
@@ -49,7 +33,6 @@ pub fn NetworkTopologyTab(
 ) -> Element {
     let snapshot = topology.read().clone();
     let expanded_node_id = use_signal(|| None::<String>);
-    let zoom = use_signal(|| 1.0_f32);
     let title = layout
         .title
         .unwrap_or_else(|| "SEDSprintf Network".to_string());
@@ -75,10 +58,10 @@ pub fn NetworkTopologyTab(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let zoom_value = *zoom.read();
-    let scaled_width = ((GRAPH_WIDTH as f32) * zoom_value).round() as i32;
-    let scaled_height = ((GRAPH_HEIGHT as f32) * zoom_value).round() as i32;
-    let zoom_percent = (zoom_value * 100.0).round() as i32;
+
+    use_effect(move || {
+        install_drag_handlers();
+    });
 
     rsx! {
         div {
@@ -96,52 +79,34 @@ pub fn NetworkTopologyTab(
                 style: "display:flex; align-items:center; gap:10px; color:#cbd5e1;",
                 button {
                     style: zoom_button_style(),
-                    onclick: {
-                        let mut zoom = zoom;
-                        move |_| {
-                            let current = *zoom.read();
-                            zoom.set(adjust_zoom(current, -ZOOM_STEP));
-                        }
-                    },
+                    onclick: move |_| graph_zoom_delta(-ZOOM_STEP),
                     "Zoom Out"
                 }
                 button {
                     style: zoom_button_style(),
-                    onclick: {
-                        let mut zoom = zoom;
-                        move |_| zoom.set(1.0)
-                    },
+                    onclick: move |_| graph_zoom_reset(),
                     "Reset"
                 }
                 button {
                     style: zoom_button_style(),
-                    onclick: {
-                        let mut zoom = zoom;
-                        move |_| {
-                            let current = *zoom.read();
-                            zoom.set(adjust_zoom(current, ZOOM_STEP));
-                        }
-                    },
+                    onclick: move |_| graph_zoom_delta(ZOOM_STEP),
                     "Zoom In"
                 }
                 span {
                     style: "font-size:0.85rem; color:#94a3b8;",
-                    "{zoom_percent}%"
+                    "Pinch or drag to navigate"
                 }
             }
 
             div {
                 id: "{GRAPH_VIEWPORT_ID}",
-                style: "padding:18px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:0; cursor:grab; user-select:none;",
-                onmousedown: {
-                    move |evt| {
-                        start_drag_pan(evt.client_coordinates().x, evt.client_coordinates().y);
-                    }
-                },
+                style: "padding:18px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:0; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
                 div {
-                    style: "position:relative; width:{scaled_width}px; height:{scaled_height}px; min-width:{scaled_width}px; min-height:{scaled_height}px;",
+                    id: "{GRAPH_SURFACE_ID}",
+                    style: "position:relative; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; min-width:{GRAPH_WIDTH}px; min-height:{GRAPH_HEIGHT}px;",
                     div {
-                        style: "position:absolute; inset:0 auto auto 0; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; transform:scale({zoom_value}); transform-origin:top left;",
+                        id: "{GRAPH_CANVAS_ID}",
+                        style: "position:absolute; inset:0 auto auto 0; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; transform:scale(1); transform-origin:top left;",
                         svg {
                             width: "{GRAPH_WIDTH}",
                             height: "{GRAPH_HEIGHT}",
@@ -168,103 +133,206 @@ pub fn NetworkTopologyTab(
     }
 }
 
-fn adjust_zoom(current: f32, delta: f32) -> f32 {
-    (current + delta).clamp(ZOOM_MIN, ZOOM_MAX)
-}
-
 fn zoom_button_style() -> &'static str {
     "padding:6px 10px; border-radius:10px; border:1px solid #334155; background:#0f172a; color:#e2e8f0; font-size:0.82rem; cursor:pointer;"
 }
 
-#[cfg(target_arch = "wasm32")]
-fn scroll_graph_viewport(delta_x: f64, delta_y: f64) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let Some(document) = window.document() else {
-        return;
-    };
-    let Some(element) = document.get_element_by_id(GRAPH_VIEWPORT_ID) else {
-        return;
-    };
-    let Ok(viewport) = element.dyn_into::<web_sys::HtmlElement>() else {
-        return;
-    };
-    viewport.set_scroll_left(viewport.scroll_left() + delta_x.round() as i32);
-    viewport.set_scroll_top(viewport.scroll_top() + delta_y.round() as i32);
+fn graph_zoom_delta(delta: f32) {
+    js_eval(&format!(
+        r#"
+        (function() {{
+          if (typeof window.__gs26NetworkGraphZoomDelta === "function") {{
+            window.__gs26NetworkGraphZoomDelta({delta});
+          }}
+        }})();
+        "#
+    ));
 }
 
-#[cfg(target_arch = "wasm32")]
-fn start_drag_pan(x: f64, y: f64) {
-    install_drag_handlers();
-    ACTIVE_DRAG.with(|drag| {
-        *drag.borrow_mut() = Some(DragState { x, y });
-    });
-    set_graph_cursor("grabbing");
+fn graph_zoom_reset() {
+    js_eval(
+        r#"
+        (function() {
+          if (typeof window.__gs26NetworkGraphZoomReset === "function") {
+            window.__gs26NetworkGraphZoomReset();
+          }
+        })();
+        "#,
+    );
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn start_drag_pan(_x: f64, _y: f64) {}
-
-#[cfg(target_arch = "wasm32")]
 fn install_drag_handlers() {
-    DRAG_HANDLERS.with(|handlers| {
-        if !handlers.borrow().is_empty() {
-            return;
-        }
+    js_eval(&format!(
+        r#"
+        (function() {{
+          const viewport = document.getElementById({viewport_id:?});
+          const surface = document.getElementById({surface_id:?});
+          const canvas = document.getElementById({canvas_id:?});
+          if (!viewport || !surface || !canvas) return;
+          if (viewport.__gs26PanInstalled) return;
+          viewport.__gs26PanInstalled = true;
 
-        let Some(window) = web_sys::window() else {
-            return;
-        };
+          const state = {{
+            scale: 1.0,
+            drag: null,
+            suppressNextClick: false,
+            pointers: new Map(),
+            pinchDistance: null,
+            pinchScale: 1.0,
+            padX: 0,
+            padY: 0,
+          }};
 
-        let on_move = Closure::wrap(Box::new(move |evt: web_sys::MouseEvent| {
-            ACTIVE_DRAG.with(|drag| {
-                let mut drag = drag.borrow_mut();
-                let Some(current) = *drag else {
-                    return;
-                };
-                let next_x = evt.client_x() as f64;
-                let next_y = evt.client_y() as f64;
-                scroll_graph_viewport(current.x - next_x, current.y - next_y);
-                *drag = Some(DragState {
-                    x: next_x,
-                    y: next_y,
-                });
-            });
-        }) as Box<dyn FnMut(_)>);
+          const setCursor = (value) => {{
+            viewport.style.cursor = value;
+          }};
 
-        let on_up = Closure::wrap(Box::new(move |_evt: web_sys::MouseEvent| {
-            ACTIVE_DRAG.with(|drag| {
-                *drag.borrow_mut() = None;
-            });
-            set_graph_cursor("grab");
-        }) as Box<dyn FnMut(_)>);
+          const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+          const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+          const refreshSurfaceFrame = () => {{
+            const scaledWidth = Math.round({graph_width} * state.scale);
+            const scaledHeight = Math.round({graph_height} * state.scale);
+            state.padX = Math.max(Math.round(viewport.clientWidth * 0.8), 320);
+            state.padY = Math.max(Math.round(viewport.clientHeight * 0.8), 220);
+            surface.style.width = `${{scaledWidth + state.padX * 2}}px`;
+            surface.style.height = `${{scaledHeight + state.padY * 2}}px`;
+            surface.style.minWidth = surface.style.width;
+            surface.style.minHeight = surface.style.height;
+            canvas.style.left = `${{state.padX}}px`;
+            canvas.style.top = `${{state.padY}}px`;
+          }};
+          const centerGraph = () => {{
+            const scaledWidth = Math.round({graph_width} * state.scale);
+            const scaledHeight = Math.round({graph_height} * state.scale);
+            viewport.scrollLeft = Math.max(0, state.padX + Math.round((scaledWidth - viewport.clientWidth) / 2));
+            viewport.scrollTop = Math.max(0, state.padY + Math.round((scaledHeight - viewport.clientHeight) / 2));
+          }};
+          const applyScale = (nextScale, clientX, clientY) => {{
+            const scale = clamp(nextScale, {zoom_min}, {zoom_max});
+            const rect = viewport.getBoundingClientRect();
+            const localX = clientX - rect.left;
+            const localY = clientY - rect.top;
+            const contentX = (viewport.scrollLeft + localX - state.padX) / state.scale;
+            const contentY = (viewport.scrollTop + localY - state.padY) / state.scale;
+            state.scale = scale;
+            canvas.style.transform = `scale(${{scale}})`;
+            refreshSurfaceFrame();
+            viewport.scrollLeft = Math.max(0, contentX * scale + state.padX - localX);
+            viewport.scrollTop = Math.max(0, contentY * scale + state.padY - localY);
+          }};
 
-        let _ =
-            window.add_event_listener_with_callback("mousemove", on_move.as_ref().unchecked_ref());
-        let _ = window.add_event_listener_with_callback("mouseup", on_up.as_ref().unchecked_ref());
+          window.__gs26NetworkGraphZoomDelta = (delta) => {{
+            const rect = viewport.getBoundingClientRect();
+            applyScale(state.scale + delta, rect.left + rect.width / 2, rect.top + rect.height / 2);
+          }};
 
-        let mut handlers = handlers.borrow_mut();
-        handlers.push(on_move);
-        handlers.push(on_up);
-    });
-}
+          window.__gs26NetworkGraphZoomReset = () => {{
+            state.scale = 1.0;
+            canvas.style.transform = "scale(1)";
+            refreshSurfaceFrame();
+            centerGraph();
+          }};
 
-#[cfg(target_arch = "wasm32")]
-fn set_graph_cursor(cursor: &str) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let Some(document) = window.document() else {
-        return;
-    };
-    let Some(element) = document.get_element_by_id(GRAPH_VIEWPORT_ID) else {
-        return;
-    };
-    let Ok(viewport) = element.dyn_into::<web_sys::HtmlElement>() else {
-        return;
-    };
-    let _ = viewport.style().set_property("cursor", cursor);
+          refreshSurfaceFrame();
+          centerGraph();
+          window.addEventListener("resize", () => {{
+            refreshSurfaceFrame();
+          }});
+
+          surface.addEventListener("pointerdown", (evt) => {{
+            const target = evt.target;
+            if (target && typeof target.closest === "function" && target.closest("button")) {{
+              return;
+            }}
+            state.pointers.set(evt.pointerId, {{ x: evt.clientX, y: evt.clientY }});
+            state.suppressNextClick = false;
+            if (state.pointers.size === 1) {{
+              state.drag = {{
+                x: evt.clientX,
+                y: evt.clientY,
+                moved: false,
+              }};
+            }} else if (state.pointers.size === 2) {{
+              const [a, b] = Array.from(state.pointers.values());
+              state.drag = null;
+              state.pinchDistance = distance(a, b);
+              state.pinchScale = state.scale;
+            }}
+            try {{
+              surface.setPointerCapture(evt.pointerId);
+            }} catch (_err) {{}}
+            setCursor("grabbing");
+            evt.preventDefault();
+          }});
+
+          window.addEventListener("pointermove", (evt) => {{
+            if (!state.pointers.has(evt.pointerId)) return;
+            state.pointers.set(evt.pointerId, {{ x: evt.clientX, y: evt.clientY }});
+            if (state.pointers.size >= 2) {{
+              const [a, b] = Array.from(state.pointers.values());
+              const nextDistance = distance(a, b);
+              if (state.pinchDistance && nextDistance > 0) {{
+                const centerX = (a.x + b.x) / 2;
+                const centerY = (a.y + b.y) / 2;
+                applyScale(state.pinchScale * (nextDistance / state.pinchDistance), centerX, centerY);
+                state.suppressNextClick = true;
+              }}
+              evt.preventDefault();
+              return;
+            }}
+            if (!state.drag) return;
+            const dx = state.drag.x - evt.clientX;
+            const dy = state.drag.y - evt.clientY;
+            viewport.scrollLeft += dx;
+            viewport.scrollTop += dy;
+            state.drag = {{
+              x: evt.clientX,
+              y: evt.clientY,
+              moved: state.drag.moved || Math.abs(dx) > 2 || Math.abs(dy) > 2,
+            }};
+            evt.preventDefault();
+          }}, {{ passive: false }});
+
+          window.addEventListener("pointerup", (evt) => {{
+            const dragged = !!(state.drag && state.drag.moved);
+            state.suppressNextClick = state.suppressNextClick || dragged;
+            state.pointers.delete(evt.pointerId);
+            if (state.pointers.size === 1) {{
+              const [remaining] = Array.from(state.pointers.values());
+              state.drag = {{
+                x: remaining.x,
+                y: remaining.y,
+                moved: true,
+              }};
+              state.pinchDistance = null;
+              state.pinchScale = state.scale;
+            }} else if (state.pointers.size === 0) {{
+              state.drag = null;
+              state.pinchDistance = null;
+              state.pinchScale = state.scale;
+            }}
+            setCursor("grab");
+            try {{
+              surface.releasePointerCapture(evt.pointerId);
+            }} catch (_err) {{}}
+          }});
+
+          surface.addEventListener("click", (evt) => {{
+            if (!state.suppressNextClick) return;
+            state.suppressNextClick = false;
+            evt.preventDefault();
+            evt.stopPropagation();
+          }}, true);
+        }})();
+        "#,
+        viewport_id = GRAPH_VIEWPORT_ID,
+        surface_id = GRAPH_SURFACE_ID,
+        canvas_id = GRAPH_CANVAS_ID,
+        zoom_min = ZOOM_MIN,
+        zoom_max = ZOOM_MAX,
+        graph_width = GRAPH_WIDTH,
+        graph_height = GRAPH_HEIGHT,
+    ));
 }
 
 fn graph_positions() -> HashMap<&'static str, NodePlacement> {

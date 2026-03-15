@@ -24,7 +24,20 @@ def default_layout_path() -> Path:
 def default_layout() -> dict:
     return {
         "version": 1,
+        "main_tabs": [
+            "state",
+            "connection-status",
+            "map",
+            "actions",
+            "calibration",
+            "notifications",
+            "warnings",
+            "errors",
+            "data",
+            "network-topology",
+        ],
         "connection_tab": {"sections": []},
+        "network_tab": {"enabled": False, "title": "SEDSprintf Network"},
         "actions_tab": {"actions": []},
         "data_tab": {"tabs": []},
         "state_tab": {"states": []},
@@ -40,9 +53,25 @@ def validate_layout(data: dict) -> list[str]:
     if not isinstance(data, dict):
         return ["Layout root must be an object."]
 
-    for key in ("version", "connection_tab", "actions_tab", "data_tab", "state_tab"):
+    for key in (
+        "version",
+        "main_tabs",
+        "connection_tab",
+        "network_tab",
+        "actions_tab",
+        "data_tab",
+        "state_tab",
+    ):
         if key not in data:
             errors.append(f"Missing top-level key: {key}")
+
+    main_tabs = data.get("main_tabs", [])
+    if not isinstance(main_tabs, list):
+        errors.append("main_tabs must be a list.")
+
+    network = data.get("network_tab", {})
+    if not isinstance(network, dict):
+        errors.append("network_tab must be an object.")
 
     connection = data.get("connection_tab", {})
     if not isinstance(connection, dict) or not isinstance(connection.get("sections", []), list):
@@ -90,22 +119,28 @@ class LayoutEditor(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
+        self.main_tabs_frame = ttk.Frame(self.notebook)
         self.data_tab_frame = ttk.Frame(self.notebook)
         self.connection_tab_frame = ttk.Frame(self.notebook)
+        self.network_tab_frame = ttk.Frame(self.notebook)
         self.actions_tab_frame = ttk.Frame(self.notebook)
         self.state_tab_frame = ttk.Frame(self.notebook)
         self.battery_tab_frame = ttk.Frame(self.notebook)
 
+        self.notebook.add(self.main_tabs_frame, text="Dashboard Tabs")
         self.notebook.add(self.data_tab_frame, text="Data")
         self.notebook.add(self.connection_tab_frame, text="Connection")
+        self.notebook.add(self.network_tab_frame, text="Network")
         self.notebook.add(self.actions_tab_frame, text="Actions")
         self.notebook.add(self.state_tab_frame, text="State Layout")
         self.notebook.add(self.battery_tab_frame, text="Battery")
 
         self._suspend_events = False
         self._section_title_loaded = ""
+        self._build_main_tabs_tab()
         self._build_data_tab()
         self._build_connection_tab()
+        self._build_network_tab()
         self._build_actions_tab()
         self._build_state_tab()
         self._build_battery_tab()
@@ -113,6 +148,54 @@ class LayoutEditor(tk.Tk):
         self.load()
         self.after(100, self.focus_force)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    # ------------------------
+    # Dashboard tabs editor
+    # ------------------------
+    def _build_main_tabs_tab(self) -> None:
+        frame = self.main_tabs_frame
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self._main_tabs_selected_idx: int | None = None
+        self.available_main_tabs = [
+            "state",
+            "connection-status",
+            "map",
+            "actions",
+            "calibration",
+            "notifications",
+            "warnings",
+            "errors",
+            "data",
+            "network-topology",
+        ]
+
+        self.main_tabs_list = tk.Listbox(frame, height=16)
+        self.main_tabs_list.grid(row=0, column=0, sticky="ns", padx=(0, 10), pady=5)
+        self.main_tabs_list.bind("<<ListboxSelect>>", lambda _: self._on_main_tab_select())
+
+        form = ttk.Frame(frame)
+        form.grid(row=0, column=1, sticky="nsew")
+        form.columnconfigure(1, weight=1)
+
+        ttk.Label(form, text="Available dashboard tab").grid(row=0, column=0, sticky="w")
+        self.main_tab_choice = tk.StringVar(value=self.available_main_tabs[0])
+        ttk.OptionMenu(form, self.main_tab_choice, self.available_main_tabs[0], *self.available_main_tabs).grid(
+            row=0, column=1, sticky="w", padx=6, pady=3
+        )
+
+        ttk.Label(
+            form,
+            text="The runtime dashboard nav follows this list order.",
+            foreground="#94a3b8",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        btns = ttk.Frame(form)
+        btns.grid(row=2, column=1, sticky="w", pady=8)
+        ttk.Button(btns, text="Add", command=self._add_main_tab_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Remove", command=self._remove_main_tab_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Up", command=lambda: self._move_main_tab_item(-1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Down", command=lambda: self._move_main_tab_item(1)).pack(side=tk.LEFT, padx=4)
 
     # ------------------------
     # Data tab editor
@@ -217,6 +300,19 @@ class LayoutEditor(tk.Tk):
         ttk.Button(btns, text="Down", command=lambda: self._move_conn_item(1)).pack(
             side=tk.LEFT, padx=4
         )
+
+    # ------------------------
+    # Network tab editor
+    # ------------------------
+    def _build_network_tab(self) -> None:
+        frame = self.network_tab_frame
+        frame.columnconfigure(1, weight=1)
+
+        self.network_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="Enable network tab", variable=self.network_enabled).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(8, 6)
+        )
+        self.network_title = self._entry(frame, "Title", 1)
 
     # ------------------------
     # Actions tab editor
@@ -547,6 +643,11 @@ class LayoutEditor(tk.Tk):
         self._with_suspended_events(self._refresh_lists_inner)
 
     def _refresh_lists_inner(self) -> None:
+        if hasattr(self, "main_tabs_list"):
+            self.main_tabs_list.delete(0, tk.END)
+            for tab_id in self.data.get("main_tabs", []):
+                self.main_tabs_list.insert(tk.END, tab_id)
+
         self.data_list.delete(0, tk.END)
         for t in self.data["data_tab"]["tabs"]:
             self.data_list.insert(tk.END, t.get("label") or t.get("id") or "tab")
@@ -586,6 +687,8 @@ class LayoutEditor(tk.Tk):
 
         self.status.set(f"Layout path: {self.path}")
         self._refresh_lists()
+        if hasattr(self, "network_title"):
+            self._load_network_tab()
 
     def save(self) -> None:
         self._commit_current_tab()
@@ -615,6 +718,28 @@ class LayoutEditor(tk.Tk):
             messagebox.showerror("Validation errors", "\n".join(errors))
         else:
             messagebox.showinfo("Validation", "Layout JSON looks good.")
+
+    # ------------------------
+    # Dashboard tab actions
+    # ------------------------
+    def _on_main_tab_select(self) -> None:
+        if self._suspend_events:
+            return
+        self._main_tabs_selected_idx = self._selected_index(self.main_tabs_list)
+
+    def _add_main_tab_item(self) -> None:
+        self.data.setdefault("main_tabs", []).append(self.main_tab_choice.get())
+        self._refresh_lists()
+
+    def _remove_main_tab_item(self) -> None:
+        idx = self._selected_index(self.main_tabs_list)
+        if idx is None:
+            return
+        self.data["main_tabs"].pop(idx)
+        self._refresh_lists()
+
+    def _move_main_tab_item(self, delta: int) -> None:
+        self._move_list_item(self.data["main_tabs"], self.main_tabs_list, delta)
 
     # ------------------------
     # Data tab actions
@@ -677,7 +802,25 @@ class LayoutEditor(tk.Tk):
     # Battery tab actions
     # ------------------------
     def _ensure_layout_shape(self) -> None:
+        self.data.setdefault(
+            "main_tabs",
+            [
+                "state",
+                "connection-status",
+                "map",
+                "actions",
+                "calibration",
+                "notifications",
+                "warnings",
+                "errors",
+                "data",
+                "network-topology",
+            ],
+        )
         self.data.setdefault("connection_tab", {}).setdefault("sections", [])
+        network = self.data.setdefault("network_tab", {})
+        network.setdefault("enabled", False)
+        network.setdefault("title", "SEDSprintf Network")
         self.data.setdefault("actions_tab", {}).setdefault("actions", [])
         self.data.setdefault("data_tab", {}).setdefault("tabs", [])
         self.data.setdefault("state_tab", {}).setdefault("states", [])
@@ -687,6 +830,12 @@ class LayoutEditor(tk.Tk):
         estimator = battery["estimator"]
         estimator.setdefault("window_seconds", 300)
         estimator.setdefault("min_drop_rate_v_per_min", 0.005)
+
+    def _load_network_tab(self) -> None:
+        network = self.data.get("network_tab", {})
+        self.network_enabled.set(bool(network.get("enabled", False)))
+        self.network_title.delete(0, tk.END)
+        self.network_title.insert(0, network.get("title", "") or "")
 
     def _load_battery_item(self) -> None:
         idx = self._selected_index(self.battery_list)
@@ -1587,15 +1736,28 @@ class LayoutEditor(tk.Tk):
     def _commit_current_tab(self) -> None:
         current = self.notebook.index(self.notebook.select())
         if current == 0:
-            self._commit_data_form()
+            self._commit_main_tabs_form()
         elif current == 1:
-            self._commit_conn_form()
+            self._commit_data_form()
         elif current == 2:
-            self._commit_action_form()
+            self._commit_conn_form()
         elif current == 3:
-            self._commit_state_form()
+            self._commit_network_form()
         elif current == 4:
+            self._commit_action_form()
+        elif current == 5:
+            self._commit_state_form()
+        elif current == 6:
             self._commit_battery_form()
+
+    def _commit_main_tabs_form(self) -> None:
+        self.data["main_tabs"] = [tab for tab in self.data.get("main_tabs", []) if str(tab).strip()]
+
+    def _commit_network_form(self) -> None:
+        self.data["network_tab"] = {
+            "enabled": bool(self.network_enabled.get()),
+            "title": self.network_title.get().strip() or None,
+        }
 
     def _on_tab_changed(self, _event=None) -> None:
         if self._suspend_events:

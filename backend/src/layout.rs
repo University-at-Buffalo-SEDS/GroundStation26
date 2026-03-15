@@ -8,6 +8,8 @@ const DEFAULT_HITL_LAYOUT_PATH: &str = "layout/layout_hitl.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
     pub version: u32,
+    #[serde(default = "default_main_tabs")]
+    pub main_tabs: Vec<String>,
     pub connection_tab: ConnectionTabLayout,
     #[serde(default)]
     pub network_tab: NetworkTabLayout,
@@ -16,6 +18,21 @@ pub struct LayoutConfig {
     pub state_tab: StateTabLayout,
     #[serde(default)]
     pub battery: BatteryLayoutConfig,
+}
+
+fn default_main_tabs() -> Vec<String> {
+    vec![
+        "state".to_string(),
+        "connection-status".to_string(),
+        "map".to_string(),
+        "actions".to_string(),
+        "calibration".to_string(),
+        "notifications".to_string(),
+        "warnings".to_string(),
+        "errors".to_string(),
+        "data".to_string(),
+        "network-topology".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

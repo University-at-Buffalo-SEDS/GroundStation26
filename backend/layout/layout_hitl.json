@@ -1,5 +1,17 @@
 {
   "version": 1,
+  "main_tabs": [
+    "state",
+    "connection-status",
+    "map",
+    "actions",
+    "calibration",
+    "notifications",
+    "warnings",
+    "errors",
+    "data",
+    "network-topology"
+  ],
   "connection_tab": {
     "sections": [
       {

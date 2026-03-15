@@ -6,6 +6,8 @@ use super::types::FlightState;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
     pub version: u32,
+    #[serde(default = "default_main_tabs")]
+    pub main_tabs: Vec<String>,
     pub connection_tab: ConnectionTabLayout,
     #[serde(default)]
     pub network_tab: NetworkTabLayout,
@@ -14,6 +16,21 @@ pub struct LayoutConfig {
     pub state_tab: StateTabLayout,
     #[serde(default)]
     pub battery: BatteryLayoutConfig,
+}
+
+fn default_main_tabs() -> Vec<String> {
+    vec![
+        "state".to_string(),
+        "connection-status".to_string(),
+        "map".to_string(),
+        "actions".to_string(),
+        "calibration".to_string(),
+        "notifications".to_string(),
+        "warnings".to_string(),
+        "errors".to_string(),
+        "data".to_string(),
+        "network-topology".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -204,6 +221,33 @@ pub enum StateWidgetKind {
 
 impl LayoutConfig {
     pub fn validate(&self) -> Result<(), String> {
+        let mut main_tab_ids = HashSet::new();
+        for tab in &self.main_tabs {
+            let trimmed = tab.trim();
+            if trimmed.is_empty() {
+                return Err("layout contains an empty main tab id".to_string());
+            }
+            let known = matches!(
+                trimmed,
+                "state"
+                    | "connection-status"
+                    | "map"
+                    | "actions"
+                    | "calibration"
+                    | "notifications"
+                    | "warnings"
+                    | "errors"
+                    | "data"
+                    | "network-topology"
+            );
+            if !known {
+                return Err(format!("layout contains unknown main tab id '{trimmed}'"));
+            }
+            if !main_tab_ids.insert(trimmed.to_string()) {
+                return Err(format!("layout contains duplicate main tab id '{trimmed}'"));
+            }
+        }
+
         let mut tab_ids = HashSet::new();
         for tab in &self.data_tab.tabs {
             if tab.id.trim().is_empty() {

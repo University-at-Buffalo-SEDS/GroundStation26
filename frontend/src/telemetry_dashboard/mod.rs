@@ -623,6 +623,29 @@ fn _main_tab_from_str(s: &str) -> MainTab {
     }
 }
 
+fn _layout_main_tab_enabled(layout: &LayoutConfig, tab: MainTab) -> bool {
+    let listed = layout
+        .main_tabs
+        .iter()
+        .any(|id| _main_tab_from_str(id) == tab);
+    listed && (tab != MainTab::NetworkTopology || layout.network_tab.enabled)
+}
+
+fn _configured_main_tabs(layout: &LayoutConfig) -> Vec<MainTab> {
+    let mut tabs = Vec::new();
+    for id in &layout.main_tabs {
+        let tab = _main_tab_from_str(id);
+        if !_layout_main_tab_enabled(layout, tab) || tabs.contains(&tab) {
+            continue;
+        }
+        tabs.push(tab);
+    }
+    if tabs.is_empty() {
+        tabs.push(MainTab::State);
+    }
+    tabs
+}
+
 // ---------- Base URL config ----------
 pub struct UrlConfig;
 
@@ -875,8 +898,13 @@ fn TelemetryDashboardInner() -> Element {
             let Some(layout) = layout_config.read().clone() else {
                 return;
             };
-            if !layout.network_tab.enabled && *active_main_tab.read() == MainTab::NetworkTopology {
-                active_main_tab.set(MainTab::State);
+            let current = *active_main_tab.read();
+            if !_layout_main_tab_enabled(&layout, current) {
+                let next = _configured_main_tabs(&layout)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(MainTab::State);
+                active_main_tab.set(next);
             }
         });
     }
@@ -1744,100 +1772,122 @@ fn TelemetryDashboardInner() -> Element {
                         min-width:260px;
                     ",
                     nav { style: "display:flex; gap:0.5rem; flex-wrap:wrap;",
-                        button {
-                            style: if *active_main_tab.read() == MainTab::State { tab_style_active("#38bdf8") } else { tab_style_inactive.to_string() },
-                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::State) },
-                            "Flight"
-                        }
-                        button {
-                            style: if *active_main_tab.read() == MainTab::ConnectionStatus { tab_style_active("#06b6d4") } else { tab_style_inactive.to_string() },
-                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::ConnectionStatus) },
-                            "Connection Status"
-                        }
-                        button {
-                            style: if *active_main_tab.read() == MainTab::Map { tab_style_active("#22c55e") } else { tab_style_inactive.to_string() },
-                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Map) },
-                            "Map"
-                        }
-                        button {
-                            style: if *active_main_tab.read() == MainTab::Actions { tab_style_active("#a78bfa") } else { tab_style_inactive.to_string() },
-                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Actions) },
-                            "Actions"
-                        }
-                        button {
-                            style: if *active_main_tab.read() == MainTab::Calibration { tab_style_active("#14b8a6") } else { tab_style_inactive.to_string() },
-                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Calibration) },
-                            "Calibration"
-                        }
-                        button {
-                            style: if *active_main_tab.read() == MainTab::Notifications { tab_style_active("#3b82f6") } else { tab_style_inactive.to_string() },
-                            onclick: {
-                                let mut t = active_main_tab;
-                                let notifications = notifications;
-                                let dismissed_notifications = dismissed_notifications;
-                                let unread_notification_ids = unread_notification_ids;
-                                move |_| {
-                                    t.set(MainTab::Notifications);
-                                    dismiss_all_active_notifications_local_and_remote(
-                                        notifications,
-                                        dismissed_notifications,
-                                        unread_notification_ids,
-                                    );
-                                }
-                            },
-                            span { "Notifications" }
-                            if has_unread_notifications {
-                                span { style: "margin-left:6px; color:#93c5fd;", "●" }
-                            }
-                        }
-                        button {
-                            style: if *active_main_tab.read() == MainTab::Warnings { tab_style_active("#facc15") } else { tab_style_inactive.to_string() },
-                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Warnings) },
-                            span { "Warnings" }
-                            if has_warnings {
-                                span {
-                                    style: {
-                                        if has_unacked_warnings && *flash_on.read() {
-                                            "margin-left:6px; color:#facc15; opacity:1;".to_string()
-                                        } else if has_unacked_warnings {
-                                            "margin-left:6px; color:#facc15; opacity:0.4;".to_string()
-                                        } else {
-                                            "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                        for tab in _configured_main_tabs(&layout).into_iter() {
+                            match tab {
+                                MainTab::State => rsx! {
+                                    button {
+                                        style: if *active_main_tab.read() == MainTab::State { tab_style_active("#38bdf8") } else { tab_style_inactive.to_string() },
+                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::State) },
+                                        "Flight"
+                                    }
+                                },
+                                MainTab::ConnectionStatus => rsx! {
+                                    button {
+                                        style: if *active_main_tab.read() == MainTab::ConnectionStatus { tab_style_active("#06b6d4") } else { tab_style_inactive.to_string() },
+                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::ConnectionStatus) },
+                                        "Connection Status"
+                                    }
+                                },
+                                MainTab::Map => rsx! {
+                                    button {
+                                        style: if *active_main_tab.read() == MainTab::Map { tab_style_active("#22c55e") } else { tab_style_inactive.to_string() },
+                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Map) },
+                                        "Map"
+                                    }
+                                },
+                                MainTab::Actions => rsx! {
+                                    button {
+                                        style: if *active_main_tab.read() == MainTab::Actions { tab_style_active("#a78bfa") } else { tab_style_inactive.to_string() },
+                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Actions) },
+                                        "Actions"
+                                    }
+                                },
+                                MainTab::Calibration => rsx! {
+                                    button {
+                                        style: if *active_main_tab.read() == MainTab::Calibration { tab_style_active("#14b8a6") } else { tab_style_inactive.to_string() },
+                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Calibration) },
+                                        "Calibration"
+                                    }
+                                },
+                                MainTab::Notifications => rsx! {
+                                    button {
+                                        style: if *active_main_tab.read() == MainTab::Notifications { tab_style_active("#3b82f6") } else { tab_style_inactive.to_string() },
+                                        onclick: {
+                                            let mut t = active_main_tab;
+                                            let notifications = notifications;
+                                            let dismissed_notifications = dismissed_notifications;
+                                            let unread_notification_ids = unread_notification_ids;
+                                            move |_| {
+                                                t.set(MainTab::Notifications);
+                                                dismiss_all_active_notifications_local_and_remote(
+                                                    notifications,
+                                                    dismissed_notifications,
+                                                    unread_notification_ids,
+                                                );
+                                            }
+                                        },
+                                        span { "Notifications" }
+                                        if has_unread_notifications {
+                                            span { style: "margin-left:6px; color:#93c5fd;", "●" }
                                         }
-                                    },
-                                    "⚠"
-                                }
-                            }
-                        }
-                        button {
-                            style: if *active_main_tab.read() == MainTab::Errors { tab_style_active("#ef4444") } else { tab_style_inactive.to_string() },
-                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Errors) },
-                            span { "Errors" }
-                            if has_errors {
-                                span {
-                                    style: {
-                                        if has_unacked_errors && *flash_on.read() {
-                                            "margin-left:6px; color:#fecaca; opacity:1;".to_string()
-                                        } else if has_unacked_errors {
-                                            "margin-left:6px; color:#fecaca; opacity:0.4;".to_string()
-                                        } else {
-                                            "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                                    }
+                                },
+                                MainTab::Warnings => rsx! {
+                                    button {
+                                        style: if *active_main_tab.read() == MainTab::Warnings { tab_style_active("#facc15") } else { tab_style_inactive.to_string() },
+                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Warnings) },
+                                        span { "Warnings" }
+                                        if has_warnings {
+                                            span {
+                                                style: {
+                                                    if has_unacked_warnings && *flash_on.read() {
+                                                        "margin-left:6px; color:#facc15; opacity:1;".to_string()
+                                                    } else if has_unacked_warnings {
+                                                        "margin-left:6px; color:#facc15; opacity:0.4;".to_string()
+                                                    } else {
+                                                        "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                                                    }
+                                                },
+                                                "⚠"
+                                            }
                                         }
-                                    },
-                                    "⛔"
-                                }
-                            }
-                        }
-                        button {
-                            style: if *active_main_tab.read() == MainTab::Data { tab_style_active("#f97316") } else { tab_style_inactive.to_string() },
-                            onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Data) },
-                            "Data"
-                        }
-                        if layout.network_tab.enabled {
-                            button {
-                                style: if *active_main_tab.read() == MainTab::NetworkTopology { tab_style_active("#8b5cf6") } else { tab_style_inactive.to_string() },
-                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::NetworkTopology) },
-                                "Network"
+                                    }
+                                },
+                                MainTab::Errors => rsx! {
+                                    button {
+                                        style: if *active_main_tab.read() == MainTab::Errors { tab_style_active("#ef4444") } else { tab_style_inactive.to_string() },
+                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Errors) },
+                                        span { "Errors" }
+                                        if has_errors {
+                                            span {
+                                                style: {
+                                                    if has_unacked_errors && *flash_on.read() {
+                                                        "margin-left:6px; color:#fecaca; opacity:1;".to_string()
+                                                    } else if has_unacked_errors {
+                                                        "margin-left:6px; color:#fecaca; opacity:0.4;".to_string()
+                                                    } else {
+                                                        "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                                                    }
+                                                },
+                                                "⛔"
+                                            }
+                                        }
+                                    }
+                                },
+                                MainTab::Data => rsx! {
+                                    button {
+                                        style: if *active_main_tab.read() == MainTab::Data { tab_style_active("#f97316") } else { tab_style_inactive.to_string() },
+                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Data) },
+                                        "Data"
+                                    }
+                                },
+                                MainTab::NetworkTopology => rsx! {
+                                    button {
+                                        style: if *active_main_tab.read() == MainTab::NetworkTopology { tab_style_active("#8b5cf6") } else { tab_style_inactive.to_string() },
+                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::NetworkTopology) },
+                                        "Network"
+                                    }
+                                },
                             }
                         }
                     }
