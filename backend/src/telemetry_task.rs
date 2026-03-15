@@ -18,7 +18,7 @@ use crate::rocket_commands::FlightComputerCommands;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 use crate::web::{FlightStateMsg, emit_warning};
 use groundstation_shared::Board;
-use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
+use sedsprintf_rs_2026::packet::Packet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -580,7 +580,7 @@ pub async fn telemetry_task(
     );
     let db_work_queue_size = env_usize("GS_DB_WORK_QUEUE_SIZE", DB_WORK_QUEUE_SIZE, 1024, 262_144);
     let packet_enqueue_burst = env_usize("GS_PACKET_ENQUEUE_BURST", PACKET_ENQUEUE_BURST, 32, 4096);
-    let (packet_tx, mut packet_rx) = mpsc::channel::<TelemetryPacket>(packet_work_queue_size);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<Packet>(packet_work_queue_size);
     let (db_tx, mut db_rx) = mpsc::channel::<DbWrite>(db_work_queue_size);
     let db_overflow = DbOverflow {
         queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -1182,7 +1182,7 @@ async fn handle_packet(
     timesync_state: &Arc<Mutex<TimeSyncState>>,
     db_tx: &mpsc::Sender<DbWrite>,
     db_overflow: &DbOverflow,
-    pkt: TelemetryPacket,
+    pkt: Packet,
 ) -> Option<TelemetryRow> {
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
 
@@ -1393,7 +1393,7 @@ fn log_telemetry_error(context: &str, err: sedsprintf_rs_2026::TelemetryError) {
     eprintln!("{context}: {:?}", err);
 }
 
-fn payload_json_from_pkt(pkt: &sedsprintf_rs_2026::telemetry_packet::TelemetryPacket) -> String {
+fn payload_json_from_pkt(pkt: &sedsprintf_rs_2026::packet::Packet) -> String {
     let bytes = pkt.payload();
     serde_json::to_string(&bytes).unwrap_or_else(|_| "[]".to_string())
 }
@@ -1437,7 +1437,7 @@ fn handle_timesync_tick(
 fn handle_timesync_packet(
     router: &Arc<sedsprintf_rs_2026::router::Router>,
     timesync_state: &Arc<Mutex<TimeSyncState>>,
-    pkt: &sedsprintf_rs_2026::telemetry_packet::TelemetryPacket,
+    pkt: &sedsprintf_rs_2026::packet::Packet,
 ) -> bool {
     if !timesync_enabled() {
         return false;

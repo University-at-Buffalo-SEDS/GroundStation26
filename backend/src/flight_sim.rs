@@ -12,7 +12,7 @@ use rand::RngExt;
 use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
-use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
+use sedsprintf_rs_2026::packet::Packet;
 #[cfg(feature = "testing")]
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
@@ -156,7 +156,7 @@ struct FlightSimState {
     saw_dump_open_after_n2: bool,
     saw_dump_closed_after_n2: bool,
     nitrous_fill_started_ms: Option<u64>,
-    queued: VecDeque<TelemetryPacket>,
+    queued: VecDeque<Packet>,
 }
 
 #[cfg(feature = "testing")]
@@ -230,7 +230,7 @@ impl FlightSimState {
     }
 
     fn queue_flight_state(&mut self, now_ms: u64) {
-        if let Ok(pkt) = TelemetryPacket::new(
+        if let Ok(pkt) = Packet::new(
             DataType::FlightState,
             &[DataEndpoint::GroundStation],
             Board::FlightComputer.sender_id(),
@@ -247,7 +247,7 @@ impl FlightSimState {
         } else {
             Board::ActuatorBoard.sender_id()
         };
-        if let Ok(pkt) = TelemetryPacket::new(
+        if let Ok(pkt) = Packet::new(
             DataType::UmbilicalStatus,
             &[DataEndpoint::GroundStation],
             sender,
@@ -259,7 +259,7 @@ impl FlightSimState {
     }
 
     fn queue_board_heartbeat(&mut self, board: Board, now_ms: u64) {
-        if let Ok(pkt) = TelemetryPacket::new(
+        if let Ok(pkt) = Packet::new(
             DataType::Heartbeat,
             &[DataEndpoint::GroundStation],
             board.sender_id(),
@@ -610,7 +610,7 @@ impl FlightSimState {
         self.yaw_dps = rng.random_range(-6.0..6.0);
     }
 
-    fn next_sensor_packet(&mut self, now_ms: u64) -> TelemetryResult<TelemetryPacket> {
+    fn next_sensor_packet(&mut self, now_ms: u64) -> TelemetryResult<Packet> {
         self.update_physics(now_ms);
 
         let seq = [
@@ -703,7 +703,7 @@ impl FlightSimState {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
 
-        TelemetryPacket::new(
+        Packet::new(
             dtype,
             &[DataEndpoint::GroundStation],
             sender,
@@ -775,7 +775,7 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
 }
 
 #[cfg(feature = "testing")]
-pub fn _next_state_aware_packet() -> TelemetryResult<TelemetryPacket> {
+pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
     let now_ms = get_current_timestamp_ms();
     let mut s = sim().lock().expect("flight sim mutex poisoned");
 
@@ -814,6 +814,6 @@ pub fn handle_command(_cmd: &TelemetryCommand) -> bool {
 }
 
 #[cfg(not(feature = "testing"))]
-pub fn _next_state_aware_packet() -> TelemetryResult<TelemetryPacket> {
+pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
     unreachable!("flight sim only available with testing feature")
 }

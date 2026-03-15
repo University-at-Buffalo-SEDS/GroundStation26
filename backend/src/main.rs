@@ -32,8 +32,8 @@ use groundstation_shared::{Board, FlightState as FlightStateMode};
 use sedsprintf_rs_2026::TelemetryError;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
+use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
-use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Connection, Row};
 use std::collections::HashMap;
@@ -390,6 +390,7 @@ async fn main() -> anyhow::Result<()> {
         recent_telemetry_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         av_bay_radio_connected: Arc::new(AtomicBool::new(false)),
         fill_radio_connected: Arc::new(AtomicBool::new(false)),
+        topology_router: Arc::new(std::sync::OnceLock::new()),
     });
 
     gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
@@ -402,7 +403,7 @@ async fn main() -> anyhow::Result<()> {
     let flight_state_handler_state_clone = state.clone();
 
     let ground_station_handler =
-        EndpointHandler::new_packet_handler(GroundStation, move |pkt: &TelemetryPacket| {
+        EndpointHandler::new_packet_handler(GroundStation, move |pkt: &Packet| {
             ground_station_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
@@ -415,7 +416,7 @@ async fn main() -> anyhow::Result<()> {
         });
 
     let flight_state_handler =
-        EndpointHandler::new_packet_handler(FlightState, move |pkt: &TelemetryPacket| {
+        EndpointHandler::new_packet_handler(FlightState, move |pkt: &Packet| {
             flight_state_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             flight_state_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
@@ -424,7 +425,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         });
 
-    let abort_handler = EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket| {
+    let abort_handler = EndpointHandler::new_packet_handler(Abort, move |pkt: &Packet| {
         abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
         abort_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
         let error_msg = pkt
@@ -508,6 +509,7 @@ async fn main() -> anyhow::Result<()> {
         cfg,
         clock(),
     ));
+    let _ = state.topology_router.set(router.clone());
 
     let rocket_side = {
         let rocket_radio = Arc::clone(&rocket_radio);

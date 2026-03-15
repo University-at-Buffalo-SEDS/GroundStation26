@@ -7,6 +7,8 @@ use super::types::FlightState;
 pub struct LayoutConfig {
     pub version: u32,
     pub connection_tab: ConnectionTabLayout,
+    #[serde(default)]
+    pub network_tab: NetworkTabLayout,
     pub actions_tab: ActionsTabLayout,
     pub data_tab: DataTabLayout,
     pub state_tab: StateTabLayout,
@@ -22,6 +24,13 @@ pub struct ConnectionTabLayout {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionSection {
     pub kind: ConnectionSectionKind,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NetworkTabLayout {
+    #[serde(default)]
+    pub enabled: bool,
     pub title: Option<String>,
 }
 

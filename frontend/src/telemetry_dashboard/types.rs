@@ -94,6 +94,55 @@ pub struct BoardStatusMsg {
     pub boards: Vec<BoardStatusEntry>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkTopologyNodeKind {
+    Router,
+    Endpoint,
+    Side,
+    Board,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkTopologyStatus {
+    Online,
+    Offline,
+    Simulated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NetworkTopologyNode {
+    pub id: String,
+    pub label: String,
+    pub kind: NetworkTopologyNodeKind,
+    pub status: NetworkTopologyStatus,
+    pub group: String,
+    pub sender_id: Option<String>,
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NetworkTopologyLink {
+    pub source: String,
+    pub target: String,
+    pub label: Option<String>,
+    pub status: NetworkTopologyStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]
+pub struct NetworkTopologyMsg {
+    pub generated_ms: u64,
+    #[serde(default)]
+    pub simulated: bool,
+    #[serde(default)]
+    pub nodes: Vec<NetworkTopologyNode>,
+    #[serde(default)]
+    pub links: Vec<NetworkTopologyLink>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TelemetryRow {
     pub timestamp_ms: i64,

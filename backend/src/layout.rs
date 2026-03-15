@@ -9,6 +9,8 @@ const DEFAULT_HITL_LAYOUT_PATH: &str = "layout/layout_hitl.json";
 pub struct LayoutConfig {
     pub version: u32,
     pub connection_tab: ConnectionTabLayout,
+    #[serde(default)]
+    pub network_tab: NetworkTabLayout,
     pub actions_tab: ActionsTabLayout,
     pub data_tab: DataTabLayout,
     pub state_tab: StateTabLayout,
@@ -24,6 +26,13 @@ pub struct ConnectionTabLayout {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionSection {
     pub kind: ConnectionSectionKind,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NetworkTabLayout {
+    #[serde(default)]
+    pub enabled: bool,
     pub title: Option<String>,
 }
 

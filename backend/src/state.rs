@@ -6,11 +6,15 @@ use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
 use groundstation_shared::{
     Board, BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow,
 };
-use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
+use sedsprintf_rs_2026::config::DataEndpoint;
+use sedsprintf_rs_2026::discovery::TopologySnapshot;
+use sedsprintf_rs_2026::packet::Packet;
+use sedsprintf_rs_2026::router::Router;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 
@@ -21,10 +25,55 @@ pub struct BoardStatus {
     pub warned: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkTopologyNodeKind {
+    Router,
+    Endpoint,
+    Side,
+    Board,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkTopologyStatus {
+    Online,
+    Offline,
+    Simulated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkTopologyNode {
+    pub id: String,
+    pub label: String,
+    pub kind: NetworkTopologyNodeKind,
+    pub status: NetworkTopologyStatus,
+    pub group: String,
+    pub sender_id: Option<String>,
+    pub endpoints: Vec<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkTopologyLink {
+    pub source: String,
+    pub target: String,
+    pub label: Option<String>,
+    pub status: NetworkTopologyStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkTopologyMsg {
+    pub generated_ms: u64,
+    pub simulated: bool,
+    pub nodes: Vec<NetworkTopologyNode>,
+    pub links: Vec<NetworkTopologyLink>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     /// Optional ring buffer for full telemetry packets (not JSON)
-    pub ring_buffer: Arc<Mutex<RingBuffer<TelemetryPacket>>>,
+    pub ring_buffer: Arc<Mutex<RingBuffer<Packet>>>,
 
     /// Commands from frontend → server (Arm, Disarm, Abort, etc.)
     pub cmd_tx: mpsc::Sender<TelemetryCommand>,
@@ -106,6 +155,9 @@ pub struct AppState {
 
     /// Whether the fill-system (umbilical) radio link is physically present.
     pub fill_radio_connected: Arc<AtomicBool>,
+
+    /// Shared router handle used for exporting discovery topology.
+    pub topology_router: Arc<OnceLock<Arc<Router>>>,
 }
 
 impl AppState {
@@ -153,6 +205,290 @@ impl AppState {
         }
 
         BoardStatusMsg { boards }
+    }
+
+    pub fn network_topology_snapshot(&self, now_ms: u64) -> NetworkTopologyMsg {
+        let simulated = cfg!(feature = "testing");
+        let exported = self
+            .topology_router
+            .get()
+            .map(|router| router.export_topology());
+        let board_snapshot = self.board_status_snapshot(now_ms);
+
+        let rocket_radio_online = simulated || self.av_bay_radio_connected.load(Ordering::Relaxed);
+        let fill_radio_online = simulated || self.fill_radio_connected.load(Ordering::Relaxed);
+
+        let radio_status = |online: bool| {
+            if simulated {
+                NetworkTopologyStatus::Simulated
+            } else if online {
+                NetworkTopologyStatus::Online
+            } else {
+                NetworkTopologyStatus::Offline
+            }
+        };
+
+        let endpoints_for_side = |snapshot: Option<&TopologySnapshot>, side_name: &str| {
+            snapshot
+                .and_then(|snapshot| {
+                    snapshot
+                        .routes
+                        .iter()
+                        .find(|route| route.side_name == side_name)
+                })
+                .map(|route| {
+                    route
+                        .reachable_endpoints
+                        .iter()
+                        .map(DataEndpoint::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        let board_status = |board: Board| -> (NetworkTopologyStatus, Option<String>) {
+            let Some(entry) = board_snapshot
+                .boards
+                .iter()
+                .find(|entry| entry.board == board)
+            else {
+                return (NetworkTopologyStatus::Offline, None);
+            };
+
+            if entry.seen {
+                let detail = entry
+                    .age_ms
+                    .map(|age_ms| format!("Last packet {} ms ago", age_ms));
+                (NetworkTopologyStatus::Online, detail)
+            } else if simulated {
+                (
+                    NetworkTopologyStatus::Simulated,
+                    Some("Simulated network node".to_string()),
+                )
+            } else {
+                (
+                    NetworkTopologyStatus::Offline,
+                    Some("No packets received".to_string()),
+                )
+            }
+        };
+
+        let side_status = |side_name: &str, default_online: bool| {
+            if exported.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .routes
+                    .iter()
+                    .any(|route| route.side_name == side_name)
+            }) {
+                if simulated {
+                    NetworkTopologyStatus::Simulated
+                } else {
+                    NetworkTopologyStatus::Online
+                }
+            } else {
+                radio_status(default_online)
+            }
+        };
+
+        let local_endpoints = exported
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .advertised_endpoints
+                    .iter()
+                    .map(DataEndpoint::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|s: &String| !s.is_empty());
+        let local_endpoint_list = exported
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .advertised_endpoints
+                    .iter()
+                    .map(DataEndpoint::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut nodes = vec![
+            NetworkTopologyNode {
+                id: "router".to_string(),
+                label: "Ground Station Router".to_string(),
+                kind: NetworkTopologyNodeKind::Router,
+                status: NetworkTopologyStatus::Online,
+                group: "local".to_string(),
+                sender_id: Some(Board::GroundStation.sender_id().to_string()),
+                endpoints: local_endpoint_list.clone(),
+                detail: Some("SEDSprintf relay router".to_string()),
+            },
+            NetworkTopologyNode {
+                id: "endpoint_ground_station".to_string(),
+                label: "GroundStation Endpoint".to_string(),
+                kind: NetworkTopologyNodeKind::Endpoint,
+                status: NetworkTopologyStatus::Online,
+                group: "local".to_string(),
+                sender_id: Some("GS".to_string()),
+                endpoints: local_endpoint_list.clone(),
+                detail: local_endpoints
+                    .clone()
+                    .map(|eps| format!("Advertised endpoints: {eps}"))
+                    .or_else(|| Some("Local telemetry sink".to_string())),
+            },
+            NetworkTopologyNode {
+                id: "endpoint_flight_state".to_string(),
+                label: "FlightState Endpoint".to_string(),
+                kind: NetworkTopologyNodeKind::Endpoint,
+                status: NetworkTopologyStatus::Online,
+                group: "local".to_string(),
+                sender_id: None,
+                endpoints: vec!["FlightState".to_string()],
+                detail: Some("Updates ground-station flight state".to_string()),
+            },
+            NetworkTopologyNode {
+                id: "endpoint_abort".to_string(),
+                label: "Abort Endpoint".to_string(),
+                kind: NetworkTopologyNodeKind::Endpoint,
+                status: NetworkTopologyStatus::Online,
+                group: "local".to_string(),
+                sender_id: None,
+                endpoints: vec!["Abort".to_string()],
+                detail: Some("Consumes abort/error packets".to_string()),
+            },
+        ];
+
+        let rocket_boards = [Board::FlightComputer, Board::RFBoard, Board::PowerBoard];
+        let fill_boards = [
+            Board::ValveBoard,
+            Board::ActuatorBoard,
+            Board::GatewayBoard,
+            Board::DaqBoard,
+        ];
+
+        for board in rocket_boards {
+            let (status, detail) = board_status(board);
+            let endpoints = endpoints_for_side(exported.as_ref(), "rocket_radio");
+            nodes.push(NetworkTopologyNode {
+                id: format!("board_{}", board.sender_id().to_ascii_lowercase()),
+                label: board.as_str().to_string(),
+                kind: NetworkTopologyNodeKind::Board,
+                status,
+                group: "rocket_remote".to_string(),
+                sender_id: Some(board.sender_id().to_string()),
+                endpoints: if matches!(board, Board::RFBoard) {
+                    endpoints.clone()
+                } else {
+                    Vec::new()
+                },
+                detail: detail.or_else(|| {
+                    if endpoints.is_empty() {
+                        None
+                    } else {
+                        Some(format!(
+                            "Discovered via rocket side: {}",
+                            endpoints.join(", ")
+                        ))
+                    }
+                }),
+            });
+        }
+
+        for board in fill_boards {
+            let (status, detail) = board_status(board);
+            let endpoints = endpoints_for_side(exported.as_ref(), "umbilical_radio");
+            nodes.push(NetworkTopologyNode {
+                id: format!("board_{}", board.sender_id().to_ascii_lowercase()),
+                label: board.as_str().to_string(),
+                kind: NetworkTopologyNodeKind::Board,
+                status,
+                group: "fill_remote".to_string(),
+                sender_id: Some(board.sender_id().to_string()),
+                endpoints: if matches!(board, Board::GatewayBoard) {
+                    endpoints.clone()
+                } else {
+                    Vec::new()
+                },
+                detail: detail.or_else(|| {
+                    if endpoints.is_empty() {
+                        None
+                    } else {
+                        Some(format!(
+                            "Discovered via fill side: {}",
+                            endpoints.join(", ")
+                        ))
+                    }
+                }),
+            });
+        }
+
+        let mut links = vec![
+            NetworkTopologyLink {
+                source: "router".to_string(),
+                target: "endpoint_ground_station".to_string(),
+                label: Some("local".to_string()),
+                status: NetworkTopologyStatus::Online,
+            },
+            NetworkTopologyLink {
+                source: "router".to_string(),
+                target: "endpoint_flight_state".to_string(),
+                label: Some("local".to_string()),
+                status: NetworkTopologyStatus::Online,
+            },
+            NetworkTopologyLink {
+                source: "router".to_string(),
+                target: "endpoint_abort".to_string(),
+                label: Some("local".to_string()),
+                status: NetworkTopologyStatus::Online,
+            },
+            NetworkTopologyLink {
+                source: "router".to_string(),
+                target: "board_rf".to_string(),
+                label: Some("rocket radio".to_string()),
+                status: side_status("rocket_radio", rocket_radio_online),
+            },
+            NetworkTopologyLink {
+                source: "router".to_string(),
+                target: "board_gw".to_string(),
+                label: Some("umbilical radio".to_string()),
+                status: side_status("umbilical_radio", fill_radio_online),
+            },
+        ];
+
+        for board in rocket_boards {
+            let (status, _) = board_status(board);
+            if matches!(board, Board::RFBoard) {
+                continue;
+            }
+            links.push(NetworkTopologyLink {
+                source: "board_rf".to_string(),
+                target: format!("board_{}", board.sender_id().to_ascii_lowercase()),
+                label: Some("physical link".to_string()),
+                status,
+            });
+        }
+
+        for board in fill_boards {
+            let (status, _) = board_status(board);
+            if matches!(board, Board::GatewayBoard) {
+                continue;
+            }
+            links.push(NetworkTopologyLink {
+                source: "board_gw".to_string(),
+                target: format!("board_{}", board.sender_id().to_ascii_lowercase()),
+                label: Some("physical link".to_string()),
+                status,
+            });
+        }
+
+        NetworkTopologyMsg {
+            generated_ms: now_ms,
+            simulated,
+            nodes,
+            links,
+        }
     }
 
     pub fn set_umbilical_valve_state(&self, cmd_id: u8, on: bool) {

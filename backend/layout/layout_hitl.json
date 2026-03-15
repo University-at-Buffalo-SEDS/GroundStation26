@@ -12,6 +12,10 @@
       }
     ]
   },
+  "network_tab": {
+    "enabled": true,
+    "title": "SEDSprintf Network"
+  },
   "actions_tab": {
     "actions": [
       {

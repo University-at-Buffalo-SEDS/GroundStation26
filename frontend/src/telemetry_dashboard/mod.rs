@@ -13,6 +13,7 @@ pub(crate) mod gps_android;
 mod gps_webview;
 mod latency_chart;
 pub mod layout;
+mod network_topology_tab;
 mod notifications_tab;
 pub mod types;
 
@@ -42,10 +43,11 @@ use dioxus_signals::Signal;
 use errors_tab::ErrorsTab;
 use layout::LayoutConfig;
 use map_tab::MapTab;
+use network_topology_tab::NetworkTopologyTab;
 use notifications_tab::NotificationsTab;
 use serde::{Deserialize, Serialize};
 use state_tab::StateTab;
-use types::{BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryRow};
+use types::{BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryRow};
 use warnings_tab::WarningsTab;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -288,6 +290,7 @@ enum WsInMsg {
     Warning(AlertMsg),
     Error(AlertMsg),
     BoardStatus(BoardStatusMsg),
+    NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
     NetworkTime(NetworkTimeMsg),
@@ -449,6 +452,7 @@ struct GpsResponse {
 enum MainTab {
     State,
     ConnectionStatus,
+    NetworkTopology,
     Map,
     Actions,
     Calibration,
@@ -474,7 +478,7 @@ const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
 const MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
 const DATA_TAB_STORAGE_KEY: &str = "gs_data_tab";
 const BASE_URL_STORAGE_KEY: &str = "gs_base_url";
-const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v4";
+const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v5";
 const NOTIFICATION_DISMISSED_STORAGE_KEY: &str = "gs_notification_dismissed_ids_v1";
 const _SKIP_TLS_VERIFY_KEY_PREFIX: &str = "gs_skip_tls_verify_";
 const NOTIFICATION_AUTO_DISMISS_MS: u32 = 5_000;
@@ -593,6 +597,7 @@ fn _main_tab_to_str(tab: MainTab) -> &'static str {
     match tab {
         MainTab::State => "state",
         MainTab::ConnectionStatus => "connection-status",
+        MainTab::NetworkTopology => "network-topology",
         MainTab::Map => "map",
         MainTab::Actions => "actions",
         MainTab::Calibration => "calibration",
@@ -606,6 +611,7 @@ fn _main_tab_from_str(s: &str) -> MainTab {
     match s {
         "state" => MainTab::State,
         "connection-status" => MainTab::ConnectionStatus,
+        "network-topology" => MainTab::NetworkTopology,
         "map" => MainTab::Map,
         "actions" => MainTab::Actions,
         "calibration" => MainTab::Calibration,
@@ -841,6 +847,7 @@ fn TelemetryDashboardInner() -> Element {
     let network_time = use_signal(|| None::<NetworkTimeSync>);
     let flight_state = use_signal(|| FlightState::Startup);
     let board_status = use_signal(Vec::<BoardStatusEntry>::new);
+    let network_topology = use_signal(NetworkTopologyMsg::default);
 
     let active_main_tab = use_signal(|| _main_tab_from_str(st_main_tab.read().as_str()));
 
@@ -857,6 +864,19 @@ fn TelemetryDashboardInner() -> Element {
             let current = active_data_tab.read().clone();
             if !layout.data_tab.tabs.iter().any(|t| t.id == current) {
                 active_data_tab.set(layout.data_tab.tabs[0].id.clone());
+            }
+        });
+    }
+
+    {
+        let mut active_main_tab = active_main_tab;
+        let layout_config = layout_config;
+        use_effect(move || {
+            let Some(layout) = layout_config.read().clone() else {
+                return;
+            };
+            if !layout.network_tab.enabled && *active_main_tab.read() == MainTab::NetworkTopology {
+                active_main_tab.set(MainTab::State);
             }
         });
     }
@@ -1122,6 +1142,7 @@ fn TelemetryDashboardInner() -> Element {
         let mut unread_notification_ids_s = unread_notification_ids;
         let mut action_policy_s = action_policy;
         let mut network_time_s = network_time;
+        let mut network_topology_s = network_topology;
 
         let alive = alive.clone();
         let startup_seed_ready = startup_seed_ready;
@@ -1162,6 +1183,7 @@ fn TelemetryDashboardInner() -> Element {
                         &mut unread_notification_ids_s,
                         &mut action_policy_s,
                         &mut network_time_s,
+                        &mut network_topology_s,
                         &mut board_status_s,
                         &mut rocket_gps_s,
                         &mut user_gps_s,
@@ -1377,6 +1399,7 @@ fn TelemetryDashboardInner() -> Element {
                     unread_notification_ids,
                     action_policy,
                     network_time,
+                    network_topology,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -1810,6 +1833,13 @@ fn TelemetryDashboardInner() -> Element {
                             onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Data) },
                             "Data"
                         }
+                        if layout.network_tab.enabled {
+                            button {
+                                style: if *active_main_tab.read() == MainTab::NetworkTopology { tab_style_active("#8b5cf6") } else { tab_style_inactive.to_string() },
+                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::NetworkTopology) },
+                                "Network"
+                            }
+                        }
                     }
                 }
 
@@ -1994,6 +2024,14 @@ fn TelemetryDashboardInner() -> Element {
                         ConnectionStatusTab {
                             boards: board_status,
                             layout: layout.connection_tab.clone(),
+                        }
+                    },
+                    MainTab::NetworkTopology => rsx! {
+                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                            NetworkTopologyTab {
+                                topology: network_topology,
+                                layout: layout.network_tab.clone(),
+                            }
                         }
                     },
                     MainTab::Map => rsx! {
@@ -2488,6 +2526,7 @@ async fn seed_from_db(
     unread_notification_ids: &mut Signal<Vec<u64>>,
     action_policy: &mut Signal<ActionPolicyMsg>,
     network_time: &mut Signal<Option<NetworkTimeSync>>,
+    network_topology: &mut Signal<NetworkTopologyMsg>,
     board_status: &mut Signal<Vec<BoardStatusEntry>>,
     rocket_gps: &mut Signal<Option<(f64, f64)>>,
     user_gps: &mut Signal<Option<(f64, f64)>>,
@@ -2724,6 +2763,12 @@ async fn seed_from_db(
         }));
     }
 
+    if let Ok(topology) = http_get_json::<NetworkTopologyMsg>("/api/network_topology").await
+        && alive.load(Ordering::Relaxed)
+    {
+        network_topology.set(topology);
+    }
+
     if !alive.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -2765,6 +2810,7 @@ async fn connect_ws_supervisor(
     unread_notification_ids: Signal<Vec<u64>>,
     action_policy: Signal<ActionPolicyMsg>,
     network_time: Signal<Option<NetworkTimeSync>>,
+    network_topology: Signal<NetworkTopologyMsg>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2801,6 +2847,7 @@ async fn connect_ws_supervisor(
                     unread_notification_ids,
                     action_policy,
                     network_time,
+                    network_topology,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -2825,6 +2872,7 @@ async fn connect_ws_supervisor(
                     unread_notification_ids,
                     action_policy,
                     network_time,
+                    network_topology,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -2872,6 +2920,7 @@ async fn connect_ws_once_wasm(
     unread_notification_ids: Signal<Vec<u64>>,
     action_policy: Signal<ActionPolicyMsg>,
     network_time: Signal<Option<NetworkTimeSync>>,
+    network_topology: Signal<NetworkTopologyMsg>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -2924,6 +2973,7 @@ async fn connect_ws_once_wasm(
                     unread_notification_ids,
                     action_policy,
                     network_time,
+                    network_topology,
                     warning_event_counter,
                     error_event_counter,
                     flight_state,
@@ -3006,6 +3056,7 @@ async fn connect_ws_once_native(
     unread_notification_ids: Signal<Vec<u64>>,
     action_policy: Signal<ActionPolicyMsg>,
     network_time: Signal<Option<NetworkTimeSync>>,
+    network_topology: Signal<NetworkTopologyMsg>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -3085,6 +3136,7 @@ async fn connect_ws_once_native(
                 unread_notification_ids,
                 action_policy,
                 network_time,
+                network_topology,
                 warning_event_counter,
                 error_event_counter,
                 flight_state,
@@ -3117,6 +3169,7 @@ fn handle_ws_message(
     unread_notification_ids: Signal<Vec<u64>>,
     action_policy: Signal<ActionPolicyMsg>,
     network_time: Signal<Option<NetworkTimeSync>>,
+    network_topology: Signal<NetworkTopologyMsg>,
     warning_event_counter: Signal<u64>,
     error_event_counter: Signal<u64>,
     flight_state: Signal<FlightState>,
@@ -3134,6 +3187,7 @@ fn handle_ws_message(
     let unread_notification_ids = unread_notification_ids;
     let mut action_policy = action_policy;
     let mut network_time = network_time;
+    let mut network_topology = network_topology;
     let mut flight_state = flight_state;
     let mut board_status = board_status;
     let mut rocket_gps = rocket_gps;
@@ -3224,6 +3278,10 @@ fn handle_ws_message(
 
         WsInMsg::BoardStatus(status) => {
             board_status.set(status.boards);
+        }
+
+        WsInMsg::NetworkTopology(topology) => {
+            network_topology.set(topology);
         }
 
         WsInMsg::Notifications(list) => {

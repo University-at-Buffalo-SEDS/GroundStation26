@@ -54,7 +54,7 @@ impl Radio {
 }
 
 impl RadioDevice for Radio {
-    /// Blocking receive of one TelemetryPacket
+    /// Blocking receive of one Packet
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
             .side_id

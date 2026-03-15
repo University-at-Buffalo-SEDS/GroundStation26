@@ -2,7 +2,7 @@ use crate::layout;
 use crate::loadcell;
 use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_bundle_path};
 use crate::sequences::{ActionPolicyMsg, PersistentNotification};
-use crate::state::AppState;
+use crate::state::{AppState, NetworkTopologyMsg};
 use axum::http::{StatusCode, header};
 use axum::{
     Json, Router,
@@ -110,6 +110,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/calibration/capture_span", post(capture_loadcell_span))
         .route("/api/calibration/refit", post(refit_loadcell_channel))
         .route("/api/network_time", get(get_network_time))
+        .route("/api/network_topology", get(get_network_topology))
         .route("/api/notifications", get(get_notifications))
         .route(
             "/api/notifications/{id}/dismiss",
@@ -141,6 +142,7 @@ pub enum WsOutMsg {
     FlightState(FlightStateMsg),
     Error(ErrorMsg),
     BoardStatus(BoardStatusMsg),
+    NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
     NetworkTime(NetworkTimeMsg),
@@ -724,6 +726,11 @@ async fn dismiss_notification(
 async fn get_action_policy(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.action_policy_snapshot())
 }
+
+async fn get_network_topology(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.network_topology_snapshot(crate::telemetry_task::get_current_timestamp_ms()))
+}
+
 async fn send_command(
     State(state): State<Arc<AppState>>,
     Json(cmd): Json<TelemetryCommand>,
@@ -798,6 +805,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_action_policy).await.is_err() {
+            return;
+        }
+        let initial_network_topology = serde_json::to_string(&WsOutMsg::NetworkTopology(
+            state_for_send
+                .network_topology_snapshot(crate::telemetry_task::get_current_timestamp_ms()),
+        ))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_network_topology).await.is_err() {
             return;
         }
         let initial_network_time = serde_json::to_string(&WsOutMsg::NetworkTime(NetworkTimeMsg {
@@ -887,6 +902,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         Ok(status) => {
                             let msg = WsOutMsg::BoardStatus(status);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                            let topology = WsOutMsg::NetworkTopology(
+                                state_for_send.network_topology_snapshot(
+                                    crate::telemetry_task::get_current_timestamp_ms(),
+                                ),
+                            );
+                            let text = serde_json::to_string(&topology).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;
                             }
