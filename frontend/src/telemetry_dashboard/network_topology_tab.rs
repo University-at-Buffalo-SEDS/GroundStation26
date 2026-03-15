@@ -5,6 +5,9 @@ use std::collections::{HashMap, HashSet};
 const GRAPH_VIEWPORT_ID: &str = "network-topology-viewport";
 const GRAPH_SURFACE_ID: &str = "network-topology-surface";
 const GRAPH_CANVAS_ID: &str = "network-topology-canvas";
+const GRAPH_VIEWPORT_FULLSCREEN_ID: &str = "network-topology-viewport-fullscreen";
+const GRAPH_SURFACE_FULLSCREEN_ID: &str = "network-topology-surface-fullscreen";
+const GRAPH_CANVAS_FULLSCREEN_ID: &str = "network-topology-canvas-fullscreen";
 
 use super::js_eval;
 use super::layout::NetworkTabLayout;
@@ -22,7 +25,7 @@ struct NodePlacement {
 
 const GRAPH_WIDTH: i32 = 1320;
 const GRAPH_HEIGHT: i32 = 880;
-const ZOOM_MIN: f32 = 0.6;
+const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 1.8;
 const ZOOM_STEP: f32 = 0.2;
 
@@ -33,6 +36,7 @@ pub fn NetworkTopologyTab(
 ) -> Element {
     let snapshot = topology.read().clone();
     let expanded_node_id = use_signal(|| None::<String>);
+    let mut is_fullscreen = use_signal(|| false);
     let title = layout
         .title
         .unwrap_or_else(|| "SEDSprintf Network".to_string());
@@ -58,73 +62,217 @@ pub fn NetworkTopologyTab(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let viewport_id = if *is_fullscreen.read() {
+        GRAPH_VIEWPORT_FULLSCREEN_ID
+    } else {
+        GRAPH_VIEWPORT_ID
+    };
+    let surface_id = if *is_fullscreen.read() {
+        GRAPH_SURFACE_FULLSCREEN_ID
+    } else {
+        GRAPH_SURFACE_ID
+    };
+    let canvas_id = if *is_fullscreen.read() {
+        GRAPH_CANVAS_FULLSCREEN_ID
+    } else {
+        GRAPH_CANVAS_ID
+    };
 
-    use_effect(move || {
-        install_drag_handlers();
-    });
+    {
+        let is_fullscreen = is_fullscreen;
+        use_effect(move || {
+            let fullscreen = *is_fullscreen.read();
+            let viewport_id = if fullscreen {
+                GRAPH_VIEWPORT_FULLSCREEN_ID
+            } else {
+                GRAPH_VIEWPORT_ID
+            };
+            let surface_id = if fullscreen {
+                GRAPH_SURFACE_FULLSCREEN_ID
+            } else {
+                GRAPH_SURFACE_ID
+            };
+            let canvas_id = if fullscreen {
+                GRAPH_CANVAS_FULLSCREEN_ID
+            } else {
+                GRAPH_CANVAS_ID
+            };
+            install_drag_handlers(fullscreen, viewport_id, surface_id, canvas_id);
+        });
+    }
+
+    let fullscreen_state = *is_fullscreen.read();
+
+    let on_toggle_fullscreen = move |_| {
+        let next = !*is_fullscreen.read();
+        is_fullscreen.set(next);
+        let viewport_id = if next {
+            GRAPH_VIEWPORT_FULLSCREEN_ID
+        } else {
+            GRAPH_VIEWPORT_ID
+        };
+        let surface_id = if next {
+            GRAPH_SURFACE_FULLSCREEN_ID
+        } else {
+            GRAPH_SURFACE_ID
+        };
+        let canvas_id = if next {
+            GRAPH_CANVAS_FULLSCREEN_ID
+        } else {
+            GRAPH_CANVAS_ID
+        };
+        spawn(async move {
+            #[cfg(target_arch = "wasm32")]
+            gloo_timers::future::TimeoutFuture::new(20).await;
+
+            #[cfg(not(target_arch = "wasm32"))]
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            install_drag_handlers(next, viewport_id, surface_id, canvas_id);
+        });
+    };
 
     rsx! {
-        div {
-            style: "padding:16px; display:flex; flex-direction:column; gap:14px; height:100%; overflow-y:auto;",
-            h2 { style: "margin:0; color:#e5e7eb;", "{title}" }
-            p {
-                style: "margin:0; color:#94a3b8; font-size:0.95rem;",
-                if snapshot.simulated {
-                    "Router graph is running in testing-mode simulation."
-                } else {
-                    "Router graph is built from the backend SEDSprintf topology and live board/link status."
-                }
-            }
+        if *is_fullscreen.read() {
             div {
-                style: "display:flex; align-items:center; gap:10px; color:#cbd5e1;",
-                button {
-                    style: zoom_button_style(),
-                    onclick: move |_| graph_zoom_delta(-ZOOM_STEP),
-                    "Zoom Out"
-                }
-                button {
-                    style: zoom_button_style(),
-                    onclick: move |_| graph_zoom_reset(),
-                    "Reset"
-                }
-                button {
-                    style: zoom_button_style(),
-                    onclick: move |_| graph_zoom_delta(ZOOM_STEP),
-                    "Zoom In"
-                }
-                span {
-                    style: "font-size:0.85rem; color:#94a3b8;",
-                    "Pinch or drag to navigate"
-                }
-            }
-
-            div {
-                id: "{GRAPH_VIEWPORT_ID}",
-                style: "padding:18px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:0; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
+                key: "network-fullscreen-{fullscreen_state}",
+                style: "position:fixed; inset:0; z-index:9999; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
                 div {
-                    id: "{GRAPH_SURFACE_ID}",
-                    style: "position:relative; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; min-width:{GRAPH_WIDTH}px; min-height:{GRAPH_HEIGHT}px;",
+                    style: "display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:space-between;",
+                    h2 { style: "margin:0; color:#8b5cf6;", "{title}" }
                     div {
-                        id: "{GRAPH_CANVAS_ID}",
-                        style: "position:absolute; inset:0 auto auto 0; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; transform:scale(1); transform-origin:top left;",
-                        svg {
-                            width: "{GRAPH_WIDTH}",
-                            height: "{GRAPH_HEIGHT}",
-                            view_box: "0 0 {GRAPH_WIDTH} {GRAPH_HEIGHT}",
-                            style: "position:absolute; inset:0; overflow:visible;",
-                            for link in graph_links.iter() {
-                                {render_link(link, &snapshot.nodes, &placements)}
+                        style: "display:flex; align-items:center; gap:10px; color:#cbd5e1; flex-wrap:wrap;",
+                        button {
+                            style: zoom_button_style(),
+                            onclick: move |_| graph_zoom_delta(-ZOOM_STEP),
+                            "Zoom Out"
+                        }
+                        button {
+                            style: zoom_button_style(),
+                            onclick: move |_| graph_zoom_reset(),
+                            "Reset"
+                        }
+                        button {
+                            style: zoom_button_style(),
+                            onclick: move |_| graph_zoom_delta(ZOOM_STEP),
+                            "Zoom In"
+                        }
+                        button {
+                            style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                            onclick: on_toggle_fullscreen,
+                            "Exit Fullscreen"
+                        }
+                    }
+                }
+                p {
+                    style: "margin:0; color:#94a3b8; font-size:0.95rem;",
+                    if snapshot.simulated {
+                        "Router graph is running in testing-mode simulation."
+                    } else {
+                        "Router graph is built from the backend SEDSprintf topology and live board/link status."
+                    }
+                }
+                div {
+                    style: "flex:1; min-height:0; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
+                    id: "{viewport_id}",
+                    div {
+                        id: "{surface_id}",
+                        style: "position:relative; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; min-width:{GRAPH_WIDTH}px; min-height:{GRAPH_HEIGHT}px;",
+                        div {
+                            id: "{canvas_id}",
+                            style: "position:absolute; inset:0 auto auto 0; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; transform:scale(1); transform-origin:top left;",
+                            svg {
+                                width: "{GRAPH_WIDTH}",
+                                height: "{GRAPH_HEIGHT}",
+                                view_box: "0 0 {GRAPH_WIDTH} {GRAPH_HEIGHT}",
+                                style: "position:absolute; inset:0; overflow:visible;",
+                                for link in graph_links.iter() {
+                                    {render_link(link, &snapshot.nodes, &placements)}
+                                }
+                            }
+
+                            for node in graph_nodes.iter() {
+                                {render_node(
+                                    node,
+                                    &graph_links,
+                                    &snapshot.nodes,
+                                    &placements,
+                                    expanded_node_id,
+                                )}
                             }
                         }
+                    }
+                }
+            }
+        } else {
+            div {
+                key: "network-embedded-{fullscreen_state}",
+                style: "padding:16px; display:flex; flex-direction:column; gap:14px; height:100%; overflow-y:auto;",
+                h2 { style: "margin:0; color:#e5e7eb;", "{title}" }
+                p {
+                    style: "margin:0; color:#94a3b8; font-size:0.95rem;",
+                    if snapshot.simulated {
+                        "Router graph is running in testing-mode simulation."
+                    } else {
+                        "Router graph is built from the backend SEDSprintf topology and live board/link status."
+                    }
+                }
+                div {
+                    style: "display:flex; align-items:center; gap:10px; color:#cbd5e1; flex-wrap:wrap;",
+                    button {
+                        style: zoom_button_style(),
+                        onclick: move |_| graph_zoom_delta(-ZOOM_STEP),
+                        "Zoom Out"
+                    }
+                    button {
+                        style: zoom_button_style(),
+                        onclick: move |_| graph_zoom_reset(),
+                        "Reset"
+                    }
+                    button {
+                        style: zoom_button_style(),
+                        onclick: move |_| graph_zoom_delta(ZOOM_STEP),
+                        "Zoom In"
+                    }
+                    button {
+                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                        onclick: on_toggle_fullscreen,
+                        "Fullscreen"
+                    }
+                    span {
+                        style: "font-size:0.85rem; color:#94a3b8;",
+                        "Pinch or drag to navigate"
+                    }
+                }
 
-                        for node in graph_nodes.iter() {
-                            {render_node(
-                                node,
-                                &graph_links,
-                                &snapshot.nodes,
-                                &placements,
-                                expanded_node_id,
-                            )}
+                div {
+                    id: "{viewport_id}",
+                    style: "padding:18px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:0; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
+                    div {
+                        id: "{surface_id}",
+                        style: "position:relative; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; min-width:{GRAPH_WIDTH}px; min-height:{GRAPH_HEIGHT}px;",
+                        div {
+                            id: "{canvas_id}",
+                            style: "position:absolute; inset:0 auto auto 0; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; transform:scale(1); transform-origin:top left;",
+                            svg {
+                                width: "{GRAPH_WIDTH}",
+                                height: "{GRAPH_HEIGHT}",
+                                view_box: "0 0 {GRAPH_WIDTH} {GRAPH_HEIGHT}",
+                                style: "position:absolute; inset:0; overflow:visible;",
+                                for link in graph_links.iter() {
+                                    {render_link(link, &snapshot.nodes, &placements)}
+                                }
+                            }
+
+                            for node in graph_nodes.iter() {
+                                {render_node(
+                                    node,
+                                    &graph_links,
+                                    &snapshot.nodes,
+                                    &placements,
+                                    expanded_node_id,
+                                )}
+                            }
                         }
                     }
                 }
@@ -161,7 +309,7 @@ fn graph_zoom_reset() {
     );
 }
 
-fn install_drag_handlers() {
+fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str, canvas_id: &str) {
     js_eval(&format!(
         r#"
         (function() {{
@@ -169,10 +317,7 @@ fn install_drag_handlers() {
           const surface = document.getElementById({surface_id:?});
           const canvas = document.getElementById({canvas_id:?});
           if (!viewport || !surface || !canvas) return;
-          if (viewport.__gs26PanInstalled) return;
-          viewport.__gs26PanInstalled = true;
-
-          const state = {{
+          const state = window.__gs26NetworkGraphState || {{
             scale: 1.0,
             drag: null,
             suppressNextClick: false,
@@ -181,10 +326,15 @@ fn install_drag_handlers() {
             pinchScale: 1.0,
             padX: 0,
             padY: 0,
+            listenersInstalled: false,
           }};
+          state.viewport = viewport;
+          state.surface = surface;
+          state.canvas = canvas;
+          window.__gs26NetworkGraphState = state;
 
           const setCursor = (value) => {{
-            viewport.style.cursor = value;
+            state.viewport.style.cursor = value;
           }};
 
           const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -192,56 +342,78 @@ fn install_drag_handlers() {
           const refreshSurfaceFrame = () => {{
             const scaledWidth = Math.round({graph_width} * state.scale);
             const scaledHeight = Math.round({graph_height} * state.scale);
-            state.padX = Math.max(Math.round(viewport.clientWidth * 0.8), 320);
-            state.padY = Math.max(Math.round(viewport.clientHeight * 0.8), 220);
-            surface.style.width = `${{scaledWidth + state.padX * 2}}px`;
-            surface.style.height = `${{scaledHeight + state.padY * 2}}px`;
-            surface.style.minWidth = surface.style.width;
-            surface.style.minHeight = surface.style.height;
-            canvas.style.left = `${{state.padX}}px`;
-            canvas.style.top = `${{state.padY}}px`;
+            state.padX = Math.max(Math.round(state.viewport.clientWidth * 0.8), 320);
+            state.padY = Math.max(Math.round(state.viewport.clientHeight * 0.8), 220);
+            state.surface.style.width = `${{scaledWidth + state.padX * 2}}px`;
+            state.surface.style.height = `${{scaledHeight + state.padY * 2}}px`;
+            state.surface.style.minWidth = state.surface.style.width;
+            state.surface.style.minHeight = state.surface.style.height;
+            state.canvas.style.left = `${{state.padX}}px`;
+            state.canvas.style.top = `${{state.padY}}px`;
           }};
           const centerGraph = () => {{
             const scaledWidth = Math.round({graph_width} * state.scale);
             const scaledHeight = Math.round({graph_height} * state.scale);
-            viewport.scrollLeft = Math.max(0, state.padX + Math.round((scaledWidth - viewport.clientWidth) / 2));
-            viewport.scrollTop = Math.max(0, state.padY + Math.round((scaledHeight - viewport.clientHeight) / 2));
+            state.viewport.scrollLeft = Math.max(0, state.padX + Math.round((scaledWidth - state.viewport.clientWidth) / 2));
+            state.viewport.scrollTop = Math.max(0, state.padY + Math.round((scaledHeight - state.viewport.clientHeight) / 2));
           }};
           const applyScale = (nextScale, clientX, clientY) => {{
             const scale = clamp(nextScale, {zoom_min}, {zoom_max});
-            const rect = viewport.getBoundingClientRect();
+            const rect = state.viewport.getBoundingClientRect();
             const localX = clientX - rect.left;
             const localY = clientY - rect.top;
-            const contentX = (viewport.scrollLeft + localX - state.padX) / state.scale;
-            const contentY = (viewport.scrollTop + localY - state.padY) / state.scale;
+            const contentX = (state.viewport.scrollLeft + localX - state.padX) / state.scale;
+            const contentY = (state.viewport.scrollTop + localY - state.padY) / state.scale;
             state.scale = scale;
-            canvas.style.transform = `scale(${{scale}})`;
+            state.canvas.style.transform = `scale(${{scale}})`;
             refreshSurfaceFrame();
-            viewport.scrollLeft = Math.max(0, contentX * scale + state.padX - localX);
-            viewport.scrollTop = Math.max(0, contentY * scale + state.padY - localY);
+            state.viewport.scrollLeft = Math.max(0, contentX * scale + state.padX - localX);
+            state.viewport.scrollTop = Math.max(0, contentY * scale + state.padY - localY);
           }};
 
           window.__gs26NetworkGraphZoomDelta = (delta) => {{
-            const rect = viewport.getBoundingClientRect();
+            const rect = state.viewport.getBoundingClientRect();
             applyScale(state.scale + delta, rect.left + rect.width / 2, rect.top + rect.height / 2);
           }};
 
           window.__gs26NetworkGraphZoomReset = () => {{
             state.scale = 1.0;
-            canvas.style.transform = "scale(1)";
+            state.canvas.style.transform = "scale(1)";
+            refreshSurfaceFrame();
+            centerGraph();
+          }};
+
+          window.__gs26NetworkGraphRefresh = () => {{
             refreshSurfaceFrame();
             centerGraph();
           }};
 
           refreshSurfaceFrame();
           centerGraph();
+          window.requestAnimationFrame(() => {{
+            if (typeof window.__gs26NetworkGraphRefresh === "function") {{
+              window.__gs26NetworkGraphRefresh();
+            }}
+          }});
+          window.setTimeout(() => {{
+            if (typeof window.__gs26NetworkGraphRefresh === "function") {{
+              window.__gs26NetworkGraphRefresh();
+            }}
+          }}, 60);
+          if (state.listenersInstalled) return;
+          state.listenersInstalled = true;
+
           window.addEventListener("resize", () => {{
             refreshSurfaceFrame();
           }});
 
-          surface.addEventListener("pointerdown", (evt) => {{
+          document.addEventListener("pointerdown", (evt) => {{
+            if (evt.target !== state.surface && !state.surface.contains(evt.target)) return;
             const target = evt.target;
             if (target && typeof target.closest === "function" && target.closest("button")) {{
+              return;
+            }}
+            if (target && typeof target.closest === "function" && target.closest("[data-network-node='true'], [data-network-panel='true']")) {{
               return;
             }}
             state.pointers.set(evt.pointerId, {{ x: evt.clientX, y: evt.clientY }});
@@ -259,10 +431,9 @@ fn install_drag_handlers() {
               state.pinchScale = state.scale;
             }}
             try {{
-              surface.setPointerCapture(evt.pointerId);
+              state.surface.setPointerCapture(evt.pointerId);
             }} catch (_err) {{}}
             setCursor("grabbing");
-            evt.preventDefault();
           }});
 
           window.addEventListener("pointermove", (evt) => {{
@@ -283,8 +454,8 @@ fn install_drag_handlers() {
             if (!state.drag) return;
             const dx = state.drag.x - evt.clientX;
             const dy = state.drag.y - evt.clientY;
-            viewport.scrollLeft += dx;
-            viewport.scrollTop += dy;
+            state.viewport.scrollLeft += dx;
+            state.viewport.scrollTop += dy;
             state.drag = {{
               x: evt.clientX,
               y: evt.clientY,
@@ -294,6 +465,7 @@ fn install_drag_handlers() {
           }}, {{ passive: false }});
 
           window.addEventListener("pointerup", (evt) => {{
+            if (!state.pointers.has(evt.pointerId)) return;
             const dragged = !!(state.drag && state.drag.moved);
             state.suppressNextClick = state.suppressNextClick || dragged;
             state.pointers.delete(evt.pointerId);
@@ -313,11 +485,12 @@ fn install_drag_handlers() {
             }}
             setCursor("grab");
             try {{
-              surface.releasePointerCapture(evt.pointerId);
+              state.surface.releasePointerCapture(evt.pointerId);
             }} catch (_err) {{}}
           }});
 
-          surface.addEventListener("click", (evt) => {{
+          document.addEventListener("click", (evt) => {{
+            if (evt.target !== state.surface && !state.surface.contains(evt.target)) return;
             if (!state.suppressNextClick) return;
             state.suppressNextClick = false;
             evt.preventDefault();
@@ -325,9 +498,9 @@ fn install_drag_handlers() {
           }}, true);
         }})();
         "#,
-        viewport_id = GRAPH_VIEWPORT_ID,
-        surface_id = GRAPH_SURFACE_ID,
-        canvas_id = GRAPH_CANVAS_ID,
+        viewport_id = viewport_id,
+        surface_id = surface_id,
+        canvas_id = canvas_id,
         zoom_min = ZOOM_MIN,
         zoom_max = ZOOM_MAX,
         graph_width = GRAPH_WIDTH,
@@ -514,6 +687,7 @@ fn render_node(
 
     rsx! {
         div {
+            "data-network-node": "true",
             style: "position:absolute; left:{placement.x}px; top:{placement.y}px; width:{placement.size}px; height:{placement.size}px; transform:translate(-50%, -50%); \
                     border-radius:999px; border:2px solid {ring}; background:{bg}; color:{fg}; box-shadow:0 24px 50px rgba(2, 6, 23, 0.48); \
                     display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:14px; gap:6px; cursor:pointer; \
@@ -549,6 +723,7 @@ fn render_node(
             }
             if is_expanded {
                 div {
+                    "data-network-panel": "true",
                     style: "position:absolute; left:{panel_left}; right:{panel_right}; top:50%; transform:translateY(-50%); width:240px; padding:12px 14px; border-radius:14px; \
                             border:1px solid #334155; background:#020617; box-shadow:0 20px 40px rgba(2, 6, 23, 0.55); z-index:4; text-align:left;",
                     div { style: "font-size:0.73rem; color:#94a3b8; text-transform:uppercase; letter-spacing:0.08em;", "{kind} details" }
