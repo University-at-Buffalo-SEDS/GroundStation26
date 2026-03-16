@@ -690,7 +690,7 @@ def cleanup_linux_package_artifacts(frontend_dir: Path) -> None:
         return
 
     for item in sorted(dist.iterdir()):
-        if item.suffix.lower() in {".deb", ".rpm"}:
+        if item.suffix.lower() in {".deb", ".rpm", ".appimage"} or ".pkg.tar." in item.name:
             print(f"Removing stale Linux package artifact: {item.name}")
             _remove_path(item)
 
@@ -788,7 +788,10 @@ def _find_linux_app_binary(frontend_dir: Path, rust_target: Optional[str], debug
     target_root = frontend_dir.parent / "target"
     desktop_profile = "desktop-debug" if debug_mode else "desktop-release"
     effective_target = rust_target or _default_rust_target_for_frontend("linux")
+    profile = "debug" if debug_mode else "release"
+    pkg_name = _frontend_package_name(frontend_dir)
     search_roots: list[Path] = []
+    search_roots.append(target_root / "dx" / pkg_name / profile / "linux" / "app")
     if effective_target:
         search_roots.append(target_root / effective_target / desktop_profile)
     search_roots.append(target_root / desktop_profile)
@@ -868,17 +871,42 @@ def _stage_linux_app_payload(
         encoding="utf-8",
     )
 
-    icon_src = frontend_dir / "assets" / "icon.png"
-    if icon_src.exists():
+    pixmap_icon_src = frontend_dir / "icons" / "icon.png"
+    sized_icon_src = frontend_dir / "icons" / "256x256.png"
+    if not pixmap_icon_src.exists():
+        pixmap_icon_src = frontend_dir / "assets" / "icon.png"
+    if not sized_icon_src.exists():
+        sized_icon_src = pixmap_icon_src
+
+    if pixmap_icon_src.exists():
         pixmaps_dir = pkg_root / "usr" / "share" / "pixmaps"
         pixmaps_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(icon_src, pixmaps_dir / f"{LINUX_PACKAGE_NAME}.png")
+        shutil.copy2(pixmap_icon_src, pixmaps_dir / f"{LINUX_PACKAGE_NAME}.png")
 
         icons_dir = pkg_root / "usr" / "share" / "icons" / "hicolor" / "256x256" / "apps"
         icons_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(icon_src, icons_dir / f"{LINUX_PACKAGE_NAME}.png")
+        shutil.copy2(sized_icon_src, icons_dir / f"{LINUX_PACKAGE_NAME}.png")
 
     return temp_dir, pkg_root
+
+
+def _linux_pkg_arch(rust_target: Optional[str]) -> str:
+    target = (rust_target or "").lower()
+    if "aarch64" in target or "arm64" in target:
+        return "aarch64"
+    if "armv7" in target or "armhf" in target:
+        return "armv7h"
+    return "x86_64"
+
+
+def _resolve_linuxdeploy() -> Optional[Path]:
+    cache_candidate = Path.home() / ".cache" / "tauri" / "linuxdeploy-x86_64.AppImage"
+    if cache_candidate.is_file():
+        return cache_candidate
+    binary = _which_in_path("linuxdeploy", os.environ.get("PATH", ""))
+    if binary is not None:
+        return Path(binary)
+    return None
 
 
 def _clone_tree(src: Path, dst: Path) -> None:
@@ -1189,7 +1217,11 @@ def build_manual_linux_packages(
     dpkg_deb = _which_in_path("dpkg-deb", os.environ.get("PATH", ""))
     rpmbuild = _which_in_path("rpmbuild", os.environ.get("PATH", ""))
     if dpkg_deb is None and rpmbuild is None:
-        raise FileNotFoundError("Neither dpkg-deb nor rpmbuild was found, so Linux packages cannot be built.")
+        print(
+            "Warning: neither dpkg-deb nor rpmbuild was found; skipping manual .deb/.rpm packaging.",
+            file=sys.stderr,
+        )
+        return
 
     cleanup_linux_package_artifacts(frontend_dir)
     temp_dir, base_pkg_root = _stage_linux_app_payload(frontend_dir, rust_target, debug_mode)
@@ -1280,6 +1312,132 @@ def build_manual_linux_packages(
             print(f"✅ Linux rpm created: {rpm_path}")
         else:
             print("Warning: rpmbuild not found; skipping manual .rpm packaging.", file=sys.stderr)
+    finally:
+        temp_dir.cleanup()
+
+
+def build_manual_appimage(
+        frontend_dir: Path,
+        rust_target: Optional[str],
+        debug_mode: bool,
+) -> None:
+    linuxdeploy = _resolve_linuxdeploy()
+    if linuxdeploy is None:
+        print("Warning: linuxdeploy not found; skipping AppImage packaging.", file=sys.stderr)
+        return
+
+    temp_dir, base_pkg_root = _stage_linux_app_payload(frontend_dir, rust_target, debug_mode)
+    try:
+        appdir = Path(temp_dir.name) / "AppDir"
+        appdir.mkdir(parents=True, exist_ok=True)
+        for item in sorted(base_pkg_root.iterdir()):
+            target = appdir / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target)
+
+        env = os.environ.copy()
+        env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+        env["NO_STRIP"] = "1"
+        desktop_file = appdir / "usr" / "share" / "applications" / f"{LINUX_PACKAGE_NAME}.desktop"
+        icon_file = appdir / "usr" / "share" / "icons" / "hicolor" / "256x256" / "apps" / f"{LINUX_PACKAGE_NAME}.png"
+        run(
+            [
+                str(linuxdeploy),
+                "--appdir",
+                str(appdir),
+                "--desktop-file",
+                str(desktop_file),
+                "--icon-file",
+                str(icon_file),
+                "--output",
+                "appimage",
+            ],
+            cwd=Path(temp_dir.name),
+            env=env,
+        )
+
+        built = sorted(Path(temp_dir.name).glob("*.AppImage"))
+        if not built:
+            raise FileNotFoundError(f"Manual AppImage was not created under {temp_dir.name}")
+        arch = _linux_pkg_arch(rust_target)
+        dist = dist_dir(frontend_dir)
+        dist.mkdir(parents=True, exist_ok=True)
+        appimage_path = dist / f"{APP_NAME}_{arch}.AppImage"
+        shutil.copy2(built[-1], appimage_path)
+        print(f"✅ Linux AppImage created: {appimage_path}")
+    finally:
+        temp_dir.cleanup()
+
+
+def build_manual_arch_package(
+        frontend_dir: Path,
+        rust_target: Optional[str],
+        debug_mode: bool,
+) -> None:
+    makepkg = _which_in_path("makepkg", os.environ.get("PATH", ""))
+    if makepkg is None:
+        print("Warning: makepkg not found; skipping Arch package build.", file=sys.stderr)
+        return
+
+    temp_dir, base_pkg_root = _stage_linux_app_payload(frontend_dir, rust_target, debug_mode)
+    try:
+        version = _read_frontend_version(frontend_dir)
+        description = _read_workspace_description(frontend_dir.parent)
+        repo_url = "https://github.com/University-at-Buffalo-SEDS/GroundStation26"
+        arch = _linux_pkg_arch(rust_target)
+        build_root = Path(temp_dir.name) / "archpkg"
+        src_root = build_root / "src"
+        pkg_root = build_root / "pkgsrc"
+        src_root.mkdir(parents=True, exist_ok=True)
+        _clone_tree(base_pkg_root, pkg_root)
+
+        pkgbuild = build_root / "PKGBUILD"
+        pkgbuild.write_text(
+            "\n".join([
+                f"pkgname={LINUX_PACKAGE_NAME}",
+                f"pkgver={version}",
+                "pkgrel=1",
+                f'pkgdesc="{description}"',
+                f'arch=("{arch}")',
+                f'url="{repo_url}"',
+                'license=("custom")',
+                'depends=("gtk3" "webkit2gtk-4.1")',
+                "options=(!strip !debug)",
+                "",
+                "package() {",
+                f'  cp -a "{pkg_root}/." "$pkgdir/"',
+                "}",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+
+        dist = dist_dir(frontend_dir)
+        dist.mkdir(parents=True, exist_ok=True)
+        run(
+            [
+                str(makepkg),
+                "--force",
+                "--nodeps",
+                "--cleanbuild",
+                "--skippgpcheck",
+                "--holdver",
+            ],
+            cwd=build_root,
+        )
+
+        built = sorted(build_root.glob(f"{LINUX_PACKAGE_NAME}-{version}-1-{arch}.pkg.tar.*"))
+        if not built:
+            raise FileNotFoundError(f"Manual Arch package was not created under {build_root}")
+        built_pkg = built[-1]
+        built_name = built_pkg.name
+        suffix_start = built_name.find(".pkg.tar.")
+        built_suffix = built_name[suffix_start:] if suffix_start != -1 else "".join(built_pkg.suffixes[-3:])
+        pkg_path = dist / f"{APP_NAME}_{arch}{built_suffix}"
+        shutil.copy2(built_pkg, pkg_path)
+        print(f"✅ Linux Arch package created: {pkg_path}")
     finally:
         temp_dir.cleanup()
 
@@ -2688,6 +2846,63 @@ def _ensure_windows_icon_compat(frontend_dir: Path) -> None:
         )
 
 
+def _ensure_bundle_icon_compat(frontend_dir: Path) -> None:
+    src_png = frontend_dir / "assets" / "icon.png"
+    if not src_png.exists():
+        print(f"Warning: bundle icon source not found: {src_png}", file=sys.stderr)
+        return
+
+    icons_dir = frontend_dir / "icons"
+    icons_dir.mkdir(parents=True, exist_ok=True)
+
+    src_ico = frontend_dir / "assets" / "icon.ico"
+    dst_ico = icons_dir / "icon.ico"
+    if src_ico.exists():
+        shutil.copy2(src_ico, dst_ico)
+
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:
+        print(
+            "Warning: Pillow not available; cannot generate desktop bundle icon set.",
+            file=sys.stderr,
+        )
+        fallback_targets = [
+            icons_dir / "32x32.png",
+            icons_dir / "64x64.png",
+            icons_dir / "128x128.png",
+            icons_dir / "128x128@2x.png",
+            icons_dir / "256x256.png",
+            icons_dir / "icon.png",
+        ]
+        for target in fallback_targets:
+            shutil.copy2(src_png, target)
+        return
+
+    try:
+        img = Image.open(src_png).convert("RGBA")
+    except Exception as exc:
+        print(f"Warning: failed to open bundle icon source {src_png}: {exc}", file=sys.stderr)
+        return
+
+    icon_targets = {
+        "32x32.png": 32,
+        "64x64.png": 64,
+        "128x128.png": 128,
+        "128x128@2x.png": 256,
+        "256x256.png": 256,
+        "icon.png": 512,
+    }
+    for filename, size in icon_targets.items():
+        img.resize((size, size), Image.LANCZOS).save(icons_dir / filename, format="PNG")
+
+    if not dst_ico.exists():
+        try:
+            img.save(dst_ico, format="ICO", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+        except Exception as exc:
+            print(f"Warning: failed generating bundle icon ICO {dst_ico}: {exc}", file=sys.stderr)
+
+
 def _ensure_android_icon_compat(frontend_dir: Path, app_src_main: Path) -> None:
     src_png = frontend_dir / "assets" / "icon.png"
     if not src_png.exists():
@@ -2776,6 +2991,7 @@ def build_frontend(
         android_package_type: Optional[str] = None,
 ) -> None:
     try:
+        linux_bundle_partial = False
         public_dir = frontend_dir / "dist" / "public"
         is_web_build = platform_name in {None, "web"}
 
@@ -2786,6 +3002,8 @@ def build_frontend(
             _clear_dx_web_cache(frontend_dir)
         elif platform_name == "android":
             clear_generated_android_project(frontend_dir, debug_mode)
+        else:
+            _ensure_bundle_icon_compat(frontend_dir)
 
         if not is_web_build:
             clear_app_bundle(frontend_dir)
@@ -2803,6 +3021,8 @@ def build_frontend(
                 env = os.environ.copy()
             env["DIOXUS_PRODUCT_NAME"] = LINUX_PACKAGE_NAME
             env["DIOXUS_APP_TITLE"] = WINDOWS_APP_NAME
+            env.setdefault("APPIMAGE_EXTRACT_AND_RUN", "1")
+            env.setdefault("NO_STRIP", "1")
 
         ensured_wasm_bindgen = _ensure_wasm_bindgen_cli(frontend_dir, env)
         if env is not None and ensured_wasm_bindgen is not None:
@@ -2889,6 +3109,15 @@ def build_frontend(
                             os.environ.pop("GS_WASM_BINDGEN_CLI_VERSION", None)
                         else:
                             os.environ["GS_WASM_BINDGEN_CLI_VERSION"] = prior_override
+            elif (
+                    platform_name == "linux"
+                    and (frontend_dir.parent / "target" / "dx" / _frontend_package_name(frontend_dir) / ("debug" if debug_mode else "release") / "linux" / "app").exists()
+            ):
+                print(
+                    "Warning: dx linux bundler failed after staging the app payload; falling back to manual AppImage packaging.",
+                    file=sys.stderr,
+                )
+                linux_bundle_partial = True
             else:
                 raise
 
@@ -2905,12 +3134,16 @@ def build_frontend(
             remove_legacy_dmgs(frontend_dir)
             sign_macos_app_and_dmg(frontend_dir)
         elif platform_name in {"windows", "linux"}:
-            rename_windows_linux_artifacts(frontend_dir, platform_name)
+            if not (platform_name == "linux" and linux_bundle_partial):
+                rename_windows_linux_artifacts(frontend_dir, platform_name)
             if platform_name == "windows":
                 build_manual_windows_installer(frontend_dir, rust_target, debug_mode)
             else:
-                patch_linux_bundle_metadata(frontend_dir)
+                if not linux_bundle_partial:
+                    patch_linux_bundle_metadata(frontend_dir)
+                build_manual_appimage(frontend_dir, rust_target, debug_mode)
                 build_manual_linux_packages(frontend_dir, rust_target, debug_mode)
+                build_manual_arch_package(frontend_dir, rust_target, debug_mode)
         elif platform_name == "android":
             rename_android_artifacts(frontend_dir)
             if android_package_type != "aab":
