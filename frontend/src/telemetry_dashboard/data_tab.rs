@@ -8,6 +8,7 @@ use super::data_chart::{
     ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, combined_battery_chart_key,
     series_color,
 };
+use super::{TELEMETRY_RENDER_EPOCH, latest_telemetry_row, latest_telemetry_value};
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
 const BATTERY_RUNTIME_TAB_ID: &str = "BATTERY_RUNTIME";
@@ -33,11 +34,11 @@ fn localstorage_set(key: &str, value: &str) {
 
 #[component]
 pub fn DataTab(
-    rows: Signal<Vec<TelemetryRow>>,
     active_tab: Signal<String>,
     layout: DataTabLayout,
     battery_sources: Vec<BatterySourceConfig>,
 ) -> Element {
+    let _ = *TELEMETRY_RENDER_EPOCH.read();
     let mut is_fullscreen = use_signal(|| false);
     let mut show_chart = use_signal(|| true);
 
@@ -111,12 +112,7 @@ pub fn DataTab(
         .unwrap_or(true);
 
     // Latest row for summary cards (scan backward; no sort/filter allocations)
-    let rows_snapshot = rows.read();
-    let latest_row = rows_snapshot
-        .iter()
-        .rev()
-        .find(|r| r.data_type == current)
-        .cloned();
+    let latest_row = latest_telemetry_row(&current, None);
     let battery_card_rows: Vec<(&BatterySourceConfig, Option<TelemetryRow>)> = battery_sources
         .iter()
         .filter(|source| {
@@ -127,11 +123,7 @@ pub fn DataTab(
                 || source.remaining_minutes_data_type == current
         })
         .map(|source| {
-            let row = rows_snapshot
-                .iter()
-                .rev()
-                .find(|r| r.data_type == current && r.sender_id == source.sender_id)
-                .cloned();
+            let row = latest_telemetry_row(&current, Some(&source.sender_id));
             (source, row)
         })
         .collect();
@@ -143,9 +135,9 @@ pub fn DataTab(
         })
         .collect();
     let synthetic_cards = if is_battery_runtime_tab {
-        battery_runtime_cards(&rows_snapshot, &battery_sources)
+        battery_runtime_cards(&battery_sources)
     } else if is_loadcell_tab {
-        loadcell_cards(&rows_snapshot)
+        loadcell_cards()
     } else {
         Vec::new()
     };
@@ -188,7 +180,7 @@ pub fn DataTab(
     // IMPORTANT: We do NOT fetch fullscreen geometry here anymore.
     // That avoids doing two cache builds every frame (w,h=360 and w,h=full),
     // which can interact badly with "window span" behavior and costs extra CPU.
-    let (paths, y_min, y_max, span_min) =
+    let (chunks, y_min, y_max, span_min) =
         charts_cache_get(&chart_key, view_w as f32, view_h as f32);
     let (chan_min, chan_max) =
         charts_cache_get_channel_minmax(&chart_key, view_w as f32, view_h as f32);
@@ -349,7 +341,7 @@ pub fn DataTab(
                                     ChartCanvas {
                                         view_w: view_w,
                                         view_h: view_h,
-                                        paths: paths.clone(),
+                                        chunks: chunks.clone(),
                                         style: "position:absolute; inset:0; width:100%; height:100%; display:block;".to_string(),
                                     }
                                     div { style: "position:absolute; inset:0; pointer-events:none; font-size:10px; color:#94a3b8;",
@@ -385,7 +377,7 @@ pub fn DataTab(
         // =========================
         if is_graph_allowed && *is_fullscreen.read() {
             {
-                let (paths_full, _y_min2, _y_max2, _span_min2) =
+                let (chunks_full, _y_min2, _y_max2, _span_min2) =
                     charts_cache_get(&chart_key, view_w as f32, view_h_full as f32);
 
                 rsx! {
@@ -405,7 +397,7 @@ pub fn DataTab(
                                 ChartCanvas {
                                     view_w: view_w,
                                     view_h: view_h_full,
-                                    paths: paths_full,
+                                    chunks: chunks_full,
                                     style: "position:absolute; inset:0; width:100%; height:100%; display:block;".to_string(),
                                 }
                                 div { style: "position:absolute; inset:0; pointer-events:none; font-size:10px; color:#94a3b8;",
@@ -441,30 +433,17 @@ fn summary_color(i: usize) -> &'static str {
     series_color(i)
 }
 
-fn latest_value_for(
-    rows: &[TelemetryRow],
-    data_type: &str,
-    sender_id: Option<&str>,
-) -> Option<f32> {
-    rows.iter()
-        .rev()
-        .find(|row| {
-            row.data_type == data_type && sender_id.is_none_or(|sender| row.sender_id == sender)
-        })
-        .and_then(|row| row.values.first().copied().flatten())
+fn latest_value_for(data_type: &str, sender_id: Option<&str>) -> Option<f32> {
+    latest_telemetry_value(data_type, sender_id, 0)
 }
 
-fn battery_runtime_cards(
-    rows: &[TelemetryRow],
-    battery_sources: &[BatterySourceConfig],
-) -> Vec<(String, String)> {
+fn battery_runtime_cards(battery_sources: &[BatterySourceConfig]) -> Vec<(String, String)> {
     let mut cards = Vec::new();
     for source in battery_sources {
         let prefix = source.label.clone();
         cards.push((
             format!("{prefix} %"),
             fmt_opt(latest_value_for(
-                rows,
                 &source.percent_data_type,
                 Some(&source.sender_id),
             )),
@@ -472,7 +451,6 @@ fn battery_runtime_cards(
         cards.push((
             format!("{prefix} Drop"),
             fmt_opt(latest_value_for(
-                rows,
                 &source.drop_rate_data_type,
                 Some(&source.sender_id),
             )),
@@ -480,7 +458,6 @@ fn battery_runtime_cards(
         cards.push((
             format!("{prefix} Runtime"),
             fmt_opt(latest_value_for(
-                rows,
                 &source.remaining_minutes_data_type,
                 Some(&source.sender_id),
             )),
@@ -489,19 +466,19 @@ fn battery_runtime_cards(
     cards
 }
 
-fn loadcell_cards(rows: &[TelemetryRow]) -> Vec<(String, String)> {
+fn loadcell_cards() -> Vec<(String, String)> {
     vec![
         (
             "Raw Loadcell".to_string(),
-            fmt_opt(latest_value_for(rows, "KG1000", None)),
+            fmt_opt(latest_value_for("KG1000", None)),
         ),
         (
             "Weight (kg)".to_string(),
-            fmt_opt(latest_value_for(rows, "LOADCELL_WEIGHT_KG", None)),
+            fmt_opt(latest_value_for("LOADCELL_WEIGHT_KG", None)),
         ),
         (
             "Fill %".to_string(),
-            fmt_opt(latest_value_for(rows, "LOADCELL_FILL_PERCENT", None)),
+            fmt_opt(latest_value_for("LOADCELL_FILL_PERCENT", None)),
         ),
     ]
 }

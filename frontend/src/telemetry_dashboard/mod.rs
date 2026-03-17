@@ -52,7 +52,7 @@ use state_tab::StateTab;
 use types::{BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryRow};
 use warnings_tab::WarningsTab;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -475,6 +475,81 @@ pub const HISTORY_MS: i64 = 60_000 * 20; // 20 minutes
 const UI_ROW_BUCKET_MS: i64 = 20; // Match chart bucket width in data_chart.rs.
 const STARTUP_SEED_DELAY_MS: u64 = 1_200;
 
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct UiRowKey {
+    bucket: i64,
+    data_type: String,
+    sender_id: String,
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct LatestTelemetryKey {
+    data_type: String,
+    sender_id: String,
+}
+
+impl LatestTelemetryKey {
+    fn new(data_type: &str, sender_id: &str) -> Self {
+        Self {
+            data_type: data_type.to_string(),
+            sender_id: sender_id.to_string(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct UiTelemetryStore {
+    rows: BTreeMap<UiRowKey, TelemetryRow>,
+}
+
+impl UiTelemetryStore {
+    fn clear(&mut self) {
+        self.rows.clear();
+    }
+
+    fn replace_from_rows(&mut self, rows: &[TelemetryRow]) {
+        self.rows.clear();
+        self.apply_rows(rows.iter().cloned());
+    }
+
+    fn apply_rows<I>(&mut self, rows: I)
+    where
+        I: IntoIterator<Item = TelemetryRow>,
+    {
+        for row in rows {
+            let key = UiRowKey {
+                bucket: row.timestamp_ms.div_euclid(UI_ROW_BUCKET_MS),
+                data_type: row.data_type.clone(),
+                sender_id: row.sender_id.clone(),
+            };
+            self.rows.insert(key, row);
+        }
+
+        self.prune_history();
+    }
+
+    fn prune_history(&mut self) {
+        let Some((&newest_bucket, _)) = self.rows.last_key_value().map(|(k, v)| (&k.bucket, v))
+        else {
+            return;
+        };
+        let min_bucket =
+            (newest_bucket * UI_ROW_BUCKET_MS - HISTORY_MS).div_euclid(UI_ROW_BUCKET_MS);
+        self.rows.retain(|key, _| key.bucket >= min_bucket);
+    }
+
+    fn snapshot(&self) -> Vec<TelemetryRow> {
+        self.rows.values().cloned().collect()
+    }
+}
+
+static UI_TELEMETRY_STORE: Lazy<Mutex<UiTelemetryStore>> =
+    Lazy::new(|| Mutex::new(UiTelemetryStore::default()));
+static LATEST_TELEMETRY: Lazy<Mutex<HashMap<LatestTelemetryKey, TelemetryRow>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static LATEST_TELEMETRY_BY_TYPE: Lazy<Mutex<HashMap<String, TelemetryRow>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 fn sort_rows(rows: &mut [TelemetryRow]) {
     rows.sort_by(|a, b| {
         a.timestamp_ms
@@ -507,6 +582,102 @@ fn compact_rows_for_ui(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
     out
 }
 
+fn reset_latest_telemetry(rows: &[TelemetryRow]) {
+    if let Ok(mut latest) = LATEST_TELEMETRY.lock() {
+        if let Ok(mut latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock() {
+            latest.clear();
+            latest_by_type.clear();
+            for row in rows {
+                update_latest_telemetry_locked(&mut latest, &mut latest_by_type, row);
+            }
+        }
+    }
+}
+
+fn update_latest_telemetry(row: &TelemetryRow) {
+    if let Ok(mut latest) = LATEST_TELEMETRY.lock() {
+        if let Ok(mut latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock() {
+            update_latest_telemetry_locked(&mut latest, &mut latest_by_type, row);
+        }
+    }
+}
+
+fn update_latest_telemetry_locked(
+    latest: &mut HashMap<LatestTelemetryKey, TelemetryRow>,
+    latest_by_type: &mut HashMap<String, TelemetryRow>,
+    row: &TelemetryRow,
+) {
+    let key = LatestTelemetryKey::new(&row.data_type, &row.sender_id);
+    let should_replace = latest
+        .get(&key)
+        .is_none_or(|existing| existing.timestamp_ms <= row.timestamp_ms);
+    if should_replace {
+        latest.insert(key, row.clone());
+    }
+
+    let should_replace_type = latest_by_type
+        .get(&row.data_type)
+        .is_none_or(|existing| existing.timestamp_ms <= row.timestamp_ms);
+    if should_replace_type {
+        latest_by_type.insert(row.data_type.clone(), row.clone());
+    }
+}
+
+pub(crate) fn latest_telemetry_row(
+    data_type: &str,
+    sender_id: Option<&str>,
+) -> Option<TelemetryRow> {
+    match sender_id {
+        Some(sender_id) => {
+            if let Ok(latest) = LATEST_TELEMETRY.lock() {
+                latest
+                    .get(&LatestTelemetryKey::new(data_type, sender_id))
+                    .cloned()
+            } else {
+                None
+            }
+        }
+        None => {
+            if let Ok(latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock() {
+                latest_by_type.get(data_type).cloned()
+            } else {
+                None
+            }
+        }
+    }
+}
+
+pub(crate) fn latest_telemetry_value(
+    data_type: &str,
+    sender_id: Option<&str>,
+    index: usize,
+) -> Option<f32> {
+    latest_telemetry_row(data_type, sender_id)
+        .and_then(|row| row.values.get(index).copied().flatten())
+}
+
+fn clear_ui_telemetry_store() {
+    if let Ok(mut store) = UI_TELEMETRY_STORE.lock() {
+        store.clear();
+    }
+    if let Ok(mut latest) = LATEST_TELEMETRY.lock() {
+        latest.clear();
+    }
+    if let Ok(mut latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock() {
+        latest_by_type.clear();
+    }
+    let mut epoch = TELEMETRY_RENDER_EPOCH.write();
+    *epoch = epoch.wrapping_add(1);
+}
+
+fn ui_telemetry_rows_snapshot() -> Vec<TelemetryRow> {
+    if let Ok(store) = UI_TELEMETRY_STORE.lock() {
+        store.snapshot()
+    } else {
+        Vec::new()
+    }
+}
+
 // unified storage keys
 const WARNING_ACK_STORAGE_KEY: &str = "gs_last_warning_ack_ts";
 const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
@@ -522,6 +693,7 @@ const MAX_NOTIFICATION_HISTORY: usize = 500;
 
 // When this number changes, we tear down and rebuild the websocket connection.
 static WS_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
+static TELEMETRY_RENDER_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 
 #[cfg(target_arch = "wasm32")]
 static WS_RAW: GlobalSignal<Option<web_sys::WebSocket>> = Signal::global(|| None);
@@ -811,6 +983,7 @@ fn clear_telemetry_runtime_buffers() {
     if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
         q.clear();
     }
+    clear_ui_telemetry_store();
 }
 
 // ---------- Cross-platform WS handle ----------
@@ -892,8 +1065,6 @@ fn TelemetryDashboardInner() -> Element {
     // ----------------------------
     // Live app state
     // ----------------------------
-    let rows = use_signal(Vec::<TelemetryRow>::new);
-
     let active_data_tab = use_signal(|| st_data_tab.read().clone());
     let warnings = use_signal(Vec::<AlertMsg>::new);
     let errors = use_signal(Vec::<AlertMsg>::new);
@@ -1124,18 +1295,17 @@ fn TelemetryDashboardInner() -> Element {
     // ------------------------------------------------------------------------
     {
         let alive = alive.clone();
-        let mut rows_s = rows;
 
         use_effect(move || {
             let alive = alive.clone();
             let epoch = *WS_EPOCH.read();
 
             spawn(async move {
-                // Target ~120 FPS. In browsers this often ends up ~60 FPS depending on clamps.
+                // Default to ~60 FPS; Linux WebKitGTK tends to degrade when we flush harder.
                 let tick_ms: u32 = std::env::var("GS_UI_TICK_MS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(4)
+                    .unwrap_or(16)
                     .clamp(1, 50);
 
                 while alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
@@ -1161,23 +1331,11 @@ fn TelemetryDashboardInner() -> Element {
                         continue;
                     }
 
-                    // Append + prune in one write
-                    {
-                        let mut v = rows_s.write();
-                        v.extend(drained);
-
-                        // Time prune to HISTORY_MS using newest timestamp
-                        if let Some(last) = v.last() {
-                            let cutoff = last.timestamp_ms - HISTORY_MS;
-                            let split = v.partition_point(|r| r.timestamp_ms < cutoff);
-                            if split > 0 {
-                                v.drain(0..split);
-                            }
-                        }
-
-                        // Hard cap to keep UI/state light (avoid pathological growth)
-                        *v = compact_rows_for_ui(std::mem::take(&mut *v));
+                    if let Ok(mut store) = UI_TELEMETRY_STORE.lock() {
+                        store.apply_rows(drained);
                     }
+                    let mut render_epoch = TELEMETRY_RENDER_EPOCH.write();
+                    *render_epoch = render_epoch.wrapping_add(1);
                 }
             });
         });
@@ -1187,7 +1345,6 @@ fn TelemetryDashboardInner() -> Element {
     {
         let mut last_seed_epoch = use_signal(|| None::<u64>);
 
-        let mut rows_s = rows;
         let mut warnings_s = warnings;
         let mut errors_s = errors;
         let mut board_status_s = board_status;
@@ -1233,7 +1390,6 @@ fn TelemetryDashboardInner() -> Element {
                 const RESEED_ATTEMPTS: usize = 3;
                 for attempt in 1..=RESEED_ATTEMPTS {
                     let res = seed_from_db(
-                        &mut rows_s,
                         &mut warnings_s,
                         &mut errors_s,
                         &mut notifications_s,
@@ -1449,7 +1605,6 @@ fn TelemetryDashboardInner() -> Element {
 
                 if let Err(e) = connect_ws_supervisor(
                     epoch,
-                    rows,
                     warnings,
                     errors,
                     notifications,
@@ -1609,8 +1764,6 @@ fn TelemetryDashboardInner() -> Element {
     };
 
     // Reload button (web: full reload, native: remount inner UI)
-    #[cfg(not(target_arch = "wasm32"))]
-    let mut rows = rows;
     let mut _refresh_layout = refresh_layout;
     let reload_button: Element = rsx! {
         button {
@@ -1631,7 +1784,7 @@ fn TelemetryDashboardInner() -> Element {
                 // Native reload should visibly clear graph history immediately.
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    rows.set(Vec::new());
+                    clear_ui_telemetry_store();
                     charts_cache_reset_and_ingest(&[]);
                 }
 
@@ -2120,7 +2273,6 @@ fn TelemetryDashboardInner() -> Element {
                         div { style: "height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto;",
                                 StateTab {
                                     flight_state: flight_state,
-                                    rows: rows,
                                     board_status: board_status,
                                     rocket_gps: rocket_gps,
                                     user_gps: user_gps,
@@ -2165,7 +2317,7 @@ fn TelemetryDashboardInner() -> Element {
                     },
                     MainTab::Calibration => rsx! {
                         div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
-                            CalibrationTab { rows: rows }
+                            CalibrationTab {}
                         }
                     },
                     MainTab::Notifications => rsx! {
@@ -2185,7 +2337,6 @@ fn TelemetryDashboardInner() -> Element {
                     },
                     MainTab::Data => rsx! {
                         DataTab {
-                            rows: rows,
                             active_tab: active_data_tab,
                             layout: layout.data_tab.clone(),
                             battery_sources: layout.battery.sources.clone(),
@@ -2634,7 +2785,6 @@ fn apply_notifications_snapshot(
 // ------------------------------
 #[allow(clippy::too_many_arguments)]
 async fn seed_from_db(
-    rows: &mut Signal<Vec<TelemetryRow>>,
     warnings: &mut Signal<Vec<AlertMsg>>,
     errors: &mut Signal<Vec<AlertMsg>>,
     notifications: &mut Signal<Vec<PersistentNotification>>,
@@ -2690,7 +2840,7 @@ async fn seed_from_db(
     }
 
     // ---- Telemetry history (/api/recent) ----
-    let existing_rows_before_seed = rows.read().clone();
+    let existing_rows_before_seed = ui_telemetry_rows_snapshot();
     match http_get_json::<Vec<TelemetryRow>>("/api/recent").await {
         Ok(mut list) => {
             if !alive.load(Ordering::Relaxed) {
@@ -2702,9 +2852,9 @@ async fn seed_from_db(
             list = compact_rows_for_ui(list);
 
             // Capture rows that arrived while reseed was running and keep them.
-            let mut live_rows = rows.read().clone();
+            let mut live_rows = ui_telemetry_rows_snapshot();
             live_rows.extend(queue_snapshot());
-            live_rows.extend(rows.read().clone());
+            live_rows.extend(ui_telemetry_rows_snapshot());
             live_rows.extend(queue_snapshot());
             if !live_rows.is_empty() {
                 sort_rows(&mut live_rows);
@@ -2759,7 +2909,12 @@ async fn seed_from_db(
                 // Atomically swap the prepared reseed cache in.
                 charts_cache_finish_reseed_build();
             }
-            rows.set(list);
+            if let Ok(mut store) = UI_TELEMETRY_STORE.lock() {
+                store.replace_from_rows(&list);
+            }
+            reset_latest_telemetry(&list);
+            let mut render_epoch = TELEMETRY_RENDER_EPOCH.write();
+            *render_epoch = render_epoch.wrapping_add(1);
         }
         Err(err) => {
             if existing_rows_before_seed.is_empty() {
@@ -2873,7 +3028,6 @@ async fn seed_from_db(
 #[allow(clippy::too_many_arguments)]
 async fn connect_ws_supervisor(
     epoch: u64,
-    rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
@@ -2910,7 +3064,6 @@ async fn connect_ws_supervisor(
             {
                 connect_ws_once_wasm(
                     epoch,
-                    rows,
                     warnings,
                     errors,
                     notifications,
@@ -2935,7 +3088,6 @@ async fn connect_ws_supervisor(
             {
                 connect_ws_once_native(
                     epoch,
-                    rows,
                     warnings,
                     errors,
                     notifications,
@@ -2983,7 +3135,6 @@ async fn connect_ws_supervisor(
 #[cfg(target_arch = "wasm32")]
 async fn connect_ws_once_wasm(
     epoch: u64,
-    rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
@@ -3036,7 +3187,6 @@ async fn connect_ws_once_wasm(
             if let Some(s) = e.data().as_string() {
                 handle_ws_message(
                     &s,
-                    rows,
                     warnings,
                     errors,
                     notifications,
@@ -3119,7 +3269,6 @@ async fn connect_ws_once_wasm(
 #[allow(clippy::too_many_arguments)]
 async fn connect_ws_once_native(
     epoch: u64,
-    rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
@@ -3199,7 +3348,6 @@ async fn connect_ws_once_native(
         if let tokio_tungstenite::tungstenite::Message::Text(s) = msg {
             handle_ws_message(
                 &s,
-                rows,
                 warnings,
                 errors,
                 notifications,
@@ -3232,7 +3380,6 @@ async fn connect_ws_once_native(
 #[allow(clippy::too_many_arguments)]
 fn handle_ws_message(
     s: &str,
-    rows: Signal<Vec<TelemetryRow>>,
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
@@ -3265,9 +3412,6 @@ fn handle_ws_message(
     let mut rocket_gps = rocket_gps;
     let _user_gps = user_gps;
 
-    // NOTE: `rows` is no longer written here; we batch-update it in the UI flush loop.
-    let _rows = rows;
-
     let Ok(msg) = serde_json::from_str::<WsInMsg>(s) else {
         return;
     };
@@ -3275,6 +3419,7 @@ fn handle_ws_message(
     match msg {
         WsInMsg::Telemetry(row) => {
             charts_cache_ingest_row(&row);
+            update_latest_telemetry(&row);
             if RESEED_IN_PROGRESS.load(Ordering::Relaxed)
                 && let Ok(mut v) = RESEED_LIVE_BUFFER.lock()
             {
@@ -3304,6 +3449,7 @@ fn handle_ws_message(
             if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
                 for row in batch {
                     charts_cache_ingest_row(&row);
+                    update_latest_telemetry(&row);
                     if RESEED_IN_PROGRESS.load(Ordering::Relaxed)
                         && let Ok(mut v) = RESEED_LIVE_BUFFER.lock()
                     {

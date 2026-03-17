@@ -10,7 +10,7 @@ use super::layout::{
     StateWidget, StateWidgetKind, SummaryItem, ValveColor, ValveColorSet,
 };
 use super::types::{BoardStatusEntry, FlightState, TelemetryRow};
-use super::{ActionPolicyMsg, BlinkMode};
+use super::{ActionPolicyMsg, BlinkMode, latest_telemetry_row, latest_telemetry_value};
 
 use crate::telemetry_dashboard::data_chart::{
     ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, series_color,
@@ -62,11 +62,11 @@ fn action_opacity(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn target_frame_duration() -> std::time::Duration {
-    // Default 240fps; override with GS_UI_FPS=60 etc.
+    // Default 60fps; override with GS_UI_FPS if needed.
     let fps: u64 = std::env::var("GS_UI_FPS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(240);
+        .unwrap_or(60);
 
     let fps = fps.clamp(1, 480);
     std::time::Duration::from_micros(1_000_000 / fps)
@@ -75,7 +75,6 @@ fn target_frame_duration() -> std::time::Duration {
 #[component]
 pub fn StateTab(
     flight_state: Signal<FlightState>,
-    rows: Signal<Vec<TelemetryRow>>,
     board_status: Signal<Vec<BoardStatusEntry>>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
@@ -177,7 +176,6 @@ pub fn StateTab(
     let _ = *redraw_tick.read();
 
     let state = *flight_state.read();
-    let rows_snapshot = rows.read();
     let boards_snapshot = board_status.read();
     let actions_snapshot = actions.actions.clone();
     let action_policy_snapshot = action_policy.read().clone();
@@ -191,7 +189,6 @@ pub fn StateTab(
             for section in state_layout.sections.iter() {
                 {render_state_section(
                     section,
-                    &rows_snapshot,
                     &boards_snapshot,
                     &data_layout,
                     &actions_snapshot,
@@ -233,7 +230,6 @@ fn Section(title: String, children: Element) -> Element {
 
 fn render_state_section(
     section: &StateSection,
-    rows: &[TelemetryRow],
     boards: &[BoardStatusEntry],
     data_layout: &DataTabLayout,
     actions: &[ActionSpec],
@@ -255,7 +251,6 @@ fn render_state_section(
             for widget in section.widgets.iter() {
                 {render_state_widget(
                     widget,
-                    rows,
                     boards,
                     data_layout,
                     actions,
@@ -271,7 +266,6 @@ fn render_state_section(
 
 fn render_state_widget(
     widget: &StateWidget,
-    rows: &[TelemetryRow],
     boards: &[BoardStatusEntry],
     data_layout: &DataTabLayout,
     actions: &[ActionSpec],
@@ -288,7 +282,7 @@ fn render_state_widget(
             if dt.is_empty() {
                 rsx! { div { style: "color:#94a3b8; font-size:12px;", "Missing summary data_type" } }
             } else {
-                rsx! { {summary_row(rows, dt, items)} }
+                rsx! { {summary_row(dt, items)} }
             }
         }
         StateWidgetKind::Chart => {
@@ -305,7 +299,6 @@ fn render_state_widget(
         StateWidgetKind::ValveState => {
             let labels = widget.boolean_labels.as_ref().or(default_valve_labels);
             rsx! { {valve_state_grid(
-                rows,
                 widget.valves.as_deref(),
                 widget.valve_colors.as_ref(),
                 labels,
@@ -351,7 +344,7 @@ fn data_style_chart_cached(
     let w = view_w as f32;
     let h = view_h as f32;
 
-    let (paths, y_min, y_max, span_min) = charts_cache_get(dt, w, h);
+    let (chunks, y_min, y_max, span_min) = charts_cache_get(dt, w, h);
 
     let left = 60.0_f64;
     let right = view_w - 20.0_f64;
@@ -374,7 +367,7 @@ fn data_style_chart_cached(
                 ChartCanvas {
                     view_w: view_w,
                     view_h: view_h,
-                    paths: paths,
+                    chunks: chunks,
                     style: "position:absolute; inset:0; width:100%; height:100%; display:block;".to_string(),
                 }
                 div { style: "position:absolute; inset:0; pointer-events:none; font-size:10px; color:#94a3b8;",
@@ -417,18 +410,14 @@ fn labels_from_layout(data_layout: &DataTabLayout, dt: &str) -> Vec<String> {
 // ============================================================
 
 fn valve_state_grid(
-    rows: &[TelemetryRow],
     valves: Option<&[SummaryItem]>,
     colors: Option<&ValveColorSet>,
     labels: Option<&BooleanLabels>,
     valve_labels: Option<&[BooleanLabels]>,
 ) -> Element {
-    let latest = rows
-        .iter()
-        .filter(|r| r.data_type == "VALVE_STATE")
-        .max_by_key(|r| r.timestamp_ms);
+    let latest = latest_telemetry_row("VALVE_STATE", None);
 
-    let Some(row) = latest else {
+    let Some(row) = latest.as_ref() else {
         return rsx! { div { style: "color:#94a3b8; font-size:12px;", "No valve state yet." } };
     };
 
@@ -686,7 +675,7 @@ fn action_style(
     )
 }
 
-fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[SummaryItem]) -> Element {
+fn summary_row(dt: &str, items: &[SummaryItem]) -> Element {
     let want_minmax = dt != "VALVE_STATE" && dt != "GPS_DATA";
 
     let (chan_min, chan_max) = if want_minmax {
@@ -697,13 +686,7 @@ fn summary_row(rows: &[TelemetryRow], dt: &str, items: &[SummaryItem]) -> Elemen
 
     let latest = items
         .iter()
-        .map(|item| {
-            (
-                item.label.clone(),
-                item.index,
-                latest_value(rows, dt, item.index),
-            )
-        })
+        .map(|item| (item.label.clone(), item.index, latest_value(dt, item.index)))
         .collect::<Vec<_>>();
 
     rsx! {
@@ -738,11 +721,8 @@ fn SummaryCard(label: String, value: String, min: Option<String>, max: Option<St
     }
 }
 
-fn latest_value(rows: &[TelemetryRow], dt: &str, idx: usize) -> Option<f32> {
-    rows.iter()
-        .filter(|r| r.data_type == dt)
-        .max_by_key(|r| r.timestamp_ms)
-        .and_then(|r| value_at(r, idx))
+fn latest_value(dt: &str, idx: usize) -> Option<f32> {
+    latest_telemetry_value(dt, None, idx)
 }
 
 fn value_at(row: &TelemetryRow, idx: usize) -> Option<f32> {

@@ -79,6 +79,8 @@ const LIVE_BUCKETS_BACK: i64 = 3;
 const MAX_INTERP_POINTS_PER_GAP: i64 = 64;
 // Only bridge short gaps (packet jitter). Large gaps should remain visually broken.
 const MAX_INTERP_GAP_BUCKETS: i64 = 6;
+const RENDER_CHUNK_MS: i64 = 20_000;
+const RENDER_CHUNK_BUCKETS: i64 = RENDER_CHUNK_MS / BUCKET_MS;
 
 // Avoid zero span
 const MIN_SPAN_MS: i64 = 1_000;
@@ -164,10 +166,14 @@ pub fn charts_cache_ingest_row(row: &TelemetryRow) {
 }
 
 /// Returns:
-/// - [String;8] SVG path `d` strings (may be empty)
+/// - chunked path groups for canvas rendering
 /// - y_min, y_max (labels)
 /// - span_min (minutes of effective window)
-pub fn charts_cache_get(data_type: &str, width: f32, height: f32) -> (Vec<String>, f32, f32, f32) {
+pub fn charts_cache_get(
+    data_type: &str,
+    width: f32,
+    height: f32,
+) -> (Vec<ChartRenderChunk>, f32, f32, f32) {
     CHARTS_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         c.get(data_type, width, height)
@@ -248,10 +254,10 @@ impl ChartsCache {
         combined_chart.ingest(&combined_row);
     }
 
-    fn get(&mut self, dt: &str, w: f32, h: f32) -> (Vec<String>, f32, f32, f32) {
+    fn get(&mut self, dt: &str, w: f32, h: f32) -> (Vec<ChartRenderChunk>, f32, f32, f32) {
         if let Some(c) = self.charts.get_mut(dt) {
             c.build_if_needed(w, h);
-            (c.paths.clone(), c.disp_min, c.disp_max, c.span_min)
+            (c.chunks.clone(), c.disp_min, c.disp_max, c.span_min)
         } else {
             (Vec::new(), 0.0, 1.0, 0.0)
         }
@@ -327,7 +333,7 @@ struct CachedChart {
     channel_count: usize,
 
     // cached output
-    paths: Vec<String>,
+    chunks: Vec<ChartRenderChunk>,
 
     // per-window min/max (raw)
     raw_min: f32,
@@ -361,7 +367,7 @@ impl CachedChart {
             newest_ts: 0,
             dirty: true,
             channel_count: 0,
-            paths: Vec::new(),
+            chunks: Vec::new(),
             raw_min: 0.0,
             raw_max: 1.0,
             chan_min: Vec::new(),
@@ -459,7 +465,6 @@ impl CachedChart {
         }
         let add = channels - self.channel_count;
         self.channel_count = channels;
-        self.paths.extend(std::iter::repeat_n(String::new(), add));
         self.chan_min.extend(std::iter::repeat_n(None, add));
         self.chan_max.extend(std::iter::repeat_n(None, add));
         for b in self.buckets.iter_mut() {
@@ -543,7 +548,7 @@ impl CachedChart {
         self.last_h = h;
 
         if self.buckets.is_empty() {
-            self.paths.iter_mut().for_each(|s| s.clear());
+            self.chunks.clear();
             self.raw_min = 0.0;
             self.raw_max = 1.0;
             self.chan_min = vec![None; self.channel_count];
@@ -648,66 +653,93 @@ impl CachedChart {
         let y_max = self.disp_max;
         let map_y = |v: f32| -> f32 { bottom - (v - y_min) / (y_max - y_min) * ph };
 
-        for s in &mut self.paths {
-            s.clear();
-        }
-
-        // Build paths by iterating stable bucket ids in order.
-        // Downsample to screen density so long history windows stay fast.
-        // Interpolate through gaps only at full-resolution to avoid re-inflating paths.
-        let mut segment_open: Vec<bool> = vec![false; self.channel_count];
-        let mut last_bucket_id_drawn: Vec<Option<i64>> = vec![None; self.channel_count];
-        let mut last_point_drawn: Vec<Option<(f32, f32)>> = vec![None; self.channel_count];
+        self.chunks.clear();
 
         let total = (newest_bid - start_bid + 1).max(1) as f32;
+        let first_chunk_id = start_bid.div_euclid(RENDER_CHUNK_BUCKETS);
+        let last_chunk_id = newest_bid.div_euclid(RENDER_CHUNK_BUCKETS);
 
-        for b in self.buckets.iter() {
-            if b.id < start_bid || b.id > newest_bid {
-                continue;
-            }
-            let has_any = b.has.iter().any(|v| *v);
-            if !has_any {
-                continue;
-            }
+        for chunk_id in first_chunk_id..=last_chunk_id {
+            let chunk_start_bid = (chunk_id * RENDER_CHUNK_BUCKETS).max(start_bid);
+            let chunk_end_bid = ((chunk_id + 1) * RENDER_CHUNK_BUCKETS - 1).min(newest_bid);
+            let chunk_bucket_count = (chunk_end_bid - chunk_start_bid + 1).max(1);
+            let chunk_start_x = left + pw * ((chunk_start_bid - start_bid) as f32 / total);
+            let chunk_end_x = left + pw * ((chunk_end_bid - start_bid + 1) as f32 / total);
+            let chunk_width = (chunk_end_x - chunk_start_x).max(1.0);
+            let allow_interp = true;
 
-            let i = (b.id - start_bid) as f32;
-            let x = left + pw * ((i + 0.5) / total);
+            let mut paths = vec![String::new(); self.channel_count];
+            let mut segment_open: Vec<bool> = vec![false; self.channel_count];
+            let mut last_bucket_id_drawn: Vec<Option<i64>> = vec![None; self.channel_count];
+            let mut last_point_drawn: Vec<Option<(f32, f32)>> = vec![None; self.channel_count];
 
-            for ch in 0..self.channel_count {
-                if !b.has[ch] {
+            for b in self.buckets.iter() {
+                if b.id < chunk_start_bid || b.id > chunk_end_bid {
                     continue;
                 }
-                let v = b.last[ch];
-                let y = map_y(v);
-                if let Some(prev_bid) = last_bucket_id_drawn[ch] {
-                    let gap_buckets = b.id - prev_bid;
-                    if gap_buckets > 1
-                        && gap_buckets <= MAX_INTERP_GAP_BUCKETS
-                        && segment_open[ch]
-                        && let Some((prev_x, prev_y)) = last_point_drawn[ch]
-                    {
-                        let out = &mut self.paths[ch];
-                        let missing = gap_buckets - 1;
-                        let interp_pts = missing.clamp(1, MAX_INTERP_POINTS_PER_GAP);
-                        for j in 1..=interp_pts {
-                            let t = j as f32 / (interp_pts + 1) as f32;
-                            let xi = prev_x + (x - prev_x) * t;
-                            let yi = prev_y + (y - prev_y) * t;
-                            out.push_str(&format!("L {:.2} {:.2} ", xi, yi));
-                        }
-                    }
+                let has_any = b.has.iter().any(|v| *v);
+                if !has_any {
+                    continue;
                 }
 
-                let out = &mut self.paths[ch];
-                if !segment_open[ch] {
-                    out.push_str(&format!("M {:.2} {:.2} ", x, y));
-                    segment_open[ch] = true;
-                } else {
-                    out.push_str(&format!("L {:.2} {:.2} ", x, y));
+                let rel_bid = b.id - chunk_start_bid;
+                let x = chunk_width * ((rel_bid as f32 + 0.5) / chunk_bucket_count as f32);
+
+                for ch in 0..self.channel_count {
+                    if !b.has[ch] {
+                        continue;
+                    }
+                    let v = b.last[ch];
+                    let y = map_y(v);
+                    if let Some(prev_bid) = last_bucket_id_drawn[ch] {
+                        let gap_buckets = b.id - prev_bid;
+                        if gap_buckets > 1
+                            && allow_interp
+                            && gap_buckets <= MAX_INTERP_GAP_BUCKETS
+                            && segment_open[ch]
+                            && let Some((prev_x, prev_y)) = last_point_drawn[ch]
+                        {
+                            let out = &mut paths[ch];
+                            let missing = gap_buckets - 1;
+                            let interp_pts = missing.clamp(1, MAX_INTERP_POINTS_PER_GAP);
+                            for j in 1..=interp_pts {
+                                let t = j as f32 / (interp_pts + 1) as f32;
+                                let xi = prev_x + (x - prev_x) * t;
+                                let yi = prev_y + (y - prev_y) * t;
+                                out.push_str(&format!("L {:.2} {:.2} ", xi, yi));
+                            }
+                        }
+                    }
+
+                    let out = &mut paths[ch];
+                    if !segment_open[ch] {
+                        out.push_str(&format!("M {:.2} {:.2} ", x, y));
+                        segment_open[ch] = true;
+                    } else {
+                        out.push_str(&format!("L {:.2} {:.2} ", x, y));
+                    }
+                    last_bucket_id_drawn[ch] = Some(b.id);
+                    last_point_drawn[ch] = Some((x, y));
                 }
-                last_bucket_id_drawn[ch] = Some(b.id);
-                last_point_drawn[ch] = Some((x, y));
             }
+
+            if paths.iter().all(|p| p.is_empty()) {
+                continue;
+            }
+
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            chunk_id.hash(&mut hasher);
+            paths.hash(&mut hasher);
+
+            self.chunks.push(ChartRenderChunk {
+                id: chunk_id,
+                x: chunk_start_x as f64,
+                width: chunk_width as f64,
+                right: chunk_end_x as f64,
+                paths,
+                signature: hasher.finish(),
+                live: chunk_id == last_chunk_id,
+            });
         }
 
         self.span_min = (want_buckets as f32 * BUCKET_MS as f32) / 60_000.0;
@@ -730,17 +762,33 @@ pub fn series_color(i: usize) -> &'static str {
 
 static NEXT_CANVAS_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, PartialEq, Serialize)]
+pub struct ChartRenderChunk {
+    pub id: i64,
+    pub x: f64,
+    pub width: f64,
+    pub right: f64,
+    pub paths: Vec<String>,
+    pub signature: u64,
+    pub live: bool,
+}
+
 #[derive(Serialize)]
 struct CanvasChartPayload {
     view_w: f64,
     view_h: f64,
-    paths: Vec<String>,
+    chunks: Vec<ChartRenderChunk>,
     colors: Vec<&'static str>,
     signature: u64,
 }
 
 #[component]
-pub fn ChartCanvas(view_w: f64, view_h: f64, paths: Vec<String>, style: String) -> Element {
+pub fn ChartCanvas(
+    view_w: f64,
+    view_h: f64,
+    chunks: Vec<ChartRenderChunk>,
+    style: String,
+) -> Element {
     let canvas_id = use_hook(|| {
         format!(
             "gs26-chart-canvas-{}",
@@ -751,13 +799,19 @@ pub fn ChartCanvas(view_w: f64, view_h: f64, paths: Vec<String>, style: String) 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     view_w.to_bits().hash(&mut hasher);
     view_h.to_bits().hash(&mut hasher);
-    paths.hash(&mut hasher);
+    for chunk in &chunks {
+        chunk.id.hash(&mut hasher);
+        chunk.signature.hash(&mut hasher);
+        chunk.x.to_bits().hash(&mut hasher);
+        chunk.width.to_bits().hash(&mut hasher);
+        chunk.right.to_bits().hash(&mut hasher);
+    }
 
     let payload = CanvasChartPayload {
         view_w,
         view_h,
-        colors: (0..paths.len()).map(series_color).collect(),
-        paths,
+        colors: (0..8).map(series_color).collect(),
+        chunks,
         signature: hasher.finish(),
     };
     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
@@ -776,9 +830,19 @@ pub fn ChartCanvas(view_w: f64, view_h: f64, paths: Vec<String>, style: String) 
                     const rect = el.getBoundingClientRect();
                     const cssW = Math.max(1, Math.round(rect.width || data.view_w || 1));
                     const cssH = Math.max(1, Math.round(rect.height || data.view_h || 1));
-                    const dpr = Math.max(1, Math.min(3, (window.devicePixelRatio || 1)));
-                    const pxW = Math.max(1, Math.round(cssW * dpr));
-                    const pxH = Math.max(1, Math.round(cssH * dpr));
+                    const dpr = Math.max(1, Math.min(5, (window.devicePixelRatio || 1)));
+                    const qualityBoost = 2.0;
+                    const maxCanvasEdge = 16384;
+                    let renderScale = dpr * qualityBoost;
+                    if (cssW * renderScale > maxCanvasEdge) {{
+                      renderScale = Math.min(renderScale, maxCanvasEdge / Math.max(1, cssW));
+                    }}
+                    if (cssH * renderScale > maxCanvasEdge) {{
+                      renderScale = Math.min(renderScale, maxCanvasEdge / Math.max(1, cssH));
+                    }}
+                    renderScale = Math.max(1, renderScale);
+                    const pxW = Math.max(1, Math.round(cssW * renderScale));
+                    const pxH = Math.max(1, Math.round(cssH * renderScale));
 
                     if (el.width !== pxW) el.width = pxW;
                     if (el.height !== pxH) el.height = pxH;
@@ -792,10 +856,10 @@ pub fn ChartCanvas(view_w: f64, view_h: f64, paths: Vec<String>, style: String) 
                       || cache.pxH !== pxH;
 
                     if (cacheMiss) {{
-                      const buffer = document.createElement("canvas");
-                      buffer.width = pxW;
-                      buffer.height = pxH;
-                      const bctx = buffer.getContext("2d", {{ alpha: true, desynchronized: true }});
+                      const gridBuffer = document.createElement("canvas");
+                      gridBuffer.width = pxW;
+                      gridBuffer.height = pxH;
+                      const bctx = gridBuffer.getContext("2d", {{ alpha: true, desynchronized: true }});
                       if (!bctx) return;
 
                       if (typeof bctx.resetTransform === "function") {{
@@ -804,7 +868,7 @@ pub fn ChartCanvas(view_w: f64, view_h: f64, paths: Vec<String>, style: String) 
                         bctx.setTransform(1, 0, 0, 1, 0, 0);
                       }}
 
-                      bctx.clearRect(0, 0, buffer.width, buffer.height);
+                      bctx.clearRect(0, 0, gridBuffer.width, gridBuffer.height);
                       bctx.scale(pxW / data.view_w, pxH / data.view_h);
 
                       const left = 60.0;
@@ -867,26 +931,51 @@ pub fn ChartCanvas(view_w: f64, view_h: f64, paths: Vec<String>, style: String) 
                         return p;
                       }}
 
-                      const parsedPaths = [];
-                      for (let i = 0; i < data.paths.length; i += 1) {{
-                        const path2d = buildPath2d(data.paths[i]);
-                        parsedPaths.push(path2d);
+                      cache = {{
+                        signature: data.signature,
+                        pxW,
+                        pxH,
+                        gridBuffer,
+                        chunkCache: cache && cache.chunkCache ? cache.chunkCache : new Map(),
+                      }};
+                      cacheRoot.set(canvasId, cache);
+                    }}
+
+                    function buildChunkBuffer(chunk, destW) {{
+                      const key = `${{chunk.id}}:${{chunk.signature}}:${{pxH}}:${{destW}}`;
+                      let chunkBuffer = cache.chunkCache.get(key);
+                      if (chunkBuffer) return chunkBuffer;
+
+                      const widthPx = Math.max(1, destW);
+                      const buffer = document.createElement("canvas");
+                      buffer.width = widthPx;
+                      buffer.height = pxH;
+                      const bctx = buffer.getContext("2d", {{ alpha: true, desynchronized: true }});
+                      if (!bctx) return null;
+
+                      if (typeof bctx.resetTransform === "function") {{
+                        bctx.resetTransform();
+                      }} else {{
+                        bctx.setTransform(1, 0, 0, 1, 0, 0);
+                      }}
+
+                      bctx.clearRect(0, 0, buffer.width, buffer.height);
+                      bctx.scale(widthPx / Math.max(1, chunk.width), pxH / data.view_h);
+                      bctx.imageSmoothingEnabled = true;
+
+                      for (let i = 0; i < chunk.paths.length; i += 1) {{
+                        const path2d = buildPath2d(chunk.paths[i]);
                         if (!path2d) continue;
                         bctx.strokeStyle = data.colors[i] || "#9ca3af";
-                        bctx.lineWidth = 2;
+                        bctx.lineWidth = 2.25;
                         bctx.lineJoin = "round";
                         bctx.lineCap = "round";
                         bctx.stroke(path2d);
                       }}
 
-                      cache = {{
-                        signature: data.signature,
-                        pxW,
-                        pxH,
-                        buffer,
-                        parsedPaths,
-                      }};
-                      cacheRoot.set(canvasId, cache);
+                      chunkBuffer = buffer;
+                      cache.chunkCache.set(key, chunkBuffer);
+                      return chunkBuffer;
                     }}
 
                     if (typeof ctx.resetTransform === "function") {{
@@ -895,7 +984,59 @@ pub fn ChartCanvas(view_w: f64, view_h: f64, paths: Vec<String>, style: String) 
                       ctx.setTransform(1, 0, 0, 1, 0, 0);
                     }}
                     ctx.clearRect(0, 0, el.width, el.height);
-                    ctx.drawImage(cache.buffer, 0, 0);
+                    ctx.imageSmoothingEnabled = true;
+                    ctx.drawImage(cache.gridBuffer, 0, 0);
+                    const scaleX = pxW / data.view_w;
+                    const firstChunk = data.chunks.length ? data.chunks[0] : null;
+                    const alignOffset = firstChunk
+                      ? Math.round(firstChunk.x * scaleX) - (firstChunk.x * scaleX)
+                      : 0;
+                    const historyKey = data.chunks
+                      .filter(chunk => !chunk.live)
+                      .map(chunk => `${{chunk.id}}:${{chunk.signature}}:${{chunk.x.toFixed(3)}}:${{chunk.right.toFixed(3)}}`)
+                      .join("|");
+                    if (!cache.historyBuffer || cache.historyKey !== historyKey) {{
+                      const historyBuffer = document.createElement("canvas");
+                      historyBuffer.width = pxW;
+                      historyBuffer.height = pxH;
+                      const hctx = historyBuffer.getContext("2d", {{ alpha: true, desynchronized: true }});
+                      if (!hctx) return;
+                      hctx.clearRect(0, 0, historyBuffer.width, historyBuffer.height);
+                      hctx.imageSmoothingEnabled = true;
+                      for (let i = 0; i < data.chunks.length; i += 1) {{
+                        const chunk = data.chunks[i];
+                        if (chunk.live) continue;
+                        const next = i + 1 < data.chunks.length ? data.chunks[i + 1] : null;
+                        const destX = Math.round(chunk.x * scaleX + alignOffset);
+                        const rawRight = next
+                          ? Math.round(next.x * scaleX + alignOffset)
+                          : Math.round(chunk.right * scaleX + alignOffset);
+                        const destRight = Math.max(destX + 1, rawRight);
+                        const destW = Math.max(1, destRight - destX);
+                        const chunkBuffer = buildChunkBuffer(chunk, destW);
+                        if (!chunkBuffer) continue;
+                        hctx.drawImage(chunkBuffer, destX, 0, destW, pxH);
+                      }}
+                      cache.historyBuffer = historyBuffer;
+                      cache.historyKey = historyKey;
+                    }}
+                    if (cache.historyBuffer) {{
+                      ctx.drawImage(cache.historyBuffer, 0, 0);
+                    }}
+                    for (let i = 0; i < data.chunks.length; i += 1) {{
+                      const chunk = data.chunks[i];
+                      if (!chunk.live) continue;
+                      const next = i + 1 < data.chunks.length ? data.chunks[i + 1] : null;
+                      const destX = Math.round(chunk.x * scaleX + alignOffset);
+                      const rawRight = next
+                        ? Math.round(next.x * scaleX + alignOffset)
+                        : Math.round(chunk.right * scaleX + alignOffset);
+                      const destRight = Math.max(destX + 1, rawRight);
+                      const destW = Math.max(1, destRight - destX);
+                      const chunkBuffer = buildChunkBuffer(chunk, destW);
+                      if (!chunkBuffer) continue;
+                      ctx.drawImage(chunkBuffer, destX, 0, destW, pxH);
+                    }}
                   }};
 
                   if (typeof requestAnimationFrame === "function") {{

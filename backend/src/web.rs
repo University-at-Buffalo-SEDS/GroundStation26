@@ -649,7 +649,8 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     .await
     .unwrap_or_default();
 
-    let mut merged_rows: Vec<TelemetryRow> = Vec::with_capacity(rows_db.len() + cache_snapshot.len());
+    let mut merged_rows: Vec<TelemetryRow> =
+        Vec::with_capacity(rows_db.len() + cache_snapshot.len());
     for row in rows_db {
         let item = TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),

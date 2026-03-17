@@ -1,7 +1,9 @@
 #![allow(clippy::redundant_locals)]
 
-use super::types::TelemetryRow;
-use super::{http_get_json, http_post_json};
+use super::{
+    TELEMETRY_RENDER_EPOCH, http_get_json, http_post_json, latest_telemetry_row,
+    latest_telemetry_value,
+};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -184,11 +186,8 @@ fn sleep_ms(ms: u32) -> impl std::future::Future<Output = ()> {
     }
 }
 
-fn latest_raw(rows: &[TelemetryRow], data_type: &str) -> Option<f32> {
-    rows.iter()
-        .rev()
-        .find(|r| r.data_type == data_type)
-        .and_then(|r| r.values.first().copied().flatten())
+fn latest_raw(data_type: &str) -> Option<f32> {
+    latest_telemetry_value(data_type, None, 0)
 }
 
 fn fmt_fixed(v: Option<f32>, width: usize, prec: usize) -> String {
@@ -475,7 +474,8 @@ fn fit_details_text(cfg: &CalibrationFile, channel: Channel) -> Option<String> {
 }
 
 #[component]
-pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
+pub fn CalibrationTab() -> Element {
+    let _ = *TELEMETRY_RENDER_EPOCH.read();
     let layout_cfg = use_signal(|| None::<CalibrationTabLayout>);
     let sensors = layout_cfg
         .read()
@@ -551,7 +551,6 @@ pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
 
     {
         let mut capture_loop_started = capture_loop_started;
-        let rows = rows;
         let selected_sensor_id = selected_sensor_id;
         let sensors = sensors.clone();
         let capture_target = capture_target;
@@ -580,8 +579,7 @@ pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
                         continue;
                     };
                     let channel = Channel::from_layout(sensor.channel.as_str());
-                    let Some(raw) = latest_raw(rows.read().as_slice(), sensor.data_type.as_str())
-                    else {
+                    let Some(raw) = latest_raw(sensor.data_type.as_str()) else {
                         continue;
                     };
 
@@ -710,14 +708,10 @@ pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
         .unwrap_or_default();
     let raw_live = selected_sensor
         .as_ref()
-        .and_then(|s| latest_raw(rows.read().as_slice(), s.data_type.as_str()));
-    let last_ts_ms = selected_sensor.as_ref().and_then(|s| {
-        rows.read()
-            .iter()
-            .rev()
-            .find(|r| r.data_type == s.data_type)
-            .map(|r| r.timestamp_ms)
-    });
+        .and_then(|s| latest_raw(s.data_type.as_str()));
+    let last_ts_ms = selected_sensor
+        .as_ref()
+        .and_then(|s| latest_telemetry_row(&s.data_type, None).map(|r| r.timestamp_ms));
     let sequence_started = cfg.read().as_ref().is_some_and(|c| match channel {
         Channel::Ch0 => c.ch0_zero_raw.is_some(),
         Channel::Ch1 => c.ch1_zero_raw.is_some(),
