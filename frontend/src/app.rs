@@ -97,6 +97,10 @@ pub enum Route {
     #[cfg(not(target_arch = "wasm32"))]
     #[route("/connect")]
     Connect {},
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[route("/version")]
+    Version {},
 }
 
 // -------------------------
@@ -648,8 +652,17 @@ pub fn Connect() -> Element {
             div {
                 style: "width:min(900px, 94vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
 
-                h1 { style: "margin:0 0 12px 0; font-size:20px;", "UBSEDS GS" }
-
+                div {
+                    style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px;",
+                    h1 { style: "margin:0; font-size:20px;", "UBSEDS GS" }
+                    button {
+                        style: "padding:8px 12px; border-radius:999px; border:1px solid #f59e0b; background:#451a03; color:#fde68a; cursor:pointer;",
+                        onclick: move |_| {
+                            let _ = nav.push(Route::Version {});
+                        },
+                        "Version"
+                    }
+                }
                 p { style: "margin:0 0 16px 0; color:#94a3b8;",
                     "Enter the backend URL (including http:// or https://). Example: ",
                     code { "http://https://your-backend-url.com" }
@@ -704,7 +717,6 @@ pub fn Connect() -> Element {
 
                 div { style: "display:flex; gap:12px; margin-top:16px; justify-content:flex-end; flex-wrap:wrap;",
 
-                    // TEST ROUTES (HOSTNAME ONLY)
                     button {
                         style: "
                             padding:10px 14px;
@@ -733,18 +745,16 @@ pub fn Connect() -> Element {
                             testing.set(true);
                             test_status.set("Testing connection (fast probes)...".to_string());
 
-                            // Trigger iOS local-network prompt (best-effort)
                             objc_poke::poke_url(&u_norm);
 
                             let skip_tls_verify = *skip_tls.read();
                             spawn(async move {
-                                // 1) HTTP probes (concurrent)
                                 let checks = test_routes_host_only(&u_norm, skip_tls_verify).await;
 
-                                // 2) REAL websocket probe (ws/wss) (time-bounded)
                                 let ws_probe = Some(ws_connect_probe(&parsed, skip_tls_verify).await);
 
-                                let report = format_route_report_host_only(&u_norm, &parsed, &checks, ws_probe);
+                                let report =
+                                    format_route_report_host_only(&u_norm, &parsed, &checks, ws_probe);
 
                                 testing.set(false);
                                 test_status.set(report);
@@ -753,7 +763,6 @@ pub fn Connect() -> Element {
                         if testing() { "Testing..." } else { "Test Connection" }
                     }
 
-                    // CONNECT
                     button {
                         style: "
                             padding:10px 14px;
@@ -791,6 +800,40 @@ pub fn Connect() -> Element {
                         "Connect"
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[component]
+pub fn Version() -> Element {
+    let nav = use_navigator();
+    let can_go_back = nav.can_go_back();
+
+    rsx! {
+        div {
+            style: "min-height:100vh; height:100vh; overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            div {
+                style: "width:min(900px, 94vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
+                div {
+                    style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px;",
+                    h1 { style: "margin:0; font-size:20px;", "UBSEDS GS" }
+                    button {
+                        style: "padding:8px 12px; border-radius:999px; border:1px solid #334155; background:#020617; color:#e5e7eb; cursor:pointer;",
+                        onclick: move |_| {
+                            if can_go_back {
+                                nav.go_back();
+                            } else if UrlConfig::_stored_base_url().is_some() {
+                                let _ = nav.replace(Route::Dashboard {});
+                            } else {
+                                let _ = nav.replace(Route::Connect {});
+                            }
+                        },
+                        "Back"
+                    }
+                }
+                crate::telemetry_dashboard::version_tab::VersionTab {}
             }
         }
     }

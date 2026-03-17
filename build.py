@@ -815,6 +815,8 @@ def _stage_linux_app_payload(
         frontend_dir: Path,
         rust_target: Optional[str],
         debug_mode: bool,
+        *,
+        appimage_mode: bool = False,
 ) -> tuple[tempfile.TemporaryDirectory, Path]:
     app_bin = _find_linux_app_binary(frontend_dir, rust_target, debug_mode)
     source_dir = app_bin.parent
@@ -822,7 +824,12 @@ def _stage_linux_app_payload(
 
     temp_dir = tempfile.TemporaryDirectory(prefix="gs26-linux-pkg-")
     pkg_root = Path(temp_dir.name) / "pkgroot"
-    app_dir = pkg_root / "usr" / "lib" / LINUX_PACKAGE_NAME
+    if appimage_mode:
+        app_dir = pkg_root / "usr" / "bin"
+        staged_bin = app_dir / LINUX_PACKAGE_NAME
+    else:
+        app_dir = pkg_root / "opt" / LINUX_PACKAGE_NAME
+        staged_bin = app_dir / LINUX_PACKAGE_NAME
     app_dir.mkdir(parents=True, exist_ok=True)
 
     for item in sorted(source_dir.iterdir()):
@@ -832,7 +839,7 @@ def _stage_linux_app_payload(
         if item.suffix.lower() in {".deb", ".rpm", ".appimage", ".pdb"}:
             continue
         if item == app_bin:
-            shutil.copy2(item, app_dir / LINUX_PACKAGE_NAME)
+            shutil.copy2(item, staged_bin)
         else:
             shutil.copy2(item, app_dir / item.name)
 
@@ -847,10 +854,17 @@ def _stage_linux_app_payload(
 
     bin_dir = pkg_root / "usr" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
-    launcher = bin_dir / LINUX_PACKAGE_NAME
-    if launcher.exists() or launcher.is_symlink():
-        launcher.unlink()
-    os.symlink(f"../lib/{LINUX_PACKAGE_NAME}/{LINUX_PACKAGE_NAME}", launcher)
+    if not appimage_mode:
+        launcher = bin_dir / LINUX_PACKAGE_NAME
+        launcher.write_text(
+            "\n".join([
+                "#!/bin/sh",
+                f'exec "/opt/{LINUX_PACKAGE_NAME}/{LINUX_PACKAGE_NAME}" "$@"',
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
 
     applications_dir = pkg_root / "usr" / "share" / "applications"
     applications_dir.mkdir(parents=True, exist_ok=True)
@@ -1284,7 +1298,7 @@ def build_manual_linux_packages(
                     "",
                     "%files",
                     f"/usr/bin/{LINUX_PACKAGE_NAME}",
-                    f"/usr/lib/{LINUX_PACKAGE_NAME}",
+                    f"/opt/{LINUX_PACKAGE_NAME}",
                     f"/usr/share/applications/{LINUX_PACKAGE_NAME}.desktop",
                     f"/usr/share/pixmaps/{LINUX_PACKAGE_NAME}.png",
                     f"/usr/share/icons/hicolor/256x256/apps/{LINUX_PACKAGE_NAME}.png",
@@ -1326,7 +1340,12 @@ def build_manual_appimage(
         print("Warning: linuxdeploy not found; skipping AppImage packaging.", file=sys.stderr)
         return
 
-    temp_dir, base_pkg_root = _stage_linux_app_payload(frontend_dir, rust_target, debug_mode)
+    temp_dir, base_pkg_root = _stage_linux_app_payload(
+        frontend_dir,
+        rust_target,
+        debug_mode,
+        appimage_mode=True,
+    )
     try:
         appdir = Path(temp_dir.name) / "AppDir"
         appdir.mkdir(parents=True, exist_ok=True)

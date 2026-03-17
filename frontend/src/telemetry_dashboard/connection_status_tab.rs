@@ -9,6 +9,8 @@ const LATENCY_WINDOW_MS: i64 = 20 * 60_000;
 const LATENCY_MAX_POINTS: usize = 2000;
 
 const SCROLL_TRIGGER_THRESHOLD_MS: i64 = 200;
+const LATENCY_CHART_HEIGHT_PX: u32 = 220;
+const LATENCY_FULLSCREEN_CHART_HEIGHT_PX: u32 = 240;
 
 #[component]
 pub fn ConnectionStatusTab(
@@ -148,13 +150,16 @@ pub fn ConnectionStatusTab(
                             }
 
                             if *show_latency.read() {
-                                div { style: "display:flex; flex-direction:column; gap:10px;",
+                                div { style: latency_list_style(),
                                     for entry in boards.read().iter() {
-                                        div { style: "padding:10px; border:1px solid #1f2937; border-radius:10px; background:#020617;",
+                                        div { style: latency_card_style(),
                                             div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
                                                 "{entry.board.as_str()} ({entry.sender_id})"
                                             }
-                                            {render_latency_chart(history.read().get(&entry.sender_id), 360.0_f64)}
+                                            {render_latency_chart(
+                                                history.read().get(&entry.sender_id),
+                                                LATENCY_CHART_HEIGHT_PX as f64,
+                                            )}
                                         }
                                     }
                                 }
@@ -189,15 +194,15 @@ pub fn ConnectionStatusTab(
                         "Exit Fullscreen"
                     }
                 }
-                div { style: "display:flex; flex-direction:column; gap:10px;",
+                div { style: latency_list_style(),
                     for entry in boards.read().iter() {
-                        div { style: "padding:10px; border:1px solid #1f2937; border-radius:10px; background:#020617;",
+                        div { style: latency_card_style(),
                             div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
                                 "{entry.board.as_str()} ({entry.sender_id})"
                             }
                             {render_latency_chart(
                                 history.read().get(&entry.sender_id),
-                                fullscreen_latency_height(boards.read().len()),
+                                LATENCY_FULLSCREEN_CHART_HEIGHT_PX as f64,
                             )}
                         }
                     }
@@ -334,24 +339,12 @@ fn render_latency_chart(points: Option<&Vec<(i64, f64)>>, height: f64) -> Elemen
     }
 }
 
-fn fullscreen_latency_height(_count: usize) -> f64 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let h = web_sys::window()
-            .and_then(|w| w.inner_height().ok())
-            .and_then(|v| v.as_f64())
-            .unwrap_or(700.0);
-        let header = 80.0;
-        let padding = 32.0;
-        let gap = 10.0;
-        let n = _count.max(1) as f64;
-        let available = (h - header - padding - gap * (n - 1.0)).max(260.0);
-        (available / n).max(220.0)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        360.0
-    }
+fn latency_list_style() -> &'static str {
+    "display:flex; flex-direction:column; gap:10px; width:100%;"
+}
+
+fn latency_card_style() -> &'static str {
+    "padding:10px; border:1px solid #1f2937; border-radius:10px; background:#020617; width:100%; min-width:0;"
 }
 
 fn build_latency_polylines(

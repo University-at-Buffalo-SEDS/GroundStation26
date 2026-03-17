@@ -16,6 +16,7 @@ pub mod layout;
 mod network_topology_tab;
 mod notifications_tab;
 pub mod types;
+pub mod version_tab;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod gps_apple;
@@ -1507,6 +1508,39 @@ fn TelemetryDashboardInner() -> Element {
         }
     };
 
+    let version_button: Element = {
+        #[cfg(not(target_arch = "wasm32"))]
+        use dioxus_router::use_navigator;
+        #[cfg(not(target_arch = "wasm32"))]
+        let nav = use_navigator();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            rsx! { div {} }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            rsx! {
+                button {
+                    style: "
+                        padding:0.45rem 0.85rem;
+                        border-radius:0.75rem;
+                        border:1px solid #f59e0b;
+                        background:#451a03;
+                        color:#fde68a;
+                        font-weight:800;
+                        cursor:pointer;
+                    ",
+                    onclick: move |_| {
+                        let _ = nav.push(Route::Version {});
+                    },
+                    "VERSION"
+                }
+            }
+        }
+    };
+
     let layout_config = layout_config;
     let mut layout_loading = layout_loading;
     let mut layout_error = layout_error;
@@ -1632,6 +1666,7 @@ fn TelemetryDashboardInner() -> Element {
                     div { style: "font-size:22px; font-weight:800; color:#f97316;", "Loading layout..." }
                     div { style: "font-size:14px; color:#94a3b8;", "Waiting for layout from backend" }
                     div { style: "display:flex; gap:10px; flex-wrap:wrap; justify-content:center; margin-top:4px;",
+                        {version_button}
                         {connect_button}
                     }
                 }
@@ -1657,6 +1692,7 @@ fn TelemetryDashboardInner() -> Element {
                     }
                     div { style: "display:flex; gap:10px; flex-wrap:wrap; justify-content:center;",
                         {reload_button}
+                        {version_button}
                         {connect_button}
                     }
                 }
@@ -1732,6 +1768,7 @@ fn TelemetryDashboardInner() -> Element {
                     }
 
                     {reload_button}
+                    {version_button}
                     {connect_button}
                 }
             }

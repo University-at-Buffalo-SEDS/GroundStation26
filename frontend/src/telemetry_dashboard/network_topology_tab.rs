@@ -25,6 +25,7 @@ struct NodePlacement {
 
 const GRAPH_WIDTH: i32 = 1320;
 const GRAPH_HEIGHT: i32 = 880;
+const EMBEDDED_GRAPH_MIN_HEIGHT: i32 = 360;
 const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 1.8;
 const ZOOM_STEP: f32 = 0.2;
@@ -207,7 +208,7 @@ pub fn NetworkTopologyTab(
         } else {
             div {
                 key: "network-embedded-{fullscreen_state}",
-                style: "padding:16px; display:flex; flex-direction:column; gap:14px; height:100%; overflow-y:auto;",
+                style: "padding:16px; display:flex; flex-direction:column; gap:14px; height:100%; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; overflow-y:auto;",
                 h2 { style: "margin:0; color:#e5e7eb;", "{title}" }
                 p {
                     style: "margin:0; color:#94a3b8; font-size:0.95rem;",
@@ -247,7 +248,7 @@ pub fn NetworkTopologyTab(
 
                 div {
                     id: "{viewport_id}",
-                    style: "padding:18px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:0; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
+                    style: "padding:18px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
                     div {
                         id: "{surface_id}",
                         style: "position:relative; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; min-width:{GRAPH_WIDTH}px; min-height:{GRAPH_HEIGHT}px;",
