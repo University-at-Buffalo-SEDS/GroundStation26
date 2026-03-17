@@ -16,6 +16,7 @@ pub mod layout;
 mod network_topology_tab;
 mod notifications_tab;
 pub mod types;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod version_tab;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
