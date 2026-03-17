@@ -21,18 +21,6 @@ fn localstorage_get(key: &str) -> Option<String> {
     ls.get_item(key).ok().flatten()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn target_frame_duration() -> std::time::Duration {
-    // Default 240fps; override with GS_UI_FPS=60 etc.
-    let fps: u64 = std::env::var("GS_UI_FPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(240);
-
-    let fps = fps.clamp(1, 480);
-    std::time::Duration::from_micros(1_000_000 / fps)
-}
-
 #[cfg(target_arch = "wasm32")]
 fn localstorage_set(key: &str, value: &str) {
     use web_sys::window;
@@ -104,106 +92,6 @@ pub fn DataTab(
         }
     });
 
-    // ------------------------------------------------------------
-    // Redraw driver (START ONCE)
-    // - wasm32: requestAnimationFrame
-    // - native: ~timer (GS_UI_FPS)
-    // ------------------------------------------------------------
-    let redraw_tick = use_signal(|| 0u64);
-    let started_redraw = use_signal(|| false);
-    #[cfg(target_arch = "wasm32")]
-    let raf_running = use_signal(|| std::rc::Rc::new(std::cell::Cell::new(true)));
-    #[cfg(target_arch = "wasm32")]
-    let raf_id = use_signal(|| std::rc::Rc::new(std::cell::Cell::new(None::<i32>)));
-
-    use_effect({
-        let mut redraw_tick = redraw_tick;
-        let mut started_redraw = started_redraw;
-        #[cfg(target_arch = "wasm32")]
-        let raf_running = raf_running.read().clone();
-        #[cfg(target_arch = "wasm32")]
-        let raf_id = raf_id.read().clone();
-
-        move || {
-            if *started_redraw.read() {
-                return;
-            }
-            started_redraw.set(true);
-
-            #[cfg(target_arch = "wasm32")]
-            {
-                use std::cell::RefCell;
-                use std::rc::Rc;
-                use wasm_bindgen::JsCast;
-                use wasm_bindgen::closure::Closure;
-
-                let cb: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
-                let cb2 = cb.clone();
-                let raf_running_cb = raf_running.clone();
-                let raf_id_cb = raf_id.clone();
-                let raf_id_start = raf_id.clone();
-
-                *cb2.borrow_mut() = Some(Closure::wrap(Box::new(move |_ts: f64| {
-                    if !raf_running_cb.get() {
-                        return;
-                    }
-                    let next = redraw_tick.read().wrapping_add(1);
-                    redraw_tick.set(next);
-
-                    if let Some(win) = web_sys::window() {
-                        if let Some(cb_ref) = cb.borrow().as_ref() {
-                            if let Ok(id) =
-                                win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
-                            {
-                                raf_id_cb.set(Some(id));
-                            }
-                        }
-                    }
-                }) as Box<dyn FnMut(f64)>));
-
-                if let Some(win) = web_sys::window() {
-                    if let Some(cb_ref) = cb2.borrow().as_ref() {
-                        if let Ok(id) = win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
-                        {
-                            raf_id_start.set(Some(id));
-                        }
-                    }
-                }
-
-                std::mem::forget(cb2);
-            }
-
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let frame = target_frame_duration();
-                spawn(async move {
-                    loop {
-                        tokio::time::sleep(frame).await;
-                        let next = redraw_tick.read().wrapping_add(1);
-                        redraw_tick.set(next);
-                    }
-                });
-            }
-        }
-    });
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        let raf_running = raf_running.read().clone();
-        let raf_id = raf_id.read().clone();
-        use_drop(move || {
-            raf_running.set(false);
-            if let Some(win) = web_sys::window() {
-                if let Some(id) = raf_id.get() {
-                    let _ = win.cancel_animation_frame(id);
-                }
-            }
-        });
-    }
-
-    // Force rerender when redraw driver ticks
-    let _ = *redraw_tick.read();
-
     // Layout-defined data types (for buttons)
     let types = layout.tabs.clone();
     let current = active_tab.read().clone();
@@ -223,8 +111,8 @@ pub fn DataTab(
         .unwrap_or(true);
 
     // Latest row for summary cards (scan backward; no sort/filter allocations)
-    let latest_row = rows
-        .read()
+    let rows_snapshot = rows.read();
+    let latest_row = rows_snapshot
         .iter()
         .rev()
         .find(|r| r.data_type == current)
@@ -239,8 +127,7 @@ pub fn DataTab(
                 || source.remaining_minutes_data_type == current
         })
         .map(|source| {
-            let row = rows
-                .read()
+            let row = rows_snapshot
                 .iter()
                 .rev()
                 .find(|r| r.data_type == current && r.sender_id == source.sender_id)
@@ -256,9 +143,9 @@ pub fn DataTab(
         })
         .collect();
     let synthetic_cards = if is_battery_runtime_tab {
-        battery_runtime_cards(&rows.read(), &battery_sources)
+        battery_runtime_cards(&rows_snapshot, &battery_sources)
     } else if is_loadcell_tab {
-        loadcell_cards(&rows.read())
+        loadcell_cards(&rows_snapshot)
     } else {
         Vec::new()
     };

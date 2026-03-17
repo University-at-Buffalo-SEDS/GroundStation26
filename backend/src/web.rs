@@ -32,6 +32,8 @@ use tower_http::services::ServeDir;
 static FAVICON_DATA: OnceCell<Vec<u8>> = OnceCell::const_new();
 static TILE_DB_POOL: OnceCell<Option<sqlx::SqlitePool>> = OnceCell::const_new();
 static TILE_DB_MODE: OnceCell<TileDbMode> = OnceCell::const_new();
+const RECENT_HISTORY_MS: i64 = 20 * 60 * 1000;
+const RECENT_BUCKET_MS: i64 = 20;
 
 #[derive(Clone, Copy)]
 enum TileDbMode {
@@ -70,6 +72,26 @@ fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
 
 fn value_at(values: &[Option<f32>], idx: usize) -> Option<f32> {
     values.get(idx).copied().flatten()
+}
+
+fn compact_recent_rows(rows: Vec<TelemetryRow>, cutoff: i64) -> Vec<TelemetryRow> {
+    let mut by_bucket: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
+    for row in rows {
+        if row.timestamp_ms < cutoff {
+            continue;
+        }
+        let bucket = row.timestamp_ms.div_euclid(RECENT_BUCKET_MS);
+        by_bucket.insert((row.data_type.clone(), row.sender_id.clone(), bucket), row);
+    }
+
+    let mut rows: Vec<TelemetryRow> = by_bucket.into_values().collect();
+    rows.sort_by(|a, b| {
+        a.timestamp_ms
+            .cmp(&b.timestamp_ms)
+            .then_with(|| a.sender_id.cmp(&b.sender_id))
+            .then_with(|| a.data_type.cmp(&b.data_type))
+    });
+    rows
 }
 
 /// Public router constructor
@@ -606,7 +628,7 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         (None, None) => return Json(Vec::<TelemetryRow>::new()),
     };
 
-    let cutoff = now_ms - 20 * 60 * 1000; // 20 minutes
+    let cutoff = now_ms - RECENT_HISTORY_MS;
 
     let rows_db = sqlx::query(
         r#"
@@ -627,7 +649,7 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     .await
     .unwrap_or_default();
 
-    let mut by_key: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
+    let mut merged_rows: Vec<TelemetryRow> = Vec::with_capacity(rows_db.len() + cache_snapshot.len());
     for row in rows_db {
         let item = TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
@@ -635,40 +657,17 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             sender_id: row.get::<String, _>("sender_id"),
             values: values_from_row(&row),
         };
-        by_key.insert(
-            (
-                item.data_type.clone(),
-                item.sender_id.clone(),
-                item.timestamp_ms,
-            ),
-            item,
-        );
+        merged_rows.push(item);
     }
 
     for row in cache_snapshot {
         if row.timestamp_ms < cutoff || row.timestamp_ms > now_ms {
             continue;
         }
-        // Cache rows are newest realtime view and should win over stale DB rows.
-        by_key.insert(
-            (
-                row.data_type.clone(),
-                row.sender_id.clone(),
-                row.timestamp_ms,
-            ),
-            row,
-        );
+        merged_rows.push(row);
     }
 
-    let mut rows: Vec<TelemetryRow> = by_key.into_values().collect();
-    rows.sort_by(|a, b| {
-        a.timestamp_ms
-            .cmp(&b.timestamp_ms)
-            .then_with(|| a.sender_id.cmp(&b.sender_id))
-            .then_with(|| a.data_type.cmp(&b.data_type))
-    });
-
-    Json(rows)
+    Json(compact_recent_rows(merged_rows, cutoff))
 }
 
 async fn get_favicon() -> impl IntoResponse {

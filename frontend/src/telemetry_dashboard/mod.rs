@@ -471,7 +471,40 @@ macro_rules! log {
 }
 
 pub const HISTORY_MS: i64 = 60_000 * 20; // 20 minutes
+const UI_ROW_BUCKET_MS: i64 = 20; // Match chart bucket width in data_chart.rs.
 const STARTUP_SEED_DELAY_MS: u64 = 1_200;
+
+fn sort_rows(rows: &mut [TelemetryRow]) {
+    rows.sort_by(|a, b| {
+        a.timestamp_ms
+            .cmp(&b.timestamp_ms)
+            .then_with(|| a.sender_id.cmp(&b.sender_id))
+            .then_with(|| a.data_type.cmp(&b.data_type))
+    });
+}
+
+fn prune_history(rows: &mut Vec<TelemetryRow>) {
+    if let Some(last) = rows.last() {
+        let cutoff = last.timestamp_ms - HISTORY_MS;
+        let start = rows.partition_point(|r| r.timestamp_ms < cutoff);
+        if start > 0 {
+            rows.drain(0..start);
+        }
+    }
+}
+
+fn compact_rows_for_ui(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
+    let mut by_key: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
+    for row in rows {
+        let bucket = row.timestamp_ms.div_euclid(UI_ROW_BUCKET_MS);
+        let key = (row.data_type.clone(), row.sender_id.clone(), bucket);
+        by_key.insert(key, row);
+    }
+    let mut out: Vec<TelemetryRow> = by_key.into_values().collect();
+    sort_rows(&mut out);
+    prune_history(&mut out);
+    out
+}
 
 // unified storage keys
 const WARNING_ACK_STORAGE_KEY: &str = "gs_last_warning_ack_ts";
@@ -1142,11 +1175,7 @@ fn TelemetryDashboardInner() -> Element {
                         }
 
                         // Hard cap to keep UI/state light (avoid pathological growth)
-                        const MAX_KEEP: usize = 12_000;
-                        if v.len() > MAX_KEEP {
-                            let drop_n = v.len() - MAX_KEEP;
-                            v.drain(0..drop_n);
-                        }
+                        *v = compact_rows_for_ui(std::mem::take(&mut *v));
                     }
                 }
             });
@@ -2638,56 +2667,13 @@ async fn seed_from_db(
     charts_cache_begin_reseed_build();
     let _reseed_guard = ReseedGuard;
 
-    fn sort_rows(rows: &mut [TelemetryRow]) {
-        rows.sort_by(|a, b| {
-            a.timestamp_ms
-                .cmp(&b.timestamp_ms)
-                .then_with(|| a.sender_id.cmp(&b.sender_id))
-                .then_with(|| a.data_type.cmp(&b.data_type))
-        });
-    }
-
-    fn prune_history(rows: &mut Vec<TelemetryRow>) {
-        if let Some(last) = rows.last() {
-            let cutoff = last.timestamp_ms - HISTORY_MS;
-            let start = rows.partition_point(|r| r.timestamp_ms < cutoff);
-            if start > 0 {
-                rows.drain(0..start);
-            }
-        }
-    }
-
-    fn dedupe_rows_exact(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
-        let mut by_key: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
-        for row in rows {
-            let key = (
-                row.data_type.clone(),
-                row.sender_id.clone(),
-                row.timestamp_ms,
-            );
-            match by_key.get_mut(&key) {
-                Some(existing) => {
-                    *existing = row;
-                }
-                None => {
-                    by_key.insert(key, row);
-                }
-            }
-        }
-        let mut out: Vec<TelemetryRow> = by_key.into_values().collect();
-        sort_rows(&mut out);
-        out
-    }
-
     fn merge_db_and_live(
         mut db_rows: Vec<TelemetryRow>,
         live_rows: Vec<TelemetryRow>,
     ) -> Vec<TelemetryRow> {
-        // Keep full overlap and only dedupe exact duplicates to avoid losing sparse history.
+        // Keep full overlap, then compact to the same bucket density the chart can render.
         db_rows.extend(live_rows);
-        let mut merged = dedupe_rows_exact(db_rows);
-        prune_history(&mut merged);
-        merged
+        compact_rows_for_ui(db_rows)
     }
 
     let queue_snapshot = || -> Vec<TelemetryRow> {
@@ -2712,7 +2698,7 @@ async fn seed_from_db(
 
             sort_rows(&mut list);
             prune_history(&mut list);
-            list = dedupe_rows_exact(list);
+            list = compact_rows_for_ui(list);
 
             // Capture rows that arrived while reseed was running and keep them.
             let mut live_rows = rows.read().clone();
@@ -2722,7 +2708,7 @@ async fn seed_from_db(
             if !live_rows.is_empty() {
                 sort_rows(&mut live_rows);
                 prune_history(&mut live_rows);
-                live_rows = dedupe_rows_exact(live_rows);
+                live_rows = compact_rows_for_ui(live_rows);
                 list = merge_db_and_live(list, live_rows);
             }
 
@@ -2750,8 +2736,7 @@ async fn seed_from_db(
                 }
                 if !post_reset_queued_rows.is_empty() {
                     list.extend(post_reset_queued_rows);
-                    list = dedupe_rows_exact(list);
-                    prune_history(&mut list);
+                    list = compact_rows_for_ui(list);
                 }
 
                 // Replay live rows received during reseed build.
@@ -2767,8 +2752,7 @@ async fn seed_from_db(
                         charts_cache_reseed_ingest_row(row);
                     }
                     list.extend(reseed_live_rows);
-                    list = dedupe_rows_exact(list);
-                    prune_history(&mut list);
+                    list = compact_rows_for_ui(list);
                 }
 
                 // Atomically swap the prepared reseed cache in.

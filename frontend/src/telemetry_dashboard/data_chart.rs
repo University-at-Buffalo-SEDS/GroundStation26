@@ -29,6 +29,7 @@ use dioxus::prelude::*;
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::HISTORY_MS;
@@ -735,6 +736,7 @@ struct CanvasChartPayload {
     view_h: f64,
     paths: Vec<String>,
     colors: Vec<&'static str>,
+    signature: u64,
 }
 
 #[component]
@@ -746,11 +748,17 @@ pub fn ChartCanvas(view_w: f64, view_h: f64, paths: Vec<String>, style: String) 
         )
     });
 
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    view_w.to_bits().hash(&mut hasher);
+    view_h.to_bits().hash(&mut hasher);
+    paths.hash(&mut hasher);
+
     let payload = CanvasChartPayload {
         view_w,
         view_h,
         colors: (0..paths.len()).map(series_color).collect(),
         paths,
+        signature: hasher.finish(),
     };
     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     let id_json = serde_json::to_string(&canvas_id).unwrap_or_else(|_| "\"\"".to_string());
@@ -760,6 +768,7 @@ pub fn ChartCanvas(view_w: f64, view_h: f64, paths: Vec<String>, style: String) 
                 (function() {{
                   const canvasId = {id_json};
                   const data = {payload_json};
+                  const cacheRoot = window.__gs26ChartCanvasCache || (window.__gs26ChartCanvasCache = new Map());
                   const draw = () => {{
                     const el = document.getElementById(canvasId);
                     if (!el) return;
@@ -776,83 +785,117 @@ pub fn ChartCanvas(view_w: f64, view_h: f64, paths: Vec<String>, style: String) 
 
                     const ctx = el.getContext("2d", {{ alpha: true, desynchronized: true }});
                     if (!ctx) return;
+                    let cache = cacheRoot.get(canvasId);
+                    const cacheMiss = !cache
+                      || cache.signature !== data.signature
+                      || cache.pxW !== pxW
+                      || cache.pxH !== pxH;
+
+                    if (cacheMiss) {{
+                      const buffer = document.createElement("canvas");
+                      buffer.width = pxW;
+                      buffer.height = pxH;
+                      const bctx = buffer.getContext("2d", {{ alpha: true, desynchronized: true }});
+                      if (!bctx) return;
+
+                      if (typeof bctx.resetTransform === "function") {{
+                        bctx.resetTransform();
+                      }} else {{
+                        bctx.setTransform(1, 0, 0, 1, 0, 0);
+                      }}
+
+                      bctx.clearRect(0, 0, buffer.width, buffer.height);
+                      bctx.scale(pxW / data.view_w, pxH / data.view_h);
+
+                      const left = 60.0;
+                      const right = data.view_w - 20.0;
+                      const top = 20.0;
+                      const bottom = data.view_h - 20.0;
+                      const gridXStep = (right - left) / 6.0;
+                      const gridYStep = (bottom - top) / 6.0;
+
+                      bctx.save();
+                      bctx.strokeStyle = "#1f2937";
+                      bctx.lineWidth = 1;
+                      for (let i = 1; i <= 5; i += 1) {{
+                        const y = top + gridYStep * i;
+                        bctx.beginPath();
+                        bctx.moveTo(left, y);
+                        bctx.lineTo(right, y);
+                        bctx.stroke();
+                      }}
+                      for (let i = 1; i <= 5; i += 1) {{
+                        const x = left + gridXStep * i;
+                        bctx.beginPath();
+                        bctx.moveTo(x, top);
+                        bctx.lineTo(x, bottom);
+                        bctx.stroke();
+                      }}
+
+                      bctx.strokeStyle = "#334155";
+                      bctx.beginPath();
+                      bctx.moveTo(left, top);
+                      bctx.lineTo(left, bottom);
+                      bctx.lineTo(right, bottom);
+                      bctx.stroke();
+                      bctx.restore();
+
+                      function buildPath2d(path) {{
+                        if (!path) return null;
+                        const tokens = path.trim().split(/[ \t\r\n]+/);
+                        if (!tokens.length) return null;
+                        const p = new Path2D();
+                        let mode = "";
+                        for (let i = 0; i < tokens.length; ) {{
+                          const tok = tokens[i];
+                          if (tok === "M" || tok === "L") {{
+                            mode = tok;
+                            i += 1;
+                            continue;
+                          }}
+                          const x = Number(tok);
+                          const y = Number(tokens[i + 1]);
+                          if (!Number.isFinite(x) || !Number.isFinite(y)) break;
+                          if (mode === "M") {{
+                            p.moveTo(x, y);
+                            mode = "L";
+                          }} else {{
+                            p.lineTo(x, y);
+                          }}
+                          i += 2;
+                        }}
+                        return p;
+                      }}
+
+                      const parsedPaths = [];
+                      for (let i = 0; i < data.paths.length; i += 1) {{
+                        const path2d = buildPath2d(data.paths[i]);
+                        parsedPaths.push(path2d);
+                        if (!path2d) continue;
+                        bctx.strokeStyle = data.colors[i] || "#9ca3af";
+                        bctx.lineWidth = 2;
+                        bctx.lineJoin = "round";
+                        bctx.lineCap = "round";
+                        bctx.stroke(path2d);
+                      }}
+
+                      cache = {{
+                        signature: data.signature,
+                        pxW,
+                        pxH,
+                        buffer,
+                        parsedPaths,
+                      }};
+                      cacheRoot.set(canvasId, cache);
+                    }}
 
                     if (typeof ctx.resetTransform === "function") {{
                       ctx.resetTransform();
                     }} else {{
                       ctx.setTransform(1, 0, 0, 1, 0, 0);
                     }}
-
                     ctx.clearRect(0, 0, el.width, el.height);
-                    ctx.scale(pxW / data.view_w, pxH / data.view_h);
-
-                    const left = 60.0;
-                    const right = data.view_w - 20.0;
-                    const top = 20.0;
-                    const bottom = data.view_h - 20.0;
-                    const gridXStep = (right - left) / 6.0;
-                    const gridYStep = (bottom - top) / 6.0;
-
-                    ctx.save();
-                    ctx.strokeStyle = "#1f2937";
-                    ctx.lineWidth = 1;
-                    for (let i = 1; i <= 5; i += 1) {{
-                      const y = top + gridYStep * i;
-                      ctx.beginPath();
-                      ctx.moveTo(left, y);
-                      ctx.lineTo(right, y);
-                      ctx.stroke();
-                    }}
-                    for (let i = 1; i <= 5; i += 1) {{
-                      const x = left + gridXStep * i;
-                      ctx.beginPath();
-                      ctx.moveTo(x, top);
-                      ctx.lineTo(x, bottom);
-                      ctx.stroke();
-                    }}
-
-                    ctx.strokeStyle = "#334155";
-                    ctx.beginPath();
-                    ctx.moveTo(left, top);
-                    ctx.lineTo(left, bottom);
-                    ctx.lineTo(right, bottom);
-                    ctx.stroke();
-                    ctx.restore();
-
-                    function drawPath(path, color) {{
-                      if (!path) return;
-                      const tokens = path.trim().split(/[ \t\r\n]+/);
-                      if (!tokens.length) return;
-                      ctx.beginPath();
-                      let mode = "";
-                      for (let i = 0; i < tokens.length; ) {{
-                        const tok = tokens[i];
-                        if (tok === "M" || tok === "L") {{
-                          mode = tok;
-                          i += 1;
-                          continue;
-                        }}
-                        const x = Number(tok);
-                        const y = Number(tokens[i + 1]);
-                        if (!Number.isFinite(x) || !Number.isFinite(y)) break;
-                        if (mode === "M") {{
-                          ctx.moveTo(x, y);
-                          mode = "L";
-                        }} else {{
-                          ctx.lineTo(x, y);
-                        }}
-                        i += 2;
-                      }}
-                      ctx.strokeStyle = color;
-                      ctx.lineWidth = 2;
-                      ctx.lineJoin = "round";
-                      ctx.lineCap = "round";
-                      ctx.stroke();
-                    }}
-
-                    for (let i = 0; i < data.paths.length; i += 1) {{
-                      drawPath(data.paths[i], data.colors[i] || "#9ca3af");
-                    }}
+                    ctx.drawImage(cache.buffer, 0, 0);
                   }};
 
                   if (typeof requestAnimationFrame === "function") {{
