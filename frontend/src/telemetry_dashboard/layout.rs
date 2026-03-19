@@ -29,6 +29,7 @@ fn default_main_tabs() -> Vec<String> {
         "warnings".to_string(),
         "errors".to_string(),
         "data".to_string(),
+        "detailed".to_string(),
         "network-topology".to_string(),
     ]
 }
@@ -238,6 +239,7 @@ impl LayoutConfig {
                     | "warnings"
                     | "errors"
                     | "data"
+                    | "detailed"
                     | "network-topology"
             );
             if !known {

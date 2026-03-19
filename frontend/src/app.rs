@@ -656,7 +656,14 @@ pub fn Connect() -> Element {
                     style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px;",
                     h1 { style: "margin:0; font-size:20px;", "UBSEDS GS" }
                     button {
-                        style: "padding:8px 12px; border-radius:999px; border:1px solid #f59e0b; background:#451a03; color:#fde68a; cursor:pointer;",
+                        style: "
+                            padding:10px 14px;
+                            border-radius:12px;
+                            border:1px solid #334155;
+                            background:#111827;
+                            color:#e5e7eb;
+                            cursor:pointer;
+                        ",
                         onclick: move |_| {
                             let _ = nav.push(Route::Version {});
                         },
@@ -810,30 +817,39 @@ pub fn Connect() -> Element {
 pub fn Version() -> Element {
     let nav = use_navigator();
     let can_go_back = nav.can_go_back();
+    let back_action = move |_| {
+        if can_go_back {
+            nav.go_back();
+        } else if UrlConfig::_stored_base_url().is_some() {
+            let _ = nav.replace(Route::Dashboard {});
+        } else {
+            let _ = nav.replace(Route::Connect {});
+        }
+    };
 
     rsx! {
         div {
-            style: "min-height:100vh; height:100vh; overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            style: "position:fixed; inset:0; overflow-y:auto; overflow-x:hidden; display:flex; align-items:flex-start; justify-content:center; padding:24px 16px; background:#020617; color:#e5e7eb; font-family:system-ui; overscroll-behavior:contain; -webkit-overflow-scrolling:touch;",
             div {
-                style: "width:min(900px, 94vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
+                style: "width:min(900px, 100%); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
                 div {
-                    style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px;",
+                    style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap;",
                     h1 { style: "margin:0; font-size:20px;", "UBSEDS GS" }
                     button {
-                        style: "padding:8px 12px; border-radius:999px; border:1px solid #334155; background:#020617; color:#e5e7eb; cursor:pointer;",
-                        onclick: move |_| {
-                            if can_go_back {
-                                nav.go_back();
-                            } else if UrlConfig::_stored_base_url().is_some() {
-                                let _ = nav.replace(Route::Dashboard {});
-                            } else {
-                                let _ = nav.replace(Route::Connect {});
-                            }
-                        },
+                        style: "
+                            padding:10px 14px;
+                            border-radius:12px;
+                            border:1px solid #334155;
+                            background:#111827;
+                            color:#e5e7eb;
+                            font-weight:700;
+                            cursor:pointer;
+                        ",
+                        onclick: back_action,
                         "Back"
                     }
                 }
-                crate::telemetry_dashboard::version_tab::VersionTab {}
+                crate::telemetry_dashboard::version_page::VersionTab {}
             }
         }
     }

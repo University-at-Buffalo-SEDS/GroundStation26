@@ -7,6 +7,7 @@ mod calibration_tab;
 mod connection_status_tab;
 pub mod data_chart;
 pub mod data_tab;
+mod detailed_tab;
 pub mod errors_tab;
 mod gps;
 pub(crate) mod gps_android;
@@ -17,7 +18,7 @@ mod network_topology_tab;
 mod notifications_tab;
 pub mod types;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod version_tab;
+pub mod version_page;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod gps_apple;
@@ -40,6 +41,7 @@ use crate::telemetry_dashboard::actions_tab::ActionsTab;
 use calibration_tab::CalibrationTab;
 use connection_status_tab::ConnectionStatusTab;
 use data_tab::DataTab;
+use detailed_tab::DetailedTab;
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 use errors_tab::ErrorsTab;
@@ -50,6 +52,8 @@ use notifications_tab::NotificationsTab;
 use serde::{Deserialize, Serialize};
 use state_tab::StateTab;
 use types::{BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryRow};
+#[cfg(not(target_arch = "wasm32"))]
+use version_page::VersionTab;
 use warnings_tab::WarningsTab;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -69,6 +73,8 @@ static TELEMETRY_QUEUE: Lazy<Mutex<VecDeque<TelemetryRow>>> =
     Lazy::new(|| Mutex::new(VecDeque::new()));
 static RESEED_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static RESEED_LIVE_BUFFER: Lazy<Mutex<Vec<TelemetryRow>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static FRONTEND_NETWORK_METRICS_STATE: Lazy<Mutex<FrontendNetworkMetrics>> =
+    Lazy::new(|| Mutex::new(FrontendNetworkMetrics::default()));
 
 // ============================================================================
 // Dashboard lifetime: STATIC + ALWAYS PRESENT (never Option)
@@ -442,18 +448,22 @@ struct AlertDto {
 // --------------------------
 // GPS DTO (/api/gps)
 // --------------------------
+#[derive(Deserialize, Debug, Clone, Copy)]
+struct GpsPoint {
+    pub lat: f64,
+    pub lon: f64,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 struct GpsResponse {
-    pub rocket_lat: f64,
-    pub rocket_lon: f64,
-    pub user_lat: f64,
-    pub user_lon: f64,
+    pub rocket: Option<GpsPoint>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MainTab {
     State,
     ConnectionStatus,
+    Detailed,
     NetworkTopology,
     Map,
     Actions,
@@ -462,6 +472,152 @@ enum MainTab {
     Warnings,
     Errors,
     Data,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FrontendNetworkMetrics {
+    ws_connected: bool,
+    ws_url: String,
+    base_http: String,
+    ws_epoch: u64,
+    ws_messages_total: u64,
+    ws_bytes_total: u64,
+    telemetry_rows_total: u64,
+    telemetry_batches_total: u64,
+    bytes_per_sec: f64,
+    msgs_per_sec: f64,
+    rows_per_sec: f64,
+    http_rtt_ms: Option<f64>,
+    http_rtt_ema_ms: Option<f64>,
+    last_disconnect_reason: Option<String>,
+    last_ws_message_wall_ms: Option<i64>,
+    last_rate_sample_mono_ms: f64,
+    bytes_since_last_sample: u64,
+    msgs_since_last_sample: u64,
+    rows_since_last_sample: u64,
+}
+
+impl Default for FrontendNetworkMetrics {
+    fn default() -> Self {
+        Self {
+            ws_connected: false,
+            ws_url: String::new(),
+            base_http: String::new(),
+            ws_epoch: 0,
+            ws_messages_total: 0,
+            ws_bytes_total: 0,
+            telemetry_rows_total: 0,
+            telemetry_batches_total: 0,
+            bytes_per_sec: 0.0,
+            msgs_per_sec: 0.0,
+            rows_per_sec: 0.0,
+            http_rtt_ms: None,
+            http_rtt_ema_ms: None,
+            last_disconnect_reason: None,
+            last_ws_message_wall_ms: None,
+            last_rate_sample_mono_ms: 0.0,
+            bytes_since_last_sample: 0,
+            msgs_since_last_sample: 0,
+            rows_since_last_sample: 0,
+        }
+    }
+}
+
+fn reset_frontend_network_metrics_state() {
+    if let Ok(mut metrics) = FRONTEND_NETWORK_METRICS_STATE.lock() {
+        *metrics = FrontendNetworkMetrics {
+            base_http: UrlConfig::base_http(),
+            ..FrontendNetworkMetrics::default()
+        };
+    }
+}
+
+fn frontend_network_metrics_snapshot() -> FrontendNetworkMetrics {
+    FRONTEND_NETWORK_METRICS_STATE
+        .lock()
+        .map(|metrics| metrics.clone())
+        .unwrap_or_default()
+}
+
+fn note_ws_connection_state(connected: bool, ws_url: String, reason: Option<String>, epoch: u64) {
+    if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
+        next.ws_connected = connected;
+        next.ws_url = ws_url;
+        next.base_http = UrlConfig::base_http();
+        next.ws_epoch = epoch;
+        if let Some(reason) = reason {
+            next.last_disconnect_reason = Some(reason);
+        }
+    }
+}
+
+fn note_http_rtt(rtt_ms: f64) {
+    if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
+        next.http_rtt_ms = Some(rtt_ms);
+        next.http_rtt_ema_ms = Some(
+            next.http_rtt_ema_ms
+                .map(|prev| prev * 0.8 + rtt_ms * 0.2)
+                .unwrap_or(rtt_ms),
+        );
+    }
+}
+
+fn note_incoming_ws_message(raw_bytes: usize) {
+    if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
+        let now_mono = monotonic_now_ms();
+        let now_wall = current_wallclock_ms();
+        if next.last_rate_sample_mono_ms <= 0.0 {
+            next.last_rate_sample_mono_ms = now_mono;
+        }
+        next.ws_messages_total = next.ws_messages_total.saturating_add(1);
+        next.ws_bytes_total = next.ws_bytes_total.saturating_add(raw_bytes as u64);
+        next.bytes_since_last_sample = next
+            .bytes_since_last_sample
+            .saturating_add(raw_bytes as u64);
+        next.msgs_since_last_sample = next.msgs_since_last_sample.saturating_add(1);
+        next.last_ws_message_wall_ms = Some(now_wall);
+
+        let dt_ms = (now_mono - next.last_rate_sample_mono_ms).max(0.0);
+        if dt_ms >= 800.0 {
+            let scale = 1000.0 / dt_ms;
+            next.bytes_per_sec = next.bytes_since_last_sample as f64 * scale;
+            next.msgs_per_sec = next.msgs_since_last_sample as f64 * scale;
+            next.rows_per_sec = next.rows_since_last_sample as f64 * scale;
+            next.bytes_since_last_sample = 0;
+            next.msgs_since_last_sample = 0;
+            next.rows_since_last_sample = 0;
+            next.last_rate_sample_mono_ms = now_mono;
+        }
+    }
+}
+
+fn note_incoming_telemetry_rows(telemetry_rows: usize, telemetry_batch_count: usize) {
+    if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
+        next.telemetry_rows_total = next
+            .telemetry_rows_total
+            .saturating_add(telemetry_rows as u64);
+        next.telemetry_batches_total = next
+            .telemetry_batches_total
+            .saturating_add(telemetry_batch_count as u64);
+        next.rows_since_last_sample = next
+            .rows_since_last_sample
+            .saturating_add(telemetry_rows as u64);
+    }
+}
+
+fn current_wallclock_ms() -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as i64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
 }
 
 macro_rules! log {
@@ -684,7 +840,7 @@ const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
 const MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
 const DATA_TAB_STORAGE_KEY: &str = "gs_data_tab";
 const BASE_URL_STORAGE_KEY: &str = "gs_base_url";
-const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v5";
+const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v6";
 const NOTIFICATION_DISMISSED_STORAGE_KEY: &str = "gs_notification_dismissed_ids_v1";
 const _SKIP_TLS_VERIFY_KEY_PREFIX: &str = "gs_skip_tls_verify_";
 const NOTIFICATION_AUTO_DISMISS_MS: u32 = 5_000;
@@ -804,6 +960,7 @@ fn _main_tab_to_str(tab: MainTab) -> &'static str {
     match tab {
         MainTab::State => "state",
         MainTab::ConnectionStatus => "connection-status",
+        MainTab::Detailed => "detailed",
         MainTab::NetworkTopology => "network-topology",
         MainTab::Map => "map",
         MainTab::Actions => "actions",
@@ -818,6 +975,7 @@ fn _main_tab_from_str(s: &str) -> MainTab {
     match s {
         "state" => MainTab::State,
         "connection-status" => MainTab::ConnectionStatus,
+        "detailed" => MainTab::Detailed,
         "network-topology" => MainTab::NetworkTopology,
         "map" => MainTab::Map,
         "actions" => MainTab::Actions,
@@ -1077,6 +1235,25 @@ fn TelemetryDashboardInner() -> Element {
     let flight_state = use_signal(|| FlightState::Startup);
     let board_status = use_signal(Vec::<BoardStatusEntry>::new);
     let network_topology = use_signal(NetworkTopologyMsg::default);
+    let frontend_network_metrics = use_signal(FrontendNetworkMetrics::default);
+    let show_version_overlay = use_signal(|| false);
+    let detailed_network_time_display = network_time
+        .read()
+        .as_ref()
+        .copied()
+        .map(compensated_network_time_ms)
+        .map(format_network_time);
+    let detailed_clock_delta_ms = network_time
+        .read()
+        .as_ref()
+        .copied()
+        .map(compensated_network_time_ms)
+        .map(|ms| current_wallclock_ms().saturating_sub(ms));
+    let detailed_network_time_age_ms = network_time.read().as_ref().map(|sync| {
+        (monotonic_now_ms() - sync.received_mono_ms)
+            .max(0.0)
+            .round() as i64
+    });
 
     let active_main_tab = use_signal(|| _main_tab_from_str(st_main_tab.read().as_str()));
 
@@ -1094,6 +1271,32 @@ fn TelemetryDashboardInner() -> Element {
             if !layout.data_tab.tabs.iter().any(|t| t.id == current) {
                 active_data_tab.set(layout.data_tab.tabs[0].id.clone());
             }
+        });
+    }
+
+    {
+        let mut frontend_network_metrics = frontend_network_metrics;
+        let alive = alive.clone();
+        use_effect(move || {
+            reset_frontend_network_metrics_state();
+            let alive = alive.clone();
+            let epoch = *WS_EPOCH.read();
+            spawn(async move {
+                while alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
+                    frontend_network_metrics.set(frontend_network_metrics_snapshot());
+                    let started = monotonic_now_ms();
+                    if http_get_json::<NetworkTimeMsg>("/api/network_time")
+                        .await
+                        .is_ok()
+                    {
+                        note_http_rtt(monotonic_now_ms() - started);
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    gloo_timers::future::TimeoutFuture::new(1_000).await;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            });
         });
     }
 
@@ -1694,11 +1897,6 @@ fn TelemetryDashboardInner() -> Element {
     };
 
     let version_button: Element = {
-        #[cfg(not(target_arch = "wasm32"))]
-        use dioxus_router::use_navigator;
-        #[cfg(not(target_arch = "wasm32"))]
-        let nav = use_navigator();
-
         #[cfg(target_arch = "wasm32")]
         {
             rsx! { div {} }
@@ -1706,19 +1904,20 @@ fn TelemetryDashboardInner() -> Element {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let mut show_version_overlay = show_version_overlay;
             rsx! {
                 button {
                     style: "
                         padding:0.45rem 0.85rem;
                         border-radius:0.75rem;
-                        border:1px solid #f59e0b;
-                        background:#451a03;
-                        color:#fde68a;
+                        border:1px solid #334155;
+                        background:#111827;
+                        color:#e5e7eb;
                         font-weight:800;
                         cursor:pointer;
                     ",
                     onclick: move |_| {
-                        let _ = nav.push(Route::Version {});
+                        show_version_overlay.set(true);
                     },
                     "VERSION"
                 }
@@ -1817,23 +2016,92 @@ fn TelemetryDashboardInner() -> Element {
         .copied()
         .map(compensated_network_time_ms)
         .map(format_network_time);
+    let version_overlay: Element = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            rsx! { div {} }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if *show_version_overlay.read() {
+                rsx! {
+                    div {
+                        style: "
+                            position:fixed;
+                            inset:0;
+                            z-index:1000;
+                            display:flex;
+                            align-items:flex-start;
+                            justify-content:center;
+                            padding:24px 16px;
+                            overflow-y:auto;
+                            overflow-x:hidden;
+                            background:rgba(2, 6, 23, 0.78);
+                            backdrop-filter:blur(6px);
+                            overscroll-behavior:contain;
+                            -webkit-overflow-scrolling:touch;
+                        ",
+                        onclick: {
+                            let mut show_version_overlay = show_version_overlay;
+                            move |_| show_version_overlay.set(false)
+                        },
+                        div {
+                            style: "
+                                width:min(900px, 100%);
+                                padding:24px;
+                                border:1px solid #334155;
+                                border-radius:16px;
+                                background:#0b1220;
+                                box-shadow:0 12px 30px rgba(0,0,0,0.5);
+                            ",
+                            onclick: move |evt| evt.stop_propagation(),
+                            div {
+                                style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap;",
+                                h1 { style: "margin:0; font-size:20px;", "UBSEDS GS" }
+                                button {
+                                    style: "
+                                        padding:10px 14px;
+                                        border-radius:12px;
+                                        border:1px solid #334155;
+                                        background:#111827;
+                                        color:#e5e7eb;
+                                        font-weight:700;
+                                        cursor:pointer;
+                                    ",
+                                    onclick: {
+                                        let mut show_version_overlay = show_version_overlay;
+                                        move |_| show_version_overlay.set(false)
+                                    },
+                                    "Close"
+                                }
+                            }
+                            VersionTab {}
+                        }
+                    }
+                }
+            } else {
+                rsx! { div {} }
+            }
+        }
+    };
 
     // MAIN UI
     rsx! {
-    gps::GpsDriver {
-        user_gps: user_gps,
-        // Only needed if you want to gate geolocation until the JS is ready on wasm:
-        js_ready: Some(start_gps_js()),
-    }
-        style {
-            "@keyframes gs26-blink-slow-off {{ 0%, 100% {{ opacity: 0.2; }} 18% {{ opacity: 1.0; }} }}
+            gps::GpsDriver {
+                user_gps: user_gps,
+                // Only needed if you want to gate geolocation until the JS is ready on wasm:
+                js_ready: Some(start_gps_js()),
+            }
+                style {
+                    "@keyframes gs26-blink-slow-off {{ 0%, 100% {{ opacity: 0.2; }} 18% {{ opacity: 1.0; }} }}
              @keyframes gs26-blink-slow-on  {{ 0%, 100% {{ opacity: 1.0; }} 82% {{ opacity: 0.25; }} }}
              @keyframes gs26-blink-fast-off {{ 0%, 100% {{ opacity: 0.15; }} 45% {{ opacity: 1.0; }} }}
              @keyframes gs26-blink-fast-on  {{ 0%, 100% {{ opacity: 1.0; }} 55% {{ opacity: 0.2; }} }}"
-        }
-        if layout_loading_snapshot && layout_snapshot.is_none() {
-            div {
-                style: "
+                }
+                if layout_loading_snapshot && layout_snapshot.is_none() {
+                    div {
+                        style: "
                     height:100vh;
                     padding:24px;
                     color:#e5e7eb;
@@ -1845,18 +2113,18 @@ fn TelemetryDashboardInner() -> Element {
                     border:{border_style};
                     box-sizing:border-box;
                 ",
-                div { style: "text-align:center; display:flex; flex-direction:column; gap:10px; align-items:center;",
-                    div { style: "font-size:22px; font-weight:800; color:#f97316;", "Loading layout..." }
-                    div { style: "font-size:14px; color:#94a3b8;", "Waiting for layout from backend" }
-                    div { style: "display:flex; gap:10px; flex-wrap:wrap; justify-content:center; margin-top:4px;",
-                        {version_button}
-                        {connect_button}
+                        div { style: "text-align:center; display:flex; flex-direction:column; gap:10px; align-items:center;",
+                            div { style: "font-size:22px; font-weight:800; color:#f97316;", "Loading layout..." }
+                            div { style: "font-size:14px; color:#94a3b8;", "Waiting for layout from backend" }
+                            div { style: "display:flex; gap:10px; flex-wrap:wrap; justify-content:center; margin-top:4px;",
+                                {version_button}
+                                {connect_button}
+                            }
+                        }
                     }
-                }
-            }
-        } else if layout_snapshot.is_none() {
-            div {
-                style: "
+                } else if layout_snapshot.is_none() {
+                    div {
+                        style: "
                     height:100vh;
                     padding:24px;
                     color:#e5e7eb;
@@ -1868,22 +2136,22 @@ fn TelemetryDashboardInner() -> Element {
                     border:{border_style};
                     box-sizing:border-box;
                 ",
-                div { style: "text-align:center; display:flex; flex-direction:column; gap:12px; align-items:center;",
-                    div { style: "font-size:20px; font-weight:800; color:#ef4444;", "Layout failed to load" }
-                    if let Some(msg) = layout_error_snapshot.clone() {
-                        div { style: "font-size:13px; color:#94a3b8;", "{msg}" }
+                        div { style: "text-align:center; display:flex; flex-direction:column; gap:12px; align-items:center;",
+                            div { style: "font-size:20px; font-weight:800; color:#ef4444;", "Layout failed to load" }
+                            if let Some(msg) = layout_error_snapshot.clone() {
+                                div { style: "font-size:13px; color:#94a3b8;", "{msg}" }
+                            }
+                            div { style: "display:flex; gap:10px; flex-wrap:wrap; justify-content:center;",
+                                {reload_button}
+                                {version_button}
+                                {connect_button}
+                            }
+                        }
                     }
-                    div { style: "display:flex; gap:10px; flex-wrap:wrap; justify-content:center;",
-                        {reload_button}
-                        {version_button}
-                        {connect_button}
-                    }
-                }
-            }
-        } else if let Some(layout) = layout_snapshot {
-        div {
+                } else if let Some(layout) = layout_snapshot {
+                div {
 
-            style: "
+                    style: "
                 height:100vh;
                 padding:24px;
                 color:#e5e7eb;
@@ -1896,9 +2164,9 @@ fn TelemetryDashboardInner() -> Element {
                 overflow:hidden;
             ",
 
-            // Header row 1
-            div {
-                style: "
+                    // Header row 1
+                    div {
+                        style: "
                     display:flex;
                     align-items:center;
                     justify-content:space-between;
@@ -1907,14 +2175,14 @@ fn TelemetryDashboardInner() -> Element {
                     margin-bottom:12px;
                     flex-wrap:wrap;
                 ",
-                h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "Rocket Dashboard" }
+                        h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "Rocket Dashboard" }
 
-                div { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
-                    {
-                        let software_buttons_enabled =
-                            action_policy.read().software_buttons_enabled;
-                        let abort_style = if software_buttons_enabled {
-                            "
+                        div { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
+                            {
+                                let software_buttons_enabled =
+                                    action_policy.read().software_buttons_enabled;
+                                let abort_style = if software_buttons_enabled {
+                                    "
                                 padding:0.45rem 0.85rem;
                                 border-radius:0.75rem;
                                 border:1px solid #ef4444;
@@ -1923,8 +2191,8 @@ fn TelemetryDashboardInner() -> Element {
                                 font-weight:900;
                                 cursor:pointer;
                             "
-                        } else {
-                            "
+                                } else {
+                                    "
                                 padding:0.45rem 0.85rem;
                                 border-radius:0.75rem;
                                 border:1px solid #7f1d1d;
@@ -1935,42 +2203,42 @@ fn TelemetryDashboardInner() -> Element {
                                 opacity:0.55;
                                 filter:grayscale(0.25) brightness(0.9);
                             "
-                        };
-                        rsx! {
-                    button {
-                        style: "{abort_style}",
-                        disabled: !software_buttons_enabled,
-                        onclick: move |_| {
-                            if software_buttons_enabled {
-                                send_cmd("Abort")
+                                };
+                                rsx! {
+                            button {
+                                style: "{abort_style}",
+                                disabled: !software_buttons_enabled,
+                                onclick: move |_| {
+                                    if software_buttons_enabled {
+                                        send_cmd("Abort")
+                                    }
+                                },
+                                "ABORT"
                             }
-                        },
-                        "ABORT"
-                    }
+                                }
+                            }
+
+                            {reload_button}
+                            {version_button}
+                            {connect_button}
                         }
                     }
 
-                    {reload_button}
-                    {version_button}
-                    {connect_button}
-                }
-            }
+                    if let Some(msg) = layout_error_snapshot.clone() {
+                        div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid #ef4444; background:#450a0a; color:#fecaca; font-size:12px;",
+                            "{msg}"
+                        }
+                    }
 
-            if let Some(msg) = layout_error_snapshot.clone() {
-                div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid #ef4444; background:#450a0a; color:#fecaca; font-size:12px;",
-                    "{msg}"
-                }
-            }
+                    if !action_policy.read().software_buttons_enabled {
+                        div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid #f59e0b; background:#451a03; color:#fde68a; font-size:12px;",
+                            "Software command buttons are disabled by the hardware GPIO lockout."
+                        }
+                    }
 
-            if !action_policy.read().software_buttons_enabled {
-                div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid #f59e0b; background:#451a03; color:#fde68a; font-size:12px;",
-                    "Software command buttons are disabled by the hardware GPIO lockout."
-                }
-            }
-
-            // Header row 2
-            div {
-                style: "
+                    // Header row 2
+                    div {
+                        style: "
                     display:flex;
                     align-items:center;
                     gap:12px;
@@ -1979,8 +2247,8 @@ fn TelemetryDashboardInner() -> Element {
                     flex-wrap:wrap;
                 ",
 
-                div {
-                    style: "
+                        div {
+                            style: "
                         flex:1 1 520px;
                         display:flex;
                         align-items:center;
@@ -1991,130 +2259,138 @@ fn TelemetryDashboardInner() -> Element {
                         box-shadow:0 10e0px 25px rgba(0,0,0,0.45);
                         min-width:260px;
                     ",
-                    nav { style: "display:flex; gap:0.5rem; flex-wrap:wrap;",
-                        for tab in _configured_main_tabs(&layout).into_iter() {
-                            match tab {
-                                MainTab::State => rsx! {
-                                    button {
-                                        style: if *active_main_tab.read() == MainTab::State { tab_style_active("#38bdf8") } else { tab_style_inactive.to_string() },
-                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::State) },
-                                        "Flight"
-                                    }
-                                },
-                                MainTab::ConnectionStatus => rsx! {
-                                    button {
-                                        style: if *active_main_tab.read() == MainTab::ConnectionStatus { tab_style_active("#06b6d4") } else { tab_style_inactive.to_string() },
-                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::ConnectionStatus) },
-                                        "Connection Status"
-                                    }
-                                },
-                                MainTab::Map => rsx! {
-                                    button {
-                                        style: if *active_main_tab.read() == MainTab::Map { tab_style_active("#22c55e") } else { tab_style_inactive.to_string() },
-                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Map) },
-                                        "Map"
-                                    }
-                                },
-                                MainTab::Actions => rsx! {
-                                    button {
-                                        style: if *active_main_tab.read() == MainTab::Actions { tab_style_active("#a78bfa") } else { tab_style_inactive.to_string() },
-                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Actions) },
-                                        "Actions"
-                                    }
-                                },
-                                MainTab::Calibration => rsx! {
-                                    button {
-                                        style: if *active_main_tab.read() == MainTab::Calibration { tab_style_active("#14b8a6") } else { tab_style_inactive.to_string() },
-                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Calibration) },
-                                        "Calibration"
-                                    }
-                                },
-                                MainTab::Notifications => rsx! {
-                                    button {
-                                        style: if *active_main_tab.read() == MainTab::Notifications { tab_style_active("#3b82f6") } else { tab_style_inactive.to_string() },
-                                        onclick: {
-                                            let mut t = active_main_tab;
-                                            let notifications = notifications;
-                                            let dismissed_notifications = dismissed_notifications;
-                                            let unread_notification_ids = unread_notification_ids;
-                                            move |_| {
-                                                t.set(MainTab::Notifications);
-                                                dismiss_all_active_notifications_local_and_remote(
-                                                    notifications,
-                                                    dismissed_notifications,
-                                                    unread_notification_ids,
-                                                );
+                            nav { style: "display:flex; gap:0.5rem; flex-wrap:wrap;",
+                                for tab in _configured_main_tabs(&layout).into_iter() {
+                                    match tab {
+                                        MainTab::State => rsx! {
+                                            button {
+                                                style: if *active_main_tab.read() == MainTab::State { tab_style_active("#38bdf8") } else { tab_style_inactive.to_string() },
+                                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::State) },
+                                                "Flight"
                                             }
                                         },
-                                        span { "Notifications" }
-                                        if has_unread_notifications {
-                                            span { style: "margin-left:6px; color:#93c5fd;", "●" }
-                                        }
-                                    }
-                                },
-                                MainTab::Warnings => rsx! {
-                                    button {
-                                        style: if *active_main_tab.read() == MainTab::Warnings { tab_style_active("#facc15") } else { tab_style_inactive.to_string() },
-                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Warnings) },
-                                        span { "Warnings" }
-                                        if has_warnings {
-                                            span {
-                                                style: {
-                                                    if has_unacked_warnings && *flash_on.read() {
-                                                        "margin-left:6px; color:#facc15; opacity:1;".to_string()
-                                                    } else if has_unacked_warnings {
-                                                        "margin-left:6px; color:#facc15; opacity:0.4;".to_string()
-                                                    } else {
-                                                        "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                                        MainTab::ConnectionStatus => rsx! {
+                                            button {
+                                                style: if *active_main_tab.read() == MainTab::ConnectionStatus { tab_style_active("#06b6d4") } else { tab_style_inactive.to_string() },
+                                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::ConnectionStatus) },
+                                                "Connection Status"
+                                            }
+                                        },
+                                        MainTab::Detailed => rsx! {
+                                            button {
+                                                style: if *active_main_tab.read() == MainTab::Detailed { tab_style_active("#0ea5e9") } else { tab_style_inactive.to_string() },
+                                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Detailed) },
+                                                "Detailed"
+                                            }
+                                        },
+                                        MainTab::Map => rsx! {
+                                            button {
+                                                style: if *active_main_tab.read() == MainTab::Map { tab_style_active("#22c55e") } else { tab_style_inactive.to_string() },
+                                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Map) },
+                                                "Map"
+                                            }
+                                        },
+                                        MainTab::Actions => rsx! {
+                                            button {
+                                                style: if *active_main_tab.read() == MainTab::Actions { tab_style_active("#a78bfa") } else { tab_style_inactive.to_string() },
+                                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Actions) },
+                                                "Actions"
+                                            }
+                                        },
+                                        MainTab::Calibration => rsx! {
+                                            button {
+                                                style: if *active_main_tab.read() == MainTab::Calibration { tab_style_active("#14b8a6") } else { tab_style_inactive.to_string() },
+                                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Calibration) },
+                                                "Calibration"
+                                            }
+                                        },
+                                        MainTab::Notifications => rsx! {
+                                            button {
+                                                style: if *active_main_tab.read() == MainTab::Notifications { tab_style_active("#3b82f6") } else { tab_style_inactive.to_string() },
+                                                onclick: {
+                                                    let mut t = active_main_tab;
+                                                    let notifications = notifications;
+                                                    let dismissed_notifications = dismissed_notifications;
+                                                    let unread_notification_ids = unread_notification_ids;
+                                                    move |_| {
+                                                        t.set(MainTab::Notifications);
+                                                        dismiss_all_active_notifications_local_and_remote(
+                                                            notifications,
+                                                            dismissed_notifications,
+                                                            unread_notification_ids,
+                                                        );
                                                     }
                                                 },
-                                                "⚠"
+                                                span { "Notifications" }
+                                                if has_unread_notifications {
+                                                    span { style: "margin-left:6px; color:#93c5fd;", "●" }
+                                                }
                                             }
-                                        }
-                                    }
-                                },
-                                MainTab::Errors => rsx! {
-                                    button {
-                                        style: if *active_main_tab.read() == MainTab::Errors { tab_style_active("#ef4444") } else { tab_style_inactive.to_string() },
-                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Errors) },
-                                        span { "Errors" }
-                                        if has_errors {
-                                            span {
-                                                style: {
-                                                    if has_unacked_errors && *flash_on.read() {
-                                                        "margin-left:6px; color:#fecaca; opacity:1;".to_string()
-                                                    } else if has_unacked_errors {
-                                                        "margin-left:6px; color:#fecaca; opacity:0.4;".to_string()
-                                                    } else {
-                                                        "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                                        },
+                                        MainTab::Warnings => rsx! {
+                                            button {
+                                                style: if *active_main_tab.read() == MainTab::Warnings { tab_style_active("#facc15") } else { tab_style_inactive.to_string() },
+                                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Warnings) },
+                                                span { "Warnings" }
+                                                if has_warnings {
+                                                    span {
+                                                        style: {
+                                                            if has_unacked_warnings && *flash_on.read() {
+                                                                "margin-left:6px; color:#facc15; opacity:1;".to_string()
+                                                            } else if has_unacked_warnings {
+                                                                "margin-left:6px; color:#facc15; opacity:0.4;".to_string()
+                                                            } else {
+                                                                "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                                                            }
+                                                        },
+                                                        "⚠"
                                                     }
-                                                },
-                                                "⛔"
+                                                }
                                             }
-                                        }
-                                    }
-                                },
-                                MainTab::Data => rsx! {
-                                    button {
-                                        style: if *active_main_tab.read() == MainTab::Data { tab_style_active("#f97316") } else { tab_style_inactive.to_string() },
-                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Data) },
-                                        "Data"
-                                    }
-                                },
-                                MainTab::NetworkTopology => rsx! {
-                                    button {
-                                        style: if *active_main_tab.read() == MainTab::NetworkTopology { tab_style_active("#8b5cf6") } else { tab_style_inactive.to_string() },
-                                        onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::NetworkTopology) },
-                                        "Network"
-                                    }
-                                },
-                            }
-                        }
+                                        },
+                                        MainTab::Errors => rsx! {
+                                            button {
+                                                style: if *active_main_tab.read() == MainTab::Errors { tab_style_active("#ef4444") } else { tab_style_inactive.to_string() },
+                                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Errors) },
+                                                span { "Errors" }
+                                                if has_errors {
+                                                    span {
+                                                        style: {
+                                                            if has_unacked_errors && *flash_on.read() {
+                                                                "margin-left:6px; color:#fecaca; opacity:1;".to_string()
+                                                            } else if has_unacked_errors {
+                                                                "margin-left:6px; color:#fecaca; opacity:0.4;".to_string()
+                                                            } else {
+                                                                "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                                                            }
+                                                        },
+                                                        "⛔"
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        MainTab::Data => rsx! {
+                                            button {
+                                                style: if *active_main_tab.read() == MainTab::Data { tab_style_active("#f97316") } else { tab_style_inactive.to_string() },
+                                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Data) },
+                                                "Data"
+                                            }
+                                        },
+                                        MainTab::NetworkTopology => rsx! {
+                                            button {
+                                                style: if *active_main_tab.read() == MainTab::NetworkTopology { tab_style_active("#8b5cf6") } else { tab_style_inactive.to_string() },
+                                                onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::NetworkTopology) },
+                                                "Network"
+                                            }
+                                        },
                     }
                 }
+            {version_overlay}
+        }
+    }
 
-                div {
-                    style: "
+                        div {
+                            style: "
                         flex:1 1 320px;
                         display:flex;
                         align-items:center;
@@ -2127,226 +2403,237 @@ fn TelemetryDashboardInner() -> Element {
                         border:1px solid #4b5563;
                         min-width:260px;
                     ",
-                    div { style: "display:flex; align-items:center; flex-wrap:wrap; gap:0.5rem; min-width:0;",
-                        span { style: "color:#9ca3af;", "Status:" }
+                            div { style: "display:flex; align-items:center; flex-wrap:wrap; gap:0.5rem; min-width:0;",
+                                span { style: "color:#9ca3af;", "Status:" }
 
-                        if !has_warnings && !has_errors {
-                            span { style: "color:#22c55e; font-weight:600; flex:0 0 auto;", "Nominal" }
-                            span { style: "color:#93c5fd; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
-                                "(Flight state:"
-                                span {
-                                    style: "display:inline-flex; align-items:baseline; width:15.5ch; padding-left:0.4ch; white-space:nowrap;",
-                                    span { "{flight_state.read().to_string()}" }
-                                    span { ")" }
-                                }
-                            }
-                        } else {
-                            if has_errors {
-                                span { style: "color:#fecaca; flex:0 0 auto;", {format!("{err_count} error(s)")} }
-                            }
-                            if has_warnings {
-                                span { style: "color:#fecaca; flex:0 0 auto;", {format!("{warn_count} warnings(s)")} }
-                            }
-                            span { style: "color:#93c5fd; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
-                                "(Flight state:"
-                                span {
-                                    style: "display:inline-flex; align-items:baseline; width:15.5ch; padding-left:0.4ch; white-space:nowrap;",
-                                    span { "{flight_state.read().to_string()}" }
-                                    span { ")" }
-                                }
-                            }
-
-                            if *active_main_tab.read() == MainTab::Warnings && has_warnings {
-                                button {
-                                    style: "
-                                        margin-left:auto;
-                                        padding:0.25rem 0.7rem;
-                                        border-radius:999px;
-                                        border:1px solid #4b5563;
-                                        background:#020617;
-                                        color:#e5e7eb;
-                                        font-size:0.75rem;
-                                        cursor:pointer;
-                                    ",
-                                    onclick: {
-                                        let mut ack_warning_ts = ack_warning_ts;
-                                        let mut ack_warning_count = ack_warning_count;
-                                        move |_| {
-                                            ack_warning_ts.set(latest_warning_ts);
-                                            ack_warning_count.set(*warning_event_counter.read());
+                                if !has_warnings && !has_errors {
+                                    span { style: "color:#22c55e; font-weight:600; flex:0 0 auto;", "Nominal" }
+                                    span { style: "color:#93c5fd; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
+                                        "(Flight state:"
+                                        span {
+                                            style: "display:inline-flex; align-items:baseline; width:15.5ch; padding-left:0.4ch; white-space:nowrap;",
+                                            span { "{flight_state.read().to_string()}" }
+                                            span { ")" }
                                         }
-                                    },
-                                    "Acknowledge warnings"
-                                }
-                            }
-
-                            if *active_main_tab.read() == MainTab::Errors && has_errors {
-                                button {
-                                    style: "
-                                        margin-left:auto;
-                                        padding:0.25rem 0.7rem;
-                                        border-radius:999px;
-                                        border:1px solid #4b5563;
-                                        background:#020617;
-                                        color:#e5e7eb;
-                                        font-size:0.75rem;
-                                        cursor:pointer;
-                                    ",
-                                    onclick: {
-                                        let mut ack_error_ts = ack_error_ts;
-                                        let mut ack_error_count = ack_error_count;
-                                        move |_| {
-                                            ack_error_ts.set(latest_error_ts);
-                                            ack_error_count.set(*error_event_counter.read());
-                                        }
-                                    },
-                                    "Acknowledge errors"
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(ts) = network_time_snapshot {
-                        div { style: "display:flex; align-items:center; flex:0 0 auto; min-width:0;",
-                            span { style: "color:#cbd5e1; display:inline-flex; align-items:baseline; white-space:nowrap;",
-                                "(Rocket Time:"
-                                span {
-                                    style: "display:inline-flex; align-items:baseline; width:16ch; padding-left:0.4ch; white-space:nowrap; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;",
-                                    span { "{ts}" }
-                                    span { ")" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Main body
-            if !notifications.read().is_empty() {
-                div {
-                    style: "display:flex; flex-direction:column; gap:8px; margin-bottom:10px;",
-                    for n in notifications.read().iter() {
-                        div {
-                            style: "display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid #2563eb; border-radius:10px; background:#0b1f4d; color:#bfdbfe;",
-                            span { style: "flex:1;", "{n.message}" }
-                            button {
-                                style: "padding:0.2rem 0.55rem; border-radius:999px; border:1px solid #1d4ed8; background:#111827; color:#bfdbfe; font-size:0.75rem; cursor:pointer;",
-                                onclick: {
-                                    let id = n.id;
-                                    let ts = n.timestamp_ms;
-                                    let mut notifications = notifications;
-                                    let mut dismissed_notifications = dismissed_notifications;
-                                    let mut unread_notification_ids = unread_notification_ids;
-                                    move |_| {
-                                        let mut v = notifications.read().clone();
-                                        v.retain(|x| x.id != id);
-                                        notifications.set(v);
-                                        let mut unread = unread_notification_ids.read().clone();
-                                        unread.retain(|x| *x != id);
-                                        unread_notification_ids.set(unread);
-                                        let mut ids = dismissed_notifications.read().clone();
-                                        let item = DismissedNotification {
-                                            id,
-                                            timestamp_ms: ts,
-                                        };
-                                        if !ids.contains(&item) {
-                                            ids.push(item);
-                                            ids.sort_by_key(|x| (x.id, x.timestamp_ms));
-                                            dismissed_notifications.set(ids.clone());
-                                            persist_dismissed_notifications(&ids);
-                                        }
-                                        spawn_detached(async move {
-                                            let _ = dismiss_notification_remote(id).await;
-                                        });
                                     }
-                                },
-                                "Dismiss"
+                                } else {
+                                    if has_errors {
+                                        span { style: "color:#fecaca; flex:0 0 auto;", {format!("{err_count} error(s)")} }
+                                    }
+                                    if has_warnings {
+                                        span { style: "color:#fecaca; flex:0 0 auto;", {format!("{warn_count} warnings(s)")} }
+                                    }
+                                    span { style: "color:#93c5fd; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
+                                        "(Flight state:"
+                                        span {
+                                            style: "display:inline-flex; align-items:baseline; width:15.5ch; padding-left:0.4ch; white-space:nowrap;",
+                                            span { "{flight_state.read().to_string()}" }
+                                            span { ")" }
+                                        }
+                                    }
+
+                                    if *active_main_tab.read() == MainTab::Warnings && has_warnings {
+                                        button {
+                                            style: "
+                                        margin-left:auto;
+                                        padding:0.25rem 0.7rem;
+                                        border-radius:999px;
+                                        border:1px solid #4b5563;
+                                        background:#020617;
+                                        color:#e5e7eb;
+                                        font-size:0.75rem;
+                                        cursor:pointer;
+                                    ",
+                                            onclick: {
+                                                let mut ack_warning_ts = ack_warning_ts;
+                                                let mut ack_warning_count = ack_warning_count;
+                                                move |_| {
+                                                    ack_warning_ts.set(latest_warning_ts);
+                                                    ack_warning_count.set(*warning_event_counter.read());
+                                                }
+                                            },
+                                            "Acknowledge warnings"
+                                        }
+                                    }
+
+                                    if *active_main_tab.read() == MainTab::Errors && has_errors {
+                                        button {
+                                            style: "
+                                        margin-left:auto;
+                                        padding:0.25rem 0.7rem;
+                                        border-radius:999px;
+                                        border:1px solid #4b5563;
+                                        background:#020617;
+                                        color:#e5e7eb;
+                                        font-size:0.75rem;
+                                        cursor:pointer;
+                                    ",
+                                            onclick: {
+                                                let mut ack_error_ts = ack_error_ts;
+                                                let mut ack_error_count = ack_error_count;
+                                                move |_| {
+                                                    ack_error_ts.set(latest_error_ts);
+                                                    ack_error_count.set(*error_event_counter.read());
+                                                }
+                                            },
+                                            "Acknowledge errors"
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(ts) = network_time_snapshot {
+                                div { style: "display:flex; align-items:center; flex:0 0 auto; min-width:0;",
+                                    span { style: "color:#cbd5e1; display:inline-flex; align-items:baseline; white-space:nowrap;",
+                                        "(Rocket Time:"
+                                        span {
+                                            style: "display:inline-flex; align-items:baseline; width:16ch; padding-left:0.4ch; white-space:nowrap; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;",
+                                            span { "{ts}" }
+                                            span { ")" }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                }
-            }
 
-            div { style: "flex:1; min-height:0; overflow:hidden;",
-                match *active_main_tab.read() {
-                    MainTab::State => rsx! {
-                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto;",
-                                StateTab {
-                                    flight_state: flight_state,
-                                    board_status: board_status,
-                                    rocket_gps: rocket_gps,
-                                    user_gps: user_gps,
-                                    layout: layout.state_tab.clone(),
-                                    data_layout: layout.data_tab.clone(),
-                                    actions: layout.actions_tab.clone(),
-                                    action_policy: action_policy,
-                                    default_valve_labels: layout
-                                        .data_tab
-                                        .tabs
-                                        .iter()
-                                        .find(|t| t.id == "VALVE_STATE")
-                                        .and_then(|t| t.boolean_labels.clone()),
+                    // Main body
+                    if !notifications.read().is_empty() {
+                        div {
+                            style: "display:flex; flex-direction:column; gap:8px; margin-bottom:10px;",
+                            for n in notifications.read().iter() {
+                                div {
+                                    style: "display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid #2563eb; border-radius:10px; background:#0b1f4d; color:#bfdbfe;",
+                                    span { style: "flex:1;", "{n.message}" }
+                                    button {
+                                        style: "padding:0.2rem 0.55rem; border-radius:999px; border:1px solid #1d4ed8; background:#111827; color:#bfdbfe; font-size:0.75rem; cursor:pointer;",
+                                        onclick: {
+                                            let id = n.id;
+                                            let ts = n.timestamp_ms;
+                                            let mut notifications = notifications;
+                                            let mut dismissed_notifications = dismissed_notifications;
+                                            let mut unread_notification_ids = unread_notification_ids;
+                                            move |_| {
+                                                let mut v = notifications.read().clone();
+                                                v.retain(|x| x.id != id);
+                                                notifications.set(v);
+                                                let mut unread = unread_notification_ids.read().clone();
+                                                unread.retain(|x| *x != id);
+                                                unread_notification_ids.set(unread);
+                                                let mut ids = dismissed_notifications.read().clone();
+                                                let item = DismissedNotification {
+                                                    id,
+                                                    timestamp_ms: ts,
+                                                };
+                                                if !ids.contains(&item) {
+                                                    ids.push(item);
+                                                    ids.sort_by_key(|x| (x.id, x.timestamp_ms));
+                                                    dismissed_notifications.set(ids.clone());
+                                                    persist_dismissed_notifications(&ids);
+                                                }
+                                                spawn_detached(async move {
+                                                    let _ = dismiss_notification_remote(id).await;
+                                                });
+                                            }
+                                        },
+                                        "Dismiss"
+                                    }
                                 }
                             }
-                    },
-                    MainTab::ConnectionStatus => rsx! {
-                        ConnectionStatusTab {
-                            boards: board_status,
-                            layout: layout.connection_tab.clone(),
                         }
-                    },
-                    MainTab::NetworkTopology => rsx! {
-                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
-                            NetworkTopologyTab {
-                                topology: network_topology,
-                                layout: layout.network_tab.clone(),
-                            }
+                    }
+
+                    div { style: "flex:1; min-height:0; overflow:hidden;",
+                        match *active_main_tab.read() {
+                            MainTab::State => rsx! {
+                                div { style: "height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto;",
+                                        StateTab {
+                                            flight_state: flight_state,
+                                            board_status: board_status,
+                                            rocket_gps: rocket_gps,
+                                            user_gps: user_gps,
+                                            layout: layout.state_tab.clone(),
+                                            data_layout: layout.data_tab.clone(),
+                                            actions: layout.actions_tab.clone(),
+                                            action_policy: action_policy,
+                                            default_valve_labels: layout
+                                                .data_tab
+                                                .tabs
+                                                .iter()
+                                                .find(|t| t.id == "VALVE_STATE")
+                                                .and_then(|t| t.boolean_labels.clone()),
+                                        }
+                                    }
+                            },
+                            MainTab::ConnectionStatus => rsx! {
+                                ConnectionStatusTab {
+                                    boards: board_status,
+                                    layout: layout.connection_tab.clone(),
+                                }
+                            },
+                            MainTab::Detailed => rsx! {
+                                DetailedTab {
+                                    metrics: frontend_network_metrics,
+                                    board_status: board_status,
+                                    network_topology: network_topology,
+                                    flight_state: flight_state,
+                                    network_time_display: detailed_network_time_display.clone(),
+                                    network_clock_delta_ms: detailed_clock_delta_ms,
+                                    network_time_age_ms: detailed_network_time_age_ms,
+                                }
+                            },
+                            MainTab::NetworkTopology => rsx! {
+                                div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                                    NetworkTopologyTab {
+                                        topology: network_topology,
+                                        layout: layout.network_tab.clone(),
+                                    }
+                                }
+                            },
+                            MainTab::Map => rsx! {
+                                MapTab {
+                                    key: "{*WS_EPOCH.read()}",
+                                    rocket_gps: rocket_gps,
+                                    user_gps: user_gps
+                                }
+                            },
+                            MainTab::Actions => rsx! {
+                                div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                                    ActionsTab { layout: layout.actions_tab.clone(), action_policy: action_policy }
+                                }
+                            },
+                            MainTab::Calibration => rsx! {
+                                div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                                    CalibrationTab {}
+                                }
+                            },
+                            MainTab::Notifications => rsx! {
+                                div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                                    NotificationsTab { history: notification_history }
+                                }
+                            },
+                            MainTab::Warnings => rsx! {
+                                div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                                    WarningsTab { warnings: warnings }
+                                }
+                            },
+                            MainTab::Errors => rsx! {
+                                div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
+                                    ErrorsTab { errors: errors }
+                                }
+                            },
+                            MainTab::Data => rsx! {
+                                DataTab {
+                                    active_tab: active_data_tab,
+                                    layout: layout.data_tab.clone(),
+                                    battery_sources: layout.battery.sources.clone(),
+                                }
+                            },
                         }
-                    },
-                    MainTab::Map => rsx! {
-                        MapTab {
-                            key: "{*WS_EPOCH.read()}",
-                            rocket_gps: rocket_gps,
-                            user_gps: user_gps
-                        }
-                    },
-                    MainTab::Actions => rsx! {
-                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
-                            ActionsTab { layout: layout.actions_tab.clone(), action_policy: action_policy }
-                        }
-                    },
-                    MainTab::Calibration => rsx! {
-                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
-                            CalibrationTab {}
-                        }
-                    },
-                    MainTab::Notifications => rsx! {
-                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
-                            NotificationsTab { history: notification_history }
-                        }
-                    },
-                    MainTab::Warnings => rsx! {
-                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
-                            WarningsTab { warnings: warnings }
-                        }
-                    },
-                    MainTab::Errors => rsx! {
-                        div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
-                            ErrorsTab { errors: errors }
-                        }
-                    },
-                    MainTab::Data => rsx! {
-                        DataTab {
-                            active_tab: active_data_tab,
-                            layout: layout.data_tab.clone(),
-                            battery_sources: layout.battery.sources.clone(),
-                        }
-                    },
+                    }
+                }
                 }
             }
-        }
-        }
-    }
 }
 
 fn send_cmd(cmd: &str) {
@@ -2796,7 +3083,7 @@ async fn seed_from_db(
     network_topology: &mut Signal<NetworkTopologyMsg>,
     board_status: &mut Signal<Vec<BoardStatusEntry>>,
     rocket_gps: &mut Signal<Option<(f64, f64)>>,
-    user_gps: &mut Signal<Option<(f64, f64)>>,
+    _user_gps: &mut Signal<Option<(f64, f64)>>,
     ack_warning_ts: &mut Signal<i64>,
     ack_error_ts: &mut Signal<i64>,
     alive: Arc<AtomicBool>,
@@ -3015,8 +3302,9 @@ async fn seed_from_db(
     if let Ok(gps) = http_get_json::<GpsResponse>("/api/gps").await
         && alive.load(Ordering::Relaxed)
     {
-        rocket_gps.set(Some((gps.rocket_lat, gps.rocket_lon)));
-        user_gps.set(Some((gps.user_lat, gps.user_lon)));
+        if let Some(rocket) = gps.rocket {
+            rocket_gps.set(Some((rocket.lat, rocket.lon)));
+        }
     }
 
     Ok(())
@@ -3167,6 +3455,7 @@ async fn connect_ws_once_wasm(
     log!("[WS] connecting to {ws_url} (epoch={epoch})");
 
     let ws = WebSocket::new(&ws_url).map_err(|_| "failed to create websocket".to_string())?;
+    note_ws_connection_state(false, ws_url.clone(), None, epoch);
 
     *WS_RAW.write() = Some(ws.clone());
     *WS_SENDER.write() = Some(WsSender { ws: ws.clone() });
@@ -3177,6 +3466,7 @@ async fn connect_ws_once_wasm(
     {
         let onopen: Closure<dyn FnMut(Event)> = Closure::new(move |_e: Event| {
             log!("[WS] open");
+            note_ws_connection_state(true, ws_url.clone(), None, epoch);
         });
         ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
         onopen.forget();
@@ -3258,6 +3548,7 @@ async fn connect_ws_once_wasm(
     }
 
     if *WS_EPOCH.read() == epoch {
+        note_ws_connection_state(false, ws_url, Some("websocket closed".to_string()), epoch);
         *WS_SENDER.write() = None;
         *WS_RAW.write() = None;
     }
@@ -3299,6 +3590,7 @@ async fn connect_ws_once_native(
     let ws_url = format!("{base_ws}/ws");
 
     log!("[WS] connecting to {ws_url} (epoch={epoch})");
+    note_ws_connection_state(false, ws_url.clone(), None, epoch);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     *WS_SENDER.write() = Some(WsSender { tx });
@@ -3325,6 +3617,7 @@ async fn connect_ws_once_native(
     };
 
     let (mut write, mut read) = ws_stream.split();
+    note_ws_connection_state(true, ws_url.clone(), None, epoch);
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -3371,6 +3664,7 @@ async fn connect_ws_once_native(
     // Only clear sender if this task still owns the active epoch.
     // Prevents old-epoch teardown from clobbering a freshly reconnected sender.
     if *WS_EPOCH.read() == epoch {
+        note_ws_connection_state(false, ws_url, Some("websocket closed".to_string()), epoch);
         *WS_SENDER.write() = None;
     }
 
@@ -3415,9 +3709,11 @@ fn handle_ws_message(
     let Ok(msg) = serde_json::from_str::<WsInMsg>(s) else {
         return;
     };
+    note_incoming_ws_message(s.len());
 
     match msg {
         WsInMsg::Telemetry(row) => {
+            note_incoming_telemetry_rows(1, 0);
             charts_cache_ingest_row(&row);
             update_latest_telemetry(&row);
             if RESEED_IN_PROGRESS.load(Ordering::Relaxed)
@@ -3446,6 +3742,7 @@ fn handle_ws_message(
             if batch.is_empty() {
                 return;
             }
+            note_incoming_telemetry_rows(batch.len(), 1);
             if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
                 for row in batch {
                     charts_cache_ingest_row(&row);

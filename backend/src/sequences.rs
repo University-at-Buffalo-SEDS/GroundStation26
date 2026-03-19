@@ -811,6 +811,52 @@ fn update_sequence_runtime(
     }
 }
 
+fn maybe_drive_local_prelaunch_state(
+    state: &AppState,
+    runtime: &SequenceRuntime,
+    valves: ValveSnapshot,
+    current_state: FlightState,
+) -> FlightState {
+    if (current_state as u8) > (FlightState::Armed as u8) {
+        return current_state;
+    }
+
+    if current_state == FlightState::Startup && state.all_boards_seen() {
+        state.set_local_flight_state(FlightState::Idle);
+        return FlightState::Idle;
+    }
+
+    let desired_state = match runtime.step {
+        SequenceStep::SetupValves => {
+            if current_state == FlightState::Idle
+                && (valves.normally_open == Some(false) || valves.dump_open == Some(false))
+            {
+                Some(FlightState::PreFill)
+            } else {
+                None
+            }
+        }
+        SequenceStep::NitrogenFill | SequenceStep::CloseNitrogen => Some(FlightState::NitrogenFill),
+        SequenceStep::NitrogenLeakCheck | SequenceStep::DumpNitrogen | SequenceStep::CloseDump => {
+            Some(FlightState::FillTest)
+        }
+        SequenceStep::OpenNitrous
+        | SequenceStep::CloseNitrous
+        | SequenceStep::NitrousSoak
+        | SequenceStep::RetractFillLines => Some(FlightState::NitrousFill),
+        SequenceStep::ArmedReady => Some(FlightState::Armed),
+    };
+
+    if let Some(next_state) = desired_state
+        && current_state != next_state
+    {
+        state.set_local_flight_state(next_state);
+        return next_state;
+    }
+
+    current_state
+}
+
 fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
     let controls = all_command_names()
         .into_iter()
@@ -1074,7 +1120,7 @@ pub fn start_sequence_task(
                 }
             }
 
-            let flight_state = *state.state.lock().unwrap();
+            let mut flight_state = *state.state.lock().unwrap();
             let valves = ValveSnapshot::read(&state);
             let pressure_psi = *state.latest_fuel_tank_pressure.lock().unwrap();
             let current_mass_kg = *state.latest_fill_mass_kg.lock().unwrap();
@@ -1092,6 +1138,8 @@ pub fn start_sequence_task(
                 current_mass_kg,
                 now,
             );
+            flight_state =
+                maybe_drive_local_prelaunch_state(&state, &runtime, valves, flight_state);
             let policy = build_policy(
                 &state,
                 &cfg,

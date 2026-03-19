@@ -522,6 +522,30 @@ impl AppState {
         self.pending_db_writes.fetch_add(1, Ordering::SeqCst);
     }
 
+    pub fn set_local_flight_state(&self, next_state: FlightState) {
+        let mut slot = self.state.lock().unwrap();
+        if *slot == next_state {
+            return;
+        }
+        *slot = next_state;
+        drop(slot);
+
+        let _ = self.state_tx.send(FlightStateMsg { state: next_state });
+
+        self.begin_db_write();
+        let db = self.db.clone();
+        let state_for_task = self.clone();
+        let ts_ms = crate::telemetry_task::get_current_timestamp_ms() as i64;
+        tokio::spawn(async move {
+            let _ = sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
+                .bind(ts_ms)
+                .bind(next_state as i64)
+                .execute(&db)
+                .await;
+            state_for_task.end_db_write();
+        });
+    }
+
     pub fn end_db_write(&self) {
         if self.pending_db_writes.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.db_write_notify.notify_waiters();

@@ -10,6 +10,7 @@
     "warnings",
     "errors",
     "data",
+    "detailed",
     "network-topology"
   ],
   "connection_tab": {
@@ -26,7 +27,7 @@
   },
   "network_tab": {
     "enabled": true,
-    "title": "SEDSprintf Network"
+    "title": "Rocket Network"
   },
   "actions_tab": {
     "actions": [

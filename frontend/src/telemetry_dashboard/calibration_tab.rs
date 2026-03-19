@@ -804,9 +804,6 @@ pub fn CalibrationTab() -> Element {
     rsx! {
         div { style: "padding:16px; display:flex; flex-direction:column; gap:10px; min-height:100%; overflow:visible;",
             h2 { style: "margin:0; color:#14b8a6;", "Calibration Sequence" }
-            div { style: "font-size:13px; color:#94a3b8;",
-                "Compatible with the Python calibration JSON (ch0/ch1/iadc + points + fit metadata)."
-            }
 
             div { style: "display:flex; gap:8px; flex-wrap:wrap; align-items:center;",
                 span { "Sensors" }

@@ -6,8 +6,6 @@ import sys
 import time
 from pathlib import Path
 
-import build
-
 
 def warn_if_db_sidecars_present(repo_root: Path) -> None:
     db = repo_root / "data" / "groundstation.db"
@@ -102,7 +100,9 @@ def main() -> None:
     if features:
         cmd.extend(["--features", ",".join(features)])
     repo_root = Path(__file__).resolve().parent
-    build.build_frontend(repo_root / "frontend")
+    frontend_cmd = [sys.executable, str(repo_root / "frontend" / "build.py"), "frontend_web"]
+    print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")
+    subprocess.run(frontend_cmd, cwd=repo_root, check=True)
     try:
         run(cmd, cwd=repo_root)
     except subprocess.CalledProcessError as e:

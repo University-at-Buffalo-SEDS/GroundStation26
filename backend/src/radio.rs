@@ -1,5 +1,6 @@
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
+use crate::radio_config::{CanLinkConfig, RadioLinkConfig, SerialLinkConfig, SpiLinkConfig};
 use anyhow::Context;
 use sedsprintf_rs_2026::{
     TelemetryError, TelemetryResult,
@@ -7,7 +8,16 @@ use sedsprintf_rs_2026::{
 };
 use serial::{SerialPort, SystemPort};
 use std::error::Error;
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::mem::size_of;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::time::Duration;
 
 pub const ROCKET_RADIO_PORT: &str = "/dev/ttyUSB1";
@@ -22,6 +32,74 @@ pub trait RadioDevice: Send {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()>;
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>>;
     fn set_side_id(&mut self, side_id: RouterSideId);
+}
+
+pub fn link_description(cfg: &RadioLinkConfig) -> String {
+    match cfg {
+        RadioLinkConfig::UsbSerial { serial } => serial_description("usb_serial", serial),
+        RadioLinkConfig::RaspberryPiGpioUart { serial } => {
+            serial_description("raspberry_pi_gpio_uart", serial)
+        }
+        RadioLinkConfig::CustomSerial { serial } => serial_description("custom_serial", serial),
+        RadioLinkConfig::Spi { spi } => spi_description(spi),
+        RadioLinkConfig::Can { can } => can_description(can),
+    }
+}
+
+pub fn open_link(cfg: &RadioLinkConfig) -> anyhow::Result<Box<dyn RadioDevice>> {
+    match cfg {
+        RadioLinkConfig::UsbSerial { serial }
+        | RadioLinkConfig::RaspberryPiGpioUart { serial }
+        | RadioLinkConfig::CustomSerial { serial } => {
+            Ok(Box::new(Radio::open(&serial.port, serial.baud_rate)?))
+        }
+        RadioLinkConfig::Spi { spi } => Ok(Box::new(SpiRadio::open(spi)?)),
+        RadioLinkConfig::Can { can } => Ok(Box::new(CanRadio::open(can)?)),
+    }
+}
+
+pub fn startup_failure_hint(cfg: &RadioLinkConfig) -> String {
+    match cfg {
+        RadioLinkConfig::UsbSerial { serial } | RadioLinkConfig::CustomSerial { serial } => {
+            format!(
+                "Check that {} exists, is the correct serial device, and is not already in use. Prefer a stable /dev/serial/by-id path when available.",
+                serial.port
+            )
+        }
+        RadioLinkConfig::RaspberryPiGpioUart { serial } => format!(
+            "Check that {} exists and that the Raspberry Pi UART is enabled. On Raspberry Pi OS or Ubuntu on Pi: set enable_uart=1, disable the serial login console/getty, reboot, then retry. This UART path is generic Linux serial access; it does not require rppal.",
+            serial.port
+        ),
+        RadioLinkConfig::Spi { spi } => format!(
+            "Check that {} exists and that SPI is enabled. On Raspberry Pi OS or Ubuntu on Pi: enable SPI in the boot config so /dev/spidev* appears, then confirm mode {} and {} Hz match the attached device.",
+            spi.port, spi.spi_mode, spi.spi_speed_hz
+        ),
+        RadioLinkConfig::Can { can } => format!(
+            "Check that CAN interface {} exists and is up. Example: `sudo ip link set {} type can bitrate 500000` then `sudo ip link set {} up`. Confirm the remote device uses tx_id=0x{:x} / rx_id=0x{:x}.",
+            can.port, can.port, can.port, can.can_tx_id, can.can_rx_id
+        ),
+    }
+}
+
+fn serial_description(name: &str, serial: &SerialLinkConfig) -> String {
+    format!(
+        "interface={name} port={} baud_rate={}",
+        serial.port, serial.baud_rate
+    )
+}
+
+fn spi_description(spi: &SpiLinkConfig) -> String {
+    format!(
+        "interface=spi port={} speed_hz={} mode={} bits_per_word={}",
+        spi.port, spi.spi_speed_hz, spi.spi_mode, spi.spi_bits_per_word
+    )
+}
+
+fn can_description(can: &CanLinkConfig) -> String {
+    format!(
+        "interface=can ifname={} tx_id=0x{:x} rx_id=0x{:x}",
+        can.port, can.can_tx_id, can.can_rx_id
+    )
 }
 
 // ======================================================================
@@ -92,6 +170,303 @@ impl RadioDevice for Radio {
         self.inner.write_all(payload)?;
         self.inner.flush()?;
         Ok(())
+    }
+
+    fn set_side_id(&mut self, side_id: RouterSideId) {
+        self.side_id = Some(side_id);
+    }
+}
+
+// ======================================================================
+// SPI Radio Implementation
+// ======================================================================
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct SpiRadio {
+    inner: File,
+    side_id: Option<RouterSideId>,
+    speed_hz: u32,
+    bits_per_word: u8,
+}
+
+impl SpiRadio {
+    pub fn open(cfg: &SpiLinkConfig) -> anyhow::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let inner = OpenOptions::new().read(true).write(true).open(&cfg.port)?;
+            let fd = inner.as_raw_fd();
+
+            spi_ioctl_write(fd, SPI_IOC_WR_MODE, &cfg.spi_mode)
+                .context("failed to set SPI mode")?;
+            spi_ioctl_write(fd, SPI_IOC_WR_BITS_PER_WORD, &cfg.spi_bits_per_word)
+                .context("failed to set SPI bits_per_word")?;
+            spi_ioctl_write(fd, SPI_IOC_WR_MAX_SPEED_HZ, &cfg.spi_speed_hz)
+                .context("failed to set SPI speed")?;
+
+            Ok(Self {
+                inner,
+                side_id: None,
+                speed_hz: cfg.spi_speed_hz,
+                bits_per_word: cfg.spi_bits_per_word,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cfg;
+            anyhow::bail!("SPI radio support is only implemented on Linux")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> anyhow::Result<()> {
+        if tx.len() != rx.len() {
+            anyhow::bail!("spi transfer tx/rx length mismatch");
+        }
+        let transfer = SpiIocTransfer {
+            tx_buf: tx.as_ptr() as u64,
+            rx_buf: rx.as_mut_ptr() as u64,
+            len: tx.len() as u32,
+            speed_hz: self.speed_hz,
+            delay_usecs: 0,
+            bits_per_word: self.bits_per_word,
+            cs_change: 0,
+            tx_nbits: 0,
+            rx_nbits: 0,
+            word_delay_usecs: 0,
+            pad: 0,
+        };
+        let req = spi_ioc_message_request(1);
+        let rc = unsafe { libc::ioctl(self.inner.as_raw_fd(), req as _, &transfer) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error()).context("spi ioctl transfer failed");
+        }
+        Ok(())
+    }
+}
+
+impl RadioDevice for SpiRadio {
+    fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
+        let side_id = self
+            .side_id
+            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut tx = vec![0u8; MAX_PACKET_SIZE + 2];
+            let mut rx = vec![0u8; MAX_PACKET_SIZE + 2];
+            self.transfer(&tx, &mut rx)
+                .map_err(|_| TelemetryError::HandlerError("spi transfer failed"))?;
+            tx.clear();
+
+            let frame_len = u16::from_le_bytes([rx[0], rx[1]]) as usize;
+            if frame_len == 0 {
+                return Ok(());
+            }
+            if frame_len > MAX_PACKET_SIZE {
+                return Err(TelemetryError::HandlerError(
+                    "invalid frame length from spi",
+                ));
+            }
+
+            let payload = &rx[2..2 + frame_len];
+            return router.rx_serialized_queue_from_side(payload, side_id);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = router;
+            let _ = side_id;
+            Err(TelemetryError::HandlerError(
+                "spi radio support is only implemented on Linux",
+            ))
+        }
+    }
+
+    fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if payload.is_empty() || payload.len() > u16::MAX as usize {
+            return Err(
+                format!("packet too large to send over spi: {} bytes", payload.len()).into(),
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut tx = Vec::with_capacity(payload.len() + 2);
+            tx.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+            tx.extend_from_slice(payload);
+            let mut rx = vec![0u8; tx.len()];
+            self.transfer(&tx, &mut rx)?;
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = payload;
+            Err("spi radio support is only implemented on Linux".into())
+        }
+    }
+
+    fn set_side_id(&mut self, side_id: RouterSideId) {
+        self.side_id = Some(side_id);
+    }
+}
+
+// ======================================================================
+// CAN Radio Implementation
+// ======================================================================
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct CanRadio {
+    inner: File,
+    side_id: Option<RouterSideId>,
+    tx_id: u32,
+    rx_id: u32,
+    rx_seq: Option<u8>,
+    rx_expected_chunks: u8,
+    rx_received_chunks: u8,
+    rx_buf: Vec<u8>,
+    tx_seq: u8,
+}
+
+impl CanRadio {
+    pub fn open(cfg: &CanLinkConfig) -> anyhow::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let fd = open_can_socket(&cfg.port)?;
+            let inner = unsafe { File::from_raw_fd(fd) };
+            Ok(Self {
+                inner,
+                side_id: None,
+                tx_id: cfg.can_tx_id,
+                rx_id: cfg.can_rx_id,
+                rx_seq: None,
+                rx_expected_chunks: 0,
+                rx_received_chunks: 0,
+                rx_buf: Vec::new(),
+                tx_seq: 0,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cfg;
+            anyhow::bail!("CAN radio support is only implemented on Linux")
+        }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn reset_rx(&mut self) {
+        self.rx_seq = None;
+        self.rx_expected_chunks = 0;
+        self.rx_received_chunks = 0;
+        self.rx_buf.clear();
+    }
+}
+
+impl RadioDevice for CanRadio {
+    fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
+        let side_id = self
+            .side_id
+            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let frame = match can_read_frame(self.inner.as_raw_fd()) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(()),
+                Err(_) => return Err(TelemetryError::HandlerError("can receive failed")),
+            };
+
+            if (frame.can_id & CAN_EFF_FLAG) != 0 || (frame.can_id & CAN_ERR_FLAG) != 0 {
+                return Ok(());
+            }
+            if frame.can_id != self.rx_id {
+                return Ok(());
+            }
+            if frame.can_dlc < 4 {
+                self.reset_rx();
+                return Err(TelemetryError::HandlerError("invalid can fragment header"));
+            }
+
+            let seq = frame.data[0];
+            let chunk_idx = frame.data[1];
+            let total_chunks = frame.data[2];
+            let chunk_len = frame.data[3] as usize;
+
+            if chunk_len > 4 || 4 + chunk_len > frame.can_dlc as usize || total_chunks == 0 {
+                self.reset_rx();
+                return Err(TelemetryError::HandlerError("invalid can fragment size"));
+            }
+
+            if chunk_idx == 0 {
+                self.rx_seq = Some(seq);
+                self.rx_expected_chunks = total_chunks;
+                self.rx_received_chunks = 0;
+                self.rx_buf.clear();
+            }
+
+            if self.rx_seq != Some(seq)
+                || self.rx_expected_chunks != total_chunks
+                || chunk_idx != self.rx_received_chunks
+            {
+                self.reset_rx();
+                return Err(TelemetryError::HandlerError("out-of-order can fragments"));
+            }
+
+            self.rx_buf.extend_from_slice(&frame.data[4..4 + chunk_len]);
+            if self.rx_buf.len() > MAX_PACKET_SIZE {
+                self.reset_rx();
+                return Err(TelemetryError::HandlerError("can packet exceeds max size"));
+            }
+
+            self.rx_received_chunks = self.rx_received_chunks.saturating_add(1);
+            if self.rx_received_chunks < self.rx_expected_chunks {
+                return Ok(());
+            }
+
+            let packet = std::mem::take(&mut self.rx_buf);
+            self.reset_rx();
+            return router.rx_serialized_queue_from_side(&packet, side_id);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = router;
+            let _ = side_id;
+            Err(TelemetryError::HandlerError(
+                "can radio support is only implemented on Linux",
+            ))
+        }
+    }
+
+    fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if payload.is_empty() || payload.len() > MAX_PACKET_SIZE {
+            return Err(
+                format!("packet too large to send over can: {} bytes", payload.len()).into(),
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let total_chunks = payload.len().div_ceil(4) as u8;
+            let seq = self.tx_seq;
+            self.tx_seq = self.tx_seq.wrapping_add(1);
+
+            for (chunk_idx, chunk) in payload.chunks(4).enumerate() {
+                let mut frame = CanFrame::default();
+                frame.can_id = self.tx_id;
+                frame.can_dlc = (4 + chunk.len()) as u8;
+                frame.data[0] = seq;
+                frame.data[1] = chunk_idx as u8;
+                frame.data[2] = total_chunks;
+                frame.data[3] = chunk.len() as u8;
+                frame.data[4..4 + chunk.len()].copy_from_slice(chunk);
+                can_write_frame(self.inner.as_raw_fd(), &frame)?;
+            }
+
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = payload;
+            Err("can radio support is only implemented on Linux".into())
+        }
     }
 
     fn set_side_id(&mut self, side_id: RouterSideId) {
@@ -181,4 +556,208 @@ impl RadioDevice for DummyRadio {
     fn set_side_id(&mut self, side_id: RouterSideId) {
         self.side_id = Some(side_id);
     }
+}
+
+#[cfg(target_os = "linux")]
+const SPI_IOC_MAGIC: u8 = b'k';
+#[cfg(target_os = "linux")]
+const SPI_IOC_WR_MODE: libc::c_ulong = ioc_write::<u8>(SPI_IOC_MAGIC, 1);
+#[cfg(target_os = "linux")]
+const SPI_IOC_WR_BITS_PER_WORD: libc::c_ulong = ioc_write::<u8>(SPI_IOC_MAGIC, 3);
+#[cfg(target_os = "linux")]
+const SPI_IOC_WR_MAX_SPEED_HZ: libc::c_ulong = ioc_write::<u32>(SPI_IOC_MAGIC, 4);
+
+#[cfg(target_os = "linux")]
+const IOC_NRBITS: u32 = 8;
+#[cfg(target_os = "linux")]
+const IOC_TYPEBITS: u32 = 8;
+#[cfg(target_os = "linux")]
+const IOC_SIZEBITS: u32 = 14;
+#[cfg(target_os = "linux")]
+const IOC_NRSHIFT: u32 = 0;
+#[cfg(target_os = "linux")]
+const IOC_TYPESHIFT: u32 = IOC_NRSHIFT + IOC_NRBITS;
+#[cfg(target_os = "linux")]
+const IOC_SIZESHIFT: u32 = IOC_TYPESHIFT + IOC_TYPEBITS;
+#[cfg(target_os = "linux")]
+const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + IOC_SIZEBITS;
+#[cfg(target_os = "linux")]
+const IOC_WRITE: u32 = 1;
+
+#[cfg(target_os = "linux")]
+const CAN_EFF_FLAG: u32 = 0x8000_0000;
+#[cfg(target_os = "linux")]
+const CAN_ERR_FLAG: u32 = 0x2000_0000;
+#[cfg(target_os = "linux")]
+const PF_CAN_VALUE: libc::c_int = 29;
+#[cfg(target_os = "linux")]
+const AF_CAN_VALUE: libc::sa_family_t = 29;
+#[cfg(target_os = "linux")]
+const CAN_RAW_PROTOCOL: libc::c_int = 1;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct SpiIocTransfer {
+    tx_buf: u64,
+    rx_buf: u64,
+    len: u32,
+    speed_hz: u32,
+    delay_usecs: u16,
+    bits_per_word: u8,
+    cs_change: u8,
+    tx_nbits: u8,
+    rx_nbits: u8,
+    word_delay_usecs: u8,
+    pad: u8,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockAddrCan {
+    can_family: libc::sa_family_t,
+    can_ifindex: libc::c_int,
+    addr: [u8; 8],
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CanFrame {
+    can_id: u32,
+    can_dlc: u8,
+    __pad: u8,
+    __res0: u8,
+    __res1: u8,
+    data: [u8; 8],
+}
+
+#[cfg(target_os = "linux")]
+const fn ioc_write<T>(kind: u8, nr: u8) -> libc::c_ulong {
+    ((IOC_WRITE << IOC_DIRSHIFT)
+        | ((kind as u32) << IOC_TYPESHIFT)
+        | ((nr as u32) << IOC_NRSHIFT)
+        | ((size_of::<T>() as u32) << IOC_SIZESHIFT)) as libc::c_ulong
+}
+
+#[cfg(target_os = "linux")]
+const fn spi_ioc_message_request(count: usize) -> libc::c_ulong {
+    ((IOC_WRITE << IOC_DIRSHIFT)
+        | ((SPI_IOC_MAGIC as u32) << IOC_TYPESHIFT)
+        | ((0u32) << IOC_NRSHIFT)
+        | (((count * size_of::<SpiIocTransfer>()) as u32) << IOC_SIZESHIFT)) as libc::c_ulong
+}
+
+#[cfg(target_os = "linux")]
+fn spi_ioctl_write<T>(fd: RawFd, request: libc::c_ulong, value: &T) -> std::io::Result<()> {
+    let rc = unsafe { libc::ioctl(fd, request as _, value) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_can_socket(ifname: &str) -> anyhow::Result<RawFd> {
+    let fd = unsafe { libc::socket(PF_CAN_VALUE, libc::SOCK_RAW, CAN_RAW_PROTOCOL) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("socket(PF_CAN) failed");
+    }
+
+    let timeout = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 200_000,
+    };
+    let timeout_rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &timeout as *const _ as *const _,
+            size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if timeout_rc < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err).context("setsockopt(SO_RCVTIMEO) failed");
+    }
+
+    let ifname_c = CString::new(ifname).context("CAN interface contains NUL byte")?;
+    let ifindex = unsafe { libc::if_nametoindex(ifname_c.as_ptr()) };
+    if ifindex == 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err).context(format!("unknown CAN interface {ifname}"));
+    }
+
+    let addr = SockAddrCan {
+        can_family: AF_CAN_VALUE,
+        can_ifindex: ifindex as libc::c_int,
+        addr: [0u8; 8],
+    };
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            size_of::<SockAddrCan>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err).context(format!("bind CAN interface {ifname} failed"));
+    }
+
+    Ok(fd)
+}
+
+#[cfg(target_os = "linux")]
+fn can_read_frame(fd: RawFd) -> std::io::Result<Option<CanFrame>> {
+    let mut frame = CanFrame::default();
+    let rc = unsafe {
+        libc::read(
+            fd,
+            &mut frame as *mut _ as *mut libc::c_void,
+            size_of::<CanFrame>(),
+        )
+    };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Ok(None),
+            _ => Err(err),
+        };
+    }
+    if rc == 0 {
+        return Ok(None);
+    }
+    if rc as usize != size_of::<CanFrame>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "short CAN frame read",
+        ));
+    }
+    Ok(Some(frame))
+}
+
+#[cfg(target_os = "linux")]
+fn can_write_frame(fd: RawFd, frame: &CanFrame) -> std::io::Result<()> {
+    let rc = unsafe {
+        libc::write(
+            fd,
+            frame as *const _ as *const libc::c_void,
+            size_of::<CanFrame>(),
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if rc as usize != size_of::<CanFrame>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "short CAN frame write",
+        ));
+    }
+    Ok(())
 }

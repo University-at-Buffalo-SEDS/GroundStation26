@@ -9,6 +9,7 @@ mod layout;
 mod loadcell;
 mod map;
 mod radio;
+mod radio_config;
 mod ring_buffer;
 mod rocket_commands;
 mod safety_task;
@@ -26,7 +27,7 @@ use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
 use crate::radio::DummyRadio;
-use crate::radio::{RADIO_BAUD_RATE, ROCKET_RADIO_PORT, Radio, RadioDevice, UMBILICAL_RADIO_PORT};
+use crate::radio::{RadioDevice, link_description, open_link, startup_failure_hint};
 use axum::Router;
 use groundstation_shared::{Board, FlightState as FlightStateMode};
 use sedsprintf_rs_2026::TelemetryError;
@@ -361,6 +362,7 @@ async fn main() -> anyhow::Result<()> {
 
     let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
     let loadcell_calibration = loadcell::load_or_default();
+    let radio_links = radio_config::load_or_default();
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
@@ -442,14 +444,24 @@ async fn main() -> anyhow::Result<()> {
     ]);
 
     // --- Radios ---
+    println!("AV bay config: {}", link_description(&radio_links.av_bay));
+    println!(
+        "Fill box config: {}",
+        link_description(&radio_links.fill_box)
+    );
+
     let (rocket_radio, av_bay_radio_connected): (Arc<Mutex<Box<dyn RadioDevice>>>, bool) =
-        match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUD_RATE) {
+        match open_link(&radio_links.av_bay) {
             Ok(r) => {
                 println!("Rocket radio online");
-                (Arc::new(Mutex::new(Box::new(r))), true)
+                (Arc::new(Mutex::new(r)), true)
             }
             Err(e) => {
                 println!("Rocket radio missing, using DummyRadio: {}", e);
+                eprintln!(
+                    "AV bay link setup hint: {}",
+                    startup_failure_hint(&radio_links.av_bay)
+                );
                 #[cfg(feature = "testing")]
                 {
                     (
@@ -471,13 +483,17 @@ async fn main() -> anyhow::Result<()> {
         };
 
     let (umbilical_radio, fill_radio_connected): (Arc<Mutex<Box<dyn RadioDevice>>>, bool) =
-        match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUD_RATE) {
+        match open_link(&radio_links.fill_box) {
             Ok(r) => {
                 println!("Umbilical radio online");
-                (Arc::new(Mutex::new(Box::new(r))), true)
+                (Arc::new(Mutex::new(r)), true)
             }
             Err(e) => {
                 println!("Umbilical radio missing, using DummyRadio: {}", e);
+                eprintln!(
+                    "Fill box link setup hint: {}",
+                    startup_failure_hint(&radio_links.fill_box)
+                );
                 #[cfg(feature = "testing")]
                 {
                     (

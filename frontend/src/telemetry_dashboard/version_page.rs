@@ -96,7 +96,7 @@ pub fn VersionTab() -> Element {
     let info = &*VERSION_INFO;
 
     rsx! {
-        div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto;",
+        div { style: "padding:16px; overflow:visible;",
             h2 { style: "margin:0 0 14px 0;", "Version & Credits" }
 
             div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:12px;",
