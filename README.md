@@ -72,8 +72,12 @@ Build output notes:
 
 ## Documentation
 
-- Frontend/backend API contract: `docs/frontend_api.md`
-- System architecture: `docs/architecture.md`
+- Documentation index: `docs/README.md`
+- Frontend/backend API contract: `docs/frontend/api.md`
+- Frontend architecture: `docs/frontend/architecture.md`
+- Backend architecture: `docs/backend/architecture.md`
+- Shared contracts: `docs/shared/contracts.md`
+- System overview: `docs/system/overview.md`
 
 ## Run
 
