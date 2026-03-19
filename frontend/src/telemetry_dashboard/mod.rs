@@ -1236,6 +1236,7 @@ fn TelemetryDashboardInner() -> Element {
     let board_status = use_signal(Vec::<BoardStatusEntry>::new);
     let network_topology = use_signal(NetworkTopologyMsg::default);
     let frontend_network_metrics = use_signal(FrontendNetworkMetrics::default);
+    #[cfg(not(target_arch = "wasm32"))]
     let show_version_overlay = use_signal(|| false);
     let detailed_network_time_display = network_time
         .read()
@@ -3464,9 +3465,10 @@ async fn connect_ws_once_wasm(
     let closed_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(closed_tx)));
 
     {
+        let ws_url_for_open = ws_url.clone();
         let onopen: Closure<dyn FnMut(Event)> = Closure::new(move |_e: Event| {
             log!("[WS] open");
-            note_ws_connection_state(true, ws_url.clone(), None, epoch);
+            note_ws_connection_state(true, ws_url_for_open.clone(), None, epoch);
         });
         ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
         onopen.forget();
