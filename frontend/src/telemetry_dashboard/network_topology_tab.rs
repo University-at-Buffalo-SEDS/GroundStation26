@@ -24,7 +24,7 @@ struct NodePlacement {
 }
 
 const GRAPH_WIDTH: i32 = 1320;
-const GRAPH_HEIGHT: i32 = 880;
+const GRAPH_HEIGHT: i32 = 700;
 const EMBEDDED_GRAPH_MIN_HEIGHT: i32 = 360;
 const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 1.8;
@@ -208,7 +208,7 @@ pub fn NetworkTopologyTab(
         } else {
             div {
                 key: "network-embedded-{fullscreen_state}",
-                style: "padding:16px; display:flex; flex-direction:column; gap:14px; height:100%; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; overflow-y:auto;",
+                style: "padding:10px 14px 14px 14px; display:flex; flex-direction:column; gap:10px; height:100%; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; overflow-y:auto;",
                 h2 { style: "margin:0; color:#e5e7eb;", "{title}" }
                 p {
                     style: "margin:0; color:#94a3b8; font-size:0.95rem;",
@@ -248,7 +248,7 @@ pub fn NetworkTopologyTab(
 
                 div {
                     id: "{viewport_id}",
-                    style: "padding:18px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
+                    style: "padding:8px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
                     div {
                         id: "{surface_id}",
                         style: "position:relative; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; min-width:{GRAPH_WIDTH}px; min-height:{GRAPH_HEIGHT}px;",
@@ -343,8 +343,8 @@ fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str,
           const refreshSurfaceFrame = () => {{
             const scaledWidth = Math.round({graph_width} * state.scale);
             const scaledHeight = Math.round({graph_height} * state.scale);
-            state.padX = Math.max(Math.round(state.viewport.clientWidth * 0.8), 320);
-            state.padY = Math.max(Math.round(state.viewport.clientHeight * 0.8), 220);
+            state.padX = Math.max(Math.round(state.viewport.clientWidth * 0.35), 180);
+            state.padY = Math.max(Math.round(state.viewport.clientHeight * 0.18), 60);
             state.surface.style.width = `${{scaledWidth + state.padX * 2}}px`;
             state.surface.style.height = `${{scaledHeight + state.padY * 2}}px`;
             state.surface.style.minWidth = state.surface.style.width;
@@ -354,9 +354,8 @@ fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str,
           }};
           const centerGraph = () => {{
             const scaledWidth = Math.round({graph_width} * state.scale);
-            const scaledHeight = Math.round({graph_height} * state.scale);
             state.viewport.scrollLeft = Math.max(0, state.padX + Math.round((scaledWidth - state.viewport.clientWidth) / 2));
-            state.viewport.scrollTop = Math.max(0, state.padY + Math.round((scaledHeight - state.viewport.clientHeight) / 2));
+            state.viewport.scrollTop = Math.max(0, state.padY - 24);
           }};
           const applyScale = (nextScale, clientX, clientY) => {{
             const scale = clamp(nextScale, {zoom_min}, {zoom_max});
@@ -512,34 +511,10 @@ fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str,
 fn graph_positions() -> HashMap<&'static str, NodePlacement> {
     HashMap::from([
         (
-            "endpoint_ground_station",
-            NodePlacement {
-                x: 110,
-                y: 180,
-                size: 120,
-            },
-        ),
-        (
-            "endpoint_flight_state",
-            NodePlacement {
-                x: 110,
-                y: 430,
-                size: 118,
-            },
-        ),
-        (
-            "endpoint_abort",
-            NodePlacement {
-                x: 110,
-                y: 690,
-                size: 120,
-            },
-        ),
-        (
             "router",
             NodePlacement {
                 x: 320,
-                y: 430,
+                y: 330,
                 size: 220,
             },
         ),
@@ -547,7 +522,7 @@ fn graph_positions() -> HashMap<&'static str, NodePlacement> {
             "board_rf",
             NodePlacement {
                 x: 700,
-                y: 250,
+                y: 180,
                 size: 146,
             },
         ),
@@ -555,7 +530,7 @@ fn graph_positions() -> HashMap<&'static str, NodePlacement> {
             "board_fc",
             NodePlacement {
                 x: 1070,
-                y: 140,
+                y: 100,
                 size: 132,
             },
         ),
@@ -563,7 +538,7 @@ fn graph_positions() -> HashMap<&'static str, NodePlacement> {
             "board_pb",
             NodePlacement {
                 x: 1070,
-                y: 360,
+                y: 280,
                 size: 132,
             },
         ),
@@ -571,7 +546,7 @@ fn graph_positions() -> HashMap<&'static str, NodePlacement> {
             "board_gw",
             NodePlacement {
                 x: 700,
-                y: 620,
+                y: 500,
                 size: 146,
             },
         ),
@@ -579,7 +554,7 @@ fn graph_positions() -> HashMap<&'static str, NodePlacement> {
             "board_vb",
             NodePlacement {
                 x: 1070,
-                y: 520,
+                y: 420,
                 size: 132,
             },
         ),
@@ -587,7 +562,7 @@ fn graph_positions() -> HashMap<&'static str, NodePlacement> {
             "board_daq",
             NodePlacement {
                 x: 1210,
-                y: 620,
+                y: 520,
                 size: 132,
             },
         ),
@@ -595,7 +570,7 @@ fn graph_positions() -> HashMap<&'static str, NodePlacement> {
             "board_ab",
             NodePlacement {
                 x: 1070,
-                y: 760,
+                y: 610,
                 size: 132,
             },
         ),
