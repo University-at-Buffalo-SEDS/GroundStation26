@@ -1,8 +1,11 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 
-use super::types::{BoardStatusEntry, FlightState, NetworkTopologyMsg, NetworkTopologyStatus};
-use super::{FrontendNetworkMetrics, format_timestamp_ms_clock};
+use super::types::{
+    BoardStatusEntry, FlightState, NetworkTopologyMsg, NetworkTopologyNodeKind,
+    NetworkTopologyStatus,
+};
+use super::{AlertMsg, FrontendNetworkMetrics, PersistentNotification, format_timestamp_ms_clock};
 
 #[component]
 pub fn DetailedTab(
@@ -10,6 +13,9 @@ pub fn DetailedTab(
     board_status: Signal<Vec<BoardStatusEntry>>,
     network_topology: Signal<NetworkTopologyMsg>,
     flight_state: Signal<FlightState>,
+    warnings: Signal<Vec<AlertMsg>>,
+    errors: Signal<Vec<AlertMsg>>,
+    notifications: Signal<Vec<PersistentNotification>>,
     network_time_display: Option<String>,
     network_clock_delta_ms: Option<i64>,
     network_time_age_ms: Option<i64>,
@@ -17,6 +23,10 @@ pub fn DetailedTab(
     let metrics_snapshot = metrics.read().clone();
     let boards = board_status.read().clone();
     let topology = network_topology.read().clone();
+    let warnings_count = warnings.read().len();
+    let errors_count = errors.read().len();
+    let notifications_count = notifications.read().len();
+    let now_ms = current_wallclock_ms();
 
     let board_seen = boards.iter().filter(|board| board.seen).count();
     let board_total = boards.len();
@@ -30,6 +40,71 @@ pub fn DetailedTab(
         .iter()
         .filter(|node| node.status == NetworkTopologyStatus::Offline)
         .count();
+    let simulated_nodes = topology
+        .nodes
+        .iter()
+        .filter(|node| node.status == NetworkTopologyStatus::Simulated)
+        .count();
+    let online_links = topology
+        .links
+        .iter()
+        .filter(|link| link.status == NetworkTopologyStatus::Online)
+        .count();
+    let offline_links = topology
+        .links
+        .iter()
+        .filter(|link| link.status == NetworkTopologyStatus::Offline)
+        .count();
+    let router_nodes = topology
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NetworkTopologyNodeKind::Router)
+        .count();
+    let endpoint_nodes = topology
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NetworkTopologyNodeKind::Endpoint)
+        .count();
+    let side_nodes = topology
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NetworkTopologyNodeKind::Side)
+        .count();
+    let board_nodes = topology
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NetworkTopologyNodeKind::Board)
+        .count();
+    let max_board_age_ms = boards.iter().filter_map(|board| board.age_ms).max();
+    let min_board_age_ms = boards.iter().filter_map(|board| board.age_ms).min();
+    let avg_bytes_per_msg = if metrics_snapshot.ws_messages_total > 0 {
+        Some(metrics_snapshot.ws_bytes_total as f64 / metrics_snapshot.ws_messages_total as f64)
+    } else {
+        None
+    };
+    let avg_rows_per_batch = if metrics_snapshot.telemetry_batches_total > 0 {
+        Some(
+            metrics_snapshot.telemetry_rows_total as f64
+                / metrics_snapshot.telemetry_batches_total as f64,
+        )
+    } else {
+        None
+    };
+    let ws_idle_ms = metrics_snapshot
+        .last_ws_message_wall_ms
+        .map(|ts| now_ms.saturating_sub(ts));
+    let ws_connected_for_ms = if metrics_snapshot.ws_connected {
+        metrics_snapshot
+            .last_connect_wall_ms
+            .map(|ts| now_ms.saturating_sub(ts))
+    } else {
+        None
+    };
+    let topology_age_ms = if topology.generated_ms > 0 {
+        Some(now_ms.saturating_sub(topology.generated_ms as i64))
+    } else {
+        None
+    };
 
     rsx! {
         div { style: "padding:18px; height:100%; overflow-y:auto; overflow-x:hidden; color:#dbe7f3;",
@@ -54,17 +129,32 @@ pub fn DetailedTab(
                         ("Telemetry batches", metrics_snapshot.telemetry_batches_total.to_string()),
                         ("Msg rate", format!("{:.1}/s", metrics_snapshot.msgs_per_sec)),
                         ("Bandwidth", format!("{}/s", human_bytes_f64(metrics_snapshot.bytes_per_sec))),
+                        ("Avg bytes/msg", avg_bytes_per_msg.map(|v| format!("{v:.1} B")).unwrap_or_else(|| "--".to_string())),
+                        ("Avg rows/batch", avg_rows_per_batch.map(|v| format!("{v:.1}")).unwrap_or_else(|| "--".to_string())),
                     ],
                 )}
                 {metric_card(
-                    "Freshness",
+                    "Session",
                     vec![
                         ("Rows per second", format!("{:.1}/s", metrics_snapshot.rows_per_sec)),
+                        ("WS disconnects", metrics_snapshot.ws_disconnects_total.to_string()),
+                        ("Connected for", opt_i64_ms(ws_connected_for_ms)),
+                        ("WS idle", opt_i64_ms(ws_idle_ms)),
                         ("Last WS message", opt_timestamp(metrics_snapshot.last_ws_message_wall_ms)),
                         ("Last disconnect", metrics_snapshot.last_disconnect_reason.clone().unwrap_or_else(|| "None".to_string())),
+                        ("Last connect", opt_timestamp(metrics_snapshot.last_connect_wall_ms)),
+                    ],
+                )}
+                {metric_card(
+                    "Mission State",
+                    vec![
                         ("Flight state", flight_state.read().to_string()),
                         ("Rocket time", network_time_display.unwrap_or_else(|| "Unavailable".to_string())),
                         ("Clock delta", opt_signed_ms(network_clock_delta_ms)),
+                        ("Server time age", opt_i64_ms(network_time_age_ms)),
+                        ("Warnings", warnings_count.to_string()),
+                        ("Errors", errors_count.to_string()),
+                        ("Notifications", notifications_count.to_string()),
                     ],
                 )}
                 {metric_card(
@@ -75,12 +165,27 @@ pub fn DetailedTab(
                         ("Topology links", topology.links.len().to_string()),
                         ("Online nodes", online_nodes.to_string()),
                         ("Offline nodes", offline_nodes.to_string()),
-                        ("Server time age", opt_i64_ms(network_time_age_ms)),
+                        ("Simulated nodes", simulated_nodes.to_string()),
+                        ("Online links", online_links.to_string()),
+                        ("Offline links", offline_links.to_string()),
+                        ("Topology age", opt_i64_ms(topology_age_ms)),
+                        ("Topology simulated", yes_no(topology.simulated)),
+                    ],
+                )}
+                {metric_card(
+                    "Node Mix",
+                    vec![
+                        ("Routers", router_nodes.to_string()),
+                        ("Endpoints", endpoint_nodes.to_string()),
+                        ("Sides", side_nodes.to_string()),
+                        ("Boards", board_nodes.to_string()),
+                        ("Fastest board", opt_u64_ms(min_board_age_ms)),
+                        ("Slowest board", opt_u64_ms(max_board_age_ms)),
                     ],
                 )}
             }
 
-            div { style: "display:grid; gap:14px; grid-template-columns:minmax(320px, 1.2fr) minmax(320px, 1fr);",
+            div { style: "display:grid; gap:14px; grid-template-columns:minmax(320px, 1.2fr) minmax(320px, 1fr); margin-bottom:14px;",
                 div { style: section_style(),
                     h3 { style: section_title_style(), "Board Latency Detail" }
                     table { style: table_style(),
@@ -106,7 +211,34 @@ pub fn DetailedTab(
                         }
                     }
                 }
+            }
 
+            div { style: "display:grid; gap:14px; grid-template-columns:minmax(320px, 1.2fr) minmax(320px, 1fr);",
+                div { style: section_style(),
+                    h3 { style: section_title_style(), "Topology Nodes" }
+                    table { style: table_style(),
+                        thead {
+                            tr {
+                                th { style: th_style(), "Node" }
+                                th { style: th_style(), "Kind" }
+                                th { style: th_style(), "Status" }
+                                th { style: th_style(), "Group" }
+                                th { style: th_style(), "Sender" }
+                            }
+                        }
+                        tbody {
+                            for node in topology.nodes.iter() {
+                                tr {
+                                    td { style: td_style(), "{node.label}" }
+                                    td { style: td_style(), "{format_kind(node.kind)}" }
+                                    td { style: td_style(), "{format_status(node.status)}" }
+                                    td { style: td_style(), "{node.group}" }
+                                    td { style: td_style_mono(), "{node.sender_id.clone().unwrap_or_else(|| \"--\".to_string())}" }
+                                }
+                            }
+                        }
+                    }
+                }
                 div { style: section_style(),
                     h3 { style: section_title_style(), "Network Notes" }
                     div { style: "display:flex; flex-direction:column; gap:10px; font-size:13px; color:#cbd5e1;",
@@ -165,6 +297,12 @@ fn opt_i64_ms(value: Option<i64>) -> String {
         .unwrap_or_else(|| "--".to_string())
 }
 
+fn opt_u64_ms(value: Option<u64>) -> String {
+    value
+        .map(|v| format!("{v} ms"))
+        .unwrap_or_else(|| "--".to_string())
+}
+
 fn opt_timestamp(value: Option<i64>) -> String {
     value
         .map(format_timestamp_ms_clock)
@@ -212,4 +350,44 @@ fn td_style() -> &'static str {
 
 fn td_style_mono() -> &'static str {
     "padding:8px 6px; border-bottom:1px solid #132738; color:#dbe7f3; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;"
+}
+
+fn format_status(status: NetworkTopologyStatus) -> &'static str {
+    match status {
+        NetworkTopologyStatus::Online => "online",
+        NetworkTopologyStatus::Offline => "offline",
+        NetworkTopologyStatus::Simulated => "simulated",
+    }
+}
+
+fn format_kind(kind: NetworkTopologyNodeKind) -> &'static str {
+    match kind {
+        NetworkTopologyNodeKind::Router => "router",
+        NetworkTopologyNodeKind::Endpoint => "endpoint",
+        NetworkTopologyNodeKind::Side => "side",
+        NetworkTopologyNodeKind::Board => "board",
+    }
+}
+
+fn yes_no(value: bool) -> String {
+    if value {
+        "yes".to_string()
+    } else {
+        "no".to_string()
+    }
+}
+
+fn current_wallclock_ms() -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as i64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
 }

@@ -199,33 +199,37 @@ mod persist {
 
         #[cfg(target_os = "android")]
         fn android_storage_base_dir() -> Option<std::path::PathBuf> {
-            use jni::JavaVM;
             use jni::objects::{JObject, JString};
+            use jni::{JavaVM, jni_sig, jni_str};
             use ndk_context::android_context;
 
             let ctx = android_context();
-            let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
-            let mut env = vm.attach_current_thread().ok()?;
-            let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+            let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
+            vm.attach_current_thread(|env| -> jni::errors::Result<std::path::PathBuf> {
+                let context = unsafe { JObject::from_raw(env, ctx.context().cast()) };
 
-            let files_dir = env
-                .call_method(&context, "getFilesDir", "()Ljava/io/File;", &[])
-                .ok()?
-                .l()
-                .ok()?;
-            let path_obj = env
-                .call_method(&files_dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
-                .ok()?
-                .l()
-                .ok()?;
-            let path = env
-                .get_string(&JString::from(path_obj))
-                .ok()?
-                .to_string_lossy()
-                .into_owned();
+                let files_dir = env
+                    .call_method(
+                        &context,
+                        jni_str!("getFilesDir"),
+                        jni_sig!("()Ljava/io/File;"),
+                        &[],
+                    )?
+                    .l()?;
+                let path_obj = env
+                    .call_method(
+                        &files_dir,
+                        jni_str!("getAbsolutePath"),
+                        jni_sig!("()Ljava/lang/String;"),
+                        &[],
+                    )?
+                    .l()?;
+                let path = env.as_cast::<JString>(&path_obj)?.try_to_string(env)?;
 
-            let _ = context.into_raw();
-            Some(std::path::PathBuf::from(path))
+                let _ = context.into_raw();
+                Ok(std::path::PathBuf::from(path))
+            })
+            .ok()
         }
 
         fn storage_base_dir() -> std::path::PathBuf {
@@ -480,6 +484,7 @@ struct FrontendNetworkMetrics {
     ws_url: String,
     base_http: String,
     ws_epoch: u64,
+    ws_disconnects_total: u64,
     ws_messages_total: u64,
     ws_bytes_total: u64,
     telemetry_rows_total: u64,
@@ -489,6 +494,7 @@ struct FrontendNetworkMetrics {
     rows_per_sec: f64,
     http_rtt_ms: Option<f64>,
     http_rtt_ema_ms: Option<f64>,
+    last_connect_wall_ms: Option<i64>,
     last_disconnect_reason: Option<String>,
     last_ws_message_wall_ms: Option<i64>,
     last_rate_sample_mono_ms: f64,
@@ -504,6 +510,7 @@ impl Default for FrontendNetworkMetrics {
             ws_url: String::new(),
             base_http: String::new(),
             ws_epoch: 0,
+            ws_disconnects_total: 0,
             ws_messages_total: 0,
             ws_bytes_total: 0,
             telemetry_rows_total: 0,
@@ -513,6 +520,7 @@ impl Default for FrontendNetworkMetrics {
             rows_per_sec: 0.0,
             http_rtt_ms: None,
             http_rtt_ema_ms: None,
+            last_connect_wall_ms: None,
             last_disconnect_reason: None,
             last_ws_message_wall_ms: None,
             last_rate_sample_mono_ms: 0.0,
@@ -541,10 +549,16 @@ fn frontend_network_metrics_snapshot() -> FrontendNetworkMetrics {
 
 fn note_ws_connection_state(connected: bool, ws_url: String, reason: Option<String>, epoch: u64) {
     if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
+        let was_connected = next.ws_connected;
         next.ws_connected = connected;
         next.ws_url = ws_url;
         next.base_http = UrlConfig::base_http();
         next.ws_epoch = epoch;
+        if connected {
+            next.last_connect_wall_ms = Some(current_wallclock_ms());
+        } else if was_connected {
+            next.ws_disconnects_total = next.ws_disconnects_total.saturating_add(1);
+        }
         if let Some(reason) = reason {
             next.last_disconnect_reason = Some(reason);
         }
@@ -840,7 +854,7 @@ const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
 const MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
 const DATA_TAB_STORAGE_KEY: &str = "gs_data_tab";
 const BASE_URL_STORAGE_KEY: &str = "gs_base_url";
-const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v6";
+const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v7";
 const NOTIFICATION_DISMISSED_STORAGE_KEY: &str = "gs_notification_dismissed_ids_v1";
 const _SKIP_TLS_VERIFY_KEY_PREFIX: &str = "gs_skip_tls_verify_";
 const NOTIFICATION_AUTO_DISMISS_MS: u32 = 5_000;
@@ -2281,7 +2295,7 @@ fn TelemetryDashboardInner() -> Element {
                                             button {
                                                 style: if *active_main_tab.read() == MainTab::Detailed { tab_style_active("#0ea5e9") } else { tab_style_inactive.to_string() },
                                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Detailed) },
-                                                "Detailed"
+                                                "Detailed Info"
                                             }
                                         },
                                         MainTab::Map => rsx! {
@@ -2578,6 +2592,9 @@ fn TelemetryDashboardInner() -> Element {
                                     board_status: board_status,
                                     network_topology: network_topology,
                                     flight_state: flight_state,
+                                    warnings: warnings,
+                                    errors: errors,
+                                    notifications: notifications,
                                     network_time_display: detailed_network_time_display.clone(),
                                     network_clock_delta_ms: detailed_clock_delta_ms,
                                     network_time_age_ms: detailed_network_time_age_ms,

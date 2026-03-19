@@ -147,33 +147,37 @@ mod persist {
 
     #[cfg(target_os = "android")]
     fn android_storage_dir() -> Option<std::path::PathBuf> {
-        use jni::JavaVM;
         use jni::objects::{JObject, JString};
+        use jni::{JavaVM, jni_sig, jni_str};
         use ndk_context::android_context;
 
         let ctx = android_context();
-        let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
-        let mut env = vm.attach_current_thread().ok()?;
-        let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+        let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
+        vm.attach_current_thread(|env| -> jni::errors::Result<std::path::PathBuf> {
+            let context = unsafe { JObject::from_raw(env, ctx.context().cast()) };
 
-        let files_dir = env
-            .call_method(&context, "getFilesDir", "()Ljava/io/File;", &[])
-            .ok()?
-            .l()
-            .ok()?;
-        let path_obj = env
-            .call_method(&files_dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
-            .ok()?
-            .l()
-            .ok()?;
-        let path = env
-            .get_string(&JString::from(path_obj))
-            .ok()?
-            .to_string_lossy()
-            .into_owned();
+            let files_dir = env
+                .call_method(
+                    &context,
+                    jni_str!("getFilesDir"),
+                    jni_sig!("()Ljava/io/File;"),
+                    &[],
+                )?
+                .l()?;
+            let path_obj = env
+                .call_method(
+                    &files_dir,
+                    jni_str!("getAbsolutePath"),
+                    jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                )?
+                .l()?;
+            let path = env.as_cast::<JString>(&path_obj)?.try_to_string(env)?;
 
-        let _ = context.into_raw();
-        Some(std::path::PathBuf::from(path).join("gs26"))
+            let _ = context.into_raw();
+            Ok(std::path::PathBuf::from(path).join("gs26"))
+        })
+        .ok()
     }
 
     fn storage_dir() -> std::path::PathBuf {

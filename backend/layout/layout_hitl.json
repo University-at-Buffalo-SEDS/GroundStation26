@@ -10,8 +10,8 @@
     "warnings",
     "errors",
     "data",
-    "detailed",
-    "network-topology"
+    "network-topology",
+    "detailed"
   ],
   "connection_tab": {
     "sections": [
