@@ -5,6 +5,8 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
 
+use crate::auth;
+
 use super::layout::{
     ActionSpec, ActionsTabLayout, BooleanLabels, DataTabLayout, StateSection, StateTabLayout,
     StateWidget, StateWidgetKind, SummaryItem, ValveColor, ValveColorSet,
@@ -83,6 +85,7 @@ pub fn StateTab(
     actions: ActionsTabLayout,
     action_policy: Signal<ActionPolicyMsg>,
     default_valve_labels: Option<BooleanLabels>,
+    abort_only_mode: bool,
 ) -> Element {
     // ------------------------------------------------------------
     // Redraw driver for charts on State tab
@@ -195,7 +198,8 @@ pub fn StateTab(
                     &action_policy_snapshot,
                     default_valve_labels.as_ref(),
                     rocket_gps,
-                    user_gps
+                    user_gps,
+                    abort_only_mode
                 )}
             }
         }
@@ -237,6 +241,7 @@ fn render_state_section(
     default_valve_labels: Option<&BooleanLabels>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
+    abort_only_mode: bool,
 ) -> Element {
     if !section_has_content(section, actions) {
         return rsx! { div {} };
@@ -257,7 +262,8 @@ fn render_state_section(
                     action_policy,
                     default_valve_labels,
                     rocket_gps,
-                    user_gps
+                    user_gps,
+                    abort_only_mode
                 )}
             }
         }
@@ -273,6 +279,7 @@ fn render_state_widget(
     default_valve_labels: Option<&BooleanLabels>,
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
+    abort_only_mode: bool,
 ) -> Element {
     match widget.kind {
         StateWidgetKind::BoardStatus => rsx! { {board_status_table(boards)} },
@@ -307,7 +314,7 @@ fn render_state_widget(
         }
         StateWidgetKind::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
         StateWidgetKind::Actions => {
-            rsx! { {action_section(actions, action_policy, widget.actions.as_deref())} }
+            rsx! { {action_section(actions, action_policy, widget.actions.as_deref(), abort_only_mode)} }
         }
     }
 }
@@ -576,6 +583,7 @@ fn action_section(
     actions: &[ActionSpec],
     action_policy: &ActionPolicyMsg,
     selection: Option<&[String]>,
+    abort_only_mode: bool,
 ) -> Element {
     let blink_now_ms = blink_epoch_ms();
     let filtered = filter_actions(actions, selection);
@@ -589,6 +597,8 @@ fn action_section(
                 {
                     let control = action_policy.controls.iter().find(|c| c.cmd == action.cmd);
                     let enabled = action_policy.software_buttons_enabled
+                        && auth::can_send_command(action.cmd.as_str())
+                        && (!abort_only_mode || action.cmd == "Abort")
                         && control.map(|c| c.enabled).unwrap_or(action.cmd == "Abort");
                     let blink = control.map(|c| c.blink).unwrap_or(BlinkMode::None);
                     let actuated = control.and_then(|c| c.actuated);

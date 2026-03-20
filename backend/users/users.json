@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "session_ttl_seconds": 1209600,
+  "anonymous": {
+    "view_data": false,
+    "send_commands": false
+  },
+  "anonymous_command_access": {
+    "allowed_commands": []
+  },
+  "users": []
+}

@@ -736,6 +736,9 @@ pub fn CalibrationTab() -> Element {
         .read()
         .as_ref()
         .and_then(|c| fit_details_text(c, channel));
+    let fit_equation_text = fit_meta_text
+        .clone()
+        .unwrap_or_else(|| format!("type={fit_type_s}"));
 
     let plot_w = 900.0_f32;
     let plot_h = 260.0_f32;
@@ -833,15 +836,6 @@ pub fn CalibrationTab() -> Element {
                 {metric_card("Live Raw", raw_live_s.clone())}
                 {metric_card("Calibrated Value", calibrated_live_s.clone())}
                 {metric_card("Active Fit", fit_type_s.clone())}
-            }
-
-            if let Some(fit_meta_text) = fit_meta_text {
-                div { style: "border:1px solid #334155; border-radius:10px; padding:10px 12px; background:#0b1220; color:#94a3b8; overflow:visible; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;",
-                    div { style: "font-size:12px; color:#94a3b8; margin-bottom:4px;", "Fit Parameters" }
-                    div { style: "white-space:pre-wrap; word-break:break-word; min-height:24px; line-height:1.45;",
-                        "{fit_meta_text}"
-                    }
-                }
             }
 
             div { style: "display:flex; gap:8px; flex-wrap:wrap; align-items:center;",
@@ -1179,6 +1173,16 @@ pub fn CalibrationTab() -> Element {
             }
 
             div { style: "border:1px solid #334155; border-radius:10px; padding:8px; background:#020617;",
+                div { style: "display:grid; grid-template-columns:minmax(160px, 220px) minmax(0, 1fr); gap:12px; align-items:start; padding:6px 6px 10px 6px;",
+                    div {
+                        style: "font-size:12px; color:#94a3b8; font-weight:700; letter-spacing:0.03em; text-transform:uppercase;",
+                        "Calibration Fit"
+                    }
+                    div {
+                        style: "color:#cbd5e1; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums; white-space:pre-wrap; word-break:break-word; line-height:1.45; min-height:20px;",
+                        "{fit_equation_text}"
+                    }
+                }
                 svg { view_box: "0 0 {plot_w} {plot_h}", style: "width:100%; height:260px; display:block;",
                     rect { x:"0", y:"0", width:"{plot_w}", height:"{plot_h}", fill:"#020617" }
                     line { x1:"{pad_l}", y1:"{pad_t}", x2:"{pad_l}", y2:"{plot_h - pad_b}", stroke:"#334155", "stroke-width":"1" }

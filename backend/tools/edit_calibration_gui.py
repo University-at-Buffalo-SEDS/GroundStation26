@@ -34,7 +34,7 @@ def _default_calibration_path() -> Path:
     testing_path = backend_dir / "calibration" / "loadcell_calibration_testing.json"
     if testing_path.exists():
         return testing_path
-    return backend_dir / "data" / "loadcell_calibration.json"
+    return backend_dir / "calibration" / "loadcell_calibration.json"
 
 
 def _read_json(path: Path) -> dict[str, Any]:

@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
+use std::collections::BTreeMap;
 
 use super::types::{
     BoardStatusEntry, FlightState, NetworkTopologyMsg, NetworkTopologyNodeKind,
@@ -119,6 +120,7 @@ pub fn DetailedTab(
         })
         .collect::<Vec<_>>();
     let topology_nodes_only = topology.nodes.iter().collect::<Vec<_>>();
+    let endpoint_rows = collect_endpoint_rows(&topology.nodes);
 
     rsx! {
         div { style: "padding:18px; height:100%; overflow-y:auto; overflow-x:hidden; color:#dbe7f3;",
@@ -253,6 +255,30 @@ pub fn DetailedTab(
                     }
                 }
                 div { style: "display:flex; flex-direction:column; gap:14px; min-width:0;",
+                    div { style: section_style(),
+                        h3 { style: section_title_style(), "Endpoint Ownership" }
+                        table { style: table_style(),
+                            thead {
+                                tr {
+                                    th { style: th_style(), "Endpoint" }
+                                    th { style: th_style(), "Host" }
+                                }
+                            }
+                            tbody {
+                                for (endpoint, owners) in endpoint_rows.iter() {
+                                    tr {
+                                        td { style: td_style_mono(), "{endpoint}" }
+                                        td { style: td_style(), "{owners.join(\", \")}" }
+                                    }
+                                }
+                                if endpoint_rows.is_empty() {
+                                    tr {
+                                        td { style: td_style(), colspan: "2", "No endpoint ownership data available." }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     div { style: section_style(),
                         h3 { style: section_title_style(), "Topology Links" }
                         table { style: table_style(),
@@ -394,6 +420,40 @@ fn node_label(id: &str, nodes: &[super::types::NetworkTopologyNode]) -> String {
         .find(|node| node.id == id)
         .map(|node| node.label.clone())
         .unwrap_or_else(|| id.to_string())
+}
+
+fn collect_endpoint_rows(
+    nodes: &[super::types::NetworkTopologyNode],
+) -> Vec<(String, Vec<String>)> {
+    let mut by_endpoint = BTreeMap::<String, Vec<String>>::new();
+    for node in nodes {
+        let Some(owner) = endpoint_owner_label(node) else {
+            continue;
+        };
+        for endpoint in &node.endpoints {
+            by_endpoint
+                .entry(endpoint.clone())
+                .or_default()
+                .push(owner.clone());
+        }
+    }
+
+    by_endpoint
+        .into_iter()
+        .map(|(endpoint, mut owners)| {
+            owners.sort();
+            owners.dedup();
+            (endpoint, owners)
+        })
+        .collect()
+}
+
+fn endpoint_owner_label(node: &super::types::NetworkTopologyNode) -> Option<String> {
+    match node.kind {
+        NetworkTopologyNodeKind::Router => Some("Ground Station".to_string()),
+        NetworkTopologyNodeKind::Board => Some(node.label.clone()),
+        NetworkTopologyNodeKind::Endpoint | NetworkTopologyNodeKind::Side => None,
+    }
 }
 
 fn yes_no(value: bool) -> String {

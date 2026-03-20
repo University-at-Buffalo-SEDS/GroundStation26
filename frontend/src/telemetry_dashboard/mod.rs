@@ -27,8 +27,8 @@ pub mod map_tab;
 pub mod state_tab;
 pub mod warnings_tab;
 
-#[cfg(not(target_arch = "wasm32"))]
 use crate::app::Route;
+use crate::auth;
 #[cfg(not(target_arch = "wasm32"))]
 use data_chart::charts_cache_reset_and_ingest;
 use data_chart::{
@@ -1342,6 +1342,7 @@ fn TelemetryDashboardInner() -> Element {
 
     let flash_on = use_signal(|| false);
     let clock_tick = use_signal(|| 0u64);
+    let abort_only_mode = use_signal(|| false);
 
     let rocket_gps = use_signal(|| None::<(f64, f64)>);
     let user_gps = use_signal(|| None::<(f64, f64)>);
@@ -1940,6 +1941,42 @@ fn TelemetryDashboardInner() -> Element {
         }
     };
 
+    let auth_button: Element = {
+        use dioxus_router::use_navigator;
+        let nav = use_navigator();
+        let base = UrlConfig::base_http();
+        let skip_tls = UrlConfig::_skip_tls_verify();
+        let label = auth::current_session()
+            .and_then(|session| session.session.username)
+            .map(|username| format!("SIGN OUT {username}"))
+            .unwrap_or_else(|| "SIGN IN".to_string());
+        rsx! {
+            button {
+                style: "
+                    padding:0.45rem 0.85rem;
+                    border-radius:0.75rem;
+                    border:1px solid #334155;
+                    background:#111827;
+                    color:#e5e7eb;
+                    font-weight:800;
+                    cursor:pointer;
+                ",
+                onclick: move |_| {
+                    if auth::current_session().is_some() {
+                        let base = base.clone();
+                        spawn(async move {
+                            let _ = auth::logout(&base, skip_tls).await;
+                            let _ = nav.push(Route::Login {});
+                        });
+                    } else {
+                        let _ = nav.push(Route::Login {});
+                    }
+                },
+                "{label}"
+            }
+        }
+    };
+
     let layout_config = layout_config;
     let mut layout_loading = layout_loading;
     let mut layout_error = layout_error;
@@ -2196,7 +2233,9 @@ fn TelemetryDashboardInner() -> Element {
                             {
                                 let software_buttons_enabled =
                                     action_policy.read().software_buttons_enabled;
-                                let abort_style = if software_buttons_enabled {
+                                let abort_allowed =
+                                    software_buttons_enabled && auth::can_send_command("Abort");
+                                let abort_style = if abort_allowed {
                                     "
                                 padding:0.45rem 0.85rem;
                                 border-radius:0.75rem;
@@ -2222,9 +2261,9 @@ fn TelemetryDashboardInner() -> Element {
                                 rsx! {
                             button {
                                 style: "{abort_style}",
-                                disabled: !software_buttons_enabled,
+                                disabled: !abort_allowed,
                                 onclick: move |_| {
-                                    if software_buttons_enabled {
+                                    if abort_allowed {
                                         send_cmd("Abort")
                                     }
                                 },
@@ -2233,7 +2272,40 @@ fn TelemetryDashboardInner() -> Element {
                                 }
                             }
 
+                            button {
+                                style: if *abort_only_mode.read() {
+                                    "
+                                        padding:0.45rem 0.85rem;
+                                        border-radius:0.75rem;
+                                        border:1px solid #f59e0b;
+                                        background:#451a03;
+                                        color:#fde68a;
+                                        font-weight:800;
+                                        cursor:pointer;
+                                    "
+                                } else {
+                                    "
+                                        padding:0.45rem 0.85rem;
+                                        border-radius:0.75rem;
+                                        border:1px solid #334155;
+                                        background:#111827;
+                                        color:#e5e7eb;
+                                        font-weight:800;
+                                        cursor:pointer;
+                                    "
+                                },
+                                onclick: {
+                                    let mut abort_only_mode = abort_only_mode;
+                                    move |_| {
+                                        let next = !*abort_only_mode.read();
+                                        abort_only_mode.set(next);
+                                    }
+                                },
+                                if *abort_only_mode.read() { "ABORT-ONLY ON" } else { "ABORT-ONLY OFF" }
+                            }
+
                             {reload_button}
+                            {auth_button}
                             {version_button}
                             {connect_button}
                         }
@@ -2248,6 +2320,11 @@ fn TelemetryDashboardInner() -> Element {
                     if !action_policy.read().software_buttons_enabled {
                         div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid #f59e0b; background:#451a03; color:#fde68a; font-size:12px;",
                             "Software command buttons are disabled by the hardware GPIO lockout."
+                        }
+                    }
+                    if *abort_only_mode.read() {
+                        div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid #f59e0b; background:#451a03; color:#fde68a; font-size:12px;",
+                            "Abort-only mode is enabled. All action and flight-state buttons except Abort are disabled."
                         }
                     }
 
@@ -2577,6 +2654,7 @@ fn TelemetryDashboardInner() -> Element {
                                                 .iter()
                                                 .find(|t| t.id == "VALVE_STATE")
                                                 .and_then(|t| t.boolean_labels.clone()),
+                                            abort_only_mode: *abort_only_mode.read(),
                                         }
                                     }
                             },
@@ -2617,7 +2695,11 @@ fn TelemetryDashboardInner() -> Element {
                             },
                             MainTab::Actions => rsx! {
                                 div { style: "height:100%; overflow-y:auto; overflow-x:hidden;",
-                                    ActionsTab { layout: layout.actions_tab.clone(), action_policy: action_policy }
+                                    ActionsTab {
+                                        layout: layout.actions_tab.clone(),
+                                        action_policy: action_policy,
+                                        abort_only_mode: *abort_only_mode.read(),
+                                    }
                                 }
                             },
                             MainTab::Calibration => rsx! {
@@ -2655,6 +2737,9 @@ fn TelemetryDashboardInner() -> Element {
 }
 
 fn send_cmd(cmd: &str) {
+    if !auth::can_send_command(cmd) {
+        return;
+    }
     if let Some(sender) = WS_SENDER.read().clone()
         && let Err(e) = sender.send_cmd(cmd)
     {
@@ -2706,13 +2791,21 @@ pub(crate) async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> R
         format!("{base}{path}")
     };
 
-    Request::get(&url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json::<T>()
-        .await
-        .map_err(|e| e.to_string())
+    let mut request = Request::get(&url);
+    if let Some(token) = auth::current_token() {
+        request = request.header("Authorization", &format!("Bearer {token}"));
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if status == 401 {
+        auth::clear_current_session();
+    }
+    if !(200..300).contains(&status) {
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("HTTP {status}: {}", snippet.trim()));
+    }
+    serde_json::from_str::<T>(&body).map_err(|e| e.to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2735,11 +2828,18 @@ pub(crate) async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> R
         .build()
         .map_err(|e| e.to_string())?;
 
-    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let mut request = client.get(url);
+    if let Some(token) = auth::current_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
 
     let status = response.status();
     let body = response.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            auth::clear_current_session();
+        }
         let snippet: String = body.chars().take(200).collect();
         return Err(format!("HTTP {}: {}", status, snippet.trim()));
     }
@@ -2775,15 +2875,26 @@ pub(crate) async fn http_post_json<B: Serialize, T: for<'de> Deserialize<'de>>(
         format!("{base}{path}")
     };
 
-    Request::post(&url)
+    let mut request = Request::post(&url);
+    if let Some(token) = auth::current_token() {
+        request = request.header("Authorization", &format!("Bearer {token}"));
+    }
+    let response = request
         .json(body)
         .map_err(|e| e.to_string())?
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .json::<T>()
-        .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if status == 401 {
+        auth::clear_current_session();
+    }
+    if !(200..300).contains(&status) {
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("HTTP {status}: {}", snippet.trim()));
+    }
+    serde_json::from_str::<T>(&body).map_err(|e| e.to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2809,15 +2920,21 @@ pub(crate) async fn http_post_json<B: Serialize, T: for<'de> Deserialize<'de>>(
         .build()
         .map_err(|e| e.to_string())?;
 
-    client
-        .post(url)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json::<T>()
-        .await
-        .map_err(|e| e.to_string())
+    let mut request = client.post(url).json(body);
+    if let Some(token) = auth::current_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        auth::clear_current_session();
+    }
+    if !status.is_success() {
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("HTTP {}: {}", status, snippet.trim()));
+    }
+    serde_json::from_str::<T>(&body).map_err(|e| e.to_string())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2842,10 +2959,19 @@ async fn http_post_empty(path: &str) -> Result<(), String> {
         format!("{base}{path}")
     };
 
-    Request::post(&url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut request = Request::post(&url);
+    if let Some(token) = auth::current_token() {
+        request = request.header("Authorization", &format!("Bearer {token}"));
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status == 401 {
+        auth::clear_current_session();
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}: {}", body.trim()));
+    }
     Ok(())
 }
 
@@ -2869,7 +2995,19 @@ async fn http_post_empty(path: &str) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    client.post(url).send().await.map_err(|e| e.to_string())?;
+    let mut request = client.post(url);
+    if let Some(token) = auth::current_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        auth::clear_current_session();
+    }
+    if !status.is_success() {
+        return Err(format!("HTTP {}: {}", status, body.trim()));
+    }
     Ok(())
 }
 
@@ -2891,6 +3029,17 @@ where
     F: Future<Output = ()> + 'static,
 {
     spawn(fut);
+}
+
+fn auth_ws_url(base_ws: &str) -> String {
+    let mut url = format!("{}/ws", base_ws.trim_end_matches('/'));
+    if let Some(token) = auth::current_token() {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        url.push(sep);
+        url.push_str("token=");
+        url.push_str(&token);
+    }
+    url
 }
 
 fn load_dismissed_notifications() -> Vec<DismissedNotification> {
@@ -3468,7 +3617,7 @@ async fn connect_ws_once_wasm(
     }
 
     let base_ws = UrlConfig::base_ws();
-    let ws_url = format!("{base_ws}/ws");
+    let ws_url = auth_ws_url(&base_ws);
 
     log!("[WS] connecting to {ws_url} (epoch={epoch})");
 
@@ -3606,7 +3755,7 @@ async fn connect_ws_once_native(
     }
 
     let base_ws = UrlConfig::base_ws();
-    let ws_url = format!("{base_ws}/ws");
+    let ws_url = auth_ws_url(&base_ws);
 
     log!("[WS] connecting to {ws_url} (epoch={epoch})");
     note_ws_connection_state(false, ws_url.clone(), None, epoch);

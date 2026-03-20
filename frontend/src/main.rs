@@ -1,4 +1,5 @@
 mod app;
+mod auth;
 mod telemetry_dashboard;
 
 use dioxus::prelude::*;

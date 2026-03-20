@@ -4,13 +4,12 @@ const _CONNECTION_TIMEOUT_MS: u64 = 8000;
 const _BODY_TRANSFER_TIMEOUT_MS: u64 = 10000;
 const _WS_TIMEOUT_MS: u64 = 4500;
 
+use crate::auth::{self, SessionStatus as AuthSessionStatus};
 use dioxus::prelude::*;
-use dioxus_router::{Routable, Router};
+use dioxus_router::{Routable, Router, use_navigator};
 
 #[allow(unused_imports)]
 use crate::telemetry_dashboard::UrlConfig;
-#[cfg(not(target_arch = "wasm32"))]
-use dioxus_router::use_navigator;
 
 // -------------------------
 // Native-only keep-awake shims (mobile)
@@ -94,6 +93,9 @@ pub enum Route {
     #[route("/dashboard")]
     Dashboard {},
 
+    #[route("/login")]
+    Login {},
+
     #[cfg(not(target_arch = "wasm32"))]
     #[route("/connect")]
     Connect {},
@@ -101,6 +103,16 @@ pub enum Route {
     #[cfg(not(target_arch = "wasm32"))]
     #[route("/version")]
     Version {},
+}
+
+#[cfg(target_arch = "wasm32")]
+fn connect_route() -> Route {
+    Route::Root {}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn connect_route() -> Route {
+    Route::Connect {}
 }
 
 // -------------------------
@@ -590,6 +602,7 @@ fn format_route_report_host_only(
 // -------------------------
 #[component]
 pub fn App() -> Element {
+    auth::init_from_storage();
     #[cfg(not(target_arch = "wasm32"))]
     {
         keep_awake::set_enabled(true);
@@ -627,11 +640,149 @@ pub fn Root() -> Element {
             if UrlConfig::_stored_base_url().is_some() {
                 let _ = nav.replace(Route::Dashboard {});
             } else {
-                let _ = nav.replace(Route::Connect {});
+                let _ = nav.replace(connect_route());
             }
         });
 
         rsx! { div {} }
+    }
+}
+
+#[component]
+fn LoginCard(
+    title: String,
+    subtitle: String,
+    allow_back_to_connect: bool,
+    on_success_route: Route,
+) -> Element {
+    let nav = use_navigator();
+    let base = UrlConfig::base_http();
+    let skip_tls = UrlConfig::_skip_tls_verify();
+    let stored_username = auth::current_session()
+        .and_then(|session| session.session.username)
+        .unwrap_or_default();
+    let mut username = use_signal(|| stored_username);
+    let mut password = use_signal(String::new);
+    let mut remember_me = use_signal(|| auth::current_session().is_some());
+    let mut status = use_signal(String::new);
+    let mut busy = use_signal(|| false);
+
+    rsx! {
+        div {
+            style: "min-height:100vh; height:100vh; overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            div {
+                style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
+                h1 { style: "margin:0 0 10px 0; font-size:22px;", "{title}" }
+                p { style: "margin:0 0 16px 0; color:#94a3b8;", "{subtitle}" }
+
+                if base.trim().is_empty() {
+                    div {
+                        style: "margin-bottom:14px; padding:12px; border-radius:12px; border:1px solid #7c2d12; background:#451a03; color:#fed7aa;",
+                        "Configure the backend URL before logging in."
+                    }
+                } else {
+                    div {
+                        style: "margin-bottom:14px; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#cbd5e1;",
+                        div { style: "font-size:12px; color:#94a3b8; margin-bottom:4px;", "Backend" }
+                        div { style: "font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;", "{base}" }
+                    }
+                }
+
+                input {
+                    style: "width:100%; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#e5e7eb; outline:none; margin-bottom:12px;",
+                    placeholder: "Username",
+                    value: "{username()}",
+                    oninput: move |evt| username.set(evt.value()),
+                }
+
+                input {
+                    style: "width:100%; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#e5e7eb; outline:none;",
+                    r#type: "password",
+                    placeholder: "Password",
+                    value: "{password()}",
+                    oninput: move |evt| password.set(evt.value()),
+                }
+
+                div { style: "margin-top:12px; display:flex; align-items:center; gap:10px;",
+                    input {
+                        r#type: "checkbox",
+                        checked: *remember_me.read(),
+                        onclick: move |_| {
+                            let next = !*remember_me.read();
+                            remember_me.set(next);
+                        },
+                    }
+                    div { style: "font-size:13px; color:#94a3b8;", "Remember this device until the backend session expires" }
+                }
+
+                if !status().is_empty() {
+                    div {
+                        style: "margin-top:14px; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#cbd5e1; white-space:pre-wrap;",
+                        "{status()}"
+                    }
+                }
+
+                div { style: "display:flex; gap:12px; margin-top:16px; justify-content:flex-end; flex-wrap:wrap;",
+                    if allow_back_to_connect {
+                        button {
+                            style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
+                            onclick: move |_| {
+                                let _ = nav.replace(connect_route());
+                            },
+                            "Back"
+                        }
+                    }
+
+                    button {
+                        style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
+                        disabled: busy() || base.trim().is_empty(),
+                        onclick: move |_| {
+                            let base = UrlConfig::base_http();
+                            if base.trim().is_empty() {
+                                status.set("Configure the backend URL first.".to_string());
+                                return;
+                            }
+                            let username_value = username();
+                            let password_value = password();
+                            if username_value.trim().is_empty() || password_value.is_empty() {
+                                status.set("Enter both username and password.".to_string());
+                                return;
+                            }
+                            let remember = *remember_me.read();
+                            let success_route = on_success_route.clone();
+                            busy.set(true);
+                            status.set("Signing in...".to_string());
+                            spawn(async move {
+                                match auth::login(&base, skip_tls, username_value.trim(), &password_value, remember).await {
+                                    Ok(_) => {
+                                        busy.set(false);
+                                        status.set(String::new());
+                                        let _ = nav.replace(success_route);
+                                    }
+                                    Err(err) => {
+                                        busy.set(false);
+                                        status.set(err);
+                                    }
+                                }
+                            });
+                        },
+                        if busy() { "Signing In..." } else { "Sign In" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn Login() -> Element {
+    rsx! {
+        LoginCard {
+            title: "Sign In".to_string(),
+            subtitle: "Authenticate with the backend to view protected data or send commands.".to_string(),
+            allow_back_to_connect: true,
+            on_success_route: Route::Dashboard {},
+        }
     }
 }
 
@@ -727,6 +878,34 @@ pub fn Connect() -> Element {
                 }
 
                 div { style: "display:flex; gap:12px; margin-top:16px; justify-content:flex-end; flex-wrap:wrap;",
+                    button {
+                        style: "
+                            padding:10px 14px;
+                            border-radius:12px;
+                            border:1px solid #334155;
+                            background:#111827;
+                            color:#e5e7eb;
+                            cursor:pointer;
+                        ",
+                        onclick: move |_| {
+                            let u_norm = normalize_base_url(url_edit().trim().to_string());
+                            if u_norm.is_empty() {
+                                test_status.set("Enter a URL first.".to_string());
+                                return;
+                            }
+                            if !(u_norm.starts_with("http://") || u_norm.starts_with("https://")) {
+                                test_status.set("URL must start with http:// or https://".to_string());
+                                return;
+                            }
+
+                            objc_poke::poke_url(&u_norm);
+                            UrlConfig::set_base_url_and_persist(u_norm.to_string());
+                            UrlConfig::_set_skip_tls_verify_for_base(&u_norm, *skip_tls.read());
+                            let _ = persist::write_connect_shown(true);
+                            let _ = nav.replace(Route::Login {});
+                        },
+                        "Sign In"
+                    }
 
                     button {
                         style: "
@@ -827,7 +1006,7 @@ pub fn Version() -> Element {
         } else if UrlConfig::_stored_base_url().is_some() {
             let _ = nav.replace(Route::Dashboard {});
         } else {
-            let _ = nav.replace(Route::Connect {});
+            let _ = nav.replace(connect_route());
         }
     };
 
@@ -883,7 +1062,7 @@ pub fn Dashboard() -> Element {
                                 cursor:pointer;
                             ",
                             onclick: move |_| {
-                                let _ = nav.replace(Route::Connect {});
+                                let _ = nav.replace(connect_route());
                             },
                             "Back to Connect"
                         }
@@ -893,5 +1072,42 @@ pub fn Dashboard() -> Element {
         }
     }
 
-    rsx! { crate::telemetry_dashboard::TelemetryDashboard {} }
+    let mut auth_state = use_signal(|| None::<Result<AuthSessionStatus, String>>);
+    use_effect(move || {
+        if auth_state.read().is_some() {
+            return;
+        }
+        let base = UrlConfig::base_http();
+        let skip_tls = UrlConfig::_skip_tls_verify();
+        spawn(async move {
+            auth_state.set(Some(auth::fetch_session_status(&base, skip_tls).await));
+        });
+    });
+
+    match auth_state.read().as_ref() {
+        None => rsx! {
+            div { style: "height:100vh; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+                div { style: "padding:20px; border:1px solid #334155; border-radius:16px; background:#0b1220;", "Checking session..." }
+            }
+        },
+        Some(Ok(status)) if status.permissions.view_data => {
+            rsx! { crate::telemetry_dashboard::TelemetryDashboard {} }
+        }
+        Some(Ok(_)) => rsx! {
+            LoginCard {
+                title: "Sign In Required".to_string(),
+                subtitle: "This backend does not allow anonymous view access. Sign in to continue.".to_string(),
+                allow_back_to_connect: true,
+                on_success_route: Route::Dashboard {},
+            }
+        },
+        Some(Err(err)) => rsx! {
+            LoginCard {
+                title: "Sign In Required".to_string(),
+                subtitle: format!("Backend session check failed: {err}"),
+                allow_back_to_connect: true,
+                on_success_route: Route::Dashboard {},
+            }
+        },
+    }
 }

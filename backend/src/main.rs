@@ -1,5 +1,6 @@
 // main.rs
 
+mod auth;
 #[cfg(feature = "testing")]
 mod dummy_packets;
 mod flight_sim;
@@ -324,6 +325,38 @@ async fn main() -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            token             TEXT PRIMARY KEY,
+            username          TEXT NOT NULL,
+            session_type      TEXT NOT NULL,
+            can_view_data     INTEGER NOT NULL,
+            can_send_commands INTEGER NOT NULL,
+            allowed_commands_json TEXT NOT NULL DEFAULT '[]',
+            created_at_ms     INTEGER NOT NULL,
+            expires_at_ms     INTEGER NOT NULL
+        );
+        "#,
+    )
+    .execute(&db)
+    .await?;
+
+    let session_columns = sqlx::query("PRAGMA table_info(auth_sessions);")
+        .fetch_all(&db)
+        .await?;
+    let has_allowed_commands_json = session_columns.iter().any(|row| {
+        row.get::<String, _>("name")
+            .eq_ignore_ascii_case("allowed_commands_json")
+    });
+    if !has_allowed_commands_json {
+        sqlx::query(
+            "ALTER TABLE auth_sessions ADD COLUMN allowed_commands_json TEXT NOT NULL DEFAULT '[]';",
+        )
+        .execute(&db)
+        .await?;
+    }
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS flight_state (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp_ms INTEGER NOT NULL,
@@ -363,6 +396,18 @@ async fn main() -> anyhow::Result<()> {
     let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
     let loadcell_calibration = loadcell::load_or_default();
     let radio_links = radio_config::load_or_default();
+    let users_path = PathBuf::from("./users/users.json");
+    let legacy_users_path = PathBuf::from("./data/users.json");
+    if !users_path.exists() && legacy_users_path.exists() {
+        if let Some(parent) = users_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&legacy_users_path, &users_path)?;
+    }
+    let auth = Arc::new(auth::AuthManager::new(users_path));
+    auth.ensure_file()
+        .map_err(|e| anyhow::anyhow!("failed to initialize users.json: {e}"))?;
+    let _ = auth.cleanup_expired_sessions(&db).await;
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
@@ -393,6 +438,7 @@ async fn main() -> anyhow::Result<()> {
         av_bay_radio_connected: Arc::new(AtomicBool::new(false)),
         fill_radio_connected: Arc::new(AtomicBool::new(false)),
         topology_router: Arc::new(std::sync::OnceLock::new()),
+        auth,
     });
 
     gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");

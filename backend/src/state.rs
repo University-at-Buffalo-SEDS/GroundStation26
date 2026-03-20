@@ -1,3 +1,4 @@
+use crate::auth::AuthManager;
 use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
@@ -158,6 +159,9 @@ pub struct AppState {
 
     /// Shared router handle used for exporting discovery topology.
     pub topology_router: Arc<OnceLock<Arc<Router>>>,
+
+    /// Authentication and authorization manager.
+    pub auth: Arc<AuthManager>,
 }
 
 impl AppState {

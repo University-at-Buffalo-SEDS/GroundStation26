@@ -2,6 +2,8 @@
 
 use dioxus::prelude::*;
 
+use crate::auth;
+
 use super::layout::ActionsTabLayout;
 use super::{ActionPolicyMsg, BlinkMode};
 
@@ -106,7 +108,11 @@ fn btn_style(
 }
 
 #[component]
-pub fn ActionsTab(layout: ActionsTabLayout, action_policy: Signal<ActionPolicyMsg>) -> Element {
+pub fn ActionsTab(
+    layout: ActionsTabLayout,
+    action_policy: Signal<ActionPolicyMsg>,
+    abort_only_mode: bool,
+) -> Element {
     let mut redraw_tick = use_signal(|| 0u64);
     use_effect(move || {
         spawn(async move {
@@ -150,6 +156,8 @@ pub fn ActionsTab(layout: ActionsTabLayout, action_policy: Signal<ActionPolicyMs
                             .find(|c| c.cmd == action.cmd)
                             .cloned();
                         let enabled = software_buttons_enabled
+                            && auth::can_send_command(action.cmd.as_str())
+                            && (!abort_only_mode || action.cmd == "Abort")
                             && control
                             .as_ref()
                             .map(|c| c.enabled)
