@@ -232,10 +232,22 @@ impl FlightSimState {
     fn queue_flight_state(&mut self, now_ms: u64) {
         if let Ok(pkt) = Packet::new(
             DataType::FlightState,
-            &[DataEndpoint::GroundStation],
+            &[DataEndpoint::GroundStation, DataEndpoint::FlightState],
             Board::FlightComputer.sender_id(),
             now_ms,
             Arc::from([self.flight_state as u8]),
+        ) {
+            self.queued.push_back(pkt);
+        }
+    }
+
+    fn queue_abort(&mut self, board: Board, reason: &str, now_ms: u64) {
+        if let Ok(pkt) = Packet::new(
+            DataType::Abort,
+            &[DataEndpoint::Abort],
+            board.sender_id(),
+            now_ms,
+            Arc::<[u8]>::from(reason.as_bytes().to_vec()),
         ) {
             self.queued.push_back(pkt);
         }
@@ -307,6 +319,12 @@ impl FlightSimState {
         match cmd {
             TelemetryCommand::Abort => {
                 self.launch_time_ms = None;
+                self.queue_abort(Board::ValveBoard, "simulated valve board abort", now_ms);
+                self.queue_abort(
+                    Board::ActuatorBoard,
+                    "simulated actuator board abort",
+                    now_ms,
+                );
                 self.set_flight_state(FlightState::Aborted, now_ms);
             }
             TelemetryCommand::Launch => {

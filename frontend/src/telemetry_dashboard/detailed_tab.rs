@@ -105,10 +105,24 @@ pub fn DetailedTab(
     } else {
         None
     };
+    let topology_links_preview = topology
+        .links
+        .iter()
+        .take(8)
+        .map(|link| {
+            (
+                link.source.clone(),
+                link.target.clone(),
+                link.label.clone().unwrap_or_else(|| "--".to_string()),
+                link.status,
+            )
+        })
+        .collect::<Vec<_>>();
+    let topology_nodes_only = topology.nodes.iter().collect::<Vec<_>>();
 
     rsx! {
         div { style: "padding:18px; height:100%; overflow-y:auto; overflow-x:hidden; color:#dbe7f3;",
-            div { style: "display:grid; gap:14px; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); margin-bottom:14px;",
+            div { style: "display:grid; gap:14px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:14px; align-items:start;",
                 {metric_card(
                     "Frontend ↔ Backend",
                     vec![
@@ -185,8 +199,9 @@ pub fn DetailedTab(
                 )}
             }
 
-            div { style: "display:grid; gap:14px; grid-template-columns:minmax(320px, 1.2fr) minmax(320px, 1fr); margin-bottom:14px;",
-                div { style: section_style(),
+            div { style: "display:grid; gap:14px; grid-template-columns:minmax(420px, 1.7fr) minmax(300px, 1fr); align-items:start;",
+                div { style: "display:flex; flex-direction:column; gap:14px; min-width:0;",
+                    div { style: section_style(),
                     h3 { style: section_title_style(), "Board Latency Detail" }
                     table { style: table_style(),
                         thead {
@@ -211,10 +226,7 @@ pub fn DetailedTab(
                         }
                     }
                 }
-            }
-
-            div { style: "display:grid; gap:14px; grid-template-columns:minmax(320px, 1.2fr) minmax(320px, 1fr);",
-                div { style: section_style(),
+                    div { style: section_style(),
                     h3 { style: section_title_style(), "Topology Nodes" }
                     table { style: table_style(),
                         thead {
@@ -227,7 +239,7 @@ pub fn DetailedTab(
                             }
                         }
                         tbody {
-                            for node in topology.nodes.iter() {
+                            for node in topology_nodes_only.iter() {
                                 tr {
                                     td { style: td_style(), "{node.label}" }
                                     td { style: td_style(), "{format_kind(node.kind)}" }
@@ -237,16 +249,32 @@ pub fn DetailedTab(
                                 }
                             }
                         }
+                        }
                     }
                 }
-                div { style: section_style(),
-                    h3 { style: section_title_style(), "Network Notes" }
-                    div { style: "display:flex; flex-direction:column; gap:10px; font-size:13px; color:#cbd5e1;",
-                        {info_line("HTTP RTT", "Measured by polling `/api/network_time`; this is the best current frontend ↔ backend round-trip estimate.")}
-                        {info_line("WS bandwidth", "Computed locally from incoming WebSocket payload sizes seen by the frontend.")}
-                        {info_line("Board age", "Derived from backend board-status packets; large values usually indicate radio-side latency or missing telemetry.")}
-                        {info_line("Clock delta", "Local wall-clock minus backend-reported network time. Useful for spotting machine clock drift.")}
-                        {info_line("Topology", "Uses the backend discovery snapshot plus physical link health flags.")}
+                div { style: "display:flex; flex-direction:column; gap:14px; min-width:0;",
+                    div { style: section_style(),
+                        h3 { style: section_title_style(), "Topology Links" }
+                        table { style: table_style(),
+                            thead {
+                                tr {
+                                    th { style: th_style(), "Source" }
+                                    th { style: th_style(), "Target" }
+                                    th { style: th_style(), "Label" }
+                                    th { style: th_style(), "Status" }
+                                }
+                            }
+                            tbody {
+                                for (source, target, label, status) in topology_links_preview.iter() {
+                                    tr {
+                                        td { style: td_style_mono(), "{node_label(source, &topology.nodes)}" }
+                                        td { style: td_style_mono(), "{node_label(target, &topology.nodes)}" }
+                                        td { style: td_style(), "{label}" }
+                                        td { style: td_style(), "{format_status(*status)}" }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -266,15 +294,6 @@ fn metric_card(title: &'static str, rows: Vec<(&'static str, String)>) -> Elemen
                     }
                 }
             }
-        }
-    }
-}
-
-fn info_line(label: &'static str, text: &'static str) -> Element {
-    rsx! {
-        div {
-            strong { style: "color:#f8fafc; margin-right:8px;", "{label}:" }
-            span { "{text}" }
         }
     }
 }
@@ -329,7 +348,7 @@ fn human_bytes_f64(bytes: f64) -> String {
 }
 
 fn section_style() -> &'static str {
-    "border:1px solid #274154; border-radius:16px; padding:14px; background:#081521;"
+    "border:1px solid #274154; border-radius:16px; padding:14px; background:#081521; min-width:0;"
 }
 
 fn section_title_style() -> &'static str {
@@ -367,6 +386,14 @@ fn format_kind(kind: NetworkTopologyNodeKind) -> &'static str {
         NetworkTopologyNodeKind::Side => "side",
         NetworkTopologyNodeKind::Board => "board",
     }
+}
+
+fn node_label(id: &str, nodes: &[super::types::NetworkTopologyNode]) -> String {
+    nodes
+        .iter()
+        .find(|node| node.id == id)
+        .map(|node| node.label.clone())
+        .unwrap_or_else(|| id.to_string())
 }
 
 fn yes_no(value: bool) -> String {

@@ -2894,6 +2894,7 @@ def _ensure_bundle_icon_compat(frontend_dir: Path) -> None:
             icons_dir / "128x128.png",
             icons_dir / "128x128@2x.png",
             icons_dir / "256x256.png",
+            icons_dir / "512x512.png",
             icons_dir / "icon.png",
         ]
         for target in fallback_targets:
@@ -2913,6 +2914,7 @@ def _ensure_bundle_icon_compat(frontend_dir: Path) -> None:
         "128x128.png": 128,
         "128x128@2x.png": 256,
         "256x256.png": 256,
+        "512x512.png": 512,
         "icon.png": 512,
     }
     for filename, size in icon_targets.items():

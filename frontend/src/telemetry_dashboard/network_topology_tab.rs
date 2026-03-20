@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const GRAPH_VIEWPORT_ID: &str = "network-topology-viewport";
 const GRAPH_SURFACE_ID: &str = "network-topology-surface";
@@ -63,6 +63,7 @@ pub fn NetworkTopologyTab(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let endpoint_rows = collect_endpoint_rows(&snapshot.nodes);
     let viewport_id = if *is_fullscreen.read() {
         GRAPH_VIEWPORT_FULLSCREEN_ID
     } else {
@@ -204,6 +205,7 @@ pub fn NetworkTopologyTab(
                         }
                     }
                 }
+                {render_endpoint_section(&endpoint_rows)}
             }
         } else {
             div {
@@ -274,6 +276,36 @@ pub fn NetworkTopologyTab(
                                     expanded_node_id,
                                 )}
                             }
+                        }
+                    }
+                }
+                {render_endpoint_section(&endpoint_rows)}
+            }
+        }
+    }
+}
+
+fn render_endpoint_section(endpoint_rows: &[(String, Vec<String>)]) -> Element {
+    rsx! {
+        div {
+            style: "border:1px solid #334155; border-radius:18px; background:#07121f; padding:14px;",
+            h3 { style: "margin:0 0 10px 0; color:#e5e7eb;", "Endpoint Ownership" }
+            p {
+                style: "margin:0 0 12px 0; color:#94a3b8; font-size:0.9rem;",
+                "One row per endpoint, with every board or local node that currently owns or advertises it."
+            }
+            table { style: "width:100%; border-collapse:collapse; font-size:0.92rem;",
+                thead {
+                    tr {
+                        th { style: topology_th_style(), "Endpoint" }
+                        th { style: topology_th_style(), "Owners" }
+                    }
+                }
+                tbody {
+                    for (endpoint, owners) in endpoint_rows.iter() {
+                        tr {
+                            td { style: topology_td_style(true), "{endpoint}" }
+                            td { style: topology_td_style(false), "{owners.join(\", \")}" }
                         }
                     }
                 }
@@ -513,15 +545,23 @@ fn graph_positions() -> HashMap<&'static str, NodePlacement> {
         (
             "router",
             NodePlacement {
-                x: 320,
+                x: 250,
                 y: 330,
                 size: 220,
             },
         ),
         (
+            "side_rocket_radio",
+            NodePlacement {
+                x: 520,
+                y: 210,
+                size: 120,
+            },
+        ),
+        (
             "board_rf",
             NodePlacement {
-                x: 700,
+                x: 760,
                 y: 180,
                 size: 146,
             },
@@ -529,23 +569,31 @@ fn graph_positions() -> HashMap<&'static str, NodePlacement> {
         (
             "board_fc",
             NodePlacement {
-                x: 1070,
-                y: 100,
+                x: 1090,
+                y: 90,
                 size: 132,
             },
         ),
         (
             "board_pb",
             NodePlacement {
-                x: 1070,
-                y: 280,
+                x: 1090,
+                y: 270,
                 size: 132,
+            },
+        ),
+        (
+            "side_umbilical_radio",
+            NodePlacement {
+                x: 520,
+                y: 500,
+                size: 120,
             },
         ),
         (
             "board_gw",
             NodePlacement {
-                x: 700,
+                x: 760,
                 y: 500,
                 size: 146,
             },
@@ -575,6 +623,38 @@ fn graph_positions() -> HashMap<&'static str, NodePlacement> {
             },
         ),
     ])
+}
+
+fn collect_endpoint_rows(nodes: &[NetworkTopologyNode]) -> Vec<(String, Vec<String>)> {
+    let mut by_endpoint = BTreeMap::<String, Vec<String>>::new();
+    for node in nodes {
+        let Some(owner) = endpoint_owner_label(node) else {
+            continue;
+        };
+        for endpoint in &node.endpoints {
+            by_endpoint
+                .entry(endpoint.clone())
+                .or_default()
+                .push(owner.clone());
+        }
+    }
+
+    by_endpoint
+        .into_iter()
+        .map(|(endpoint, mut owners)| {
+            owners.sort();
+            owners.dedup();
+            (endpoint, owners)
+        })
+        .collect()
+}
+
+fn endpoint_owner_label(node: &NetworkTopologyNode) -> Option<String> {
+    match node.kind {
+        NetworkTopologyNodeKind::Router => Some("Ground Station".to_string()),
+        NetworkTopologyNodeKind::Board => Some(node.label.clone()),
+        NetworkTopologyNodeKind::Endpoint | NetworkTopologyNodeKind::Side => None,
+    }
 }
 
 fn render_link(
@@ -800,6 +880,18 @@ fn link_color(link: &NetworkTopologyLink, default: &'static str) -> &'static str
             NetworkTopologyStatus::Simulated => "#c084fc",
         },
         _ => default,
+    }
+}
+
+fn topology_th_style() -> &'static str {
+    "text-align:left; color:#8fb3c9; border-bottom:1px solid #243447; padding:8px 6px;"
+}
+
+fn topology_td_style(mono: bool) -> &'static str {
+    if mono {
+        "padding:8px 6px; border-bottom:1px solid #132738; color:#dbe7f3; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;"
+    } else {
+        "padding:8px 6px; border-bottom:1px solid #132738; color:#dbe7f3;"
     }
 }
 
