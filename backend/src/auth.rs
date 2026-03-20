@@ -222,13 +222,14 @@ impl AuthManager {
         db: &SqlitePool,
         req: LoginRequest,
     ) -> Result<LoginResponse, AuthFailure> {
+        let requested_username = req.username.trim();
         let config = self
             .load_users_file()
             .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
         let user = config
             .users
             .iter()
-            .find(|user| user.username == req.username)
+            .find(|user| user.username.eq_ignore_ascii_case(requested_username))
             .ok_or_else(|| AuthFailure::Unauthorized("invalid username or password".to_string()))?;
 
         if user.disabled {

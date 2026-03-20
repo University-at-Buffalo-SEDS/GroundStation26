@@ -337,7 +337,6 @@ def build_bundle(
     print(f"starting bundle writes with workers={workers}")
 
     inserted_tiles = existing_tiles
-    unique_blobs = 0
     start_t = time.time()
     last_print_t = start_t
     if existing_tiles > 0 and total_tiles > 0:

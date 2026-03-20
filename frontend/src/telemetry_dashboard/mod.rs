@@ -547,11 +547,33 @@ fn frontend_network_metrics_snapshot() -> FrontendNetworkMetrics {
         .unwrap_or_default()
 }
 
+fn redact_ws_url_for_display(ws_url: &str) -> String {
+    if let Some((prefix, query)) = ws_url.split_once('?') {
+        let redacted_query = query
+            .split('&')
+            .map(|part| {
+                if let Some((key, _)) = part.split_once('=') {
+                    if key == "token" {
+                        return format!("{key}=<redacted>");
+                    }
+                } else if part == "token" {
+                    return "token=<redacted>".to_string();
+                }
+                part.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("{prefix}?{redacted_query}")
+    } else {
+        ws_url.to_string()
+    }
+}
+
 fn note_ws_connection_state(connected: bool, ws_url: String, reason: Option<String>, epoch: u64) {
     if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
         let was_connected = next.ws_connected;
         next.ws_connected = connected;
-        next.ws_url = ws_url;
+        next.ws_url = redact_ws_url_for_display(&ws_url);
         next.base_http = UrlConfig::base_http();
         next.ws_epoch = epoch;
         if connected {
@@ -2300,51 +2322,11 @@ fn TelemetryDashboardInner() -> Element {
                 ",
                         h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "{_dashboard_title(&layout)}" }
 
-                        div { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
-                            {
-                                let software_buttons_enabled =
-                                    action_policy.read().software_buttons_enabled;
-                                let abort_visible = auth::can_send_command("Abort");
-                                let abort_allowed = software_buttons_enabled && abort_visible;
-                                let abort_style = if abort_allowed {
-                                    "
-                                padding:0.45rem 0.85rem;
-                                border-radius:0.75rem;
-                                border:1px solid #ef4444;
-                                background:#450a0a;
-                                color:#fecaca;
-                                font-weight:900;
-                                cursor:pointer;
-                            "
-                                } else {
-                                    "
-                                padding:0.45rem 0.85rem;
-                                border-radius:0.75rem;
-                                border:1px solid #7f1d1d;
-                                background:#1f2937;
-                                color:#fca5a5;
-                                font-weight:900;
-                                cursor:not-allowed;
-                                opacity:0.55;
-                                filter:grayscale(0.25) brightness(0.9);
-                            "
-                                };
-                                rsx! {
-                            if abort_visible {
-                            button {
-                                style: "{abort_style}",
-                                disabled: !abort_allowed,
-                                onclick: move |_| {
-                                    if abort_allowed {
-                                        send_cmd("Abort")
-                                    }
-                                },
-                                "ABORT"
-                            }
-                            }
-                                }
-                            }
-
+                        {
+                            let show_disable_actions = _actions_tab_has_visible_actions(&layout, *abort_only_mode.read());
+                            rsx! {
+                        div { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-left:auto;",
+                            if show_disable_actions {
                             button {
                                 style: if *abort_only_mode.read() {
                                     "
@@ -2377,11 +2359,60 @@ fn TelemetryDashboardInner() -> Element {
                                 },
                                 if *abort_only_mode.read() { "DISABLE ACTIONS ON" } else { "DISABLE ACTIONS OFF" }
                             }
+                            }
 
                             {reload_button}
                             {auth_button}
                             {version_button}
                             {connect_button}
+
+                            {
+                                let software_buttons_enabled =
+                                    action_policy.read().software_buttons_enabled;
+                                let abort_visible = auth::can_send_command("Abort");
+                                let abort_allowed = software_buttons_enabled && abort_visible;
+                                let abort_style = if abort_allowed {
+                                    "
+                                margin-left:clamp(20px, 6vw, 96px);
+                                padding:0.45rem 0.85rem;
+                                border-radius:0.75rem;
+                                border:1px solid #ef4444;
+                                background:#450a0a;
+                                color:#fecaca;
+                                font-weight:900;
+                                cursor:pointer;
+                            "
+                                } else {
+                                    "
+                                margin-left:clamp(20px, 6vw, 96px);
+                                padding:0.45rem 0.85rem;
+                                border-radius:0.75rem;
+                                border:1px solid #7f1d1d;
+                                background:#1f2937;
+                                color:#fca5a5;
+                                font-weight:900;
+                                cursor:not-allowed;
+                                opacity:0.55;
+                                filter:grayscale(0.25) brightness(0.9);
+                            "
+                                };
+                                rsx! {
+                                    if abort_visible {
+                                        button {
+                                            style: "{abort_style}",
+                                            disabled: !abort_allowed,
+                                            onclick: move |_| {
+                                                if abort_allowed {
+                                                    send_cmd("Abort")
+                                                }
+                                            },
+                                            "ABORT"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                            }
                         }
                     }
 

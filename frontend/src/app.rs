@@ -671,7 +671,7 @@ fn LoginCard(
         .unwrap_or_default();
     let mut username = use_signal(|| stored_username);
     let mut password = use_signal(String::new);
-    let mut remember_me = use_signal(|| auth::current_session().is_some());
+    let mut remember_me = use_signal(|| true);
     let mut status = use_signal(String::new);
     let mut busy = use_signal(|| false);
 
@@ -711,12 +711,6 @@ fn LoginCard(
                     div {
                         style: "margin-bottom:14px; padding:12px; border-radius:12px; border:1px solid #7c2d12; background:#451a03; color:#fed7aa;",
                         "Configure the backend URL before logging in."
-                    }
-                } else {
-                    div {
-                        style: "margin-bottom:14px; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#cbd5e1;",
-                        div { style: "font-size:12px; color:#94a3b8; margin-bottom:4px;", "Backend" }
-                        div { style: "font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;", "{base}" }
                     }
                 }
 

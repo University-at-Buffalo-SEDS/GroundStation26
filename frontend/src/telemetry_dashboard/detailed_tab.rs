@@ -314,13 +314,13 @@ pub fn DetailedTab(
 
 fn metric_card(title: &'static str, rows: Vec<(&'static str, String)>) -> Element {
     rsx! {
-        div { style: "border:1px solid #274154; border-radius:16px; padding:14px; background:linear-gradient(180deg, #071521 0%, #0d1b2a 100%); box-shadow:0 14px 30px rgba(2, 6, 23, 0.28);",
+        div { style: "border:1px solid #274154; border-radius:16px; padding:14px; background:linear-gradient(180deg, #071521 0%, #0d1b2a 100%); box-shadow:0 14px 30px rgba(2, 6, 23, 0.28); min-width:0;",
             h3 { style: "margin:0 0 10px 0; color:#f8fafc; font-size:15px; letter-spacing:0.02em;", "{title}" }
             div { style: "display:flex; flex-direction:column; gap:8px;",
                 for (label, value) in rows {
-                    div { style: "display:flex; justify-content:space-between; gap:16px; align-items:baseline;",
-                        span { style: "color:#8fb3c9; font-size:12px;", "{label}" }
-                        span { style: "color:#eef6ff; font-size:13px; text-align:right; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;", "{value}" }
+                    div { style: "display:flex; justify-content:space-between; gap:16px; align-items:flex-start; min-width:0;",
+                        span { style: "color:#8fb3c9; font-size:12px; flex:0 0 auto;", "{label}" }
+                        span { style: "color:#eef6ff; font-size:13px; text-align:right; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums; flex:1 1 auto; min-width:0; overflow-wrap:anywhere; word-break:break-word;", "{value}" }
                     }
                 }
             }
