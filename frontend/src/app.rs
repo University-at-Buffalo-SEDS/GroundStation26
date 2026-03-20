@@ -826,6 +826,37 @@ fn LoginCard(
 }
 
 #[component]
+fn ConnectionFailedCard(message: String) -> Element {
+    let nav = use_navigator();
+    rsx! {
+        div {
+            style: "min-height:100vh; height:100vh; overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            div {
+                style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
+                h1 { style: "margin:0 0 10px 0; font-size:22px;", "Failed to Connect" }
+                p { style: "margin:0 0 16px 0; color:#94a3b8; white-space:pre-wrap;", "{message}" }
+                div { style: "display:flex; gap:12px; justify-content:flex-end; flex-wrap:wrap;",
+                    button {
+                        style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
+                        onclick: move |_| {
+                            let _ = nav.replace(connect_route());
+                        },
+                        "Back to Connect"
+                    }
+                    button {
+                        style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#0f172a; color:#e5e7eb; cursor:pointer;",
+                        onclick: move |_| {
+                            let _ = nav.replace(Route::Dashboard {});
+                        },
+                        "Retry"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 pub fn Login() -> Element {
     rsx! {
         LoginCard {
@@ -1153,11 +1184,11 @@ pub fn Dashboard() -> Element {
             }
         },
         Some(Err(err)) => rsx! {
-            LoginCard {
-                title: "Sign In Required".to_string(),
-                subtitle: format!("Backend session check failed: {err}"),
-                allow_back_to_connect: true,
-                on_success_route: Route::Dashboard {},
+            ConnectionFailedCard {
+                message: format!(
+                    "The frontend could not reach the backend session endpoint.\n\n{}",
+                    err
+                ),
             }
         },
     }

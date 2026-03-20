@@ -2285,9 +2285,10 @@ fn TelemetryDashboardInner() -> Element {
                                     "
                                         padding:0.45rem 0.85rem;
                                         border-radius:0.75rem;
-                                        border:1px solid #f59e0b;
-                                        background:#451a03;
-                                        color:#fde68a;
+                                        border:1px solid #ef4444;
+                                        background:#4c0519;
+                                        color:#fecdd3;
+                                        box-shadow:0 0 0 1px rgba(239,68,68,0.15), 0 8px 20px rgba(76,5,25,0.35);
                                         font-weight:800;
                                         cursor:pointer;
                                     "
@@ -2295,9 +2296,9 @@ fn TelemetryDashboardInner() -> Element {
                                     "
                                         padding:0.45rem 0.85rem;
                                         border-radius:0.75rem;
-                                        border:1px solid #334155;
-                                        background:#111827;
-                                        color:#e5e7eb;
+                                        border:1px solid #475569;
+                                        background:#0f172a;
+                                        color:#cbd5e1;
                                         font-weight:800;
                                         cursor:pointer;
                                     "
@@ -2309,7 +2310,7 @@ fn TelemetryDashboardInner() -> Element {
                                         abort_only_mode.set(next);
                                     }
                                 },
-                                if *abort_only_mode.read() { "ABORT-ONLY ON" } else { "ABORT-ONLY OFF" }
+                                if *abort_only_mode.read() { "DISABLE ACTIONS ON" } else { "DISABLE ACTIONS OFF" }
                             }
 
                             {reload_button}
@@ -2330,12 +2331,6 @@ fn TelemetryDashboardInner() -> Element {
                             "Software command buttons are disabled by the hardware GPIO lockout."
                         }
                     }
-                    if *abort_only_mode.read() {
-                        div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid #f59e0b; background:#451a03; color:#fde68a; font-size:12px;",
-                            "Abort-only mode is enabled. All action and flight-state buttons except Abort are disabled."
-                        }
-                    }
-
                     // Header row 2
                     div {
                         style: "

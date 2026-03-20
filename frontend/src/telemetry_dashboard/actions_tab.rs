@@ -138,6 +138,12 @@ pub fn ActionsTab(
                 "All available actions are available all the time, use with caution as improper use \
                 can and will damage the system."
             }
+            if abort_only_mode {
+                div {
+                    style: "margin:0 0 12px 0; padding:10px 12px; border-radius:10px; border:1px solid #ef4444; background:#4c0519; color:#fecdd3; font-size:12px;",
+                    "Disable Actions is enabled. All action and flight-state buttons except Abort are disabled."
+                }
+            }
 
             div {
                 style: "
