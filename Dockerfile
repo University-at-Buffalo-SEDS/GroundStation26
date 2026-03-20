@@ -34,6 +34,7 @@ COPY map_downloader/src map_downloader/src
 
 # Frontend
 COPY frontend/src frontend/src
+COPY frontend/build.py frontend/
 COPY frontend/build.rs frontend/
 COPY frontend/Cargo.toml frontend/
 COPY frontend/assets frontend/assets
