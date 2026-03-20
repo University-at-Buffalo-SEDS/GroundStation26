@@ -58,8 +58,8 @@ use warnings_tab::WarningsTab;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
-    atomic::{AtomicBool, Ordering}, Arc,
-    Mutex,
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 
 use once_cell::sync::Lazy;
@@ -200,7 +200,7 @@ mod persist {
         #[cfg(target_os = "android")]
         fn android_storage_base_dir() -> Option<std::path::PathBuf> {
             use jni::objects::{JObject, JString};
-            use jni::{jni_sig, jni_str, JavaVM};
+            use jni::{JavaVM, jni_sig, jni_str};
             use ndk_context::android_context;
 
             let ctx = android_context();
@@ -1966,7 +1966,15 @@ fn TelemetryDashboardInner() -> Element {
                         let base = base.clone();
                         spawn(async move {
                             let _ = auth::logout(&base, skip_tls).await;
-                            let _ = nav.push(Route::Login {});
+                            match auth::fetch_logged_out_session_status(&base, skip_tls).await {
+                                Ok(status) if status.permissions.view_data => {
+                                    auth::set_logged_out_status(status);
+                                }
+                                Ok(_) | Err(_) => {
+                                    auth::clear_current_session();
+                                    let _ = nav.push(Route::Login {});
+                                }
+                            }
                         });
                     } else {
                         let _ = nav.push(Route::Login {});

@@ -657,7 +657,13 @@ fn LoginCard(
 ) -> Element {
     let nav = use_navigator();
     let base = UrlConfig::base_http();
+    let effect_base = base.clone();
+    let continue_logged_out_base = base.clone();
     let skip_tls = UrlConfig::_skip_tls_verify();
+    let mut logged_out_status = use_signal(|| None::<Result<AuthSessionStatus, String>>);
+    let mut logged_out_probe_base = use_signal(String::new);
+    let continue_logged_out_route = on_success_route.clone();
+    let sign_in_route = on_success_route.clone();
     let stored_username = auth::current_session()
         .and_then(|session| session.session.username)
         .unwrap_or_default();
@@ -666,6 +672,23 @@ fn LoginCard(
     let mut remember_me = use_signal(|| auth::current_session().is_some());
     let mut status = use_signal(String::new);
     let mut busy = use_signal(|| false);
+
+    use_effect(move || {
+        if effect_base.trim().is_empty() {
+            return;
+        }
+        if *logged_out_probe_base.read() == effect_base {
+            return;
+        }
+        logged_out_probe_base.set(effect_base.clone());
+        logged_out_status.set(None);
+        let base = effect_base.clone();
+        spawn(async move {
+            logged_out_status.set(Some(
+                auth::fetch_logged_out_session_status(&base, skip_tls).await,
+            ));
+        });
+    });
 
     rsx! {
         div {
@@ -723,6 +746,34 @@ fn LoginCard(
                 }
 
                 div { style: "display:flex; gap:12px; margin-top:16px; justify-content:flex-end; flex-wrap:wrap;",
+                    if matches!(logged_out_status.read().as_ref(), Some(Ok(status)) if status.permissions.view_data) {
+                        button {
+                            style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#0f172a; color:#e5e7eb; cursor:pointer;",
+                            disabled: busy() || base.trim().is_empty(),
+                            onclick: move |_| {
+                                let success_route = continue_logged_out_route.clone();
+                                let base = continue_logged_out_base.clone();
+                                busy.set(true);
+                                status.set("Continuing logged out...".to_string());
+                                spawn(async move {
+                                    match auth::fetch_logged_out_session_status(&base, skip_tls).await {
+                                        Ok(session) => {
+                                            auth::set_logged_out_status(session);
+                                            busy.set(false);
+                                            status.set(String::new());
+                                            let _ = nav.replace(success_route);
+                                        }
+                                        Err(err) => {
+                                            busy.set(false);
+                                            status.set(format!("Logged-out access failed: {err}"));
+                                        }
+                                    }
+                                });
+                            },
+                            "Use Logged Out"
+                        }
+                    }
+
                     if allow_back_to_connect {
                         button {
                             style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
@@ -749,7 +800,7 @@ fn LoginCard(
                                 return;
                             }
                             let remember = *remember_me.read();
-                            let success_route = on_success_route.clone();
+                            let success_route = sign_in_route.clone();
                             busy.set(true);
                             status.set("Signing in...".to_string());
                             spawn(async move {

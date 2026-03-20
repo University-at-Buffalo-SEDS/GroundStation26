@@ -99,6 +99,16 @@ pub fn set_current_session(session: StoredAuthSession) {
     }
 }
 
+pub fn set_logged_out_status(status: SessionStatus) {
+    if let Ok(mut slot) = CURRENT_SESSION.lock() {
+        *slot = None;
+    }
+    if let Ok(mut current) = CURRENT_STATUS.lock() {
+        *current = status;
+    }
+    write_storage_session(None);
+}
+
 pub fn clear_current_session() {
     if let Ok(mut slot) = CURRENT_SESSION.lock() {
         *slot = None;
@@ -114,7 +124,7 @@ pub async fn fetch_session_status(
     skip_tls_verify: bool,
 ) -> Result<SessionStatus, String> {
     let url = build_url(base, "/api/auth/session")?;
-    let text = auth_request_get(&url, skip_tls_verify).await?;
+    let text = auth_request_get(&url, skip_tls_verify, true, true).await?;
     let status = serde_json::from_str::<SessionStatus>(&text)
         .map_err(|e| format!("invalid auth JSON: {e}"))?;
     if let Ok(mut slot) = CURRENT_STATUS.lock() {
@@ -129,6 +139,15 @@ pub async fn fetch_session_status(
         }
     }
     Ok(status)
+}
+
+pub async fn fetch_logged_out_session_status(
+    base: &str,
+    skip_tls_verify: bool,
+) -> Result<SessionStatus, String> {
+    let url = build_url(base, "/api/auth/session")?;
+    let text = auth_request_get(&url, skip_tls_verify, false, false).await?;
+    serde_json::from_str::<SessionStatus>(&text).map_err(|e| format!("invalid auth JSON: {e}"))
 }
 
 pub async fn login(
@@ -165,17 +184,22 @@ pub async fn logout(base: &str, skip_tls_verify: bool) -> Result<(), String> {
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn auth_request_get(url: &str, _skip_tls_verify: bool) -> Result<String, String> {
+async fn auth_request_get(
+    url: &str,
+    _skip_tls_verify: bool,
+    include_token: bool,
+    clear_on_unauthorized: bool,
+) -> Result<String, String> {
     use gloo_net::http::Request;
 
     let mut request = Request::get(url);
-    if let Some(token) = current_token() {
+    if include_token && let Some(token) = current_token() {
         request = request.header("Authorization", &format!("Bearer {token}"));
     }
     let response = request.send().await.map_err(|e| e.to_string())?;
     let status = response.status();
     let text = response.text().await.map_err(|e| e.to_string())?;
-    if status == 401 {
+    if clear_on_unauthorized && status == 401 {
         clear_current_session();
     }
     if !(200..300).contains(&status) {
@@ -185,19 +209,24 @@ async fn auth_request_get(url: &str, _skip_tls_verify: bool) -> Result<String, S
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn auth_request_get(url: &str, skip_tls_verify: bool) -> Result<String, String> {
+async fn auth_request_get(
+    url: &str,
+    skip_tls_verify: bool,
+    include_token: bool,
+    clear_on_unauthorized: bool,
+) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(skip_tls_verify)
         .build()
         .map_err(|e| e.to_string())?;
     let mut request = client.get(url.to_string());
-    if let Some(token) = current_token() {
+    if include_token && let Some(token) = current_token() {
         request = request.bearer_auth(token);
     }
     let response = request.send().await.map_err(|e| e.to_string())?;
     let status = response.status();
     let text = response.text().await.map_err(|e| e.to_string())?;
-    if status == reqwest::StatusCode::UNAUTHORIZED {
+    if clear_on_unauthorized && status == reqwest::StatusCode::UNAUTHORIZED {
         clear_current_session();
     }
     if !status.is_success() {

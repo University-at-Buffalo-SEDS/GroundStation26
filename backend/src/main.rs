@@ -396,8 +396,9 @@ async fn main() -> anyhow::Result<()> {
     let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
     let loadcell_calibration = loadcell::load_or_default();
     let radio_links = radio_config::load_or_default();
-    let users_path = PathBuf::from("./users/users.json");
-    let legacy_users_path = PathBuf::from("./data/users.json");
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let users_path = manifest_dir.join("users").join("users.json");
+    let legacy_users_path = manifest_dir.join("data").join("users.json");
     if !users_path.exists() && legacy_users_path.exists() {
         if let Some(parent) = users_path.parent() {
             fs::create_dir_all(parent)?;
