@@ -9,16 +9,15 @@ Optimized schema (deduplicated image blobs):
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import math
 import os
-import sqlite3
 import shutil
+import sqlite3
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-
 
 DEFAULT_REGION = "north_america"
 DEFAULT_MAP_ROOT = Path("backend/data/maps")
@@ -61,10 +60,10 @@ def tile_in_coverage_bounds(z: int, x: int, y: int) -> bool:
 
 
 def iter_tile_files(
-    tiles_dir: Path,
-    min_zoom: int | None = None,
-    max_zoom: int | None = None,
-    match_downloader_bounds: bool = False,
+        tiles_dir: Path,
+        min_zoom: int | None = None,
+        max_zoom: int | None = None,
+        match_downloader_bounds: bool = False,
 ):
     with os.scandir(tiles_dir) as z_iter:
         for z_entry in z_iter:
@@ -111,10 +110,10 @@ def prepare_tile(record: tuple[int, int, int, Path]) -> tuple[int, int, int, byt
 
 
 def count_tiles(
-    tiles_dir: Path,
-    min_zoom: int | None = None,
-    max_zoom: int | None = None,
-    match_downloader_bounds: bool = False,
+        tiles_dir: Path,
+        min_zoom: int | None = None,
+        max_zoom: int | None = None,
+        match_downloader_bounds: bool = False,
 ) -> int:
     total = 0
     scanned_files = 0
@@ -166,7 +165,8 @@ def count_tiles(
                                 last_print_t = now
     if scanned_files > 0:
         sys.stdout.write(
-            f"\rcounting tiles... scanned={scanned_files:,} jpg={total:,} rate={scanned_files/max(time.time()-start_t,0.001):,.0f}/s"
+            f"\rcounting tiles... scanned={scanned_files:,} jpg={total:,} rate="
+            f"{scanned_files / max(time.time() - start_t, 0.001):,.0f}/s"
         )
         sys.stdout.flush()
         print()
@@ -185,6 +185,7 @@ def render_progress(prefix: str, done: int, total: int, start_t: float) -> str:
         f"{rate:,.1f} tiles/s ETA {eta_m:02d}:{eta_s:02d}"
     )
 
+
 def render_progress_bar(prefix: str, done: int, total: int, start_t: float, unique_blobs: int | None = None) -> str:
     elapsed = max(time.time() - start_t, 0.001)
     pct = 100.0 if total <= 0 else (done * 100.0 / total)
@@ -202,6 +203,7 @@ def render_progress_bar(prefix: str, done: int, total: int, start_t: float, uniq
         f"\r{prefix} [{bar}] {pct:6.2f}% "
         f"{done:,}/{total:,} {rate:,.1f}/s ETA {eta_m:02d}:{eta_s:02d}{extra}"
     )
+
 
 def print_progress_bar(prefix: str, done: int, total: int, start_t: float, unique_blobs: int | None = None) -> None:
     line = render_progress_bar(prefix, done, total, start_t, unique_blobs)
@@ -230,18 +232,48 @@ def configure_conn(conn: sqlite3.Connection) -> None:
 def ensure_dedup_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
-        CREATE TABLE IF NOT EXISTS tile_blobs (
-            id INTEGER PRIMARY KEY,
-            hash BLOB NOT NULL UNIQUE,
-            image BLOB NOT NULL
+        CREATE TABLE IF NOT EXISTS tile_blobs
+        (
+            id
+            INTEGER
+            PRIMARY
+            KEY,
+            hash
+            BLOB
+            NOT
+            NULL
+            UNIQUE,
+            image
+            BLOB
+            NOT
+            NULL
         );
-        CREATE TABLE IF NOT EXISTS tiles (
-            z INTEGER NOT NULL,
-            x INTEGER NOT NULL,
-            y INTEGER NOT NULL,
-            blob_id INTEGER NOT NULL,
-            PRIMARY KEY (z, x, y)
-        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS tiles
+        (
+            z
+            INTEGER
+            NOT
+            NULL,
+            x
+            INTEGER
+            NOT
+            NULL,
+            y
+            INTEGER
+            NOT
+            NULL,
+            blob_id
+            INTEGER
+            NOT
+            NULL,
+            PRIMARY
+            KEY
+        (
+            z,
+            x,
+            y
+        )
+            ) WITHOUT ROWID;
         """
     )
 
@@ -253,17 +285,17 @@ def detect_legacy_inline_schema(conn: sqlite3.Connection) -> bool:
 
 
 def build_bundle(
-    tiles_dir: Path,
-    bundle: Path,
-    remove_source: bool,
-    workers: int,
-    commit_every: int,
-    max_in_flight: int | None,
-    no_vacuum: bool,
-    resume: bool,
-    min_zoom: int | None,
-    max_zoom: int | None,
-    match_downloader_bounds: bool,
+        tiles_dir: Path,
+        bundle: Path,
+        remove_source: bool,
+        workers: int,
+        commit_every: int,
+        max_in_flight: int | None,
+        no_vacuum: bool,
+        resume: bool,
+        min_zoom: int | None,
+        max_zoom: int | None,
+        match_downloader_bounds: bool,
 ) -> None:
     if not tiles_dir.exists() or not tiles_dir.is_dir():
         raise SystemExit(f"tiles directory not found: {tiles_dir}")
@@ -332,8 +364,8 @@ def build_bundle(
             for z, x, y, tile_path in base_iter:
                 resume_scanned += 1
                 if check_cur.execute(
-                    "SELECT 1 FROM tiles WHERE z = ? AND x = ? AND y = ?",
-                    (z, x, y),
+                        "SELECT 1 FROM tiles WHERE z = ? AND x = ? AND y = ?",
+                        (z, x, y),
                 ).fetchone() is not None:
                     resume_skipped += 1
                     now = time.time()
@@ -392,9 +424,10 @@ def build_bundle(
         for z, x, y, h, data in prepared_iter:
             row = cur.execute(
                 """
-                INSERT INTO tile_blobs (hash, image) VALUES (?, ?)
-                ON CONFLICT(hash) DO UPDATE SET hash = excluded.hash
-                RETURNING id
+                INSERT INTO tile_blobs (hash, image)
+                VALUES (?, ?) ON CONFLICT(hash) DO
+                UPDATE SET hash = excluded.hash
+                    RETURNING id
                 """,
                 (h, data),
             ).fetchone()
@@ -464,7 +497,7 @@ def extract_bundle(bundle: Path, output_dir: Path) -> None:
             """
             SELECT t.z, t.x, t.y, b.image
             FROM tiles t
-            JOIN tile_blobs b ON b.id = t.blob_id
+                     JOIN tile_blobs b ON b.id = t.blob_id
             ORDER BY t.z, t.x, t.y
             """
         )
@@ -558,7 +591,8 @@ def parse_args() -> argparse.Namespace:
     p_build.add_argument(
         "--match-downloader-bounds",
         action="store_true",
-        help="Only include tiles within downloader coverage bounds (NA low zoom; Buffalo/Rochester + West Texas high zoom).",
+        help="Only include tiles within downloader coverage bounds (NA low zoom; Buffalo/Rochester + West Texas high "
+             "zoom).",
     )
 
     p_extract = sub.add_parser("extract", help="Extract tiles from a tiles.sqlite3 bundle")
@@ -577,9 +611,9 @@ def main() -> None:
     args = parse_args()
     if args.cmd == "build":
         if (
-            args.min_zoom is not None
-            and args.max_zoom is not None
-            and args.min_zoom > args.max_zoom
+                args.min_zoom is not None
+                and args.max_zoom is not None
+                and args.min_zoom > args.max_zoom
         ):
             raise SystemExit("--min-zoom cannot be greater than --max-zoom")
         region_root = DEFAULT_MAP_ROOT / args.region

@@ -20,7 +20,6 @@ except ImportError:
     ttk = None  # type: ignore[assignment]
     TK_AVAILABLE = False
 
-
 DEFAULT_BAUD_RATE = 57_600
 DEFAULT_SPI_SPEED_HZ = 1_000_000
 DEFAULT_SPI_MODE = 0
@@ -89,12 +88,12 @@ def repo_root() -> Path:
 
 
 def default_config_path() -> Path:
-    return repo_root() / "data" / "radio_links.json"
+    return repo_root() / "backend" / "comms" / "coms.json"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Configure GroundStation radio links.")
-    parser.add_argument("--config", default=str(default_config_path()), help="Path to radio_links.json.")
+    parser.add_argument("--config", default=str(default_config_path()), help="Path to coms.json.")
     parser.add_argument("--gui", action="store_true", help="Force GUI mode.")
     parser.add_argument("--tui", action="store_true", help="Force interactive terminal mode.")
     parser.add_argument("--cli", action="store_true", help="Apply settings from CLI flags and save without prompts.")
@@ -156,13 +155,13 @@ def detect_serial_ports() -> list[str]:
                     candidates.append(value)
 
     for pattern in (
-        "/dev/ttyUSB*",
-        "/dev/ttyACM*",
-        "/dev/ttyAMA*",
-        "/dev/ttyS*",
-        "/dev/serial*",
-        "/dev/cu.usb*",
-        "/dev/cu.serial*",
+            "/dev/ttyUSB*",
+            "/dev/ttyACM*",
+            "/dev/ttyAMA*",
+            "/dev/ttyS*",
+            "/dev/serial*",
+            "/dev/cu.usb*",
+            "/dev/cu.serial*",
     ):
         for path in sorted(Path("/").glob(pattern.lstrip("/"))):
             value = str(path)
@@ -351,10 +350,16 @@ def interface_candidates(interface_name: str, env: EnvironmentInfo) -> list[str]
 
 
 def build_help_lines(cfg: dict, env: EnvironmentInfo) -> list[str]:
+    def yes_no_unknown(value: bool | None) -> str:
+        if value is None:
+            return "unknown"
+        return "yes" if value else "no"
+
     lines = [
         "General:",
         f"- Default config path: {default_config_path()}",
-        "- Raspberry Pi UART and SPI both use generic Linux device nodes. They do not require rppal for link transport.",
+        "- Raspberry Pi UART and SPI both use generic Linux device nodes. They do not require rppal for link "
+        "transport.",
         "- Prefer stable device names such as /dev/serial/by-id when they exist.",
         "",
     ]
@@ -364,14 +369,18 @@ def build_help_lines(cfg: dict, env: EnvironmentInfo) -> list[str]:
     wants_can = any(cfg[name]["interface"] == "can" for name in ("av_bay", "fill_box"))
 
     if wants_gpio_uart:
+        uart_enabled_status = yes_no_unknown(uart_enabled())
+        serial_console_status = yes_no_unknown(cmdline_uses_serial_console())
+        getty_ttyama0_status = yes_no_unknown(systemctl_unit_active("serial-getty@ttyAMA0.service"))
+        getty_serial0_status = yes_no_unknown(systemctl_unit_active("serial-getty@serial0.service"))
         lines.extend(
             [
                 "Raspberry Pi GPIO UART setup:",
                 "- Use a Linux serial device such as /dev/serial0, /dev/ttyAMA0, or /dev/ttyS0.",
-                f"- enable_uart=1: {'yes' if uart_enabled() else 'no' if uart_enabled() is not None else 'unknown'}",
-                f"- Serial console in cmdline: {'yes' if cmdline_uses_serial_console() else 'no' if cmdline_uses_serial_console() is not None else 'unknown'}",
-                f"- serial-getty@ttyAMA0 active: {'yes' if systemctl_unit_active('serial-getty@ttyAMA0.service') else 'no' if systemctl_unit_active('serial-getty@ttyAMA0.service') is not None else 'unknown'}",
-                f"- serial-getty@serial0 active: {'yes' if systemctl_unit_active('serial-getty@serial0.service') else 'no' if systemctl_unit_active('serial-getty@serial0.service') is not None else 'unknown'}",
+                f"- enable_uart=1: {uart_enabled_status}",
+                f"- Serial console in cmdline: {serial_console_status}",
+                f"- serial-getty@ttyAMA0 active: {getty_ttyama0_status}",
+                f"- serial-getty@serial0 active: {getty_serial0_status}",
                 "1. Add or verify `enable_uart=1` in /boot/firmware/config.txt or /boot/config.txt.",
                 "2. Disable the serial login console and serial-getty if they are using the same UART.",
                 "3. Reboot after changing boot config or cmdline.",
@@ -381,11 +390,12 @@ def build_help_lines(cfg: dict, env: EnvironmentInfo) -> list[str]:
         )
 
     if wants_spi:
+        spi_enabled_status = yes_no_unknown(spi_enabled())
         lines.extend(
             [
                 "Raspberry Pi / generic Linux SPI setup:",
                 "- Use a Linux spidev node such as /dev/spidev0.0.",
-                f"- SPI enabled in boot config: {'yes' if spi_enabled() else 'no' if spi_enabled() is not None else 'unknown'}",
+                f"- SPI enabled in boot config: {spi_enabled_status}",
                 "1. Enable SPI in the boot config or board firmware so /dev/spidev* appears.",
                 "2. Confirm mode, bits-per-word, and speed match the attached device.",
                 "3. Reboot if boot-config changes were required.",
@@ -400,8 +410,10 @@ def build_help_lines(cfg: dict, env: EnvironmentInfo) -> list[str]:
                 "CAN setup:",
                 "- Use an interface such as can0 or vcan0.",
                 "1. Load modules if needed: `sudo modprobe can can_raw`.",
-                "2. For vcan: `sudo modprobe vcan && sudo ip link add dev vcan0 type vcan && sudo ip link set vcan0 up`.",
-                "3. For hardware CAN: `sudo ip link set can0 down ; sudo ip link set can0 type can bitrate 500000 ; sudo ip link set can0 up`.",
+                "2. For vcan: `sudo modprobe vcan && sudo ip link add dev vcan0 type vcan && sudo ip link set vcan0 "
+                "up`.",
+                "3. For hardware CAN: `sudo ip link set can0 down ; sudo ip link set can0 type can bitrate 500000 ; "
+                "sudo ip link set can0 up`.",
                 "4. Confirm with `ip -details link show can0`.",
                 "",
             ]
@@ -499,18 +511,22 @@ def configure_link_tui(link_label: str, link_key: str, cfg: dict, env: Environme
     if candidates:
         print(f"{link_label} detected candidates: {', '.join(candidates)}")
     current["port"] = prompt(f"{link_label} device / port / iface", current["port"])
-    current["baud_rate"] = parse_int(prompt(f"{link_label} baud rate", str(current["baud_rate"])), f"{link_label} baud rate")
+    current["baud_rate"] = parse_int(prompt(f"{link_label} baud rate", str(current["baud_rate"])),
+                                     f"{link_label} baud rate")
     current["spi_speed_hz"] = parse_int(
         prompt(f"{link_label} SPI speed Hz", str(current["spi_speed_hz"])),
         f"{link_label} SPI speed Hz",
     )
-    current["spi_mode"] = parse_int(prompt(f"{link_label} SPI mode", str(current["spi_mode"])), f"{link_label} SPI mode")
+    current["spi_mode"] = parse_int(prompt(f"{link_label} SPI mode", str(current["spi_mode"])),
+                                    f"{link_label} SPI mode")
     current["spi_bits_per_word"] = parse_int(
         prompt(f"{link_label} SPI bits per word", str(current["spi_bits_per_word"])),
         f"{link_label} SPI bits per word",
     )
-    current["can_tx_id"] = parse_int(prompt(f"{link_label} CAN tx id", hex(current["can_tx_id"])), f"{link_label} CAN tx id")
-    current["can_rx_id"] = parse_int(prompt(f"{link_label} CAN rx id", hex(current["can_rx_id"])), f"{link_label} CAN rx id")
+    current["can_tx_id"] = parse_int(prompt(f"{link_label} CAN tx id", hex(current["can_tx_id"])),
+                                     f"{link_label} CAN tx id")
+    current["can_rx_id"] = parse_int(prompt(f"{link_label} CAN rx id", hex(current["can_rx_id"])),
+                                     f"{link_label} CAN rx id")
 
 
 def run_tui(config_path: Path) -> int:
@@ -587,12 +603,15 @@ if TK_AVAILABLE:
             frame.grid(row=1, column=0, sticky="ew", padx=12)
             for col in range(9):
                 frame.columnconfigure(col, weight=1)
-            headers = ["Link", "Interface", "Device / Port / Iface", "Baud", "SPI Hz", "SPI mode", "SPI bits", "CAN Tx ID", "CAN Rx ID"]
+            headers = ["Link", "Interface", "Device / Port / Iface", "Baud", "SPI Hz", "SPI mode", "SPI bits",
+                       "CAN Tx ID", "CAN Rx ID"]
             for idx, label in enumerate(headers):
                 ttk.Label(frame, text=label).grid(row=0, column=idx, sticky="w", padx=(0, 8))
             self._build_link_row(frame, 1, "av_bay", "AV bay")
             self._build_link_row(frame, 2, "fill_box", "Fill box")
-            ttk.Button(frame, text="Refresh detected interfaces", command=self._refresh_devices).grid(row=3, column=0, sticky="w", pady=(12, 0))
+            ttk.Button(frame, text="Refresh detected interfaces", command=self._refresh_devices).grid(row=3, column=0,
+                                                                                                      sticky="w",
+                                                                                                      pady=(12, 0))
 
         def _build_link_row(self, parent: ttk.Frame, row: int, key: str, label: str) -> None:
             cfg = self.cfg[key]
@@ -608,27 +627,31 @@ if TK_AVAILABLE:
                 port_combo=ttk.Combobox(parent),
             )
             ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=6)
-            interface_combo = ttk.Combobox(parent, textvariable=widgets.interface_var, values=INTERFACE_OPTIONS, state="readonly")
+            interface_combo = ttk.Combobox(parent, textvariable=widgets.interface_var, values=INTERFACE_OPTIONS,
+                                           state="readonly")
             interface_combo.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=6)
             widgets.port_combo.configure(textvariable=widgets.port_var)
             widgets.port_combo.grid(row=row, column=2, sticky="ew", padx=(0, 8), pady=6)
             ttk.Entry(parent, textvariable=widgets.baud_var).grid(row=row, column=3, sticky="ew", padx=(0, 8), pady=6)
-            ttk.Entry(parent, textvariable=widgets.spi_speed_var).grid(row=row, column=4, sticky="ew", padx=(0, 8), pady=6)
-            ttk.Entry(parent, textvariable=widgets.spi_mode_var).grid(row=row, column=5, sticky="ew", padx=(0, 8), pady=6)
-            ttk.Entry(parent, textvariable=widgets.spi_bits_var).grid(row=row, column=6, sticky="ew", padx=(0, 8), pady=6)
+            ttk.Entry(parent, textvariable=widgets.spi_speed_var).grid(row=row, column=4, sticky="ew", padx=(0, 8),
+                                                                       pady=6)
+            ttk.Entry(parent, textvariable=widgets.spi_mode_var).grid(row=row, column=5, sticky="ew", padx=(0, 8),
+                                                                      pady=6)
+            ttk.Entry(parent, textvariable=widgets.spi_bits_var).grid(row=row, column=6, sticky="ew", padx=(0, 8),
+                                                                      pady=6)
             ttk.Entry(parent, textvariable=widgets.can_tx_var).grid(row=row, column=7, sticky="ew", padx=(0, 8), pady=6)
             ttk.Entry(parent, textvariable=widgets.can_rx_var).grid(row=row, column=8, sticky="ew", pady=6)
             self.link_widgets[key] = widgets
             interface_combo.bind("<<ComboboxSelected>>", lambda _event, name=key: self._sync_port_options(name))
             for variable in (
-                widgets.interface_var,
-                widgets.port_var,
-                widgets.baud_var,
-                widgets.spi_speed_var,
-                widgets.spi_mode_var,
-                widgets.spi_bits_var,
-                widgets.can_tx_var,
-                widgets.can_rx_var,
+                    widgets.interface_var,
+                    widgets.port_var,
+                    widgets.baud_var,
+                    widgets.spi_speed_var,
+                    widgets.spi_mode_var,
+                    widgets.spi_bits_var,
+                    widgets.can_tx_var,
+                    widgets.can_rx_var,
             ):
                 variable.trace_add("write", lambda *_args: self._refresh_help())
             self._sync_port_options(key)
@@ -698,9 +721,12 @@ if TK_AVAILABLE:
         def _refresh_help(self) -> None:
             cfg = self._collect_config_safe()
             detected_text = (
-                "Serial: " + ", ".join(self.env.serial_ports) + "\n"
-                "SPI: " + ", ".join(self.env.spi_devices) + "\n"
-                "CAN: " + ", ".join(self.env.can_interfaces)
+                    "Serial: " + ", ".join(self.env.serial_ports) + "\n"
+                                                                    "SPI: " + ", ".join(self.env.spi_devices) + "\n"
+                                                                                                                "CAN: "
+                                                                                                                "" + 
+                    ", ".join(
+                self.env.can_interfaces)
             )
             self.detected_label.configure(text=detected_text)
             self.help_text.configure(state="normal")

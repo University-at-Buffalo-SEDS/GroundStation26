@@ -3,8 +3,8 @@ use crate::dummy_packets::get_dummy_packet;
 use crate::radio_config::{CanLinkConfig, RadioLinkConfig, SerialLinkConfig, SpiLinkConfig};
 use anyhow::Context;
 use sedsprintf_rs_2026::{
-    TelemetryError, TelemetryResult,
-    router::{Router, RouterSideId},
+    router::{Router, RouterSideId}, TelemetryError,
+    TelemetryResult,
 };
 use serial::{SerialPort, SystemPort};
 use std::error::Error;

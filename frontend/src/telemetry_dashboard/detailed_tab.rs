@@ -6,7 +6,7 @@ use super::types::{
     BoardStatusEntry, FlightState, NetworkTopologyMsg, NetworkTopologyNodeKind,
     NetworkTopologyStatus,
 };
-use super::{AlertMsg, FrontendNetworkMetrics, PersistentNotification, format_timestamp_ms_clock};
+use super::{format_timestamp_ms_clock, AlertMsg, FrontendNetworkMetrics, PersistentNotification};
 
 #[component]
 pub fn DetailedTab(
@@ -119,7 +119,11 @@ pub fn DetailedTab(
             )
         })
         .collect::<Vec<_>>();
-    let topology_nodes_only = topology.nodes.iter().collect::<Vec<_>>();
+    let topology_nodes_only = topology
+        .nodes
+        .iter()
+        .filter(|node| node.show_in_details)
+        .collect::<Vec<_>>();
     let endpoint_rows = collect_endpoint_rows(&topology.nodes);
 
     rsx! {
@@ -164,7 +168,7 @@ pub fn DetailedTab(
                 {metric_card(
                     "Mission State",
                     vec![
-                        ("Flight state", flight_state.read().to_string()),
+                        ("Flight state", flight_state.read().to_string().to_string()),
                         ("Rocket time", network_time_display.unwrap_or_else(|| "Unavailable".to_string())),
                         ("Clock delta", opt_signed_ms(network_clock_delta_ms)),
                         ("Server time age", opt_i64_ms(network_time_age_ms)),
@@ -218,7 +222,7 @@ pub fn DetailedTab(
                         tbody {
                             for board in boards.iter() {
                                 tr {
-                                    td { style: td_style(), "{board.board.as_str()}" }
+                                    td { style: td_style(), "{board.display_name()}" }
                                     td { style: td_style_mono(), "{board.sender_id}" }
                                     td { style: td_style(), if board.seen { "yes" } else { "no" } }
                                     td { style: td_style_mono(), "{opt_i64_ms(board.age_ms.map(|v| v as i64))}" }
@@ -450,7 +454,7 @@ fn collect_endpoint_rows(
 
 fn endpoint_owner_label(node: &super::types::NetworkTopologyNode) -> Option<String> {
     match node.kind {
-        NetworkTopologyNodeKind::Router => Some("Ground Station".to_string()),
+        NetworkTopologyNodeKind::Router => Some(node.label.clone()),
         NetworkTopologyNodeKind::Board => Some(node.label.clone()),
         NetworkTopologyNodeKind::Endpoint | NetworkTopologyNodeKind::Side => None,
     }

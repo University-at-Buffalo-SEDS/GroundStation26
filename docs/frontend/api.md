@@ -1,8 +1,10 @@
 # Frontend API Contract
 
-This document describes the backend surface the Dioxus frontend depends on to boot, seed state, remain connected, and render the dashboard correctly.
+This document describes the backend surface the Dioxus frontend depends on to boot, seed state, remain connected, and
+render the dashboard correctly.
 
-The goal is not just to list routes. It is to describe what the frontend expects each route to mean, how often it is used, and what failures degrade the UI.
+The goal is not just to list routes. It is to describe what the frontend expects each route to mean, how often it is
+used, and what failures degrade the UI.
 
 ## Transport Model
 
@@ -11,7 +13,8 @@ The frontend uses two transport paths:
 - HTTP for bootstrap, point-in-time reads, layout/config, map config, calibration, and recovery.
 - WebSocket for live telemetry, alerts, board state, topology, notifications, action policy, and clock updates.
 
-The frontend is designed to survive reconnects and partial data loss, but a fully working dashboard assumes the backend exposes the same host for HTTP and WebSocket.
+The frontend is designed to survive reconnects and partial data loss, but a fully working dashboard assumes the backend
+exposes the same host for HTTP and WebSocket.
 
 ## Base URL and Connection Expectations
 
@@ -32,19 +35,23 @@ On first connection or reconnect, the frontend does roughly the following:
 5. Open the WebSocket.
 6. Switch to incremental live updates.
 
-The frontend can tolerate these returning in a slightly different order, but it assumes they all describe the same backend instance and same mission state.
+The frontend can tolerate these returning in a slightly different order, but it assumes they all describe the same
+backend instance and same mission state.
 
 ## Required HTTP Endpoints
 
 ### `GET /api/recent`
 
 Purpose:
+
 - Seed recent telemetry rows used by charts, latest-value widgets, and reconnect recovery.
 
 Expected response:
+
 - JSON array of `TelemetryRow`.
 
 Shape:
+
 ```json
 [
   {
@@ -57,20 +64,24 @@ Shape:
 ```
 
 Frontend expectations:
+
 - `timestamp_ms` is milliseconds since Unix epoch.
 - `data_type` is the primary routing key for widgets and charts.
 - `sender_id` must stay stable across frontend/backend/device builds.
 - `values` ordering must remain stable for a given `data_type`.
 
 Failure impact:
+
 - The dashboard still connects live, but charts and latest-value views start cold and reconnects produce visible gaps.
 
 ### `GET /api/alerts?minutes=20`
 
 Purpose:
+
 - Seed warning/error history shown in warning and error tabs.
 
 Expected response:
+
 ```json
 [
   {
@@ -82,21 +93,26 @@ Expected response:
 ```
 
 Frontend expectations:
+
 - `severity` is `"warning"` or `"error"`.
 - Timestamps must be comparable to telemetry timestamps.
 
 Failure impact:
+
 - Historical alerts are missing until live websocket alerts arrive.
 
 ### `GET /api/boards`
 
 Purpose:
+
 - Seed per-board seen/freshness state for connection and diagnostics views.
 
 Expected response:
+
 - `BoardStatusMsg`.
 
 Shape:
+
 ```json
 {
   "boards": [
@@ -112,55 +128,65 @@ Shape:
 ```
 
 Frontend expectations:
+
 - `board` names must deserialize to the shared enum.
 - `age_ms` is already backend-computed freshness, not frontend-local RTT.
 
 ### `GET /api/layout`
 
 Purpose:
+
 - Provide the top-level tab list and the layout for state/data/network/calibration views.
 
 Expected response:
+
 - JSON matching `frontend/src/telemetry_dashboard/layout.rs`.
 
 Critical expectations:
+
 - `main_tabs` may only contain known IDs:
-  - `state`
-  - `connection-status`
-  - `map`
-  - `actions`
-  - `calibration`
-  - `notifications`
-  - `warnings`
-  - `errors`
-  - `data`
-  - `network-topology`
-  - `detailed`
+    - `state`
+    - `connection-status`
+    - `map`
+    - `actions`
+    - `calibration`
+    - `notifications`
+    - `warnings`
+    - `errors`
+    - `data`
+    - `network-topology`
+    - `detailed`
 - Tab IDs must be unique.
 - Data tab channel labels and boolean label sets must line up with actual telemetry value ordering.
 - State widgets must reference valid data types and valid per-value indexes.
 
 Failure impact:
+
 - Invalid layouts are rejected or cause degraded UI behavior.
 - Layout cache version changes on the frontend can force a reload of default layout ordering.
 
 ### `GET /api/calibration_config`
 
 Purpose:
+
 - Provide the calibration-tab UI schema.
 
 Expected response:
+
 - Calibration layout JSON produced by `backend/src/loadcell.rs`.
 
 Failure impact:
+
 - Calibration UI cannot render correctly even if calibration endpoints exist.
 
 ### `GET /api/map_config`
 
 Purpose:
+
 - Tell the map tab the highest native tile zoom level available.
 
 Expected response:
+
 ```json
 {
   "max_native_zoom": 12
@@ -168,28 +194,35 @@ Expected response:
 ```
 
 Failure impact:
+
 - The map still renders, but zoom behavior may be wrong or conservative.
 
 ### `GET /flightstate`
 
 Purpose:
+
 - Seed current flight state before websocket updates arrive.
 
 Expected response:
+
 - A JSON-serialized `FlightState` enum value, for example:
+
 ```json
 "NitrousFill"
 ```
 
 Failure impact:
+
 - The state tab boots in a stale/default state until the backend pushes a live state update.
 
 ### `GET /api/gps`
 
 Purpose:
+
 - Seed the current rocket GPS point for the map.
 
 Expected response:
+
 ```json
 {
   "rocket": {
@@ -200,15 +233,18 @@ Expected response:
 ```
 
 Frontend expectations:
+
 - `rocket` may be `null`.
 - Latitude/longitude are decimal degrees.
 
 ### `GET /api/network_time`
 
 Purpose:
+
 - Seed backend clock time and feed periodic RTT/clock-delta estimation.
 
 Expected response:
+
 ```json
 {
   "timestamp_ms": 1742400000000
@@ -216,6 +252,7 @@ Expected response:
 ```
 
 Frontend use:
+
 - frontend-to-backend HTTP RTT estimate
 - smoothed RTT estimate
 - backend clock age
@@ -225,24 +262,30 @@ Frontend use:
 ### `GET /api/network_topology`
 
 Purpose:
+
 - Seed the current router/network topology graph and diagnostics tables.
 
 Expected response:
+
 - `NetworkTopologyMsg`.
 
 Frontend expectations:
+
 - `generated_ms` is the backend time the snapshot was created.
 - Node `kind`, `status`, `group`, `sender_id`, and `detail` are rendered directly.
 
 ### `GET /api/notifications`
 
 Purpose:
+
 - Seed persistent operator notifications.
 
 Expected response:
+
 - Array of notification objects.
 
 Shape:
+
 ```json
 [
   {
@@ -257,12 +300,15 @@ Shape:
 ### `GET /api/action_policy`
 
 Purpose:
+
 - Seed current UI command enable/disable policy.
 
 Expected response:
+
 - `ActionPolicyMsg`.
 
 Frontend expectations:
+
 - The frontend uses this to disable or allow action buttons, not merely to decorate the UI.
 
 ## Optional or Feature-Specific HTTP Endpoints
@@ -288,32 +334,39 @@ These are required for the calibration tab to be interactive.
 ### `POST /api/notifications/{id}/dismiss`
 
 Purpose:
+
 - Dismiss a persistent notification for all connected clients.
 
 Expected behavior:
+
 - `204 No Content` on success.
 - `404 Not Found` if the ID no longer exists.
 
 ### `GET /tiles/{z}/{x}/{y}`
 
 Purpose:
+
 - Serve JPEG map tiles to browser builds.
 
 Frontend expectations:
+
 - `204 No Content` is acceptable for missing tiles.
 - The frontend also supports native custom-protocol tile fetches that proxy through this route.
 
 ### `GET /favicon` and `GET /favicon.ico`
 
 Purpose:
+
 - Browser asset convenience endpoints.
 
 ### `GET /valvestate`
 
 Purpose:
+
 - Point-in-time convenience endpoint for the latest `VALVE_STATE` row.
 
 Current role:
+
 - Not the primary live path. WebSocket telemetry remains the authoritative live feed.
 
 ## Command Submission
@@ -321,18 +374,22 @@ Current role:
 ### `POST /api/command`
 
 Purpose:
+
 - Send a `TelemetryCommand` to the backend over HTTP.
 
 Expected request body:
+
 ```json
 "Abort"
 ```
 
 Expected behavior:
+
 - `200 OK` when accepted.
 - `403 Forbidden` when action policy currently blocks the command.
 
 Current frontend use:
+
 - The dashboard primarily sends commands over WebSocket.
 - This endpoint still forms part of the documented API and is useful for tooling/tests.
 
@@ -341,16 +398,18 @@ Current frontend use:
 ### `GET /ws`
 
 Purpose:
+
 - Main live data path for the dashboard.
 
 ### Commands sent by frontend
 
 Shape:
+
 ```json
 { "cmd": "Abort" }
 ```
 
-The `cmd` value must deserialize into `groundstation_shared::TelemetryCommand`.
+The `cmd` value must deserialize into the backend command enum exposed by the API contract.
 
 ### Messages sent by backend
 
@@ -369,9 +428,12 @@ The backend sends tagged JSON objects:
 ```
 
 Notes:
+
 - The exact `ty` casing matters.
-- The frontend currently expects `TelemetryBatch`; it does not rely on a `Telemetry` single-row message from the backend.
-- The backend sends initial snapshots for notifications, action policy, topology, and network time immediately after websocket connect.
+- The frontend currently expects `TelemetryBatch`; it does not rely on a `Telemetry` single-row message from the
+  backend.
+- The backend sends initial snapshots for notifications, action policy, topology, and network time immediately after
+  websocket connect.
 
 ### Live message semantics
 
@@ -401,7 +463,8 @@ The frontend is intentionally simple about schema discovery. It assumes:
 - `values` index meanings are stable for a given `data_type`.
 - timestamps are in epoch milliseconds.
 
-If any of those change without corresponding frontend changes, the UI may still render but show wrong labels, wrong channels, or wrong state.
+If any of those change without corresponding frontend changes, the UI may still render but show wrong labels, wrong
+channels, or wrong state.
 
 ## Backend Behaviors the Frontend Relies On
 

@@ -58,8 +58,8 @@ use warnings_tab::WarningsTab;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, Ordering}, Arc,
+    Mutex,
 };
 
 use once_cell::sync::Lazy;
@@ -200,7 +200,7 @@ mod persist {
         #[cfg(target_os = "android")]
         fn android_storage_base_dir() -> Option<std::path::PathBuf> {
             use jni::objects::{JObject, JString};
-            use jni::{JavaVM, jni_sig, jni_str};
+            use jni::{jni_sig, jni_str, JavaVM};
             use ndk_context::android_context;
 
             let ctx = android_context();
@@ -229,7 +229,7 @@ mod persist {
                 let _ = context.into_raw();
                 Ok(std::path::PathBuf::from(path))
             })
-            .ok()
+                .ok()
         }
 
         fn storage_base_dir() -> std::path::PathBuf {
@@ -684,7 +684,7 @@ impl UiTelemetryStore {
 
     fn apply_rows<I>(&mut self, rows: I)
     where
-        I: IntoIterator<Item = TelemetryRow>,
+        I: IntoIterator<Item=TelemetryRow>,
     {
         for row in rows {
             let key = UiRowKey {
@@ -854,7 +854,7 @@ const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
 const MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
 const DATA_TAB_STORAGE_KEY: &str = "gs_data_tab";
 const BASE_URL_STORAGE_KEY: &str = "gs_base_url";
-const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v7";
+const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v8";
 const NOTIFICATION_DISMISSED_STORAGE_KEY: &str = "gs_notification_dismissed_ids_v1";
 const _SKIP_TLS_VERIFY_KEY_PREFIX: &str = "gs_skip_tls_verify_";
 const NOTIFICATION_AUTO_DISMISS_MS: u32 = 5_000;
@@ -984,6 +984,40 @@ fn _main_tab_to_str(tab: MainTab) -> &'static str {
         MainTab::Errors => "errors",
         MainTab::Data => "data",
     }
+}
+
+fn _default_main_tab_label(tab: MainTab) -> &'static str {
+    match tab {
+        MainTab::State => "Flight",
+        MainTab::ConnectionStatus => "Connection Status",
+        MainTab::Detailed => "Detailed Info",
+        MainTab::NetworkTopology => "Network Topology",
+        MainTab::Map => "Map",
+        MainTab::Actions => "Actions",
+        MainTab::Calibration => "Calibration",
+        MainTab::Notifications => "Notifications",
+        MainTab::Warnings => "Warnings",
+        MainTab::Errors => "Errors",
+        MainTab::Data => "Data",
+    }
+}
+
+fn _main_tab_label(layout: &LayoutConfig, tab: MainTab) -> String {
+    layout
+        .branding
+        .tab_labels
+        .get(_main_tab_to_str(tab))
+        .cloned()
+        .unwrap_or_else(|| _default_main_tab_label(tab).to_string())
+}
+
+fn _dashboard_title(layout: &LayoutConfig) -> String {
+    layout
+        .branding
+        .dashboard_title
+        .clone()
+        .or_else(|| layout.branding.app_name.clone())
+        .unwrap_or_else(|| "Telemetry Dashboard".to_string())
 }
 fn _main_tab_from_str(s: &str) -> MainTab {
     match s {
@@ -1258,7 +1292,7 @@ fn TelemetryDashboardInner() -> Element {
     let unread_notification_ids = use_signal(Vec::<u64>::new);
     let action_policy = use_signal(ActionPolicyMsg::default_locked);
     let network_time = use_signal(|| None::<NetworkTimeSync>);
-    let flight_state = use_signal(|| FlightState::Startup);
+    let flight_state = use_signal(|| "Startup".to_string());
     let board_status = use_signal(Vec::<BoardStatusEntry>::new);
     let network_topology = use_signal(NetworkTopologyMsg::default);
     let frontend_network_metrics = use_signal(FrontendNetworkMetrics::default);
@@ -1654,7 +1688,7 @@ fn TelemetryDashboardInner() -> Element {
                         &mut ack_error_ts_s,
                         alive.clone(),
                     )
-                    .await;
+                        .await;
 
                     match res {
                         Ok(()) => {
@@ -1674,7 +1708,7 @@ fn TelemetryDashboardInner() -> Element {
                                 tokio::time::sleep(std::time::Duration::from_millis(
                                     400 * attempt as u64,
                                 ))
-                                .await;
+                                    .await;
                             }
                         }
                     }
@@ -1767,10 +1801,10 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
-            || *warning_event_counter.read() > *ack_warning_count.read());
+        || *warning_event_counter.read() > *ack_warning_count.read());
     let has_unacked_errors = latest_error_ts > 0
         && (latest_error_ts > *ack_error_ts.read()
-            || *error_event_counter.read() > *ack_error_count.read());
+        || *error_event_counter.read() > *ack_error_count.read());
 
     let border_style = if has_unacked_errors && *flash_on.read() {
         "2px solid #ef4444"
@@ -1870,7 +1904,7 @@ fn TelemetryDashboardInner() -> Element {
                     user_gps,
                     alive.clone(),
                 )
-                .await
+                    .await
                     && alive.load(Ordering::Relaxed)
                 {
                     log!("[WS] supervisor ended: {e}");
@@ -2264,7 +2298,7 @@ fn TelemetryDashboardInner() -> Element {
                     margin-bottom:12px;
                     flex-wrap:wrap;
                 ",
-                        h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "Rocket Dashboard" }
+                        h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "{_dashboard_title(&layout)}" }
 
                         div { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
                             {
@@ -2392,42 +2426,42 @@ fn TelemetryDashboardInner() -> Element {
                                             button {
                                                 style: if *active_main_tab.read() == MainTab::State { tab_style_active("#38bdf8") } else { tab_style_inactive.to_string() },
                                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::State) },
-                                                "Flight"
+                                                "{_main_tab_label(&layout, MainTab::State)}"
                                             }
                                         },
                                         MainTab::ConnectionStatus => rsx! {
                                             button {
                                                 style: if *active_main_tab.read() == MainTab::ConnectionStatus { tab_style_active("#06b6d4") } else { tab_style_inactive.to_string() },
                                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::ConnectionStatus) },
-                                                "Connection Status"
+                                                "{_main_tab_label(&layout, MainTab::ConnectionStatus)}"
                                             }
                                         },
                                         MainTab::Detailed => rsx! {
                                             button {
                                                 style: if *active_main_tab.read() == MainTab::Detailed { tab_style_active("#0ea5e9") } else { tab_style_inactive.to_string() },
                                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Detailed) },
-                                                "Detailed Info"
+                                                "{_main_tab_label(&layout, MainTab::Detailed)}"
                                             }
                                         },
                                         MainTab::Map => rsx! {
                                             button {
                                                 style: if *active_main_tab.read() == MainTab::Map { tab_style_active("#22c55e") } else { tab_style_inactive.to_string() },
                                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Map) },
-                                                "Map"
+                                                "{_main_tab_label(&layout, MainTab::Map)}"
                                             }
                                         },
                                         MainTab::Actions => rsx! {
                                             button {
                                                 style: if *active_main_tab.read() == MainTab::Actions { tab_style_active("#a78bfa") } else { tab_style_inactive.to_string() },
                                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Actions) },
-                                                "Actions"
+                                                "{_main_tab_label(&layout, MainTab::Actions)}"
                                             }
                                         },
                                         MainTab::Calibration => rsx! {
                                             button {
                                                 style: if *active_main_tab.read() == MainTab::Calibration { tab_style_active("#14b8a6") } else { tab_style_inactive.to_string() },
                                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Calibration) },
-                                                "Calibration"
+                                                "{_main_tab_label(&layout, MainTab::Calibration)}"
                                             }
                                         },
                                         MainTab::Notifications => rsx! {
@@ -2447,7 +2481,7 @@ fn TelemetryDashboardInner() -> Element {
                                                         );
                                                     }
                                                 },
-                                                span { "Notifications" }
+                                                span { "{_main_tab_label(&layout, MainTab::Notifications)}" }
                                                 if has_unread_notifications {
                                                     span { style: "margin-left:6px; color:#93c5fd;", "●" }
                                                 }
@@ -2457,7 +2491,7 @@ fn TelemetryDashboardInner() -> Element {
                                             button {
                                                 style: if *active_main_tab.read() == MainTab::Warnings { tab_style_active("#facc15") } else { tab_style_inactive.to_string() },
                                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Warnings) },
-                                                span { "Warnings" }
+                                                span { "{_main_tab_label(&layout, MainTab::Warnings)}" }
                                                 if has_warnings {
                                                     span {
                                                         style: {
@@ -2478,7 +2512,7 @@ fn TelemetryDashboardInner() -> Element {
                                             button {
                                                 style: if *active_main_tab.read() == MainTab::Errors { tab_style_active("#ef4444") } else { tab_style_inactive.to_string() },
                                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Errors) },
-                                                span { "Errors" }
+                                                span { "{_main_tab_label(&layout, MainTab::Errors)}" }
                                                 if has_errors {
                                                     span {
                                                         style: {
@@ -2499,14 +2533,14 @@ fn TelemetryDashboardInner() -> Element {
                                             button {
                                                 style: if *active_main_tab.read() == MainTab::Data { tab_style_active("#f97316") } else { tab_style_inactive.to_string() },
                                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::Data) },
-                                                "Data"
+                                                "{_main_tab_label(&layout, MainTab::Data)}"
                                             }
                                         },
                                         MainTab::NetworkTopology => rsx! {
                                             button {
                                                 style: if *active_main_tab.read() == MainTab::NetworkTopology { tab_style_active("#8b5cf6") } else { tab_style_inactive.to_string() },
                                                 onclick: { let mut t = active_main_tab; move |_| t.set(MainTab::NetworkTopology) },
-                                                "Network"
+                                                "{_main_tab_label(&layout, MainTab::NetworkTopology)}"
                                             }
                                         },
                     }
@@ -2611,7 +2645,7 @@ fn TelemetryDashboardInner() -> Element {
                             if let Some(ts) = network_time_snapshot {
                                 div { style: "display:flex; align-items:center; flex:0 0 auto; min-width:0;",
                                     span { style: "color:#cbd5e1; display:inline-flex; align-items:baseline; white-space:nowrap;",
-                                        "(Rocket Time:"
+                                        "(Network Time:"
                                         span {
                                             style: "display:inline-flex; align-items:baseline; width:16ch; padding-left:0.4ch; white-space:nowrap; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;",
                                             span { "{ts}" }
@@ -2696,6 +2730,7 @@ fn TelemetryDashboardInner() -> Element {
                                 ConnectionStatusTab {
                                     boards: board_status,
                                     layout: layout.connection_tab.clone(),
+                                    title: _main_tab_label(&layout, MainTab::ConnectionStatus),
                                 }
                             },
                             MainTab::Detailed => rsx! {
@@ -2724,7 +2759,8 @@ fn TelemetryDashboardInner() -> Element {
                                 MapTab {
                                     key: "{*WS_EPOCH.read()}",
                                     rocket_gps: rocket_gps,
-                                    user_gps: user_gps
+                                    user_gps: user_gps,
+                                    title: _main_tab_label(&layout, MainTab::Map),
                                 }
                             },
                             MainTab::Actions => rsx! {
@@ -3052,7 +3088,7 @@ async fn dismiss_notification_remote(id: u64) -> Result<(), String> {
 #[cfg(target_arch = "wasm32")]
 fn spawn_detached<F>(fut: F)
 where
-    F: std::future::Future<Output = ()> + 'static,
+    F: std::future::Future<Output=()> + 'static,
 {
     wasm_bindgen_futures::spawn_local(fut);
 }
@@ -3060,7 +3096,7 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_detached<F>(fut: F)
 where
-    F: Future<Output = ()> + 'static,
+    F: Future<Output=()> + 'static,
 {
     spawn(fut);
 }
@@ -3240,7 +3276,7 @@ fn apply_notifications_snapshot(
             tokio::time::sleep(std::time::Duration::from_millis(
                 NOTIFICATION_AUTO_DISMISS_MS as u64,
             ))
-            .await;
+                .await;
 
             let still_visible = { notifications.read().iter().any(|x| x.id == id) };
             if !still_visible {
@@ -3569,7 +3605,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                .await
+                    .await
             }
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -3593,7 +3629,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                .await
+                    .await
             }
         };
 
@@ -3740,7 +3776,7 @@ async fn connect_ws_once_wasm(
             &mut closed_rx,
             gloo_timers::future::TimeoutFuture::new(150),
         )
-        .await;
+            .await;
 
         match done {
             futures_util::future::Either::Left((_closed, _timeout)) => break,
@@ -3807,9 +3843,9 @@ async fn connect_ws_once_native(
             false,
             Some(tokio_tungstenite::Connector::NativeTls(tls)),
         )
-        .await
-        .map_err(|e| format!("[WS] connect failed: {e}"))?
-        .0
+            .await
+            .map_err(|e| format!("[WS] connect failed: {e}"))?
+            .0
     } else {
         tokio_tungstenite::connect_async(ws_url.as_str())
             .await

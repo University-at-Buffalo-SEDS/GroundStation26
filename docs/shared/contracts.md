@@ -1,6 +1,7 @@
 # Shared Contracts
 
-This document describes the role of the shared crate and the contracts it creates between frontend, backend, and other tooling.
+This document describes the role of the shared crate and the contracts it creates between frontend, backend, and other
+tooling.
 
 ## Shared Crate
 
@@ -26,37 +27,44 @@ The shared crate keeps those contracts in one place so serde, command dispatch, 
 ### `TelemetryCommand`
 
 Used for:
+
 - HTTP command submission
 - websocket command messages
 - backend command routing/policy
 
 Implication:
+
 - renaming or reordering variants changes the control-plane contract
 
 ### `FlightState`
 
 Used for:
+
 - backend mission state
 - frontend current state rendering
 - sequence transitions
 - persisted state history
 
 Implication:
+
 - changes here affect UI state tabs, backend policy, and persisted values
 
 ### `Board`
 
 Used for:
+
 - canonical board names
 - sender ID mapping
 - board status rendering
 
 Implication:
+
 - `sender_id()` and `from_sender_id()` are critical for joining telemetry sender IDs to UI board names
 
 ### `BoardStatusEntry` and `BoardStatusMsg`
 
 Used for:
+
 - `/api/boards`
 - websocket board status updates
 - connection status tab
@@ -65,18 +73,21 @@ Used for:
 ### `TelemetryRow`
 
 Used for:
+
 - `/api/recent`
 - websocket telemetry batches
 - chart ingest
 - latest-value caching
 
 Important fields:
+
 - `timestamp_ms`
 - `data_type`
 - `sender_id`
 - `values`
 
 Implication:
+
 - this is the core data-plane record shared between backend and frontend
 
 ## Contract Stability Notes

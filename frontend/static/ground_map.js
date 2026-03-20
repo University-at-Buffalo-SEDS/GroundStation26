@@ -315,10 +315,15 @@ function getLastUserLatLng() {
     return {lat: lastUserLatLng[0], lon: lastUserLatLng[1]};
 }
 
-function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom) {
+function trackedAssetTitle() {
+    return window.__gs26_tracked_asset_title || "Tracked Asset";
+}
+
+function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom, assetTitle) {
     const L = getLeaflet();
     ensureMarkerStylesOnce();
     initCompassOnce();
+    window.__gs26_tracked_asset_title = assetTitle || trackedAssetTitle();
     const effectiveMaxNativeZoom = clampMaxNativeZoom(maxNativeZoom);
     const effectiveMaxZoom = effectiveMaxNativeZoom + DEFAULT_MAX_OVERZOOM_DELTA;
     const desiredZoom = lastMapView ? lastMapView.zoom : zoom;
@@ -335,7 +340,8 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom) {
             zoom,
             maxNativeZoom,
         });
-    } catch (e) {}
+    } catch (e) {
+    }
 
     if (groundMap && groundMap.getContainer() === el) {
         const configChanged =
@@ -347,7 +353,8 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom) {
             if (groundTileLayer) {
                 try {
                     groundMap.removeLayer(groundTileLayer);
-                } catch (e) {}
+                } catch (e) {
+                }
             }
 
             groundMap.setMinZoom(MIN_ZOOM);
@@ -373,7 +380,8 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom) {
 
         try {
             groundMap.invalidateSize();
-        } catch (e) {}
+        } catch (e) {
+        }
         return;
     }
     if (groundMap) {
@@ -401,7 +409,7 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom) {
     if (lastRocketLatLng) {
         rocketMarker = L.marker(lastRocketLatLng, {
             icon: makeEmojiIcon("🚀", "rocket-marker"),
-            title: "Rocket",
+            title: trackedAssetTitle(),
         }).addTo(groundMap);
     }
 
@@ -423,7 +431,7 @@ function updateGroundMapMarkers(rLat, rLon, uLat, uLon) {
         if (!rocketMarker) {
             rocketMarker = L.marker(lastRocketLatLng, {
                 icon: makeEmojiIcon("🚀", "rocket-marker"),
-                title: "Rocket",
+                title: trackedAssetTitle(),
             }).addTo(groundMap);
         } else {
             rocketMarker.setLatLng(lastRocketLatLng);

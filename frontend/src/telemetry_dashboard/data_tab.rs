@@ -5,10 +5,10 @@ use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 
 use super::data_chart::{
-    ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, combined_battery_chart_key,
-    series_color,
+    charts_cache_get, charts_cache_get_channel_minmax, combined_battery_chart_key, series_color,
+    ChartCanvas,
 };
-use super::{TELEMETRY_RENDER_EPOCH, latest_telemetry_row, latest_telemetry_value};
+use super::{latest_telemetry_row, latest_telemetry_value, TELEMETRY_RENDER_EPOCH};
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
 const BATTERY_RUNTIME_TAB_ID: &str = "BATTERY_RUNTIME";

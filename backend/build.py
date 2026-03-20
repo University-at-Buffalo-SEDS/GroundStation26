@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-
 LOG_FILE: Optional[Path] = None
 
 
@@ -70,8 +69,8 @@ def is_raspberry_pi() -> bool:
     if platform.system() != "Linux":
         return False
     for path in (
-        Path("/sys/firmware/devicetree/base/model"),
-        Path("/proc/device-tree/model"),
+            Path("/sys/firmware/devicetree/base/model"),
+            Path("/proc/device-tree/model"),
     ):
         try:
             txt = path.read_text(errors="ignore").lower()
@@ -96,12 +95,12 @@ def _configure_log_file(repo_root: Path, log_file_arg: Optional[str]) -> None:
 
 
 def build_backend(
-    backend_dir: Path,
-    force_pi: bool,
-    force_no_pi: bool,
-    testing_mode: bool,
-    hitl_mode: bool,
-    debug_mode: bool = False,
+        backend_dir: Path,
+        force_pi: bool,
+        force_no_pi: bool,
+        testing_mode: bool,
+        hitl_mode: bool,
+        debug_mode: bool = False,
 ) -> None:
     cmd = ["cargo", "build", "-p", "groundstation_backend"]
     if not debug_mode:

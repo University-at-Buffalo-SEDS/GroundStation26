@@ -2,21 +2,22 @@ use crate::auth::AuthManager;
 use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
-use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
-use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
-use groundstation_shared::{
-    Board, BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow,
+use crate::sequences::{command_name, ActionPolicyMsg, PersistentNotification};
+use crate::types::{
+    Board, BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyLink, NetworkTopologyMsg,
+    NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus, TelemetryCommand,
+    TelemetryRow,
 };
+use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
 use sedsprintf_rs_2026::config::DataEndpoint;
 use sedsprintf_rs_2026::discovery::TopologySnapshot;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::Router;
-use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -24,51 +25,6 @@ pub struct BoardStatus {
     pub last_seen_ms: Option<u64>,
     pub ema_gap_ms: Option<u64>,
     pub warned: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkTopologyNodeKind {
-    Router,
-    Endpoint,
-    Side,
-    Board,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkTopologyStatus {
-    Online,
-    Offline,
-    Simulated,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NetworkTopologyNode {
-    pub id: String,
-    pub label: String,
-    pub kind: NetworkTopologyNodeKind,
-    pub status: NetworkTopologyStatus,
-    pub group: String,
-    pub sender_id: Option<String>,
-    pub endpoints: Vec<String>,
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NetworkTopologyLink {
-    pub source: String,
-    pub target: String,
-    pub label: Option<String>,
-    pub status: NetworkTopologyStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NetworkTopologyMsg {
-    pub generated_ms: u64,
-    pub simulated: bool,
-    pub nodes: Vec<NetworkTopologyNode>,
-    pub links: Vec<NetworkTopologyLink>,
 }
 
 #[derive(Clone)]
@@ -88,8 +44,11 @@ pub struct AppState {
     /// Error messages → frontend
     pub errors_tx: broadcast::Sender<ErrorMsg>,
 
-    /// SQLite database
+    /// Main telemetry/application SQLite database.
     pub db: SqlitePool,
+
+    /// Separate SQLite database for auth sessions.
+    pub auth_db: SqlitePool,
 
     /// Current flight state
     pub state: Arc<Mutex<FlightState>>,
@@ -201,6 +160,7 @@ impl AppState {
 
             boards.push(BoardStatusEntry {
                 board: *board,
+                board_label: board.as_str().to_string(),
                 sender_id: board.sender_id().to_string(),
                 seen,
                 last_seen_ms,
@@ -253,31 +213,6 @@ impl AppState {
             endpoints.dedup();
             endpoints
         };
-
-        let expected_board_endpoints = |board: Board| -> Vec<String> {
-            let endpoints = match board {
-                Board::FlightComputer => {
-                    &[DataEndpoint::FlightController, DataEndpoint::FlightState][..]
-                }
-                Board::ValveBoard => &[DataEndpoint::ValveBoard, DataEndpoint::Abort][..],
-                Board::ActuatorBoard => &[DataEndpoint::ActuatorBoard, DataEndpoint::Abort][..],
-                _ => &[][..],
-            };
-            endpoints
-                .iter()
-                .map(|endpoint| endpoint.as_str().to_string())
-                .collect()
-        };
-
-        let board_endpoints =
-            |board: Board, side_endpoints: &[String], simulated: bool| -> Vec<String> {
-                let mut expected = expected_board_endpoints(board);
-                if simulated {
-                    return expected;
-                }
-                expected.retain(|endpoint| side_endpoints.iter().any(|side| side == endpoint));
-                expected
-            };
 
         let board_status = |board: Board| -> (NetworkTopologyStatus, Option<String>) {
             let Some(entry) = board_snapshot
@@ -336,53 +271,49 @@ impl AppState {
             .unwrap_or_default();
         let rocket_side_endpoints = endpoints_for_side(exported.as_ref(), "rocket_radio");
         let fill_side_endpoints = endpoints_for_side(exported.as_ref(), "umbilical_radio");
+        let expected_board_endpoints = |board: Board, side_endpoints: &[String]| -> Vec<String> {
+            let mut endpoints = match board {
+                Board::GroundStation => local_endpoint_list.clone(),
+                Board::FlightComputer => vec![
+                    DataEndpoint::FlightController.as_str().to_string(),
+                    DataEndpoint::FlightState.as_str().to_string(),
+                ],
+                Board::RFBoard | Board::GatewayBoard => side_endpoints.to_vec(),
+                Board::PowerBoard => Vec::new(),
+                Board::DaqBoard => Vec::new(),
+                Board::ValveBoard => vec![
+                    DataEndpoint::ValveBoard.as_str().to_string(),
+                    DataEndpoint::Abort.as_str().to_string(),
+                ],
+                Board::ActuatorBoard => vec![
+                    DataEndpoint::ActuatorBoard.as_str().to_string(),
+                    DataEndpoint::Abort.as_str().to_string(),
+                ],
+            };
+            if simulated {
+                match board {
+                    Board::ValveBoard | Board::ActuatorBoard => {
+                        endpoints.push(DataEndpoint::FlightState.as_str().to_string());
+                    }
+                    _ => {}
+                }
+            }
+            endpoints.sort();
+            endpoints.dedup();
+            endpoints
+        };
 
-        let mut nodes = vec![
-            NetworkTopologyNode {
-                id: "router".to_string(),
-                label: "Ground Station Router".to_string(),
-                kind: NetworkTopologyNodeKind::Router,
-                status: NetworkTopologyStatus::Online,
-                group: "local".to_string(),
-                sender_id: Some(Board::GroundStation.sender_id().to_string()),
-                endpoints: local_endpoint_list.clone(),
-                detail: Some("SEDSprintf relay router".to_string()),
-            },
-            NetworkTopologyNode {
-                id: "side_rocket_radio".to_string(),
-                label: "Rocket Radio Side".to_string(),
-                kind: NetworkTopologyNodeKind::Side,
-                status: side_status("rocket_radio", rocket_radio_online),
-                group: "local".to_string(),
-                sender_id: Some(Board::GroundStation.sender_id().to_string()),
-                endpoints: rocket_side_endpoints.clone(),
-                detail: Some(if rocket_side_endpoints.is_empty() {
-                    "Ground-station rocket-side router interface".to_string()
-                } else {
-                    format!(
-                        "Ground-station rocket-side route reaches: {}",
-                        rocket_side_endpoints.join(", ")
-                    )
-                }),
-            },
-            NetworkTopologyNode {
-                id: "side_umbilical_radio".to_string(),
-                label: "Umbilical Radio Side".to_string(),
-                kind: NetworkTopologyNodeKind::Side,
-                status: side_status("umbilical_radio", fill_radio_online),
-                group: "local".to_string(),
-                sender_id: Some(Board::GroundStation.sender_id().to_string()),
-                endpoints: fill_side_endpoints.clone(),
-                detail: Some(if fill_side_endpoints.is_empty() {
-                    "Ground-station fill-side router interface".to_string()
-                } else {
-                    format!(
-                        "Ground-station fill-side route reaches: {}",
-                        fill_side_endpoints.join(", ")
-                    )
-                }),
-            },
-        ];
+        let mut nodes = vec![NetworkTopologyNode {
+            id: "router".to_string(),
+            label: "Ground Station Router".to_string(),
+            kind: NetworkTopologyNodeKind::Router,
+            status: NetworkTopologyStatus::Online,
+            group: "local".to_string(),
+            sender_id: Some(Board::GroundStation.sender_id().to_string()),
+            endpoints: local_endpoint_list.clone(),
+            show_in_details: true,
+            detail: Some("SEDSprintf relay router".to_string()),
+        }];
 
         let rocket_boards = [Board::FlightComputer, Board::RFBoard, Board::PowerBoard];
         let fill_boards = [
@@ -394,7 +325,19 @@ impl AppState {
 
         for board in rocket_boards {
             let (status, detail) = board_status(board);
-            let endpoints = board_endpoints(board, &rocket_side_endpoints, simulated);
+            let endpoints = expected_board_endpoints(board, &rocket_side_endpoints);
+            let relay_detail = if matches!(board, Board::RFBoard) {
+                Some(if rocket_side_endpoints.is_empty() {
+                    "Relay board for the rocket radio path".to_string()
+                } else {
+                    format!(
+                        "Relay board for the rocket radio path. Routed endpoints: {}",
+                        rocket_side_endpoints.join(", ")
+                    )
+                })
+            } else {
+                None
+            };
             nodes.push(NetworkTopologyNode {
                 id: format!("board_{}", board.sender_id().to_ascii_lowercase()),
                 label: board.as_str().to_string(),
@@ -403,7 +346,8 @@ impl AppState {
                 group: "rocket_remote".to_string(),
                 sender_id: Some(board.sender_id().to_string()),
                 endpoints: endpoints.clone(),
-                detail: detail.or_else(|| {
+                show_in_details: true,
+                detail: detail.or(relay_detail).or_else(|| {
                     if endpoints.is_empty() {
                         None
                     } else {
@@ -418,7 +362,19 @@ impl AppState {
 
         for board in fill_boards {
             let (status, detail) = board_status(board);
-            let endpoints = board_endpoints(board, &fill_side_endpoints, simulated);
+            let endpoints = expected_board_endpoints(board, &fill_side_endpoints);
+            let relay_detail = if matches!(board, Board::GatewayBoard) {
+                Some(if fill_side_endpoints.is_empty() {
+                    "Relay board for the umbilical radio path".to_string()
+                } else {
+                    format!(
+                        "Relay board for the umbilical radio path. Routed endpoints: {}",
+                        fill_side_endpoints.join(", ")
+                    )
+                })
+            } else {
+                None
+            };
             nodes.push(NetworkTopologyNode {
                 id: format!("board_{}", board.sender_id().to_ascii_lowercase()),
                 label: board.as_str().to_string(),
@@ -427,7 +383,8 @@ impl AppState {
                 group: "fill_remote".to_string(),
                 sender_id: Some(board.sender_id().to_string()),
                 endpoints: endpoints.clone(),
-                detail: detail.or_else(|| {
+                show_in_details: true,
+                detail: detail.or(relay_detail).or_else(|| {
                     if endpoints.is_empty() {
                         None
                     } else {
@@ -443,26 +400,14 @@ impl AppState {
         let mut links = vec![
             NetworkTopologyLink {
                 source: "router".to_string(),
-                target: "side_rocket_radio".to_string(),
+                target: "board_rf".to_string(),
                 label: Some("rocket radio".to_string()),
                 status: side_status("rocket_radio", rocket_radio_online),
             },
             NetworkTopologyLink {
                 source: "router".to_string(),
-                target: "side_umbilical_radio".to_string(),
-                label: Some("umbilical radio".to_string()),
-                status: side_status("umbilical_radio", fill_radio_online),
-            },
-            NetworkTopologyLink {
-                source: "side_rocket_radio".to_string(),
-                target: "board_rf".to_string(),
-                label: Some("radio modem".to_string()),
-                status: side_status("rocket_radio", rocket_radio_online),
-            },
-            NetworkTopologyLink {
-                source: "side_umbilical_radio".to_string(),
                 target: "board_gw".to_string(),
-                label: Some("radio modem".to_string()),
+                label: Some("umbilical radio".to_string()),
                 status: side_status("umbilical_radio", fill_radio_online),
             },
         ];

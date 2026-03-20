@@ -16,6 +16,7 @@ const LATENCY_FULLSCREEN_CHART_HEIGHT_PX: u32 = 240;
 pub fn ConnectionStatusTab(
     boards: Signal<Vec<BoardStatusEntry>>,
     layout: ConnectionTabLayout,
+    title: String,
 ) -> Element {
     let mut show_board = use_signal(|| true);
     let mut board_fullscreen = use_signal(|| false);
@@ -94,7 +95,7 @@ pub fn ConnectionStatusTab(
 
     rsx! {
         div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto;",
-            h2 { style: "margin:0 0 12px 0;", "Connection Status" }
+            h2 { style: "margin:0 0 12px 0;", "{title}" }
             for (idx, section) in layout.sections.iter().enumerate() {
                 match section.kind {
                     ConnectionSectionKind::BoardStatus => rsx! {
@@ -154,7 +155,7 @@ pub fn ConnectionStatusTab(
                                     for entry in boards.read().iter() {
                                         div { style: latency_card_style(),
                                             div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
-                                                "{entry.board.as_str()} ({entry.sender_id})"
+                                                "{entry.display_name()} ({entry.sender_id})"
                                             }
                                             {render_latency_chart(
                                                 history.read().get(&entry.sender_id),
@@ -198,7 +199,7 @@ pub fn ConnectionStatusTab(
                     for entry in boards.read().iter() {
                         div { style: latency_card_style(),
                             div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
-                                "{entry.board.as_str()} ({entry.sender_id})"
+                                "{entry.display_name()} ({entry.sender_id})"
                             }
                             {render_latency_chart(
                                 history.read().get(&entry.sender_id),
@@ -462,7 +463,7 @@ fn render_board_table(boards: &[BoardStatusEntry]) -> Element {
                 div { style: "font-weight:600; color:#e2e8f0; padding:8px; border-bottom:1px solid #1f2937;", "Age (ms)" }
 
                 for entry in boards.iter() {
-                    div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;", "{entry.board.as_str()}" }
+                    div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;", "{entry.display_name()}" }
                     div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;", "{entry.sender_id}" }
                     div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;", if entry.seen { "yes" } else { "no" } }
                     div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;",

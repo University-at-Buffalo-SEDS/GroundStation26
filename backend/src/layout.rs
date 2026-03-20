@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 const DEFAULT_LAYOUT_PATH: &str = "layout/layout.json";
@@ -8,6 +9,8 @@ const DEFAULT_HITL_LAYOUT_PATH: &str = "layout/layout_hitl.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
     pub version: u32,
+    #[serde(default)]
+    pub branding: BrandingConfig,
     #[serde(default = "default_main_tabs")]
     pub main_tabs: Vec<String>,
     pub connection_tab: ConnectionTabLayout,
@@ -34,6 +37,14 @@ fn default_main_tabs() -> Vec<String> {
         "network-topology".to_string(),
         "detailed".to_string(),
     ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BrandingConfig {
+    pub app_name: Option<String>,
+    pub dashboard_title: Option<String>,
+    #[serde(default)]
+    pub tab_labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

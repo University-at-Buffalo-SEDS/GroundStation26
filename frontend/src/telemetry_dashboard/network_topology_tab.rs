@@ -23,11 +23,18 @@ struct NodePlacement {
     size: i32,
 }
 
-const GRAPH_WIDTH: i32 = 1320;
-const GRAPH_HEIGHT: i32 = 700;
-const EMBEDDED_GRAPH_MIN_HEIGHT: i32 = 360;
-const ZOOM_MIN: f32 = 0.25;
-const ZOOM_MAX: f32 = 1.8;
+#[derive(Clone)]
+struct GraphLayout {
+    width: i32,
+    height: i32,
+    placements: HashMap<String, NodePlacement>,
+}
+
+const GRAPH_MIN_WIDTH: i32 = 1080;
+const GRAPH_MIN_HEIGHT: i32 = 720;
+const EMBEDDED_GRAPH_MIN_HEIGHT: i32 = 520;
+const ZOOM_MIN: f32 = 0.12;
+const ZOOM_MAX: f32 = 2.2;
 const ZOOM_STEP: f32 = 0.2;
 
 #[component]
@@ -40,12 +47,16 @@ pub fn NetworkTopologyTab(
     let mut is_fullscreen = use_signal(|| false);
     let title = layout
         .title
-        .unwrap_or_else(|| "SEDSprintf Network".to_string());
-    let placements = graph_positions();
+        .unwrap_or_else(|| "Network Topology".to_string());
     let visible_node_ids = snapshot
         .nodes
         .iter()
-        .filter(|node| !matches!(node.kind, NetworkTopologyNodeKind::Endpoint))
+        .filter(|node| {
+            !matches!(
+                node.kind,
+                NetworkTopologyNodeKind::Endpoint | NetworkTopologyNodeKind::Side
+            )
+        })
         .map(|node| node.id.as_str())
         .collect::<HashSet<_>>();
     let graph_nodes = snapshot
@@ -63,6 +74,7 @@ pub fn NetworkTopologyTab(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let graph_layout = compute_graph_layout(&graph_nodes, &graph_links);
     let endpoint_rows = collect_endpoint_rows(&snapshot.nodes);
     let viewport_id = if *is_fullscreen.read() {
         GRAPH_VIEWPORT_FULLSCREEN_ID
@@ -99,7 +111,14 @@ pub fn NetworkTopologyTab(
             } else {
                 GRAPH_CANVAS_ID
             };
-            install_drag_handlers(fullscreen, viewport_id, surface_id, canvas_id);
+            install_drag_handlers(
+                fullscreen,
+                viewport_id,
+                surface_id,
+                canvas_id,
+                graph_layout.width,
+                graph_layout.height,
+            );
         });
     }
 
@@ -123,6 +142,8 @@ pub fn NetworkTopologyTab(
         } else {
             GRAPH_CANVAS_ID
         };
+        let graph_width = graph_layout.width;
+        let graph_height = graph_layout.height;
         spawn(async move {
             #[cfg(target_arch = "wasm32")]
             gloo_timers::future::TimeoutFuture::new(20).await;
@@ -130,7 +151,14 @@ pub fn NetworkTopologyTab(
             #[cfg(not(target_arch = "wasm32"))]
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-            install_drag_handlers(next, viewport_id, surface_id, canvas_id);
+            install_drag_handlers(
+                next,
+                viewport_id,
+                surface_id,
+                canvas_id,
+                graph_width,
+                graph_height,
+            );
         });
     };
 
@@ -138,7 +166,7 @@ pub fn NetworkTopologyTab(
         if *is_fullscreen.read() {
             div {
                 key: "network-fullscreen-{fullscreen_state}",
-                style: "position:fixed; inset:0; z-index:9999; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
+                style: "position:fixed; inset:0; z-index:9999; padding:16px; background:rgba(2, 6, 23, 0.96); display:flex; flex-direction:column; gap:12px;",
                 div {
                     style: "display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:space-between;",
                     h2 { style: "margin:0; color:#8b5cf6;", "{title}" }
@@ -169,27 +197,27 @@ pub fn NetworkTopologyTab(
                 p {
                     style: "margin:0; color:#94a3b8; font-size:0.95rem;",
                     if snapshot.simulated {
-                        "Router graph is running in testing-mode simulation."
+                        "Topology graph is running in testing-mode simulation."
                     } else {
-                        "Router graph is built from the backend SEDSprintf topology and live board/link status."
+                        "Topology graph is built from backend topology and live node/link status."
                     }
                 }
                 div {
-                    style: "flex:1; min-height:0; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
+                    style: "flex:1; min-height:0; border:1px solid #334155; border-radius:20px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain; box-shadow:0 24px 60px rgba(0,0,0,0.45);",
                     id: "{viewport_id}",
                     div {
                         id: "{surface_id}",
-                        style: "position:relative; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; min-width:{GRAPH_WIDTH}px; min-height:{GRAPH_HEIGHT}px;",
+                        style: "position:relative; width:{graph_layout.width}px; height:{graph_layout.height}px; min-width:{graph_layout.width}px; min-height:{graph_layout.height}px;",
                         div {
                             id: "{canvas_id}",
-                            style: "position:absolute; inset:0 auto auto 0; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; transform:scale(1); transform-origin:top left;",
+                            style: "position:absolute; inset:0 auto auto 0; width:{graph_layout.width}px; height:{graph_layout.height}px; transform:scale(1); transform-origin:top left;",
                             svg {
-                                width: "{GRAPH_WIDTH}",
-                                height: "{GRAPH_HEIGHT}",
-                                view_box: "0 0 {GRAPH_WIDTH} {GRAPH_HEIGHT}",
+                                width: "{graph_layout.width}",
+                                height: "{graph_layout.height}",
+                                view_box: "0 0 {graph_layout.width} {graph_layout.height}",
                                 style: "position:absolute; inset:0; overflow:visible;",
                                 for link in graph_links.iter() {
-                                    {render_link(link, &snapshot.nodes, &placements)}
+                                    {render_link(link, &snapshot.nodes, &graph_layout.placements)}
                                 }
                             }
 
@@ -198,19 +226,19 @@ pub fn NetworkTopologyTab(
                                     node,
                                     &graph_links,
                                     &snapshot.nodes,
-                                    &placements,
+                                    &graph_layout.placements,
+                                    graph_layout.width,
                                     expanded_node_id,
                                 )}
                             }
                         }
                     }
                 }
-                {render_endpoint_section(&endpoint_rows)}
             }
         } else {
             div {
                 key: "network-embedded-{fullscreen_state}",
-                style: "padding:10px 14px 14px 14px; display:flex; flex-direction:column; gap:10px; height:100%; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; overflow-y:auto;",
+                style: "padding:10px 14px 14px 14px; display:flex; flex-direction:column; gap:12px; height:100%; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; overflow-y:auto;",
                 h2 { style: "margin:0; color:#e5e7eb;", "{title}" }
                 p {
                     style: "margin:0; color:#94a3b8; font-size:0.95rem;",
@@ -250,20 +278,20 @@ pub fn NetworkTopologyTab(
 
                 div {
                     id: "{viewport_id}",
-                    style: "padding:8px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
+                    style: "padding:8px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; max-height:calc(100vh - 260px); cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
                     div {
                         id: "{surface_id}",
-                        style: "position:relative; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; min-width:{GRAPH_WIDTH}px; min-height:{GRAPH_HEIGHT}px;",
+                        style: "position:relative; width:{graph_layout.width}px; height:{graph_layout.height}px; min-width:{graph_layout.width}px; min-height:{graph_layout.height}px;",
                         div {
                             id: "{canvas_id}",
-                            style: "position:absolute; inset:0 auto auto 0; width:{GRAPH_WIDTH}px; height:{GRAPH_HEIGHT}px; transform:scale(1); transform-origin:top left;",
+                            style: "position:absolute; inset:0 auto auto 0; width:{graph_layout.width}px; height:{graph_layout.height}px; transform:scale(1); transform-origin:top left;",
                             svg {
-                                width: "{GRAPH_WIDTH}",
-                                height: "{GRAPH_HEIGHT}",
-                                view_box: "0 0 {GRAPH_WIDTH} {GRAPH_HEIGHT}",
+                                width: "{graph_layout.width}",
+                                height: "{graph_layout.height}",
+                                view_box: "0 0 {graph_layout.width} {graph_layout.height}",
                                 style: "position:absolute; inset:0; overflow:visible;",
                                 for link in graph_links.iter() {
-                                    {render_link(link, &snapshot.nodes, &placements)}
+                                    {render_link(link, &snapshot.nodes, &graph_layout.placements)}
                                 }
                             }
 
@@ -272,7 +300,8 @@ pub fn NetworkTopologyTab(
                                     node,
                                     &graph_links,
                                     &snapshot.nodes,
-                                    &placements,
+                                    &graph_layout.placements,
+                                    graph_layout.width,
                                     expanded_node_id,
                                 )}
                             }
@@ -342,7 +371,14 @@ fn graph_zoom_reset() {
     );
 }
 
-fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str, canvas_id: &str) {
+fn install_drag_handlers(
+    _fullscreen: bool,
+    viewport_id: &str,
+    surface_id: &str,
+    canvas_id: &str,
+    graph_width: i32,
+    graph_height: i32,
+) {
     js_eval(&format!(
         r#"
         (function() {{
@@ -359,6 +395,7 @@ fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str,
             pinchScale: 1.0,
             padX: 0,
             padY: 0,
+            autoFitted: false,
             listenersInstalled: false,
           }};
           state.viewport = viewport;
@@ -372,11 +409,16 @@ fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str,
 
           const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
           const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+          const fitScale = () => {{
+            const availW = Math.max(state.viewport.clientWidth - 120, 240);
+            const availH = Math.max(state.viewport.clientHeight - 120, 240);
+            return clamp(Math.min(availW / {graph_width}, availH / {graph_height}), {zoom_min}, {zoom_max});
+          }};
           const refreshSurfaceFrame = () => {{
             const scaledWidth = Math.round({graph_width} * state.scale);
             const scaledHeight = Math.round({graph_height} * state.scale);
-            state.padX = Math.max(Math.round(state.viewport.clientWidth * 0.35), 180);
-            state.padY = Math.max(Math.round(state.viewport.clientHeight * 0.18), 60);
+            state.padX = Math.max(Math.round((state.viewport.clientWidth - scaledWidth) / 2), 90);
+            state.padY = Math.max(Math.round((state.viewport.clientHeight - scaledHeight) / 2), 60);
             state.surface.style.width = `${{scaledWidth + state.padX * 2}}px`;
             state.surface.style.height = `${{scaledHeight + state.padY * 2}}px`;
             state.surface.style.minWidth = state.surface.style.width;
@@ -386,8 +428,9 @@ fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str,
           }};
           const centerGraph = () => {{
             const scaledWidth = Math.round({graph_width} * state.scale);
+            const scaledHeight = Math.round({graph_height} * state.scale);
             state.viewport.scrollLeft = Math.max(0, state.padX + Math.round((scaledWidth - state.viewport.clientWidth) / 2));
-            state.viewport.scrollTop = Math.max(0, state.padY - 24);
+            state.viewport.scrollTop = Math.max(0, state.padY + Math.round((scaledHeight - state.viewport.clientHeight) / 2));
           }};
           const applyScale = (nextScale, clientX, clientY) => {{
             const scale = clamp(nextScale, {zoom_min}, {zoom_max});
@@ -409,8 +452,8 @@ fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str,
           }};
 
           window.__gs26NetworkGraphZoomReset = () => {{
-            state.scale = 1.0;
-            state.canvas.style.transform = "scale(1)";
+            state.scale = fitScale();
+            state.canvas.style.transform = `scale(${{state.scale}})`;
             refreshSurfaceFrame();
             centerGraph();
           }};
@@ -420,6 +463,8 @@ fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str,
             centerGraph();
           }};
 
+          state.scale = fitScale();
+          state.canvas.style.transform = `scale(${{state.scale}})`;
           refreshSurfaceFrame();
           centerGraph();
           window.requestAnimationFrame(() => {{
@@ -436,7 +481,10 @@ fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str,
           state.listenersInstalled = true;
 
           window.addEventListener("resize", () => {{
+            state.scale = fitScale();
+            state.canvas.style.transform = `scale(${{state.scale}})`;
             refreshSurfaceFrame();
+            centerGraph();
           }});
 
           document.addEventListener("pointerdown", (evt) => {{
@@ -535,94 +583,9 @@ fn install_drag_handlers(_fullscreen: bool, viewport_id: &str, surface_id: &str,
         canvas_id = canvas_id,
         zoom_min = ZOOM_MIN,
         zoom_max = ZOOM_MAX,
-        graph_width = GRAPH_WIDTH,
-        graph_height = GRAPH_HEIGHT,
+        graph_width = graph_width,
+        graph_height = graph_height,
     ));
-}
-
-fn graph_positions() -> HashMap<&'static str, NodePlacement> {
-    HashMap::from([
-        (
-            "router",
-            NodePlacement {
-                x: 250,
-                y: 330,
-                size: 220,
-            },
-        ),
-        (
-            "side_rocket_radio",
-            NodePlacement {
-                x: 520,
-                y: 210,
-                size: 120,
-            },
-        ),
-        (
-            "board_rf",
-            NodePlacement {
-                x: 760,
-                y: 180,
-                size: 146,
-            },
-        ),
-        (
-            "board_fc",
-            NodePlacement {
-                x: 1090,
-                y: 90,
-                size: 132,
-            },
-        ),
-        (
-            "board_pb",
-            NodePlacement {
-                x: 1090,
-                y: 270,
-                size: 132,
-            },
-        ),
-        (
-            "side_umbilical_radio",
-            NodePlacement {
-                x: 520,
-                y: 500,
-                size: 120,
-            },
-        ),
-        (
-            "board_gw",
-            NodePlacement {
-                x: 760,
-                y: 500,
-                size: 146,
-            },
-        ),
-        (
-            "board_vb",
-            NodePlacement {
-                x: 1070,
-                y: 420,
-                size: 132,
-            },
-        ),
-        (
-            "board_daq",
-            NodePlacement {
-                x: 1210,
-                y: 520,
-                size: 132,
-            },
-        ),
-        (
-            "board_ab",
-            NodePlacement {
-                x: 1070,
-                y: 610,
-                size: 132,
-            },
-        ),
-    ])
 }
 
 fn collect_endpoint_rows(nodes: &[NetworkTopologyNode]) -> Vec<(String, Vec<String>)> {
@@ -651,7 +614,7 @@ fn collect_endpoint_rows(nodes: &[NetworkTopologyNode]) -> Vec<(String, Vec<Stri
 
 fn endpoint_owner_label(node: &NetworkTopologyNode) -> Option<String> {
     match node.kind {
-        NetworkTopologyNodeKind::Router => Some("Ground Station".to_string()),
+        NetworkTopologyNodeKind::Router => Some(node.label.clone()),
         NetworkTopologyNodeKind::Board => Some(node.label.clone()),
         NetworkTopologyNodeKind::Endpoint | NetworkTopologyNodeKind::Side => None,
     }
@@ -660,7 +623,7 @@ fn endpoint_owner_label(node: &NetworkTopologyNode) -> Option<String> {
 fn render_link(
     link: &NetworkTopologyLink,
     nodes: &[NetworkTopologyNode],
-    placements: &HashMap<&'static str, NodePlacement>,
+    placements: &HashMap<String, NodePlacement>,
 ) -> Element {
     let Some(source) = placement_for(&link.source, placements) else {
         return rsx! { g {} };
@@ -705,7 +668,8 @@ fn render_node(
     node: &NetworkTopologyNode,
     links: &[NetworkTopologyLink],
     nodes: &[NetworkTopologyNode],
-    placements: &HashMap<&'static str, NodePlacement>,
+    placements: &HashMap<String, NodePlacement>,
+    graph_width: i32,
     expanded_node_id: Signal<Option<String>>,
 ) -> Element {
     let Some(placement) = placement_for(&node.id, placements) else {
@@ -729,12 +693,12 @@ fn render_node(
     } else {
         "none"
     };
-    let panel_left = if placement.x > (GRAPH_WIDTH / 2) {
+    let panel_left = if placement.x > (graph_width / 2) {
         "auto"
     } else {
         "calc(100% + 14px)"
     };
-    let panel_right = if placement.x > (GRAPH_WIDTH / 2) {
+    let panel_right = if placement.x > (graph_width / 2) {
         "calc(100% + 14px)"
     } else {
         "auto"
@@ -816,10 +780,7 @@ fn render_node(
     }
 }
 
-fn placement_for(
-    id: &str,
-    placements: &HashMap<&'static str, NodePlacement>,
-) -> Option<NodePlacement> {
+fn placement_for(id: &str, placements: &HashMap<String, NodePlacement>) -> Option<NodePlacement> {
     placements.get(id).copied()
 }
 
@@ -868,19 +829,8 @@ fn link_style(status: NetworkTopologyStatus) -> (&'static str, &'static str, &'s
 }
 
 fn link_color(link: &NetworkTopologyLink, default: &'static str) -> &'static str {
-    match link.label.as_deref() {
-        Some("rocket radio") => match link.status {
-            NetworkTopologyStatus::Online => "#f59e0b",
-            NetworkTopologyStatus::Offline => "#ef4444",
-            NetworkTopologyStatus::Simulated => "#c084fc",
-        },
-        Some("umbilical radio") => match link.status {
-            NetworkTopologyStatus::Online => "#14b8a6",
-            NetworkTopologyStatus::Offline => "#ef4444",
-            NetworkTopologyStatus::Simulated => "#c084fc",
-        },
-        _ => default,
-    }
+    let _ = link;
+    default
 }
 
 fn topology_th_style() -> &'static str {
@@ -930,5 +880,331 @@ fn node_style(
             "#ddd6fe",
             "Simulated",
         ),
+    }
+}
+
+fn node_size(kind: NetworkTopologyNodeKind) -> i32 {
+    match kind {
+        NetworkTopologyNodeKind::Router => 220,
+        NetworkTopologyNodeKind::Side => 144,
+        NetworkTopologyNodeKind::Board => 164,
+        NetworkTopologyNodeKind::Endpoint => 120,
+    }
+}
+
+fn estimated_label_lines(node: &NetworkTopologyNode) -> i32 {
+    let chars_per_line = match node.kind {
+        NetworkTopologyNodeKind::Router => 18,
+        NetworkTopologyNodeKind::Side => 14,
+        NetworkTopologyNodeKind::Board => 13,
+        NetworkTopologyNodeKind::Endpoint => 12,
+    };
+    let mut lines = 1_i32;
+    let mut current = 0_i32;
+    for word in node.label.split_whitespace() {
+        let word_len = word.chars().count() as i32;
+        if current == 0 {
+            current = word_len;
+            continue;
+        }
+        if current + 1 + word_len > chars_per_line {
+            lines += 1;
+            current = word_len;
+        } else {
+            current += 1 + word_len;
+        }
+    }
+    lines.max(1)
+}
+
+fn node_diameter(node: &NetworkTopologyNode) -> i32 {
+    let base = node_size(node.kind);
+    let extra_label_height = (estimated_label_lines(node) - 2).max(0) * 18;
+    let endpoint_extra = if node.endpoints.is_empty() { 0 } else { 10 };
+    let sender_extra = if node.sender_id.is_some() { 0 } else { 6 };
+    base + extra_label_height + endpoint_extra + sender_extra
+}
+
+fn stack_height(nodes: &[&NetworkTopologyNode], node_gap: i32) -> i32 {
+    if nodes.is_empty() {
+        return 0;
+    }
+    nodes.iter().map(|node| node_diameter(node)).sum::<i32>() + node_gap * (nodes.len() as i32 - 1)
+}
+
+fn compute_graph_layout(
+    nodes: &[NetworkTopologyNode],
+    links: &[NetworkTopologyLink],
+) -> GraphLayout {
+    let horizontal_gap = 320_i32;
+    let node_gap = 40_i32;
+    let margin_x = 160_i32;
+    let margin_y = 120_i32;
+
+    if nodes.is_empty() {
+        return GraphLayout {
+            width: GRAPH_MIN_WIDTH,
+            height: GRAPH_MIN_HEIGHT,
+            placements: HashMap::new(),
+        };
+    }
+
+    let mut adjacency = HashMap::<String, Vec<String>>::new();
+    let mut indegree = HashMap::<String, usize>::new();
+    let mut kind_by_id = HashMap::<String, NetworkTopologyNodeKind>::new();
+
+    for node in nodes {
+        adjacency.entry(node.id.clone()).or_default();
+        indegree.entry(node.id.clone()).or_insert(0);
+        kind_by_id.insert(node.id.clone(), node.kind);
+    }
+    for link in links {
+        adjacency
+            .entry(link.source.clone())
+            .or_default()
+            .push(link.target.clone());
+        adjacency
+            .entry(link.target.clone())
+            .or_default()
+            .push(link.source.clone());
+        *indegree.entry(link.target.clone()).or_insert(0) += 1;
+    }
+
+    let mut roots = nodes
+        .iter()
+        .filter(|node| indegree.get(&node.id).copied().unwrap_or(0) == 0)
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        roots = nodes
+            .iter()
+            .filter(|node| node.kind == NetworkTopologyNodeKind::Router)
+            .map(|node| node.id.clone())
+            .collect();
+    }
+    if roots.is_empty() {
+        roots.push(nodes[0].id.clone());
+    }
+
+    let mut layer_map = HashMap::<String, usize>::new();
+    let mut queue = std::collections::VecDeque::<String>::new();
+    for root in roots {
+        if layer_map.insert(root.clone(), 0).is_none() {
+            queue.push_back(root);
+        }
+    }
+    while let Some(node_id) = queue.pop_front() {
+        let current_layer = layer_map.get(&node_id).copied().unwrap_or(0);
+        if let Some(neighbors) = adjacency.get(&node_id) {
+            for neighbor in neighbors {
+                let next_layer = current_layer + 1;
+                let update = match layer_map.get(neighbor) {
+                    Some(existing) => next_layer < *existing,
+                    None => true,
+                };
+                if update {
+                    layer_map.insert(neighbor.clone(), next_layer);
+                    queue.push_back(neighbor.clone());
+                }
+            }
+        }
+    }
+
+    let mut unplaced = nodes
+        .iter()
+        .filter(|node| !layer_map.contains_key(&node.id))
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    while let Some(id) = unplaced.pop() {
+        let start_layer = layer_map.values().copied().max().unwrap_or(0) + 1;
+        layer_map.insert(id.clone(), start_layer);
+        queue.push_back(id.clone());
+        while let Some(node_id) = queue.pop_front() {
+            let current_layer = layer_map.get(&node_id).copied().unwrap_or(start_layer);
+            if let Some(neighbors) = adjacency.get(&node_id) {
+                for neighbor in neighbors {
+                    if layer_map.contains_key(neighbor) {
+                        continue;
+                    }
+                    layer_map.insert(neighbor.clone(), current_layer + 1);
+                    queue.push_back(neighbor.clone());
+                }
+            }
+        }
+        unplaced.retain(|node_id| !layer_map.contains_key(node_id));
+    }
+
+    let root_router_ids = nodes
+        .iter()
+        .filter(|node| node.kind == NetworkTopologyNodeKind::Router)
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+
+    let mut branch_roots = nodes
+        .iter()
+        .filter(|node| node.kind == NetworkTopologyNodeKind::Side)
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+
+    if branch_roots.is_empty() {
+        branch_roots = root_router_ids
+            .iter()
+            .flat_map(|router_id| {
+                adjacency
+                    .get(router_id)
+                    .into_iter()
+                    .flat_map(|neighbors| neighbors.iter())
+                    .filter(|neighbor| *neighbor != router_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        branch_roots.sort();
+        branch_roots.dedup();
+    }
+
+    let branch_root_set = branch_roots
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let root_router_set = root_router_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let mut branch_index_by_node = HashMap::<String, usize>::new();
+
+    for (branch_idx, branch_root) in branch_roots.iter().enumerate() {
+        let mut queue = std::collections::VecDeque::<String>::new();
+        queue.push_back(branch_root.clone());
+        branch_index_by_node
+            .entry(branch_root.clone())
+            .or_insert(branch_idx);
+        while let Some(node_id) = queue.pop_front() {
+            if let Some(neighbors) = adjacency.get(&node_id) {
+                for neighbor in neighbors {
+                    if root_router_set.contains(neighbor) {
+                        continue;
+                    }
+                    if branch_root_set.contains(neighbor) && neighbor != branch_root {
+                        continue;
+                    }
+                    if branch_index_by_node.contains_key(neighbor) {
+                        continue;
+                    }
+                    branch_index_by_node.insert(neighbor.clone(), branch_idx);
+                    queue.push_back(neighbor.clone());
+                }
+            }
+        }
+    }
+
+    let max_layer = layer_map.values().copied().max().unwrap_or(0);
+    let mut layers = vec![Vec::<&NetworkTopologyNode>::new(); max_layer + 1];
+    for node in nodes {
+        let layer = layer_map.get(&node.id).copied().unwrap_or(0);
+        layers[layer].push(node);
+    }
+
+    for layer_nodes in &mut layers {
+        layer_nodes.sort_by(|a, b| {
+            let kind_rank = |kind: NetworkTopologyNodeKind| match kind {
+                NetworkTopologyNodeKind::Router => 0,
+                NetworkTopologyNodeKind::Side => 1,
+                NetworkTopologyNodeKind::Board => 2,
+                NetworkTopologyNodeKind::Endpoint => 3,
+            };
+            kind_rank(a.kind)
+                .cmp(&kind_rank(b.kind))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+    }
+
+    let branch_count = branch_roots.len().max(1) as i32;
+    let max_branch_stack_height = layers
+        .iter()
+        .map(|layer_nodes| {
+            let mut counts = HashMap::<Option<usize>, Vec<&NetworkTopologyNode>>::new();
+            for node in layer_nodes {
+                let branch = branch_index_by_node.get(&node.id).copied();
+                counts.entry(branch).or_default().push(*node);
+            }
+            counts
+                .values()
+                .map(|branch_nodes| stack_height(branch_nodes, node_gap))
+                .max()
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+        .max(220);
+    let branch_gap = max_branch_stack_height + 96;
+    let content_height = ((branch_count - 1).max(0) * branch_gap) + max_branch_stack_height + 120;
+    let total_height = (content_height + margin_y * 2).max(GRAPH_MIN_HEIGHT);
+    let mut placements = HashMap::<String, NodePlacement>::new();
+    let graph_center_y = total_height / 2;
+    let branch_center_offset = (branch_count - 1) as f32 / 2.0;
+
+    for (layer_idx, layer_nodes) in layers.iter().enumerate() {
+        if layer_nodes.is_empty() {
+            continue;
+        }
+
+        let mut by_branch = HashMap::<Option<usize>, Vec<&NetworkTopologyNode>>::new();
+        for node in layer_nodes {
+            let branch = branch_index_by_node.get(&node.id).copied();
+            by_branch.entry(branch).or_default().push(*node);
+        }
+
+        let mut branch_keys = by_branch.keys().copied().collect::<Vec<_>>();
+        branch_keys.sort_by(|a, b| match (a, b) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+
+        for branch_key in branch_keys {
+            let Some(branch_nodes) = by_branch.get_mut(&branch_key) else {
+                continue;
+            };
+            branch_nodes.sort_by(|a, b| a.label.cmp(&b.label));
+            let branch_center_y = match branch_key {
+                Some(branch_idx) => {
+                    graph_center_y
+                        + ((branch_idx as f32 - branch_center_offset) * branch_gap as f32) as i32
+                }
+                None => graph_center_y,
+            };
+            let stack_height = stack_height(branch_nodes, node_gap);
+            let mut cursor_y = branch_center_y - (stack_height / 2);
+
+            for node in branch_nodes.iter() {
+                let size = node_diameter(node);
+                let x = margin_x + layer_idx as i32 * horizontal_gap;
+                let y = cursor_y + (size / 2);
+                placements.insert(
+                    node.id.clone(),
+                    NodePlacement {
+                        x,
+                        y,
+                        size,
+                    },
+                );
+                cursor_y += size + node_gap;
+            }
+        }
+    }
+
+    let rightmost = placements
+        .values()
+        .map(|placement| placement.x + placement.size / 2)
+        .max()
+        .unwrap_or(GRAPH_MIN_WIDTH - margin_x);
+    let width = (rightmost + margin_x).max(GRAPH_MIN_WIDTH);
+
+    GraphLayout {
+        width,
+        height: total_height,
+        placements,
     }
 }

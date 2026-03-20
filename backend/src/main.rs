@@ -17,9 +17,10 @@ mod safety_task;
 mod sequences;
 mod state;
 mod telemetry_task;
+mod types;
 mod web;
 
-use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
+use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
 use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
@@ -28,14 +29,14 @@ use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
 
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
 use crate::radio::DummyRadio;
-use crate::radio::{RadioDevice, link_description, open_link, startup_failure_hint};
+use crate::radio::{link_description, open_link, startup_failure_hint, RadioDevice};
+use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
-use groundstation_shared::{Board, FlightState as FlightStateMode};
-use sedsprintf_rs_2026::TelemetryError;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
+use sedsprintf_rs_2026::TelemetryError;
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Connection, Row};
 use std::collections::HashMap;
@@ -67,6 +68,51 @@ fn env_i64(name: &str, default: i64, min: i64, max: i64) -> i64 {
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(default)
         .clamp(min, max)
+}
+
+fn ensure_sqlite_db_file(path: &Path) -> anyhow::Result<String> {
+    if !path.exists() {
+        fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        fs::write(path, b"")?;
+        println!("Created empty DB file: {}", path.display());
+    }
+    Ok(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().to_string())
+}
+
+async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            token             TEXT PRIMARY KEY,
+            username          TEXT NOT NULL,
+            session_type      TEXT NOT NULL,
+            can_view_data     INTEGER NOT NULL,
+            can_send_commands INTEGER NOT NULL,
+            allowed_commands_json TEXT NOT NULL DEFAULT '[]',
+            created_at_ms     INTEGER NOT NULL,
+            expires_at_ms     INTEGER NOT NULL
+        );
+        "#,
+    )
+        .execute(db)
+        .await?;
+
+    let session_columns = sqlx::query("PRAGMA table_info(auth_sessions);")
+        .fetch_all(db)
+        .await?;
+    let has_allowed_commands_json = session_columns.iter().any(|row| {
+        row.get::<String, _>("name")
+            .eq_ignore_ascii_case("allowed_commands_json")
+    });
+    if !has_allowed_commands_json {
+        sqlx::query(
+            "ALTER TABLE auth_sessions ADD COLUMN allowed_commands_json TEXT NOT NULL DEFAULT '[]';",
+        )
+            .execute(db)
+            .await?;
+    }
+
+    Ok(())
 }
 
 async fn apply_sqlite_pragmas(db: &sqlx::SqlitePool) {
@@ -253,17 +299,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- DB path ---
-    let mut db_path = PathBuf::from("./data/groundstation.db");
-    if !db_path.exists() {
-        fs::create_dir_all(db_path.parent().unwrap_or_else(|| Path::new(".")))?;
-        fs::write(&db_path, b"")?;
-        println!("Created empty DB file.");
-    }
-    db_path = fs::canonicalize(&db_path).unwrap_or(db_path);
-    let db_path_str = db_path.to_string_lossy().to_string();
+    let db_path = PathBuf::from("./data/groundstation.db");
+    let db_path_str = ensure_sqlite_db_file(&db_path)?;
+    let auth_db_path = db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("users.db");
+    let auth_db_path_str = ensure_sqlite_db_file(&auth_db_path)?;
 
     let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path_str)).await?;
     apply_sqlite_pragmas(&db).await;
+    let auth_db = sqlx::SqlitePool::connect(&format!("sqlite://{}", auth_db_path_str)).await?;
+    apply_sqlite_pragmas(&auth_db).await;
 
     // --- Tables ---
     sqlx::query(
@@ -278,8 +325,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     // Add values_json column for older DBs.
     let cols = sqlx::query("PRAGMA table_info(telemetry)")
@@ -320,40 +367,10 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS auth_sessions (
-            token             TEXT PRIMARY KEY,
-            username          TEXT NOT NULL,
-            session_type      TEXT NOT NULL,
-            can_view_data     INTEGER NOT NULL,
-            can_send_commands INTEGER NOT NULL,
-            allowed_commands_json TEXT NOT NULL DEFAULT '[]',
-            created_at_ms     INTEGER NOT NULL,
-            expires_at_ms     INTEGER NOT NULL
-        );
-        "#,
-    )
-    .execute(&db)
-    .await?;
-
-    let session_columns = sqlx::query("PRAGMA table_info(auth_sessions);")
-        .fetch_all(&db)
-        .await?;
-    let has_allowed_commands_json = session_columns.iter().any(|row| {
-        row.get::<String, _>("name")
-            .eq_ignore_ascii_case("allowed_commands_json")
-    });
-    if !has_allowed_commands_json {
-        sqlx::query(
-            "ALTER TABLE auth_sessions ADD COLUMN allowed_commands_json TEXT NOT NULL DEFAULT '[]';",
-        )
         .execute(&db)
         .await?;
-    }
+
+    ensure_auth_sessions_table(&auth_db).await?;
 
     sqlx::query(
         r#"
@@ -364,8 +381,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -408,7 +425,7 @@ async fn main() -> anyhow::Result<()> {
     let auth = Arc::new(auth::AuthManager::new(users_path));
     auth.ensure_file()
         .map_err(|e| anyhow::anyhow!("failed to initialize users.json: {e}"))?;
-    let _ = auth.cleanup_expired_sessions(&db).await;
+    let _ = auth.cleanup_expired_sessions(&auth_db).await;
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
@@ -416,6 +433,7 @@ async fn main() -> anyhow::Result<()> {
         warnings_tx: broadcast::channel(alerts_capacity).0,
         errors_tx: broadcast::channel(alerts_capacity).0,
         db,
+        auth_db,
         state: Arc::new(Mutex::new(FlightStateMode::Startup)),
         state_tx: broadcast::channel(16).0,
         gpio,
@@ -695,6 +713,18 @@ async fn main() -> anyhow::Result<()> {
     if !lingering.is_empty() {
         eprintln!(
             "WARNING: SQLite sidecar files still present after shutdown cleanup: {}",
+            lingering.join(", ")
+        );
+    }
+
+    flush_sqlite_journals(&state.auth_db).await;
+    state.auth_db.close().await;
+    finalize_sqlite_after_pool_close(&auth_db_path_str).await;
+    remove_sqlite_sidecars(&auth_db_path_str).await;
+    let lingering = sqlite_sidecars_present(&auth_db_path_str);
+    if !lingering.is_empty() {
+        eprintln!(
+            "WARNING: Auth SQLite sidecar files still present after shutdown cleanup: {}",
             lingering.join(", ")
         );
     }

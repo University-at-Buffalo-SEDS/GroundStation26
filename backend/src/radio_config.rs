@@ -4,7 +4,12 @@ use std::path::PathBuf;
 
 use crate::radio::{RADIO_BAUD_RATE, ROCKET_RADIO_PORT, UMBILICAL_RADIO_PORT};
 
-const DEFAULT_CONFIG_PATH: &str = "./data/radio_links.json";
+const DEFAULT_CONFIG_PATH: &str = "comms/coms.json";
+const LEGACY_CONFIG_PATHS: &[&str] = &[
+    "comms/radio_links.json",
+    "data/radio_links.json",
+    "../comms/radio_links.json",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SerialLinkConfig {
@@ -130,11 +135,12 @@ impl RadioLinkConfig {
 pub fn config_path() -> PathBuf {
     std::env::var("GS_RADIO_LINK_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CONFIG_PATH))
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_CONFIG_PATH))
 }
 
 pub fn load_or_default() -> RadioLinksConfig {
     let path = config_path();
+    migrate_legacy_config(&path);
     match fs::read_to_string(&path) {
         Ok(raw) => match serde_json::from_str::<RadioLinksConfig>(&raw) {
             Ok(cfg) => cfg,
@@ -176,6 +182,39 @@ pub fn save(cfg: &RadioLinksConfig) -> Result<(), String> {
         .map_err(|err| format!("serialize radio link config: {err}"))?;
     fs::write(&path, raw)
         .map_err(|err| format!("write radio link config {}: {err}", path.display()))
+}
+
+fn migrate_legacy_config(target_path: &PathBuf) {
+    if std::env::var_os("GS_RADIO_LINK_CONFIG").is_some() || target_path.exists() {
+        return;
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for legacy_rel_path in LEGACY_CONFIG_PATHS {
+        let legacy_path = manifest_dir.join(legacy_rel_path);
+        if !legacy_path.exists() {
+            continue;
+        }
+        if let Some(parent) = target_path.parent()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "WARNING: failed to create radio config directory {}: {err}",
+                parent.display()
+            );
+            return;
+        }
+        if let Err(err) = fs::rename(&legacy_path, target_path) {
+            if let Err(copy_err) = fs::copy(&legacy_path, target_path) {
+                eprintln!(
+                    "WARNING: failed to migrate radio link config {} -> {}: {err}; copy fallback failed: {copy_err}",
+                    legacy_path.display(),
+                    target_path.display()
+                );
+                return;
+            }
+        }
+        return;
+    }
 }
 
 #[cfg(test)]

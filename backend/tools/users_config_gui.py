@@ -10,7 +10,6 @@ import os
 import re
 import secrets
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -67,9 +66,9 @@ def available_commands(source_path: Path = DEFAULT_COMMANDS_SOURCE) -> list[str]
 
     commands: list[str] = []
     for match in re.finditer(
-        r"pub fn all_command_names\(\) -> Vec<&'static str>\s*\{\s*vec!\[(?P<body>.*?)\]\s*\}",
-        raw,
-        re.DOTALL,
+            r"pub fn all_command_names\(\) -> Vec<&'static str>\s*\{\s*vec!\[(?P<body>.*?)\]\s*\}",
+            raw,
+            re.DOTALL,
     ):
         body = match.group("body")
         commands.extend(re.findall(r'"([^"]+)"', body))
@@ -116,14 +115,14 @@ def save_config(path: Path, cfg: dict[str, Any]) -> None:
 
 
 def upsert_user(
-    cfg: dict[str, Any],
-    username: str,
-    *,
-    password: str | None,
-    view_data: bool,
-    send_commands: bool,
-    disabled: bool,
-    allowed_commands: list[str] | None,
+        cfg: dict[str, Any],
+        username: str,
+        *,
+        password: str | None,
+        view_data: bool,
+        send_commands: bool,
+        disabled: bool,
+        allowed_commands: list[str] | None,
 ) -> None:
     username = username.strip()
     if not username:
@@ -348,9 +347,9 @@ def prompt_bool(label: str, default: bool) -> bool:
 
 
 def prompt_command_selection(
-    label: str,
-    commands_catalog: list[str],
-    current: list[str],
+        label: str,
+        commands_catalog: list[str],
+        current: list[str],
 ) -> list[str]:
     if not commands_catalog:
         raw = input(

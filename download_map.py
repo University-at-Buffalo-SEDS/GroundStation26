@@ -44,7 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keep-tiles",
         action="store_true",
-        help="Keep backend/data/maps/<region>/tiles after successful bundle build (default removes tiles and keeps DB).",
+        help="Keep backend/data/maps/<region>/tiles after successful bundle build (default removes tiles and keeps "
+             "DB).",
     )
     parser.add_argument(
         "--direct-to-db",

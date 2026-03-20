@@ -125,11 +125,11 @@ def fetch_archive(remote: str, local_archive: Path) -> None:
 
 
 def fetch_and_unpack(
-    remote: str,
-    local_archive: Path,
-    dest: Path,
-    threads: int,
-    delete_archive: bool,
+        remote: str,
+        local_archive: Path,
+        dest: Path,
+        threads: int,
+        delete_archive: bool,
 ) -> None:
     fetch_archive(remote=remote, local_archive=local_archive)
     decompress_maps(archive=local_archive, dest=dest, threads=threads)

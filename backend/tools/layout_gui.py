@@ -54,13 +54,13 @@ def validate_layout(data: dict) -> list[str]:
         return ["Layout root must be an object."]
 
     for key in (
-        "version",
-        "main_tabs",
-        "connection_tab",
-        "network_tab",
-        "actions_tab",
-        "data_tab",
-        "state_tab",
+            "version",
+            "main_tabs",
+            "connection_tab",
+            "network_tab",
+            "actions_tab",
+            "data_tab",
+            "state_tab",
     ):
         if key not in data:
             errors.append(f"Missing top-level key: {key}")

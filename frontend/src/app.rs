@@ -3,10 +3,12 @@
 const _CONNECTION_TIMEOUT_MS: u64 = 8000;
 const _BODY_TRANSFER_TIMEOUT_MS: u64 = 10000;
 const _WS_TIMEOUT_MS: u64 = 4500;
+#[allow(dead_code)]
+const APP_DISPLAY_NAME: &str = "Telemetry Client";
 
 use crate::auth::{self, SessionStatus as AuthSessionStatus};
 use dioxus::prelude::*;
-use dioxus_router::{Routable, Router, use_navigator};
+use dioxus_router::{use_navigator, Routable, Router};
 
 #[allow(unused_imports)]
 use crate::telemetry_dashboard::UrlConfig;
@@ -160,7 +162,7 @@ mod persist {
     #[cfg(target_os = "android")]
     fn android_storage_dir() -> Option<std::path::PathBuf> {
         use jni::objects::{JObject, JString};
-        use jni::{JavaVM, jni_sig, jni_str};
+        use jni::{jni_sig, jni_str, JavaVM};
         use ndk_context::android_context;
 
         let ctx = android_context();
@@ -189,7 +191,7 @@ mod persist {
             let _ = context.into_raw();
             Ok(std::path::PathBuf::from(path).join("gs26"))
         })
-        .ok()
+            .ok()
     }
 
     fn storage_dir() -> std::path::PathBuf {
@@ -501,15 +503,15 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl, skip_tls_verify: bool) -> Resu
                 false,
                 Some(tokio_tungstenite::Connector::NativeTls(tls)),
             )
-            .await
-            .map_err(|e| format!("{e}"))
+                .await
+                .map_err(|e| format!("{e}"))
         } else {
             tokio_tungstenite::connect_async(ws_url.clone())
                 .await
                 .map_err(|e| format!("{e}"))
         }
     })
-    .await;
+        .await;
 
     match res {
         Err(_) => Err(format!(
@@ -602,7 +604,6 @@ fn format_route_report_host_only(
 // -------------------------
 #[component]
 pub fn App() -> Element {
-    auth::init_from_storage();
     #[cfg(not(target_arch = "wasm32"))]
     {
         keep_awake::set_enabled(true);
@@ -657,6 +658,7 @@ fn LoginCard(
 ) -> Element {
     let nav = use_navigator();
     let base = UrlConfig::base_http();
+    auth::init_from_storage(&base);
     let effect_base = base.clone();
     let continue_logged_out_base = base.clone();
     let skip_tls = UrlConfig::_skip_tls_verify();
@@ -672,6 +674,13 @@ fn LoginCard(
     let mut remember_me = use_signal(|| auth::current_session().is_some());
     let mut status = use_signal(String::new);
     let mut busy = use_signal(|| false);
+
+    use_effect({
+        let effect_base = effect_base.clone();
+        move || {
+            auth::init_from_storage(&effect_base);
+        }
+    });
 
     use_effect(move || {
         if effect_base.trim().is_empty() {
@@ -891,7 +900,7 @@ pub fn Connect() -> Element {
 
                 div {
                     style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px;",
-                    h1 { style: "margin:0; font-size:20px;", "UBSEDS GS" }
+                    h1 { style: "margin:0; font-size:20px;", "{APP_DISPLAY_NAME}" }
                     button {
                         style: "
                             padding:10px 14px;
@@ -1099,7 +1108,7 @@ pub fn Version() -> Element {
                 style: "width:min(900px, 100%); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
                 div {
                     style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap;",
-                    h1 { style: "margin:0; font-size:20px;", "UBSEDS GS" }
+                    h1 { style: "margin:0; font-size:20px;", "{APP_DISPLAY_NAME}" }
                     button {
                         style: "
                             padding:10px 14px;
@@ -1154,13 +1163,20 @@ pub fn Dashboard() -> Element {
         }
     }
 
+    let base = UrlConfig::base_http();
+    auth::init_from_storage(&base);
     let mut auth_state = use_signal(|| None::<Result<AuthSessionStatus, String>>);
+    let mut auth_state_base = use_signal(String::new);
     use_effect(move || {
+        let base = UrlConfig::base_http();
+        if *auth_state_base.read() != base {
+            auth_state_base.set(base.clone());
+            auth_state.set(None);
+        }
+        let skip_tls = UrlConfig::_skip_tls_verify();
         if auth_state.read().is_some() {
             return;
         }
-        let base = UrlConfig::base_http();
-        let skip_tls = UrlConfig::_skip_tls_verify();
         spawn(async move {
             auth_state.set(Some(auth::fetch_session_status(&base, skip_tls).await));
         });

@@ -2,13 +2,14 @@ use crate::flight_sim;
 use crate::layout;
 use crate::loadcell;
 use crate::state::AppState;
-use groundstation_shared::TelemetryRow;
-use groundstation_shared::{TelemetryCommand, u8_to_flight_state};
-use sedsprintf_rs_2026::config::DEVICE_IDENTIFIER;
+#[cfg(feature = "hitl_mode")]
+use crate::types::FlightState;
+use crate::types::{u8_to_flight_state, Board, TelemetryCommand, TelemetryRow};
 use sedsprintf_rs_2026::config::DataType;
+use sedsprintf_rs_2026::config::DEVICE_IDENTIFIER;
 use sedsprintf_rs_2026::timesync::{
-    TimeSyncConfig, TimeSyncRole, TimeSyncTracker, TimeSyncUpdate, compute_offset_delay,
-    decode_timesync_request, decode_timesync_response,
+    compute_offset_delay, decode_timesync_request, decode_timesync_response, TimeSyncConfig, TimeSyncRole,
+    TimeSyncTracker, TimeSyncUpdate,
 };
 
 use crate::gpio_panel::IGNITION_PIN;
@@ -16,17 +17,16 @@ use crate::radio::RadioDevice;
 #[cfg(feature = "hitl_mode")]
 use crate::rocket_commands::FlightComputerCommands;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
-use crate::web::{FlightStateMsg, emit_warning};
-use groundstation_shared::Board;
+use crate::web::{emit_warning, FlightStateMsg};
 use sedsprintf_rs_2026::packet::Packet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
-use tokio::sync::{Notify, broadcast, mpsc};
-use tokio::time::{Duration, interval};
+use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::time::{interval, Duration};
 
 const TIMESYNC_PRIORITY: u64 = 50;
 const TIMESYNC_SOURCE_TIMEOUT_MS: u64 = 5_000;
@@ -77,30 +77,27 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
 }
 
 #[cfg(feature = "hitl_mode")]
-const HITL_FLIGHT_STATE_ORDER: [groundstation_shared::FlightState; 16] = [
-    groundstation_shared::FlightState::Startup,
-    groundstation_shared::FlightState::Idle,
-    groundstation_shared::FlightState::PreFill,
-    groundstation_shared::FlightState::FillTest,
-    groundstation_shared::FlightState::NitrogenFill,
-    groundstation_shared::FlightState::NitrousFill,
-    groundstation_shared::FlightState::Armed,
-    groundstation_shared::FlightState::Launch,
-    groundstation_shared::FlightState::Ascent,
-    groundstation_shared::FlightState::Coast,
-    groundstation_shared::FlightState::Apogee,
-    groundstation_shared::FlightState::ParachuteDeploy,
-    groundstation_shared::FlightState::Descent,
-    groundstation_shared::FlightState::Landed,
-    groundstation_shared::FlightState::Recovery,
-    groundstation_shared::FlightState::Aborted,
+const HITL_FLIGHT_STATE_ORDER: [FlightState; 16] = [
+    FlightState::Startup,
+    FlightState::Idle,
+    FlightState::PreFill,
+    FlightState::FillTest,
+    FlightState::NitrogenFill,
+    FlightState::NitrousFill,
+    FlightState::Armed,
+    FlightState::Launch,
+    FlightState::Ascent,
+    FlightState::Coast,
+    FlightState::Apogee,
+    FlightState::ParachuteDeploy,
+    FlightState::Descent,
+    FlightState::Landed,
+    FlightState::Recovery,
+    FlightState::Aborted,
 ];
 
 #[cfg(feature = "hitl_mode")]
-fn hitl_adjacent_flight_state(
-    current: groundstation_shared::FlightState,
-    delta: i32,
-) -> groundstation_shared::FlightState {
+fn hitl_adjacent_flight_state(current: FlightState, delta: i32) -> FlightState {
     let idx = HITL_FLIGHT_STATE_ORDER
         .iter()
         .position(|s| *s == current)
@@ -110,10 +107,7 @@ fn hitl_adjacent_flight_state(
 }
 
 #[cfg(feature = "hitl_mode")]
-async fn set_local_flight_state_for_hitl(
-    state: &Arc<AppState>,
-    next_state: groundstation_shared::FlightState,
-) {
+async fn set_local_flight_state_for_hitl(state: &Arc<AppState>, next_state: FlightState) {
     {
         let mut fs = state.state.lock().unwrap();
         *fs = next_state;
@@ -363,7 +357,7 @@ fn telemetry_values_json(values: &[Option<f32>]) -> Option<String> {
             .map(|v| v.map(|n| n as f64))
             .collect::<Vec<_>>(),
     )
-    .ok()
+        .ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -424,7 +418,7 @@ async fn emit_derived_battery_rows(
                         payload_json: payload_json.to_string(),
                     },
                 )
-                .await;
+                    .await;
             }
 
             let row = TelemetryRow {
@@ -482,7 +476,7 @@ async fn emit_derived_loadcell_rows(
                     payload_json: payload_json.to_string(),
                 },
             )
-            .await;
+                .await;
         }
 
         let row = TelemetryRow {
@@ -1225,7 +1219,7 @@ async fn handle_packet(
                 state_code: pkt_data as i64,
             },
         )
-        .await;
+            .await;
 
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
@@ -1251,7 +1245,7 @@ async fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                .ok();
+                    .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 queue_db_write(
@@ -1266,7 +1260,7 @@ async fn handle_packet(
                         payload_json,
                     },
                 )
-                .await;
+                    .await;
 
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
@@ -1298,7 +1292,7 @@ async fn handle_packet(
                 .map(|v| v.map(|n| n as f64))
                 .collect::<Vec<_>>(),
         )
-        .ok();
+            .ok();
 
         if should_persist_telemetry_sample(&data_type_str, ts_ms) {
             queue_db_write(
@@ -1313,7 +1307,7 @@ async fn handle_packet(
                     payload_json: payload_json.clone(),
                 },
             )
-            .await;
+                .await;
         }
 
         if let Some(voltage) = values_vec.first().copied().flatten() {
@@ -1328,7 +1322,7 @@ async fn handle_packet(
                 voltage,
                 &payload_json,
             )
-            .await;
+                .await;
 
             if data_type_str == loadcell::RAW_LOADCELL_DATA_TYPE_1000KG {
                 emit_derived_loadcell_rows(
@@ -1340,7 +1334,7 @@ async fn handle_packet(
                     voltage,
                     &payload_json,
                 )
-                .await;
+                    .await;
             }
         }
 
@@ -1366,7 +1360,7 @@ async fn handle_packet(
                     payload_json,
                 },
             )
-            .await;
+                .await;
         }
         None
     }

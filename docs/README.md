@@ -1,6 +1,7 @@
 # Documentation
 
-This directory is split by runtime concern so frontend, backend, shared-contract, and whole-system docs can evolve independently.
+This directory is split by runtime concern so frontend, backend, shared-contract, and whole-system docs can evolve
+independently.
 
 ## Structure
 

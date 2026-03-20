@@ -1,8 +1,8 @@
 #![allow(clippy::redundant_locals)]
 
 use super::{
-    TELEMETRY_RENDER_EPOCH, http_get_json, http_post_json, latest_telemetry_row,
-    latest_telemetry_value,
+    http_get_json, http_post_json, latest_telemetry_row, latest_telemetry_value,
+    TELEMETRY_RENDER_EPOCH,
 };
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,14 @@ impl Channel {
             Self::Ch0 => "50kg",
             Self::Ch1 => "1000kg",
             Self::Iadc => "Tank Pressure",
+        }
+    }
+
+    fn fit_color(&self) -> &'static str {
+        match self {
+            Self::Ch0 => "#f59e0b",
+            Self::Ch1 => "#22d3ee",
+            Self::Iadc => "#a78bfa",
         }
     }
 }
@@ -175,7 +183,7 @@ enum CaptureMode {
     SequencePoint,
 }
 
-fn sleep_ms(ms: u32) -> impl Future<Output = ()> {
+fn sleep_ms(ms: u32) -> impl Future<Output=()> {
     #[cfg(target_arch = "wasm32")]
     {
         gloo_timers::future::TimeoutFuture::new(ms)
@@ -613,7 +621,7 @@ pub fn CalibrationTab() -> Element {
                                 "/api/calibration/capture_zero",
                                 &body,
                             )
-                            .await
+                                .await
                             {
                                 Ok(new_cfg) => {
                                     cfg.set(Some(new_cfg));
@@ -635,7 +643,7 @@ pub fn CalibrationTab() -> Element {
                                 "/api/calibration/capture_span",
                                 &body,
                             )
-                            .await
+                                .await
                             {
                                 Ok(_) => {
                                     let refit = RefitReq {
@@ -646,7 +654,7 @@ pub fn CalibrationTab() -> Element {
                                         "/api/calibration/refit",
                                         &refit,
                                     )
-                                    .await
+                                        .await
                                     {
                                         Ok(new_cfg) => {
                                             cfg.set(Some(new_cfg));
@@ -739,6 +747,7 @@ pub fn CalibrationTab() -> Element {
     let fit_equation_text = fit_meta_text
         .clone()
         .unwrap_or_else(|| format!("type={fit_type_s}"));
+    let fit_color = channel.fit_color();
 
     let plot_w = 900.0_f32;
     let plot_h = 260.0_f32;
@@ -1173,13 +1182,17 @@ pub fn CalibrationTab() -> Element {
             }
 
             div { style: "border:1px solid #334155; border-radius:10px; padding:8px; background:#020617;",
-                div { style: "display:grid; grid-template-columns:minmax(160px, 220px) minmax(0, 1fr); gap:12px; align-items:start; padding:6px 6px 10px 6px;",
+                div {
+                    style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:6px 8px 10px 8px;",
+                    svg { width: "30", height: "10", view_box: "0 0 30 10", style: "display:block; flex:0 0 auto;",
+                        line { x1:"2", y1:"5", x2:"28", y2:"5", stroke:"{fit_color}", "stroke-width":"2.5", "stroke-linecap":"round" }
+                    }
                     div {
-                        style: "font-size:12px; color:#94a3b8; font-weight:700; letter-spacing:0.03em; text-transform:uppercase;",
+                        style: "color:{fit_color}; font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase;",
                         "Calibration Fit"
                     }
                     div {
-                        style: "color:#cbd5e1; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums; white-space:pre-wrap; word-break:break-word; line-height:1.45; min-height:20px;",
+                        style: "color:{fit_color}; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums; white-space:pre-wrap; word-break:break-word; line-height:1.45; min-height:20px;",
                         "{fit_equation_text}"
                     }
                 }
@@ -1188,7 +1201,7 @@ pub fn CalibrationTab() -> Element {
                     line { x1:"{pad_l}", y1:"{pad_t}", x2:"{pad_l}", y2:"{plot_h - pad_b}", stroke:"#334155", "stroke-width":"1" }
                     line { x1:"{pad_l}", y1:"{plot_h - pad_b}", x2:"{plot_w - pad_r}", y2:"{plot_h - pad_b}", stroke:"#334155", "stroke-width":"1" }
                     if !fit_path.is_empty() {
-                        path { d: "{fit_path}", fill:"none", stroke:"#22d3ee", "stroke-width":"2" }
+                        path { d: "{fit_path}", fill:"none", stroke:"{fit_color}", "stroke-width":"2.5" }
                     }
                     for (cx, cy) in scatter_xy.iter() {
                         circle { cx:"{cx}", cy:"{cy}", r:"3.5", fill:"#f59e0b" }

@@ -13,7 +13,10 @@ RUN set -e; \
 
 # Directory creation
 WORKDIR /app
-RUN mkdir -p backend/sr
+RUN mkdir -p backend/src
+RUN mkdir -p backend/data
+RUN mkdir -p backend/comms
+RUN mkdir -p backend/users
 RUN mkdir -p map_downloader/src
 RUN mkdir -p frontend/dist
 RUN mkdir -p shared/src
@@ -22,6 +25,9 @@ RUN mkdir -p shared/src
 COPY backend/Cargo.toml backend/
 COPY backend/src backend/src
 COPY backend/layout backend/layout
+COPY backend/calibration backend/calibration
+COPY backend/comms backend/comms
+COPY backend/users backend/users
 
 # Map downloader crate
 COPY map_downloader/Cargo.toml map_downloader/
@@ -90,7 +96,18 @@ RUN apt-get update \
 
 WORKDIR /app
 
+RUN mkdir -p /app/backend/data \
+    /app/backend/layout \
+    /app/backend/calibration \
+    /app/backend/comms \
+    /app/backend/users \
+    /app/frontend/dist \
+    /app/map_downloader
+
+COPY --from=builder /app/backend/calibration /app/backend/calibration/
+COPY --from=builder /app/backend/comms /app/backend/comms/
 COPY --from=builder /app/backend/layout /app/backend/layout/
+COPY --from=builder /app/backend/users /app/backend/users/
 COPY --from=builder /app/target/release/groundstation_backend /app/
 COPY --from=builder /app/target/release/map_downloader /app/map_downloader/
 COPY --from=builder /app/frontend/dist /app/frontend/dist/

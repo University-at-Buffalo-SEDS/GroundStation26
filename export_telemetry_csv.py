@@ -42,10 +42,10 @@ def main() -> None:
         }
         has_sender_id = "sender_id" in table_cols
         query = (
-            "SELECT timestamp_ms, data_type, "
-            + ("sender_id, " if has_sender_id else "NULL AS sender_id, ")
-            + "values_json, payload_json "
-            "FROM telemetry ORDER BY timestamp_ms"
+                "SELECT timestamp_ms, data_type, "
+                + ("sender_id, " if has_sender_id else "NULL AS sender_id, ")
+                + "values_json, payload_json "
+                  "FROM telemetry ORDER BY timestamp_ms"
         )
         cursor = conn.execute(query)
         col_names = [col[0] for col in cursor.description]

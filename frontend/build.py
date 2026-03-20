@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 import gzip
 import json
-import multiprocessing as mp
 import os
-import platform
 import plistlib
 import re
 import shutil
@@ -11,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+
+import platform
 
 try:
     import tomllib  # py3.11+
@@ -449,9 +449,9 @@ def rename_windows_linux_artifacts(frontend_dir: Path, platform_name: str) -> No
     for item in sorted(dist.iterdir()):
         name = item.name
         if not (
-            name.startswith(LEGACY_APP_NAME)
-            or name.startswith(APP_NAME)
-            or name.startswith(target_name)
+                name.startswith(LEGACY_APP_NAME)
+                or name.startswith(APP_NAME)
+                or name.startswith(target_name)
         ):
             continue
         if name.startswith(LEGACY_APP_NAME):
@@ -567,8 +567,12 @@ def _resolve_makensis() -> Optional[str]:
         return None
 
     candidates = [
-        str(_which_in_path("makensis", os.environ.get("PATH", ""))) if _which_in_path("makensis", os.environ.get("PATH", "")) else None,
-        str(_which_in_path("makensis.exe", os.environ.get("PATH", ""))) if _which_in_path("makensis.exe", os.environ.get("PATH", "")) else None,
+        str(_which_in_path("makensis", os.environ.get("PATH", ""))) if _which_in_path("makensis", os.environ.get("PATH",
+                                                                                                                 ""))
+        else None,
+        str(_which_in_path("makensis.exe", os.environ.get("PATH", ""))) if _which_in_path("makensis.exe",
+                                                                                          os.environ.get("PATH",
+                                                                                                         "")) else None,
         "C:/Program Files (x86)/NSIS/makensis.exe",
         "C:/Program Files/NSIS/makensis.exe",
     ]
@@ -623,8 +627,12 @@ def _resolve_makensis() -> Optional[str]:
 
 def _resolve_iexpress() -> Optional[str]:
     candidates = [
-        str(_which_in_path("iexpress", os.environ.get("PATH", ""))) if _which_in_path("iexpress", os.environ.get("PATH", "")) else None,
-        str(_which_in_path("iexpress.exe", os.environ.get("PATH", ""))) if _which_in_path("iexpress.exe", os.environ.get("PATH", "")) else None,
+        str(_which_in_path("iexpress", os.environ.get("PATH", ""))) if _which_in_path("iexpress", os.environ.get("PATH",
+                                                                                                                 ""))
+        else None,
+        str(_which_in_path("iexpress.exe", os.environ.get("PATH", ""))) if _which_in_path("iexpress.exe",
+                                                                                          os.environ.get("PATH",
+                                                                                                         "")) else None,
         "C:/Windows/System32/iexpress.exe",
     ]
     for cand in candidates:
@@ -639,10 +647,10 @@ def _resolve_iexpress() -> Optional[str]:
 def _is_probable_windows_installer(path: Path) -> bool:
     lowered = path.name.lower()
     return (
-        "installer" in lowered
-        or "setup" in lowered
-        or lowered.endswith(".msi")
-        or lowered.startswith("uninstall")
+            "installer" in lowered
+            or "setup" in lowered
+            or lowered.endswith(".msi")
+            or lowered.startswith("uninstall")
     )
 
 
@@ -1010,10 +1018,14 @@ Section "Install"
   CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk" "$INSTDIR\\Uninstall.exe"
 
   WriteRegStr HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}" "InstallDir" "$INSTDIR"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "{WINDOWS_APP_NAME}"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" "$INSTDIR\\Uninstall.exe"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "
+{WINDOWS_APP_NAME}"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" 
+  "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" 
+  "$INSTDIR\\Uninstall.exe"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" 
+  "$INSTDIR"
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoModify" 1
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoRepair" 1
 SectionEnd
@@ -1075,7 +1087,8 @@ $folderDialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $folderDialog.Description = "Choose install folder for $appName"
 $folderDialog.SelectedPath = $defaultInstallDir
 $dialogResult = $folderDialog.ShowDialog()
-if ($dialogResult -ne [System.Windows.Forms.DialogResult]::OK -or [string]::IsNullOrWhiteSpace($folderDialog.SelectedPath)) {{
+if ($dialogResult -ne [System.Windows.Forms.DialogResult]::OK -or [string]::IsNullOrWhiteSpace(
+$folderDialog.SelectedPath)) {{
     throw "Installation cancelled"
 }}
 $installDir = $folderDialog.SelectedPath
@@ -1106,12 +1119,18 @@ New-Item -Path "HKCU:\\Software\\UBSEDS\\$appName" -Force | Out-Null
 Set-ItemProperty -Path "HKCU:\\Software\\UBSEDS\\$appName" -Name "InstallDir" -Value $installDir
 
 New-Item -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Force | Out-Null
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayName" -Value $appName
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayIcon" -Value $exePath
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "InstallLocation" -Value $installDir
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoModify" -Type DWord -Value 1
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoRepair" -Type DWord -Value 1
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayName" 
+-Value $appName
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayIcon" 
+-Value $exePath
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name 
+"InstallLocation" -Value $installDir
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name 
+"UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoModify" 
+-Type DWord -Value 1
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoRepair" 
+-Type DWord -Value 1
 """.strip()
     script_path.write_text(script, encoding="utf-8")
 
@@ -1470,11 +1489,11 @@ def rename_android_artifacts(frontend_dir: Path) -> None:
     for item in sorted(dist.iterdir()):
         name = item.name
         if not (
-            name.startswith("app-debug")
-            or name.startswith("app-release")
-            or name.startswith(LEGACY_APP_NAME)
-            or name.startswith(APP_NAME)
-            or name.startswith(ANDROID_APP_NAME)
+                name.startswith("app-debug")
+                or name.startswith("app-release")
+                or name.startswith(LEGACY_APP_NAME)
+                or name.startswith(APP_NAME)
+                or name.startswith(ANDROID_APP_NAME)
         ):
             continue
 
@@ -2763,7 +2782,8 @@ def _android_tool_paths(sdk_root: Path, ndk_root: Optional[Path]) -> list[Path]:
                 paths.append(base)
 
     if ndk_root is not None:
-        for rel in [Path("toolchains/llvm/prebuilt/darwin-x86_64/bin"), Path("toolchains/llvm/prebuilt/darwin-arm64/bin")]:
+        for rel in [Path("toolchains/llvm/prebuilt/darwin-x86_64/bin"),
+                    Path("toolchains/llvm/prebuilt/darwin-arm64/bin")]:
             base = ndk_root / rel
             if base.is_dir():
                 paths.append(base)
@@ -2925,7 +2945,8 @@ def _ensure_bundle_icon_compat(frontend_dir: Path) -> None:
 
     if not dst_ico.exists():
         try:
-            img.save(dst_ico, format="ICO", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+            img.save(dst_ico, format="ICO",
+                     sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
         except Exception as exc:
             print(f"Warning: failed generating bundle icon ICO {dst_ico}: {exc}", file=sys.stderr)
 
@@ -3140,10 +3161,12 @@ def build_frontend(
                             os.environ["GS_WASM_BINDGEN_CLI_VERSION"] = prior_override
             elif (
                     platform_name == "linux"
-                    and (frontend_dir.parent / "target" / "dx" / _frontend_package_name(frontend_dir) / ("debug" if debug_mode else "release") / "linux" / "app").exists()
+                    and (frontend_dir.parent / "target" / "dx" / _frontend_package_name(frontend_dir) / (
+            "debug" if debug_mode else "release") / "linux" / "app").exists()
             ):
                 print(
-                    "Warning: dx linux bundler failed after staging the app payload; falling back to manual AppImage packaging.",
+                    "Warning: dx linux bundler failed after staging the app payload; falling back to manual AppImage "
+                    "packaging.",
                     file=sys.stderr,
                 )
                 linux_bundle_partial = True
@@ -3187,6 +3210,7 @@ def build_frontend(
     except subprocess.CalledProcessError as e:
         _print_command_failure("Frontend build", e, frontend_dir)
         sys.exit(e.returncode)
+
 
 def _configure_log_file(repo_root: Path, log_file_arg: Optional[str]) -> None:
     global LOG_FILE

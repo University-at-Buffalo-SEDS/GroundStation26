@@ -1,5 +1,22 @@
 {
   "version": 1,
+  "branding": {
+    "app_name": "Telemetry Dashboard",
+    "dashboard_title": "Telemetry Dashboard",
+    "tab_labels": {
+      "state": "Flight",
+      "connection-status": "Connection Status",
+      "map": "Map",
+      "actions": "Actions",
+      "calibration": "Calibration",
+      "notifications": "Notifications",
+      "warnings": "Warnings",
+      "errors": "Errors",
+      "data": "Data",
+      "network-topology": "Network Topology",
+      "detailed": "Detailed Info"
+    }
+  },
   "main_tabs": [
     "state",
     "connection-status",
@@ -27,7 +44,7 @@
   },
   "network_tab": {
     "enabled": true,
-    "title": "Rocket Network"
+    "title": "Network Topology"
   },
   "actions_tab": {
     "actions": [

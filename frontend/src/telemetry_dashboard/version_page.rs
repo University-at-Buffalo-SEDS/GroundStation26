@@ -25,9 +25,9 @@ impl VersionInfo {
             build_number: parse_toml_value(DIOXUS_TOML, "application", "build")
                 .unwrap_or_else(|| "unknown".to_string()),
             app_name: parse_toml_value(DIOXUS_TOML, "application", "name")
-                .unwrap_or_else(|| "UBSEDS GS".to_string()),
+                .unwrap_or_else(|| "Telemetry Client".to_string()),
             app_title: parse_toml_value(DIOXUS_TOML, "application", "title")
-                .unwrap_or_else(|| "UBSEDS GroundStation".to_string()),
+                .unwrap_or_else(|| "Telemetry Dashboard".to_string()),
             target_os: std::env::consts::OS,
             target_arch: std::env::consts::ARCH,
             critical_packages: critical_packages(),
@@ -86,9 +86,9 @@ fn critical_packages() -> Vec<(&'static str, String)> {
         ("wry", "Wry"),
         ("axum", "Axum"),
     ]
-    .into_iter()
-    .filter_map(|(crate_name, label)| parse_lock_version(crate_name).map(|v| (label, v)))
-    .collect()
+        .into_iter()
+        .filter_map(|(crate_name, label)| parse_lock_version(crate_name).map(|v| (label, v)))
+        .collect()
 }
 
 #[component]
@@ -113,10 +113,10 @@ pub fn VersionTab() -> Element {
                 SectionCard {
                     title: "Credits",
                     rows: vec![
-                        ("Project", "UBSEDS GroundStation".to_string()),
-                        ("Team", "University at Buffalo SEDS".to_string()),
+                        ("Project", info.app_title.clone()),
                         ("UI Mapping", "Leaflet".to_string()),
                         ("Runtime", "Rust + Dioxus".to_string()),
+                        ("Packaging", "Dioxus".to_string()),
                     ],
                 }
             }

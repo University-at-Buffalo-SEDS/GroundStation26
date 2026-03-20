@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-
-use super::types::FlightState;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
     pub version: u32,
+    #[serde(default)]
+    pub branding: BrandingConfig,
     #[serde(default = "default_main_tabs")]
     pub main_tabs: Vec<String>,
     pub connection_tab: ConnectionTabLayout,
@@ -32,6 +32,14 @@ fn default_main_tabs() -> Vec<String> {
         "network-topology".to_string(),
         "detailed".to_string(),
     ]
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BrandingConfig {
+    pub app_name: Option<String>,
+    pub dashboard_title: Option<String>,
+    #[serde(default)]
+    pub tab_labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,7 +167,7 @@ pub struct StateTabLayout {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateLayout {
-    pub states: Vec<FlightState>,
+    pub states: Vec<String>,
     pub sections: Vec<StateSection>,
 }
 

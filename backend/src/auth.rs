@@ -1,5 +1,5 @@
-use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
+use base64::Engine;
 use ring::pbkdf2;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
@@ -260,17 +260,17 @@ impl AuthManager {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(&token)
-        .bind(&user.username)
-        .bind(session_type)
-        .bind(permissions.view_data as i64)
-        .bind(permissions.send_commands as i64)
-        .bind(allowed_commands_json)
-        .bind(now_ms)
-        .bind(expires_at_ms)
-        .execute(db)
-        .await
-        .map_err(|e| AuthFailure::Internal(format!("failed to create session: {e}")))?;
+            .bind(&token)
+            .bind(&user.username)
+            .bind(session_type)
+            .bind(permissions.view_data as i64)
+            .bind(permissions.send_commands as i64)
+            .bind(allowed_commands_json)
+            .bind(now_ms)
+            .bind(expires_at_ms)
+            .execute(db)
+            .await
+            .map_err(|e| AuthFailure::Internal(format!("failed to create session: {e}")))?;
 
         Ok(LoginResponse {
             token,
@@ -282,7 +282,7 @@ impl AuthManager {
                 session_type: Some(session_type.to_string()),
                 command_access: user.command_access.clone(),
             }
-            .session_status(),
+                .session_status(),
         })
     }
 
@@ -313,10 +313,10 @@ impl AuthManager {
                 LIMIT 1
                 "#,
             )
-            .bind(token.trim())
-            .fetch_optional(db)
-            .await
-            .map_err(|e| AuthFailure::Internal(format!("failed to query session: {e}")))?;
+                .bind(token.trim())
+                .fetch_optional(db)
+                .await
+                .map_err(|e| AuthFailure::Internal(format!("failed to query session: {e}")))?;
 
             let Some(row) = row else {
                 return Err(AuthFailure::Unauthorized(
@@ -339,7 +339,7 @@ impl AuthManager {
                 view_data: row.get::<i64, _>("can_view_data") != 0,
                 send_commands: row.get::<i64, _>("can_send_commands") != 0,
             }
-            .normalized();
+                .normalized();
 
             if !permissions.allows(required) {
                 return Err(AuthFailure::Forbidden(
@@ -357,9 +357,9 @@ impl AuthManager {
                     allowed_commands: serde_json::from_str(
                         row.get::<String, _>("allowed_commands_json").as_str(),
                     )
-                    .unwrap_or_default(),
+                        .unwrap_or_default(),
                 }
-                .normalized(),
+                    .normalized(),
             });
         }
 
@@ -402,7 +402,7 @@ impl AuthManager {
                     session_type: None,
                     command_access: config.anonymous_command_access,
                 }
-                .session_status())
+                    .session_status())
             }
             Err(err) => Err(err),
         }
@@ -449,7 +449,7 @@ pub fn verify_password(record: &PasswordHashRecord, password: &str) -> Result<()
         password.as_bytes(),
         &expected,
     )
-    .map_err(|_| "password verification failed".to_string())
+        .map_err(|_| "password verification failed".to_string())
 }
 
 #[allow(dead_code)]

@@ -1,7 +1,7 @@
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 use crate::state::AppState;
+use crate::types::{FlightState, TelemetryCommand};
 use crate::web::emit_warning;
-use groundstation_shared::{FlightState, TelemetryCommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

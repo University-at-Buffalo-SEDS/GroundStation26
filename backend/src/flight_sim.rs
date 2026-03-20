@@ -4,15 +4,15 @@ use crate::loadcell;
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 #[cfg(feature = "testing")]
 use crate::telemetry_task::get_current_timestamp_ms;
-use groundstation_shared::TelemetryCommand;
+use crate::types::TelemetryCommand;
 #[cfg(feature = "testing")]
-use groundstation_shared::{Board, FlightState};
+use crate::types::{Board, FlightState};
 #[cfg(feature = "testing")]
 use rand::RngExt;
-use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
+use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
@@ -467,8 +467,8 @@ impl FlightSimState {
                 if !n2o_open
                     && fill_lines_removed
                     && self
-                        .nitrous_fill_started_ms
-                        .is_some_and(|t0| now_ms.saturating_sub(t0) >= 30_000)
+                    .nitrous_fill_started_ms
+                    .is_some_and(|t0| now_ms.saturating_sub(t0) >= 30_000)
                 {
                     self.set_flight_state(FlightState::Armed, now_ms);
                 }
@@ -709,8 +709,8 @@ impl FlightSimState {
             DataType::KG1000 => {
                 let raw_kg = (self.loadcell_mass_kg
                     + rng.random_range(-LOADCELL_NOISE_KG..LOADCELL_NOISE_KG))
-                .max(0.0)
-                .min(sim_full_mass_kg());
+                    .max(0.0)
+                    .min(sim_full_mass_kg());
                 vec![raw_kg]
             }
             _ => vec![0.0],

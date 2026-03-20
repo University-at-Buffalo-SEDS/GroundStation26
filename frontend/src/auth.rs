@@ -5,8 +5,10 @@ use std::sync::Mutex;
 static CURRENT_SESSION: Lazy<Mutex<Option<StoredAuthSession>>> = Lazy::new(|| Mutex::new(None));
 static CURRENT_STATUS: Lazy<Mutex<SessionStatus>> =
     Lazy::new(|| Mutex::new(SessionStatus::default()));
+static CURRENT_HOST_SCOPE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const AUTH_STORAGE_KEY: &str = "auth_session_v1";
+const AUTH_STORAGE_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Permissions {
@@ -45,6 +47,19 @@ pub struct StoredAuthSession {
     pub remember_me: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredAuthSessionEntry {
+    host_scope: String,
+    session: StoredAuthSession,
+    updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StoredAuthSessionStore {
+    #[serde(default)]
+    entries: Vec<StoredAuthSessionEntry>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct LoginRequest<'a> {
     username: &'a str,
@@ -52,13 +67,17 @@ struct LoginRequest<'a> {
     remember_me: bool,
 }
 
-pub fn init_from_storage() {
-    let restored = read_storage_session();
+pub fn init_from_storage(base: &str) {
+    let host_scope = host_scope_for_base(base);
+    let restored = read_storage_session(&host_scope);
     if let Ok(mut slot) = CURRENT_SESSION.lock() {
         *slot = restored.clone();
     }
     if let Ok(mut status) = CURRENT_STATUS.lock() {
         *status = restored.map(|session| session.session).unwrap_or_default();
+    }
+    if let Ok(mut current_host) = CURRENT_HOST_SCOPE.lock() {
+        *current_host = Some(host_scope);
     }
 }
 
@@ -86,37 +105,40 @@ pub fn can_send_command(cmd: &str) -> bool {
 }
 
 pub fn set_current_session(session: StoredAuthSession) {
+    let host_scope = current_host_scope();
     if let Ok(mut slot) = CURRENT_SESSION.lock() {
         *slot = Some(session.clone());
     }
     if let Ok(mut status) = CURRENT_STATUS.lock() {
         *status = session.session.clone();
     }
-    if session.remember_me {
-        write_storage_session(Some(&session));
+    if session.remember_me && !host_scope.is_empty() {
+        write_storage_session(&host_scope, Some(&session));
     } else {
-        write_storage_session(None);
+        clear_storage_session_for_host(&host_scope);
     }
 }
 
 pub fn set_logged_out_status(status: SessionStatus) {
+    let host_scope = current_host_scope();
     if let Ok(mut slot) = CURRENT_SESSION.lock() {
         *slot = None;
     }
     if let Ok(mut current) = CURRENT_STATUS.lock() {
         *current = status;
     }
-    write_storage_session(None);
+    clear_storage_session_for_host(&host_scope);
 }
 
 pub fn clear_current_session() {
+    let host_scope = current_host_scope();
     if let Ok(mut slot) = CURRENT_SESSION.lock() {
         *slot = None;
     }
     if let Ok(mut status) = CURRENT_STATUS.lock() {
         *status = SessionStatus::default();
     }
-    write_storage_session(None);
+    clear_storage_session_for_host(&host_scope);
 }
 
 pub async fn fetch_session_status(
@@ -135,7 +157,10 @@ pub async fn fetch_session_status(
     {
         session.session = status.clone();
         if session.remember_me {
-            write_storage_session(Some(session));
+            let host_scope = current_host_scope();
+            if !host_scope.is_empty() {
+                write_storage_session(&host_scope, Some(session));
+            }
         }
     }
     Ok(status)
@@ -163,10 +188,13 @@ pub async fn login(
         password,
         remember_me,
     })
-    .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
     let text = auth_request_post_json(&url, &body, skip_tls_verify).await?;
     let response = serde_json::from_str::<LoginResponse>(&text)
         .map_err(|e| format!("invalid auth JSON: {e}"))?;
+    if let Ok(mut current_host) = CURRENT_HOST_SCOPE.lock() {
+        *current_host = Some(host_scope_for_base(base));
+    }
     let stored = StoredAuthSession {
         token: response.token,
         session: response.session,
@@ -363,57 +391,168 @@ fn build_url(base: &str, path: &str) -> Result<String, String> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn read_storage_session() -> Option<StoredAuthSession> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
-    storage
-        .get_item(AUTH_STORAGE_KEY)
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<StoredAuthSession>(&raw).ok())
+fn read_storage_store() -> StoredAuthSessionStore {
+    let raw = web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(AUTH_STORAGE_KEY).ok().flatten());
+    parse_storage_store(raw.as_deref())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn read_storage_session() -> Option<StoredAuthSession> {
+fn read_storage_store() -> StoredAuthSessionStore {
     let path = auth_storage_path();
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<StoredAuthSession>(&raw).ok())
+    let raw = std::fs::read_to_string(path).ok();
+    parse_storage_store(raw.as_deref())
 }
 
 #[cfg(target_arch = "wasm32")]
-fn write_storage_session(session: Option<&StoredAuthSession>) {
+fn write_storage_store(store: &StoredAuthSessionStore) {
     if let Some(window) = web_sys::window()
         && let Ok(Some(storage)) = window.local_storage()
     {
-        match session {
-            Some(session) => {
-                if let Ok(raw) = serde_json::to_string(session) {
-                    let _ = storage.set_item(AUTH_STORAGE_KEY, &raw);
-                }
-            }
-            None => {
-                let _ = storage.remove_item(AUTH_STORAGE_KEY);
-            }
+        if store.entries.is_empty() {
+            let _ = storage.remove_item(AUTH_STORAGE_KEY);
+        } else if let Ok(raw) = serde_json::to_string(store) {
+            let _ = storage.set_item(AUTH_STORAGE_KEY, &raw);
         }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn write_storage_session(session: Option<&StoredAuthSession>) {
+fn write_storage_store(store: &StoredAuthSessionStore) {
     let path = auth_storage_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match session {
-        Some(session) => {
-            if let Ok(raw) = serde_json::to_string_pretty(session) {
-                let _ = std::fs::write(path, raw);
-            }
+    if store.entries.is_empty() {
+        let _ = std::fs::remove_file(path);
+    } else if let Ok(raw) = serde_json::to_string_pretty(store) {
+        let _ = std::fs::write(path, raw);
+    }
+}
+
+fn read_storage_session(host_scope: &str) -> Option<StoredAuthSession> {
+    if host_scope.is_empty() {
+        return None;
+    }
+    let mut store = read_storage_store();
+    if let Some(entry) = store
+        .entries
+        .iter_mut()
+        .find(|entry| entry.host_scope == host_scope)
+    {
+        entry.updated_at_ms = now_ms();
+        let session = entry.session.clone();
+        prune_store(&mut store);
+        write_storage_store(&store);
+        return Some(session);
+    }
+    if let Some(entry) = store
+        .entries
+        .iter_mut()
+        .find(|entry| entry.host_scope.is_empty())
+    {
+        entry.host_scope = host_scope.to_string();
+        entry.updated_at_ms = now_ms();
+        let session = entry.session.clone();
+        prune_store(&mut store);
+        write_storage_store(&store);
+        return Some(session);
+    }
+    None
+}
+
+fn write_storage_session(host_scope: &str, session: Option<&StoredAuthSession>) {
+    if host_scope.is_empty() {
+        return;
+    }
+    let mut store = read_storage_store();
+    store.entries.retain(|entry| entry.host_scope != host_scope);
+    if let Some(session) = session {
+        store.entries.push(StoredAuthSessionEntry {
+            host_scope: host_scope.to_string(),
+            session: session.clone(),
+            updated_at_ms: now_ms(),
+        });
+    }
+    prune_store(&mut store);
+    write_storage_store(&store);
+}
+
+fn clear_storage_session_for_host(host_scope: &str) {
+    if host_scope.is_empty() {
+        return;
+    }
+    let mut store = read_storage_store();
+    let original_len = store.entries.len();
+    store.entries.retain(|entry| entry.host_scope != host_scope);
+    if store.entries.len() != original_len {
+        write_storage_store(&store);
+    }
+}
+
+fn prune_store(store: &mut StoredAuthSessionStore) {
+    store.entries.sort_by_key(|entry| entry.updated_at_ms);
+    if store.entries.len() > AUTH_STORAGE_LIMIT {
+        let drop_count = store.entries.len() - AUTH_STORAGE_LIMIT;
+        store.entries.drain(0..drop_count);
+    }
+}
+
+fn parse_storage_store(raw: Option<&str>) -> StoredAuthSessionStore {
+    let Some(raw) = raw else {
+        return StoredAuthSessionStore::default();
+    };
+    serde_json::from_str::<StoredAuthSessionStore>(raw)
+        .or_else(|_| {
+            serde_json::from_str::<StoredAuthSession>(raw).map(|session| StoredAuthSessionStore {
+                entries: vec![StoredAuthSessionEntry {
+                    host_scope: String::new(),
+                    session,
+                    updated_at_ms: now_ms(),
+                }],
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn current_host_scope() -> String {
+    CURRENT_HOST_SCOPE
+        .lock()
+        .ok()
+        .and_then(|scope| scope.clone())
+        .unwrap_or_default()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn host_scope_for_base(base: &str) -> String {
+    let mut scope = base.trim().trim_end_matches('/').to_ascii_lowercase();
+    if scope.is_empty() {
+        if let Some(window) = web_sys::window()
+            && let Ok(origin) = window.location().origin()
+        {
+            scope = origin.trim().trim_end_matches('/').to_ascii_lowercase();
         }
-        None => {
-            let _ = std::fs::remove_file(path);
-        }
+    }
+    scope
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_scope_for_base(base: &str) -> String {
+    base.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn now_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now().max(0.0) as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
     }
 }
 

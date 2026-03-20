@@ -4,8 +4,8 @@ import os
 import platform
 import subprocess
 import sys
-from subprocess import DEVNULL
 from pathlib import Path
+from subprocess import DEVNULL
 from typing import Optional
 
 LOG_FILE: Optional[Path] = None
@@ -60,8 +60,8 @@ def is_raspberry_pi() -> bool:
     if platform.system() != "Linux":
         return False
     for path in (
-        Path("/sys/firmware/devicetree/base/model"),
-        Path("/proc/device-tree/model"),
+            Path("/sys/firmware/devicetree/base/model"),
+            Path("/proc/device-tree/model"),
     ):
         try:
             txt = path.read_text(errors="ignore").lower()
@@ -107,7 +107,8 @@ def get_compose_base_cmd() -> list[str]:
         return ["docker-compose"]
     except (FileNotFoundError, subprocess.CalledProcessError):
         print(
-            "Error: Neither 'docker compose' nor 'docker-compose' is available.\nPlease install Docker and Docker Compose.",
+            "Error: Neither 'docker compose' nor 'docker-compose' is available.\nPlease install Docker and Docker "
+            "Compose.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -140,14 +141,14 @@ def _backend_script(repo_root: Path) -> Path:
 
 
 def _frontend_args(
-    *,
-    platform_name: Optional[str],
-    debug_mode: bool,
-    max_size_mode: bool,
-    android_package_type: Optional[str],
-    use_existing: bool,
-    action: Optional[str] = None,
-    log_file_arg: Optional[str] = None,
+        *,
+        platform_name: Optional[str],
+        debug_mode: bool,
+        max_size_mode: bool,
+        android_package_type: Optional[str],
+        use_existing: bool,
+        action: Optional[str] = None,
+        log_file_arg: Optional[str] = None,
 ) -> list[str]:
     args: list[str] = []
     if action is not None:
@@ -168,13 +169,13 @@ def _frontend_args(
 
 
 def _backend_args(
-    *,
-    force_pi: bool,
-    force_no_pi: bool,
-    testing_mode: bool,
-    hitl_mode: bool,
-    debug_mode: bool,
-    log_file_arg: Optional[str] = None,
+        *,
+        force_pi: bool,
+        force_no_pi: bool,
+        testing_mode: bool,
+        hitl_mode: bool,
+        debug_mode: bool,
+        log_file_arg: Optional[str] = None,
 ) -> list[str]:
     args: list[str] = []
     if force_pi:
@@ -321,7 +322,8 @@ def main() -> None:
 
     if action:
         if docker_mode or force_pi or force_no_pi or testing_mode or hitl_mode:
-            print("Error: Frontend actions cannot be combined with docker/pi_build/no_pi/testing/hitl-mode.", file=sys.stderr)
+            print("Error: Frontend actions cannot be combined with docker/pi_build/no_pi/testing/hitl-mode.",
+                  file=sys.stderr)
             print_usage()
         _run_script(
             repo_root,
@@ -340,7 +342,8 @@ def main() -> None:
 
     if frontend_only_platform is not None:
         if docker_mode or force_pi or force_no_pi or testing_mode or hitl_mode:
-            print("Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing/hitl-mode.", file=sys.stderr)
+            print("Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing/hitl-mode.",
+                  file=sys.stderr)
             print_usage()
         _run_script(
             repo_root,
@@ -380,7 +383,9 @@ def main() -> None:
             sys.exit(1)
         pi_build_flag = False if force_no_pi else (force_pi or is_raspberry_pi())
         use_plain = plain_mode or (LOG_FILE is not None)
-        print("Note: docker image builds cannot be post-processed with host wasm-opt; optimize in Dockerfile for image artifacts.")
+        print(
+            "Note: docker image builds cannot be post-processed with host wasm-opt; optimize in Dockerfile for image "
+            "artifacts.")
         build_docker(
             repo_root=repo_root,
             pi_build=pi_build_flag,

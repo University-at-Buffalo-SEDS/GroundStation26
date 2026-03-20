@@ -1,6 +1,7 @@
 # System Overview
 
-This document describes how the full system fits together across frontend, backend, shared contracts, and build/runtime boundaries.
+This document describes how the full system fits together across frontend, backend, shared contracts, and build/runtime
+boundaries.
 
 ## Top-Level Components
 
@@ -30,7 +31,8 @@ This document describes how the full system fits together across frontend, backe
 - `backend/build.py`
   Backend-only cargo-oriented build entry point.
 
-This split matters because the frontend is a real native app target in its own right and is not just a static asset pack for the backend.
+This split matters because the frontend is a real native app target in its own right and is not just a static asset pack
+for the backend.
 
 ## Frontend/Backend Coupling
 
@@ -84,4 +86,5 @@ They are intentionally decoupled in these ways:
 - The web frontend depends on the backend serving `frontend/dist/public`.
 - Native frontends still depend on the backend API, but not on backend static-file serving.
 - Map behavior depends on tile assets under backend-managed data locations.
-- Raspberry Pi OS and Ubuntu are both supported by keeping device access generic at the Linux device-node level where practical.
+- Raspberry Pi OS and Ubuntu are both supported by keeping device access generic at the Linux device-node level where
+  practical.

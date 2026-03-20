@@ -12,10 +12,10 @@ use super::layout::{
     StateWidget, StateWidgetKind, SummaryItem, ValveColor, ValveColorSet,
 };
 use super::types::{BoardStatusEntry, FlightState, TelemetryRow};
-use super::{ActionPolicyMsg, BlinkMode, latest_telemetry_row, latest_telemetry_value};
+use super::{latest_telemetry_row, latest_telemetry_value, ActionPolicyMsg, BlinkMode};
 
 use crate::telemetry_dashboard::data_chart::{
-    ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, series_color,
+    charts_cache_get, charts_cache_get_channel_minmax, series_color, ChartCanvas,
 };
 use crate::telemetry_dashboard::map_tab::MapTab;
 
@@ -178,7 +178,7 @@ pub fn StateTab(
     // Force rerender when redraw driver ticks
     let _ = *redraw_tick.read();
 
-    let state = *flight_state.read();
+    let state = flight_state.read().clone();
     let boards_snapshot = board_status.read();
     let actions_snapshot = actions.actions.clone();
     let action_policy_snapshot = action_policy.read().clone();
@@ -186,7 +186,7 @@ pub fn StateTab(
     let content = if let Some(state_layout) = layout
         .states
         .iter()
-        .find(|entry| entry.states.contains(&state))
+        .find(|entry| entry.states.iter().any(|configured| configured == &state))
     {
         rsx! {
             for section in state_layout.sections.iter() {
@@ -778,7 +778,7 @@ fn board_status_table(boards: &[BoardStatusEntry]) -> Element {
             }
             for entry in boards.iter() {
                 div { style: "display:grid; grid-template-columns:1.4fr 0.8fr 0.6fr 0.8fr 0.8fr; background:#020617;",
-                    div { style: cell_style(), "{entry.board.as_str()}" }
+                    div { style: cell_style(), "{entry.display_name()}" }
                     div { style: cell_style(), "{entry.sender_id}" }
                     div { style: cell_style(), if entry.seen { "yes" } else { "no" } }
                     div { style: cell_style(), "{entry.last_seen_ms.map(|v| v.to_string()).unwrap_or_else(|| \"-\".into())}" }
