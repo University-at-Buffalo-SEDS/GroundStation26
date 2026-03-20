@@ -125,6 +125,14 @@ pub fn ActionsTab(
     });
     let _blink_tick = *redraw_tick.read();
     let blink_now_ms = blink_epoch_ms();
+    let visible_actions = layout
+        .actions
+        .iter()
+        .filter(|action| {
+            auth::can_send_command(action.cmd.as_str())
+                && (!abort_only_mode || action.cmd == "Abort")
+        })
+        .collect::<Vec<_>>();
     rsx! {
         div {
             style: "
@@ -145,45 +153,52 @@ pub fn ActionsTab(
                 }
             }
 
-            div {
-                style: "
-                    display:grid;
-                    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-                    gap:12px;
-                ",
+            if visible_actions.is_empty() {
+                div {
+                    style: "padding:12px; border:1px solid #334155; border-radius:12px; background:#0b1220; color:#94a3b8; font-size:13px;",
+                    "No actions are available for this user."
+                }
+            } else {
+                div {
+                    style: "
+                        display:grid;
+                        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                        gap:12px;
+                    ",
 
-                for action in layout.actions.iter() {
-                    {
-                        let software_buttons_enabled = action_policy.read().software_buttons_enabled;
-                        let control = action_policy
-                            .read()
-                            .controls
-                            .iter()
-                            .find(|c| c.cmd == action.cmd)
-                            .cloned();
-                        let enabled = software_buttons_enabled
-                            && auth::can_send_command(action.cmd.as_str())
-                            && (!abort_only_mode || action.cmd == "Abort")
-                            && control
-                            .as_ref()
-                            .map(|c| c.enabled)
-                            .unwrap_or(action.cmd == "Abort");
-                        let blink = control.as_ref().map(|c| c.blink).unwrap_or(BlinkMode::None);
-                        let actuated = control.as_ref().and_then(|c| c.actuated);
-                        rsx! {
-                    button {
-                        style: "{btn_style(&action.border, &action.bg, &action.fg, blink_now_ms, enabled, blink, actuated)}",
-                        disabled: !enabled,
-                        onclick: {
-                            let cmd = action.cmd.clone();
-                            move |_| {
-                                if enabled {
-                                    crate::telemetry_dashboard::send_cmd(&cmd)
+                    for action in visible_actions.iter() {
+                        {
+                            let software_buttons_enabled = action_policy.read().software_buttons_enabled;
+                            let control = action_policy
+                                .read()
+                                .controls
+                                .iter()
+                                .find(|c| c.cmd == action.cmd)
+                                .cloned();
+                            let enabled = software_buttons_enabled
+                                && auth::can_send_command(action.cmd.as_str())
+                                && (!abort_only_mode || action.cmd == "Abort")
+                                && control
+                                    .as_ref()
+                                    .map(|c| c.enabled)
+                                    .unwrap_or(action.cmd == "Abort");
+                            let blink = control.as_ref().map(|c| c.blink).unwrap_or(BlinkMode::None);
+                            let actuated = control.as_ref().and_then(|c| c.actuated);
+                            rsx! {
+                                button {
+                                    style: "{btn_style(&action.border, &action.bg, &action.fg, blink_now_ms, enabled, blink, actuated)}",
+                                    disabled: !enabled,
+                                    onclick: {
+                                        let cmd = action.cmd.clone();
+                                        move |_| {
+                                            if enabled {
+                                                crate::telemetry_dashboard::send_cmd(&cmd)
+                                            }
+                                        }
+                                    },
+                                    "{action.label}"
                                 }
                             }
-                        },
-                        "{action.label}"
-                    }
                         }
                     }
                 }

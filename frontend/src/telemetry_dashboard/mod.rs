@@ -1010,11 +1010,20 @@ fn _layout_main_tab_enabled(layout: &LayoutConfig, tab: MainTab) -> bool {
     listed && (tab != MainTab::NetworkTopology || layout.network_tab.enabled)
 }
 
-fn _configured_main_tabs(layout: &LayoutConfig) -> Vec<MainTab> {
+fn _actions_tab_has_visible_actions(layout: &LayoutConfig, abort_only_mode: bool) -> bool {
+    layout.actions_tab.actions.iter().any(|action| {
+        auth::can_send_command(action.cmd.as_str()) && (!abort_only_mode || action.cmd == "Abort")
+    })
+}
+
+fn _configured_main_tabs(layout: &LayoutConfig, abort_only_mode: bool) -> Vec<MainTab> {
     let mut tabs = Vec::new();
     for id in &layout.main_tabs {
         let tab = _main_tab_from_str(id);
         if !_layout_main_tab_enabled(layout, tab) || tabs.contains(&tab) {
+            continue;
+        }
+        if tab == MainTab::Actions && !_actions_tab_has_visible_actions(layout, abort_only_mode) {
             continue;
         }
         tabs.push(tab);
@@ -1250,6 +1259,7 @@ fn TelemetryDashboardInner() -> Element {
     let board_status = use_signal(Vec::<BoardStatusEntry>::new);
     let network_topology = use_signal(NetworkTopologyMsg::default);
     let frontend_network_metrics = use_signal(FrontendNetworkMetrics::default);
+    let abort_only_mode = use_signal(|| false);
     #[cfg(not(target_arch = "wasm32"))]
     let show_version_overlay = use_signal(|| false);
     let detailed_network_time_display = network_time
@@ -1318,16 +1328,15 @@ fn TelemetryDashboardInner() -> Element {
     {
         let mut active_main_tab = active_main_tab;
         let layout_config = layout_config;
+        let abort_only_mode = abort_only_mode;
         use_effect(move || {
             let Some(layout) = layout_config.read().clone() else {
                 return;
             };
             let current = *active_main_tab.read();
-            if !_layout_main_tab_enabled(&layout, current) {
-                let next = _configured_main_tabs(&layout)
-                    .into_iter()
-                    .next()
-                    .unwrap_or(MainTab::State);
+            let configured = _configured_main_tabs(&layout, *abort_only_mode.read());
+            if !configured.contains(&current) {
+                let next = configured.into_iter().next().unwrap_or(MainTab::State);
                 active_main_tab.set(next);
             }
         });
@@ -1342,7 +1351,6 @@ fn TelemetryDashboardInner() -> Element {
 
     let flash_on = use_signal(|| false);
     let clock_tick = use_signal(|| 0u64);
-    let abort_only_mode = use_signal(|| false);
 
     let rocket_gps = use_signal(|| None::<(f64, f64)>);
     let user_gps = use_signal(|| None::<(f64, f64)>);
@@ -2241,8 +2249,8 @@ fn TelemetryDashboardInner() -> Element {
                             {
                                 let software_buttons_enabled =
                                     action_policy.read().software_buttons_enabled;
-                                let abort_allowed =
-                                    software_buttons_enabled && auth::can_send_command("Abort");
+                                let abort_visible = auth::can_send_command("Abort");
+                                let abort_allowed = software_buttons_enabled && abort_visible;
                                 let abort_style = if abort_allowed {
                                     "
                                 padding:0.45rem 0.85rem;
@@ -2267,6 +2275,7 @@ fn TelemetryDashboardInner() -> Element {
                             "
                                 };
                                 rsx! {
+                            if abort_visible {
                             button {
                                 style: "{abort_style}",
                                 disabled: !abort_allowed,
@@ -2276,6 +2285,7 @@ fn TelemetryDashboardInner() -> Element {
                                     }
                                 },
                                 "ABORT"
+                            }
                             }
                                 }
                             }
@@ -2355,7 +2365,7 @@ fn TelemetryDashboardInner() -> Element {
                         min-width:260px;
                     ",
                             nav { style: "display:flex; gap:0.5rem; flex-wrap:wrap;",
-                                for tab in _configured_main_tabs(&layout).into_iter() {
+                                for tab in _configured_main_tabs(&layout, *abort_only_mode.read()).into_iter() {
                                     match tab {
                                         MainTab::State => rsx! {
                                             button {
