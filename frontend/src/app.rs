@@ -955,7 +955,7 @@ pub fn Connect() -> Element {
                 }
                 p { style: "margin:0 0 16px 0; color:#94a3b8;",
                     "Enter the backend URL (including http:// or https://). Example: ",
-                    code { "http://https://your-backend-url.com" }
+                    code { "https://your-backend-url.com" }
                 }
 
                 input {
