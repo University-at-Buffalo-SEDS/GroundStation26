@@ -1167,10 +1167,8 @@ pub fn Dashboard() -> Element {
     auth::init_from_storage(&base);
     let mut auth_state = use_signal(|| None::<Result<AuthSessionStatus, String>>);
     let mut auth_state_base = use_signal(String::new);
-    let mut auth_retry_nonce = use_signal(|| 0_u64);
     use_effect(move || {
         let base = UrlConfig::base_http();
-        let _retry_nonce = *auth_retry_nonce.read();
         if *auth_state_base.read() != base {
             auth_state_base.set(base.clone());
             auth_state.set(None);
@@ -1208,9 +1206,12 @@ pub fn Dashboard() -> Element {
                     err
                 ),
                 on_retry: move |_| {
+                    let base = UrlConfig::base_http();
+                    let skip_tls = UrlConfig::_skip_tls_verify();
                     auth_state.set(None);
-                    let next = auth_retry_nonce.read().wrapping_add(1);
-                    auth_retry_nonce.set(next);
+                    spawn(async move {
+                        auth_state.set(Some(auth::fetch_session_status(&base, skip_tls).await));
+                    });
                 },
             }
         },
