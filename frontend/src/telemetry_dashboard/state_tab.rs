@@ -592,7 +592,7 @@ fn action_section(
     abort_only_mode: bool,
 ) -> Element {
     let blink_now_ms = blink_epoch_ms();
-    let filtered = filter_actions(actions, selection, abort_only_mode);
+    let filtered = filter_actions(actions, selection);
     if filtered.is_empty() {
         return rsx! { div {} };
     }
@@ -632,25 +632,24 @@ fn action_section(
 fn filter_actions<'a>(
     actions: &'a [ActionSpec],
     selection: Option<&[String]>,
-    abort_only_mode: bool,
 ) -> Vec<&'a ActionSpec> {
     let Some(selected) = selection else {
         return actions
             .iter()
-            .filter(|action| action_is_visible(action, abort_only_mode))
+            .filter(|action| action_is_visible(action))
             .collect();
     };
     if selected.is_empty() {
         return actions
             .iter()
-            .filter(|action| action_is_visible(action, abort_only_mode))
+            .filter(|action| action_is_visible(action))
             .collect();
     }
     let mut filtered = Vec::with_capacity(selected.len());
     for cmd in selected {
         if let Some(action) = actions
             .iter()
-            .find(|a| &a.cmd == cmd && action_is_visible(a, abort_only_mode))
+            .find(|a| &a.cmd == cmd && action_is_visible(a))
         {
             filtered.push(action);
         }
@@ -663,11 +662,12 @@ fn has_any_actions(
     selection: Option<&[String]>,
     abort_only_mode: bool,
 ) -> bool {
-    !filter_actions(actions, selection, abort_only_mode).is_empty()
+    let _ = abort_only_mode;
+    !filter_actions(actions, selection).is_empty()
 }
 
-fn action_is_visible(action: &ActionSpec, abort_only_mode: bool) -> bool {
-    auth::can_send_command(action.cmd.as_str()) && (!abort_only_mode || action.cmd == "Abort")
+fn action_is_visible(action: &ActionSpec) -> bool {
+    auth::can_send_command(action.cmd.as_str())
 }
 
 fn action_style(

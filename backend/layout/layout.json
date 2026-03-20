@@ -87,7 +87,8 @@
         "bg": "#1f2937",
         "fg": "#fef9c3"
       }
-    ]
+    ],
+    "disable_actions_by_default": true
   },
   "data_tab": {
     "tabs": [

@@ -128,10 +128,7 @@ pub fn ActionsTab(
     let visible_actions = layout
         .actions
         .iter()
-        .filter(|action| {
-            auth::can_send_command(action.cmd.as_str())
-                && (!abort_only_mode || action.cmd == "Abort")
-        })
+        .filter(|action| auth::can_send_command(action.cmd.as_str()))
         .collect::<Vec<_>>();
     rsx! {
         div {

@@ -140,6 +140,8 @@ pub struct DataTabChart {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionsTabLayout {
+    #[serde(default)]
+    pub disable_actions_by_default: bool,
     pub actions: Vec<ActionSpec>,
 }
 

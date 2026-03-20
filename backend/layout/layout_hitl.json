@@ -269,7 +269,8 @@
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       }
-    ]
+    ],
+    "disable_actions_by_default": true
   },
   "data_tab": {
     "tabs": [

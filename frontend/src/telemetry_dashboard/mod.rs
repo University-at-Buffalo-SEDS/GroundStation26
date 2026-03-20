@@ -1011,9 +1011,12 @@ fn _layout_main_tab_enabled(layout: &LayoutConfig, tab: MainTab) -> bool {
 }
 
 fn _actions_tab_has_visible_actions(layout: &LayoutConfig, abort_only_mode: bool) -> bool {
-    layout.actions_tab.actions.iter().any(|action| {
-        auth::can_send_command(action.cmd.as_str()) && (!abort_only_mode || action.cmd == "Abort")
-    })
+    let _ = abort_only_mode;
+    layout
+        .actions_tab
+        .actions
+        .iter()
+        .any(|action| auth::can_send_command(action.cmd.as_str()))
 }
 
 fn _configured_main_tabs(layout: &LayoutConfig, abort_only_mode: bool) -> Vec<MainTab> {
@@ -1260,6 +1263,7 @@ fn TelemetryDashboardInner() -> Element {
     let network_topology = use_signal(NetworkTopologyMsg::default);
     let frontend_network_metrics = use_signal(FrontendNetworkMetrics::default);
     let abort_only_mode = use_signal(|| false);
+    let last_applied_disable_actions_default = use_signal(|| None::<bool>);
     #[cfg(not(target_arch = "wasm32"))]
     let show_version_overlay = use_signal(|| false);
     let detailed_network_time_display = network_time
@@ -1339,6 +1343,23 @@ fn TelemetryDashboardInner() -> Element {
                 let next = configured.into_iter().next().unwrap_or(MainTab::State);
                 active_main_tab.set(next);
             }
+        });
+    }
+
+    {
+        let layout_config = layout_config;
+        let mut abort_only_mode = abort_only_mode;
+        let mut last_applied_disable_actions_default = last_applied_disable_actions_default;
+        use_effect(move || {
+            let Some(layout) = layout_config.read().clone() else {
+                return;
+            };
+            let default_disabled = layout.actions_tab.disable_actions_by_default;
+            if *last_applied_disable_actions_default.read() == Some(default_disabled) {
+                return;
+            }
+            last_applied_disable_actions_default.set(Some(default_disabled));
+            abort_only_mode.set(default_disabled);
         });
     }
 

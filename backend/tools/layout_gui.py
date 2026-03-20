@@ -38,7 +38,7 @@ def default_layout() -> dict:
         ],
         "connection_tab": {"sections": []},
         "network_tab": {"enabled": False, "title": "SEDSprintf Network"},
-        "actions_tab": {"actions": []},
+        "actions_tab": {"disable_actions_by_default": False, "actions": []},
         "data_tab": {"tabs": []},
         "state_tab": {"states": []},
         "battery": {
@@ -334,14 +334,22 @@ class LayoutEditor(tk.Tk):
         form.grid(row=0, column=1, sticky="nsew")
         form.columnconfigure(1, weight=1)
 
-        self.action_label = self._entry(form, "Label", 0)
-        self.action_cmd = self._entry(form, "Command", 1)
-        self.action_border = self._color_entry(form, "Border color", 2)
-        self.action_bg = self._color_entry(form, "Background color", 3)
-        self.action_fg = self._color_entry(form, "Text color", 4)
+        self.disable_actions_by_default = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            form,
+            text="Disable actions by default",
+            variable=self.disable_actions_by_default,
+            command=self._store_actions_defaults,
+        ).grid(row=0, column=1, sticky="w", pady=(0, 8))
+
+        self.action_label = self._entry(form, "Label", 1)
+        self.action_cmd = self._entry(form, "Command", 2)
+        self.action_border = self._color_entry(form, "Border color", 3)
+        self.action_bg = self._color_entry(form, "Background color", 4)
+        self.action_fg = self._color_entry(form, "Text color", 5)
 
         btns = ttk.Frame(form)
-        btns.grid(row=5, column=1, sticky="w", pady=8)
+        btns.grid(row=6, column=1, sticky="w", pady=8)
         ttk.Button(btns, text="Add", command=self._add_action_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove", command=self._remove_action_item).pack(
             side=tk.LEFT, padx=4
@@ -659,6 +667,14 @@ class LayoutEditor(tk.Tk):
         self.actions_list.delete(0, tk.END)
         for a in self.data["actions_tab"]["actions"]:
             self.actions_list.insert(tk.END, a.get("label", "action"))
+        if hasattr(self, "disable_actions_by_default"):
+            self.disable_actions_by_default.set(
+                bool(
+                    self.data.get("actions_tab", {}).get(
+                        "disable_actions_by_default", False
+                    )
+                )
+            )
 
         self.state_entry_list.delete(0, tk.END)
         for entry in self.data["state_tab"]["states"]:
@@ -821,7 +837,9 @@ class LayoutEditor(tk.Tk):
         network = self.data.setdefault("network_tab", {})
         network.setdefault("enabled", False)
         network.setdefault("title", "SEDSprintf Network")
-        self.data.setdefault("actions_tab", {}).setdefault("actions", [])
+        actions_tab = self.data.setdefault("actions_tab", {})
+        actions_tab.setdefault("disable_actions_by_default", False)
+        actions_tab.setdefault("actions", [])
         self.data.setdefault("data_tab", {}).setdefault("tabs", [])
         self.data.setdefault("state_tab", {}).setdefault("states", [])
         battery = self.data.setdefault("battery", {})
@@ -1023,6 +1041,11 @@ class LayoutEditor(tk.Tk):
             "bg": self.action_bg.get().strip(),
             "fg": self.action_fg.get().strip(),
         }
+
+    def _store_actions_defaults(self) -> None:
+        self.data.setdefault("actions_tab", {})["disable_actions_by_default"] = bool(
+            self.disable_actions_by_default.get()
+        )
 
     # ------------------------
     # State layout actions
