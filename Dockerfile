@@ -27,6 +27,7 @@ COPY backend/layout backend/layout
 COPY backend/calibration backend/calibration
 COPY backend/comms backend/comms
 COPY backend/users backend/users
+COPY backend/build.py backend/
 
 # Map downloader crate
 COPY map_downloader/Cargo.toml map_downloader/
