@@ -73,6 +73,7 @@ static TELEMETRY_QUEUE: Lazy<Mutex<VecDeque<TelemetryRow>>> =
     Lazy::new(|| Mutex::new(VecDeque::new()));
 static RESEED_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static RESEED_LIVE_BUFFER: Lazy<Mutex<Vec<TelemetryRow>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static DASHBOARD_HAS_CONNECTED: AtomicBool = AtomicBool::new(false);
 static FRONTEND_NETWORK_METRICS_STATE: Lazy<Mutex<FrontendNetworkMetrics>> =
     Lazy::new(|| Mutex::new(FrontendNetworkMetrics::default()));
 
@@ -570,6 +571,9 @@ fn redact_ws_url_for_display(ws_url: &str) -> String {
 }
 
 fn note_ws_connection_state(connected: bool, ws_url: String, reason: Option<String>, epoch: u64) {
+    if connected {
+        DASHBOARD_HAS_CONNECTED.store(true, Ordering::Relaxed);
+    }
     if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
         let was_connected = next.ws_connected;
         next.ws_connected = connected;
@@ -1217,6 +1221,14 @@ fn reconnect_and_reload_ui() {
     }
 
     // Native: keep current UI mounted so charts/history remain visible while reseed runs.
+}
+
+pub fn dashboard_has_prior_backend_connection() -> bool {
+    DASHBOARD_HAS_CONNECTED.load(Ordering::Relaxed)
+}
+
+pub fn reconnect_and_reseed_after_auth_change() {
+    reconnect_and_reload_ui();
 }
 
 fn clear_telemetry_runtime_buffers() {
@@ -3468,6 +3480,9 @@ async fn seed_from_db(
                 store.replace_from_rows(&list);
             }
             reset_latest_telemetry(&list);
+            if !list.is_empty() {
+                DASHBOARD_HAS_CONNECTED.store(true, Ordering::Relaxed);
+            }
             let mut render_epoch = TELEMETRY_RENDER_EPOCH.write();
             *render_epoch = render_epoch.wrapping_add(1);
         }

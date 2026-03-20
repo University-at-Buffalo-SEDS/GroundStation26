@@ -11,7 +11,7 @@ use dioxus::prelude::*;
 use dioxus_router::{use_navigator, Routable, Router};
 
 #[allow(unused_imports)]
-use crate::telemetry_dashboard::UrlConfig;
+use crate::telemetry_dashboard::{self, UrlConfig};
 
 // -------------------------
 // Native-only keep-awake shims (mobile)
@@ -655,6 +655,7 @@ fn LoginCard(
     subtitle: String,
     allow_back_to_connect: bool,
     on_success_route: Route,
+    #[props(default = false)] overlay_mode: bool,
 ) -> Element {
     let nav = use_navigator();
     let base = UrlConfig::base_http();
@@ -701,7 +702,11 @@ fn LoginCard(
 
     rsx! {
         div {
-            style: "min-height:100vh; height:100vh; overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            style: if overlay_mode {
+                "width:min(560px, 92vw); color:#e5e7eb; font-family:system-ui;"
+            } else {
+                "min-height:100vh; height:100vh; overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;"
+            },
             div {
                 style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
                 h1 { style: "margin:0 0 10px 0; font-size:22px;", "{title}" }
@@ -809,6 +814,7 @@ fn LoginCard(
                             spawn(async move {
                                 match auth::login(&base, skip_tls, username_value.trim(), &password_value, remember).await {
                                     Ok(_) => {
+                                        telemetry_dashboard::reconnect_and_reseed_after_auth_change();
                                         busy.set(false);
                                         status.set(String::new());
                                         let _ = nav.replace(success_route);
@@ -860,13 +866,50 @@ fn ConnectionFailedCard(message: String, on_retry: EventHandler<()>) -> Element 
 }
 
 #[component]
-pub fn Login() -> Element {
+fn LoginOverlay(
+    title: String,
+    subtitle: String,
+    allow_back_to_connect: bool,
+    on_success_route: Route,
+) -> Element {
     rsx! {
-        LoginCard {
-            title: "Sign In".to_string(),
-            subtitle: "Authenticate with the backend to view protected data or send commands.".to_string(),
-            allow_back_to_connect: true,
-            on_success_route: Route::Dashboard {},
+        div {
+            style: "position:relative; width:100%; min-height:100vh;",
+            crate::telemetry_dashboard::TelemetryDashboard {}
+            div {
+                style: "position:fixed; inset:0; display:flex; align-items:center; justify-content:center; padding:24px; background:rgba(2, 6, 23, 0.78); backdrop-filter:blur(8px); z-index:1000;",
+                LoginCard {
+                    title: title.clone(),
+                    subtitle: subtitle.clone(),
+                    allow_back_to_connect,
+                    on_success_route: on_success_route.clone(),
+                    overlay_mode: true,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn Login() -> Element {
+    let show_live_dashboard = telemetry_dashboard::dashboard_has_prior_backend_connection();
+    if show_live_dashboard {
+        rsx! {
+            LoginOverlay {
+                title: "Sign In".to_string(),
+                subtitle: "Authenticate with the backend to view protected data or send commands.".to_string(),
+                allow_back_to_connect: true,
+                on_success_route: Route::Dashboard {},
+            }
+        }
+    } else {
+        rsx! {
+            LoginCard {
+                title: "Sign In".to_string(),
+                subtitle: "Authenticate with the backend to view protected data or send commands.".to_string(),
+                allow_back_to_connect: true,
+                on_success_route: Route::Dashboard {},
+            }
         }
     }
 }
@@ -1185,14 +1228,27 @@ pub fn Dashboard() -> Element {
         Some(Ok(status)) if status.permissions.view_data => {
             rsx! { crate::telemetry_dashboard::TelemetryDashboard {} }
         }
-        Some(Ok(_)) => rsx! {
-            LoginCard {
-                title: "Sign In Required".to_string(),
-                subtitle: "This backend does not allow anonymous view access. Sign in to continue.".to_string(),
-                allow_back_to_connect: true,
-                on_success_route: Route::Dashboard {},
+        Some(Ok(_)) => {
+            if telemetry_dashboard::dashboard_has_prior_backend_connection() {
+                rsx! {
+                    LoginOverlay {
+                        title: "Sign In Required".to_string(),
+                        subtitle: "This backend does not allow anonymous view access. Sign in to continue.".to_string(),
+                        allow_back_to_connect: true,
+                        on_success_route: Route::Dashboard {},
+                    }
+                }
+            } else {
+                rsx! {
+                    LoginCard {
+                        title: "Sign In Required".to_string(),
+                        subtitle: "This backend does not allow anonymous view access. Sign in to continue.".to_string(),
+                        allow_back_to_connect: true,
+                        on_success_route: Route::Dashboard {},
+                    }
+                }
             }
-        },
+        }
         Some(Err(err)) => rsx! {
             ConnectionFailedCard {
                 message: format!(
