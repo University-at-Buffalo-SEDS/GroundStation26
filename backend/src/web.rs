@@ -850,7 +850,7 @@ async fn get_notifications(
 async fn dismiss_notification(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<u64>,
+    Path(id): Path<u64>,
 ) -> impl IntoResponse {
     if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
         return response;

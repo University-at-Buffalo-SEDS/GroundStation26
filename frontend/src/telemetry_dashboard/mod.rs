@@ -58,8 +58,8 @@ use warnings_tab::WarningsTab;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, Ordering}, Arc,
+    Mutex,
 };
 
 use once_cell::sync::Lazy;
@@ -200,7 +200,7 @@ mod persist {
         #[cfg(target_os = "android")]
         fn android_storage_base_dir() -> Option<std::path::PathBuf> {
             use jni::objects::{JObject, JString};
-            use jni::{JavaVM, jni_sig, jni_str};
+            use jni::{jni_sig, jni_str, JavaVM};
             use ndk_context::android_context;
 
             let ctx = android_context();
@@ -753,22 +753,22 @@ fn compact_rows_for_ui(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
 }
 
 fn reset_latest_telemetry(rows: &[TelemetryRow]) {
-    if let Ok(mut latest) = LATEST_TELEMETRY.lock() {
-        if let Ok(mut latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock() {
-            latest.clear();
-            latest_by_type.clear();
-            for row in rows {
-                update_latest_telemetry_locked(&mut latest, &mut latest_by_type, row);
-            }
+    if let Ok(mut latest) = LATEST_TELEMETRY.lock()
+        && let Ok(mut latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock()
+    {
+        latest.clear();
+        latest_by_type.clear();
+        for row in rows {
+            update_latest_telemetry_locked(&mut latest, &mut latest_by_type, row);
         }
     }
 }
 
 fn update_latest_telemetry(row: &TelemetryRow) {
-    if let Ok(mut latest) = LATEST_TELEMETRY.lock() {
-        if let Ok(mut latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock() {
-            update_latest_telemetry_locked(&mut latest, &mut latest_by_type, row);
-        }
+    if let Ok(mut latest) = LATEST_TELEMETRY.lock()
+        && let Ok(mut latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock()
+    {
+        update_latest_telemetry_locked(&mut latest, &mut latest_by_type, row);
     }
 }
 
@@ -3468,10 +3468,9 @@ async fn seed_from_db(
     // ---- Optional GPS seed (/api/gps) ----
     if let Ok(gps) = http_get_json::<GpsResponse>("/api/gps").await
         && alive.load(Ordering::Relaxed)
+        && let Some(rocket) = gps.rocket
     {
-        if let Some(rocket) = gps.rocket {
-            rocket_gps.set(Some((rocket.lat, rocket.lon)));
-        }
+        rocket_gps.set(Some((rocket.lat, rocket.lon)));
     }
 
     Ok(())

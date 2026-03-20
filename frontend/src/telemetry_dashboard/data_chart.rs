@@ -591,7 +591,7 @@ impl CachedChart {
         self.prev_span_ms = span_ms;
 
         // Determine how many buckets to render from that span (stable)
-        let want_buckets = (span_ms.div_euclid(BUCKET_MS)).max(1);
+        let want_buckets = span_ms.div_euclid(BUCKET_MS).max(1);
         let start_bid = newest_bid.saturating_sub(want_buckets - 1);
 
         // Build window min/max from buckets in [start_bid, newest_bid]

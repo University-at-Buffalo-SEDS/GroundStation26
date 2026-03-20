@@ -175,7 +175,7 @@ enum CaptureMode {
     SequencePoint,
 }
 
-fn sleep_ms(ms: u32) -> impl std::future::Future<Output = ()> {
+fn sleep_ms(ms: u32) -> impl Future<Output = ()> {
     #[cfg(target_arch = "wasm32")]
     {
         gloo_timers::future::TimeoutFuture::new(ms)

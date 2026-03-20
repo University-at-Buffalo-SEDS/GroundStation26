@@ -142,7 +142,7 @@ async fn remove_sqlite_sidecars(db_path: &str) {
     for suffix in [".wal", ".shm", "-wal", "-shm", "-journal", ".journal"] {
         let sidecar = format!("{db_path}{suffix}");
         for attempt in 0..retries {
-            match std::fs::remove_file(&sidecar) {
+            match fs::remove_file(&sidecar) {
                 Ok(()) => break,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
                 Err(err) => {

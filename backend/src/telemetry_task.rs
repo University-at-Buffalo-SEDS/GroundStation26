@@ -258,7 +258,7 @@ fn push_battery_sample_and_compute_drop_rate(
 
     let dt_s = state
         .last_remaining_ts_ms
-        .map(|t0| ((ts_ms.saturating_sub(t0)) as f32 / 1000.0).clamp(0.0, 10.0))
+        .map(|t0| (ts_ms.saturating_sub(t0) as f32 / 1000.0).clamp(0.0, 10.0))
         .unwrap_or(0.0);
     state.last_remaining_ts_ms = Some(ts_ms);
     state.last_ts_ms = Some(ts_ms);
@@ -510,7 +510,7 @@ fn smooth_remaining_minutes(source_id: &str, ts_ms: i64, raw: Option<f32>) -> Op
 
     let dt_s = state
         .last_ts_ms
-        .map(|t0| ((ts_ms.saturating_sub(t0)) as f32 / 1000.0).clamp(0.0, 10.0))
+        .map(|t0| (ts_ms.saturating_sub(t0) as f32 / 1000.0).clamp(0.0, 10.0))
         .unwrap_or(0.0);
     let prev = state.ema_remaining_min.unwrap_or(raw_val);
     let max_step = REMAINING_MAX_STEP_MIN_PER_SEC * dt_s.max(0.02);
@@ -1393,7 +1393,7 @@ fn log_telemetry_error(context: &str, err: sedsprintf_rs_2026::TelemetryError) {
     eprintln!("{context}: {:?}", err);
 }
 
-fn payload_json_from_pkt(pkt: &sedsprintf_rs_2026::packet::Packet) -> String {
+fn payload_json_from_pkt(pkt: &Packet) -> String {
     let bytes = pkt.payload();
     serde_json::to_string(&bytes).unwrap_or_else(|_| "[]".to_string())
 }
@@ -1437,7 +1437,7 @@ fn handle_timesync_tick(
 fn handle_timesync_packet(
     router: &Arc<sedsprintf_rs_2026::router::Router>,
     timesync_state: &Arc<Mutex<TimeSyncState>>,
-    pkt: &sedsprintf_rs_2026::packet::Packet,
+    pkt: &Packet,
 ) -> bool {
     if !timesync_enabled() {
         return false;
