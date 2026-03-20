@@ -98,11 +98,19 @@ fn build_windows_resources(manifest_dir: &Path, target: &str) {
     if !target.contains("windows") {
         return;
     }
+    let host = env::var("HOST").unwrap_or_default();
 
     let icon = manifest_dir.join("assets").join("icon.ico");
     println!("cargo:rerun-if-changed={}", icon.display());
     if !icon.exists() {
         panic!("Windows icon not found: {}", icon.display());
+    }
+
+    if !host.contains("windows") {
+        println!(
+            "cargo:warning=Skipping Windows resource compilation while cross-checking from non-Windows host ({host})"
+        );
+        return;
     }
 
     let mut res = winres::WindowsResource::new();

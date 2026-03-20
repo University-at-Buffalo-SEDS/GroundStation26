@@ -835,7 +835,7 @@ fn LoginCard(
 }
 
 #[component]
-fn ConnectionFailedCard(message: String) -> Element {
+fn ConnectionFailedCard(message: String, on_retry: EventHandler<()>) -> Element {
     let nav = use_navigator();
     rsx! {
         div {
@@ -855,7 +855,7 @@ fn ConnectionFailedCard(message: String) -> Element {
                     button {
                         style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#0f172a; color:#e5e7eb; cursor:pointer;",
                         onclick: move |_| {
-                            let _ = nav.replace(Route::Dashboard {});
+                            on_retry.call(());
                         },
                         "Retry"
                     }
@@ -1167,8 +1167,10 @@ pub fn Dashboard() -> Element {
     auth::init_from_storage(&base);
     let mut auth_state = use_signal(|| None::<Result<AuthSessionStatus, String>>);
     let mut auth_state_base = use_signal(String::new);
+    let mut auth_retry_nonce = use_signal(|| 0_u64);
     use_effect(move || {
         let base = UrlConfig::base_http();
+        let _retry_nonce = *auth_retry_nonce.read();
         if *auth_state_base.read() != base {
             auth_state_base.set(base.clone());
             auth_state.set(None);
@@ -1205,6 +1207,11 @@ pub fn Dashboard() -> Element {
                     "The frontend could not reach the backend session endpoint.\n\n{}",
                     err
                 ),
+                on_retry: move |_| {
+                    auth_state.set(None);
+                    let next = auth_retry_nonce.read().wrapping_add(1);
+                    auth_retry_nonce.set(next);
+                },
             }
         },
     }

@@ -19,7 +19,6 @@ RUN mkdir -p backend/comms
 RUN mkdir -p backend/users
 RUN mkdir -p map_downloader/src
 RUN mkdir -p frontend/dist
-RUN mkdir -p shared/src
 
 # Backend crate (no data/)
 COPY backend/Cargo.toml backend/
@@ -42,10 +41,6 @@ COPY frontend/platform frontend/platform
 COPY frontend/scripts frontend/scripts
 COPY frontend/static frontend/static
 COPY frontend/Dioxus.toml frontend/
-
-# Shared
-COPY shared/Cargo.toml shared/
-COPY shared/src shared/src
 
 # Top-level workspace manifest and main build script
 COPY Cargo.toml ./
