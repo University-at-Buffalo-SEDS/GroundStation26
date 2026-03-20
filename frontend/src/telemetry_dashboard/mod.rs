@@ -2066,9 +2066,11 @@ fn TelemetryDashboardInner() -> Element {
                             match auth::fetch_logged_out_session_status(&base, skip_tls).await {
                                 Ok(status) if status.permissions.view_data => {
                                     auth::set_logged_out_status(status);
+                                    reconnect_and_reseed_after_auth_change();
                                 }
                                 Ok(_) | Err(_) => {
                                     auth::clear_current_session();
+                                    reconnect_and_reseed_after_auth_change();
                                     let _ = nav.push(Route::Login {});
                                 }
                             }

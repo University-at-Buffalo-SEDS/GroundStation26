@@ -3162,7 +3162,7 @@ def build_frontend(
             elif (
                     platform_name == "linux"
                     and (frontend_dir.parent / "target" / "dx" / _frontend_package_name(frontend_dir) / (
-            "debug" if debug_mode else "release") / "linux" / "app").exists()
+                    "debug" if debug_mode else "release") / "linux" / "app").exists()
             ):
                 print(
                     "Warning: dx linux bundler failed after staging the app payload; falling back to manual AppImage "

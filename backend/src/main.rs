@@ -76,7 +76,10 @@ fn ensure_sqlite_db_file(path: &Path) -> anyhow::Result<String> {
         fs::write(path, b"")?;
         println!("Created empty DB file: {}", path.display());
     }
-    Ok(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().to_string())
+    Ok(fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string())
 }
 
 async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()> {

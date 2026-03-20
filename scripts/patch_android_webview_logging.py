@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ANDROID_KOTLIN_DIR = (ROOT / "target" / "dx" / "groundstation_frontend" / "release" / "android" / "app" / "app" / 
+ANDROID_KOTLIN_DIR = (ROOT / "target" / "dx" / "groundstation_frontend" / "release" / "android" / "app" / "app" /
                       "src" / "main" / "kotlin" / "dev" / "dioxus" / "main")
 CLIENT_PATH = ANDROID_KOTLIN_DIR / "RustWebViewClient.kt"
 WEBVIEW_PATH = ANDROID_KOTLIN_DIR / "RustWebView.kt"

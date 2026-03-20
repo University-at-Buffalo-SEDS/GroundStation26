@@ -724,9 +724,9 @@ if TK_AVAILABLE:
                     "Serial: " + ", ".join(self.env.serial_ports) + "\n"
                                                                     "SPI: " + ", ".join(self.env.spi_devices) + "\n"
                                                                                                                 "CAN: "
-                                                                                                                "" + 
+                                                                                                                "" +
                     ", ".join(
-                self.env.can_interfaces)
+                        self.env.can_interfaces)
             )
             self.detected_label.configure(text=detected_text)
             self.help_text.configure(state="normal")

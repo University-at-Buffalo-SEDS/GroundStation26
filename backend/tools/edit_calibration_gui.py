@@ -130,7 +130,7 @@ def _points_for_channel(data: dict[str, Any], channel_name: str) -> list[tuple[f
 
 
 def _write_points_for_channel(
-    data: dict[str, Any], channel_name: str, points: list[tuple[float, float]]
+        data: dict[str, Any], channel_name: str, points: list[tuple[float, float]]
 ) -> None:
     spec = CHANNEL_SPECS[channel_name]
     out = []
@@ -170,7 +170,7 @@ def _eval_fit(data: dict[str, Any], channel_name: str, raw: float) -> float | No
         d = fit.get("d")
         if None not in (a, b, c, d):
             x = raw - x0
-            return float(a) * x**3 + float(b) * x**2 + float(c) * x + float(d)
+            return float(a) * x ** 3 + float(b) * x ** 2 + float(c) * x + float(d)
 
     if fit_type == "poly2":
         a = fit.get("a")
@@ -178,7 +178,7 @@ def _eval_fit(data: dict[str, Any], channel_name: str, raw: float) -> float | No
         c = fit.get("c")
         if None not in (a, b, c):
             x = raw - x0
-            return float(a) * x**2 + float(b) * x + float(c)
+            return float(a) * x ** 2 + float(b) * x + float(c)
 
     m = linear.get("m")
     if m is None:
@@ -211,13 +211,13 @@ def _fit_summary(data: dict[str, Any], channel_name: str) -> str:
 
 class PointDialog(tk.Toplevel):
     def __init__(
-        self,
-        parent: tk.Misc,
-        *,
-        title: str,
-        expected_label: str,
-        expected_value: float = 0.0,
-        raw_value: float = 0.0,
+            self,
+            parent: tk.Misc,
+            *,
+            title: str,
+            expected_label: str,
+            expected_value: float = 0.0,
+            raw_value: float = 0.0,
     ) -> None:
         super().__init__(parent)
         self.title(title)
@@ -370,9 +370,9 @@ class ChannelPane(ttk.Frame):
 
     def reset_points(self) -> None:
         if not messagebox.askyesno(
-            "Reset points",
-            f"Reset all {self.spec['label']} points?",
-            parent=self,
+                "Reset points",
+                f"Reset all {self.spec['label']} points?",
+                parent=self,
         ):
             return
         _write_points_for_channel(self.editor.data, self.channel_name, [])
@@ -438,9 +438,12 @@ class ChannelPane(ttk.Frame):
             self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#f8fafc", outline=color, width=1.5)
 
         self.canvas.create_text(8, 8, anchor="nw", fill="#94a3b8", text=f"y max {y_max:.3f}", font=("TkDefaultFont", 9))
-        self.canvas.create_text(8, bottom - 2, anchor="sw", fill="#94a3b8", text=f"y min {y_min:.3f}", font=("TkDefaultFont", 9))
-        self.canvas.create_text(left, h - 8, anchor="sw", fill="#94a3b8", text=f"x min {x_min:.3f}", font=("TkDefaultFont", 9))
-        self.canvas.create_text(right, h - 8, anchor="se", fill="#94a3b8", text=f"x max {x_max:.3f}", font=("TkDefaultFont", 9))
+        self.canvas.create_text(8, bottom - 2, anchor="sw", fill="#94a3b8", text=f"y min {y_min:.3f}",
+                                font=("TkDefaultFont", 9))
+        self.canvas.create_text(left, h - 8, anchor="sw", fill="#94a3b8", text=f"x min {x_min:.3f}",
+                                font=("TkDefaultFont", 9))
+        self.canvas.create_text(right, h - 8, anchor="se", fill="#94a3b8", text=f"x max {x_max:.3f}",
+                                font=("TkDefaultFont", 9))
 
 
 class CalibrationEditor(tk.Tk):
@@ -502,9 +505,11 @@ class CalibrationEditor(tk.Tk):
             ttk.Label(section, text="Slope (m)").grid(row=0, column=0, sticky="w")
             ttk.Entry(section, textvariable=vars_for_channel["m"]).grid(row=0, column=1, sticky="ew", padx=(8, 0))
             ttk.Label(section, text="Intercept (b)").grid(row=1, column=0, sticky="w", pady=(6, 0))
-            ttk.Entry(section, textvariable=vars_for_channel["b"]).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(6, 0))
+            ttk.Entry(section, textvariable=vars_for_channel["b"]).grid(row=1, column=1, sticky="ew", padx=(8, 0),
+                                                                        pady=(6, 0))
             ttk.Label(section, text="Zero raw").grid(row=2, column=0, sticky="w", pady=(6, 0))
-            ttk.Entry(section, textvariable=vars_for_channel["zero"]).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(6, 0))
+            ttk.Entry(section, textvariable=vars_for_channel["zero"]).grid(row=2, column=1, sticky="ew", padx=(8, 0),
+                                                                           pady=(6, 0))
             ttk.Label(section, text="Fit").grid(row=3, column=0, sticky="nw", pady=(6, 0))
             ttk.Label(
                 section,
@@ -549,9 +554,9 @@ class CalibrationEditor(tk.Tk):
             self.data = _normalize_data(_read_json(path))
         except FileNotFoundError:
             if not messagebox.askyesno(
-                "File not found",
-                f"{path} does not exist.\n\nCreate a new calibration file there?",
-                parent=self,
+                    "File not found",
+                    f"{path} does not exist.\n\nCreate a new calibration file there?",
+                    parent=self,
             ):
                 return
             self.data = _normalize_data({})

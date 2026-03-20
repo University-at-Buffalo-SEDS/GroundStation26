@@ -1182,14 +1182,7 @@ fn compute_graph_layout(
                 let size = node_diameter(node);
                 let x = margin_x + layer_idx as i32 * horizontal_gap;
                 let y = cursor_y + (size / 2);
-                placements.insert(
-                    node.id.clone(),
-                    NodePlacement {
-                        x,
-                        y,
-                        size,
-                    },
-                );
+                placements.insert(node.id.clone(), NodePlacement { x, y, size });
                 cursor_y += size + node_gap;
             }
         }
