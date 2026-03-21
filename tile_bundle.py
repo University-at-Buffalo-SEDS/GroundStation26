@@ -641,4 +641,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nTile bundle operation interrupted.", file=sys.stderr)
+        raise SystemExit(130)

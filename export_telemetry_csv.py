@@ -62,6 +62,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        print("\nExport interrupted.", file=sys.stderr)
+        raise SystemExit(130)
     except sqlite3.OperationalError as e:
         print(f"Error: SQLite operation failed: {e}", file=sys.stderr)
         print("Hint: ensure the DB file exists and is not locked by another process.", file=sys.stderr)

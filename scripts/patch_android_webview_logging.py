@@ -206,4 +206,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nPatch interrupted.", file=sys.stderr)
+        raise SystemExit(130)

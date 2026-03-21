@@ -2265,14 +2265,38 @@ fn TelemetryDashboardInner() -> Element {
                .gs26-tab-shell {{
                  flex:1 1 100%;
                  min-width:0;
-                 align-items:stretch;
+                 display:grid !important;
+                 width:100% !important;
+                 justify-content:stretch !important;
+                 align-items:center !important;
+                 justify-items:center !important;
+                 row-gap:0.95rem;
                  padding:0.7rem;
+               }}
+               .gs26-tab-shell[data-expanded=\"false\"] {{
+                 grid-template-columns:auto;
+                 justify-content:center;
+               }}
+               .gs26-tab-shell[data-expanded=\"true\"] {{
+                 grid-template-columns:minmax(0, 1fr) minmax(0, 1fr);
+                 column-gap:0.95rem;
+                 justify-content:stretch;
+               }}
+               .gs26-tab-shell[data-expanded=\"true\"] .gs26-tab-toggle {{
+                 grid-column:1;
+               }}
+               .gs26-tab-shell[data-expanded=\"true\"] .gs26-tab-nav {{
+                 grid-column:2;
                }}
                .gs26-tab-toggle {{
                  display:inline-flex;
                  align-items:center;
                  justify-content:center;
-                 width:100%;
+                 width:fit-content;
+                 max-width:100%;
+                 align-self:center;
+                 justify-self:center;
+                 white-space:nowrap;
                  padding:0.7rem 0.9rem;
                  border-radius:0.75rem;
                  border:1px solid #334155;
@@ -2283,17 +2307,22 @@ fn TelemetryDashboardInner() -> Element {
                }}
                .gs26-tab-nav {{
                  display:none;
-                 width:100%;
+                 width:auto;
                }}
                .gs26-tab-shell[data-expanded=\"true\"] .gs26-tab-nav {{
                  display:flex;
                  flex-direction:column;
-                 align-items:stretch;
-                 margin-top:0.7rem;
+                 align-items:center;
+                 justify-self:stretch;
+                 width:100%;
+                  margin-top:0;
                }}
                .gs26-tab-shell[data-expanded=\"true\"] .gs26-tab-nav button {{
-                 width:100%;
-                 justify-content:flex-start;
+                 width:18ch;
+                 max-width:100%;
+                 justify-content:center;
+                 margin-left:auto;
+                 margin-right:auto;
                }}
              }}"
                 }

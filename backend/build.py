@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 LOG_FILE: Optional[Path] = None
+INTERRUPTED_EXIT_CODE = 130
 
 
 def _append_log(line: str) -> None:
@@ -44,7 +45,10 @@ def run(cmd: list[str], cwd: Path) -> None:
     print(cmd_line)
     _append_log(cmd_line + "\n")
     if LOG_FILE is None:
-        subprocess.run(cmd, cwd=cwd, check=True)
+        try:
+            subprocess.run(cmd, cwd=cwd, check=True)
+        except KeyboardInterrupt:
+            raise
         return
     proc = subprocess.Popen(
         cmd,
@@ -55,10 +59,19 @@ def run(cmd: list[str], cwd: Path) -> None:
         bufsize=1,
     )
     assert proc.stdout is not None
-    for line in proc.stdout:
-        print(line, end="")
-        _append_log(line)
-    rc = proc.wait()
+    try:
+        for line in proc.stdout:
+            print(line, end="")
+            _append_log(line)
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
     if rc != 0:
         raise subprocess.CalledProcessError(rc, cmd)
 
@@ -216,6 +229,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        print("\nBackend build interrupted.", file=sys.stderr)
+        sys.exit(INTERRUPTED_EXIT_CODE)
     except FileNotFoundError as e:
         missing = e.filename or "<unknown>"
         print("\nError: backend build failed because a required tool/file is missing.", file=sys.stderr)

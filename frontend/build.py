@@ -36,6 +36,7 @@ LEGACY_APP_BUNDLE_NAME = f"{LEGACY_APP_NAME}.app"
 FIXED_MOBILEPROVISION_REL = Path("Groundstation_26.mobileprovision")
 
 LOG_FILE: Optional[Path] = None
+INTERRUPTED_EXIT_CODE = 130
 
 
 def _append_log(line: str) -> None:
@@ -100,7 +101,10 @@ def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None
     if env:
         merged.update(env)
     if LOG_FILE is None:
-        subprocess.run(cmd, cwd=cwd, check=True, env=merged)
+        try:
+            subprocess.run(cmd, cwd=cwd, check=True, env=merged)
+        except KeyboardInterrupt:
+            raise
         return
 
     proc = subprocess.Popen(
@@ -113,10 +117,19 @@ def run(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None
         bufsize=1,
     )
     assert proc.stdout is not None
-    for line in proc.stdout:
-        print(line, end="")
-        _append_log(line)
-    rc = proc.wait()
+    try:
+        for line in proc.stdout:
+            print(line, end="")
+            _append_log(line)
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
     if rc != 0:
         raise subprocess.CalledProcessError(rc, cmd)
 
@@ -4331,6 +4344,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        print("\nFrontend build interrupted.", file=sys.stderr)
+        sys.exit(INTERRUPTED_EXIT_CODE)
     except FileNotFoundError as e:
         missing = e.filename or "<unknown>"
         print("\nError: frontend build failed because a required tool/file is missing.", file=sys.stderr)

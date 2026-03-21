@@ -424,4 +424,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nImage generation interrupted.", file=sys.stderr)
+        raise SystemExit(130)

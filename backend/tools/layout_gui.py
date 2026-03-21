@@ -1952,6 +1952,9 @@ if __name__ == "__main__":
 
         app = LayoutEditor(initial_path=args.layout)
         app.mainloop()
+    except KeyboardInterrupt:
+        print("\nLayout editor interrupted.", file=sys.stderr)
+        sys.exit(130)
     except FileNotFoundError as e:
         missing = e.filename or "<unknown>"
         print(f"Error: Required file not found: {missing}", file=sys.stderr)
