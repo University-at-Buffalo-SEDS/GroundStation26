@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import os
+import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
