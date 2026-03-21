@@ -278,7 +278,7 @@ pub fn NetworkTopologyTab(
 
                 div {
                     id: "{viewport_id}",
-                    style: "padding:8px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; max-height:calc(100vh - 260px); cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
+                    style: "padding:8px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; max-height:calc(var(--gs26-app-height) - 260px); cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
                     div {
                         id: "{surface_id}",
                         style: "position:relative; width:{graph_layout.width}px; height:{graph_layout.height}px; min-width:{graph_layout.width}px; min-height:{graph_layout.height}px;",

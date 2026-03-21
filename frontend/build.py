@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import gzip
 import json
+import errno
 import os
 import plistlib
 import re
@@ -8,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 import platform
@@ -698,7 +700,7 @@ def cleanup_linux_package_artifacts(frontend_dir: Path) -> None:
         return
 
     for item in sorted(dist.iterdir()):
-        if item.suffix.lower() in {".deb", ".rpm", ".appimage"} or ".pkg.tar." in item.name:
+        if item.suffix.lower() in {".deb", ".rpm", ".appimage", ".flatpak"} or ".pkg.tar." in item.name:
             print(f"Removing stale Linux package artifact: {item.name}")
             _remove_path(item)
 
@@ -918,6 +920,15 @@ def _linux_pkg_arch(rust_target: Optional[str]) -> str:
         return "aarch64"
     if "armv7" in target or "armhf" in target:
         return "armv7h"
+    return "x86_64"
+
+
+def _flatpak_arch(rust_target: Optional[str]) -> str:
+    target = (rust_target or "").lower()
+    if "aarch64" in target or "arm64" in target:
+        return "aarch64"
+    if "armv7" in target or "armhf" in target:
+        return "arm"
     return "x86_64"
 
 
@@ -1480,6 +1491,114 @@ def build_manual_arch_package(
         temp_dir.cleanup()
 
 
+def build_manual_flatpak_package(
+        frontend_dir: Path,
+        rust_target: Optional[str],
+        debug_mode: bool,
+) -> None:
+    flatpak = _which_in_path("flatpak", os.environ.get("PATH", ""))
+    if flatpak is None:
+        print("Warning: flatpak not found; skipping Flatpak packaging.", file=sys.stderr)
+        return
+
+    temp_dir, base_pkg_root = _stage_linux_app_payload(frontend_dir, rust_target, debug_mode)
+    try:
+        version = _read_frontend_version(frontend_dir)
+        flatpak_arch = _flatpak_arch(rust_target)
+        app_id = _bundle_identifier(frontend_dir)
+        runtime = f"org.freedesktop.Platform/{flatpak_arch}/24.08"
+        sdk = f"org.freedesktop.Sdk/{flatpak_arch}/24.08"
+        branch = "stable"
+        app_root = Path(temp_dir.name) / "flatpak-app"
+        files_root = app_root / "files"
+        export_repo = Path(temp_dir.name) / "flatpak-repo"
+        files_root.mkdir(parents=True, exist_ok=True)
+
+        usr_root = base_pkg_root / "usr"
+        if usr_root.exists():
+            for item in sorted(usr_root.iterdir()):
+                target = files_root / item.name
+                if item.is_dir():
+                    shutil.copytree(item, target, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, target)
+
+        opt_root = base_pkg_root / "opt"
+        if opt_root.exists():
+            target = files_root / "opt"
+            shutil.copytree(opt_root, target, dirs_exist_ok=True)
+
+        metadata = app_root / "metadata"
+        metadata.write_text(
+            "\n".join([
+                "[Application]",
+                f"name={app_id}",
+                f"runtime={runtime}",
+                f"sdk={sdk}",
+                f"command={LINUX_PACKAGE_NAME}",
+                "",
+                "[Context]",
+                "shared=network;ipc;",
+                "sockets=wayland;x11;fallback-x11;",
+                "devices=dri;",
+                "filesystems=home;",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+
+        run(
+            [
+                str(flatpak),
+                "build-finish",
+                "--allow=bluetooth",
+                "--share=network",
+                "--share=ipc",
+                "--socket=wayland",
+                "--socket=fallback-x11",
+                "--socket=x11",
+                "--device=dri",
+                "--filesystem=home",
+                str(app_root),
+            ],
+            cwd=frontend_dir,
+        )
+        run(
+            [
+                str(flatpak),
+                "build-export",
+                "--arch",
+                flatpak_arch,
+                str(export_repo),
+                str(app_root),
+                branch,
+            ],
+            cwd=frontend_dir,
+        )
+
+        dist = dist_dir(frontend_dir)
+        dist.mkdir(parents=True, exist_ok=True)
+        flatpak_path = dist / f"{APP_NAME}_{flatpak_arch}.flatpak"
+        run(
+            [
+                str(flatpak),
+                "build-bundle",
+                str(export_repo),
+                str(flatpak_path),
+                app_id,
+                branch,
+                "--arch",
+                flatpak_arch,
+            ],
+            cwd=frontend_dir,
+        )
+        if not flatpak_path.exists():
+            raise FileNotFoundError(f"Manual Flatpak bundle was not created: {flatpak_path}")
+        print(f"✅ Linux Flatpak created: {flatpak_path} (version {version})")
+    finally:
+        temp_dir.cleanup()
+
+
 def rename_android_artifacts(frontend_dir: Path) -> None:
     dist = dist_dir(frontend_dir)
     if not dist.exists():
@@ -1622,7 +1741,23 @@ def clear_generated_android_project(frontend_dir: Path, debug_mode: bool) -> Non
     project_dir = _generated_android_app_dir(frontend_dir, debug_mode)
     if project_dir.exists():
         print(f"Removing existing generated Android project: {project_dir}")
-        shutil.rmtree(project_dir)
+        last_error: Optional[OSError] = None
+        for attempt in range(5):
+            try:
+                shutil.rmtree(project_dir)
+                last_error = None
+                break
+            except OSError as exc:
+                last_error = exc
+                if exc.errno != errno.ENOTEMPTY:
+                    raise
+                if attempt == 4:
+                    break
+                time.sleep(0.2 * (attempt + 1))
+        if project_dir.exists():
+            shutil.rmtree(project_dir, ignore_errors=True)
+        if project_dir.exists() and last_error is not None:
+            raise last_error
 
 
 def _merge_tree(src: Path, dst: Path) -> None:
@@ -1636,6 +1771,159 @@ def _merge_tree(src: Path, dst: Path) -> None:
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
+
+
+def _kotlin_string_literal(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _keychain_password(service: str) -> Optional[str]:
+    if platform.system() != "Darwin":
+        return None
+    try:
+        out = subprocess.check_output(
+            ["security", "find-generic-password", "-a", os.environ.get("USER", ""), "-s", service, "-w"],
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    value = out.decode("utf-8", errors="replace").strip()
+    return value or None
+
+
+def _android_signing_settings(frontend_dir: Path) -> dict[str, str]:
+    repo_root = frontend_dir.parent
+    defaults = {
+        "ANDROID_KEYSTORE_PATH": str((Path.home() / "keys" / "groundstation-upload.jks").expanduser()),
+        "ANDROID_KEY_ALIAS": "upload",
+        "ANDROID_KEYSTORE_TYPE": "JKS",
+    }
+    settings: dict[str, str] = {}
+    for key, default_value in defaults.items():
+        value = os.environ.get(key, "").strip() or default_value
+        settings[key] = value
+
+    keystore_path = Path(settings["ANDROID_KEYSTORE_PATH"]).expanduser()
+    if not keystore_path.is_absolute():
+        keystore_path = (repo_root / keystore_path).resolve()
+    settings["ANDROID_KEYSTORE_PATH"] = str(keystore_path)
+
+    settings["ANDROID_KEYSTORE_PASSWORD"] = (
+        os.environ.get("ANDROID_KEYSTORE_PASSWORD", "").strip()
+        or _keychain_password("gs26-android-keystore-pass")
+        or ""
+    )
+    settings["ANDROID_KEY_PASSWORD"] = (
+        os.environ.get("ANDROID_KEY_PASSWORD", "").strip()
+        or _keychain_password("gs26-android-key-pass")
+        or settings["ANDROID_KEYSTORE_PASSWORD"]
+    )
+    return settings
+
+
+def _android_sdk_levels() -> tuple[int, int, int]:
+    min_sdk = int(os.environ.get("ANDROID_MIN_SDK", "24").strip() or "24")
+    target_sdk = int(os.environ.get("ANDROID_TARGET_SDK", "35").strip() or "35")
+    compile_sdk = int(os.environ.get("ANDROID_COMPILE_SDK", str(target_sdk)).strip() or str(target_sdk))
+    return min_sdk, target_sdk, compile_sdk
+
+
+def _configure_android_app_gradle(frontend_dir: Path, project_dir: Path) -> None:
+    gradle_file = project_dir / "app" / "build.gradle.kts"
+    if not gradle_file.exists():
+        raise FileNotFoundError(f"Android app Gradle file not found: {gradle_file}")
+
+    min_sdk, target_sdk, compile_sdk = _android_sdk_levels()
+    version_name = _read_frontend_version(frontend_dir)
+    version_code = _read_dioxus_build(frontend_dir)
+    raw = gradle_file.read_text(encoding="utf-8")
+    raw = re.sub(r"compileSdk\s*=\s*\d+", f"compileSdk = {compile_sdk}", raw)
+    raw = re.sub(r"minSdk\s*=\s*\d+", f"minSdk = {min_sdk}", raw)
+    raw = re.sub(r"targetSdk\s*=\s*\d+", f"targetSdk = {target_sdk}", raw)
+    raw = re.sub(r'versionCode\s*=\s*\d+', f"versionCode = {int(version_code)}", raw)
+    raw = re.sub(r'versionName\s*=\s*"[^"]+"', f'versionName = "{version_name}"', raw)
+    gradle_file.write_text(raw, encoding="utf-8")
+    print(
+        "Configured Android app Gradle values: "
+        f"minSdk={min_sdk}, targetSdk={target_sdk}, compileSdk={compile_sdk}, "
+        f"versionCode={version_code}, versionName={version_name}"
+    )
+
+
+def _configure_android_signing(frontend_dir: Path, project_dir: Path) -> bool:
+    settings = _android_signing_settings(frontend_dir)
+    keystore_raw = settings["ANDROID_KEYSTORE_PATH"].strip()
+    alias = settings["ANDROID_KEY_ALIAS"].strip()
+    store_password = settings["ANDROID_KEYSTORE_PASSWORD"].strip()
+    key_password = settings["ANDROID_KEY_PASSWORD"].strip() or store_password
+    store_type = settings["ANDROID_KEYSTORE_TYPE"].strip()
+
+    if not Path(keystore_raw).exists() and not any(
+            os.environ.get(key, "").strip()
+            for key in [
+                "ANDROID_KEYSTORE_PATH",
+                "ANDROID_KEY_ALIAS",
+                "ANDROID_KEYSTORE_PASSWORD",
+                "ANDROID_KEY_PASSWORD",
+                "ANDROID_KEYSTORE_TYPE",
+            ]
+    ):
+        return False
+
+    missing: list[str] = []
+    if not keystore_raw:
+        missing.append("ANDROID_KEYSTORE_PATH")
+    if not alias:
+        missing.append("ANDROID_KEY_ALIAS")
+    if not store_password:
+        missing.append("ANDROID_KEYSTORE_PASSWORD")
+    if not key_password:
+        missing.append("ANDROID_KEY_PASSWORD")
+    if missing:
+        raise RuntimeError("Android signing is partially configured. Missing: " + ", ".join(missing))
+
+    keystore_path = Path(keystore_raw).expanduser()
+    if not keystore_path.is_absolute():
+        keystore_path = (frontend_dir.parent / keystore_path).resolve()
+    if not keystore_path.exists():
+        raise FileNotFoundError(f"Android keystore not found: {keystore_path}")
+
+    gradle_file = project_dir / "app" / "build.gradle.kts"
+    if not gradle_file.exists():
+        raise FileNotFoundError(f"Android app Gradle file not found: {gradle_file}")
+
+    raw = gradle_file.read_text(encoding="utf-8")
+    signing_block = "\n".join([
+        "    signingConfigs {",
+        "        create(\"release\") {",
+        f"            storeFile = file({_kotlin_string_literal(str(keystore_path))})",
+        f"            storePassword = {_kotlin_string_literal(store_password)}",
+        f"            keyAlias = {_kotlin_string_literal(alias)}",
+        f"            keyPassword = {_kotlin_string_literal(key_password)}",
+        *([f"            storeType = {_kotlin_string_literal(store_type)}"] if store_type else []),
+        "        }",
+        "    }",
+    ])
+    if "signingConfigs {" not in raw:
+        marker = "    buildTypes {\n"
+        if marker not in raw:
+            raise RuntimeError(f"Could not find Android buildTypes block in {gradle_file}")
+        raw = raw.replace(marker, signing_block + "\n" + marker, 1)
+
+    release_marker = "        getByName(\"release\") {\n"
+    if release_marker not in raw:
+        raise RuntimeError(f"Could not find Android release build type in {gradle_file}")
+    release_block = "\n".join([
+        release_marker.rstrip("\n"),
+        "            signingConfig = signingConfigs.getByName(\"release\")",
+    ]) + "\n"
+    if "signingConfig = signingConfigs.getByName(\"release\")" not in raw:
+        raw = raw.replace(release_marker, release_block, 1)
+
+    gradle_file.write_text(raw, encoding="utf-8")
+    print(f"Configured Android release signing with keystore: {keystore_path}")
+    return True
 
 
 def patch_generated_android_project(frontend_dir: Path, debug_mode: bool) -> Path:
@@ -1660,6 +1948,8 @@ def patch_generated_android_project(frontend_dir: Path, debug_mode: bool) -> Pat
     _merge_tree(overlay_root / "java", app_src_main / "java")
     _merge_tree(overlay_root / "kotlin", app_src_main / "kotlin")
     _ensure_android_icon_compat(frontend_dir, app_src_main)
+    _configure_android_app_gradle(frontend_dir, project_dir)
+    _configure_android_signing(frontend_dir, project_dir)
     proguard_src = overlay_root / "proguard-rules.pro"
     if proguard_src.exists():
         shutil.copy2(proguard_src, project_dir / "app" / "proguard-rules.pro")
@@ -1677,8 +1967,14 @@ def rebuild_patched_android_bundle(frontend_dir: Path, debug_mode: bool, env: Op
         raise FileNotFoundError(f"Gradle wrapper not found: {gradlew}")
 
     task = "bundleDebug" if debug_mode else "bundleRelease"
-    clean_task = "clean"
-    run([str(gradlew), clean_task, task], cwd=project_dir, env=env)
+    for stale_dir in [
+        project_dir / "app" / "build",
+        project_dir / "build",
+    ]:
+        if stale_dir.exists():
+            print(f"Removing stale Android Gradle output: {stale_dir}")
+            shutil.rmtree(stale_dir, ignore_errors=True)
+    run([str(gradlew), task], cwd=project_dir, env=env)
 
     outputs_dir = project_dir / "app" / "build" / "outputs" / "bundle" / ("debug" if debug_mode else "release")
     bundles = sorted(outputs_dir.glob("*.aab"))
@@ -1794,6 +2090,309 @@ def install_android_apk(frontend_dir: Path, apk_path: Optional[Path] = None) -> 
     run([adb, "-s", serial, "install", "-r", str(apk)], cwd=frontend_dir, env=env)
     print(f"✅ Installed Android APK on {serial}: {apk}")
     return serial, apk
+
+
+def _bundle_identifier(frontend_dir: Path) -> str:
+    dioxus_toml = frontend_dir / "Dioxus.toml"
+    if not dioxus_toml.exists():
+        raise FileNotFoundError(f"Dioxus.toml not found: {dioxus_toml}")
+    if tomllib is None:
+        raise RuntimeError("Python tomllib is required to read Dioxus.toml")
+    with dioxus_toml.open("rb") as f:
+        data = tomllib.load(f)
+    bundle = data.get("bundle") or {}
+    identifier = bundle.get("identifier")
+    if not identifier:
+        raise RuntimeError(f"bundle.identifier missing in {dioxus_toml}")
+    return str(identifier)
+
+
+def _sanitize_screenshot_stem(name: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())
+    stem = stem.strip("._-")
+    return stem or "screenshot"
+
+
+def _parse_screenshot_delay(raw: Optional[str]) -> float:
+    if raw is None:
+        return 1.5
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid screenshot_delay '{raw}'") from exc
+    if value < 0:
+        raise RuntimeError("screenshot_delay must be >= 0")
+    return value
+
+
+def _resolve_screenshot_output_dir(repo_root: Path, raw: Optional[str]) -> Path:
+    if raw:
+        out = Path(raw)
+        if not out.is_absolute():
+            out = repo_root / out
+    else:
+        out = repo_root / "artifacts" / "screenshots"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _parse_size_arg(raw: Optional[str], *, default: tuple[int, int], label: str) -> tuple[int, int]:
+    if raw is None:
+        return default
+    m = re.fullmatch(r"\s*(\d{2,5})[xX](\d{2,5})\s*", raw)
+    if not m:
+        raise RuntimeError(f"Invalid {label} '{raw}', expected WIDTHxHEIGHT")
+    width = int(m.group(1))
+    height = int(m.group(2))
+    if width < 200 or height < 200:
+        raise RuntimeError(f"{label} must be at least 200x200")
+    return width, height
+
+
+def _write_screenshot_manifest(output_dir: Path, lines: list[str]) -> None:
+    manifest = output_dir / "manifest.txt"
+    manifest.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
+def _osascript_capture(lines: list[str], cwd: Path) -> str:
+    cmd = ["osascript"]
+    for line in lines:
+        cmd.extend(["-e", line])
+    return run_capture(cmd, cwd=cwd).strip()
+
+
+def _kill_app(process_name: str, cwd: Path) -> None:
+    try:
+        _osascript_capture([f'tell application "{process_name}" to quit'], cwd)
+    except subprocess.CalledProcessError:
+        pass
+
+
+def _macos_bundle_info(app: Path) -> tuple[str, str]:
+    plist_path = app / "Contents" / "Info.plist"
+    if not plist_path.exists():
+        raise FileNotFoundError(f"Info.plist not found in app bundle: {plist_path}")
+    with plist_path.open("rb") as f:
+        info = plistlib.load(f)
+    bundle_id = info.get("CFBundleIdentifier")
+    executable = info.get("CFBundleExecutable")
+    if not bundle_id:
+        raise RuntimeError(f"CFBundleIdentifier missing in {plist_path}")
+    if not executable:
+        raise RuntimeError(f"CFBundleExecutable missing in {plist_path}")
+    return str(bundle_id), str(executable)
+
+
+def _kill_macos_app(bundle_id: str, executable: str, cwd: Path) -> None:
+    try:
+        _osascript_capture([f'tell application id "{bundle_id}" to quit'], cwd)
+    except subprocess.CalledProcessError:
+        pass
+    try:
+        run(["pkill", "-x", executable], cwd=cwd)
+    except subprocess.CalledProcessError:
+        pass
+
+
+def _open_macos_app_for_capture(frontend_dir: Path) -> tuple[Path, str, str, int]:
+    if platform.system() != "Darwin":
+        print("Error: macOS screenshot requires macOS.", file=sys.stderr)
+        sys.exit(1)
+
+    app = app_bundle_path(frontend_dir)
+    if not app.exists():
+        raise FileNotFoundError(f"App bundle not found: {app}")
+
+    bundle_id, executable = _macos_bundle_info(app)
+    _kill_macos_app(bundle_id, executable, frontend_dir)
+    run(["open", "-na", str(app)], cwd=frontend_dir)
+    pid = -1
+    for _ in range(60):
+        try:
+            out = run_capture(["pgrep", "-n", "-x", executable], cwd=frontend_dir).strip()
+            if out:
+                pid = int(out.splitlines()[-1].strip())
+                break
+        except subprocess.CalledProcessError:
+            pass
+        time.sleep(0.1)
+    if pid <= 0:
+        raise RuntimeError(f"Timed out waiting for macOS app process '{executable}'")
+    return app, bundle_id, executable, pid
+
+
+def _resize_macos_capture_window(
+        frontend_dir: Path,
+        process_pid: int,
+        *,
+        window_size: tuple[int, int],
+        origin: tuple[int, int] = (80, 80),
+) -> tuple[int, int, int, int]:
+    width, height = window_size
+    origin_x, origin_y = origin
+    bounds = _osascript_capture(
+        [
+            'tell application "System Events"',
+            f'set targetProc to first process whose unix id is {process_pid}',
+            'tell targetProc',
+            'set frontmost to true',
+            'repeat 60 times',
+            'if (count of windows) > 0 then exit repeat',
+            'delay 0.1',
+            'end repeat',
+            'if (count of windows) is 0 then error "App window did not appear in time"',
+            f'set position of front window to {{{origin_x}, {origin_y}}}',
+            f'set size of front window to {{{width}, {height}}}',
+            'delay 0.15',
+            'set winPos to position of front window',
+            'set winSize to size of front window',
+            'return (item 1 of winPos as string) & "," & (item 2 of winPos as string) & "," & (item 1 of winSize as string) & "," & (item 2 of winSize as string)',
+            'end tell',
+            'end tell',
+        ],
+        frontend_dir,
+    )
+    try:
+        x_str, y_str, w_str, h_str = [part.strip() for part in bounds.split(",", 3)]
+        return int(x_str), int(y_str), int(w_str), int(h_str)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse macOS window bounds: {bounds}") from exc
+
+
+def _capture_macos_window_region(frontend_dir: Path, output_path: Path, region: tuple[int, int, int, int]) -> None:
+    x, y, w, h = region
+    run(["screencapture", "-x", "-R", f"{x},{y},{w},{h}", str(output_path)], cwd=frontend_dir)
+
+
+def _fit_preview_window_size(
+        target_size: tuple[int, int],
+        *,
+        max_width: int = 1600,
+        max_height: int = 1400,
+) -> tuple[int, int]:
+    target_width, target_height = target_size
+    scale = min(max_width / target_width, max_height / target_height, 1.0)
+    width = max(320, int(round(target_width * scale)))
+    height = max(320, int(round(target_height * scale)))
+    return width, height
+
+
+def _capture_macos_app_content(
+        frontend_dir: Path,
+        output_path: Path,
+        *,
+        window_region: tuple[int, int, int, int],
+        target_size: tuple[int, int],
+        top_chrome_px: int = 32,
+) -> None:
+    x, y, w, h = window_region
+    content_y = y + top_chrome_px
+    content_h = h - top_chrome_px
+    if content_h <= 0:
+        raise RuntimeError(f"Invalid content height after cropping macOS chrome: {window_region}")
+
+    with tempfile.TemporaryDirectory(prefix="gs26-shot-") as temp_dir_name:
+        raw_path = Path(temp_dir_name) / "raw.png"
+        _capture_macos_window_region(frontend_dir, raw_path, (x, content_y, w, content_h))
+        target_width, target_height = target_size
+        run(
+            ["sips", "-z", str(target_height), str(target_width), str(raw_path), "--out", str(output_path)],
+            cwd=frontend_dir,
+        )
+
+
+def _adb_shell_capture(frontend_dir: Path, serial: str, env: Optional[dict[str, str]], *args: str) -> str:
+    adb = _resolve_adb(env)
+    return run_capture([adb, "-s", serial, "shell", *args], cwd=frontend_dir, env=env)
+
+
+def _android_override_value(wm_output: str, label: str) -> Optional[str]:
+    pat = re.compile(rf"{label}:\s*([0-9x]+)", re.IGNORECASE)
+    m = pat.search(wm_output)
+    return m.group(1) if m else None
+
+
+def _restore_android_screen_config(
+        frontend_dir: Path,
+        serial: str,
+        env: Optional[dict[str, str]],
+        *,
+        prior_size_override: Optional[str],
+        prior_density_override: Optional[str],
+) -> None:
+    adb = _resolve_adb(env)
+    if prior_size_override:
+        run([adb, "-s", serial, "shell", "wm", "size", prior_size_override], cwd=frontend_dir, env=env)
+    else:
+        run([adb, "-s", serial, "shell", "wm", "size", "reset"], cwd=frontend_dir, env=env)
+
+    if prior_density_override:
+        run([adb, "-s", serial, "shell", "wm", "density", prior_density_override], cwd=frontend_dir, env=env)
+    else:
+        run([adb, "-s", serial, "shell", "wm", "density", "reset"], cwd=frontend_dir, env=env)
+
+
+def capture_android_screenshot(
+        frontend_dir: Path,
+        *,
+        output_dir: Path,
+        delay_seconds: float,
+        filename_stem: Optional[str] = None,
+        screen_size: Optional[tuple[int, int]] = None,
+) -> Path:
+    env = _ensure_android_env(frontend_dir, None)
+    devices = _list_adb_devices(frontend_dir, env)
+    if not devices:
+        raise RuntimeError("No Android emulator/device found. Start an emulator or connect a device first.")
+    if len(devices) > 1:
+        raise RuntimeError(f"Multiple Android devices found: {', '.join(devices)}. Leave only one connected.")
+
+    adb = _resolve_adb(env)
+    serial = devices[0]
+    package_id = _bundle_identifier(frontend_dir)
+    remote_path = f"/sdcard/{_sanitize_screenshot_stem(filename_stem or package_id)}.png"
+    local_name = f"{_sanitize_screenshot_stem(filename_stem or package_id)}.png"
+    local_path = output_dir / local_name
+    prior_size_override = _android_override_value(
+        _adb_shell_capture(frontend_dir, serial, env, "wm", "size"),
+        "Override size",
+    )
+    prior_density_override = _android_override_value(
+        _adb_shell_capture(frontend_dir, serial, env, "wm", "density"),
+        "Override density",
+    )
+
+    try:
+        if screen_size:
+            width, height = screen_size
+            print(f"Setting Android capture size on {serial} to {width}x{height}")
+            run([adb, "-s", serial, "shell", "wm", "size", f"{width}x{height}"], cwd=frontend_dir, env=env)
+
+        print(f"Launching Android app on {serial}: {package_id}")
+        run(
+            [adb, "-s", serial, "shell", "monkey", "-p", package_id, "-c", "android.intent.category.LAUNCHER", "1"],
+            cwd=frontend_dir,
+            env=env,
+        )
+        if delay_seconds > 0:
+            print(f"Waiting {delay_seconds:.1f}s before Android screenshot capture")
+            time.sleep(delay_seconds)
+
+        run([adb, "-s", serial, "shell", "rm", "-f", remote_path], cwd=frontend_dir, env=env)
+        run([adb, "-s", serial, "shell", "screencap", "-p", remote_path], cwd=frontend_dir, env=env)
+        run([adb, "-s", serial, "pull", remote_path, str(local_path)], cwd=frontend_dir, env=env)
+        run([adb, "-s", serial, "shell", "rm", "-f", remote_path], cwd=frontend_dir, env=env)
+    finally:
+        _restore_android_screen_config(
+            frontend_dir,
+            serial,
+            env,
+            prior_size_override=prior_size_override,
+            prior_density_override=prior_density_override,
+        )
+
+    print(f"Android screenshot saved: {local_path}")
+    return local_path
 
 
 def clear_app_bundle(frontend_dir: Path) -> None:
@@ -2666,6 +3265,126 @@ def ios_sim_deploy(frontend_dir: Path) -> tuple[str, str]:
     return udid, bundle_id
 
 
+def capture_ios_sim_screenshot(
+        frontend_dir: Path,
+        *,
+        output_dir: Path,
+        delay_seconds: float,
+        filename_stem: Optional[str] = None,
+) -> Path:
+    if platform.system() != "Darwin":
+        print("Error: iOS simulator screenshot requires macOS.", file=sys.stderr)
+        sys.exit(1)
+
+    app = app_bundle_path(frontend_dir)
+    if not app.exists():
+        raise FileNotFoundError(f"Simulator app bundle not found: {app}")
+
+    udid, bundle_id = ios_sim_deploy(frontend_dir)
+    if delay_seconds > 0:
+        print(f"Waiting {delay_seconds:.1f}s before iOS simulator screenshot capture")
+        time.sleep(delay_seconds)
+
+    local_name = f"{_sanitize_screenshot_stem(filename_stem or bundle_id)}.png"
+    local_path = output_dir / local_name
+    run(["xcrun", "simctl", "io", udid, "screenshot", str(local_path)], cwd=frontend_dir)
+    print(f"iOS simulator screenshot saved: {local_path}")
+    return local_path
+
+
+def capture_macos_screenshot(
+        frontend_dir: Path,
+        *,
+        output_dir: Path,
+        delay_seconds: float,
+        filename_stem: Optional[str] = None,
+        window_size: tuple[int, int] = (1440, 900),
+) -> Path:
+    _app, bundle_id, executable, process_pid = _open_macos_app_for_capture(frontend_dir)
+    local_name = f"{_sanitize_screenshot_stem(filename_stem or 'macos')}.png"
+    local_path = output_dir / local_name
+    preview_size = _fit_preview_window_size(window_size)
+    bounds = _resize_macos_capture_window(frontend_dir, process_pid, window_size=preview_size)
+    if delay_seconds > 0:
+        print(f"Waiting {delay_seconds:.1f}s before macOS screenshot capture")
+        time.sleep(delay_seconds)
+    _capture_macos_app_content(frontend_dir, local_path, window_region=bounds, target_size=window_size)
+    _kill_macos_app(bundle_id, executable, frontend_dir)
+    print(f"macOS screenshot saved: {local_path}")
+    return local_path
+
+
+def capture_publisher_screenshots(
+        frontend_dir: Path,
+        *,
+        debug_mode: bool,
+        max_size_mode: bool,
+        use_existing: bool,
+        output_dir: Path,
+        delay_seconds: float,
+        desktop_window_size: tuple[int, int],
+        ios_window_size: tuple[int, int],
+        android_window_size: tuple[int, int],
+) -> list[Path]:
+    if platform.system() != "Darwin":
+        raise RuntimeError("publisher_screenshots currently requires macOS because it captures the macOS app window.")
+
+    desktop_dir = output_dir / "desktop"
+    ios_dir = output_dir / "ios"
+    android_dir = output_dir / "android"
+    for path in (desktop_dir, ios_dir, android_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    if not use_existing:
+        build_frontend(
+            frontend_dir,
+            platform_name="macos",
+            rust_target=None,
+            debug_mode=debug_mode,
+            max_size=max_size_mode,
+        )
+    _app, bundle_id, executable, process_pid = _open_macos_app_for_capture(frontend_dir)
+    captures = [
+        ("desktop", desktop_dir / "publisher-desktop.png", desktop_window_size),
+        ("ios-phone", ios_dir / "publisher-ios-phone.png", ios_window_size),
+        ("ios-tablet", ios_dir / "publisher-ios-tablet.png", (2048, 2732)),
+        ("android-phone", android_dir / "publisher-android-phone.png", android_window_size),
+        ("android-tablet7", android_dir / "publisher-android-tablet7.png", (1600, 2560)),
+        ("android-tablet10", android_dir / "publisher-android-tablet10.png", (1920, 3072)),
+    ]
+    results: list[Path] = []
+    try:
+        for label, output_path, target_size in captures:
+            preview_size = _fit_preview_window_size(target_size)
+            print(f"Capturing {label} publisher screenshot at {target_size[0]}x{target_size[1]}")
+            bounds = _resize_macos_capture_window(frontend_dir, process_pid, window_size=preview_size)
+            if delay_seconds > 0:
+                print(f"Waiting {delay_seconds:.1f}s before {label} screenshot capture")
+                time.sleep(delay_seconds)
+            _capture_macos_app_content(frontend_dir, output_path, window_region=bounds, target_size=target_size)
+            results.append(output_path)
+    finally:
+        _kill_macos_app(bundle_id, executable, frontend_dir)
+
+    manifest_lines = [
+        f"desktop={results[0]}",
+        f"ios_phone={results[1]}",
+        f"ios_tablet={results[2]}",
+        f"android_phone={results[3]}",
+        f"android_tablet7={results[4]}",
+        f"android_tablet10={results[5]}",
+        f"desktop_window={desktop_window_size[0]}x{desktop_window_size[1]}",
+        f"ios_window={ios_window_size[0]}x{ios_window_size[1]}",
+        f"android_window={android_window_size[0]}x{android_window_size[1]}",
+        "ios_tablet_window=2048x2732",
+        "android_tablet7_window=1600x2560",
+        "android_tablet10_window=1920x3072",
+        f"delay_seconds={delay_seconds:.1f}",
+    ]
+    _write_screenshot_manifest(output_dir, manifest_lines)
+    return results
+
+
 def macos_deploy(frontend_dir: Path) -> Path:
     if platform.system() != "Darwin":
         print("Error: macos_deploy requires macOS.", file=sys.stderr)
@@ -2952,7 +3671,9 @@ def _ensure_bundle_icon_compat(frontend_dir: Path) -> None:
 
 
 def _ensure_android_icon_compat(frontend_dir: Path, app_src_main: Path) -> None:
-    src_png = frontend_dir / "assets" / "icon.png"
+    src_png = frontend_dir / "assets" / "icon_1024x1024.png"
+    if not src_png.exists():
+        src_png = frontend_dir / "assets" / "icon.png"
     if not src_png.exists():
         print(f"Warning: Android icon source not found: {src_png}", file=sys.stderr)
         return
@@ -2992,17 +3713,15 @@ def _ensure_android_icon_compat(frontend_dir: Path, app_src_main: Path) -> None:
         out_dir = res_dir / folder
         out_dir.mkdir(parents=True, exist_ok=True)
         target = out_dir / "ic_launcher.webp"
-        if not target.exists():
-            img.resize((size, size), Image.LANCZOS).save(target, format="WEBP", quality=100)
+        img.resize((size, size), Image.LANCZOS).save(target, format="WEBP", quality=100)
 
     for folder, size in foreground_sizes.items():
         out_dir = res_dir / folder
         out_dir.mkdir(parents=True, exist_ok=True)
         target = out_dir / "ic_launcher_foreground.webp"
-        if not target.exists():
-            img.resize((size, size), Image.LANCZOS).save(
-                target, format="WEBP", quality=100
-            )
+        img.resize((size, size), Image.LANCZOS).save(
+            target, format="WEBP", quality=100
+        )
 
     drawable_dir = res_dir / "drawable"
     drawable_dir.mkdir(parents=True, exist_ok=True)
@@ -3012,14 +3731,12 @@ def _ensure_android_icon_compat(frontend_dir: Path, app_src_main: Path) -> None:
     android:src="@mipmap/ic_launcher_foreground" />
 """
     foreground_xml_path = drawable_dir / "ic_launcher_foreground.xml"
-    if not foreground_xml_path.exists():
-        foreground_xml_path.write_text(foreground_xml, encoding="utf-8")
+    foreground_xml_path.write_text(foreground_xml, encoding="utf-8")
 
     drawable_v24_dir = res_dir / "drawable-v24"
     drawable_v24_dir.mkdir(parents=True, exist_ok=True)
     foreground_v24_xml_path = drawable_v24_dir / "ic_launcher_foreground.xml"
-    if not foreground_v24_xml_path.exists():
-        foreground_v24_xml_path.write_text(foreground_xml, encoding="utf-8")
+    foreground_v24_xml_path.write_text(foreground_xml, encoding="utf-8")
 
     background_xml = """<?xml version="1.0" encoding="utf-8"?>
 <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
@@ -3027,8 +3744,7 @@ def _ensure_android_icon_compat(frontend_dir: Path, app_src_main: Path) -> None:
 </shape>
 """
     background_xml_path = drawable_dir / "ic_launcher_background.xml"
-    if not background_xml_path.exists():
-        background_xml_path.write_text(background_xml, encoding="utf-8")
+    background_xml_path.write_text(background_xml, encoding="utf-8")
 
 
 def build_frontend(
@@ -3114,8 +3830,6 @@ def build_frontend(
             elif platform_name == "windows":
                 _ensure_windows_icon_compat(frontend_dir)
                 cmd.extend(["--windows-subsystem", "WINDOWS"])
-            elif platform_name == "android" and android_package_type == "aab":
-                cmd.extend(["--package-types", android_package_type])
         else:
             cmd.extend(["--platform", "web"])
 
@@ -3196,6 +3910,7 @@ def build_frontend(
                 build_manual_appimage(frontend_dir, rust_target, debug_mode)
                 build_manual_linux_packages(frontend_dir, rust_target, debug_mode)
                 build_manual_arch_package(frontend_dir, rust_target, debug_mode)
+                build_manual_flatpak_package(frontend_dir, rust_target, debug_mode)
         elif platform_name == "android":
             rename_android_artifacts(frontend_dir)
             if android_package_type != "aab":
@@ -3236,9 +3951,12 @@ def print_usage(exit_code: int = 1) -> None:
     print("Frontend packaging and deploy actions:")
     print("  ./frontend/build.py ios_deploy [debug] [existing]")
     print("  ./frontend/build.py ios_sim_deploy [debug] [existing]")
+    print("  ./frontend/build.py ios_sim_screenshot [debug] [existing] [screenshot_delay=<seconds>] [screenshot_out=<path>] [screenshot_name=<name>]")
     print("  ./frontend/build.py ios_sign [debug] [existing]")
     print("  ./frontend/build.py ios_dist_sign [debug] [existing]")
     print("  ./frontend/build.py android_install [debug] [existing]")
+    print("  ./frontend/build.py android_screenshot [debug] [existing] [screenshot_delay=<seconds>] [screenshot_out=<path>] [screenshot_name=<name>]")
+    print("  ./frontend/build.py publisher_screenshots [debug] [existing] [screenshot_delay=<seconds>] [screenshot_out=<path>] [desktop_window=<width>x<height>] [ios_window=<width>x<height>] [android_window=<width>x<height>]")
     print("  ./frontend/build.py macos_deploy [debug] [existing]")
     print("  ./frontend/build.py macos_sign [debug] [existing]")
     print("  ./frontend/build.py macos_notarize [debug] [existing]")
@@ -3249,7 +3967,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  - iOS packaging/signing")
     print("  - Android bundle/APK generation and install")
     print("  - macOS signing/notarization/deploy")
-    print("  - Windows/Linux packaging helpers")
+    print("  - Windows/Linux packaging helpers (AppImage, deb, rpm, Arch, Flatpak)")
     print("  - frontend icon compatibility and asset generation")
     print("")
     print("Options:")
@@ -3258,6 +3976,12 @@ def print_usage(exit_code: int = 1) -> None:
     print("  existing                          # reuse existing build artifacts when action allows it")
     print("  apk|aab                           # Android package type")
     print("  log=<path>                        # tee command output into a log file")
+    print("  screenshot_delay=<seconds>        # wait before capturing screenshot")
+    print("  screenshot_out=<path>             # output directory for screenshot actions")
+    print("  screenshot_name=<name>            # screenshot filename stem")
+    print("  desktop_window=<width>x<height>   # desktop output size for publisher screenshot")
+    print("  ios_window=<width>x<height>       # iPhone output size for publisher screenshot set")
+    print("  android_window=<width>x<height>   # Android phone output size for publisher screenshot set")
     print("")
     print("Environment:")
     print("  CERT_REGEX=...                    # override cert regex for signer script")
@@ -3270,6 +3994,14 @@ def print_usage(exit_code: int = 1) -> None:
     print("  GS_WASM_BINDGEN_CLI_VERSION=...   # force wasm-bindgen-cli version")
     print("  GS26_WINDOWS_TARGET=...           # override windows Rust target")
     print("  GS26_MACOS_TARGET=...             # override macOS Rust target")
+    print("  ANDROID_KEYSTORE_PATH=...         # defaults to ~/keys/groundstation-upload.jks")
+    print("  ANDROID_KEY_ALIAS=...             # defaults to upload")
+    print("  ANDROID_KEYSTORE_PASSWORD=...     # defaults from macOS Keychain service gs26-android-keystore-pass")
+    print("  ANDROID_KEY_PASSWORD=...          # defaults from macOS Keychain service gs26-android-key-pass")
+    print("  ANDROID_KEYSTORE_TYPE=...         # defaults to JKS")
+    print("  ANDROID_MIN_SDK=...               # defaults to 24")
+    print("  ANDROID_TARGET_SDK=...            # defaults to 35")
+    print("  ANDROID_COMPILE_SDK=...           # defaults to ANDROID_TARGET_SDK")
     print("")
     print("Provisioning profile path:")
     print(f"  {FIXED_MOBILEPROVISION_REL}")
@@ -3286,6 +4018,12 @@ def main() -> None:
     use_existing = False
     log_file_arg: Optional[str] = None
     android_package_type: Optional[str] = None
+    screenshot_delay_arg: Optional[str] = None
+    screenshot_out_arg: Optional[str] = None
+    screenshot_name_arg: Optional[str] = None
+    desktop_window_arg: Optional[str] = None
+    ios_window_arg: Optional[str] = None
+    android_window_arg: Optional[str] = None
     frontend_only_platform: Optional[str] = None
     frontend_rust_target: Optional[str] = None
     action: Optional[str] = None
@@ -3302,8 +4040,11 @@ def main() -> None:
     }
     actions = {
         "android_install",
+        "android_screenshot",
+        "publisher_screenshots",
         "ios_deploy",
         "ios_sim_deploy",
+        "ios_sim_screenshot",
         "ios_sign",
         "ios_dist_sign",
         "macos_deploy",
@@ -3327,6 +4068,42 @@ def main() -> None:
                 print("Error: log= requires a filepath.", file=sys.stderr)
                 print_usage()
             log_file_arg = value
+        elif arg.startswith("screenshot_delay="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: screenshot_delay= requires a number of seconds.", file=sys.stderr)
+                print_usage()
+            screenshot_delay_arg = value
+        elif arg.startswith("screenshot_out="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: screenshot_out= requires a directory path.", file=sys.stderr)
+                print_usage()
+            screenshot_out_arg = value
+        elif arg.startswith("screenshot_name="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: screenshot_name= requires a filename stem.", file=sys.stderr)
+                print_usage()
+            screenshot_name_arg = value
+        elif arg.startswith("desktop_window="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: desktop_window= requires WIDTHxHEIGHT.", file=sys.stderr)
+                print_usage()
+            desktop_window_arg = value
+        elif arg.startswith("ios_window="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: ios_window= requires WIDTHxHEIGHT.", file=sys.stderr)
+                print_usage()
+            ios_window_arg = value
+        elif arg.startswith("android_window=") or arg.startswith("android_screen="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: android_window= requires WIDTHxHEIGHT.", file=sys.stderr)
+                print_usage()
+            android_window_arg = value
         elif arg in actions:
             if action or frontend_only_platform:
                 print("Error: Only one frontend action/build may be specified.", file=sys.stderr)
@@ -3344,6 +4121,23 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     frontend_dir = repo_root / "frontend"
     _configure_log_file(repo_root, log_file_arg)
+    screenshot_delay = _parse_screenshot_delay(screenshot_delay_arg)
+    screenshot_out_dir = _resolve_screenshot_output_dir(repo_root, screenshot_out_arg)
+    desktop_window_size = _parse_size_arg(
+        desktop_window_arg,
+        default=(1440, 900),
+        label="desktop_window",
+    )
+    ios_window_size = _parse_size_arg(
+        ios_window_arg,
+        default=(1290, 2796),
+        label="ios_window",
+    )
+    android_window_size = _parse_size_arg(
+        android_window_arg,
+        default=(1080, 1920),
+        label="android_window",
+    )
 
     if action:
         if action == "ios_deploy":
@@ -3376,6 +4170,46 @@ def main() -> None:
             print(f"Android install complete ({serial}) for {installed_apk.name}")
             return
 
+        if action == "android_screenshot":
+            apk_path: Optional[Path] = None
+            if not use_existing:
+                build_frontend(
+                    frontend_dir,
+                    platform_name="android",
+                    rust_target=None,
+                    debug_mode=debug_mode,
+                    max_size=max_size_mode,
+                    android_package_type="apk",
+                )
+                apk_candidates = sorted(dist_dir(frontend_dir).glob("*.apk"))
+                apk_path = apk_candidates[-1] if apk_candidates else None
+            serial, installed_apk = install_android_apk(frontend_dir, apk_path=apk_path)
+            screenshot_path = capture_android_screenshot(
+                frontend_dir,
+                output_dir=screenshot_out_dir,
+                delay_seconds=screenshot_delay,
+                filename_stem=screenshot_name_arg,
+            )
+            print(f"Android screenshot complete ({serial}) for {installed_apk.name}: {screenshot_path}")
+            return
+
+        if action == "publisher_screenshots":
+            results = capture_publisher_screenshots(
+                frontend_dir,
+                debug_mode=debug_mode,
+                max_size_mode=max_size_mode,
+                use_existing=use_existing,
+                output_dir=screenshot_out_dir,
+                delay_seconds=screenshot_delay,
+                desktop_window_size=desktop_window_size,
+                ios_window_size=ios_window_size,
+                android_window_size=android_window_size,
+            )
+            print("Publisher screenshots complete:")
+            for path in results:
+                print(f"  {path}")
+            return
+
         if action == "ios_sim_deploy":
             if not use_existing:
                 build_frontend(
@@ -3387,6 +4221,24 @@ def main() -> None:
                 )
             udid, bundle_id = ios_sim_deploy(frontend_dir)
             print(f"Simulator deploy complete ({udid}) for {bundle_id}")
+            return
+
+        if action == "ios_sim_screenshot":
+            if not use_existing:
+                build_frontend(
+                    frontend_dir,
+                    platform_name="ios",
+                    rust_target="aarch64-apple-ios-sim",
+                    debug_mode=debug_mode,
+                    max_size=max_size_mode,
+                )
+            screenshot_path = capture_ios_sim_screenshot(
+                frontend_dir,
+                output_dir=screenshot_out_dir,
+                delay_seconds=screenshot_delay,
+                filename_stem=screenshot_name_arg,
+            )
+            print(f"iOS simulator screenshot complete: {screenshot_path}")
             return
 
         if action == "ios_sign":

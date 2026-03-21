@@ -63,11 +63,22 @@ fn all_tests_passed(checks: &[RouteCheck], ws_probe: &Option<Result<String, Stri
 
 // --- global css ---
 const GLOBAL_CSS: &str = r#"
+:root {
+    --gs26-app-height: 100dvh;
+}
+
+@supports not (height: 100dvh) {
+    :root {
+        --gs26-app-height: 100vh;
+    }
+}
+
 html, body {
     margin: 0;
     padding: 0;
     width: 100%;
-    height: 100%;
+    min-height: var(--gs26-app-height);
+    height: var(--gs26-app-height);
     background: #020617;
     overflow: hidden;
 }
@@ -78,7 +89,8 @@ html, body {
 
 #main {
     width: 100%;
-    height: 100%;
+    min-height: var(--gs26-app-height);
+    height: var(--gs26-app-height);
     background: #020617;
 }
 
@@ -620,7 +632,7 @@ pub fn App() -> Element {
         document::Script { src: asset!("static/ground_map.js") }
 
         div {
-            style: "min-height: 100vh; width: 100%; background: #020617; color: #e5e7eb;",
+            style: "min-height: var(--gs26-app-height); width: 100%; background: #020617; color: #e5e7eb;",
             Router::<Route> {}
         }
     }
@@ -705,7 +717,7 @@ fn LoginCard(
             style: if overlay_mode {
                 "width:min(560px, 92vw); color:#e5e7eb; font-family:system-ui;"
             } else {
-                "min-height:100vh; height:100vh; overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;"
+                "min-height:var(--gs26-app-height); height:var(--gs26-app-height); overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;"
             },
             div {
                 style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
@@ -839,7 +851,7 @@ fn ConnectionFailedCard(message: String, on_retry: EventHandler<()>) -> Element 
     let nav = use_navigator();
     rsx! {
         div {
-            style: "min-height:100vh; height:100vh; overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            style: "min-height:var(--gs26-app-height); height:var(--gs26-app-height); overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
             div {
                 style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
                 h1 { style: "margin:0 0 10px 0; font-size:22px;", "Failed to Connect" }
@@ -874,7 +886,7 @@ fn LoginOverlay(
 ) -> Element {
     rsx! {
         div {
-            style: "position:relative; width:100%; min-height:100vh;",
+            style: "position:relative; width:100%; min-height:var(--gs26-app-height);",
             crate::telemetry_dashboard::TelemetryDashboard {}
             div {
                 style: "position:fixed; inset:0; display:flex; align-items:center; justify-content:center; padding:24px; background:rgba(2, 6, 23, 0.78); backdrop-filter:blur(8px); z-index:1000;",
@@ -931,7 +943,7 @@ pub fn Connect() -> Element {
 
     rsx! {
         div {
-            style: "min-height:100vh; height:100vh; overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            style: "min-height:var(--gs26-app-height); height:var(--gs26-app-height); overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
             div {
                 style: "width:min(900px, 94vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
 
@@ -1174,7 +1186,7 @@ pub fn Dashboard() -> Element {
         if UrlConfig::_stored_base_url().is_none() {
             return rsx! {
                 div {
-                    style: "height:100vh; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+                    style: "height:var(--gs26-app-height); display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
                     div {
                         style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220;",
                         h1 { style: "margin:0 0 12px 0; font-size:18px;", "Not connected" }
@@ -1221,7 +1233,7 @@ pub fn Dashboard() -> Element {
 
     match auth_state.read().as_ref() {
         None => rsx! {
-            div { style: "height:100vh; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            div { style: "height:var(--gs26-app-height); display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
                 div { style: "padding:20px; border:1px solid #334155; border-radius:16px; background:#0b1220;", "Checking session..." }
             }
         },

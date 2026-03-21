@@ -205,10 +205,11 @@ pub fn DetailedTab(
                 )}
             }
 
-            div { style: "display:grid; gap:14px; grid-template-columns:minmax(420px, 1.7fr) minmax(300px, 1fr); align-items:start;",
+            div { style: "display:grid; gap:14px; grid-template-columns:repeat(auto-fit, minmax(min(100%, 360px), 1fr)); align-items:start; width:100%;",
                 div { style: "display:flex; flex-direction:column; gap:14px; min-width:0;",
                     div { style: section_style(),
                     h3 { style: section_title_style(), "Board Latency Detail" }
+                    div { style: "width:100%; overflow-x:auto;",
                     table { style: table_style(),
                         thead {
                             tr {
@@ -231,9 +232,11 @@ pub fn DetailedTab(
                             }
                         }
                     }
+                    }
                 }
                     div { style: section_style(),
                     h3 { style: section_title_style(), "Topology Nodes" }
+                    div { style: "width:100%; overflow-x:auto;",
                     table { style: table_style(),
                         thead {
                             tr {
@@ -257,10 +260,12 @@ pub fn DetailedTab(
                         }
                         }
                     }
+                    }
                 }
                 div { style: "display:flex; flex-direction:column; gap:14px; min-width:0;",
                     div { style: section_style(),
                         h3 { style: section_title_style(), "Endpoint Ownership" }
+                        div { style: "width:100%; overflow-x:auto;",
                         table { style: table_style(),
                             thead {
                                 tr {
@@ -282,9 +287,11 @@ pub fn DetailedTab(
                                 }
                             }
                         }
+                        }
                     }
                     div { style: section_style(),
                         h3 { style: section_title_style(), "Topology Links" }
+                        div { style: "width:100%; overflow-x:auto;",
                         table { style: table_style(),
                             thead {
                                 tr {
@@ -304,6 +311,7 @@ pub fn DetailedTab(
                                     }
                                 }
                             }
+                        }
                         }
                     }
                 }
@@ -386,7 +394,7 @@ fn section_title_style() -> &'static str {
 }
 
 fn table_style() -> &'static str {
-    "width:100%; border-collapse:collapse; font-size:13px;"
+    "width:100%; border-collapse:collapse; font-size:13px; table-layout:fixed;"
 }
 
 fn th_style() -> &'static str {
@@ -398,7 +406,7 @@ fn td_style() -> &'static str {
 }
 
 fn td_style_mono() -> &'static str {
-    "padding:8px 6px; border-bottom:1px solid #132738; color:#dbe7f3; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;"
+    "padding:8px 6px; border-bottom:1px solid #132738; color:#dbe7f3; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums; white-space:normal; overflow-wrap:anywhere; word-break:break-word;"
 }
 
 fn format_status(status: NetworkTopologyStatus) -> &'static str {

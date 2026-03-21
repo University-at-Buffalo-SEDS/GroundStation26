@@ -149,6 +149,12 @@ def _frontend_args(
         use_existing: bool,
         action: Optional[str] = None,
         log_file_arg: Optional[str] = None,
+        screenshot_delay_arg: Optional[str] = None,
+        screenshot_out_arg: Optional[str] = None,
+        screenshot_name_arg: Optional[str] = None,
+        desktop_window_arg: Optional[str] = None,
+        ios_window_arg: Optional[str] = None,
+        android_window_arg: Optional[str] = None,
 ) -> list[str]:
     args: list[str] = []
     if action is not None:
@@ -165,6 +171,18 @@ def _frontend_args(
         args.append("existing")
     if log_file_arg:
         args.append(f"log={log_file_arg}")
+    if screenshot_delay_arg:
+        args.append(f"screenshot_delay={screenshot_delay_arg}")
+    if screenshot_out_arg:
+        args.append(f"screenshot_out={screenshot_out_arg}")
+    if screenshot_name_arg:
+        args.append(f"screenshot_name={screenshot_name_arg}")
+    if desktop_window_arg:
+        args.append(f"desktop_window={desktop_window_arg}")
+    if ios_window_arg:
+        args.append(f"ios_window={ios_window_arg}")
+    if android_window_arg:
+        args.append(f"android_window={android_window_arg}")
     return args
 
 
@@ -217,6 +235,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py windows")
     print("  ./build.py android [apk|aab]")
     print("  ./build.py linux")
+    print("  Linux frontend builds emit AppImage/deb/rpm/Arch/Flatpak when supporting tools are installed")
     print("  (add `debug` to frontend/local builds to skip --release)")
     print("")
     print("Frontend actions:")
@@ -225,9 +244,12 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py ios_sign")
     print("  ./build.py ios_dist_sign")
     print("  ./build.py android_install")
+    print("  ./build.py publisher_screenshots")
     print("  ./build.py macos_deploy")
     print("  ./build.py macos_sign")
     print("  ./build.py macos_notarize")
+    print("  ./build.py publisher_screenshots screenshot_out=artifacts/screenshots")
+    print("  ./build.py publisher_screenshots desktop_window=1440x900 ios_window=1290x2796 android_window=1080x1920")
     sys.exit(exit_code)
 
 
@@ -244,15 +266,18 @@ def main() -> None:
     backend_only = False
     log_file_arg: Optional[str] = None
     android_package_type: Optional[str] = None
+    screenshot_delay_arg: Optional[str] = None
+    screenshot_out_arg: Optional[str] = None
+    screenshot_name_arg: Optional[str] = None
+    desktop_window_arg: Optional[str] = None
+    ios_window_arg: Optional[str] = None
+    android_window_arg: Optional[str] = None
     frontend_only_platform: Optional[str] = None
     action: Optional[str] = None
 
     raw_args = [a.strip() for a in sys.argv[1:]]
     if any(a in {"-h", "--help", "help"} for a in raw_args):
         print_usage(0)
-    if len(raw_args) > 8:
-        print("Error: Too many arguments.", file=sys.stderr)
-        print_usage()
 
     frontend_platforms = {"ios", "ios_sim", "macos", "windows", "android", "linux", "web", "frontend_web"}
     frontend_actions = {
@@ -264,6 +289,7 @@ def main() -> None:
         "macos_deploy",
         "macos_sign",
         "macos_notarize",
+        "publisher_screenshots",
     }
 
     for raw_arg in raw_args:
@@ -296,6 +322,42 @@ def main() -> None:
                 print("Error: log= requires a filepath.", file=sys.stderr)
                 print_usage()
             log_file_arg = value
+        elif arg.startswith("screenshot_delay="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: screenshot_delay= requires a number of seconds.", file=sys.stderr)
+                print_usage()
+            screenshot_delay_arg = value
+        elif arg.startswith("screenshot_out="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: screenshot_out= requires a directory path.", file=sys.stderr)
+                print_usage()
+            screenshot_out_arg = value
+        elif arg.startswith("screenshot_name="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: screenshot_name= requires a filename stem.", file=sys.stderr)
+                print_usage()
+            screenshot_name_arg = value
+        elif arg.startswith("desktop_window="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: desktop_window= requires WIDTHxHEIGHT.", file=sys.stderr)
+                print_usage()
+            desktop_window_arg = value
+        elif arg.startswith("ios_window="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: ios_window= requires WIDTHxHEIGHT.", file=sys.stderr)
+                print_usage()
+            ios_window_arg = value
+        elif arg.startswith("android_window=") or arg.startswith("android_screen="):
+            value = raw_arg.split("=", 1)[1].strip()
+            if not value:
+                print("Error: android_window= requires WIDTHxHEIGHT.", file=sys.stderr)
+                print_usage()
+            android_window_arg = value
         elif arg in frontend_actions:
             if action or frontend_only_platform or backend_only:
                 print("Error: Only one frontend action/build may be specified.", file=sys.stderr)
@@ -336,6 +398,12 @@ def main() -> None:
                 use_existing=use_existing,
                 action=action,
                 log_file_arg=log_file_arg,
+                screenshot_delay_arg=screenshot_delay_arg,
+                screenshot_out_arg=screenshot_out_arg,
+                screenshot_name_arg=screenshot_name_arg,
+                desktop_window_arg=desktop_window_arg,
+                ios_window_arg=ios_window_arg,
+                android_window_arg=android_window_arg,
             ),
         )
         return
@@ -355,6 +423,12 @@ def main() -> None:
                 android_package_type=android_package_type,
                 use_existing=use_existing,
                 log_file_arg=log_file_arg,
+                screenshot_delay_arg=screenshot_delay_arg,
+                screenshot_out_arg=screenshot_out_arg,
+                screenshot_name_arg=screenshot_name_arg,
+                desktop_window_arg=desktop_window_arg,
+                ios_window_arg=ios_window_arg,
+                android_window_arg=android_window_arg,
             ),
         )
         return
@@ -401,6 +475,12 @@ def main() -> None:
         android_package_type=android_package_type,
         use_existing=use_existing,
         log_file_arg=log_file_arg,
+        screenshot_delay_arg=screenshot_delay_arg,
+        screenshot_out_arg=screenshot_out_arg,
+        screenshot_name_arg=screenshot_name_arg,
+        desktop_window_arg=desktop_window_arg,
+        ios_window_arg=ios_window_arg,
+        android_window_arg=android_window_arg,
     )
     backend_args = _backend_args(
         force_pi=force_pi,

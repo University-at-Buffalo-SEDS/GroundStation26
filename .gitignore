@@ -21,3 +21,4 @@ __pycache__/
 /.ai/mcp/mcp.json
 !.mobileprovision
 Groundstation_26.mobileprovision
+/artifacts/
