@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
+import errno
 import gzip
 import json
-import errno
 import os
 import plistlib
 import re
@@ -1823,14 +1823,14 @@ def _android_signing_settings(frontend_dir: Path) -> dict[str, str]:
     settings["ANDROID_KEYSTORE_PATH"] = str(keystore_path)
 
     settings["ANDROID_KEYSTORE_PASSWORD"] = (
-        os.environ.get("ANDROID_KEYSTORE_PASSWORD", "").strip()
-        or _keychain_password("gs26-android-keystore-pass")
-        or ""
+            os.environ.get("ANDROID_KEYSTORE_PASSWORD", "").strip()
+            or _keychain_password("gs26-android-keystore-pass")
+            or ""
     )
     settings["ANDROID_KEY_PASSWORD"] = (
-        os.environ.get("ANDROID_KEY_PASSWORD", "").strip()
-        or _keychain_password("gs26-android-key-pass")
-        or settings["ANDROID_KEYSTORE_PASSWORD"]
+            os.environ.get("ANDROID_KEY_PASSWORD", "").strip()
+            or _keychain_password("gs26-android-key-pass")
+            or settings["ANDROID_KEYSTORE_PASSWORD"]
     )
     return settings
 
@@ -2259,7 +2259,8 @@ def _resize_macos_capture_window(
             'delay 0.15',
             'set winPos to position of front window',
             'set winSize to size of front window',
-            'return (item 1 of winPos as string) & "," & (item 2 of winPos as string) & "," & (item 1 of winSize as string) & "," & (item 2 of winSize as string)',
+            'return (item 1 of winPos as string) & "," & (item 2 of winPos as string) & "," & (item 1 of winSize as '
+            'string) & "," & (item 2 of winSize as string)',
             'end tell',
             'end tell',
         ],
@@ -3964,12 +3965,19 @@ def print_usage(exit_code: int = 1) -> None:
     print("Frontend packaging and deploy actions:")
     print("  ./frontend/build.py ios_deploy [debug] [existing]")
     print("  ./frontend/build.py ios_sim_deploy [debug] [existing]")
-    print("  ./frontend/build.py ios_sim_screenshot [debug] [existing] [screenshot_delay=<seconds>] [screenshot_out=<path>] [screenshot_name=<name>]")
+    print(
+        "  ./frontend/build.py ios_sim_screenshot [debug] [existing] [screenshot_delay=<seconds>] ["
+        "screenshot_out=<path>] [screenshot_name=<name>]")
     print("  ./frontend/build.py ios_sign [debug] [existing]")
     print("  ./frontend/build.py ios_dist_sign [debug] [existing]")
     print("  ./frontend/build.py android_install [debug] [existing]")
-    print("  ./frontend/build.py android_screenshot [debug] [existing] [screenshot_delay=<seconds>] [screenshot_out=<path>] [screenshot_name=<name>]")
-    print("  ./frontend/build.py publisher_screenshots [debug] [existing] [screenshot_delay=<seconds>] [screenshot_out=<path>] [desktop_window=<width>x<height>] [ios_window=<width>x<height>] [android_window=<width>x<height>]")
+    print(
+        "  ./frontend/build.py android_screenshot [debug] [existing] [screenshot_delay=<seconds>] ["
+        "screenshot_out=<path>] [screenshot_name=<name>]")
+    print(
+        "  ./frontend/build.py publisher_screenshots [debug] [existing] [screenshot_delay=<seconds>] ["
+        "screenshot_out=<path>] [desktop_window=<width>x<height>] [ios_window=<width>x<height>] ["
+        "android_window=<width>x<height>]")
     print("  ./frontend/build.py macos_deploy [debug] [existing]")
     print("  ./frontend/build.py macos_sign [debug] [existing]")
     print("  ./frontend/build.py macos_notarize [debug] [existing]")

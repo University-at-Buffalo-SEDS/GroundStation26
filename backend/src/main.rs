@@ -25,7 +25,7 @@ use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
-use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
+use crate::telemetry_task::{get_current_timestamp_ms, set_network_time_router, telemetry_task};
 
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
 use crate::radio::DummyRadio;
@@ -36,6 +36,7 @@ use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
+use sedsprintf_rs_2026::timesync::{TimeSyncConfig, TimeSyncRole};
 use sedsprintf_rs_2026::TelemetryError;
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Connection, Row};
@@ -49,10 +50,6 @@ use tokio::time::Duration;
 
 use crate::web::emit_error;
 use tokio::sync::{broadcast, mpsc};
-
-fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
-    Box::new(get_current_timestamp_ms)
-}
 
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
@@ -505,11 +502,20 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     });
 
-    let cfg = sedsprintf_rs_2026::router::RouterConfig::new([
+    let mut cfg = sedsprintf_rs_2026::router::RouterConfig::new([
         ground_station_handler,
         abort_handler,
         flight_state_handler,
     ]);
+    if telemetry_task::timesync_enabled() {
+        cfg = cfg.with_timesync(TimeSyncConfig {
+            role: TimeSyncRole::Auto,
+            priority: 50,
+            source_timeout_ms: 5_000,
+            announce_interval_ms: 1_000,
+            request_interval_ms: 1_000,
+        });
+    }
 
     // --- Radios ---
     println!("AV bay config: {}", link_description(&radio_links.av_bay));
@@ -591,8 +597,8 @@ async fn main() -> anyhow::Result<()> {
     let router = Arc::new(sedsprintf_rs_2026::router::Router::new(
         RouterMode::Relay,
         cfg,
-        clock(),
     ));
+    set_network_time_router(router.clone());
     let _ = state.topology_router.set(router.clone());
 
     let rocket_side = {

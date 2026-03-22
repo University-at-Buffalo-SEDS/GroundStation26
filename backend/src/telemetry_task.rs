@@ -1,37 +1,28 @@
 use crate::flight_sim;
+use crate::gpio_panel::IGNITION_PIN;
 use crate::layout;
 use crate::loadcell;
-use crate::state::AppState;
-#[cfg(feature = "hitl_mode")]
-use crate::types::FlightState;
-use crate::types::{u8_to_flight_state, Board, TelemetryCommand, TelemetryRow};
-use sedsprintf_rs_2026::config::DataType;
-use sedsprintf_rs_2026::config::DEVICE_IDENTIFIER;
-use sedsprintf_rs_2026::timesync::{
-    compute_offset_delay, decode_timesync_request, decode_timesync_response, TimeSyncConfig, TimeSyncRole,
-    TimeSyncTracker, TimeSyncUpdate,
-};
-
-use crate::gpio_panel::IGNITION_PIN;
 use crate::radio::RadioDevice;
 #[cfg(feature = "hitl_mode")]
 use crate::rocket_commands::FlightComputerCommands;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
+use crate::state::AppState;
+#[cfg(feature = "hitl_mode")]
+use crate::types::FlightState;
+use crate::types::{u8_to_flight_state, Board, TelemetryCommand, TelemetryRow};
 use crate::web::{emit_warning, FlightStateMsg};
+use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
+use sedsprintf_rs_2026::router::Router;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
 use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::time::{interval, Duration};
 
-const TIMESYNC_PRIORITY: u64 = 50;
-const TIMESYNC_SOURCE_TIMEOUT_MS: u64 = 5_000;
-const TIMESYNC_ANNOUNCE_INTERVAL_MS: u64 = 1_000;
-const TIMESYNC_REQUEST_INTERVAL_MS: u64 = 1_000;
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
 const DB_WORK_QUEUE_SIZE: usize = 8_192;
@@ -127,7 +118,6 @@ async fn set_local_flight_state_for_hitl(state: &Arc<AppState>, next_state: Flig
     });
 }
 
-static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static DB_BACKPRESSURE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static DB_LAST_BUCKET_BY_TYPE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
@@ -135,6 +125,7 @@ static DB_OVERFLOW_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static BATTERY_ESTIMATOR_STATE: OnceLock<Mutex<HashMap<String, BatteryEstimatorState>>> =
     OnceLock::new();
 static BATTERY_LAYOUT_CFG: OnceLock<layout::BatteryLayoutConfig> = OnceLock::new();
+static NETWORK_TIME_ROUTER: OnceLock<Arc<Router>> = OnceLock::new();
 const BATTERY_VOLTAGE_EMA_ALPHA: f32 = 0.06;
 const BATTERY_DROP_RATE_EMA_ALPHA: f32 = 0.10;
 const BATTERY_MAX_VOLTAGE_SLEW_V_PER_SEC: f32 = 0.035;
@@ -514,41 +505,8 @@ fn smooth_remaining_minutes(source_id: &str, ts_ms: i64, raw: Option<f32>) -> Op
     state.ema_remaining_min
 }
 
-pub struct TimeSyncState {
-    tracker: TimeSyncTracker,
-    next_seq: u64,
-    pending: Option<(u64, u64)>,
-    last_request_ms: u64,
-    last_announce_ms: u64,
-    last_offset_ms: Option<i64>,
-    last_delay_ms: Option<u64>,
-}
-
-impl TimeSyncState {
-    fn new() -> Self {
-        Self {
-            tracker: TimeSyncTracker::new(TimeSyncConfig {
-                role: TimeSyncRole::Auto,
-                priority: TIMESYNC_PRIORITY,
-                source_timeout_ms: TIMESYNC_SOURCE_TIMEOUT_MS,
-            }),
-            next_seq: 1,
-            pending: None,
-            last_request_ms: 0,
-            last_announce_ms: 0,
-            last_offset_ms: None,
-            last_delay_ms: None,
-        }
-    }
-
-    fn mark_request(&mut self, seq: u64, t1_ms: u64, now_ms: u64) {
-        self.pending = Some((seq, t1_ms));
-        self.last_request_ms = now_ms;
-    }
-
-    fn clear_pending(&mut self) {
-        self.pending = None;
-    }
+pub fn set_network_time_router(router: Arc<Router>) {
+    let _ = NETWORK_TIME_ROUTER.set(router);
 }
 
 pub async fn telemetry_task(
@@ -565,7 +523,6 @@ pub async fn telemetry_task(
     let mut timesync_interval = interval(Duration::from_millis(100));
     let mut heartbeat_failed = false;
     let mut last_backpressure_log_ms: u64 = 0;
-    let timesync_state = Arc::new(Mutex::new(TimeSyncState::new()));
     let packet_work_queue_size = env_usize(
         "GS_PACKET_WORK_QUEUE_SIZE",
         PACKET_WORK_QUEUE_SIZE,
@@ -648,15 +605,11 @@ pub async fn telemetry_task(
 
     let packet_worker = {
         let state = state.clone();
-        let router = router.clone();
-        let timesync_state = timesync_state.clone();
         let db_tx = db_tx.clone();
         let db_overflow = db_overflow.clone();
         tokio::spawn(async move {
             while let Some(pkt) = packet_rx.recv().await {
-                if let Some(row) =
-                    handle_packet(&state, &router, &timesync_state, &db_tx, &db_overflow, pkt).await
-                {
+                if let Some(row) = handle_packet(&state, &db_tx, &db_overflow, pkt).await {
                     state.cache_recent_telemetry(row.clone());
                     let _ = state.ws_tx.send(row);
                 }
@@ -945,7 +898,7 @@ pub async fn telemetry_task(
                 }
                 _ = timesync_interval.tick() => {
                     if timesync_enabled() {
-                        handle_timesync_tick(&router, &timesync_state);
+                        let _ = router.poll_timesync();
                     }
                 }
                 recv = shutdown_rx.recv() => {
@@ -1172,8 +1125,6 @@ async fn queue_db_write(
 
 async fn handle_packet(
     state: &Arc<AppState>,
-    router: &Arc<sedsprintf_rs_2026::router::Router>,
-    timesync_state: &Arc<Mutex<TimeSyncState>>,
     db_tx: &mpsc::Sender<DbWrite>,
     db_overflow: &DbOverflow,
     pkt: Packet,
@@ -1186,10 +1137,6 @@ async fn handle_packet(
         } else {
             emit_warning(state, "Warning packet with invalid UTF-8 payload");
         }
-        return None;
-    }
-
-    if handle_timesync_packet(router, timesync_state, &pkt) {
         return None;
     }
 
@@ -1367,13 +1314,10 @@ async fn handle_packet(
 }
 
 pub fn get_current_timestamp_ms() -> u64 {
-    let raw = get_system_timestamp_ms();
-    let offset = TIMESYNC_OFFSET_MS.load(Ordering::Relaxed);
-    if offset >= 0 {
-        raw.saturating_add(offset as u64)
-    } else {
-        raw.saturating_sub((-offset) as u64)
-    }
+    NETWORK_TIME_ROUTER
+        .get()
+        .and_then(|router| router.network_time_ms())
+        .unwrap_or_else(get_system_timestamp_ms)
 }
 
 fn get_system_timestamp_ms() -> u64 {
@@ -1392,143 +1336,9 @@ fn payload_json_from_pkt(pkt: &Packet) -> String {
     serde_json::to_string(&bytes).unwrap_or_else(|_| "[]".to_string())
 }
 
-fn handle_timesync_tick(
-    router: &Arc<sedsprintf_rs_2026::router::Router>,
-    timesync_state: &Arc<Mutex<TimeSyncState>>,
-) {
-    let now_ms = get_system_timestamp_ms();
-    let mut ts = timesync_state.lock().unwrap();
-
-    if ts.tracker.refresh(now_ms) == TimeSyncUpdate::SourceChanged {
-        ts.clear_pending();
-    }
-
-    if ts.tracker.should_announce(now_ms) {
-        if now_ms.saturating_sub(ts.last_announce_ms) >= TIMESYNC_ANNOUNCE_INTERVAL_MS {
-            let _ = queue_timesync_announce(
-                router,
-                ts.tracker.config().priority,
-                get_current_timestamp_ms(),
-            );
-            ts.last_announce_ms = now_ms;
-        }
-        return;
-    }
-
-    if ts.tracker.current_source().is_some()
-        && ts.pending.is_none()
-        && now_ms.saturating_sub(ts.last_request_ms) >= TIMESYNC_REQUEST_INTERVAL_MS
-    {
-        let seq = ts.next_seq;
-        ts.next_seq = ts.next_seq.wrapping_add(1);
-        let t1_ms = get_system_timestamp_ms();
-        if queue_timesync_request(router, seq, t1_ms).is_ok() {
-            ts.mark_request(seq, t1_ms, now_ms);
-        }
-    }
-}
-
-fn handle_timesync_packet(
-    router: &Arc<sedsprintf_rs_2026::router::Router>,
-    timesync_state: &Arc<Mutex<TimeSyncState>>,
-    pkt: &Packet,
-) -> bool {
-    if !timesync_enabled() {
-        return false;
-    }
-
-    if pkt.sender() == DEVICE_IDENTIFIER {
-        return true;
-    }
-
-    match pkt.data_type() {
-        DataType::TimeSyncAnnounce => {
-            let now_ms = get_system_timestamp_ms();
-            let mut ts = timesync_state.lock().unwrap();
-            if ts.tracker.handle_announce(pkt, now_ms).is_ok() {
-                return true;
-            }
-            true
-        }
-        DataType::TimeSyncRequest => {
-            let now_ms = get_system_timestamp_ms();
-            let ts = timesync_state.lock().unwrap();
-            if !ts.tracker.should_announce(now_ms) {
-                return true;
-            }
-            let req = match decode_timesync_request(pkt) {
-                Ok(req) => req,
-                Err(_) => return true,
-            };
-            let t2_ms = get_current_timestamp_ms();
-            let t3_ms = get_current_timestamp_ms();
-            let _ = queue_timesync_response(router, req.seq, req.t1_ms, t2_ms, t3_ms);
-            true
-        }
-        DataType::TimeSyncResponse => {
-            let now_ms = get_system_timestamp_ms();
-            let mut ts = timesync_state.lock().unwrap();
-            let resp = match decode_timesync_response(pkt) {
-                Ok(resp) => resp,
-                Err(_) => return true,
-            };
-            let Some((pending_seq, t1_ms)) = ts.pending else {
-                return true;
-            };
-            if pending_seq != resp.seq {
-                return true;
-            }
-            if let Some(source) = ts.tracker.current_source() {
-                if source.sender != pkt.sender() {
-                    return true;
-                }
-            } else {
-                return true;
-            }
-            let sample = compute_offset_delay(t1_ms, resp.t2_ms, resp.t3_ms, now_ms);
-            TIMESYNC_OFFSET_MS.store(sample.offset_ms, Ordering::Relaxed);
-            ts.last_offset_ms = Some(sample.offset_ms);
-            ts.last_delay_ms = Some(sample.delay_ms);
-            ts.clear_pending();
-            true
-        }
-        _ => false,
-    }
-}
-
-fn timesync_enabled() -> bool {
+pub fn timesync_enabled() -> bool {
     if cfg!(feature = "testing") {
         return std::env::var("GROUNDSTATION_TIMESYNC").ok().as_deref() == Some("1");
     }
     true
-}
-
-fn queue_timesync_announce(
-    router: &sedsprintf_rs_2026::router::Router,
-    priority: u64,
-    time_ms: u64,
-) -> sedsprintf_rs_2026::TelemetryResult<()> {
-    router.log_queue_ts(DataType::TimeSyncAnnounce, time_ms, &[priority, time_ms])
-}
-
-fn queue_timesync_request(
-    router: &sedsprintf_rs_2026::router::Router,
-    seq: u64,
-    t1_ms: u64,
-) -> sedsprintf_rs_2026::TelemetryResult<()> {
-    router.log_queue_ts(DataType::TimeSyncRequest, t1_ms, &[seq, t1_ms])
-}
-
-fn queue_timesync_response(
-    router: &sedsprintf_rs_2026::router::Router,
-    seq: u64,
-    t1_ms: u64,
-    t2_ms: u64,
-    t3_ms: u64,
-) -> sedsprintf_rs_2026::TelemetryResult<()> {
-    router.log_queue_ts(
-        DataType::TimeSyncResponse,
-        t3_ms,
-        &[seq, t1_ms, t2_ms, t3_ms],
-    )
 }
