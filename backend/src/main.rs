@@ -454,6 +454,7 @@ async fn main() -> anyhow::Result<()> {
         action_policy_tx,
         last_command_ms: Arc::new(Mutex::new(HashMap::new())),
         recent_telemetry_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        recent_alerts_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         av_bay_radio_connected: Arc::new(AtomicBool::new(false)),
         fill_radio_connected: Arc::new(AtomicBool::new(false)),
         topology_router: Arc::new(std::sync::OnceLock::new()),

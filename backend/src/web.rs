@@ -272,7 +272,7 @@ pub struct ErrorMsg {
 /// DTO returned by /api/alerts
 /// Frontend expects:
 ///   [{ "timestamp_ms": i64, "severity": "warning"|"error", "message": "..." }, ...]
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct AlertDto {
     pub timestamp_ms: i64,
     pub severity: String,
@@ -1289,22 +1289,37 @@ async fn get_alerts(
         return response;
     }
     let minutes = params.minutes.unwrap_or(20);
-    let cutoff = now_ms_i64() - (minutes as i64) * 60_000;
+    let latest_db_ts: Option<i64> = sqlx::query_scalar("SELECT MAX(timestamp_ms) FROM alerts")
+        .fetch_one(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let cache_snapshot = state.recent_alerts_snapshot();
+    let latest_cache_ts = cache_snapshot.iter().map(|a| a.timestamp_ms).max();
+
+    let now_ms = match (latest_db_ts, latest_cache_ts) {
+        (Some(a), Some(b)) => a.max(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => return Json(Vec::<AlertDto>::new()).into_response(),
+    };
+    let cutoff = now_ms - (minutes as i64) * 60_000;
 
     let alerts_db = sqlx::query(
         r#"
         SELECT timestamp_ms, severity, message
         FROM alerts
-        WHERE timestamp_ms >= ?
+        WHERE timestamp_ms BETWEEN ? AND ?
         ORDER BY timestamp_ms DESC
         "#,
     )
         .bind(cutoff)
+        .bind(now_ms)
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
 
-    let alerts: Vec<AlertDto> = alerts_db
+    let mut alerts: Vec<AlertDto> = alerts_db
         .into_iter()
         .map(|row| AlertDto {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
@@ -1312,6 +1327,18 @@ async fn get_alerts(
             message: row.get::<String, _>("message"),
         })
         .collect();
+
+    for alert in cache_snapshot {
+        if alert.timestamp_ms < cutoff || alert.timestamp_ms > now_ms {
+            continue;
+        }
+        alerts.push(alert);
+    }
+
+    alerts.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+    alerts.dedup_by(|a, b| {
+        a.timestamp_ms == b.timestamp_ms && a.severity == b.severity && a.message == b.message
+    });
 
     Json(alerts).into_response()
 }
@@ -1336,6 +1363,11 @@ fn spawn_alert_insert(
     severity: &'static str,
     message: String,
 ) {
+    state.cache_recent_alert(AlertDto {
+        timestamp_ms,
+        severity: severity.to_string(),
+        message: message.clone(),
+    });
     state.begin_db_write();
     let db = state.db.clone();
     let state_for_task = state.clone();

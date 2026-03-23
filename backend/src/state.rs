@@ -8,7 +8,7 @@ use crate::types::{
     NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus, TelemetryCommand,
     TelemetryRow,
 };
-use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
+use crate::web::{AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
 use sedsprintf_rs_2026::config::DataEndpoint;
 use sedsprintf_rs_2026::discovery::TopologySnapshot;
 use sedsprintf_rs_2026::packet::Packet;
@@ -109,6 +109,9 @@ pub struct AppState {
 
     /// In-memory recent telemetry cache used to bridge DB write lag during reseed.
     pub recent_telemetry_cache: Arc<Mutex<VecDeque<TelemetryRow>>>,
+
+    /// In-memory recent alerts cache used to bridge DB write lag during reseed.
+    pub recent_alerts_cache: Arc<Mutex<VecDeque<AlertDto>>>,
 
     /// Whether the av-bay (rocket) radio link is physically present.
     pub av_bay_radio_connected: Arc<AtomicBool>,
@@ -650,6 +653,37 @@ impl AppState {
 
     pub fn recent_telemetry_snapshot(&self) -> Vec<TelemetryRow> {
         self.recent_telemetry_cache
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn cache_recent_alert(&self, alert: AlertDto) {
+        const CACHE_WINDOW_MS: i64 = 20 * 60 * 1000;
+        const CACHE_MAX_ROWS: usize = 4_096;
+
+        let mut q = self.recent_alerts_cache.lock().unwrap();
+        q.push_back(alert);
+
+        let newest_ts = q.back().map(|r| r.timestamp_ms).unwrap_or(0);
+        let cutoff = newest_ts.saturating_sub(CACHE_WINDOW_MS);
+        while let Some(front) = q.front() {
+            if front.timestamp_ms < cutoff {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        while q.len() > CACHE_MAX_ROWS {
+            q.pop_front();
+        }
+    }
+
+    pub fn recent_alerts_snapshot(&self) -> Vec<AlertDto> {
+        self.recent_alerts_cache
             .lock()
             .unwrap()
             .iter()
