@@ -467,8 +467,8 @@ impl FlightSimState {
                 if !n2o_open
                     && fill_lines_removed
                     && self
-                    .nitrous_fill_started_ms
-                    .is_some_and(|t0| now_ms.saturating_sub(t0) >= 30_000)
+                        .nitrous_fill_started_ms
+                        .is_some_and(|t0| now_ms.saturating_sub(t0) >= 30_000)
                 {
                     self.set_flight_state(FlightState::Armed, now_ms);
                 }
@@ -641,6 +641,7 @@ impl FlightSimState {
             DataType::BatteryVoltage,
             DataType::BatteryCurrent,
             DataType::GpsData,
+            DataType::GpsSatelliteNumber,
             DataType::KG1000,
         ];
         let dtype = seq[self.next_sensor_idx % seq.len()];
@@ -648,12 +649,15 @@ impl FlightSimState {
 
         let mut rng = rand::rng();
         let mut sender = sender_for_datatype(dtype);
-        let values: Vec<f32> = match dtype {
+        let bytes: Vec<u8> = match dtype {
             DataType::GyroData => vec![
                 self.roll_dps + rng.random_range(-0.15..0.15),
                 self.pitch_dps + rng.random_range(-0.15..0.15),
                 self.yaw_dps + rng.random_range(-0.45..0.45),
-            ],
+            ]
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
             DataType::AccelData => {
                 let az = self.accel_g * 9.80665 + rng.random_range(-0.25..0.25);
                 vec![
@@ -661,42 +665,59 @@ impl FlightSimState {
                     rng.random_range(-0.35..0.35),
                     az,
                 ]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect()
             }
             DataType::KalmanFilterData => vec![
                 self.altitude_ft * 0.3048,
                 self.velocity_fps * 0.3048,
                 self.accel_g,
-            ],
+            ]
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
             DataType::BarometerData => {
                 let altitude_m = self.altitude_ft * 0.3048;
                 let pressure_pa = 101_325.0_f32 * f32::powf(1.0 - altitude_m / 44_330.0, 5.255);
                 let temp_c = (24.0 - altitude_m * 0.0065).clamp(-20.0, 35.0);
                 vec![pressure_pa, temp_c, altitude_m]
+                    .into_iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
             }
-            DataType::FuelTankPressure => vec![self.fuel_tank_pressure_psi],
-            DataType::FuelFlow => vec![self.fuel_flow_lpm],
-            DataType::BatteryVoltage => {
-                if self.next_battery_sender_gateway {
-                    self.next_battery_sender_gateway = false;
-                    self.last_battery_sender_gateway = true;
-                    sender = Board::GatewayBoard.sender_id();
-                    vec![self.ground_station_battery_v]
-                } else {
-                    self.next_battery_sender_gateway = true;
-                    self.last_battery_sender_gateway = false;
-                    sender = Board::PowerBoard.sender_id();
-                    vec![self.av_bay_battery_v]
-                }
+            DataType::FuelTankPressure => vec![self.fuel_tank_pressure_psi]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            DataType::FuelFlow => vec![self.fuel_flow_lpm]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            DataType::BatteryVoltage => if self.next_battery_sender_gateway {
+                self.next_battery_sender_gateway = false;
+                self.last_battery_sender_gateway = true;
+                sender = Board::GatewayBoard.sender_id();
+                vec![self.ground_station_battery_v]
+            } else {
+                self.next_battery_sender_gateway = true;
+                self.last_battery_sender_gateway = false;
+                sender = Board::PowerBoard.sender_id();
+                vec![self.av_bay_battery_v]
             }
-            DataType::BatteryCurrent => {
-                if self.last_battery_sender_gateway {
-                    sender = Board::GatewayBoard.sender_id();
-                    vec![self.ground_station_battery_a]
-                } else {
-                    sender = Board::PowerBoard.sender_id();
-                    vec![self.battery_a]
-                }
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+            DataType::BatteryCurrent => if self.last_battery_sender_gateway {
+                sender = Board::GatewayBoard.sender_id();
+                vec![self.ground_station_battery_a]
+            } else {
+                sender = Board::PowerBoard.sender_id();
+                vec![self.battery_a]
             }
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
             DataType::GpsData => {
                 let dlat_deg = (self.altitude_ft / 5_280.0) * 0.00001;
                 let dlon_deg = dlat_deg * 0.8;
@@ -705,21 +726,29 @@ impl FlightSimState {
                     BASE_LON + dlon_deg + rng.random_range(-0.00002..0.00002),
                     self.altitude_ft * 0.3048,
                 ]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect()
+            }
+            DataType::GpsSatelliteNumber => {
+                let satellites = 10 + ((now_ms / 5_000) % 6) as u8;
+                vec![satellites]
             }
             DataType::KG1000 => {
                 let raw_kg = (self.loadcell_mass_kg
                     + rng.random_range(-LOADCELL_NOISE_KG..LOADCELL_NOISE_KG))
-                    .max(0.0)
-                    .min(sim_full_mass_kg());
+                .max(0.0)
+                .min(sim_full_mass_kg());
                 vec![raw_kg]
+                    .into_iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
             }
-            _ => vec![0.0],
+            _ => vec![0.0_f32]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
         };
-
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        for v in values {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
 
         Packet::new(
             dtype,
@@ -743,7 +772,7 @@ fn sender_for_datatype(dtype: DataType) -> &'static str {
         }
         DataType::KG1000 => Board::DaqBoard.sender_id(),
         DataType::BatteryVoltage | DataType::BatteryCurrent => Board::PowerBoard.sender_id(),
-        DataType::GpsData => Board::GatewayBoard.sender_id(),
+        DataType::GpsData | DataType::GpsSatelliteNumber => Board::GatewayBoard.sender_id(),
         _ => Board::GroundStation.sender_id(),
     }
 }

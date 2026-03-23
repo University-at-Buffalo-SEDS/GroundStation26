@@ -294,8 +294,8 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
             image BLOB NOT NULL
         );",
     )
-        .execute(&pool)
-        .await?;
+    .execute(&pool)
+    .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS tiles (
             z INTEGER NOT NULL,
@@ -305,8 +305,8 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
             PRIMARY KEY (z, x, y)
         ) WITHOUT ROWID;",
     )
-        .execute(&pool)
-        .await?;
+    .execute(&pool)
+    .await?;
 
     let mut tx = pool.begin().await?;
     let commit_every: u64 = 10_000;
@@ -370,11 +370,11 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
                     let present: Option<i64> = sqlx::query_scalar(
                         "SELECT blob_id FROM tiles WHERE z = ? AND x = ? AND y = ? LIMIT 1",
                     )
-                        .bind(i64::from(z))
-                        .bind(i64::from(x))
-                        .bind(i64::from(y))
-                        .fetch_optional(&mut *tx)
-                        .await?;
+                    .bind(i64::from(z))
+                    .bind(i64::from(x))
+                    .bind(i64::from(y))
+                    .fetch_optional(&mut *tx)
+                    .await?;
                     if present.is_some() {
                         skipped_existing += 1;
                         if skipped_existing.is_multiple_of(50_000) {
@@ -396,10 +396,10 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
                      ON CONFLICT(hash) DO UPDATE SET hash = excluded.hash
                      RETURNING id",
                 )
-                    .bind(&hash_bytes)
-                    .bind(&bytes)
-                    .fetch_one(&mut *tx)
-                    .await?;
+                .bind(&hash_bytes)
+                .bind(&bytes)
+                .fetch_one(&mut *tx)
+                .await?;
 
                 sqlx::query("INSERT OR REPLACE INTO tiles (z, x, y, blob_id) VALUES (?, ?, ?, ?)")
                     .bind(i64::from(z))
@@ -492,8 +492,8 @@ async fn init_direct_bundle_pool(bundle_path: &Path, resume: bool) -> Result<Sql
             image BLOB NOT NULL
         );",
     )
-        .execute(&pool)
-        .await?;
+    .execute(&pool)
+    .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS tiles (
             z INTEGER NOT NULL,
@@ -503,8 +503,8 @@ async fn init_direct_bundle_pool(bundle_path: &Path, resume: bool) -> Result<Sql
             PRIMARY KEY (z, x, y)
         ) WITHOUT ROWID;",
     )
-        .execute(&pool)
-        .await?;
+    .execute(&pool)
+    .await?;
     Ok(pool)
 }
 
@@ -545,10 +545,10 @@ async fn upsert_tile_to_bundle(
          ON CONFLICT(hash) DO UPDATE SET hash = excluded.hash
          RETURNING id",
     )
-        .bind(&hash_bytes)
-        .bind(bytes)
-        .fetch_one(pool)
-        .await?;
+    .bind(&hash_bytes)
+    .bind(bytes)
+    .fetch_one(pool)
+    .await?;
     sqlx::query("INSERT OR REPLACE INTO tiles (z, x, y, blob_id) VALUES (?, ?, ?, ?)")
         .bind(i64::from(z))
         .bind(i64::from(x))
@@ -871,7 +871,7 @@ async fn fetch_tiles_for_zoom_async(
                     limiter_for_worker.as_ref(),
                     MAX_RETRY_ATTEMPTS,
                 )
-                    .await;
+                .await;
                 if !ok {
                     failed_coords.lock().await.push((x, y));
                 }
@@ -920,7 +920,7 @@ async fn fetch_tiles_for_zoom_async(
                         limiter.as_ref(),
                         MAX_RETRY_ATTEMPTS,
                     )
-                        .await;
+                    .await;
                     if !ok {
                         retry_failures.lock().await.push((x, y));
                     }
@@ -1189,7 +1189,7 @@ async fn fetch_tiles_for_zoom_async_to_db(
                     limiter_for_worker.as_ref(),
                     MAX_RETRY_ATTEMPTS,
                 )
-                    .await;
+                .await;
                 if !ok {
                     failed_coords.lock().await.push((x, y));
                 }
@@ -1237,7 +1237,7 @@ async fn fetch_tiles_for_zoom_async_to_db(
                         limiter.as_ref(),
                         MAX_RETRY_ATTEMPTS,
                     )
-                        .await;
+                    .await;
                     if !ok {
                         retry_failures.lock().await.push((x, y));
                     }

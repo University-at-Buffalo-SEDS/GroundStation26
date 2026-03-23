@@ -110,6 +110,12 @@ pub struct AppState {
     /// In-memory recent telemetry cache used to bridge DB write lag during reseed.
     pub recent_telemetry_cache: Arc<Mutex<VecDeque<TelemetryRow>>>,
 
+    /// Latest raw GPS fix values keyed by sender ID.
+    pub latest_gps_fix_by_sender: Arc<Mutex<HashMap<String, Vec<Option<f32>>>>>,
+
+    /// Latest GPS satellite count keyed by sender ID.
+    pub latest_gps_satellites_by_sender: Arc<Mutex<HashMap<String, u8>>>,
+
     /// In-memory recent alerts cache used to bridge DB write lag during reseed.
     pub recent_alerts_cache: Arc<Mutex<VecDeque<AlertDto>>>,
 

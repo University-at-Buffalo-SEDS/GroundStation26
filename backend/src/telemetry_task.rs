@@ -29,6 +29,7 @@ const DB_WORK_QUEUE_SIZE: usize = 8_192;
 const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
 const DB_BATCH_MAX_DEFAULT: usize = 256;
 const DB_BATCH_WAIT_MS_DEFAULT: u64 = 8;
+const GPS_SATELLITES_DATA_TYPE: &str = "GPS_SATELLITE_NUMBER";
 
 #[cfg(feature = "hitl_mode")]
 fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
@@ -348,7 +349,7 @@ fn telemetry_values_json(values: &[Option<f32>]) -> Option<String> {
             .map(|v| v.map(|n| n as f64))
             .collect::<Vec<_>>(),
     )
-        .ok()
+    .ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -409,7 +410,7 @@ async fn emit_derived_battery_rows(
                         payload_json: payload_json.to_string(),
                     },
                 )
-                    .await;
+                .await;
             }
 
             let row = TelemetryRow {
@@ -467,7 +468,7 @@ async fn emit_derived_loadcell_rows(
                     payload_json: payload_json.to_string(),
                 },
             )
-                .await;
+            .await;
         }
 
         let row = TelemetryRow {
@@ -479,6 +480,134 @@ async fn emit_derived_loadcell_rows(
         state.cache_recent_telemetry(row.clone());
         let _ = state.ws_tx.send(row);
     }
+}
+
+fn normalized_gps_values(
+    state: &Arc<AppState>,
+    sender_id: &str,
+    raw_values: &[Option<f32>],
+) -> Vec<Option<f32>> {
+    let lat = raw_values.first().copied().flatten();
+    let lon = raw_values.get(1).copied().flatten();
+    let alt = raw_values.get(2).copied().flatten();
+
+    {
+        let mut fixes = state.latest_gps_fix_by_sender.lock().unwrap();
+        fixes.insert(sender_id.to_string(), vec![lat, lon, alt]);
+    }
+
+    let satellites = state
+        .latest_gps_satellites_by_sender
+        .lock()
+        .unwrap()
+        .get(sender_id)
+        .copied()
+        .map(|v| v as f32);
+
+    vec![lat, lon, alt, satellites]
+}
+
+async fn emit_normalized_gps_row(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbWrite>,
+    db_overflow: &DbOverflow,
+    ts_ms: i64,
+    sender_id: &str,
+    values: Vec<Option<f32>>,
+    payload_json: &str,
+) {
+    if should_persist_telemetry_sample(DataType::GpsData.as_str(), ts_ms) {
+        queue_db_write(
+            state,
+            db_tx,
+            db_overflow,
+            DbWrite::Telemetry {
+                timestamp_ms: ts_ms,
+                data_type: DataType::GpsData.as_str().to_string(),
+                sender_id: sender_id.to_string(),
+                values_json: telemetry_values_json(&values),
+                payload_json: payload_json.to_string(),
+            },
+        )
+        .await;
+    }
+
+    let row = TelemetryRow {
+        timestamp_ms: ts_ms,
+        data_type: DataType::GpsData.as_str().to_string(),
+        sender_id: sender_id.to_string(),
+        values,
+    };
+    state.cache_recent_telemetry(row.clone());
+    let _ = state.ws_tx.send(row);
+}
+
+async fn handle_gps_satellite_count_packet(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbWrite>,
+    db_overflow: &DbOverflow,
+    pkt: &Packet,
+    payload_json: &str,
+) -> Option<TelemetryRow> {
+    let count = pkt.data_as_u8().ok().and_then(|v| v.first().copied())?;
+    let ts_ms = pkt.timestamp() as i64;
+    let sender_id = pkt.sender().to_string();
+
+    {
+        let mut sats = state.latest_gps_satellites_by_sender.lock().unwrap();
+        sats.insert(sender_id.clone(), count);
+    }
+
+    let values = vec![Some(count as f32)];
+    if should_persist_telemetry_sample(GPS_SATELLITES_DATA_TYPE, ts_ms) {
+        queue_db_write(
+            state,
+            db_tx,
+            db_overflow,
+            DbWrite::Telemetry {
+                timestamp_ms: ts_ms,
+                data_type: GPS_SATELLITES_DATA_TYPE.to_string(),
+                sender_id: sender_id.clone(),
+                values_json: telemetry_values_json(&values),
+                payload_json: payload_json.to_string(),
+            },
+        )
+        .await;
+    }
+
+    let fix_values = {
+        state
+            .latest_gps_fix_by_sender
+            .lock()
+            .unwrap()
+            .get(&sender_id)
+            .cloned()
+    };
+    if let Some(fix_values) = fix_values {
+        let normalized = vec![
+            fix_values.first().copied().flatten(),
+            fix_values.get(1).copied().flatten(),
+            fix_values.get(2).copied().flatten(),
+            Some(count as f32),
+        ];
+        emit_normalized_gps_row(
+            state,
+            db_tx,
+            db_overflow,
+            ts_ms,
+            &sender_id,
+            normalized,
+            payload_json,
+        )
+        .await;
+    }
+
+    Some(TelemetryRow {
+        timestamp_ms: ts_ms,
+        data_type: GPS_SATELLITES_DATA_TYPE.to_string(),
+        sender_id,
+        values,
+    })
 }
 
 fn smooth_remaining_minutes(source_id: &str, ts_ms: i64, raw: Option<f32>) -> Option<f32> {
@@ -1166,7 +1295,7 @@ async fn handle_packet(
                 state_code: pkt_data as i64,
             },
         )
-            .await;
+        .await;
 
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
@@ -1192,7 +1321,7 @@ async fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                    .ok();
+                .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 queue_db_write(
@@ -1207,7 +1336,7 @@ async fn handle_packet(
                         payload_json,
                     },
                 )
-                    .await;
+                .await;
 
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
@@ -1226,8 +1355,16 @@ async fn handle_packet(
 
     let payload_json = payload_json_from_pkt(&pkt);
 
+    if pkt.data_type() == DataType::GpsSatelliteNumber {
+        return handle_gps_satellite_count_packet(state, db_tx, db_overflow, &pkt, &payload_json)
+            .await;
+    }
+
     if let Ok(values) = pkt.data_as_f32() {
-        let values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
+        let mut values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
+        if pkt.data_type() == DataType::GpsData {
+            values_vec = normalized_gps_values(state, pkt.sender(), &values_vec);
+        }
         if pkt.data_type() == DataType::FuelTankPressure {
             let latest = values_vec.first().copied().flatten();
             let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
@@ -1239,7 +1376,7 @@ async fn handle_packet(
                 .map(|v| v.map(|n| n as f64))
                 .collect::<Vec<_>>(),
         )
-            .ok();
+        .ok();
 
         if should_persist_telemetry_sample(&data_type_str, ts_ms) {
             queue_db_write(
@@ -1254,7 +1391,7 @@ async fn handle_packet(
                     payload_json: payload_json.clone(),
                 },
             )
-                .await;
+            .await;
         }
 
         if let Some(voltage) = values_vec.first().copied().flatten() {
@@ -1269,7 +1406,7 @@ async fn handle_packet(
                 voltage,
                 &payload_json,
             )
-                .await;
+            .await;
 
             if data_type_str == loadcell::RAW_LOADCELL_DATA_TYPE_1000KG {
                 emit_derived_loadcell_rows(
@@ -1281,7 +1418,7 @@ async fn handle_packet(
                     voltage,
                     &payload_json,
                 )
-                    .await;
+                .await;
             }
         }
 
@@ -1307,7 +1444,7 @@ async fn handle_packet(
                     payload_json,
                 },
             )
-                .await;
+            .await;
         }
         None
     }

@@ -344,7 +344,9 @@
         "label": "GPS_DATA",
         "channels": [
           "Lat",
-          "Lon"
+          "Lon",
+          "Altitude",
+          "Satellites"
         ],
         "chart": {
           "enabled": true
@@ -499,6 +501,29 @@
           "Aborted"
         ],
         "sections": [
+          {
+            "title": "GPS",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GPS_DATA",
+                "items": [
+                  {
+                    "label": "Lat",
+                    "index": 0
+                  },
+                  {
+                    "label": "Lon",
+                    "index": 1
+                  },
+                  {
+                    "label": "Satellites",
+                    "index": 3
+                  }
+                ]
+              }
+            ]
+          },
           {
             "title": "Actions",
             "widgets": [

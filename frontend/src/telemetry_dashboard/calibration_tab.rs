@@ -183,7 +183,7 @@ enum CaptureMode {
     SequencePoint,
 }
 
-fn sleep_ms(ms: u32) -> impl Future<Output=()> {
+fn sleep_ms(ms: u32) -> impl Future<Output = ()> {
     #[cfg(target_arch = "wasm32")]
     {
         gloo_timers::future::TimeoutFuture::new(ms)
@@ -621,7 +621,7 @@ pub fn CalibrationTab() -> Element {
                                 "/api/calibration/capture_zero",
                                 &body,
                             )
-                                .await
+                            .await
                             {
                                 Ok(new_cfg) => {
                                     cfg.set(Some(new_cfg));
@@ -643,7 +643,7 @@ pub fn CalibrationTab() -> Element {
                                 "/api/calibration/capture_span",
                                 &body,
                             )
-                                .await
+                            .await
                             {
                                 Ok(_) => {
                                     let refit = RefitReq {
@@ -654,7 +654,7 @@ pub fn CalibrationTab() -> Element {
                                         "/api/calibration/refit",
                                         &refit,
                                     )
-                                        .await
+                                    .await
                                     {
                                         Ok(new_cfg) => {
                                             cfg.set(Some(new_cfg));

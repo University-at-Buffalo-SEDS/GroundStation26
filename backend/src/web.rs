@@ -312,9 +312,9 @@ async fn get_valve_state(
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
@@ -350,9 +350,9 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
         let values = values_from_row(&r);
@@ -422,7 +422,7 @@ async fn get_map_config(
         map_title: "Map".to_string(),
         tracked_asset_label: "Tracked Asset".to_string(),
     })
-        .into_response()
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -618,11 +618,11 @@ async fn read_exact_tile(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
                 match sqlx::query_scalar::<_, Vec<u8>>(
                     "SELECT image FROM tiles WHERE z = ? AND x = ? AND y = ? LIMIT 1",
                 )
-                    .bind(i64::from(z))
-                    .bind(i64::from(x))
-                    .bind(i64::from(y))
-                    .fetch_optional(&pool)
-                    .await
+                .bind(i64::from(z))
+                .bind(i64::from(x))
+                .bind(i64::from(y))
+                .fetch_optional(&pool)
+                .await
                 {
                     Ok(Some(bytes)) => return Some(bytes),
                     Ok(None) => {}
@@ -637,11 +637,11 @@ async fn read_exact_tile(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
                      WHERE t.z = ? AND t.x = ? AND t.y = ?
                      LIMIT 1",
                 )
-                    .bind(i64::from(z))
-                    .bind(i64::from(x))
-                    .bind(i64::from(y))
-                    .fetch_optional(&pool)
-                    .await
+                .bind(i64::from(z))
+                .bind(i64::from(x))
+                .bind(i64::from(y))
+                .fetch_optional(&pool)
+                .await
                 {
                     Ok(Some(bytes)) => return Some(bytes),
                     Ok(None) => {}
@@ -736,7 +736,7 @@ fn synthesize_zoom_tile_from_ancestor(
         rgb.height(),
         image::ExtendedColorType::Rgb8,
     )
-        .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?;
     Ok(out)
 }
 
@@ -774,11 +774,11 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
         ORDER BY timestamp_ms ASC
         "#,
     )
-        .bind(cutoff)
-        .bind(now_ms)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .bind(now_ms)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let mut merged_rows: Vec<TelemetryRow> =
         Vec::with_capacity(rows_db.len() + cache_snapshot.len());
@@ -849,7 +849,7 @@ async fn get_network_time(
     Json(NetworkTimeMsg {
         timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
     })
-        .into_response()
+    .into_response()
 }
 
 async fn get_notifications(
@@ -1000,14 +1000,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         let initial_notifications = serde_json::to_string(&WsOutMsg::Notifications(
             state_for_send.notifications_snapshot(),
         ))
-            .unwrap_or_default();
+        .unwrap_or_default();
         if ws_out_tx.send(initial_notifications).await.is_err() {
             return;
         }
         let initial_action_policy = serde_json::to_string(&WsOutMsg::ActionPolicy(
             state_for_send.action_policy_snapshot(),
         ))
-            .unwrap_or_default();
+        .unwrap_or_default();
         if ws_out_tx.send(initial_action_policy).await.is_err() {
             return;
         }
@@ -1015,14 +1015,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
             state_for_send
                 .network_topology_snapshot(crate::telemetry_task::get_current_timestamp_ms()),
         ))
-            .unwrap_or_default();
+        .unwrap_or_default();
         if ws_out_tx.send(initial_network_topology).await.is_err() {
             return;
         }
         let initial_network_time = serde_json::to_string(&WsOutMsg::NetworkTime(NetworkTimeMsg {
             timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
         }))
-            .unwrap_or_default();
+        .unwrap_or_default();
         if ws_out_tx.send(initial_network_time).await.is_err() {
             return;
         }
@@ -1313,11 +1313,11 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-        .bind(cutoff)
-        .bind(now_ms)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .bind(now_ms)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let mut alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -1379,11 +1379,11 @@ fn spawn_alert_insert(
             VALUES (?, ?, ?)
             "#,
         )
-            .bind(timestamp_ms)
-            .bind(severity)
-            .bind(message)
-            .execute(&db)
-            .await;
+        .bind(timestamp_ms)
+        .bind(severity)
+        .bind(message)
+        .execute(&db)
+        .await;
         state_for_task.end_db_write();
     });
 }
