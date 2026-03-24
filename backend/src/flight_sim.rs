@@ -54,6 +54,8 @@ const NITROUS_PRESSURE_RESPONSE_PER_S: f32 = 1.3;
 const NITROGEN_PRESSURE_RESPONSE_PER_S: f32 = 1.0;
 #[cfg(feature = "testing")]
 const NITROGEN_MASS_GAIN_KG_PER_S: f32 = 0.08;
+#[cfg(feature = "testing")]
+const GRAVITY_FPS2: f32 = 32.174;
 
 #[cfg(feature = "testing")]
 fn sim_full_mass_kg() -> f32 {
@@ -535,7 +537,7 @@ impl FlightSimState {
 
         if let Some(t0_ms) = self.launch_time_ms {
             let t = (now_ms.saturating_sub(t0_ms) as f32) / 1000.0;
-            self.apply_flight_profile(t, now_ms);
+            self.apply_flight_profile(t, dt_s, now_ms);
         } else {
             self.altitude_ft = (self.altitude_ft - 0.5).max(0.0);
             self.velocity_fps = 0.0;
@@ -569,57 +571,67 @@ impl FlightSimState {
         self.battery_v = self.av_bay_battery_v;
     }
 
-    fn apply_flight_profile(&mut self, t: f32, now_ms: u64) {
-        let (state, alt, vel, accel_g, flow_lpm) = if t < 2.0 {
-            (FlightState::Launch, 150.0 * (t / 2.0), 90.0, 3.2, 45.0)
-        } else if t < 34.0 {
-            let p = (t - 2.0) / 32.0;
-            (
-                FlightState::Ascent,
-                150.0 + 9_850.0 * p,
-                330.0 * (1.0 - 0.2 * p),
-                2.1,
-                58.0,
-            )
+    fn apply_flight_profile(&mut self, t: f32, dt_s: f32, now_ms: u64) {
+        let dt_s = dt_s.clamp(0.0, 0.2);
+        let current_net_accel_fps2 = (self.accel_g - 1.0) * GRAVITY_FPS2;
+        let (state, target_accel_fps2, flow_lpm) = if t < 2.0 {
+            (FlightState::Launch, 52.0, 45.0)
+        } else if t < 10.0 {
+            let p = (t - 2.0) / 8.0;
+            (FlightState::Ascent, 32.0 - 10.0 * p, 58.0)
+        } else if t < 18.0 {
+            let p = (t - 10.0) / 8.0;
+            (FlightState::Ascent, 22.0 - 20.0 * p, 34.0 * (1.0 - p))
         } else if t < 43.0 {
-            let p = (t - 34.0) / 9.0;
             (
                 FlightState::Coast,
-                10_000.0 + 500.0 * p,
-                120.0 * (1.0 - p),
-                1.0,
+                -24.0 - self.velocity_fps.max(0.0) * 0.035,
                 0.0,
             )
         } else if t < 46.0 {
-            (FlightState::Apogee, 10_500.0, 0.0, 1.0, 0.0)
-        } else if t < 54.0 {
-            let p = (t - 46.0) / 8.0;
             (
-                FlightState::ParachuteDeploy,
-                10_500.0 - 700.0 * p,
-                -80.0,
-                0.7,
+                FlightState::Apogee,
+                -16.0 - self.velocity_fps.abs() * 0.02,
                 0.0,
             )
-        } else if t < 174.0 {
-            let p = (t - 54.0) / 120.0;
+        } else if t < 54.0 {
+            let chute_terminal_fps = -55.0;
+            (
+                FlightState::ParachuteDeploy,
+                (chute_terminal_fps - self.velocity_fps) * 1.4,
+                0.0,
+            )
+        } else if self.altitude_ft > 4.0 {
+            let terminal_fps = -52.0;
             (
                 FlightState::Descent,
-                (9_800.0 * (1.0 - p)).max(0.0),
-                -85.0,
-                0.95,
+                (terminal_fps - self.velocity_fps) * 0.65,
                 0.0,
             )
         } else if t < 182.0 {
-            (FlightState::Landed, 0.0, 0.0, 1.0, 0.0)
+            (FlightState::Landed, 0.0, 0.0)
         } else {
-            (FlightState::Recovery, 0.0, 0.0, 1.0, 0.0)
+            (FlightState::Recovery, 0.0, 0.0)
         };
 
+        let accel_alpha = if dt_s <= 0.0 {
+            1.0
+        } else {
+            (1.0 - f32::exp(-dt_s * 3.5)).clamp(0.0, 1.0)
+        };
+        let net_accel_fps2 =
+            current_net_accel_fps2 + (target_accel_fps2 - current_net_accel_fps2) * accel_alpha;
+
+        self.velocity_fps += net_accel_fps2 * dt_s;
+        self.altitude_ft = (self.altitude_ft + self.velocity_fps * dt_s).max(0.0);
+
+        if matches!(state, FlightState::Landed | FlightState::Recovery) {
+            self.altitude_ft = 0.0;
+            self.velocity_fps = 0.0;
+        }
+
         self.set_flight_state(state, now_ms);
-        self.altitude_ft = alt;
-        self.velocity_fps = vel;
-        self.accel_g = accel_g;
+        self.accel_g = 1.0 + net_accel_fps2 / GRAVITY_FPS2;
         self.fuel_flow_lpm = flow_lpm;
 
         let mut rng = rand::rng();
