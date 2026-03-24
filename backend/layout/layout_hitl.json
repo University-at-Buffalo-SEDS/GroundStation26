@@ -515,10 +515,6 @@
                   {
                     "label": "Lon",
                     "index": 1
-                  },
-                  {
-                    "label": "Satellites",
-                    "index": 3
                   }
                 ]
               }
@@ -564,6 +560,36 @@
                   "ReinitAfter12",
                   "ReinitAfter26",
                   "ReinitAfter44"
+                ]
+              }
+            ]
+          },
+          {
+            "title": "Satellites",
+            "style": {
+              "background": "#0b1220",
+              "border": "#475569",
+              "title_color": "#facc15"
+            },
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GPS_DATA",
+                "summary_style": {
+                  "background": "#1f2937",
+                  "border": "#facc15",
+                  "label_color": "#fde68a",
+                  "value_color": "#fef3c7"
+                },
+                "items": [
+                  {
+                    "label": "Satellites",
+                    "index": 3,
+                    "formatter": {
+                      "kind": "integer",
+                      "prefix": "🛰 "
+                    }
+                  }
                 ]
               }
             ]

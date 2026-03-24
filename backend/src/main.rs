@@ -94,8 +94,8 @@ async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()>
         );
         "#,
     )
-    .execute(db)
-    .await?;
+        .execute(db)
+        .await?;
 
     let session_columns = sqlx::query("PRAGMA table_info(auth_sessions);")
         .fetch_all(db)
@@ -325,8 +325,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     // Add values_json column for older DBs.
     let cols = sqlx::query("PRAGMA table_info(telemetry)")
@@ -367,8 +367,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     ensure_auth_sessions_table(&auth_db).await?;
 
@@ -381,8 +381,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-    .execute(&db)
-    .await?;
+        .execute(&db)
+        .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);

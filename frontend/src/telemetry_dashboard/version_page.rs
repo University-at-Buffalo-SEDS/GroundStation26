@@ -86,9 +86,9 @@ fn critical_packages() -> Vec<(&'static str, String)> {
         ("wry", "Wry"),
         ("axum", "Axum"),
     ]
-    .into_iter()
-    .filter_map(|(crate_name, label)| parse_lock_version(crate_name).map(|v| (label, v)))
-    .collect()
+        .into_iter()
+        .filter_map(|(crate_name, label)| parse_lock_version(crate_name).map(|v| (label, v)))
+        .collect()
 }
 
 #[component]

@@ -467,8 +467,8 @@ impl FlightSimState {
                 if !n2o_open
                     && fill_lines_removed
                     && self
-                        .nitrous_fill_started_ms
-                        .is_some_and(|t0| now_ms.saturating_sub(t0) >= 30_000)
+                    .nitrous_fill_started_ms
+                    .is_some_and(|t0| now_ms.saturating_sub(t0) >= 30_000)
                 {
                     self.set_flight_state(FlightState::Armed, now_ms);
                 }
@@ -655,9 +655,9 @@ impl FlightSimState {
                 self.pitch_dps + rng.random_range(-0.15..0.15),
                 self.yaw_dps + rng.random_range(-0.45..0.45),
             ]
-            .into_iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
             DataType::AccelData => {
                 let az = self.accel_g * 9.80665 + rng.random_range(-0.25..0.25);
                 vec![
@@ -665,18 +665,18 @@ impl FlightSimState {
                     rng.random_range(-0.35..0.35),
                     az,
                 ]
-                .into_iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect()
+                    .into_iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
             }
             DataType::KalmanFilterData => vec![
                 self.altitude_ft * 0.3048,
                 self.velocity_fps * 0.3048,
                 self.accel_g,
             ]
-            .into_iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
             DataType::BarometerData => {
                 let altitude_m = self.altitude_ft * 0.3048;
                 let pressure_pa = 101_325.0_f32 * f32::powf(1.0 - altitude_m / 44_330.0, 5.255);
@@ -705,9 +705,9 @@ impl FlightSimState {
                 sender = Board::PowerBoard.sender_id();
                 vec![self.av_bay_battery_v]
             }
-            .into_iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
             DataType::BatteryCurrent => if self.last_battery_sender_gateway {
                 sender = Board::GatewayBoard.sender_id();
                 vec![self.ground_station_battery_a]
@@ -715,9 +715,9 @@ impl FlightSimState {
                 sender = Board::PowerBoard.sender_id();
                 vec![self.battery_a]
             }
-            .into_iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
             DataType::GpsData => {
                 let dlat_deg = (self.altitude_ft / 5_280.0) * 0.00001;
                 let dlon_deg = dlat_deg * 0.8;
@@ -726,9 +726,9 @@ impl FlightSimState {
                     BASE_LON + dlon_deg + rng.random_range(-0.00002..0.00002),
                     self.altitude_ft * 0.3048,
                 ]
-                .into_iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect()
+                    .into_iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
             }
             DataType::GpsSatelliteNumber => {
                 let satellites = 10 + ((now_ms / 5_000) % 6) as u8;
@@ -737,8 +737,8 @@ impl FlightSimState {
             DataType::KG1000 => {
                 let raw_kg = (self.loadcell_mass_kg
                     + rng.random_range(-LOADCELL_NOISE_KG..LOADCELL_NOISE_KG))
-                .max(0.0)
-                .min(sim_full_mass_kg());
+                    .max(0.0)
+                    .min(sim_full_mass_kg());
                 vec![raw_kg]
                     .into_iter()
                     .flat_map(|v| v.to_le_bytes())

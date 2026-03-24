@@ -349,7 +349,7 @@ fn telemetry_values_json(values: &[Option<f32>]) -> Option<String> {
             .map(|v| v.map(|n| n as f64))
             .collect::<Vec<_>>(),
     )
-    .ok()
+        .ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -410,7 +410,7 @@ async fn emit_derived_battery_rows(
                         payload_json: payload_json.to_string(),
                     },
                 )
-                .await;
+                    .await;
             }
 
             let row = TelemetryRow {
@@ -468,7 +468,7 @@ async fn emit_derived_loadcell_rows(
                     payload_json: payload_json.to_string(),
                 },
             )
-            .await;
+                .await;
         }
 
         let row = TelemetryRow {
@@ -529,7 +529,7 @@ async fn emit_normalized_gps_row(
                 payload_json: payload_json.to_string(),
             },
         )
-        .await;
+            .await;
     }
 
     let row = TelemetryRow {
@@ -572,7 +572,7 @@ async fn handle_gps_satellite_count_packet(
                 payload_json: payload_json.to_string(),
             },
         )
-        .await;
+            .await;
     }
 
     let fix_values = {
@@ -599,7 +599,7 @@ async fn handle_gps_satellite_count_packet(
             normalized,
             payload_json,
         )
-        .await;
+            .await;
     }
 
     Some(TelemetryRow {
@@ -1295,7 +1295,7 @@ async fn handle_packet(
                 state_code: pkt_data as i64,
             },
         )
-        .await;
+            .await;
 
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
@@ -1321,7 +1321,7 @@ async fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                .ok();
+                    .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 queue_db_write(
@@ -1336,7 +1336,7 @@ async fn handle_packet(
                         payload_json,
                     },
                 )
-                .await;
+                    .await;
 
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
@@ -1376,7 +1376,7 @@ async fn handle_packet(
                 .map(|v| v.map(|n| n as f64))
                 .collect::<Vec<_>>(),
         )
-        .ok();
+            .ok();
 
         if should_persist_telemetry_sample(&data_type_str, ts_ms) {
             queue_db_write(
@@ -1391,7 +1391,7 @@ async fn handle_packet(
                     payload_json: payload_json.clone(),
                 },
             )
-            .await;
+                .await;
         }
 
         if let Some(voltage) = values_vec.first().copied().flatten() {
@@ -1406,7 +1406,7 @@ async fn handle_packet(
                 voltage,
                 &payload_json,
             )
-            .await;
+                .await;
 
             if data_type_str == loadcell::RAW_LOADCELL_DATA_TYPE_1000KG {
                 emit_derived_loadcell_rows(
@@ -1418,7 +1418,7 @@ async fn handle_packet(
                     voltage,
                     &payload_json,
                 )
-                .await;
+                    .await;
             }
         }
 
@@ -1444,7 +1444,7 @@ async fn handle_packet(
                     payload_json,
                 },
             )
-            .await;
+                .await;
         }
         None
     }

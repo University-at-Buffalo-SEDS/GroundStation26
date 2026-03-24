@@ -180,6 +180,7 @@ pub struct StateLayout {
 pub struct StateSection {
     pub title: Option<String>,
     pub widgets: Vec<StateWidget>,
+    pub style: Option<StateSectionStyle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +196,7 @@ pub struct StateWidget {
     pub valve_colors: Option<ValveColorSet>,
     pub boolean_labels: Option<BooleanLabels>,
     pub valve_labels: Option<Vec<BooleanLabels>>,
+    pub summary_style: Option<SummaryCardStyle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -222,6 +224,38 @@ pub struct ValveColorSet {
 pub struct SummaryItem {
     pub label: String,
     pub index: usize,
+    pub formatter: Option<ValueFormatter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateSectionStyle {
+    pub background: Option<String>,
+    pub border: Option<String>,
+    pub title_color: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryCardStyle {
+    pub background: Option<String>,
+    pub border: Option<String>,
+    pub label_color: Option<String>,
+    pub value_color: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValueFormatter {
+    pub kind: Option<ValueFormatKind>,
+    pub precision: Option<usize>,
+    pub prefix: Option<String>,
+    pub suffix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueFormatKind {
+    #[default]
+    Number,
+    Integer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

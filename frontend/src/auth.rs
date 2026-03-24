@@ -188,7 +188,7 @@ pub async fn login(
         password,
         remember_me,
     })
-    .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
     let text = auth_request_post_json(&url, &body, skip_tls_verify).await?;
     let response = serde_json::from_str::<LoginResponse>(&text)
         .map_err(|e| format!("invalid auth JSON: {e}"))?;

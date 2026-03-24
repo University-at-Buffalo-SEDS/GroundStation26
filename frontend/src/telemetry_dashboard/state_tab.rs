@@ -8,8 +8,9 @@ use dioxus_signals::Signal;
 use crate::auth;
 
 use super::layout::{
-    ActionSpec, ActionsTabLayout, BooleanLabels, DataTabLayout, StateSection, StateTabLayout,
-    StateWidget, StateWidgetKind, SummaryItem, ValveColor, ValveColorSet,
+    ActionSpec, ActionsTabLayout, BooleanLabels, DataTabLayout, StateSection, StateSectionStyle,
+    StateTabLayout, StateWidget, StateWidgetKind, SummaryCardStyle, SummaryItem, ValueFormatKind,
+    ValueFormatter, ValveColor, ValveColorSet,
 };
 use super::types::{BoardStatusEntry, FlightState, TelemetryRow};
 use super::{latest_telemetry_row, latest_telemetry_value, ActionPolicyMsg, BlinkMode};
@@ -217,16 +218,28 @@ pub fn StateTab(
                 }
             }
             {content}
-
         }
     }
 }
 
 #[component]
-fn Section(title: String, children: Element) -> Element {
+fn Section(title: String, style: Option<StateSectionStyle>, children: Element) -> Element {
+    let background = style
+        .as_ref()
+        .and_then(|style| style.background.as_deref())
+        .unwrap_or("#0b1220");
+    let border = style
+        .as_ref()
+        .and_then(|style| style.border.as_deref())
+        .unwrap_or("#334155");
+    let title_color = style
+        .as_ref()
+        .and_then(|style| style.title_color.as_deref())
+        .unwrap_or("#cbd5f5");
+
     rsx! {
-        div { style: "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;",
-            div { style: "font-size:15px; color:#cbd5f5; font-weight:600; margin-bottom:10px;", "{title}" }
+        div { style: "padding:14px; border:1px solid {border}; border-radius:14px; background:{background};",
+            div { style: "font-size:15px; color:{title_color}; font-weight:600; margin-bottom:10px;", "{title}" }
             {children}
         }
     }
@@ -252,7 +265,7 @@ fn render_state_section(
         .unwrap_or_else(|| "Section".to_string());
 
     rsx! {
-        Section { title: title,
+        Section { title: title, style: section.style.clone(),
             for widget in section.widgets.iter() {
                 {render_state_widget(
                     widget,
@@ -289,7 +302,7 @@ fn render_state_widget(
             if dt.is_empty() {
                 rsx! { div { style: "color:#94a3b8; font-size:12px;", "Missing summary data_type" } }
             } else {
-                rsx! { {summary_row(dt, items)} }
+                rsx! { {summary_row(dt, items, widget.summary_style.as_ref())} }
             }
         }
         StateWidgetKind::Chart => {
@@ -438,30 +451,37 @@ fn valve_state_grid(
         SummaryItem {
             label: "Pilot".to_string(),
             index: 0,
+            formatter: None,
         },
         SummaryItem {
             label: "NormallyOpen".to_string(),
             index: 1,
+            formatter: None,
         },
         SummaryItem {
             label: "Dump".to_string(),
             index: 2,
+            formatter: None,
         },
         SummaryItem {
             label: "Igniter".to_string(),
             index: 3,
+            formatter: None,
         },
         SummaryItem {
             label: "Nitrogen".to_string(),
             index: 4,
+            formatter: None,
         },
         SummaryItem {
             label: "Nitrous".to_string(),
             index: 5,
+            formatter: None,
         },
         SummaryItem {
             label: "Fill Lines".to_string(),
             index: 6,
+            formatter: None,
         },
     ];
 
@@ -701,7 +721,7 @@ fn action_style(
     )
 }
 
-fn summary_row(dt: &str, items: &[SummaryItem]) -> Element {
+fn summary_row(dt: &str, items: &[SummaryItem], style: Option<&SummaryCardStyle>) -> Element {
     let want_minmax = dt != "VALVE_STATE" && dt != "GPS_DATA";
 
     let (chan_min, chan_max) = if want_minmax {
@@ -712,17 +732,25 @@ fn summary_row(dt: &str, items: &[SummaryItem]) -> Element {
 
     let latest = items
         .iter()
-        .map(|item| (item.label.clone(), item.index, latest_value(dt, item.index)))
+        .map(|item| {
+            (
+                item.label.clone(),
+                item.index,
+                latest_value(dt, item.index),
+                item.formatter.as_ref(),
+            )
+        })
         .collect::<Vec<_>>();
 
     rsx! {
         div { style: "display:grid; gap:10px; margin-bottom:12px; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); width:100%;",
-            for (label, idx, value) in latest {
+            for (label, idx, value, formatter) in latest {
                 SummaryCard {
                     label: label,
-                    value: fmt_opt(value),
-                    min: if want_minmax { chan_min.get(idx).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
-                    max: if want_minmax { chan_max.get(idx).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
+                    value: format_summary_value(value, formatter),
+                    min: if want_minmax { chan_min.get(idx).copied().flatten().map(|v| format_summary_value(Some(v), formatter)) } else { None },
+                    max: if want_minmax { chan_max.get(idx).copied().flatten().map(|v| format_summary_value(Some(v), formatter)) } else { None },
+                    style: style.cloned(),
                 }
             }
         }
@@ -730,16 +758,38 @@ fn summary_row(dt: &str, items: &[SummaryItem]) -> Element {
 }
 
 #[component]
-fn SummaryCard(label: String, value: String, min: Option<String>, max: Option<String>) -> Element {
+fn SummaryCard(
+    label: String,
+    value: String,
+    min: Option<String>,
+    max: Option<String>,
+    style: Option<SummaryCardStyle>,
+) -> Element {
     let mm = match (min.as_deref(), max.as_deref()) {
         (Some(mi), Some(ma)) => Some(format!("min {mi} • max {ma}")),
         _ => None,
     };
+    let background = style
+        .as_ref()
+        .and_then(|style| style.background.as_deref())
+        .unwrap_or("#0f172a");
+    let border = style
+        .as_ref()
+        .and_then(|style| style.border.as_deref())
+        .unwrap_or("#334155");
+    let label_color = style
+        .as_ref()
+        .and_then(|style| style.label_color.as_deref())
+        .unwrap_or("#93c5fd");
+    let value_color = style
+        .as_ref()
+        .and_then(|style| style.value_color.as_deref())
+        .unwrap_or("#e5e7eb");
 
     rsx! {
-        div { style: "padding:10px; border-radius:12px; background:#0f172a; border:1px solid #334155; width:100%; min-width:0; box-sizing:border-box;",
-            div { style: "font-size:12px; color:#93c5fd;", "{label}" }
-            div { style: "font-size:18px; color:#e5e7eb; line-height:1.1;", "{value}" }
+        div { style: "padding:10px; border-radius:12px; background:{background}; border:1px solid {border}; width:100%; min-width:0; box-sizing:border-box;",
+            div { style: "font-size:12px; color:{label_color};", "{label}" }
+            div { style: "font-size:18px; color:{value_color}; line-height:1.1;", "{value}" }
             if let Some(t) = mm {
                 div { style: "font-size:11px; color:#94a3b8; margin-top:4px;", "{t}" }
             }
@@ -755,9 +805,26 @@ fn value_at(row: &TelemetryRow, idx: usize) -> Option<f32> {
     row.values.get(idx).copied().flatten()
 }
 
-fn fmt_opt(v: Option<f32>) -> String {
+fn format_summary_value(v: Option<f32>, formatter: Option<&ValueFormatter>) -> String {
     match v {
-        Some(x) => format!("{x:.3}"),
+        Some(x) => {
+            let kind = formatter
+                .and_then(|formatter| formatter.kind.clone())
+                .unwrap_or(ValueFormatKind::Number);
+            let precision = formatter.and_then(|formatter| formatter.precision);
+            let prefix = formatter
+                .and_then(|formatter| formatter.prefix.as_deref())
+                .unwrap_or("");
+            let suffix = formatter
+                .and_then(|formatter| formatter.suffix.as_deref())
+                .unwrap_or("");
+
+            let value = match kind {
+                ValueFormatKind::Number => format!("{x:.prec$}", prec = precision.unwrap_or(3)),
+                ValueFormatKind::Integer => format!("{}", x.round() as i64),
+            };
+            format!("{prefix}{value}{suffix}")
+        }
         None => "-".to_string(),
     }
 }
