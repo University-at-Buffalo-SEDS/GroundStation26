@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 
 use crate::auth;
 
-use super::layout::ActionsTabLayout;
+use super::layout::{ActionsTabLayout, ThemeConfig};
 use super::{ActionPolicyMsg, BlinkMode};
 
 #[cfg(target_arch = "wasm32")]
@@ -112,6 +112,7 @@ pub fn ActionsTab(
     layout: ActionsTabLayout,
     action_policy: Signal<ActionPolicyMsg>,
     abort_only_mode: bool,
+    theme: ThemeConfig,
 ) -> Element {
     let mut redraw_tick = use_signal(|| 0u64);
     use_effect(move || {
@@ -138,21 +139,21 @@ pub fn ActionsTab(
                 flex-direction:column;
                 gap:12px;
             ",
-            h2 { style: "margin:0 0 8px 0; color:#e5e7eb;", "Actions" }
-            p  { style: "margin:0 0 12px 0; color:#9ca3af; font-size:0.9rem;",
+            h2 { style: "margin:0 0 8px 0; color:{theme.text_primary};", "Actions" }
+            p  { style: "margin:0 0 12px 0; color:{theme.text_soft}; font-size:0.9rem;",
                 "All available actions are available all the time, use with caution as improper use \
                 can and will damage the system."
             }
             if abort_only_mode {
                 div {
-                    style: "margin:0 0 12px 0; padding:10px 12px; border-radius:10px; border:1px solid #ef4444; background:#4c0519; color:#fecdd3; font-size:12px;",
+                    style: "margin:0 0 12px 0; padding:10px 12px; border-radius:10px; border:1px solid {theme.error_border}; background:{theme.error_background}; color:{theme.error_text}; font-size:12px;",
                     "Disable Actions is enabled. All action and flight-state buttons except Abort are disabled."
                 }
             }
 
             if visible_actions.is_empty() {
                 div {
-                    style: "padding:12px; border:1px solid #334155; border-radius:12px; background:#0b1220; color:#94a3b8; font-size:13px;",
+                    style: "padding:12px; border:1px solid {theme.border}; border-radius:12px; background:{theme.panel_background}; color:{theme.text_muted}; font-size:13px;",
                     "No actions are available for this user."
                 }
             } else {

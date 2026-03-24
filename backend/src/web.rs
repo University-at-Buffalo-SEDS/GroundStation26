@@ -11,7 +11,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::{
     extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade}, extract::{Path, Query, State},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, get_service, post},
     Json,
     Router,
 };
@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, OnceCell};
 use tower_http::compression::CompressionLayer;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 // NEW
 
@@ -99,11 +99,16 @@ fn compact_recent_rows(rows: Vec<TelemetryRow>, cutoff: i64) -> Vec<TelemetryRow
 
 /// Public router constructor
 pub fn router(state: Arc<AppState>) -> Router {
+    let spa_index = ServeFile::new("./frontend/dist/public/index.html");
     let static_dir = ServeDir::new("./frontend/dist/public")
         .precompressed_br()
-        .precompressed_gzip();
+        .precompressed_gzip()
+        .not_found_service(spa_index.clone());
     Router::new()
         .layer(CompressionLayer::new())
+        .route("/", get_service(spa_index.clone()))
+        .route("/login", get_service(spa_index.clone()))
+        .route("/dashboard", get_service(spa_index))
         .route("/api/auth/login", post(login))
         .route("/api/auth/session", get(get_session_status))
         .route("/api/auth/logout", post(logout))

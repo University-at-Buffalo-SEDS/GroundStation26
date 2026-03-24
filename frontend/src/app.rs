@@ -129,6 +129,16 @@ fn connect_route() -> Route {
     Route::Connect {}
 }
 
+#[cfg(target_arch = "wasm32")]
+fn authenticated_route() -> Route {
+    Route::Root {}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn authenticated_route() -> Route {
+    Route::Dashboard {}
+}
+
 // -------------------------
 // Native-only Objective-C poke shims
 // -------------------------
@@ -687,6 +697,45 @@ fn LoginCard(
     let mut remember_me = use_signal(|| true);
     let mut status = use_signal(String::new);
     let mut busy = use_signal(|| false);
+    let mut submit_login = move || {
+        let base = UrlConfig::base_http();
+        if base.trim().is_empty() {
+            status.set("Configure the backend URL first.".to_string());
+            return;
+        }
+        let username_value = username();
+        let password_value = password();
+        if username_value.trim().is_empty() || password_value.is_empty() {
+            status.set("Enter both username and password.".to_string());
+            return;
+        }
+        let remember = *remember_me.read();
+        let success_route = sign_in_route.clone();
+        busy.set(true);
+        status.set("Signing in...".to_string());
+        spawn(async move {
+            match auth::login(
+                &base,
+                skip_tls,
+                username_value.trim(),
+                &password_value,
+                remember,
+            )
+                .await
+            {
+                Ok(_) => {
+                    telemetry_dashboard::reconnect_and_reseed_after_auth_change();
+                    busy.set(false);
+                    status.set(String::new());
+                    let _ = nav.replace(success_route);
+                }
+                Err(err) => {
+                    busy.set(false);
+                    status.set(err);
+                }
+            }
+        });
+    };
 
     use_effect({
         let effect_base = effect_base.clone();
@@ -723,52 +772,67 @@ fn LoginCard(
                 style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
                 h1 { style: "margin:0 0 10px 0; font-size:22px;", "{title}" }
                 p { style: "margin:0 0 16px 0; color:#94a3b8;", "{subtitle}" }
-
-                if base.trim().is_empty() {
-                    div {
-                        style: "margin-bottom:14px; padding:12px; border-radius:12px; border:1px solid #7c2d12; background:#451a03; color:#fed7aa;",
-                        "Configure the backend URL before logging in."
+                form {
+                    onsubmit: move |evt| {
+                        evt.prevent_default();
+                        submit_login();
+                    },
+                    if base.trim().is_empty() {
+                        div {
+                            style: "margin-bottom:14px; padding:12px; border-radius:12px; border:1px solid #7c2d12; background:#451a03; color:#fed7aa;",
+                            "Configure the backend URL before logging in."
+                        }
                     }
-                }
 
-                input {
-                    style: "width:100%; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#e5e7eb; outline:none; margin-bottom:12px;",
-                    placeholder: "Username",
-                    value: "{username()}",
-                    oninput: move |evt| username.set(evt.value()),
-                }
-
-                input {
-                    style: "width:100%; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#e5e7eb; outline:none;",
-                    r#type: "password",
-                    placeholder: "Password",
-                    value: "{password()}",
-                    oninput: move |evt| password.set(evt.value()),
-                }
-
-                div { style: "margin-top:12px; display:flex; align-items:center; gap:10px;",
+                    label { r#for: "gs26-login-username", style: "display:block; margin-bottom:8px; font-size:13px; color:#94a3b8;", "Username" }
                     input {
-                        r#type: "checkbox",
-                        checked: *remember_me.read(),
-                        onclick: move |_| {
-                            let next = !*remember_me.read();
-                            remember_me.set(next);
-                        },
+                        id: "gs26-login-username",
+                        name: "username",
+                        autocomplete: "username",
+                        autocapitalize: "none",
+                        spellcheck: "false",
+                        style: "width:100%; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#e5e7eb; outline:none; margin-bottom:12px;",
+                        placeholder: "Username",
+                        value: "{username()}",
+                        oninput: move |evt| username.set(evt.value()),
                     }
-                    div { style: "font-size:13px; color:#94a3b8;", "Remember this device until the backend session expires" }
-                }
 
-                if !status().is_empty() {
-                    div {
-                        style: "margin-top:14px; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#cbd5e1; white-space:pre-wrap;",
-                        "{status()}"
+                    label { r#for: "gs26-login-password", style: "display:block; margin-bottom:8px; font-size:13px; color:#94a3b8;", "Password" }
+                    input {
+                        id: "gs26-login-password",
+                        name: "password",
+                        autocomplete: "current-password",
+                        style: "width:100%; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#e5e7eb; outline:none;",
+                        r#type: "password",
+                        placeholder: "Password",
+                        value: "{password()}",
+                        oninput: move |evt| password.set(evt.value()),
                     }
-                }
 
-                div { style: "display:flex; gap:12px; margin-top:16px; justify-content:flex-end; flex-wrap:wrap;",
+                    div { style: "margin-top:12px; display:flex; align-items:center; gap:10px;",
+                        input {
+                            r#type: "checkbox",
+                            checked: *remember_me.read(),
+                            onclick: move |_| {
+                                let next = !*remember_me.read();
+                                remember_me.set(next);
+                            },
+                        }
+                        div { style: "font-size:13px; color:#94a3b8;", "Remember this device until the backend session expires" }
+                    }
+
+                    if !status().is_empty() {
+                        div {
+                            style: "margin-top:14px; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#cbd5e1; white-space:pre-wrap;",
+                            "{status()}"
+                        }
+                    }
+
+                    div { style: "display:flex; gap:12px; margin-top:16px; justify-content:flex-end; flex-wrap:wrap;",
                     if matches!(logged_out_status.read().as_ref(), Some(Ok(status)) if status.permissions.view_data) {
                         button {
                             style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#0f172a; color:#e5e7eb; cursor:pointer;",
+                            r#type: "button",
                             disabled: busy() || base.trim().is_empty(),
                             onclick: move |_| {
                                 let success_route = continue_logged_out_route.clone();
@@ -797,6 +861,7 @@ fn LoginCard(
                     if allow_back_to_connect {
                         button {
                             style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
+                            r#type: "button",
                             onclick: move |_| {
                                 let _ = nav.replace(connect_route());
                             },
@@ -805,41 +870,12 @@ fn LoginCard(
                     }
 
                     button {
+                        r#type: "submit",
                         style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
                         disabled: busy() || base.trim().is_empty(),
-                        onclick: move |_| {
-                            let base = UrlConfig::base_http();
-                            if base.trim().is_empty() {
-                                status.set("Configure the backend URL first.".to_string());
-                                return;
-                            }
-                            let username_value = username();
-                            let password_value = password();
-                            if username_value.trim().is_empty() || password_value.is_empty() {
-                                status.set("Enter both username and password.".to_string());
-                                return;
-                            }
-                            let remember = *remember_me.read();
-                            let success_route = sign_in_route.clone();
-                            busy.set(true);
-                            status.set("Signing in...".to_string());
-                            spawn(async move {
-                                match auth::login(&base, skip_tls, username_value.trim(), &password_value, remember).await {
-                                    Ok(_) => {
-                                        telemetry_dashboard::reconnect_and_reseed_after_auth_change();
-                                        busy.set(false);
-                                        status.set(String::new());
-                                        let _ = nav.replace(success_route);
-                                    }
-                                    Err(err) => {
-                                        busy.set(false);
-                                        status.set(err);
-                                    }
-                                }
-                            });
-                        },
                         if busy() { "Signing In..." } else { "Sign In" }
                     }
+                }
                 }
             }
         }
@@ -904,6 +940,9 @@ fn LoginOverlay(
 
 #[component]
 pub fn Login() -> Element {
+    #[cfg(target_arch = "wasm32")]
+    let show_live_dashboard = false;
+    #[cfg(not(target_arch = "wasm32"))]
     let show_live_dashboard = telemetry_dashboard::dashboard_has_prior_backend_connection();
     if show_live_dashboard {
         rsx! {
@@ -911,7 +950,7 @@ pub fn Login() -> Element {
                 title: "Sign In".to_string(),
                 subtitle: "Authenticate with the backend to view protected data or send commands.".to_string(),
                 allow_back_to_connect: true,
-                on_success_route: Route::Dashboard {},
+                on_success_route: authenticated_route(),
             }
         }
     } else {
@@ -920,7 +959,7 @@ pub fn Login() -> Element {
                 title: "Sign In".to_string(),
                 subtitle: "Authenticate with the backend to view protected data or send commands.".to_string(),
                 allow_back_to_connect: true,
-                on_success_route: Route::Dashboard {},
+                on_success_route: authenticated_route(),
             }
         }
     }
@@ -1241,13 +1280,25 @@ pub fn Dashboard() -> Element {
             rsx! { crate::telemetry_dashboard::TelemetryDashboard {} }
         }
         Some(Ok(_)) => {
+            #[cfg(target_arch = "wasm32")]
+            {
+                rsx! {
+                    LoginCard {
+                        title: "Sign In Required".to_string(),
+                        subtitle: "This backend does not allow anonymous view access. Sign in to continue.".to_string(),
+                        allow_back_to_connect: true,
+                        on_success_route: authenticated_route(),
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             if telemetry_dashboard::dashboard_has_prior_backend_connection() {
                 rsx! {
                     LoginOverlay {
                         title: "Sign In Required".to_string(),
                         subtitle: "This backend does not allow anonymous view access. Sign in to continue.".to_string(),
                         allow_back_to_connect: true,
-                        on_success_route: Route::Dashboard {},
+                        on_success_route: authenticated_route(),
                     }
                 }
             } else {
@@ -1256,7 +1307,7 @@ pub fn Dashboard() -> Element {
                         title: "Sign In Required".to_string(),
                         subtitle: "This backend does not allow anonymous view access. Sign in to continue.".to_string(),
                         allow_back_to_connect: true,
-                        on_success_route: Route::Dashboard {},
+                        on_success_route: authenticated_route(),
                     }
                 }
             }

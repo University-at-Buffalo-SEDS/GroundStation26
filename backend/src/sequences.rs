@@ -829,7 +829,8 @@ fn maybe_drive_local_prelaunch_state(
     let desired_state = match runtime.step {
         SequenceStep::SetupValves => {
             if current_state == FlightState::Idle
-                && (valves.normally_open == Some(false) || valves.dump_open == Some(false))
+                && valves.normally_open == Some(false)
+                && valves.dump_open == Some(false)
             {
                 Some(FlightState::PreFill)
             } else {

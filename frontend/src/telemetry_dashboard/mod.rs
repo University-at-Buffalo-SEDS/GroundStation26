@@ -866,7 +866,7 @@ fn clear_ui_telemetry_store() {
     *epoch = epoch.wrapping_add(1);
 }
 
-fn ui_telemetry_rows_snapshot() -> Vec<TelemetryRow> {
+pub(crate) fn ui_telemetry_rows_snapshot() -> Vec<TelemetryRow> {
     if let Ok(store) = UI_TELEMETRY_STORE.lock() {
         store.snapshot()
     } else {
@@ -1119,6 +1119,15 @@ impl UrlConfig {
             .map(normalize_base_url)
             .unwrap_or_else(|| BASE_URL.read().clone());
 
+        #[cfg(target_arch = "wasm32")]
+        if base.is_empty() {
+            if let Some(window) = web_sys::window()
+                && let Ok(origin) = window.location().origin()
+            {
+                return normalize_base_url(origin);
+            }
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
         if base.is_empty() {
             return "http://localhost:3000".to_string();
@@ -1202,33 +1211,34 @@ fn _tls_skip_key(base: &str) -> String {
 
 static BASE_URL: GlobalSignal<String> = Signal::global(String::new);
 
-#[cfg(target_arch = "wasm32")]
-fn hard_reload_app_web() {
-    if let Some(w) = web_sys::window() {
-        let _ = w.location().reload();
-    }
-}
-
 fn reconnect_and_reload_ui() {
     // Always restart websockets/tasks
     bump_ws_epoch();
     bump_seed_epoch();
 
-    // Web: real reload
-    #[cfg(target_arch = "wasm32")]
-    {
-        hard_reload_app_web();
-    }
-
     // Native: keep current UI mounted so charts/history remain visible while reseed runs.
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn dashboard_has_prior_backend_connection() -> bool {
     DASHBOARD_HAS_CONNECTED.load(Ordering::Relaxed)
 }
 
 pub fn reconnect_and_reseed_after_auth_change() {
     reconnect_and_reload_ui();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_dashboard_runtime_allowed() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().pathname().ok())
+        .map(|path| path != "/login")
+        .unwrap_or(true)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn web_dashboard_runtime_allowed() -> bool {
+    true
 }
 
 fn clear_telemetry_runtime_buffers() {
@@ -1906,6 +1916,10 @@ fn TelemetryDashboardInner() -> Element {
             if !alive.load(Ordering::Relaxed) {
                 return;
             }
+            if !web_dashboard_runtime_allowed() {
+                log!("[WS] supervisor skipped on non-dashboard route");
+                return;
+            }
 
             if last_started_epoch.read().as_ref() == Some(&epoch) {
                 return;
@@ -1948,17 +1962,33 @@ fn TelemetryDashboardInner() -> Element {
         });
     }
 
+    let theme = layout_config
+        .read()
+        .as_ref()
+        .map(|cfg| cfg.theme.clone())
+        .unwrap_or_default();
+    let main_tab_accent = |tab_id: &str, fallback: &str| {
+        theme
+            .main_tab_accents
+            .get(tab_id)
+            .cloned()
+            .unwrap_or_else(|| fallback.to_string())
+    };
     // Button styles
     let tab_style_active = |color: &str| {
         format!(
             "padding:0.4rem 0.8rem; border-radius:0.5rem;\
-             border:1px solid {color}; background:#111827;\
-             color:{color}; cursor:pointer;"
+             border:1px solid {color}; background:{};\
+             color:{color}; cursor:pointer;",
+            theme.button_background
         )
     };
-    let tab_style_inactive = "padding:0.4rem 0.8rem; border-radius:0.5rem;\
-                             border:1px solid #4b5563; background:#020617;\
-                             color:#e5e7eb; cursor:pointer;";
+    let tab_style_inactive = format!(
+        "padding:0.4rem 0.8rem; border-radius:0.5rem;\
+         border:1px solid {}; background:{};\
+         color:{}; cursor:pointer;",
+        theme.tab_shell_border, theme.app_background, theme.text_primary
+    );
 
     // Native-only CONNECT button
     let connect_button: Element = {
@@ -1979,15 +2009,15 @@ fn TelemetryDashboardInner() -> Element {
             rsx! {
 
                 button {
-                    style: "
+                    style: format!("
                         padding:0.45rem 0.85rem;
                         border-radius:0.75rem;
-                        border:1px solid #334155;
-                        background:#111827;
-                        color:#e5e7eb;
+                        border:1px solid {};
+                        background:{};
+                        color:{};
                         font-weight:800;
                         cursor:pointer;
-                    ",
+                    ", theme.button_border, theme.button_background, theme.button_text),
                     onclick: move |_| {
                         // KEY CHANGE:
                         // Mark dashboard "not alive" *before* bumping WS_EPOCH.
@@ -2021,15 +2051,15 @@ fn TelemetryDashboardInner() -> Element {
             let mut show_version_overlay = show_version_overlay;
             rsx! {
                 button {
-                    style: "
+                    style: format!("
                         padding:0.45rem 0.85rem;
                         border-radius:0.75rem;
-                        border:1px solid #334155;
-                        background:#111827;
-                        color:#e5e7eb;
+                        border:1px solid {};
+                        background:{};
+                        color:{};
                         font-weight:800;
                         cursor:pointer;
-                    ",
+                    ", theme.button_border, theme.button_background, theme.button_text),
                     onclick: move |_| {
                         show_version_overlay.set(true);
                     },
@@ -2050,15 +2080,15 @@ fn TelemetryDashboardInner() -> Element {
             .unwrap_or_else(|| "SIGN IN".to_string());
         rsx! {
             button {
-                style: "
+                style: format!("
                     padding:0.45rem 0.85rem;
                     border-radius:0.75rem;
-                    border:1px solid #334155;
-                    background:#111827;
-                    color:#e5e7eb;
+                    border:1px solid {};
+                    background:{};
+                    color:{};
                     font-weight:800;
                     cursor:pointer;
-                ",
+                ", theme.button_border, theme.button_background, theme.button_text),
                 onclick: move |_| {
                     if auth::current_session().is_some() {
                         let base = base.clone();
@@ -2071,12 +2101,16 @@ fn TelemetryDashboardInner() -> Element {
                                 }
                                 Ok(_) | Err(_) => {
                                     auth::clear_current_session();
+                                    _set_dashboard_alive(false);
+                                    bump_ws_epoch();
                                     reconnect_and_reseed_after_auth_change();
                                     let _ = nav.push(Route::Login {});
                                 }
                             }
                         });
                     } else {
+                        _set_dashboard_alive(false);
+                        bump_ws_epoch();
                         let _ = nav.push(Route::Login {});
                     }
                 },
@@ -2126,15 +2160,15 @@ fn TelemetryDashboardInner() -> Element {
     let mut _refresh_layout = refresh_layout;
     let reload_button: Element = rsx! {
         button {
-            style: "
+            style: format!("
                 padding:0.45rem 0.85rem;
                 border-radius:0.75rem;
-                border:1px solid #334155;
-                background:#111827;
-                color:#e5e7eb;
+                border:1px solid {};
+                background:{};
+                color:{};
                 font-weight:800;
                 cursor:pointer;
-            ",
+            ", theme.button_border, theme.button_background, theme.button_text),
             onclick: move |_| {
                 // Clear transient telemetry buffers first.
                 clear_telemetry_runtime_buffers();
@@ -2505,7 +2539,7 @@ fn TelemetryDashboardInner() -> Element {
                     }
 
                     if !action_policy.read().software_buttons_enabled {
-                        div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid #f59e0b; background:#451a03; color:#fde68a; font-size:12px;",
+                        div { style: "margin-bottom:12px; padding:10px 12px; border-radius:10px; border:1px solid {theme.warning_border}; background:{theme.warning_background}; color:{theme.warning_text}; font-size:12px;",
                             "Software command buttons are disabled by the hardware GPIO lockout."
                         }
                     }
@@ -2529,8 +2563,8 @@ fn TelemetryDashboardInner() -> Element {
                         align-items:center;
                         padding:0.85rem;
                         border-radius:0.75rem;
-                        background:#020617ee;
-                        border:1px solid #4b5563;
+                        background:{theme.tab_shell_background};
+                        border:1px solid {theme.tab_shell_border};
                         box-shadow:0 10e0px 25px rgba(0,0,0,0.45);
                         min-width:260px;
                     ",
@@ -2556,7 +2590,7 @@ fn TelemetryDashboardInner() -> Element {
                                     match tab {
                                         MainTab::State => rsx! {
                                             button {
-                                                style: if *active_main_tab.read() == MainTab::State { tab_style_active("#38bdf8") } else { tab_style_inactive.to_string() },
+                                                style: if *active_main_tab.read() == MainTab::State { tab_style_active(&main_tab_accent("state", "#38bdf8")) } else { tab_style_inactive.to_string() },
                                                 onclick: {
                                                     let mut t = active_main_tab;
                                                     let mut tabs_expanded = tabs_expanded;
@@ -2570,7 +2604,7 @@ fn TelemetryDashboardInner() -> Element {
                                         },
                                         MainTab::ConnectionStatus => rsx! {
                                             button {
-                                                style: if *active_main_tab.read() == MainTab::ConnectionStatus { tab_style_active("#06b6d4") } else { tab_style_inactive.to_string() },
+                                                style: if *active_main_tab.read() == MainTab::ConnectionStatus { tab_style_active(&main_tab_accent("connection-status", "#06b6d4")) } else { tab_style_inactive.to_string() },
                                                 onclick: {
                                                     let mut t = active_main_tab;
                                                     let mut tabs_expanded = tabs_expanded;
@@ -2584,7 +2618,7 @@ fn TelemetryDashboardInner() -> Element {
                                         },
                                         MainTab::Detailed => rsx! {
                                             button {
-                                                style: if *active_main_tab.read() == MainTab::Detailed { tab_style_active("#0ea5e9") } else { tab_style_inactive.to_string() },
+                                                style: if *active_main_tab.read() == MainTab::Detailed { tab_style_active(&main_tab_accent("detailed", "#0ea5e9")) } else { tab_style_inactive.to_string() },
                                                 onclick: {
                                                     let mut t = active_main_tab;
                                                     let mut tabs_expanded = tabs_expanded;
@@ -2598,7 +2632,7 @@ fn TelemetryDashboardInner() -> Element {
                                         },
                                         MainTab::Map => rsx! {
                                             button {
-                                                style: if *active_main_tab.read() == MainTab::Map { tab_style_active("#22c55e") } else { tab_style_inactive.to_string() },
+                                                style: if *active_main_tab.read() == MainTab::Map { tab_style_active(&main_tab_accent("map", "#22c55e")) } else { tab_style_inactive.to_string() },
                                                 onclick: {
                                                     let mut t = active_main_tab;
                                                     let mut tabs_expanded = tabs_expanded;
@@ -2612,7 +2646,7 @@ fn TelemetryDashboardInner() -> Element {
                                         },
                                         MainTab::Actions => rsx! {
                                             button {
-                                                style: if *active_main_tab.read() == MainTab::Actions { tab_style_active("#a78bfa") } else { tab_style_inactive.to_string() },
+                                                style: if *active_main_tab.read() == MainTab::Actions { tab_style_active(&main_tab_accent("actions", "#a78bfa")) } else { tab_style_inactive.to_string() },
                                                 onclick: {
                                                     let mut t = active_main_tab;
                                                     let mut tabs_expanded = tabs_expanded;
@@ -2626,7 +2660,7 @@ fn TelemetryDashboardInner() -> Element {
                                         },
                                         MainTab::Calibration => rsx! {
                                             button {
-                                                style: if *active_main_tab.read() == MainTab::Calibration { tab_style_active("#14b8a6") } else { tab_style_inactive.to_string() },
+                                                style: if *active_main_tab.read() == MainTab::Calibration { tab_style_active(&main_tab_accent("calibration", "#14b8a6")) } else { tab_style_inactive.to_string() },
                                                 onclick: {
                                                     let mut t = active_main_tab;
                                                     let mut tabs_expanded = tabs_expanded;
@@ -2640,7 +2674,7 @@ fn TelemetryDashboardInner() -> Element {
                                         },
                                         MainTab::Notifications => rsx! {
                                             button {
-                                                style: if *active_main_tab.read() == MainTab::Notifications { tab_style_active("#3b82f6") } else { tab_style_inactive.to_string() },
+                                                style: if *active_main_tab.read() == MainTab::Notifications { tab_style_active(&main_tab_accent("notifications", "#3b82f6")) } else { tab_style_inactive.to_string() },
                                                 onclick: {
                                                     let mut t = active_main_tab;
                                                     let mut tabs_expanded = tabs_expanded;
@@ -2659,13 +2693,13 @@ fn TelemetryDashboardInner() -> Element {
                                                 },
                                                 span { "{_main_tab_label(&layout, MainTab::Notifications)}" }
                                                 if has_unread_notifications {
-                                                    span { style: "margin-left:6px; color:#93c5fd;", "●" }
+                                                    span { style: "margin-left:6px; color:{theme.info_text};", "●" }
                                                 }
                                             }
                                         },
                                         MainTab::Warnings => rsx! {
                                             button {
-                                                style: if *active_main_tab.read() == MainTab::Warnings { tab_style_active("#facc15") } else { tab_style_inactive.to_string() },
+                                                style: if *active_main_tab.read() == MainTab::Warnings { tab_style_active(&main_tab_accent("warnings", "#facc15")) } else { tab_style_inactive.to_string() },
                                                 onclick: {
                                                     let mut t = active_main_tab;
                                                     let mut tabs_expanded = tabs_expanded;
@@ -2679,11 +2713,11 @@ fn TelemetryDashboardInner() -> Element {
                                                     span {
                                                         style: {
                                                             if has_unacked_warnings && *flash_on.read() {
-                                                                "margin-left:6px; color:#facc15; opacity:1;".to_string()
+                                                                format!("margin-left:6px; color:{}; opacity:1;", main_tab_accent("warnings", "#facc15"))
                                                             } else if has_unacked_warnings {
-                                                                "margin-left:6px; color:#facc15; opacity:0.4;".to_string()
+                                                                format!("margin-left:6px; color:{}; opacity:0.4;", main_tab_accent("warnings", "#facc15"))
                                                             } else {
-                                                                "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                                                                format!("margin-left:6px; color:{}; opacity:1;", theme.text_soft)
                                                             }
                                                         },
                                                         "⚠"
@@ -2693,7 +2727,7 @@ fn TelemetryDashboardInner() -> Element {
                                         },
                                         MainTab::Errors => rsx! {
                                             button {
-                                                style: if *active_main_tab.read() == MainTab::Errors { tab_style_active("#ef4444") } else { tab_style_inactive.to_string() },
+                                                style: if *active_main_tab.read() == MainTab::Errors { tab_style_active(&main_tab_accent("errors", "#ef4444")) } else { tab_style_inactive.to_string() },
                                                 onclick: {
                                                     let mut t = active_main_tab;
                                                     let mut tabs_expanded = tabs_expanded;
@@ -2707,11 +2741,11 @@ fn TelemetryDashboardInner() -> Element {
                                                     span {
                                                         style: {
                                                             if has_unacked_errors && *flash_on.read() {
-                                                                "margin-left:6px; color:#fecaca; opacity:1;".to_string()
+                                                                format!("margin-left:6px; color:{}; opacity:1;", theme.error_text)
                                                             } else if has_unacked_errors {
-                                                                "margin-left:6px; color:#fecaca; opacity:0.4;".to_string()
+                                                                format!("margin-left:6px; color:{}; opacity:0.4;", theme.error_text)
                                                             } else {
-                                                                "margin-left:6px; color:#9ca3af; opacity:1;".to_string()
+                                                                format!("margin-left:6px; color:{}; opacity:1;", theme.text_soft)
                                                             }
                                                         },
                                                         "⛔"
@@ -2721,7 +2755,7 @@ fn TelemetryDashboardInner() -> Element {
                                         },
                                         MainTab::Data => rsx! {
                                             button {
-                                                style: if *active_main_tab.read() == MainTab::Data { tab_style_active("#f97316") } else { tab_style_inactive.to_string() },
+                                                style: if *active_main_tab.read() == MainTab::Data { tab_style_active(&main_tab_accent("data", "#f97316")) } else { tab_style_inactive.to_string() },
                                                 onclick: {
                                                     let mut t = active_main_tab;
                                                     let mut tabs_expanded = tabs_expanded;
@@ -2735,7 +2769,7 @@ fn TelemetryDashboardInner() -> Element {
                                         },
                                         MainTab::NetworkTopology => rsx! {
                                             button {
-                                                style: if *active_main_tab.read() == MainTab::NetworkTopology { tab_style_active("#8b5cf6") } else { tab_style_inactive.to_string() },
+                                                style: if *active_main_tab.read() == MainTab::NetworkTopology { tab_style_active(&main_tab_accent("network-topology", "#8b5cf6")) } else { tab_style_inactive.to_string() },
                                                 onclick: {
                                                     let mut t = active_main_tab;
                                                     let mut tabs_expanded = tabs_expanded;
@@ -2763,16 +2797,16 @@ fn TelemetryDashboardInner() -> Element {
                         gap:0.5rem;
                         padding:0.35rem 0.7rem;
                         border-radius:1rem;
-                        background:#111827;
-                        border:1px solid #4b5563;
+                        background:{theme.button_background};
+                        border:1px solid {theme.tab_shell_border};
                         min-width:260px;
                     ",
                             div { style: "display:flex; align-items:center; flex-wrap:wrap; gap:0.5rem; min-width:0;",
-                                span { style: "color:#9ca3af;", "Status:" }
+                                span { style: "color:{theme.text_soft};", "Status:" }
 
                                 if !has_warnings && !has_errors {
-                                    span { style: "color:#22c55e; font-weight:600; flex:0 0 auto;", "Nominal" }
-                                    span { style: "color:#93c5fd; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
+                                    span { style: "color:{theme.success_text}; font-weight:600; flex:0 0 auto;", "Nominal" }
+                                    span { style: "color:{theme.info_text}; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
                                         "(Flight state:"
                                         span {
                                             style: "display:inline-flex; align-items:baseline; width:15.5ch; padding-left:0.4ch; white-space:nowrap;",
@@ -2782,12 +2816,12 @@ fn TelemetryDashboardInner() -> Element {
                                     }
                                 } else {
                                     if has_errors {
-                                        span { style: "color:#fecaca; flex:0 0 auto;", {format!("{err_count} error(s)")} }
+                                        span { style: "color:{theme.error_text}; flex:0 0 auto;", {format!("{err_count} error(s)")} }
                                     }
                                     if has_warnings {
-                                        span { style: "color:#fecaca; flex:0 0 auto;", {format!("{warn_count} warnings(s)")} }
+                                        span { style: "color:{theme.warning_text}; flex:0 0 auto;", {format!("{warn_count} warnings(s)")} }
                                     }
-                                    span { style: "color:#93c5fd; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
+                                    span { style: "color:{theme.info_text}; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
                                         "(Flight state:"
                                         span {
                                             style: "display:inline-flex; align-items:baseline; width:15.5ch; padding-left:0.4ch; white-space:nowrap;",
@@ -2802,9 +2836,9 @@ fn TelemetryDashboardInner() -> Element {
                                         margin-left:auto;
                                         padding:0.25rem 0.7rem;
                                         border-radius:999px;
-                                        border:1px solid #4b5563;
-                                        background:#020617;
-                                        color:#e5e7eb;
+                                        border:1px solid {theme.tab_shell_border};
+                                        background:{theme.app_background};
+                                        color:{theme.text_primary};
                                         font-size:0.75rem;
                                         cursor:pointer;
                                     ",
@@ -2826,9 +2860,9 @@ fn TelemetryDashboardInner() -> Element {
                                         margin-left:auto;
                                         padding:0.25rem 0.7rem;
                                         border-radius:999px;
-                                        border:1px solid #4b5563;
-                                        background:#020617;
-                                        color:#e5e7eb;
+                                        border:1px solid {theme.tab_shell_border};
+                                        background:{theme.app_background};
+                                        color:{theme.text_primary};
                                         font-size:0.75rem;
                                         cursor:pointer;
                                     ",
@@ -2927,6 +2961,7 @@ fn TelemetryDashboardInner() -> Element {
                                                 .find(|t| t.id == "VALVE_STATE")
                                                 .and_then(|t| t.boolean_labels.clone()),
                                             abort_only_mode: *abort_only_mode.read(),
+                                            theme: layout.theme.clone(),
                                         }
                                     }
                             },
@@ -2935,6 +2970,7 @@ fn TelemetryDashboardInner() -> Element {
                                     boards: board_status,
                                     layout: layout.connection_tab.clone(),
                                     title: _main_tab_label(&layout, MainTab::ConnectionStatus),
+                                    theme: layout.theme.clone(),
                                 }
                             },
                             MainTab::Detailed => rsx! {
@@ -2973,6 +3009,7 @@ fn TelemetryDashboardInner() -> Element {
                                         layout: layout.actions_tab.clone(),
                                         action_policy: action_policy,
                                         abort_only_mode: *abort_only_mode.read(),
+                                        theme: layout.theme.clone(),
                                     }
                                 }
                             },
@@ -3000,7 +3037,7 @@ fn TelemetryDashboardInner() -> Element {
                                 DataTab {
                                     active_tab: active_data_tab,
                                     layout: layout.data_tab.clone(),
-                                    battery_sources: layout.battery.sources.clone(),
+                                    theme: layout.theme.clone(),
                                 }
                             },
                         }
@@ -3917,7 +3954,11 @@ async fn connect_ws_once_wasm(
     }
 
     {
+        let alive_for_message = alive.clone();
         let onmessage: Closure<dyn FnMut(MessageEvent)> = Closure::new(move |e: MessageEvent| {
+            if !alive_for_message.load(Ordering::Relaxed) {
+                return;
+            }
             if let Some(s) = e.data().as_string() {
                 handle_ws_message(
                     &s,
@@ -3945,7 +3986,11 @@ async fn connect_ws_once_wasm(
 
     {
         let closed_tx = closed_tx.clone();
+        let alive_for_error = alive.clone();
         let onerror: Closure<dyn FnMut(ErrorEvent)> = Closure::new(move |e: ErrorEvent| {
+            if !alive_for_error.load(Ordering::Relaxed) {
+                return;
+            }
             log!("[WS] error: {}", e.message());
             if let Some(tx) = closed_tx.borrow_mut().take() {
                 let _ = tx.send(());
@@ -3957,7 +4002,11 @@ async fn connect_ws_once_wasm(
 
     {
         let closed_tx = closed_tx.clone();
+        let alive_for_close = alive.clone();
         let onclose: Closure<dyn FnMut(CloseEvent)> = Closure::new(move |e: CloseEvent| {
+            if !alive_for_close.load(Ordering::Relaxed) {
+                return;
+            }
             log!("[WS] close code={} reason='{}'", e.code(), e.reason());
             if let Some(tx) = closed_tx.borrow_mut().take() {
                 let _ = tx.send(());
