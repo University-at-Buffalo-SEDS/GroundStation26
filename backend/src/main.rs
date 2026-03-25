@@ -514,9 +514,7 @@ async fn main() -> anyhow::Result<()> {
         cfg = cfg.with_timesync(TimeSyncConfig {
             role: TimeSyncRole::Auto,
             priority: 50,
-            source_timeout_ms: 5_000,
-            announce_interval_ms: 1_000,
-            request_interval_ms: 1_000,
+            ..TimeSyncConfig::default()
         });
     }
 

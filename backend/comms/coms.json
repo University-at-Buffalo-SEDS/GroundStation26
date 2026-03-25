@@ -7,7 +7,7 @@
   },
   "fill_box": {
     "interface": "usb_serial",
-    "port": "/dev/ttyUSB2",
-    "baud_rate": 57600
+    "port": "/dev/ttyAMA0",
+    "baud_rate": 115200
   }
 }
