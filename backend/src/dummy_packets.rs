@@ -8,7 +8,7 @@ use sedsprintf_rs_2026::TelemetryResult;
 use std::sync::Arc;
 
 const BASE_LAT: f32 = 31.7619;
-const BASE_LON: f32 = -106.4850;
+const BASE_LON: f32 = -106.485;
 
 fn random_sender() -> &'static str {
     let mut rng = rand::rng();
