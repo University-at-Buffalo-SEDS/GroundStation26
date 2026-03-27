@@ -458,8 +458,8 @@ async fn main() -> anyhow::Result<()> {
         latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
         latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),
         recent_alerts_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-        av_bay_radio_connected: Arc::new(AtomicBool::new(false)),
-        fill_radio_connected: Arc::new(AtomicBool::new(false)),
+        av_bay_comms_connected: Arc::new(AtomicBool::new(false)),
+        fill_comms_connected: Arc::new(AtomicBool::new(false)),
         topology_router: Arc::new(std::sync::OnceLock::new()),
         auth,
     });
@@ -526,7 +526,7 @@ async fn main() -> anyhow::Result<()> {
         link_description(&comms_links.fill_box)
     );
 
-    let (rocket_comms, av_bay_radio_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+    let (rocket_comms, av_bay_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
         match open_link(&comms_links.av_bay) {
             Ok(r) => {
                 println!("Rocket comms online");
@@ -554,11 +554,11 @@ async fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(not(feature = "testing"))]
                 #[cfg(not(feature = "hitl_mode"))]
-                panic!("Rocket radio missing and testing mode not enabled")
+                panic!("Rocket comms missing and testing mode not enabled")
             }
         };
 
-    let (umbilical_comms, fill_radio_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+    let (umbilical_comms, fill_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
         match open_link(&comms_links.fill_box) {
             Ok(r) => {
                 println!("Umbilical comms online");
@@ -586,15 +586,15 @@ async fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(not(feature = "testing"))]
                 #[cfg(not(feature = "hitl_mode"))]
-                panic!("Umbilical radio missing and testing mode not enabled")
+                panic!("Umbilical comms missing and testing mode not enabled")
             }
         };
     state
-        .av_bay_radio_connected
-        .store(av_bay_radio_connected, Ordering::Relaxed);
+        .av_bay_comms_connected
+        .store(av_bay_comms_connected, Ordering::Relaxed);
     state
-        .fill_radio_connected
-        .store(fill_radio_connected, Ordering::Relaxed);
+        .fill_comms_connected
+        .store(fill_comms_connected, Ordering::Relaxed);
 
     let router = Arc::new(sedsprintf_rs_2026::router::Router::new(
         RouterMode::Relay,

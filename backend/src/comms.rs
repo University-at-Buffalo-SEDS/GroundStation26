@@ -1,5 +1,5 @@
 use crate::comms_config::{
-    CanLinkConfig, CommsLinkConfig, I2cLinkConfig, SerialLinkConfig, SpiLinkConfig,
+    CanLinkConfig, CommsLinkConfig, I2cLinkConfig, SerialLinkConfig, SerialProtocol, SpiLinkConfig,
 };
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
@@ -7,6 +7,7 @@ use anyhow::Context;
 use sedsprintf_rs_2026::{
     TelemetryError, TelemetryResult,
     router::{Router, RouterSideId},
+    serialize,
 };
 use serial::{SerialPort, SystemPort};
 use std::error::Error;
@@ -26,6 +27,7 @@ pub const ROCKET_COMMS_PORT: &str = "/dev/ttyUSB1";
 pub const UMBILICAL_COMMS_PORT: &str = "/dev/ttyUSB2";
 pub const COMMS_BAUD_RATE: usize = 57_600;
 pub const MAX_PACKET_SIZE: usize = 256;
+const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
 #[cfg(target_os = "linux")]
 const I2C_FRAME_SIZE: usize = 258;
 #[cfg(target_os = "linux")]
@@ -61,9 +63,7 @@ pub fn open_link(cfg: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> 
     match cfg {
         CommsLinkConfig::UsbSerial { serial }
         | CommsLinkConfig::RaspberryPiGpioUart { serial }
-        | CommsLinkConfig::CustomSerial { serial } => {
-            Ok(Box::new(UartComms::open(&serial.port, serial.baud_rate)?))
-        }
+        | CommsLinkConfig::CustomSerial { serial } => Ok(Box::new(UartComms::open(serial)?)),
         CommsLinkConfig::Spi { spi } => Ok(Box::new(SpiComms::open(spi)?)),
         CommsLinkConfig::Can { can } => Ok(Box::new(CanComms::open(can)?)),
         CommsLinkConfig::I2c { i2c } => Ok(Box::new(I2cComms::open(i2c)?)),
@@ -99,8 +99,8 @@ pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
 
 fn serial_description(name: &str, serial: &SerialLinkConfig) -> String {
     format!(
-        "interface={name} port={} baud_rate={}",
-        serial.port, serial.baud_rate
+        "interface={name} port={} baud_rate={} protocol={:?}",
+        serial.port, serial.baud_rate, serial.protocol
     )
 }
 
@@ -126,20 +126,21 @@ fn i2c_description(i2c: &I2cLinkConfig) -> String {
 }
 
 // ======================================================================
-//  Real Radio Implementation
+//  Real Comms Implementation
 // ======================================================================
 pub struct UartComms {
     inner: SystemPort,
     side_id: Option<RouterSideId>,
     rx_buf: Vec<u8>,
+    protocol: SerialProtocol,
 }
 
 impl UartComms {
-    pub fn open(path: &str, baud: usize) -> anyhow::Result<Self> {
-        let mut inner = serial::open(path)?;
+    pub fn open(cfg: &SerialLinkConfig) -> anyhow::Result<Self> {
+        let mut inner = serial::open(&cfg.port)?;
         inner
             .reconfigure(&|settings| {
-                settings.set_baud_rate(serial::BaudRate::from_speed(baud))?;
+                settings.set_baud_rate(serial::BaudRate::from_speed(cfg.baud_rate))?;
                 settings.set_char_size(serial::CharSize::Bits8);
                 settings.set_parity(serial::Parity::ParityNone);
                 settings.set_stop_bits(serial::StopBits::Stop1);
@@ -152,6 +153,7 @@ impl UartComms {
             inner,
             side_id: None,
             rx_buf: Vec::with_capacity(MAX_PACKET_SIZE * 2),
+            protocol: cfg.protocol.clone(),
         })
     }
 
@@ -168,7 +170,7 @@ impl UartComms {
         }
     }
 
-    fn try_take_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
+    fn try_take_framed_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
         if self.rx_buf.len() < 2 {
             return Ok(None);
         }
@@ -177,7 +179,7 @@ impl UartComms {
         if frame_len == 0 || frame_len > MAX_PACKET_SIZE {
             self.rx_buf.clear();
             return Err(TelemetryError::HandlerError(
-                "invalid frame length from radio",
+                "invalid frame length from comms",
             ));
         }
 
@@ -189,6 +191,32 @@ impl UartComms {
         let payload = self.rx_buf[2..total_len].to_vec();
         self.rx_buf.drain(..total_len);
         Ok(Some(payload))
+    }
+
+    fn try_take_raw_uart_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
+        let scan_len = self.rx_buf.len().min(RAW_UART_MAX_FRAME_BYTES);
+        for end in 1..=scan_len {
+            let candidate = &self.rx_buf[..end];
+            if serialize::peek_frame_info(candidate).is_ok() {
+                let payload = candidate.to_vec();
+                self.rx_buf.drain(..end);
+                return Ok(Some(payload));
+            }
+        }
+
+        if self.rx_buf.len() > RAW_UART_MAX_FRAME_BYTES {
+            let drop_len = self.rx_buf.len() - RAW_UART_MAX_FRAME_BYTES;
+            self.rx_buf.drain(..drop_len);
+        }
+
+        Ok(None)
+    }
+
+    fn try_take_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
+        match self.protocol {
+            SerialProtocol::PacketFramed => self.try_take_framed_packet(),
+            SerialProtocol::RawUart => self.try_take_raw_uart_packet(),
+        }
     }
 }
 
@@ -204,7 +232,7 @@ impl CommsDevice for UartComms {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
             .side_id
-            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+            .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
 
         if self.rx_buf.len() < 2
             && let Err(err) = self.fill_rx_buf()
@@ -226,18 +254,24 @@ impl CommsDevice for UartComms {
         Ok(())
     }
 
-    /// Blocking send of serialized bytes (length-prefixed).
+    /// Blocking send of serialized bytes.
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         let len = payload.len();
 
         if len == 0 || len > u16::MAX as usize {
-            return Err(format!("packet too large to send over radio: {len} bytes").into());
+            return Err(format!("packet too large to send over comms: {len} bytes").into());
         }
 
-        let len_bytes = (len as u16).to_le_bytes();
-
-        self.inner.write_all(&len_bytes)?;
-        self.inner.write_all(payload)?;
+        match self.protocol {
+            SerialProtocol::PacketFramed => {
+                let len_bytes = (len as u16).to_le_bytes();
+                self.inner.write_all(&len_bytes)?;
+                self.inner.write_all(payload)?;
+            }
+            SerialProtocol::RawUart => {
+                self.inner.write_all(payload)?;
+            }
+        }
         self.inner.flush()?;
         Ok(())
     }
@@ -248,7 +282,7 @@ impl CommsDevice for UartComms {
 }
 
 // ======================================================================
-// I2C Radio Implementation
+// I2C Comms Implementation
 // ======================================================================
 
 pub struct I2cComms {
@@ -280,7 +314,7 @@ impl I2cComms {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = cfg;
-            anyhow::bail!("I2C radio support is only implemented on Linux")
+            anyhow::bail!("I2C comms support is only implemented on Linux")
         }
     }
 
@@ -357,7 +391,7 @@ impl CommsDevice for I2cComms {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
             .side_id
-            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+            .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
 
         #[cfg(target_os = "linux")]
         {
@@ -372,7 +406,7 @@ impl CommsDevice for I2cComms {
             let _ = router;
             let _ = side_id;
             Err(TelemetryError::HandlerError(
-                "i2c radio support is only implemented on Linux",
+                "i2c comms support is only implemented on Linux",
             ))
         }
     }
@@ -395,7 +429,7 @@ impl CommsDevice for I2cComms {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = payload;
-            Err("i2c radio support is only implemented on Linux".into())
+            Err("i2c comms support is only implemented on Linux".into())
         }
     }
 
@@ -405,7 +439,7 @@ impl CommsDevice for I2cComms {
 }
 
 // ======================================================================
-// SPI Radio Implementation
+// SPI Comms Implementation
 // ======================================================================
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -440,7 +474,7 @@ impl SpiComms {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = cfg;
-            anyhow::bail!("SPI radio support is only implemented on Linux")
+            anyhow::bail!("SPI comms support is only implemented on Linux")
         }
     }
 
@@ -475,7 +509,7 @@ impl CommsDevice for SpiComms {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
             .side_id
-            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+            .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
 
         #[cfg(target_os = "linux")]
         {
@@ -503,7 +537,7 @@ impl CommsDevice for SpiComms {
             let _ = router;
             let _ = side_id;
             Err(TelemetryError::HandlerError(
-                "spi radio support is only implemented on Linux",
+                "spi comms support is only implemented on Linux",
             ))
         }
     }
@@ -527,7 +561,7 @@ impl CommsDevice for SpiComms {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = payload;
-            Err("spi radio support is only implemented on Linux".into())
+            Err("spi comms support is only implemented on Linux".into())
         }
     }
 
@@ -537,7 +571,7 @@ impl CommsDevice for SpiComms {
 }
 
 // ======================================================================
-// CAN Radio Implementation
+// CAN Comms Implementation
 // ======================================================================
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -574,7 +608,7 @@ impl CanComms {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = cfg;
-            anyhow::bail!("CAN radio support is only implemented on Linux")
+            anyhow::bail!("CAN comms support is only implemented on Linux")
         }
     }
 
@@ -591,7 +625,7 @@ impl CommsDevice for CanComms {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
             .side_id
-            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+            .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
 
         #[cfg(target_os = "linux")]
         {
@@ -657,7 +691,7 @@ impl CommsDevice for CanComms {
             let _ = router;
             let _ = side_id;
             Err(TelemetryError::HandlerError(
-                "can radio support is only implemented on Linux",
+                "can comms support is only implemented on Linux",
             ))
         }
     }
@@ -692,7 +726,7 @@ impl CommsDevice for CanComms {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = payload;
-            Err("can radio support is only implemented on Linux".into())
+            Err("can comms support is only implemented on Linux".into())
         }
     }
 
@@ -702,7 +736,7 @@ impl CommsDevice for CanComms {
 }
 
 // ======================================================================
-//  Dummy Radio (fallback when hardware missing)
+//  Dummy Comms (fallback when hardware missing)
 // ======================================================================
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
 #[derive(Debug)]
@@ -729,7 +763,7 @@ impl CommsDevice for DummyComms {
         {
             let side_id = self
                 .side_id
-                .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+                .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
             let pkt = get_dummy_packet()?;
             return _router.rx_queue_from_side(pkt, side_id);
         }
@@ -737,7 +771,7 @@ impl CommsDevice for DummyComms {
         #[cfg(not(feature = "testing"))]
         {
             let _ = _router;
-            // In hitl_mode, dummy radios are used only as disconnected-link placeholders.
+            // In hitl_mode, dummy comms links are used only as disconnected-link placeholders.
             return Ok(());
         }
 

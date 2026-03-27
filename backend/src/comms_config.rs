@@ -13,10 +13,19 @@ const LEGACY_CONFIG_PATHS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SerialProtocol {
+    PacketFramed,
+    RawUart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SerialLinkConfig {
     pub port: String,
     #[serde(default = "default_baud_rate")]
     pub baud_rate: usize,
+    #[serde(default = "default_serial_protocol")]
+    pub protocol: SerialProtocol,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,6 +105,10 @@ fn default_baud_rate() -> usize {
     COMMS_BAUD_RATE
 }
 
+fn default_serial_protocol() -> SerialProtocol {
+    SerialProtocol::PacketFramed
+}
+
 fn default_spi_speed_hz() -> u32 {
     1_000_000
 }
@@ -140,12 +153,14 @@ impl Default for CommsLinksConfig {
                 serial: SerialLinkConfig {
                     port: ROCKET_COMMS_PORT.to_string(),
                     baud_rate: default_baud_rate(),
+                    protocol: default_serial_protocol(),
                 },
             },
             fill_box: CommsLinkConfig::UsbSerial {
                 serial: SerialLinkConfig {
                     port: UMBILICAL_COMMS_PORT.to_string(),
-                    baud_rate: default_baud_rate(),
+                    baud_rate: 115_200,
+                    protocol: SerialProtocol::RawUart,
                 },
             },
         }
@@ -259,7 +274,7 @@ fn migrate_legacy_config(target_path: &PathBuf) {
 mod tests {
     use super::{
         CanLinkConfig, CommsLinkConfig, CommsLinksConfig, I2cLinkConfig, SerialLinkConfig,
-        SpiLinkConfig,
+        SerialProtocol, SpiLinkConfig,
     };
 
     #[test]
@@ -272,6 +287,7 @@ mod tests {
                 serial: SerialLinkConfig {
                     port: "/dev/ttyUSB1".to_string(),
                     baud_rate: 57_600,
+                    protocol: SerialProtocol::PacketFramed,
                 },
             }
         );
@@ -280,7 +296,8 @@ mod tests {
             CommsLinkConfig::UsbSerial {
                 serial: SerialLinkConfig {
                     port: "/dev/ttyUSB2".to_string(),
-                    baud_rate: 57_600,
+                    baud_rate: 115_200,
+                    protocol: SerialProtocol::RawUart,
                 },
             }
         );

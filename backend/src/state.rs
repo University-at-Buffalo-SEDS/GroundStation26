@@ -122,11 +122,11 @@ pub struct AppState {
     /// In-memory recent alerts cache used to bridge DB write lag during reseed.
     pub recent_alerts_cache: Arc<Mutex<VecDeque<AlertDto>>>,
 
-    /// Whether the av-bay (rocket) radio link is physically present.
-    pub av_bay_radio_connected: Arc<AtomicBool>,
+    /// Whether the av-bay (rocket) comms link is physically present.
+    pub av_bay_comms_connected: Arc<AtomicBool>,
 
-    /// Whether the fill-system (umbilical) radio link is physically present.
-    pub fill_radio_connected: Arc<AtomicBool>,
+    /// Whether the fill-system (umbilical) comms link is physically present.
+    pub fill_comms_connected: Arc<AtomicBool>,
 
     /// Shared router handle used for exporting discovery topology.
     pub topology_router: Arc<OnceLock<Arc<Router>>>,
@@ -191,10 +191,10 @@ impl AppState {
             .map(|router| router.export_topology());
         let board_snapshot = self.board_status_snapshot(now_ms);
 
-        let rocket_radio_online = simulated || self.av_bay_radio_connected.load(Ordering::Relaxed);
-        let fill_radio_online = simulated || self.fill_radio_connected.load(Ordering::Relaxed);
+        let rocket_comms_online = simulated || self.av_bay_comms_connected.load(Ordering::Relaxed);
+        let fill_comms_online = simulated || self.fill_comms_connected.load(Ordering::Relaxed);
 
-        let radio_status = |online: bool| {
+        let comms_status = |online: bool| {
             if simulated {
                 NetworkTopologyStatus::Simulated
             } else if online {
@@ -266,7 +266,7 @@ impl AppState {
                     NetworkTopologyStatus::Online
                 }
             } else {
-                radio_status(default_online)
+                comms_status(default_online)
             }
         };
 
@@ -281,8 +281,8 @@ impl AppState {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let rocket_side_endpoints = endpoints_for_side(exported.as_ref(), "rocket_radio");
-        let fill_side_endpoints = endpoints_for_side(exported.as_ref(), "umbilical_radio");
+        let rocket_side_endpoints = endpoints_for_side(exported.as_ref(), "rocket_comms");
+        let fill_side_endpoints = endpoints_for_side(exported.as_ref(), "umbilical_comms");
         let expected_board_endpoints = |board: Board, side_endpoints: &[String]| -> Vec<String> {
             let mut endpoints = match board {
                 Board::GroundStation => local_endpoint_list.clone(),
@@ -340,10 +340,10 @@ impl AppState {
             let endpoints = expected_board_endpoints(board, &rocket_side_endpoints);
             let relay_detail = if matches!(board, Board::RFBoard) {
                 Some(if rocket_side_endpoints.is_empty() {
-                    "Relay board for the rocket radio path".to_string()
+                    "Relay board for the rocket comms path".to_string()
                 } else {
                     format!(
-                        "Relay board for the rocket radio path. Routed endpoints: {}",
+                        "Relay board for the rocket comms path. Routed endpoints: {}",
                         rocket_side_endpoints.join(", ")
                     )
                 })
@@ -377,10 +377,10 @@ impl AppState {
             let endpoints = expected_board_endpoints(board, &fill_side_endpoints);
             let relay_detail = if matches!(board, Board::GatewayBoard) {
                 Some(if fill_side_endpoints.is_empty() {
-                    "Relay board for the umbilical radio path".to_string()
+                    "Relay board for the umbilical comms path".to_string()
                 } else {
                     format!(
-                        "Relay board for the umbilical radio path. Routed endpoints: {}",
+                        "Relay board for the umbilical comms path. Routed endpoints: {}",
                         fill_side_endpoints.join(", ")
                     )
                 })
@@ -413,14 +413,14 @@ impl AppState {
             NetworkTopologyLink {
                 source: "router".to_string(),
                 target: "board_rf".to_string(),
-                label: Some("rocket radio".to_string()),
-                status: side_status("rocket_radio", rocket_radio_online),
+                label: Some("rocket comms".to_string()),
+                status: side_status("rocket_comms", rocket_comms_online),
             },
             NetworkTopologyLink {
                 source: "router".to_string(),
                 target: "board_gw".to_string(),
-                label: Some("umbilical radio".to_string()),
-                status: side_status("umbilical_radio", fill_radio_online),
+                label: Some("umbilical comms".to_string()),
+                status: side_status("umbilical_comms", fill_comms_online),
             },
         ];
 

@@ -884,7 +884,7 @@ pub fn set_network_time_router(router: Arc<Router>) {
 pub async fn telemetry_task(
     state: Arc<AppState>,
     router: Arc<sedsprintf_rs_2026::router::Router>,
-    radio: Vec<Arc<Mutex<Box<dyn CommsDevice>>>>,
+    comms: Vec<Arc<Mutex<Box<dyn CommsDevice>>>>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
@@ -988,26 +988,26 @@ pub async fn telemetry_task(
         })
     };
 
-    let radio_workers: Vec<_> = radio
+    let comms_workers: Vec<_> = comms
         .iter()
         .cloned()
-        .map(|radio| {
+        .map(|comms| {
             let router = router.clone();
-            let mut radio_shutdown_rx = state.shutdown_subscribe();
+            let mut comms_shutdown_rx = state.shutdown_subscribe();
             tokio::spawn(async move {
-                let mut radio_interval = interval(Duration::from_millis(2));
-                radio_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut comms_interval = interval(Duration::from_millis(2));
+                comms_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
-                        _ = radio_interval.tick() => {
-                            match radio.lock().expect("failed to get lock").recv_packet(&router) {
+                        _ = comms_interval.tick() => {
+                            match comms.lock().expect("failed to get lock").recv_packet(&router) {
                                 Ok(_) => {}
                                 Err(e) => {
-                                    log_telemetry_error("radio_task recv_packet failed", e);
+                                    log_telemetry_error("comms_task recv_packet failed", e);
                                 }
                             }
                         }
-                        recv = radio_shutdown_rx.recv() => {
+                        recv = comms_shutdown_rx.recv() => {
                             match recv {
                                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
                                     break;
@@ -1308,12 +1308,12 @@ pub async fn telemetry_task(
 
     let worker_shutdown_timeout = Duration::from_secs(10);
 
-    for worker in radio_workers {
+    for worker in comms_workers {
         match tokio::time::timeout(worker_shutdown_timeout, worker).await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("Radio worker ended with error: {e}"),
+            Ok(Err(e)) => eprintln!("Comms worker ended with error: {e}"),
             Err(_) => eprintln!(
-                "Radio worker did not shut down within {:?}",
+                "Comms worker did not shut down within {:?}",
                 worker_shutdown_timeout
             ),
         }
