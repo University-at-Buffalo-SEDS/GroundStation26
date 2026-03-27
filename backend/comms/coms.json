@@ -2,12 +2,12 @@
   "version": 1,
   "av_bay": {
     "interface": "usb_serial",
-    "port": "/dev/ttyUSB1",
+    "port": "/dev/ttyACM0",
     "baud_rate": 57600
   },
   "fill_box": {
     "interface": "usb_serial",
-    "port": "/dev/ttyAMA0",
+    "port": "/dev/serial/by-id/usb-UBSEDS_CHUD-USB-PICO-FI_CHUD-FI-if00",
     "baud_rate": 115200
   }
 }
