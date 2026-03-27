@@ -638,6 +638,10 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to get umbilical comms lock")
         .set_side_id(umbilical_side);
 
+    if let Err(err) = router.announce_discovery() {
+        eprintln!("WARNING: failed to queue initial discovery announce: {err}");
+    }
+
     router.log_queue(DataType::MessageData, "hello".as_bytes())?;
     router.log_queue(DataType::FlightState, &[FlightStateMode::Startup as u8])?;
 

@@ -1023,6 +1023,9 @@ pub async fn telemetry_task(
     loop {
         tokio::select! {
             _= router_interval.tick() => {
+                    if let Err(e) = router.poll_discovery() {
+                        log_telemetry_error("router discovery polling failed", e);
+                    }
                     if let Err(e) = router.process_all_queues_with_timeout(20) {
                         log_telemetry_error("router queue processing failed", e);
                     }
