@@ -888,7 +888,6 @@ pub async fn telemetry_task(
     mut rx: mpsc::Receiver<TelemetryCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    let mut radio_interval = interval(Duration::from_millis(10));
     let mut handle_interval = interval(Duration::from_millis(1));
     let mut router_interval = interval(Duration::from_millis(10));
     let mut heartbeat_interval = interval(Duration::from_millis(500));
@@ -989,20 +988,40 @@ pub async fn telemetry_task(
         })
     };
 
-    loop {
-        tokio::select! {
-                _ = radio_interval.tick() => {
-                    for radio in &radio {
-                        match radio.lock().expect("failed to get lock").recv_packet(&router){
-                            Ok(_) => {
-                                // Packet received and handled by router
+    let radio_workers: Vec<_> = radio
+        .iter()
+        .cloned()
+        .map(|radio| {
+            let router = router.clone();
+            let mut radio_shutdown_rx = state.shutdown_subscribe();
+            tokio::spawn(async move {
+                let mut radio_interval = interval(Duration::from_millis(2));
+                radio_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = radio_interval.tick() => {
+                            match radio.lock().expect("failed to get lock").recv_packet(&router) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    log_telemetry_error("radio_task recv_packet failed", e);
+                                }
                             }
-                            Err(e) => {
-                                log_telemetry_error("radio_task recv_packet failed", e);
+                        }
+                        recv = radio_shutdown_rx.recv() => {
+                            match recv {
+                                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
+            })
+        })
+        .collect();
+
+    loop {
+        tokio::select! {
             _= router_interval.tick() => {
                     if let Err(e) = router.process_all_queues_with_timeout(20) {
                         log_telemetry_error("router queue processing failed", e);
@@ -1288,6 +1307,17 @@ pub async fn telemetry_task(
     }
 
     let worker_shutdown_timeout = Duration::from_secs(10);
+
+    for worker in radio_workers {
+        match tokio::time::timeout(worker_shutdown_timeout, worker).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("Radio worker ended with error: {e}"),
+            Err(_) => eprintln!(
+                "Radio worker did not shut down within {:?}",
+                worker_shutdown_timeout
+            ),
+        }
+    }
 
     // Stop intake first, then wait for packet worker to drain packet queue.
     drop(packet_tx);
