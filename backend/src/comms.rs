@@ -195,12 +195,14 @@ impl UartComms {
 
     fn try_take_raw_uart_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
         let scan_len = self.rx_buf.len().min(RAW_UART_MAX_FRAME_BYTES);
-        for end in 1..=scan_len {
-            let candidate = &self.rx_buf[..end];
-            if serialize::peek_frame_info(candidate).is_ok() {
-                let payload = candidate.to_vec();
-                self.rx_buf.drain(..end);
-                return Ok(Some(payload));
+        for start in 0..scan_len {
+            for end in (start + 1)..=scan_len {
+                let candidate = &self.rx_buf[start..end];
+                if serialize::peek_frame_info(candidate).is_ok() {
+                    let payload = candidate.to_vec();
+                    self.rx_buf.drain(..end);
+                    return Ok(Some(payload));
+                }
             }
         }
 
