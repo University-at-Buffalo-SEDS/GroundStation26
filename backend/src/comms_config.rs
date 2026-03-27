@@ -192,16 +192,19 @@ pub fn load_or_default() -> CommsLinksConfig {
     let path = config_path();
     migrate_legacy_config(&path);
     match fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<CommsLinksConfig>(&raw) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                eprintln!(
-                    "WARNING: invalid comms link config at {}: {err}. Falling back to defaults.",
-                    path.display()
-                );
-                CommsLinksConfig::default()
+        Ok(raw) => {
+            let raw = migrate_serial_protocol_defaults(raw, &path);
+            match serde_json::from_str::<CommsLinksConfig>(&raw) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    eprintln!(
+                        "WARNING: invalid comms link config at {}: {err}. Falling back to defaults.",
+                        path.display()
+                    );
+                    CommsLinksConfig::default()
+                }
             }
-        },
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let cfg = CommsLinksConfig::default();
             if let Err(write_err) = save(&cfg) {
@@ -268,6 +271,67 @@ fn migrate_legacy_config(target_path: &PathBuf) {
         }
         return;
     }
+}
+
+fn migrate_serial_protocol_defaults(raw: String, path: &PathBuf) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return raw;
+    };
+
+    let mut changed = false;
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(av_bay) = obj.get_mut("av_bay") {
+            changed |= ensure_serial_protocol(av_bay, SerialProtocol::PacketFramed);
+        }
+        if let Some(fill_box) = obj.get_mut("fill_box") {
+            changed |= ensure_serial_protocol(fill_box, SerialProtocol::RawUart);
+        }
+    }
+
+    if !changed {
+        return raw;
+    }
+
+    match serde_json::to_string_pretty(&value) {
+        Ok(updated) => {
+            if let Err(err) = fs::write(path, &updated) {
+                eprintln!(
+                    "WARNING: failed to persist comms protocol migration {}: {err}",
+                    path.display()
+                );
+            }
+            updated
+        }
+        Err(_) => raw,
+    }
+}
+
+fn ensure_serial_protocol(link: &mut serde_json::Value, protocol: SerialProtocol) -> bool {
+    let Some(obj) = link.as_object_mut() else {
+        return false;
+    };
+    let Some(interface) = obj.get("interface").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if !matches!(
+        interface,
+        "usb_serial" | "raspberry_pi_gpio_uart" | "custom_serial"
+    ) {
+        return false;
+    }
+    if obj.contains_key("protocol") {
+        return false;
+    }
+
+    let protocol = match protocol {
+        SerialProtocol::PacketFramed => "packet_framed",
+        SerialProtocol::RawUart => "raw_uart",
+    };
+    obj.insert(
+        "protocol".to_string(),
+        serde_json::Value::String(protocol.to_string()),
+    );
+    true
 }
 
 #[cfg(test)]
