@@ -131,6 +131,7 @@ fn i2c_description(i2c: &I2cLinkConfig) -> String {
 pub struct UartComms {
     inner: SystemPort,
     side_id: Option<RouterSideId>,
+    rx_buf: Vec<u8>,
 }
 
 impl UartComms {
@@ -146,11 +147,48 @@ impl UartComms {
                 Ok(())
             })
             .context("failed to configure serial port")?;
-        inner.set_timeout(Duration::from_millis(200))?;
+        inner.set_timeout(Duration::from_millis(10))?;
         Ok(Self {
             inner,
             side_id: None,
+            rx_buf: Vec::with_capacity(MAX_PACKET_SIZE * 2),
         })
+    }
+
+    fn fill_rx_buf(&mut self) -> std::io::Result<()> {
+        let mut scratch = [0u8; 512];
+        match self.inner.read(&mut scratch) {
+            Ok(0) => Ok(()),
+            Ok(n) => {
+                self.rx_buf.extend_from_slice(&scratch[..n]);
+                Ok(())
+            }
+            Err(err) if is_idle_serial_timeout(&err) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn try_take_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
+        if self.rx_buf.len() < 2 {
+            return Ok(None);
+        }
+
+        let frame_len = u16::from_le_bytes([self.rx_buf[0], self.rx_buf[1]]) as usize;
+        if frame_len == 0 || frame_len > MAX_PACKET_SIZE {
+            self.rx_buf.clear();
+            return Err(TelemetryError::HandlerError(
+                "invalid frame length from radio",
+            ));
+        }
+
+        let total_len = 2 + frame_len;
+        if self.rx_buf.len() < total_len {
+            return Ok(None);
+        }
+
+        let payload = self.rx_buf[2..total_len].to_vec();
+        self.rx_buf.drain(..total_len);
+        Ok(Some(payload))
     }
 }
 
@@ -168,34 +206,24 @@ impl CommsDevice for UartComms {
             .side_id
             .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
 
-        // read length prefix
-        let mut len_buf = [0u8; 2];
-        if let Err(err) = self.inner.read_exact(&mut len_buf) {
-            return if is_idle_serial_timeout(&err) {
-                Ok(())
-            } else {
-                Err(err.into())
-            };
+        if self.rx_buf.len() < 2
+            && let Err(err) = self.fill_rx_buf()
+        {
+            return Err(err.into());
         }
-        let frame_len = u16::from_le_bytes(len_buf) as usize;
-
-        if frame_len == 0 || frame_len > MAX_PACKET_SIZE {
-            return Err(TelemetryError::HandlerError(
-                "invalid frame length from radio",
-            ));
+        if let Some(payload) = self.try_take_packet()? {
+            return router.rx_serialized_queue_from_side(&payload, side_id);
         }
 
-        // read payload
-        let mut payload = vec![0u8; frame_len];
-        if let Err(err) = self.inner.read_exact(&mut payload) {
-            return if is_idle_serial_timeout(&err) {
-                Ok(())
-            } else {
-                Err(err.into())
-            };
+        if let Err(err) = self.fill_rx_buf() {
+            return Err(err.into());
         }
 
-        router.rx_serialized_queue_from_side(&payload, side_id)
+        if let Some(payload) = self.try_take_packet()? {
+            return router.rx_serialized_queue_from_side(&payload, side_id);
+        }
+
+        Ok(())
     }
 
     /// Blocking send of serialized bytes (length-prefixed).
