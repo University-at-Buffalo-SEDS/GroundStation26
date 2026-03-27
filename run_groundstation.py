@@ -4,6 +4,7 @@ import signal
 import subprocess
 import sys
 import time
+import platform
 from pathlib import Path
 
 
@@ -60,6 +61,21 @@ def run(cmd: list[str], cwd: Path) -> None:
         raise subprocess.CalledProcessError(code, cmd)
 
 
+def is_raspberry_pi() -> bool:
+    if platform.system() != "Linux":
+        return False
+    for path in (
+        Path("/sys/firmware/devicetree/base/model"),
+        Path("/proc/device-tree/model"),
+    ):
+        try:
+            if "raspberry pi" in path.read_text(errors="ignore").lower():
+                return True
+        except FileNotFoundError:
+            continue
+    return False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build frontend and run groundstation backend."
@@ -93,6 +109,8 @@ def main() -> None:
 
     cmd = ["cargo", "run", "--release", "-p", "groundstation_backend"]
     features: list[str] = []
+    if is_raspberry_pi():
+        features.append("raspberry_pi")
     if testing_mode:
         features.append("testing")
     if hitl_mode:

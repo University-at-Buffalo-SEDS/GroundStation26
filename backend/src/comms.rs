@@ -154,6 +154,13 @@ impl UartComms {
     }
 }
 
+fn is_idle_serial_timeout(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
 impl CommsDevice for UartComms {
     /// Blocking receive of one Packet
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
@@ -163,7 +170,13 @@ impl CommsDevice for UartComms {
 
         // read length prefix
         let mut len_buf = [0u8; 2];
-        self.inner.read_exact(&mut len_buf)?;
+        if let Err(err) = self.inner.read_exact(&mut len_buf) {
+            return if is_idle_serial_timeout(&err) {
+                Ok(())
+            } else {
+                Err(err.into())
+            };
+        }
         let frame_len = u16::from_le_bytes(len_buf) as usize;
 
         if frame_len == 0 || frame_len > MAX_PACKET_SIZE {
@@ -174,7 +187,13 @@ impl CommsDevice for UartComms {
 
         // read payload
         let mut payload = vec![0u8; frame_len];
-        self.inner.read_exact(&mut payload)?;
+        if let Err(err) = self.inner.read_exact(&mut payload) {
+            return if is_idle_serial_timeout(&err) {
+                Ok(())
+            } else {
+                Err(err.into())
+            };
+        }
 
         router.rx_serialized_queue_from_side(&payload, side_id)
     }
