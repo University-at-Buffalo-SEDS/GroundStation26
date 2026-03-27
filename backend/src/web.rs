@@ -1,18 +1,21 @@
+use crate::auth::{AuthFailure, LoginRequest, Permission};
 use crate::layout;
 use crate::loadcell;
 use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_bundle_path};
-use crate::sequences::{ActionPolicyMsg, PersistentNotification};
+use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::state::AppState;
-use axum::http::{StatusCode, header};
+use crate::types::{
+    BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryCommand, TelemetryRow,
+};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::{
     Json, Router,
     extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
     extract::{Path, Query, State},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, get_service, post},
 };
 use futures::{SinkExt, StreamExt};
-use groundstation_shared::{BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
@@ -25,13 +28,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{OnceCell, mpsc};
 use tower_http::compression::CompressionLayer;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 // NEW
 
 static FAVICON_DATA: OnceCell<Vec<u8>> = OnceCell::const_new();
 static TILE_DB_POOL: OnceCell<Option<sqlx::SqlitePool>> = OnceCell::const_new();
 static TILE_DB_MODE: OnceCell<TileDbMode> = OnceCell::const_new();
+const RECENT_HISTORY_MS: i64 = 20 * 60 * 1000;
+const RECENT_BUCKET_MS: i64 = 20;
 
 #[derive(Clone, Copy)]
 enum TileDbMode {
@@ -72,13 +77,41 @@ fn value_at(values: &[Option<f32>], idx: usize) -> Option<f32> {
     values.get(idx).copied().flatten()
 }
 
+fn compact_recent_rows(rows: Vec<TelemetryRow>, cutoff: i64) -> Vec<TelemetryRow> {
+    let mut by_bucket: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
+    for row in rows {
+        if row.timestamp_ms < cutoff {
+            continue;
+        }
+        let bucket = row.timestamp_ms.div_euclid(RECENT_BUCKET_MS);
+        by_bucket.insert((row.data_type.clone(), row.sender_id.clone(), bucket), row);
+    }
+
+    let mut rows: Vec<TelemetryRow> = by_bucket.into_values().collect();
+    rows.sort_by(|a, b| {
+        a.timestamp_ms
+            .cmp(&b.timestamp_ms)
+            .then_with(|| a.sender_id.cmp(&b.sender_id))
+            .then_with(|| a.data_type.cmp(&b.data_type))
+    });
+    rows
+}
+
 /// Public router constructor
 pub fn router(state: Arc<AppState>) -> Router {
+    let spa_index = ServeFile::new("./frontend/dist/public/index.html");
     let static_dir = ServeDir::new("./frontend/dist/public")
         .precompressed_br()
-        .precompressed_gzip();
+        .precompressed_gzip()
+        .not_found_service(spa_index.clone());
     Router::new()
         .layer(CompressionLayer::new())
+        .route("/", get_service(spa_index.clone()))
+        .route("/login", get_service(spa_index.clone()))
+        .route("/dashboard", get_service(spa_index))
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/session", get(get_session_status))
+        .route("/api/auth/logout", post(logout))
         .route("/api/recent", get(get_recent))
         .route("/api/command", post(send_command))
         .route("/api/alerts", get(get_alerts))
@@ -110,6 +143,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/calibration/capture_span", post(capture_loadcell_span))
         .route("/api/calibration/refit", post(refit_loadcell_channel))
         .route("/api/network_time", get(get_network_time))
+        .route("/api/network_topology", get(get_network_topology))
         .route("/api/notifications", get(get_notifications))
         .route(
             "/api/notifications/{id}/dismiss",
@@ -128,6 +162,69 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn auth_failure_response(err: AuthFailure) -> axum::response::Response {
+    match err {
+        AuthFailure::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg).into_response(),
+        AuthFailure::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
+        AuthFailure::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
+async fn authorize_headers(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    required: Permission,
+) -> Result<crate::auth::AuthPrincipal, axum::response::Response> {
+    state
+        .auth
+        .authorize_token(&state.auth_db, bearer_token_from_headers(headers), required)
+        .await
+        .map_err(auth_failure_response)
+}
+
+async fn login(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginRequest>,
+) -> impl IntoResponse {
+    match state.auth.login(&state.auth_db, req).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => auth_failure_response(err),
+    }
+}
+
+async fn get_session_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    match state
+        .auth
+        .session_status(&state.auth_db, bearer_token_from_headers(&headers))
+        .await
+    {
+        Ok(status) => Json(status).into_response(),
+        Err(err) => auth_failure_response(err),
+    }
+}
+
+async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(token) = bearer_token_from_headers(&headers) else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    match state.auth.logout(&state.auth_db, token).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => auth_failure_response(err),
+    }
+}
+
 /// Outgoing WebSocket messages to the frontend.
 /// This is what the frontend will deserialize:
 ///   { "ty": "telemetry_batch", "data": [ ...TelemetryRow... ] }
@@ -141,6 +238,7 @@ pub enum WsOutMsg {
     FlightState(FlightStateMsg),
     Error(ErrorMsg),
     BoardStatus(BoardStatusMsg),
+    NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
     NetworkTime(NetworkTimeMsg),
@@ -179,7 +277,7 @@ pub struct ErrorMsg {
 /// DTO returned by /api/alerts
 /// Frontend expects:
 ///   [{ "timestamp_ms": i64, "severity": "warning"|"error", "message": "..." }, ...]
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct AlertDto {
     pub timestamp_ms: i64,
     pub severity: String,
@@ -202,7 +300,13 @@ pub struct NetworkTimeMsg {
     pub timestamp_ms: i64,
 }
 
-async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn get_valve_state(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
     // Latest valve state row: data_type = 'VALVE_STATE'
     let row = sqlx::query(
         r#"
@@ -234,10 +338,13 @@ async fn get_valve_state(State(state): State<Arc<AppState>>) -> impl IntoRespons
         }
     });
 
-    Json(valve_state)
+    Json(valve_state).into_response()
 }
 
-async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
     // Latest GPS row: assumes `data_type = 'GPS'`
     let row = sqlx::query(
         r#"
@@ -263,26 +370,46 @@ async fn get_gps(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         }
     });
 
-    Json(GpsResponse { rocket })
+    Json(GpsResponse { rocket }).into_response()
 }
 
-async fn get_layout() -> impl IntoResponse {
+async fn get_layout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
     match layout::load_layout() {
         Ok(layout) => Json(layout).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }
 
-async fn get_calibration_config() -> impl IntoResponse {
+async fn get_calibration_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
     Json(loadcell::calibration_tab_layout()).into_response()
 }
 
 #[derive(Serialize)]
 struct MapConfigDto {
     max_native_zoom: u32,
+    default_center_lat: f64,
+    default_center_lon: f64,
+    default_zoom: f64,
+    map_title: String,
+    tracked_asset_label: String,
 }
 
-async fn get_map_config() -> impl IntoResponse {
+async fn get_map_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
     let max_native_zoom = match detect_max_native_zoom(DEFAULT_MAP_REGION).await {
         Ok(Some(z)) => z,
         Ok(None) => 12,
@@ -292,7 +419,15 @@ async fn get_map_config() -> impl IntoResponse {
         }
     };
 
-    Json(MapConfigDto { max_native_zoom })
+    Json(MapConfigDto {
+        max_native_zoom,
+        default_center_lat: 31.0,
+        default_center_lon: -99.0,
+        default_zoom: 7.0,
+        map_title: "Map".to_string(),
+        tracked_asset_label: "Tracked Asset".to_string(),
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -314,14 +449,24 @@ struct RefitLoadcellReq {
     mode: String,
 }
 
-async fn get_loadcell_calibration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.loadcell_calibration.lock().unwrap().clone())
+async fn get_loadcell_calibration(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(state.loadcell_calibration.lock().unwrap().clone()).into_response()
 }
 
 async fn set_loadcell_calibration(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(cfg): Json<loadcell::LoadcellCalibrationFile>,
 ) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
+        return response;
+    }
     {
         let mut slot = state.loadcell_calibration.lock().unwrap();
         *slot = cfg.clone();
@@ -334,8 +479,12 @@ async fn set_loadcell_calibration(
 
 async fn capture_loadcell_zero(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<CaptureLoadcellPointReq>,
 ) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
+        return response;
+    }
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
         loadcell::capture_zero(&mut cfg, &req.sensor_id, req.raw);
@@ -349,8 +498,12 @@ async fn capture_loadcell_zero(
 
 async fn capture_loadcell_span(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<CaptureLoadcellSpanReq>,
 ) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
+        return response;
+    }
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
         loadcell::capture_span(&mut cfg, &req.sensor_id, req.raw, req.known_kg);
@@ -364,8 +517,12 @@ async fn capture_loadcell_span(
 
 async fn refit_loadcell_channel(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<RefitLoadcellReq>,
 ) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
+        return response;
+    }
     let Some(channel) = loadcell::CalibrationChannel::from_str(req.channel.trim()) else {
         return (StatusCode::BAD_REQUEST, "invalid channel".to_string()).into_response();
     };
@@ -588,23 +745,61 @@ fn synthesize_zoom_tile_from_ancestor(
     Ok(out)
 }
 
-async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let latest_db_ts: Option<i64> = sqlx::query_scalar("SELECT MAX(timestamp_ms) FROM telemetry")
-        .fetch_one(&state.db)
-        .await
-        .ok()
-        .flatten();
+async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
     let cache_snapshot = state.recent_telemetry_snapshot();
-    let latest_cache_ts = cache_snapshot.iter().map(|r| r.timestamp_ms).max();
+    let latest_cache_ts = cache_snapshot.last().map(|r| r.timestamp_ms);
+    let oldest_cache_ts = cache_snapshot.first().map(|r| r.timestamp_ms);
 
-    let now_ms = match (latest_db_ts, latest_cache_ts) {
-        (Some(a), Some(b)) => a.max(b),
-        (Some(a), None) => a,
-        (None, Some(b)) => b,
-        (None, None) => return Json(Vec::<TelemetryRow>::new()),
+    if let Some(now_ms) = latest_cache_ts {
+        let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
+        let cache_covers_window =
+            oldest_cache_ts.is_some_and(|oldest| oldest <= cutoff + RECENT_BUCKET_MS);
+        if cache_covers_window {
+            return Json(compact_recent_rows(cache_snapshot, cutoff)).into_response();
+        }
+
+        let db_end_ms = oldest_cache_ts.unwrap_or(now_ms).saturating_sub(1);
+        let mut merged_rows = if db_end_ms >= cutoff {
+            load_recent_rows_from_db(&state, cutoff, db_end_ms).await
+        } else {
+            Vec::new()
+        };
+        merged_rows.extend(
+            cache_snapshot
+                .into_iter()
+                .filter(|row| row.timestamp_ms >= cutoff && row.timestamp_ms <= now_ms),
+        );
+        return Json(compact_recent_rows(merged_rows, cutoff)).into_response();
+    }
+
+    let Some(now_ms) =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(timestamp_ms) FROM telemetry")
+            .fetch_one(&state.db)
+            .await
+            .ok()
+            .flatten()
+    else {
+        return Json(Vec::<TelemetryRow>::new()).into_response();
     };
+    let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
+    Json(compact_recent_rows(
+        load_recent_rows_from_db(&state, cutoff, now_ms).await,
+        cutoff,
+    ))
+    .into_response()
+}
 
-    let cutoff = now_ms - 20 * 60 * 1000; // 20 minutes
+async fn load_recent_rows_from_db(
+    state: &Arc<AppState>,
+    start_ms: i64,
+    end_ms: i64,
+) -> Vec<TelemetryRow> {
+    if end_ms < start_ms {
+        return Vec::new();
+    }
 
     let rows_db = sqlx::query(
         r#"
@@ -619,43 +814,22 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         ORDER BY timestamp_ms ASC
         "#,
     )
-    .bind(cutoff)
-    .bind(now_ms)
+    .bind(start_ms)
+    .bind(end_ms)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
 
-    let mut by_key: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
+    let mut out = Vec::with_capacity(rows_db.len());
     for row in rows_db {
-        let item = TelemetryRow {
+        out.push(TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             data_type: row.get::<String, _>("data_type"),
             sender_id: row.get::<String, _>("sender_id"),
             values: values_from_row(&row),
-        };
-        by_key.insert(
-            (item.data_type.clone(), item.sender_id.clone(), item.timestamp_ms),
-            item,
-        );
+        });
     }
-
-    for row in cache_snapshot {
-        if row.timestamp_ms < cutoff || row.timestamp_ms > now_ms {
-            continue;
-        }
-        // Cache rows are newest realtime view and should win over stale DB rows.
-        by_key.insert((row.data_type.clone(), row.sender_id.clone(), row.timestamp_ms), row);
-    }
-
-    let mut rows: Vec<TelemetryRow> = by_key.into_values().collect();
-    rows.sort_by(|a, b| {
-        a.timestamp_ms
-            .cmp(&b.timestamp_ms)
-            .then_with(|| a.sender_id.cmp(&b.sender_id))
-            .then_with(|| a.data_type.cmp(&b.data_type))
-    });
-
-    Json(rows)
+    out
 }
 
 async fn get_favicon() -> impl IntoResponse {
@@ -674,7 +848,13 @@ async fn get_favicon() -> impl IntoResponse {
     // Return as an image/png response
     ([(header::CONTENT_TYPE, "image/png")], bytes)
 }
-async fn get_flight_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn get_flight_state(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
     // get the state from the db
     let flight_state: i64 =
         match sqlx::query("SELECT f_state FROM flight_state ORDER BY timestamp_ms DESC LIMIT 1")
@@ -684,45 +864,124 @@ async fn get_flight_state(State(state): State<Arc<AppState>>) -> impl IntoRespon
             Ok(data) => data.get::<i64, _>("f_state"),
             Err(_) => FlightState::Startup as i64,
         };
-    let flight_state = groundstation_shared::u8_to_flight_state(flight_state as u8)
-        .unwrap_or(FlightState::Startup);
-    Json(flight_state)
+    let flight_state =
+        crate::types::u8_to_flight_state(flight_state as u8).unwrap_or(FlightState::Startup);
+    Json(flight_state).into_response()
 }
 
-async fn get_network_time() -> impl IntoResponse {
+async fn get_network_time(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
     Json(NetworkTimeMsg {
         timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
     })
+    .into_response()
 }
 
-async fn get_notifications(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.notifications_snapshot())
+async fn get_notifications(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(state.notifications_snapshot()).into_response()
 }
 
 async fn dismiss_notification(
     State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<u64>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
 ) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
+        return response;
+    }
     if state.dismiss_notification(id) {
-        StatusCode::NO_CONTENT
+        StatusCode::NO_CONTENT.into_response()
     } else {
-        StatusCode::NOT_FOUND
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
-async fn get_action_policy(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.action_policy_snapshot())
-}
-async fn send_command(
+async fn get_action_policy(
     State(state): State<Arc<AppState>>,
-    Json(cmd): Json<TelemetryCommand>,
-) -> &'static str {
-    let _ = state.cmd_tx.send(cmd).await;
-    "ok"
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(state.action_policy_snapshot()).into_response()
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state))
+async fn get_network_topology(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(state.network_topology_snapshot(crate::telemetry_task::get_current_timestamp_ms()))
+        .into_response()
+}
+
+async fn send_command(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(cmd): Json<TelemetryCommand>,
+) -> (StatusCode, &'static str) {
+    let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+        Ok(principal) => principal,
+        Err(response) => {
+            let status = response.status();
+            return if status == StatusCode::FORBIDDEN {
+                (StatusCode::FORBIDDEN, "permission denied")
+            } else {
+                (StatusCode::UNAUTHORIZED, "authentication required")
+            };
+        }
+    };
+    let cmd_name = command_name(&cmd);
+    if !principal.allows_command_name(cmd_name) {
+        emit_warning(
+            &state,
+            format!("Rejected software command {cmd:?}: session is not allowed to send {cmd_name}"),
+        );
+        return (StatusCode::FORBIDDEN, "command not allowed");
+    }
+    if !state.is_command_allowed(&cmd) {
+        emit_warning(
+            &state,
+            format!("Ignored software command {cmd:?}: command is currently disabled"),
+        );
+        return (StatusCode::FORBIDDEN, "command disabled");
+    }
+    let _ = state.cmd_tx.send(cmd).await;
+    (StatusCode::OK, "ok")
+}
+
+#[derive(Deserialize, Default)]
+struct WsAuthQuery {
+    token: Option<String>,
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WsAuthQuery>,
+) -> impl IntoResponse {
+    let principal = match state
+        .auth
+        .authorize_token(&state.auth_db, query.token.as_deref(), Permission::ViewData)
+        .await
+    {
+        Ok(principal) => principal,
+        Err(err) => return auth_failure_response(err),
+    };
+    ws.on_upgrade(move |socket| handle_ws(socket, state, principal))
 }
 
 /// Shape of commands sent from the frontend over WebSocket:
@@ -732,7 +991,7 @@ struct WsCommand {
     cmd: TelemetryCommand,
 }
 
-async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
+async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::auth::AuthPrincipal) {
     // Subscribe to all three broadcast channels
     let mut telemetry_rx = state.ws_tx.subscribe();
     let mut warnings_rx = state.warnings_tx.subscribe();
@@ -743,6 +1002,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let mut action_policy_rx = state.action_policy_tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
+    let state_for_send = state.clone();
+    let state_for_recv = state.clone();
     let (mut socket_sender, mut receiver) = socket.split();
     let ws_out_queue_cap: usize = std::env::var("GS_WS_OUT_QUEUE_CAP")
         .ok()
@@ -766,16 +1027,26 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Task: collect, batch, and enqueue outbound messages.
     let send_task = async move {
-        let initial_notifications =
-            serde_json::to_string(&WsOutMsg::Notifications(state.notifications_snapshot()))
-                .unwrap_or_default();
+        let initial_notifications = serde_json::to_string(&WsOutMsg::Notifications(
+            state_for_send.notifications_snapshot(),
+        ))
+        .unwrap_or_default();
         if ws_out_tx.send(initial_notifications).await.is_err() {
             return;
         }
-        let initial_action_policy =
-            serde_json::to_string(&WsOutMsg::ActionPolicy(state.action_policy_snapshot()))
-                .unwrap_or_default();
+        let initial_action_policy = serde_json::to_string(&WsOutMsg::ActionPolicy(
+            state_for_send.action_policy_snapshot(),
+        ))
+        .unwrap_or_default();
         if ws_out_tx.send(initial_action_policy).await.is_err() {
+            return;
+        }
+        let initial_network_topology = serde_json::to_string(&WsOutMsg::NetworkTopology(
+            state_for_send
+                .network_topology_snapshot(crate::telemetry_task::get_current_timestamp_ms()),
+        ))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_network_topology).await.is_err() {
             return;
         }
         let initial_network_time = serde_json::to_string(&WsOutMsg::NetworkTime(NetworkTimeMsg {
@@ -865,6 +1136,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                         Ok(status) => {
                             let msg = WsOutMsg::BoardStatus(status);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                            let topology = WsOutMsg::NetworkTopology(
+                                state_for_send.network_topology_snapshot(
+                                    crate::telemetry_task::get_current_timestamp_ms(),
+                                ),
+                            );
+                            let text = serde_json::to_string(&topology).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;
                             }
@@ -974,6 +1254,37 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             if let Message::Text(text) = msg {
                 match serde_json::from_str::<WsCommand>(&text) {
                     Ok(cmd) => {
+                        if !principal.permissions.send_commands {
+                            emit_warning(
+                                &state_for_recv,
+                                format!(
+                                    "Rejected websocket command {:?}: authenticated session lacks send-command permission",
+                                    cmd.cmd
+                                ),
+                            );
+                            continue;
+                        }
+                        let cmd_name = command_name(&cmd.cmd);
+                        if !principal.allows_command_name(cmd_name) {
+                            emit_warning(
+                                &state_for_recv,
+                                format!(
+                                    "Rejected websocket command {:?}: session is not allowed to send {}",
+                                    cmd.cmd, cmd_name
+                                ),
+                            );
+                            continue;
+                        }
+                        if !state_for_recv.is_command_allowed(&cmd.cmd) {
+                            emit_warning(
+                                &state_for_recv,
+                                format!(
+                                    "Ignored software command {:?}: command is currently disabled",
+                                    cmd.cmd
+                                ),
+                            );
+                            continue;
+                        }
                         if let Err(e) = cmd_tx.send(cmd.cmd).await {
                             println!("Failed to forward WS command to cmd_tx: {e}");
                         }
@@ -1001,25 +1312,44 @@ struct HistoryParams {
 /// Query param: `minutes` (optional, defaults to 20)
 async fn get_alerts(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HistoryParams>,
 ) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
     let minutes = params.minutes.unwrap_or(20);
-    let cutoff = now_ms_i64() - (minutes as i64) * 60_000;
+    let latest_db_ts: Option<i64> = sqlx::query_scalar("SELECT MAX(timestamp_ms) FROM alerts")
+        .fetch_one(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let cache_snapshot = state.recent_alerts_snapshot();
+    let latest_cache_ts = cache_snapshot.iter().map(|a| a.timestamp_ms).max();
+
+    let now_ms = match (latest_db_ts, latest_cache_ts) {
+        (Some(a), Some(b)) => a.max(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => return Json(Vec::<AlertDto>::new()).into_response(),
+    };
+    let cutoff = now_ms - (minutes as i64) * 60_000;
 
     let alerts_db = sqlx::query(
         r#"
         SELECT timestamp_ms, severity, message
         FROM alerts
-        WHERE timestamp_ms >= ?
+        WHERE timestamp_ms BETWEEN ? AND ?
         ORDER BY timestamp_ms DESC
         "#,
     )
     .bind(cutoff)
+    .bind(now_ms)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
 
-    let alerts: Vec<AlertDto> = alerts_db
+    let mut alerts: Vec<AlertDto> = alerts_db
         .into_iter()
         .map(|row| AlertDto {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
@@ -1028,13 +1358,28 @@ async fn get_alerts(
         })
         .collect();
 
-    Json(alerts)
+    for alert in cache_snapshot {
+        if alert.timestamp_ms < cutoff || alert.timestamp_ms > now_ms {
+            continue;
+        }
+        alerts.push(alert);
+    }
+
+    alerts.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+    alerts.dedup_by(|a, b| {
+        a.timestamp_ms == b.timestamp_ms && a.severity == b.severity && a.message == b.message
+    });
+
+    Json(alerts).into_response()
 }
 
-async fn get_boards(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn get_boards(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
     let now_ms = now_ms_i64().max(0) as u64;
     let msg = state.board_status_snapshot(now_ms);
-    Json(msg)
+    Json(msg).into_response()
 }
 
 /// Helper: current timestamp in ms (i64) for warnings/errors/etc.
@@ -1048,6 +1393,11 @@ fn spawn_alert_insert(
     severity: &'static str,
     message: String,
 ) {
+    state.cache_recent_alert(AlertDto {
+        timestamp_ms,
+        severity: severity.to_string(),
+        message: message.clone(),
+    });
     state.begin_db_write();
     let db = state.db.clone();
     let state_for_task = state.clone();

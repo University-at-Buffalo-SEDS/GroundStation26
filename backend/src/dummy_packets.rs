@@ -1,14 +1,14 @@
 use crate::flight_sim::{_next_state_aware_packet, sim_mode_enabled};
 use crate::telemetry_task::get_current_timestamp_ms;
-use groundstation_shared::Board;
+use crate::types::Board;
 use rand::RngExt;
 use sedsprintf_rs_2026::TelemetryResult;
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
-use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
+use sedsprintf_rs_2026::packet::Packet;
 use std::sync::Arc;
 
 const BASE_LAT: f32 = 31.7619;
-const BASE_LON: f32 = -106.4850;
+const BASE_LON: f32 = -106.485;
 
 fn random_sender() -> &'static str {
     let mut rng = rand::rng();
@@ -16,7 +16,7 @@ fn random_sender() -> &'static str {
     Board::ALL[idx].sender_id()
 }
 
-fn random_packet() -> TelemetryResult<TelemetryPacket> {
+fn random_packet() -> TelemetryResult<Packet> {
     let now_ms = get_current_timestamp_ms();
     let sender = random_sender();
     let mut rng = rand::rng();
@@ -79,7 +79,7 @@ fn random_packet() -> TelemetryResult<TelemetryPacket> {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
 
-    TelemetryPacket::new(
+    Packet::new(
         dtype,
         &[DataEndpoint::GroundStation],
         sender,
@@ -88,7 +88,7 @@ fn random_packet() -> TelemetryResult<TelemetryPacket> {
     )
 }
 
-pub fn get_dummy_packet() -> TelemetryResult<TelemetryPacket> {
+pub fn get_dummy_packet() -> TelemetryResult<Packet> {
     if sim_mode_enabled() {
         _next_state_aware_packet()
     } else {

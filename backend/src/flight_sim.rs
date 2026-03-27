@@ -4,15 +4,15 @@ use crate::loadcell;
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 #[cfg(feature = "testing")]
 use crate::telemetry_task::get_current_timestamp_ms;
-use groundstation_shared::TelemetryCommand;
+use crate::types::TelemetryCommand;
 #[cfg(feature = "testing")]
-use groundstation_shared::{Board, FlightState};
+use crate::types::{Board, FlightState};
 #[cfg(feature = "testing")]
 use rand::RngExt;
 use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
-use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
+use sedsprintf_rs_2026::packet::Packet;
 #[cfg(feature = "testing")]
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
@@ -54,6 +54,8 @@ const NITROUS_PRESSURE_RESPONSE_PER_S: f32 = 1.3;
 const NITROGEN_PRESSURE_RESPONSE_PER_S: f32 = 1.0;
 #[cfg(feature = "testing")]
 const NITROGEN_MASS_GAIN_KG_PER_S: f32 = 0.08;
+#[cfg(feature = "testing")]
+const GRAVITY_FPS2: f32 = 32.174;
 
 #[cfg(feature = "testing")]
 fn sim_full_mass_kg() -> f32 {
@@ -156,7 +158,7 @@ struct FlightSimState {
     saw_dump_open_after_n2: bool,
     saw_dump_closed_after_n2: bool,
     nitrous_fill_started_ms: Option<u64>,
-    queued: VecDeque<TelemetryPacket>,
+    queued: VecDeque<Packet>,
 }
 
 #[cfg(feature = "testing")]
@@ -226,16 +228,35 @@ impl FlightSimState {
             return;
         }
         self.flight_state = fs;
+        if !matches!(fs, FlightState::FillTest) {
+            self.saw_dump_open_after_n2 = false;
+            self.saw_dump_closed_after_n2 = false;
+        }
+        if !matches!(fs, FlightState::NitrousFill | FlightState::Armed) {
+            self.nitrous_fill_started_ms = None;
+        }
         self.queue_flight_state(now_ms);
     }
 
     fn queue_flight_state(&mut self, now_ms: u64) {
-        if let Ok(pkt) = TelemetryPacket::new(
+        if let Ok(pkt) = Packet::new(
             DataType::FlightState,
-            &[DataEndpoint::GroundStation],
+            &[DataEndpoint::GroundStation, DataEndpoint::FlightState],
             Board::FlightComputer.sender_id(),
             now_ms,
             Arc::from([self.flight_state as u8]),
+        ) {
+            self.queued.push_back(pkt);
+        }
+    }
+
+    fn queue_abort(&mut self, board: Board, reason: &str, now_ms: u64) {
+        if let Ok(pkt) = Packet::new(
+            DataType::Abort,
+            &[DataEndpoint::Abort],
+            board.sender_id(),
+            now_ms,
+            Arc::<[u8]>::from(reason.as_bytes().to_vec()),
         ) {
             self.queued.push_back(pkt);
         }
@@ -247,7 +268,7 @@ impl FlightSimState {
         } else {
             Board::ActuatorBoard.sender_id()
         };
-        if let Ok(pkt) = TelemetryPacket::new(
+        if let Ok(pkt) = Packet::new(
             DataType::UmbilicalStatus,
             &[DataEndpoint::GroundStation],
             sender,
@@ -259,7 +280,7 @@ impl FlightSimState {
     }
 
     fn queue_board_heartbeat(&mut self, board: Board, now_ms: u64) {
-        if let Ok(pkt) = TelemetryPacket::new(
+        if let Ok(pkt) = Packet::new(
             DataType::Heartbeat,
             &[DataEndpoint::GroundStation],
             board.sender_id(),
@@ -307,6 +328,12 @@ impl FlightSimState {
         match cmd {
             TelemetryCommand::Abort => {
                 self.launch_time_ms = None;
+                self.queue_abort(Board::ValveBoard, "simulated valve board abort", now_ms);
+                self.queue_abort(
+                    Board::ActuatorBoard,
+                    "simulated actuator board abort",
+                    now_ms,
+                );
                 self.set_flight_state(FlightState::Aborted, now_ms);
             }
             TelemetryCommand::Launch => {
@@ -374,6 +401,12 @@ impl FlightSimState {
                 let key = ActuatorBoardCommands::NitrousOpen as u8;
                 self.valves.insert(key, false);
                 self.queue_umbilical_status(key, false, now_ms);
+            }
+            TelemetryCommand::ContinueFillSequence => {
+                if self.flight_state == FlightState::FillTest {
+                    self.nitrous_fill_started_ms.get_or_insert(now_ms);
+                    self.set_flight_state(FlightState::NitrousFill, now_ms);
+                }
             }
             #[cfg(feature = "hitl_mode")]
             TelemetryCommand::DeployParachute
@@ -517,7 +550,7 @@ impl FlightSimState {
 
         if let Some(t0_ms) = self.launch_time_ms {
             let t = (now_ms.saturating_sub(t0_ms) as f32) / 1000.0;
-            self.apply_flight_profile(t, now_ms);
+            self.apply_flight_profile(t, dt_s, now_ms);
         } else {
             self.altitude_ft = (self.altitude_ft - 0.5).max(0.0);
             self.velocity_fps = 0.0;
@@ -551,57 +584,67 @@ impl FlightSimState {
         self.battery_v = self.av_bay_battery_v;
     }
 
-    fn apply_flight_profile(&mut self, t: f32, now_ms: u64) {
-        let (state, alt, vel, accel_g, flow_lpm) = if t < 2.0 {
-            (FlightState::Launch, 150.0 * (t / 2.0), 90.0, 3.2, 45.0)
-        } else if t < 34.0 {
-            let p = (t - 2.0) / 32.0;
-            (
-                FlightState::Ascent,
-                150.0 + 9_850.0 * p,
-                330.0 * (1.0 - 0.2 * p),
-                2.1,
-                58.0,
-            )
+    fn apply_flight_profile(&mut self, t: f32, dt_s: f32, now_ms: u64) {
+        let dt_s = dt_s.clamp(0.0, 0.2);
+        let current_net_accel_fps2 = (self.accel_g - 1.0) * GRAVITY_FPS2;
+        let (state, target_accel_fps2, flow_lpm) = if t < 2.0 {
+            (FlightState::Launch, 52.0, 45.0)
+        } else if t < 10.0 {
+            let p = (t - 2.0) / 8.0;
+            (FlightState::Ascent, 32.0 - 10.0 * p, 58.0)
+        } else if t < 18.0 {
+            let p = (t - 10.0) / 8.0;
+            (FlightState::Ascent, 22.0 - 20.0 * p, 34.0 * (1.0 - p))
         } else if t < 43.0 {
-            let p = (t - 34.0) / 9.0;
             (
                 FlightState::Coast,
-                10_000.0 + 500.0 * p,
-                120.0 * (1.0 - p),
-                1.0,
+                -24.0 - self.velocity_fps.max(0.0) * 0.035,
                 0.0,
             )
         } else if t < 46.0 {
-            (FlightState::Apogee, 10_500.0, 0.0, 1.0, 0.0)
-        } else if t < 54.0 {
-            let p = (t - 46.0) / 8.0;
             (
-                FlightState::ParachuteDeploy,
-                10_500.0 - 700.0 * p,
-                -80.0,
-                0.7,
+                FlightState::Apogee,
+                -16.0 - self.velocity_fps.abs() * 0.02,
                 0.0,
             )
-        } else if t < 174.0 {
-            let p = (t - 54.0) / 120.0;
+        } else if t < 54.0 {
+            let chute_terminal_fps = -55.0;
+            (
+                FlightState::ParachuteDeploy,
+                (chute_terminal_fps - self.velocity_fps) * 1.4,
+                0.0,
+            )
+        } else if self.altitude_ft > 4.0 {
+            let terminal_fps = -52.0;
             (
                 FlightState::Descent,
-                (9_800.0 * (1.0 - p)).max(0.0),
-                -85.0,
-                0.95,
+                (terminal_fps - self.velocity_fps) * 0.65,
                 0.0,
             )
         } else if t < 182.0 {
-            (FlightState::Landed, 0.0, 0.0, 1.0, 0.0)
+            (FlightState::Landed, 0.0, 0.0)
         } else {
-            (FlightState::Recovery, 0.0, 0.0, 1.0, 0.0)
+            (FlightState::Recovery, 0.0, 0.0)
         };
 
+        let accel_alpha = if dt_s <= 0.0 {
+            1.0
+        } else {
+            (1.0 - f32::exp(-dt_s * 3.5)).clamp(0.0, 1.0)
+        };
+        let net_accel_fps2 =
+            current_net_accel_fps2 + (target_accel_fps2 - current_net_accel_fps2) * accel_alpha;
+
+        self.velocity_fps += net_accel_fps2 * dt_s;
+        self.altitude_ft = (self.altitude_ft + self.velocity_fps * dt_s).max(0.0);
+
+        if matches!(state, FlightState::Landed | FlightState::Recovery) {
+            self.altitude_ft = 0.0;
+            self.velocity_fps = 0.0;
+        }
+
         self.set_flight_state(state, now_ms);
-        self.altitude_ft = alt;
-        self.velocity_fps = vel;
-        self.accel_g = accel_g;
+        self.accel_g = 1.0 + net_accel_fps2 / GRAVITY_FPS2;
         self.fuel_flow_lpm = flow_lpm;
 
         let mut rng = rand::rng();
@@ -610,7 +653,7 @@ impl FlightSimState {
         self.yaw_dps = rng.random_range(-6.0..6.0);
     }
 
-    fn next_sensor_packet(&mut self, now_ms: u64) -> TelemetryResult<TelemetryPacket> {
+    fn next_sensor_packet(&mut self, now_ms: u64) -> TelemetryResult<Packet> {
         self.update_physics(now_ms);
 
         let seq = [
@@ -623,6 +666,7 @@ impl FlightSimState {
             DataType::BatteryVoltage,
             DataType::BatteryCurrent,
             DataType::GpsData,
+            DataType::GpsSatelliteNumber,
             DataType::KG1000,
         ];
         let dtype = seq[self.next_sensor_idx % seq.len()];
@@ -630,12 +674,15 @@ impl FlightSimState {
 
         let mut rng = rand::rng();
         let mut sender = sender_for_datatype(dtype);
-        let values: Vec<f32> = match dtype {
+        let bytes: Vec<u8> = match dtype {
             DataType::GyroData => vec![
                 self.roll_dps + rng.random_range(-0.15..0.15),
                 self.pitch_dps + rng.random_range(-0.15..0.15),
                 self.yaw_dps + rng.random_range(-0.45..0.45),
-            ],
+            ]
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
             DataType::AccelData => {
                 let az = self.accel_g * 9.80665 + rng.random_range(-0.25..0.25);
                 vec![
@@ -643,42 +690,59 @@ impl FlightSimState {
                     rng.random_range(-0.35..0.35),
                     az,
                 ]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect()
             }
             DataType::KalmanFilterData => vec![
                 self.altitude_ft * 0.3048,
                 self.velocity_fps * 0.3048,
                 self.accel_g,
-            ],
+            ]
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
             DataType::BarometerData => {
                 let altitude_m = self.altitude_ft * 0.3048;
                 let pressure_pa = 101_325.0_f32 * f32::powf(1.0 - altitude_m / 44_330.0, 5.255);
                 let temp_c = (24.0 - altitude_m * 0.0065).clamp(-20.0, 35.0);
                 vec![pressure_pa, temp_c, altitude_m]
+                    .into_iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
             }
-            DataType::FuelTankPressure => vec![self.fuel_tank_pressure_psi],
-            DataType::FuelFlow => vec![self.fuel_flow_lpm],
-            DataType::BatteryVoltage => {
-                if self.next_battery_sender_gateway {
-                    self.next_battery_sender_gateway = false;
-                    self.last_battery_sender_gateway = true;
-                    sender = Board::GatewayBoard.sender_id();
-                    vec![self.ground_station_battery_v]
-                } else {
-                    self.next_battery_sender_gateway = true;
-                    self.last_battery_sender_gateway = false;
-                    sender = Board::PowerBoard.sender_id();
-                    vec![self.av_bay_battery_v]
-                }
+            DataType::FuelTankPressure => vec![self.fuel_tank_pressure_psi]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            DataType::FuelFlow => vec![self.fuel_flow_lpm]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            DataType::BatteryVoltage => if self.next_battery_sender_gateway {
+                self.next_battery_sender_gateway = false;
+                self.last_battery_sender_gateway = true;
+                sender = Board::GatewayBoard.sender_id();
+                vec![self.ground_station_battery_v]
+            } else {
+                self.next_battery_sender_gateway = true;
+                self.last_battery_sender_gateway = false;
+                sender = Board::PowerBoard.sender_id();
+                vec![self.av_bay_battery_v]
             }
-            DataType::BatteryCurrent => {
-                if self.last_battery_sender_gateway {
-                    sender = Board::GatewayBoard.sender_id();
-                    vec![self.ground_station_battery_a]
-                } else {
-                    sender = Board::PowerBoard.sender_id();
-                    vec![self.battery_a]
-                }
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+            DataType::BatteryCurrent => if self.last_battery_sender_gateway {
+                sender = Board::GatewayBoard.sender_id();
+                vec![self.ground_station_battery_a]
+            } else {
+                sender = Board::PowerBoard.sender_id();
+                vec![self.battery_a]
             }
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
             DataType::GpsData => {
                 let dlat_deg = (self.altitude_ft / 5_280.0) * 0.00001;
                 let dlon_deg = dlat_deg * 0.8;
@@ -687,6 +751,13 @@ impl FlightSimState {
                     BASE_LON + dlon_deg + rng.random_range(-0.00002..0.00002),
                     self.altitude_ft * 0.3048,
                 ]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect()
+            }
+            DataType::GpsSatelliteNumber => {
+                let satellites = 10 + ((now_ms / 5_000) % 6) as u8;
+                vec![satellites]
             }
             DataType::KG1000 => {
                 let raw_kg = (self.loadcell_mass_kg
@@ -694,16 +765,17 @@ impl FlightSimState {
                 .max(0.0)
                 .min(sim_full_mass_kg());
                 vec![raw_kg]
+                    .into_iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
             }
-            _ => vec![0.0],
+            _ => vec![0.0_f32]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
         };
 
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        for v in values {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-
-        TelemetryPacket::new(
+        Packet::new(
             dtype,
             &[DataEndpoint::GroundStation],
             sender,
@@ -725,7 +797,7 @@ fn sender_for_datatype(dtype: DataType) -> &'static str {
         }
         DataType::KG1000 => Board::DaqBoard.sender_id(),
         DataType::BatteryVoltage | DataType::BatteryCurrent => Board::PowerBoard.sender_id(),
-        DataType::GpsData => Board::GatewayBoard.sender_id(),
+        DataType::GpsData | DataType::GpsSatelliteNumber => Board::GatewayBoard.sender_id(),
         _ => Board::GroundStation.sender_id(),
     }
 }
@@ -775,7 +847,20 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
 }
 
 #[cfg(feature = "testing")]
-pub fn _next_state_aware_packet() -> TelemetryResult<TelemetryPacket> {
+pub fn sync_local_flight_state(next_state: FlightState) {
+    if !sim_mode_enabled() {
+        return;
+    }
+    let now_ms = get_current_timestamp_ms();
+    let mut s = sim().lock().expect("flight sim mutex poisoned");
+    s.set_flight_state(next_state, now_ms);
+}
+
+#[cfg(not(feature = "testing"))]
+pub fn sync_local_flight_state(_next_state: crate::types::FlightState) {}
+
+#[cfg(feature = "testing")]
+pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
     let now_ms = get_current_timestamp_ms();
     let mut s = sim().lock().expect("flight sim mutex poisoned");
 
@@ -814,6 +899,6 @@ pub fn handle_command(_cmd: &TelemetryCommand) -> bool {
 }
 
 #[cfg(not(feature = "testing"))]
-pub fn _next_state_aware_packet() -> TelemetryResult<TelemetryPacket> {
+pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
     unreachable!("flight sim only available with testing feature")
 }

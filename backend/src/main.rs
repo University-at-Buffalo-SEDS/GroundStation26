@@ -1,5 +1,8 @@
 // main.rs
 
+mod auth;
+mod comms;
+mod comms_config;
 #[cfg(feature = "testing")]
 mod dummy_packets;
 mod flight_sim;
@@ -8,13 +11,13 @@ mod gpio_panel;
 mod layout;
 mod loadcell;
 mod map;
-mod radio;
 mod ring_buffer;
 mod rocket_commands;
 mod safety_task;
 mod sequences;
 mod state;
 mod telemetry_task;
+mod types;
 mod web;
 
 use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
@@ -22,18 +25,19 @@ use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
-use crate::telemetry_task::{get_current_timestamp_ms, telemetry_task};
+use crate::telemetry_task::{get_current_timestamp_ms, set_network_time_router, telemetry_task};
 
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
-use crate::radio::DummyRadio;
-use crate::radio::{RADIO_BAUD_RATE, ROCKET_RADIO_PORT, Radio, RadioDevice, UMBILICAL_RADIO_PORT};
+use crate::comms::DummyComms;
+use crate::comms::{CommsDevice, link_description, open_link, startup_failure_hint};
+use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
-use groundstation_shared::{Board, FlightState as FlightStateMode};
 use sedsprintf_rs_2026::TelemetryError;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
+use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
-use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
+use sedsprintf_rs_2026::timesync::{TimeSyncConfig, TimeSyncRole};
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Connection, Row};
 use std::collections::HashMap;
@@ -46,10 +50,6 @@ use tokio::time::Duration;
 
 use crate::web::emit_error;
 use tokio::sync::{broadcast, mpsc};
-
-fn clock() -> Box<dyn sedsprintf_rs_2026::router::Clock + Send + Sync> {
-    Box::new(get_current_timestamp_ms)
-}
 
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
@@ -65,6 +65,54 @@ fn env_i64(name: &str, default: i64, min: i64, max: i64) -> i64 {
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(default)
         .clamp(min, max)
+}
+
+fn ensure_sqlite_db_file(path: &Path) -> anyhow::Result<String> {
+    if !path.exists() {
+        fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        fs::write(path, b"")?;
+        println!("Created empty DB file: {}", path.display());
+    }
+    Ok(fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string())
+}
+
+async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            token             TEXT PRIMARY KEY,
+            username          TEXT NOT NULL,
+            session_type      TEXT NOT NULL,
+            can_view_data     INTEGER NOT NULL,
+            can_send_commands INTEGER NOT NULL,
+            allowed_commands_json TEXT NOT NULL DEFAULT '[]',
+            created_at_ms     INTEGER NOT NULL,
+            expires_at_ms     INTEGER NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    let session_columns = sqlx::query("PRAGMA table_info(auth_sessions);")
+        .fetch_all(db)
+        .await?;
+    let has_allowed_commands_json = session_columns.iter().any(|row| {
+        row.get::<String, _>("name")
+            .eq_ignore_ascii_case("allowed_commands_json")
+    });
+    if !has_allowed_commands_json {
+        sqlx::query(
+            "ALTER TABLE auth_sessions ADD COLUMN allowed_commands_json TEXT NOT NULL DEFAULT '[]';",
+        )
+            .execute(db)
+            .await?;
+    }
+
+    Ok(())
 }
 
 async fn apply_sqlite_pragmas(db: &sqlx::SqlitePool) {
@@ -140,7 +188,7 @@ async fn remove_sqlite_sidecars(db_path: &str) {
     for suffix in [".wal", ".shm", "-wal", "-shm", "-journal", ".journal"] {
         let sidecar = format!("{db_path}{suffix}");
         for attempt in 0..retries {
-            match std::fs::remove_file(&sidecar) {
+            match fs::remove_file(&sidecar) {
                 Ok(()) => break,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
                 Err(err) => {
@@ -251,17 +299,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- DB path ---
-    let mut db_path = PathBuf::from("./data/groundstation.db");
-    if !db_path.exists() {
-        fs::create_dir_all(db_path.parent().unwrap_or_else(|| Path::new(".")))?;
-        fs::write(&db_path, b"")?;
-        println!("Created empty DB file.");
-    }
-    db_path = fs::canonicalize(&db_path).unwrap_or(db_path);
-    let db_path_str = db_path.to_string_lossy().to_string();
+    let db_path = PathBuf::from("./data/groundstation.db");
+    let db_path_str = ensure_sqlite_db_file(&db_path)?;
+    let auth_db_path = db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("users.db");
+    let auth_db_path_str = ensure_sqlite_db_file(&auth_db_path)?;
 
     let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path_str)).await?;
     apply_sqlite_pragmas(&db).await;
+    let auth_db = sqlx::SqlitePool::connect(&format!("sqlite://{}", auth_db_path_str)).await?;
+    apply_sqlite_pragmas(&auth_db).await;
 
     // --- Tables ---
     sqlx::query(
@@ -321,6 +370,8 @@ async fn main() -> anyhow::Result<()> {
     .execute(&db)
     .await?;
 
+    ensure_auth_sessions_table(&auth_db).await?;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS flight_state (
@@ -361,6 +412,20 @@ async fn main() -> anyhow::Result<()> {
 
     let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
     let loadcell_calibration = loadcell::load_or_default();
+    let comms_links = comms_config::load_or_default();
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let users_path = manifest_dir.join("users").join("users.json");
+    let legacy_users_path = manifest_dir.join("data").join("users.json");
+    if !users_path.exists() && legacy_users_path.exists() {
+        if let Some(parent) = users_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&legacy_users_path, &users_path)?;
+    }
+    let auth = Arc::new(auth::AuthManager::new(users_path));
+    auth.ensure_file()
+        .map_err(|e| anyhow::anyhow!("failed to initialize users.json: {e}"))?;
+    let _ = auth.cleanup_expired_sessions(&auth_db).await;
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
@@ -368,6 +433,7 @@ async fn main() -> anyhow::Result<()> {
         warnings_tx: broadcast::channel(alerts_capacity).0,
         errors_tx: broadcast::channel(alerts_capacity).0,
         db,
+        auth_db,
         state: Arc::new(Mutex::new(FlightStateMode::Startup)),
         state_tx: broadcast::channel(16).0,
         gpio,
@@ -387,9 +453,15 @@ async fn main() -> anyhow::Result<()> {
         action_policy: Arc::new(Mutex::new(default_action_policy())),
         action_policy_tx,
         last_command_ms: Arc::new(Mutex::new(HashMap::new())),
+        fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
         recent_telemetry_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
+        latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),
+        recent_alerts_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         av_bay_radio_connected: Arc::new(AtomicBool::new(false)),
         fill_radio_connected: Arc::new(AtomicBool::new(false)),
+        topology_router: Arc::new(std::sync::OnceLock::new()),
+        auth,
     });
 
     gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
@@ -402,7 +474,7 @@ async fn main() -> anyhow::Result<()> {
     let flight_state_handler_state_clone = state.clone();
 
     let ground_station_handler =
-        EndpointHandler::new_packet_handler(GroundStation, move |pkt: &TelemetryPacket| {
+        EndpointHandler::new_packet_handler(GroundStation, move |pkt: &Packet| {
             ground_station_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
@@ -415,7 +487,7 @@ async fn main() -> anyhow::Result<()> {
         });
 
     let flight_state_handler =
-        EndpointHandler::new_packet_handler(FlightState, move |pkt: &TelemetryPacket| {
+        EndpointHandler::new_packet_handler(FlightState, move |pkt: &Packet| {
             flight_state_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             flight_state_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
@@ -424,7 +496,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         });
 
-    let abort_handler = EndpointHandler::new_packet_handler(Abort, move |pkt: &TelemetryPacket| {
+    let abort_handler = EndpointHandler::new_packet_handler(Abort, move |pkt: &Packet| {
         abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
         abort_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
         let error_msg = pkt
@@ -434,32 +506,49 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     });
 
-    let cfg = sedsprintf_rs_2026::router::RouterConfig::new([
+    let mut cfg = sedsprintf_rs_2026::router::RouterConfig::new([
         ground_station_handler,
         abort_handler,
         flight_state_handler,
     ]);
+    if telemetry_task::timesync_enabled() {
+        cfg = cfg.with_timesync(TimeSyncConfig {
+            role: TimeSyncRole::Auto,
+            priority: 50,
+            ..TimeSyncConfig::default()
+        });
+    }
 
     // --- Radios ---
-    let (rocket_radio, av_bay_radio_connected): (Arc<Mutex<Box<dyn RadioDevice>>>, bool) =
-        match Radio::open(ROCKET_RADIO_PORT, RADIO_BAUD_RATE) {
+    println!("AV bay config: {}", link_description(&comms_links.av_bay));
+    println!(
+        "Fill box config: {}",
+        link_description(&comms_links.fill_box)
+    );
+
+    let (rocket_comms, av_bay_radio_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+        match open_link(&comms_links.av_bay) {
             Ok(r) => {
-                println!("Rocket radio online");
-                (Arc::new(Mutex::new(Box::new(r))), true)
+                println!("Rocket comms online");
+                (Arc::new(Mutex::new(r)), true)
             }
             Err(e) => {
-                println!("Rocket radio missing, using DummyRadio: {}", e);
+                println!("Rocket comms missing, using DummyComms: {}", e);
+                eprintln!(
+                    "AV bay link setup hint: {}",
+                    startup_failure_hint(&comms_links.av_bay)
+                );
                 #[cfg(feature = "testing")]
                 {
                     (
-                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))),
+                        Arc::new(Mutex::new(Box::new(DummyComms::new("Rocket Comms")))),
                         false,
                     )
                 }
                 #[cfg(all(not(feature = "testing"), feature = "hitl_mode"))]
                 {
                     (
-                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))),
+                        Arc::new(Mutex::new(Box::new(DummyComms::new("Rocket Comms")))),
                         false,
                     )
                 }
@@ -469,25 +558,29 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-    let (umbilical_radio, fill_radio_connected): (Arc<Mutex<Box<dyn RadioDevice>>>, bool) =
-        match Radio::open(UMBILICAL_RADIO_PORT, RADIO_BAUD_RATE) {
+    let (umbilical_comms, fill_radio_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+        match open_link(&comms_links.fill_box) {
             Ok(r) => {
-                println!("Umbilical radio online");
-                (Arc::new(Mutex::new(Box::new(r))), true)
+                println!("Umbilical comms online");
+                (Arc::new(Mutex::new(r)), true)
             }
             Err(e) => {
-                println!("Umbilical radio missing, using DummyRadio: {}", e);
+                println!("Umbilical comms missing, using DummyComms: {}", e);
+                eprintln!(
+                    "Fill box link setup hint: {}",
+                    startup_failure_hint(&comms_links.fill_box)
+                );
                 #[cfg(feature = "testing")]
                 {
                     (
-                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio")))),
+                        Arc::new(Mutex::new(Box::new(DummyComms::new("Umbilical Comms")))),
                         false,
                     )
                 }
                 #[cfg(all(not(feature = "testing"), feature = "hitl_mode"))]
                 {
                     (
-                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio")))),
+                        Arc::new(Mutex::new(Box::new(DummyComms::new("Umbilical Comms")))),
                         false,
                     )
                 }
@@ -506,15 +599,16 @@ async fn main() -> anyhow::Result<()> {
     let router = Arc::new(sedsprintf_rs_2026::router::Router::new(
         RouterMode::Relay,
         cfg,
-        clock(),
     ));
+    set_network_time_router(router.clone());
+    let _ = state.topology_router.set(router.clone());
 
     let rocket_side = {
-        let rocket_radio = Arc::clone(&rocket_radio);
-        router.add_side_serialized("rocket_radio", move |pkt| {
-            let mut guard = rocket_radio
+        let rocket_comms = Arc::clone(&rocket_comms);
+        router.add_side_serialized("rocket_comms", move |pkt| {
+            let mut guard = rocket_comms
                 .lock()
-                .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
+                .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
             guard
                 .send_data(pkt)
                 .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
@@ -523,11 +617,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let umbilical_side = {
-        let umbilical_radio = Arc::clone(&umbilical_radio);
-        router.add_side_serialized("umbilical_radio", move |pkt| {
-            let mut guard = umbilical_radio
+        let umbilical_comms = Arc::clone(&umbilical_comms);
+        router.add_side_serialized("umbilical_comms", move |pkt| {
+            let mut guard = umbilical_comms
                 .lock()
-                .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
+                .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
             guard
                 .send_data(pkt)
                 .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
@@ -535,13 +629,13 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    rocket_radio
+    rocket_comms
         .lock()
-        .expect("failed to get rocket radio lock")
+        .expect("failed to get rocket comms lock")
         .set_side_id(rocket_side);
-    umbilical_radio
+    umbilical_comms
         .lock()
-        .expect("failed to get umbilical radio lock")
+        .expect("failed to get umbilical comms lock")
         .set_side_id(umbilical_side);
 
     router.log_queue(DataType::MessageData, "hello".as_bytes())?;
@@ -553,7 +647,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tt = tokio::spawn(telemetry_task(
         state.clone(),
         router.clone(),
-        vec![rocket_radio, umbilical_radio],
+        vec![rocket_comms, umbilical_comms],
         cmd_rx,
         telemetry_shutdown_rx,
     ));
@@ -630,6 +724,18 @@ async fn main() -> anyhow::Result<()> {
     if !lingering.is_empty() {
         eprintln!(
             "WARNING: SQLite sidecar files still present after shutdown cleanup: {}",
+            lingering.join(", ")
+        );
+    }
+
+    flush_sqlite_journals(&state.auth_db).await;
+    state.auth_db.close().await;
+    finalize_sqlite_after_pool_close(&auth_db_path_str).await;
+    remove_sqlite_sidecars(&auth_db_path_str).await;
+    let lingering = sqlite_sidecars_present(&auth_db_path_str);
+    if !lingering.is_empty() {
+        eprintln!(
+            "WARNING: Auth SQLite sidecar files still present after shutdown cleanup: {}",
             lingering.join(", ")
         );
     }

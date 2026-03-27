@@ -42,10 +42,10 @@ def main() -> None:
         }
         has_sender_id = "sender_id" in table_cols
         query = (
-            "SELECT timestamp_ms, data_type, "
-            + ("sender_id, " if has_sender_id else "NULL AS sender_id, ")
-            + "values_json, payload_json "
-            "FROM telemetry ORDER BY timestamp_ms"
+                "SELECT timestamp_ms, data_type, "
+                + ("sender_id, " if has_sender_id else "NULL AS sender_id, ")
+                + "values_json, payload_json "
+                  "FROM telemetry ORDER BY timestamp_ms"
         )
         cursor = conn.execute(query)
         col_names = [col[0] for col in cursor.description]
@@ -62,6 +62,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        print("\nExport interrupted.", file=sys.stderr)
+        raise SystemExit(130)
     except sqlite3.OperationalError as e:
         print(f"Error: SQLite operation failed: {e}", file=sys.stderr)
         print("Hint: ensure the DB file exists and is not locked by another process.", file=sys.stderr)

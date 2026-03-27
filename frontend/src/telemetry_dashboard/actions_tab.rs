@@ -2,7 +2,9 @@
 
 use dioxus::prelude::*;
 
-use super::layout::ActionsTabLayout;
+use crate::auth;
+
+use super::layout::{ActionsTabLayout, ThemeConfig};
 use super::{ActionPolicyMsg, BlinkMode};
 
 #[cfg(target_arch = "wasm32")]
@@ -106,7 +108,12 @@ fn btn_style(
 }
 
 #[component]
-pub fn ActionsTab(layout: ActionsTabLayout, action_policy: Signal<ActionPolicyMsg>) -> Element {
+pub fn ActionsTab(
+    layout: ActionsTabLayout,
+    action_policy: Signal<ActionPolicyMsg>,
+    abort_only_mode: bool,
+    theme: ThemeConfig,
+) -> Element {
     let mut redraw_tick = use_signal(|| 0u64);
     use_effect(move || {
         spawn(async move {
@@ -119,6 +126,11 @@ pub fn ActionsTab(layout: ActionsTabLayout, action_policy: Signal<ActionPolicyMs
     });
     let _blink_tick = *redraw_tick.read();
     let blink_now_ms = blink_epoch_ms();
+    let visible_actions = layout
+        .actions
+        .iter()
+        .filter(|action| auth::can_send_command(action.cmd.as_str()))
+        .collect::<Vec<_>>();
     rsx! {
         div {
             style: "
@@ -127,47 +139,64 @@ pub fn ActionsTab(layout: ActionsTabLayout, action_policy: Signal<ActionPolicyMs
                 flex-direction:column;
                 gap:12px;
             ",
-            h2 { style: "margin:0 0 8px 0; color:#e5e7eb;", "Actions" }
-            p  { style: "margin:0 0 12px 0; color:#9ca3af; font-size:0.9rem;",
+            h2 { style: "margin:0 0 8px 0; color:{theme.text_primary};", "Actions" }
+            p  { style: "margin:0 0 12px 0; color:{theme.text_soft}; font-size:0.9rem;",
                 "All available actions are available all the time, use with caution as improper use \
                 can and will damage the system."
             }
+            if abort_only_mode {
+                div {
+                    style: "margin:0 0 12px 0; padding:10px 12px; border-radius:10px; border:1px solid {theme.error_border}; background:{theme.error_background}; color:{theme.error_text}; font-size:12px;",
+                    "Disable Actions is enabled. All action and flight-state buttons except Abort are disabled."
+                }
+            }
 
-            div {
-                style: "
-                    display:grid;
-                    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-                    gap:12px;
-                ",
+            if visible_actions.is_empty() {
+                div {
+                    style: "padding:12px; border:1px solid {theme.border}; border-radius:12px; background:{theme.panel_background}; color:{theme.text_muted}; font-size:13px;",
+                    "No actions are available for this user."
+                }
+            } else {
+                div {
+                    style: "
+                        display:grid;
+                        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                        gap:12px;
+                    ",
 
-                for action in layout.actions.iter() {
-                    {
-                        let control = action_policy
-                            .read()
-                            .controls
-                            .iter()
-                            .find(|c| c.cmd == action.cmd)
-                            .cloned();
-                        let enabled = control
-                            .as_ref()
-                            .map(|c| c.enabled)
-                            .unwrap_or(action.cmd == "Abort");
-                        let blink = control.as_ref().map(|c| c.blink).unwrap_or(BlinkMode::None);
-                        let actuated = control.as_ref().and_then(|c| c.actuated);
-                        rsx! {
-                    button {
-                        style: "{btn_style(&action.border, &action.bg, &action.fg, blink_now_ms, enabled, blink, actuated)}",
-                        disabled: !enabled,
-                        onclick: {
-                            let cmd = action.cmd.clone();
-                            move |_| {
-                                if enabled {
-                                    crate::telemetry_dashboard::send_cmd(&cmd)
+                    for action in visible_actions.iter() {
+                        {
+                            let software_buttons_enabled = action_policy.read().software_buttons_enabled;
+                            let control = action_policy
+                                .read()
+                                .controls
+                                .iter()
+                                .find(|c| c.cmd == action.cmd)
+                                .cloned();
+                            let enabled = software_buttons_enabled
+                                && auth::can_send_command(action.cmd.as_str())
+                                && (!abort_only_mode || action.cmd == "Abort")
+                                && control
+                                    .as_ref()
+                                    .map(|c| c.enabled)
+                                    .unwrap_or(action.cmd == "Abort");
+                            let blink = control.as_ref().map(|c| c.blink).unwrap_or(BlinkMode::None);
+                            let actuated = control.as_ref().and_then(|c| c.actuated);
+                            rsx! {
+                                button {
+                                    style: "{btn_style(&action.border, &action.bg, &action.fg, blink_now_ms, enabled, blink, actuated)}",
+                                    disabled: !enabled,
+                                    onclick: {
+                                        let cmd = action.cmd.clone();
+                                        move |_| {
+                                            if enabled {
+                                                crate::telemetry_dashboard::send_cmd(&cmd)
+                                            }
+                                        }
+                                    },
+                                    "{action.label}"
                                 }
                             }
-                        },
-                        "{action.label}"
-                    }
                         }
                     }
                 }

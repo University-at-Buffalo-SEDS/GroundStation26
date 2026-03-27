@@ -98,11 +98,19 @@ fn build_windows_resources(manifest_dir: &Path, target: &str) {
     if !target.contains("windows") {
         return;
     }
+    let host = env::var("HOST").unwrap_or_default();
 
     let icon = manifest_dir.join("assets").join("icon.ico");
     println!("cargo:rerun-if-changed={}", icon.display());
     if !icon.exists() {
         panic!("Windows icon not found: {}", icon.display());
+    }
+
+    if !host.contains("windows") {
+        println!(
+            "cargo:warning=Skipping Windows resource compilation while cross-checking from non-Windows host ({host})"
+        );
+        return;
     }
 
     let mut res = winres::WindowsResource::new();
@@ -146,6 +154,14 @@ fn log(msg: &str) {
 
     log_file.write_all(msg.as_ref()).unwrap();
 }
+
+fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<()> {
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == contents => Ok(()),
+        Ok(_) | Err(_) => fs::write(path, contents),
+    }
+}
+
 fn main() {
     let target = env::var("TARGET").unwrap();
     use fs;
@@ -185,7 +201,7 @@ fn main() {
 
     // Create the dir + stamp (dir creation doesn't help Cargo, stamp does)
     fs::create_dir_all(&leaflet_dir).unwrap();
-    fs::write(&stamp, format!("version={}\n", version)).unwrap();
+    write_if_changed(&stamp, &format!("version={}\n", version)).unwrap();
     if let Err(e) = fs::create_dir_all(&leaflet_dir) {
         log(format!("Failed to create Leaflet vendor dir {leaflet_dir:?}: {e}").as_ref());
 

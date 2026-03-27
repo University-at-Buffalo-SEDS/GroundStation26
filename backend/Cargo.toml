@@ -9,16 +9,14 @@ repository.workspace = true
 [features]
 raspberry_pi = ["rppal"]
 testing = []
-hitl_mode = ["groundstation_shared/hitl_mode"]
+hitl_mode = []
 
 [dependencies]
 axum = { workspace = true, features = ["ws"] }
 tokio.workspace = true
 serde_json.workspace = true
 rppal = { git = "https://gitlab.rylanswebsite.com/rylan-meilutis/rppal.git", branch = "main", optional = true }
-sedsprintf_rs_2026 = { git = "https://github.com/University-at-Buffalo-SEDS/sedsprintf_2026.git", branch = "main", features = ["compression", "std"] }
-
-groundstation_shared = { path = "../shared" }
+sedsprintf_rs_2026 = { git = "https://github.com/University-at-Buffalo-SEDS/sedsprintf_2026.git", branch = "main", features = ["compression", "std", "discovery"] }
 
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite"] }
 
@@ -31,3 +29,6 @@ serde = { version = "1.0.228", features = ["derive"] }
 serial = "0.4.0"
 futures = "0.3.32"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2"
+base64 = "0.22.1"
+ring = "0.17.14"

@@ -2,18 +2,22 @@ use dioxus::prelude::*;
 use dioxus_signals::Signal;
 use std::collections::HashMap;
 
-use super::layout::{ConnectionSectionKind, ConnectionTabLayout};
+use super::layout::{ConnectionSectionKind, ConnectionTabLayout, ThemeConfig};
 use super::types::BoardStatusEntry;
 
 const LATENCY_WINDOW_MS: i64 = 20 * 60_000;
 const LATENCY_MAX_POINTS: usize = 2000;
 
 const SCROLL_TRIGGER_THRESHOLD_MS: i64 = 200;
+const LATENCY_CHART_HEIGHT_PX: u32 = 220;
+const LATENCY_FULLSCREEN_CHART_HEIGHT_PX: u32 = 240;
 
 #[component]
 pub fn ConnectionStatusTab(
     boards: Signal<Vec<BoardStatusEntry>>,
     layout: ConnectionTabLayout,
+    title: String,
+    theme: ThemeConfig,
 ) -> Element {
     let mut show_board = use_signal(|| true);
     let mut board_fullscreen = use_signal(|| false);
@@ -92,27 +96,29 @@ pub fn ConnectionStatusTab(
 
     rsx! {
         div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto;",
-            h2 { style: "margin:0 0 12px 0;", "Connection Status" }
+            h2 { style: "margin:0 0 12px 0; color:{theme.text_primary};", "{title}" }
             for (idx, section) in layout.sections.iter().enumerate() {
                 match section.kind {
                     ConnectionSectionKind::BoardStatus => rsx! {
                         div { style: {
                                 let top_margin = if idx == 0 { "" } else { "margin-top:16px;" };
                                 format!(
-                                    "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;{}",
+                                    "padding:14px; border:1px solid {}; border-radius:14px; background:{};{}",
+                                    theme.border,
+                                    theme.panel_background,
                                     top_margin
                                 )
                             },
                             div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
-                                div { style: "font-size:14px; color:#94a3b8;", "{section.title.clone().unwrap_or_else(|| \"Board Status\".to_string())}" }
+                                div { style: "font-size:14px; color:{theme.text_muted};", "{section.title.clone().unwrap_or_else(|| \"Board Status\".to_string())}" }
                                 div { style: "display:flex; gap:8px; flex-wrap:wrap;",
                                     button {
-                                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                                        style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
                                         onclick: toggle_board,
                                         if *show_board.read() { "Collapse" } else { "Expand" }
                                     }
                                     button {
-                                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                                        style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
                                         onclick: toggle_board_fullscreen,
                                         "Fullscreen"
                                     }
@@ -127,20 +133,22 @@ pub fn ConnectionStatusTab(
                         div { style: {
                                 let top_margin = if idx == 0 { "" } else { "margin-top:16px;" };
                                 format!(
-                                    "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;{}",
+                                    "padding:14px; border:1px solid {}; border-radius:14px; background:{};{}",
+                                    theme.border,
+                                    theme.panel_background,
                                     top_margin
                                 )
                             },
                             div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
-                                div { style: "font-size:14px; color:#94a3b8;", "{section.title.clone().unwrap_or_else(|| \"Packet Age (ms)\".to_string())}" }
+                                div { style: "font-size:14px; color:{theme.text_muted};", "{section.title.clone().unwrap_or_else(|| \"Packet Age (ms)\".to_string())}" }
                                 div { style: "display:flex; gap:8px; flex-wrap:wrap;",
                                     button {
-                                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                                        style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
                                         onclick: toggle_latency,
                                         if *show_latency.read() { "Collapse" } else { "Expand" }
                                     }
                                     button {
-                                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                                        style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
                                         onclick: toggle_latency_fullscreen,
                                         "Fullscreen"
                                     }
@@ -148,13 +156,16 @@ pub fn ConnectionStatusTab(
                             }
 
                             if *show_latency.read() {
-                                div { style: "display:flex; flex-direction:column; gap:10px;",
+                                div { style: latency_list_style(),
                                     for entry in boards.read().iter() {
-                                        div { style: "padding:10px; border:1px solid #1f2937; border-radius:10px; background:#020617;",
+                                        div { style: latency_card_style(),
                                             div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
-                                                "{entry.board.as_str()} ({entry.sender_id})"
+                                                "{entry.display_name()} ({entry.sender_id})"
                                             }
-                                            {render_latency_chart(history.read().get(&entry.sender_id), 360.0_f64)}
+                                            {render_latency_chart(
+                                                history.read().get(&entry.sender_id),
+                                                LATENCY_CHART_HEIGHT_PX as f64,
+                                            )}
                                         }
                                     }
                                 }
@@ -166,11 +177,11 @@ pub fn ConnectionStatusTab(
         }
 
         if *board_fullscreen.read() {
-            div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px; overflow:auto;",
+            div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:{theme.app_background}; display:flex; flex-direction:column; gap:12px; overflow:auto;",
                 div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
-                    h2 { style: "margin:0; color:#e2e8f0;", "Board Status" }
+                    h2 { style: "margin:0; color:{theme.text_secondary};", "Board Status" }
                     button {
-                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                        style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
                         onclick: toggle_board_fullscreen,
                         "Exit Fullscreen"
                     }
@@ -180,24 +191,24 @@ pub fn ConnectionStatusTab(
         }
 
         if *latency_fullscreen.read() {
-            div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px; overflow:auto;",
+            div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:{theme.app_background}; display:flex; flex-direction:column; gap:12px; overflow:auto;",
                 div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
-                    h2 { style: "margin:0; color:#e2e8f0;", "Packet Age (ms)" }
+                    h2 { style: "margin:0; color:{theme.text_secondary};", "Packet Age (ms)" }
                     button {
-                        style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
+                        style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
                         onclick: toggle_latency_fullscreen,
                         "Exit Fullscreen"
                     }
                 }
-                div { style: "display:flex; flex-direction:column; gap:10px;",
+                div { style: latency_list_style(),
                     for entry in boards.read().iter() {
-                        div { style: "padding:10px; border:1px solid #1f2937; border-radius:10px; background:#020617;",
+                        div { style: latency_card_style(),
                             div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
-                                "{entry.board.as_str()} ({entry.sender_id})"
+                                "{entry.display_name()} ({entry.sender_id})"
                             }
                             {render_latency_chart(
                                 history.read().get(&entry.sender_id),
-                                fullscreen_latency_height(boards.read().len()),
+                                LATENCY_FULLSCREEN_CHART_HEIGHT_PX as f64,
                             )}
                         }
                     }
@@ -334,24 +345,12 @@ fn render_latency_chart(points: Option<&Vec<(i64, f64)>>, height: f64) -> Elemen
     }
 }
 
-fn fullscreen_latency_height(_count: usize) -> f64 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let h = web_sys::window()
-            .and_then(|w| w.inner_height().ok())
-            .and_then(|v| v.as_f64())
-            .unwrap_or(700.0);
-        let header = 80.0;
-        let padding = 32.0;
-        let gap = 10.0;
-        let n = _count.max(1) as f64;
-        let available = (h - header - padding - gap * (n - 1.0)).max(260.0);
-        (available / n).max(220.0)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        360.0
-    }
+fn latency_list_style() -> &'static str {
+    "display:flex; flex-direction:column; gap:10px; width:100%;"
+}
+
+fn latency_card_style() -> &'static str {
+    "padding:10px; border:1px solid #1f2937; border-radius:10px; background:#020617; width:100%; min-width:0;"
 }
 
 fn build_latency_polylines(
@@ -469,7 +468,7 @@ fn render_board_table(boards: &[BoardStatusEntry]) -> Element {
                 div { style: "font-weight:600; color:#e2e8f0; padding:8px; border-bottom:1px solid #1f2937;", "Age (ms)" }
 
                 for entry in boards.iter() {
-                    div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;", "{entry.board.as_str()}" }
+                    div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;", "{entry.display_name()}" }
                     div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;", "{entry.sender_id}" }
                     div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;", if entry.seen { "yes" } else { "no" } }
                     div { style: "padding:8px; border-bottom:1px solid #1f2937; border-right:1px solid #1f2937;",

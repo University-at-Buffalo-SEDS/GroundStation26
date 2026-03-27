@@ -1,17 +1,19 @@
-use super::layout::{BatterySourceConfig, BooleanLabels, DataTabLayout};
-use super::types::TelemetryRow;
+use super::layout::{
+    BooleanLabels, DataChartGroup, DataChartScaleMode, DataSubtabSpec, DataSummaryItem,
+    DataTabLayout, DataTabSpec, ThemeConfig, ValueFormatKind, ValueFormatter,
+};
 // frontend/src/telemetry_dashboard/data_tab.rs
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 
 use super::data_chart::{
-    ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, combined_battery_chart_key,
-    series_color,
+    ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, charts_cache_get_subset,
+    charts_cache_get_subset_per_series, sender_scoped_chart_key, series_color,
 };
+use super::{TELEMETRY_RENDER_EPOCH, latest_telemetry_row, latest_telemetry_value};
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
-const BATTERY_RUNTIME_TAB_ID: &str = "BATTERY_RUNTIME";
-const LOADCELL_TAB_ID: &str = "LOADCELL";
+const _ACTIVE_SUBTAB_STORAGE_KEY: &str = "gs26_active_data_subtab";
 
 #[cfg(target_arch = "wasm32")]
 fn localstorage_get(key: &str) -> Option<String> {
@@ -19,18 +21,6 @@ fn localstorage_get(key: &str) -> Option<String> {
     let w = window()?;
     let ls = w.local_storage().ok()??;
     ls.get_item(key).ok().flatten()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn target_frame_duration() -> std::time::Duration {
-    // Default 240fps; override with GS_UI_FPS=60 etc.
-    let fps: u64 = std::env::var("GS_UI_FPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(240);
-
-    let fps = fps.clamp(1, 480);
-    std::time::Duration::from_micros(1_000_000 / fps)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -44,18 +34,16 @@ fn localstorage_set(key: &str, value: &str) {
 }
 
 #[component]
-pub fn DataTab(
-    rows: Signal<Vec<TelemetryRow>>,
-    active_tab: Signal<String>,
-    layout: DataTabLayout,
-    battery_sources: Vec<BatterySourceConfig>,
-) -> Element {
-    let mut is_fullscreen = use_signal(|| false);
-    let mut show_chart = use_signal(|| true);
+pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeConfig) -> Element {
+    let _ = *TELEMETRY_RENDER_EPOCH.read();
+    let is_fullscreen = use_signal(|| false);
+    let show_chart = use_signal(|| true);
+    let active_subtab = use_signal(String::new);
 
     // -------- Restore + persist active tab --------
     let did_restore = use_signal(|| false);
     let last_saved = use_signal(String::new);
+    let last_saved_subtab = use_signal(String::new);
 
     // Restore ONCE
     use_effect({
@@ -104,180 +92,100 @@ pub fn DataTab(
         }
     });
 
-    // ------------------------------------------------------------
-    // Redraw driver (START ONCE)
-    // - wasm32: requestAnimationFrame
-    // - native: ~timer (GS_UI_FPS)
-    // ------------------------------------------------------------
-    let redraw_tick = use_signal(|| 0u64);
-    let started_redraw = use_signal(|| false);
     #[cfg(target_arch = "wasm32")]
-    let raf_running = use_signal(|| std::rc::Rc::new(std::cell::Cell::new(true)));
-    #[cfg(target_arch = "wasm32")]
-    let raf_id = use_signal(|| std::rc::Rc::new(std::cell::Cell::new(None::<i32>)));
-
     use_effect({
-        let mut redraw_tick = redraw_tick;
-        let mut started_redraw = started_redraw;
-        #[cfg(target_arch = "wasm32")]
-        let raf_running = raf_running.read().clone();
-        #[cfg(target_arch = "wasm32")]
-        let raf_id = raf_id.read().clone();
-
+        let mut active_subtab = active_subtab;
         move || {
-            if *started_redraw.read() {
-                return;
-            }
-            started_redraw.set(true);
-
-            #[cfg(target_arch = "wasm32")]
+            if active_subtab.read().is_empty()
+                && let Some(saved) = localstorage_get(_ACTIVE_SUBTAB_STORAGE_KEY)
+                && !saved.is_empty()
             {
-                use std::cell::RefCell;
-                use std::rc::Rc;
-                use wasm_bindgen::JsCast;
-                use wasm_bindgen::closure::Closure;
-
-                let cb: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
-                let cb2 = cb.clone();
-                let raf_running_cb = raf_running.clone();
-                let raf_id_cb = raf_id.clone();
-                let raf_id_start = raf_id.clone();
-
-                *cb2.borrow_mut() = Some(Closure::wrap(Box::new(move |_ts: f64| {
-                    if !raf_running_cb.get() {
-                        return;
-                    }
-                    let next = redraw_tick.read().wrapping_add(1);
-                    redraw_tick.set(next);
-
-                    if let Some(win) = web_sys::window() {
-                        if let Some(cb_ref) = cb.borrow().as_ref() {
-                            if let Ok(id) =
-                                win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
-                            {
-                                raf_id_cb.set(Some(id));
-                            }
-                        }
-                    }
-                }) as Box<dyn FnMut(f64)>));
-
-                if let Some(win) = web_sys::window() {
-                    if let Some(cb_ref) = cb2.borrow().as_ref() {
-                        if let Ok(id) = win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
-                        {
-                            raf_id_start.set(Some(id));
-                        }
-                    }
-                }
-
-                std::mem::forget(cb2);
-            }
-
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let frame = target_frame_duration();
-                spawn(async move {
-                    loop {
-                        tokio::time::sleep(frame).await;
-                        let next = redraw_tick.read().wrapping_add(1);
-                        redraw_tick.set(next);
-                    }
-                });
+                active_subtab.set(saved);
             }
         }
     });
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        let raf_running = raf_running.read().clone();
-        let raf_id = raf_id.read().clone();
-        use_drop(move || {
-            raf_running.set(false);
-            if let Some(win) = web_sys::window() {
-                if let Some(id) = raf_id.get() {
-                    let _ = win.cancel_animation_frame(id);
-                }
+    use_effect({
+        let active_subtab = active_subtab;
+        let mut last_saved_subtab = last_saved_subtab;
+        move || {
+            let cur = active_subtab.read().clone();
+            if cur.is_empty() || cur == *last_saved_subtab.read() {
+                return;
             }
-        });
-    }
+            last_saved_subtab.set(cur.clone());
 
-    // Force rerender when redraw driver ticks
-    let _ = *redraw_tick.read();
+            #[cfg(target_arch = "wasm32")]
+            localstorage_set(_ACTIVE_SUBTAB_STORAGE_KEY, &cur);
+        }
+    });
 
     // Layout-defined data types (for buttons)
     let types = layout.tabs.clone();
     let current = active_tab.read().clone();
-    let is_battery_raw_tab = matches!(current.as_str(), "BATTERY_VOLTAGE" | "BATTERY_CURRENT");
-    let is_battery_runtime_tab = current == BATTERY_RUNTIME_TAB_ID;
-    let is_loadcell_tab = current == LOADCELL_TAB_ID;
-
     let current_tab = types.iter().find(|t| t.id == current);
-
-    let mut labels: Vec<String> = Vec::new();
-    if let Some(tab) = current_tab {
-        labels = tab.channels.clone();
-    }
-
-    let chart_enabled = current_tab
-        .and_then(|tab| tab.chart.as_ref().map(|c| c.enabled))
-        .unwrap_or(true);
-
-    // Latest row for summary cards (scan backward; no sort/filter allocations)
-    let latest_row = rows
-        .read()
-        .iter()
-        .rev()
-        .find(|r| r.data_type == current)
-        .cloned();
-    let battery_card_rows: Vec<(&BatterySourceConfig, Option<TelemetryRow>)> = battery_sources
-        .iter()
-        .filter(|source| {
-            (is_battery_raw_tab && source.input_data_type == "BATTERY_VOLTAGE")
-                || source.input_data_type == current
-                || source.percent_data_type == current
-                || source.drop_rate_data_type == current
-                || source.remaining_minutes_data_type == current
-        })
-        .map(|source| {
-            let row = rows
-                .read()
-                .iter()
-                .rev()
-                .find(|r| r.data_type == current && r.sender_id == source.sender_id)
-                .cloned();
-            (source, row)
-        })
-        .collect();
-    let battery_graph_sources: Vec<&BatterySourceConfig> = battery_sources
-        .iter()
-        .filter(|source| {
-            (is_battery_raw_tab && source.input_data_type == "BATTERY_VOLTAGE")
-                || source.input_data_type == current
-        })
-        .collect();
-    let synthetic_cards = if is_battery_runtime_tab {
-        battery_runtime_cards(&rows.read(), &battery_sources)
-    } else if is_loadcell_tab {
-        loadcell_cards(&rows.read())
+    let current_subtabs = current_tab
+        .and_then(|tab| tab.subtabs.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let selected_subtab = if current_subtabs.is_empty() {
+        None
     } else {
-        Vec::new()
+        let selected_id = active_subtab.read().clone();
+        current_subtabs
+            .iter()
+            .find(|subtab| subtab.id == selected_id)
+            .cloned()
+            .or_else(|| current_subtabs.first().cloned())
     };
+
+    use_effect({
+        let current_tab_id = current.clone();
+        let current_subtabs = current_subtabs.clone();
+        let mut active_subtab = active_subtab;
+        move || {
+            if current_tab_id.is_empty() || current_subtabs.is_empty() {
+                return;
+            }
+            let current = active_subtab.read().clone();
+            if !current_subtabs.iter().any(|subtab| subtab.id == current) {
+                active_subtab.set(current_subtabs[0].id.clone());
+            }
+        }
+    });
+
+    let effective_source = effective_source(current_tab, selected_subtab.as_ref());
+    let labels = effective_labels(current_tab, selected_subtab.as_ref());
+    let channel_formatters = effective_channel_formatters(current_tab, selected_subtab.as_ref());
+    let boolean_labels = effective_boolean_labels(current_tab, selected_subtab.as_ref());
+    let channel_boolean_labels =
+        effective_channel_boolean_labels(current_tab, selected_subtab.as_ref());
+
+    let chart_enabled = selected_subtab
+        .as_ref()
+        .and_then(|subtab| subtab.chart.as_ref().map(|c| c.enabled))
+        .or_else(|| current_tab.and_then(|tab| tab.chart.as_ref().map(|c| c.enabled)))
+        .unwrap_or(true);
+    let latest_row = effective_source
+        .as_ref()
+        .and_then(|source| latest_telemetry_row(&source.data_type, source.sender_id.as_deref()));
+    let summary_items = selected_subtab
+        .as_ref()
+        .and_then(|subtab| subtab.summary_items.as_ref())
+        .cloned()
+        .unwrap_or_default();
 
     let is_valve_state = current == "VALVE_STATE";
-    let boolean_labels = current_tab.and_then(|t| t.boolean_labels.as_ref());
-    let channel_boolean_labels = current_tab.and_then(|t| t.channel_boolean_labels.as_ref());
-    let has_telemetry = if battery_card_rows.is_empty() {
-        latest_row.is_some() || !synthetic_cards.is_empty()
+    let has_telemetry = if !summary_items.is_empty() {
+        summary_items.iter().any(summary_item_has_value)
     } else {
-        battery_card_rows.iter().any(|(_, row)| row.is_some())
+        latest_row.is_some()
     };
-    let is_graph_allowed =
-        chart_enabled
-            && has_telemetry
-            && current != "GPS_DATA"
-            && !is_valve_state
-            && !is_battery_runtime_tab
-            && !is_loadcell_tab;
+    let is_graph_allowed = chart_enabled
+        && has_telemetry
+        && current != "GPS_DATA"
+        && !is_valve_state
+        && effective_source.is_some();
 
     // Viewport constants
     let view_w = 1200.0_f64;
@@ -292,68 +200,25 @@ pub fn DataTab(
     let inner_h = view_h - pad_top - pad_bottom;
     let inner_h_full = view_h_full - pad_top - pad_bottom;
 
-    let chart_key = if is_battery_raw_tab {
-        combined_battery_chart_key(&current).unwrap_or_else(|| current.clone())
-    } else {
-        current.clone()
-    };
-    // Cache fetch (NON-FULLSCREEN)
-    //
-    // IMPORTANT: We do NOT fetch fullscreen geometry here anymore.
-    // That avoids doing two cache builds every frame (w,h=360 and w,h=full),
-    // which can interact badly with "window span" behavior and costs extra CPU.
-    let (paths, y_min, y_max, span_min) =
+    let chart_key = effective_source
+        .as_ref()
+        .map(chart_key_for_source)
+        .unwrap_or_else(|| current.clone());
+    let (_chunks, _y_min, _y_max, _span_min) =
         charts_cache_get(&chart_key, view_w as f32, view_h as f32);
     let (chan_min, chan_max) =
         charts_cache_get_channel_minmax(&chart_key, view_w as f32, view_h as f32);
-    let y_mid = (y_min + y_max) * 0.5;
-    let y_max_s = format!("{:.2}", y_max);
-    let y_mid_s = format!("{:.2}", y_mid);
-    let y_min_s = format!("{:.2}", y_min);
-    let x_left_s = fmt_span(span_min);
-    let x_mid_s = fmt_span(span_min * 0.5);
-    let x_pct = |x: f64, total: f64| format!("{:.4}%", (x / total) * 100.0);
-    let y_pct = |y: f64, total: f64| format!("{:.4}%", (y / total) * 100.0);
-    let legend_items: Vec<(usize, &str)> = if is_battery_raw_tab && !battery_graph_sources.is_empty()
-    {
-        battery_graph_sources
-            .iter()
-            .enumerate()
-            .map(|(i, source)| (i, source.label.as_str()))
-            .collect()
-    } else {
-        labels
-            .iter()
-            .enumerate()
-            .filter_map(|(i, l)| {
-                if l.is_empty() {
-                    None
-                } else {
-                    Some((i, l.as_str()))
-                }
-            })
-            .collect()
-    };
-    let legend_rows: Vec<(usize, &str)> =
-        legend_items.iter().map(|(i, label)| (*i, *label)).collect();
-    let on_toggle_fullscreen = move |_| {
-        let next = !*is_fullscreen.read();
-        is_fullscreen.set(next);
-    };
-    let on_toggle_chart = move |_| {
-        let next = !*show_chart.read();
-        show_chart.set(next);
-    };
-    let summary_content = if !synthetic_cards.is_empty() {
+    let chart_groups = effective_chart_groups(current_tab, selected_subtab.as_ref(), labels.len());
+    let summary_content = if !summary_items.is_empty() {
         rsx! {
             div {
                 style: "display:grid; gap:10px; align-items:stretch; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); width:100%;",
-                for (i, (label, value)) in synthetic_cards.iter().enumerate() {
+                for (i, item) in summary_items.iter().enumerate() {
                     SummaryCard {
-                        label: label.clone(),
+                        label: item.label.clone(),
                         min: None,
                         max: None,
-                        value: value.clone(),
+                        value: summary_item_value(item),
                         color: summary_color(i),
                     }
                 }
@@ -362,44 +227,28 @@ pub fn DataTab(
     } else {
         match latest_row {
             None => rsx! {
-                div { style: "color:#94a3b8; padding:2px 2px;", "Waiting for telemetry…" }
+                div { style: "color:{theme.text_muted}; padding:2px 2px;", "Waiting for telemetry…" }
             },
             Some(row) => {
                 let vals = row.values.clone();
                 rsx! {
                     div {
                         style: "display:grid; gap:10px; align-items:stretch; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); width:100%;",
-                        if battery_card_rows.is_empty() {
-                            for (i, label) in labels.iter().enumerate() {
-                                if !label.is_empty() {
-                                    SummaryCard {
-                                        label: label.clone(),
-                                        min: if is_graph_allowed { chan_min.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
-                                        max: if is_graph_allowed { chan_max.get(i).copied().flatten().map(|v| format!("{v:.4}")) } else { None },
-                                        value: if let Some(lbls) = channel_boolean_labels
-                                            .and_then(|list| list.get(i))
-                                        {
-                                            boolean_value_text(vals.get(i).copied().flatten(), Some(lbls))
-                                        } else if is_valve_state || boolean_labels.is_some() {
-                                            boolean_value_text(vals.get(i).copied().flatten(), boolean_labels)
-                                        } else {
-                                            fmt_opt(vals.get(i).copied().flatten())
-                                        },
-                                        color: summary_color(i),
-                                    }
-                                }
-                            }
-                        } else {
-                            for (i, (source, battery_row)) in battery_card_rows.iter().enumerate() {
+                        for (i, label) in labels.iter().enumerate() {
+                            if !label.is_empty() {
                                 SummaryCard {
-                                    label: source.label.clone(),
-                                    min: None,
-                                    max: None,
-                                    value: battery_row
-                                        .as_ref()
-                                        .and_then(|row| row.values.first().copied().flatten())
-                                        .map(|v| format!("{v:.4}"))
-                                        .unwrap_or_else(|| "—".to_string()),
+                                    label: label.clone(),
+                                    min: if is_graph_allowed { chan_min.get(i).copied().flatten().map(|v| format_value(Some(v), channel_formatters.and_then(|list| list.get(i)))) } else { None },
+                                    max: if is_graph_allowed { chan_max.get(i).copied().flatten().map(|v| format_value(Some(v), channel_formatters.and_then(|list| list.get(i)))) } else { None },
+                                    value: if let Some(lbls) = channel_boolean_labels
+                                        .and_then(|list| list.get(i))
+                                    {
+                                        boolean_value_text(vals.get(i).copied().flatten(), Some(lbls))
+                                    } else if is_valve_state || boolean_labels.is_some() {
+                                        boolean_value_text(vals.get(i).copied().flatten(), boolean_labels)
+                                    } else {
+                                        format_value(vals.get(i).copied().flatten(), channel_formatters.and_then(|list| list.get(i)))
+                                    },
                                     color: summary_color(i),
                                 }
                             }
@@ -420,9 +269,16 @@ pub fn DataTab(
                     for t in types.iter().take(32) {
                         button {
                             style: if t.id == current {
-                                "padding:6px 10px; border-radius:999px; border:1px solid #f97316; background:#111827; color:#f97316; cursor:pointer;"
+                                {
+                                    let accent = theme
+                                        .main_tab_accents
+                                        .get("data")
+                                        .map(String::as_str)
+                                        .unwrap_or("#f97316");
+                                    format!("padding:6px 10px; border-radius:999px; border:1px solid {accent}; background:{}; color:{accent}; cursor:pointer;", theme.button_background)
+                                }
                             } else {
-                                "padding:6px 10px; border-radius:999px; border:1px solid #334155; background:#0b1220; color:#e5e7eb; cursor:pointer;"
+                                format!("padding:6px 10px; border-radius:999px; border:1px solid {}; background:{}; color:{}; cursor:pointer;", theme.border, theme.panel_background, theme.text_primary)
                             },
                             onclick: {
                                 let t = t.id.clone();
@@ -434,117 +290,53 @@ pub fn DataTab(
                     }
                 }
 
-                {summary_content}
-            }
-
-            // =========================
-            // Graph (non-fullscreen)
-            // =========================
-            if is_graph_allowed {
-                div { style: "flex:0; width:100%; margin-top:6px;",
-                    div { style: "width:100%;",
-
-                        div { style: "display:flex; justify-content:flex-end; gap:8px; margin-bottom:6px;",
+                if !current_subtabs.is_empty() {
+                    div { style: "display:flex; gap:8px; flex-wrap:wrap; align-items:center;",
+                        for subtab in current_subtabs.iter() {
                             button {
-                                style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
-                                onclick: on_toggle_chart,
-                                if *show_chart.read() { "Collapse" } else { "Expand" }
-                            }
-                            button {
-                                style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
-                                onclick: on_toggle_fullscreen,
-                                "Fullscreen"
-                            }
-                        }
-
-                        if *show_chart.read() {
-                            div { style: "width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
-                                div { style: "position:relative; width:100%; aspect-ratio:{view_w}/{view_h};",
-                                    ChartCanvas {
-                                        view_w: view_w,
-                                        view_h: view_h,
-                                        paths: paths.clone(),
-                                        style: "position:absolute; inset:0; width:100%; height:100%; display:block;".to_string(),
+                                style: if selected_subtab.as_ref().is_some_and(|active| active.id == subtab.id) {
+                                    {
+                                        let accent = theme
+                                            .main_tab_accents
+                                            .get("data")
+                                            .map(String::as_str)
+                                            .unwrap_or("#f97316");
+                                        format!("padding:5px 10px; border-radius:999px; border:1px solid {accent}; background:{}; color:{accent}; cursor:pointer; font-size:12px;", theme.button_background)
                                     }
-                                    div { style: "position:absolute; inset:0; pointer-events:none; font-size:10px; color:#94a3b8;",
-                                        span { style: "position:absolute; left:10px; top:{y_pct(pad_top + 6.0, view_h)};", "{y_max_s.clone()}" }
-                                        span { style: "position:absolute; left:10px; top:{y_pct(pad_top + inner_h / 2.0 + 4.0, view_h)}; transform:translateY(-50%);", "{y_mid_s.clone()}" }
-                                        span { style: "position:absolute; left:10px; top:{y_pct(view_h - pad_bottom + 4.0, view_h)}; transform:translateY(-100%);", "{y_min_s.clone()}" }
-                                        span { style: "position:absolute; left:{x_pct(left + 10.0, view_w)}; bottom:5px;", "{x_left_s.clone()}" }
-                                        span { style: "position:absolute; left:{x_pct(view_w * 0.5, view_w)}; bottom:5px; transform:translateX(-50%);", "{x_mid_s.clone()}" }
-                                        span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "now" }
-                                    }
-                                }
-                                if !legend_rows.is_empty() {
-                                    div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
-                                        for (i, label) in legend_rows.iter() {
-                                            div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
-                                                svg { width:"26", height:"8", view_box:"0 0 26 8",
-                                                    line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", "stroke-width":"2", "stroke-linecap":"round" }
-                                                }
-                                                "{label}"
-                                            }
-                                        }
-                                    }
-                                }
+                                } else {
+                                    format!("padding:5px 10px; border-radius:999px; border:1px solid {}; background:{}; color:{}; cursor:pointer; font-size:12px;", theme.border_soft, theme.panel_background, theme.text_secondary)
+                                },
+                                onclick: {
+                                    let id = subtab.id.clone();
+                                    let mut active_subtab = active_subtab;
+                                    move |_| active_subtab.set(id.clone())
+                                },
+                                "{subtab.label}"
                             }
                         }
                     }
                 }
+
+                {summary_content}
             }
-        }
 
-        // =========================
-        // Fullscreen
-        // =========================
-        if is_graph_allowed && *is_fullscreen.read() {
-            {
-                let (paths_full, _y_min2, _y_max2, _span_min2) =
-                    charts_cache_get(&chart_key, view_w as f32, view_h_full as f32);
-
-                rsx! {
-                    div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
-                        div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
-                            h2 { style: "margin:0; color:#f97316;", "Data Graph" }
-                            button {
-                                style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
-                                onclick: on_toggle_fullscreen,
-                                "Exit Fullscreen"
-                            }
-                        }
-
-                        div {
-                            style: "flex:1; min-height:0; width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; align-items:stretch; gap:8px;",
-                            div { style: "position:relative; flex:1; min-height:0; width:100%;",
-                                ChartCanvas {
-                                    view_w: view_w,
-                                    view_h: view_h_full,
-                                    paths: paths_full,
-                                    style: "position:absolute; inset:0; width:100%; height:100%; display:block;".to_string(),
-                                }
-                                div { style: "position:absolute; inset:0; pointer-events:none; font-size:10px; color:#94a3b8;",
-                                    span { style: "position:absolute; left:10px; top:{y_pct(pad_top + 6.0, view_h_full)};", "{y_max_s.clone()}" }
-                                    span { style: "position:absolute; left:10px; top:{y_pct(pad_top + inner_h_full / 2.0 + 4.0, view_h_full)}; transform:translateY(-50%);", "{y_mid_s.clone()}" }
-                                    span { style: "position:absolute; left:10px; top:{y_pct(view_h_full - pad_bottom + 4.0, view_h_full)}; transform:translateY(-100%);", "{y_min_s.clone()}" }
-                                    span { style: "position:absolute; left:{x_pct(left + 10.0, view_w)}; bottom:5px;", "{x_left_s.clone()}" }
-                                    span { style: "position:absolute; left:{x_pct(view_w * 0.5, view_w)}; bottom:5px; transform:translateX(-50%);", "{x_mid_s.clone()}" }
-                                    span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "now" }
-                                }
-                            }
-                            if !legend_rows.is_empty() {
-                                div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:8px 12px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
-                                    for (i, label) in legend_rows.iter() {
-                                        div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5f5;",
-                                            svg { width:"26", height:"8", view_box:"0 0 26 8",
-                                                line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", "stroke-width":"2", "stroke-linecap":"round" }
-                                            }
-                                            "{label}"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+            if is_graph_allowed {
+                DataGraphPanel {
+                    theme: theme.clone(),
+                    chart_groups: chart_groups.clone(),
+                    chart_key: chart_key.clone(),
+                    labels: labels.clone(),
+                    view_w: view_w,
+                    view_h: view_h,
+                    view_h_full: view_h_full,
+                    left: left,
+                    right: right,
+                    pad_top: pad_top,
+                    pad_bottom: pad_bottom,
+                    inner_h: inner_h,
+                    inner_h_full: inner_h_full,
+                    is_fullscreen: is_fullscreen,
+                    show_chart: show_chart,
                 }
             }
         }
@@ -555,61 +347,376 @@ fn summary_color(i: usize) -> &'static str {
     series_color(i)
 }
 
-fn latest_value_for(rows: &[TelemetryRow], data_type: &str, sender_id: Option<&str>) -> Option<f32> {
-    rows.iter()
-        .rev()
-        .find(|row| row.data_type == data_type && sender_id.is_none_or(|sender| row.sender_id == sender))
-        .and_then(|row| row.values.first().copied().flatten())
+fn effective_source(
+    tab: Option<&DataTabSpec>,
+    subtab: Option<&DataSubtabSpec>,
+) -> Option<DataSource> {
+    let data_type = subtab
+        .and_then(|subtab| subtab.data_type.clone())
+        .or_else(|| tab.map(|tab| tab.id.clone()))?;
+    let sender_id = subtab.and_then(|subtab| subtab.sender_id.clone());
+    Some(DataSource {
+        data_type,
+        sender_id,
+    })
 }
 
-fn battery_runtime_cards(
-    rows: &[TelemetryRow],
-    battery_sources: &[BatterySourceConfig],
-) -> Vec<(String, String)> {
-    let mut cards = Vec::new();
-    for source in battery_sources {
-        let prefix = source.label.clone();
-        cards.push((
-            format!("{prefix} %"),
-            fmt_opt(latest_value_for(rows, &source.percent_data_type, Some(&source.sender_id))),
-        ));
-        cards.push((
-            format!("{prefix} Drop"),
-            fmt_opt(latest_value_for(
-                rows,
-                &source.drop_rate_data_type,
-                Some(&source.sender_id),
-            )),
-        ));
-        cards.push((
-            format!("{prefix} Runtime"),
-            fmt_opt(latest_value_for(
-                rows,
-                &source.remaining_minutes_data_type,
-                Some(&source.sender_id),
-            )),
-        ));
+fn effective_labels(tab: Option<&DataTabSpec>, subtab: Option<&DataSubtabSpec>) -> Vec<String> {
+    if let Some(channels) = subtab.and_then(|subtab| subtab.channels.as_ref()) {
+        return channels.clone();
     }
-    cards
+    tab.map(|tab| tab.channels.clone()).unwrap_or_default()
 }
 
-fn loadcell_cards(rows: &[TelemetryRow]) -> Vec<(String, String)> {
-    vec![
-        (
-            "Raw Loadcell".to_string(),
-            fmt_opt(latest_value_for(rows, "KG1000", None)),
-        ),
-        (
-            "Weight (kg)".to_string(),
-            fmt_opt(latest_value_for(rows, "LOADCELL_WEIGHT_KG", None)),
-        ),
-        (
-            "Fill %".to_string(),
-            fmt_opt(latest_value_for(rows, "LOADCELL_FILL_PERCENT", None)),
-        ),
-    ]
+fn effective_channel_formatters<'a>(
+    tab: Option<&'a DataTabSpec>,
+    subtab: Option<&'a DataSubtabSpec>,
+) -> Option<&'a Vec<ValueFormatter>> {
+    subtab
+        .and_then(|subtab| subtab.channel_formatters.as_ref())
+        .or_else(|| tab.and_then(|tab| tab.channel_formatters.as_ref()))
 }
 
+fn effective_boolean_labels<'a>(
+    tab: Option<&'a DataTabSpec>,
+    subtab: Option<&'a DataSubtabSpec>,
+) -> Option<&'a BooleanLabels> {
+    subtab
+        .and_then(|subtab| subtab.boolean_labels.as_ref())
+        .or_else(|| tab.and_then(|tab| tab.boolean_labels.as_ref()))
+}
+
+fn effective_channel_boolean_labels<'a>(
+    tab: Option<&'a DataTabSpec>,
+    subtab: Option<&'a DataSubtabSpec>,
+) -> Option<&'a Vec<BooleanLabels>> {
+    subtab
+        .and_then(|subtab| subtab.channel_boolean_labels.as_ref())
+        .or_else(|| tab.and_then(|tab| tab.channel_boolean_labels.as_ref()))
+}
+
+fn effective_chart_groups(
+    tab: Option<&DataTabSpec>,
+    subtab: Option<&DataSubtabSpec>,
+    channel_count: usize,
+) -> Vec<DataChartGroup> {
+    subtab
+        .and_then(|subtab| subtab.chart_groups.as_ref())
+        .or_else(|| tab.and_then(|tab| tab.chart_groups.as_ref()))
+        .cloned()
+        .unwrap_or_else(|| {
+            vec![DataChartGroup {
+                title: None,
+                data_type: None,
+                sender_id: None,
+                labels: None,
+                channels: (0..channel_count).collect(),
+                scale_mode: None,
+            }]
+        })
+}
+
+fn chart_key_for_group(group: &DataChartGroup, fallback: &str) -> String {
+    if let Some(data_type) = group.data_type.as_deref() {
+        if let Some(sender_id) = group.sender_id.as_deref() {
+            return sender_scoped_chart_key(data_type, sender_id);
+        }
+        return data_type.to_string();
+    }
+    fallback.to_string()
+}
+
+fn chart_key_for_source(source: &DataSource) -> String {
+    source
+        .sender_id
+        .as_deref()
+        .map(|sender_id| sender_scoped_chart_key(&source.data_type, sender_id))
+        .unwrap_or_else(|| source.data_type.clone())
+}
+
+fn summary_item_has_value(item: &DataSummaryItem) -> bool {
+    latest_telemetry_value(&item.data_type, item.sender_id.as_deref(), item.index).is_some()
+}
+
+fn summary_item_value(item: &DataSummaryItem) -> String {
+    let value = latest_telemetry_value(&item.data_type, item.sender_id.as_deref(), item.index);
+    if item.boolean_labels.is_some() {
+        boolean_value_text(value, item.boolean_labels.as_ref())
+    } else {
+        format_value(value, item.formatter.as_ref())
+    }
+}
+
+#[derive(Clone)]
+struct DataSource {
+    data_type: String,
+    sender_id: Option<String>,
+}
+
+#[component]
+#[allow(clippy::too_many_arguments)]
+fn DataGraphPanel(
+    theme: ThemeConfig,
+    chart_groups: Vec<DataChartGroup>,
+    chart_key: String,
+    labels: Vec<String>,
+    view_w: f64,
+    view_h: f64,
+    view_h_full: f64,
+    left: f64,
+    right: f64,
+    pad_top: f64,
+    pad_bottom: f64,
+    inner_h: f64,
+    inner_h_full: f64,
+    is_fullscreen: Signal<bool>,
+    show_chart: Signal<bool>,
+) -> Element {
+    let _ = *TELEMETRY_RENDER_EPOCH.read();
+    let x_pct = |x: f64, total: f64| format!("{:.4}%", (x / total) * 100.0);
+    let y_pct = |y: f64, total: f64| format!("{:.4}%", (y / total) * 100.0);
+    let on_toggle_fullscreen = move |_: Event<MouseData>| {
+        let next = !*is_fullscreen.read();
+        is_fullscreen.set(next);
+    };
+    let on_toggle_chart = move |_: Event<MouseData>| {
+        let next = !*show_chart.read();
+        show_chart.set(next);
+    };
+
+    let (_chunks, _y_min, _y_max, _span_min) =
+        charts_cache_get(&chart_key, view_w as f32, view_h as f32);
+
+    rsx! {
+        div { style: "flex:0; width:100%; margin-top:6px;",
+            div { style: "width:100%;",
+                div { style: "display:flex; justify-content:flex-end; gap:8px; margin-bottom:6px;",
+                    button {
+                        style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
+                        onclick: on_toggle_chart,
+                        if *show_chart.read() { "Collapse" } else { "Expand" }
+                    }
+                    button {
+                        style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
+                        onclick: on_toggle_fullscreen,
+                        "Fullscreen"
+                    }
+                }
+
+                if *show_chart.read() {
+                    div { style: "display:flex; flex-direction:column; gap:12px;",
+                        for group in chart_groups.iter() {
+                            {render_chart_group(
+                                group,
+                                &chart_key,
+                                &labels,
+                                view_w,
+                                view_h,
+                                left,
+                                right,
+                                pad_top,
+                                pad_bottom,
+                                inner_h,
+                                &x_pct,
+                                &y_pct,
+                                &theme,
+                            )}
+                        }
+                    }
+                }
+            }
+        }
+
+        if *is_fullscreen.read() {
+            {
+                let (_chunks_full, _y_min2, _y_max2, _span_min2) =
+                    charts_cache_get(&chart_key, view_w as f32, view_h_full as f32);
+
+                rsx! {
+                    div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:{theme.app_background}; display:flex; flex-direction:column; gap:12px;",
+                        div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
+                            h2 { style: "margin:0; color:{theme.main_tab_accents.get(\"data\").map(String::as_str).unwrap_or(\"#f97316\")};", "Data Graph" }
+                            button {
+                                style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
+                                onclick: on_toggle_fullscreen,
+                                "Exit Fullscreen"
+                            }
+                        }
+
+                        div {
+                            style: "flex:1; min-height:0; width:100%; overflow-y:auto; display:flex; flex-direction:column; gap:12px;",
+                            for group in chart_groups.iter() {
+                                {render_chart_group(
+                                    group,
+                                    &chart_key,
+                                    &labels,
+                                    view_w,
+                                    view_h_full,
+                                    left,
+                                    right,
+                                    pad_top,
+                                    pad_bottom,
+                                    inner_h_full,
+                                    &x_pct,
+                                    &y_pct,
+                                    &theme,
+                                )}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_chart_group(
+    group: &DataChartGroup,
+    fallback_chart_key: &str,
+    fallback_labels: &[String],
+    view_w: f64,
+    view_h: f64,
+    left: f64,
+    right: f64,
+    pad_top: f64,
+    pad_bottom: f64,
+    inner_h: f64,
+    x_pct: &dyn Fn(f64, f64) -> String,
+    y_pct: &dyn Fn(f64, f64) -> String,
+    theme: &ThemeConfig,
+) -> Element {
+    let chart_key = chart_key_for_group(group, fallback_chart_key);
+    let per_series_scale = matches!(group.scale_mode, Some(DataChartScaleMode::PerSeries));
+    let (filtered_chunks, y_min, y_max, span_min, per_series_scales) = if per_series_scale {
+        let (chunks, scales, span_min) = charts_cache_get_subset_per_series(
+            &chart_key,
+            &group.channels,
+            view_w as f32,
+            view_h as f32,
+        );
+        let overall_min = scales
+            .iter()
+            .flatten()
+            .map(|(min, _)| *min)
+            .fold(f32::INFINITY, f32::min);
+        let overall_max = scales
+            .iter()
+            .flatten()
+            .map(|(_, max)| *max)
+            .fold(f32::NEG_INFINITY, f32::max);
+        (
+            chunks,
+            if overall_min.is_finite() {
+                overall_min
+            } else {
+                0.0
+            },
+            if overall_max.is_finite() {
+                overall_max
+            } else {
+                1.0
+            },
+            span_min,
+            scales,
+        )
+    } else {
+        let (chunks, y_min, y_max, span_min) =
+            charts_cache_get_subset(&chart_key, &group.channels, view_w as f32, view_h as f32);
+        (chunks, y_min, y_max, span_min, Vec::new())
+    };
+    if filtered_chunks.is_empty() {
+        return rsx! {};
+    }
+    let x_left_s = fmt_span(span_min);
+    let x_mid_s = fmt_span(span_min * 0.5);
+    let y_mid = (y_min + y_max) * 0.5;
+    let y_max_s = format!("{:.2}", y_max);
+    let y_mid_s = format!("{:.2}", y_mid);
+    let y_min_s = format!("{:.2}", y_min);
+    let legend_source = group.labels.as_deref().unwrap_or(fallback_labels);
+    let legend_rows: Vec<(usize, &str)> = group
+        .channels
+        .iter()
+        .enumerate()
+        .filter_map(|(group_idx, idx)| {
+            legend_source
+                .get(*idx)
+                .or_else(|| legend_source.get(group_idx))
+                .map(|label| (group_idx, label.as_str()))
+        })
+        .filter(|(_, label)| !label.is_empty())
+        .collect();
+
+    rsx! {
+        div { style: "width:100%; background:{theme.app_background}; border-radius:14px; border:1px solid {theme.border}; padding:12px; display:flex; flex-direction:column; gap:8px;",
+            if let Some(title) = group.title.as_ref() {
+                div { style: "font-size:13px; font-weight:600; color:{theme.text_primary};", "{title}" }
+            }
+            div { style: "display:flex; gap:2px; align-items:stretch;",
+                if per_series_scale {
+                    div { style: "flex:0 0 88px; width:88px; min-width:88px; display:flex; flex-direction:column; justify-content:space-between; align-items:flex-end; font-size:10px; padding-top:4px; padding-bottom:16px; overflow:hidden;",
+                        div { style: "display:flex; justify-content:flex-end; flex-wrap:nowrap; gap:6px; white-space:nowrap; width:100%; text-align:right;",
+                            for (i, _) in group.channels.iter().enumerate() {
+                                if let Some((_, series_max)) = per_series_scales.get(i).and_then(|scale| *scale) {
+                                    div { style: "color:{series_color(i)};", {format!("{:.2}", series_max)} }
+                                }
+                            }
+                        }
+                        div { style: "display:flex; justify-content:flex-end; flex-wrap:nowrap; gap:6px; white-space:nowrap; width:100%; text-align:right;",
+                            for (i, _) in group.channels.iter().enumerate() {
+                                if let Some((series_min, series_max)) = per_series_scales.get(i).and_then(|scale| *scale) {
+                                    div { style: "color:{series_color(i)};", {format!("{:.2}", (series_min + series_max) * 0.5)} }
+                                }
+                            }
+                        }
+                        div { style: "display:flex; justify-content:flex-end; flex-wrap:nowrap; gap:6px; white-space:nowrap; width:100%; text-align:right;",
+                            for (i, _) in group.channels.iter().enumerate() {
+                                if let Some((series_min, _)) = per_series_scales.get(i).and_then(|scale| *scale) {
+                                    div { style: "color:{series_color(i)};", {format!("{:.2}", series_min)} }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { style: "position:relative; flex:1 1 auto; min-width:0; aspect-ratio:{view_w}/{view_h};",
+                    ChartCanvas {
+                        view_w: view_w,
+                        view_h: view_h,
+                        chunks: filtered_chunks,
+                        grid_left: None,
+                        grid_right: None,
+                        grid_top: None,
+                        grid_bottom: None,
+                        style: "position:absolute; inset:0; width:100%; height:100%; display:block;".to_string(),
+                    }
+                    div { style: "position:absolute; inset:0; pointer-events:none; font-size:10px; color:{theme.text_muted};",
+                        if !per_series_scale {
+                            span { style: "position:absolute; left:10px; top:{y_pct(pad_top + 6.0, view_h)};", "{y_max_s}" }
+                            span { style: "position:absolute; left:10px; top:{y_pct(pad_top + inner_h / 2.0 + 4.0, view_h)}; transform:translateY(-50%);", "{y_mid_s}" }
+                            span { style: "position:absolute; left:10px; top:{y_pct(view_h - pad_bottom + 4.0, view_h)}; transform:translateY(-100%);", "{y_min_s}" }
+                        }
+                        span { style: "position:absolute; left:{x_pct(left + 10.0, view_w)}; bottom:5px;", "{x_left_s}" }
+                        span { style: "position:absolute; left:{x_pct(view_w * 0.5, view_w)}; bottom:5px; transform:translateX(-50%);", "{x_mid_s}" }
+                        span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "now" }
+                    }
+                }
+            }
+            if !legend_rows.is_empty() {
+                div { style: "display:flex; flex-wrap:wrap; gap:8px; padding:6px 10px; background:rgba(2,6,23,0.75); border:1px solid {theme.border_soft}; border-radius:10px;",
+                    for (i, label) in legend_rows.iter() {
+                        div { style: "display:flex; align-items:center; gap:6px; font-size:12px; color:{theme.text_secondary};",
+                            svg { width:"26", height:"8", view_box:"0 0 26 8",
+                                line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", "stroke-width":"2", "stroke-linecap":"round" }
+                            }
+                            "{label}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[component]
 fn SummaryCard(
@@ -635,9 +742,25 @@ fn SummaryCard(
     }
 }
 
-fn fmt_opt(v: Option<f32>) -> String {
+fn format_value(v: Option<f32>, formatter: Option<&ValueFormatter>) -> String {
     match v {
-        Some(x) => format!("{x:.4}"),
+        Some(x) => {
+            let kind = formatter
+                .and_then(|formatter| formatter.kind.clone())
+                .unwrap_or(ValueFormatKind::Number);
+            let precision = formatter.and_then(|formatter| formatter.precision);
+            let prefix = formatter
+                .and_then(|formatter| formatter.prefix.as_deref())
+                .unwrap_or("");
+            let suffix = formatter
+                .and_then(|formatter| formatter.suffix.as_deref())
+                .unwrap_or("");
+            let value = match kind {
+                ValueFormatKind::Number => format!("{x:.prec$}", prec = precision.unwrap_or(4)),
+                ValueFormatKind::Integer => format!("{}", x.round() as i64),
+            };
+            format!("{prefix}{value}{suffix}")
+        }
         None => "-".to_string(),
     }
 }

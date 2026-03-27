@@ -3,9 +3,13 @@ use std::path::PathBuf;
 
 pub const DEFAULT_FULL_MASS_KG: f32 = 10.0;
 pub const CALIBRATION_CAPTURE_TARGET_SAMPLES: usize = 200;
+pub const RAW_LOADCELL_DATA_TYPE_50KG: &str = "KG50";
 pub const RAW_LOADCELL_DATA_TYPE_1000KG: &str = "KG1000";
+pub const RAW_PRESSURE_TRANSDUCER_DATA_TYPE: &str = "IADC";
+pub const DERIVED_50KG_CALIBRATED_DATA_TYPE: &str = "LOADCELL_50KG_CALIBRATED";
 pub const DERIVED_WEIGHT_DATA_TYPE: &str = "LOADCELL_WEIGHT_KG";
 pub const DERIVED_FILL_PERCENT_DATA_TYPE: &str = "LOADCELL_FILL_PERCENT";
+pub const DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE: &str = "PRESSURE_TRANSDUCER_CALIBRATED";
 #[cfg(feature = "testing")]
 const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration_testing.json";
 #[cfg(not(feature = "testing"))]
@@ -893,6 +897,22 @@ pub fn calibrated_weight_kg(
     match sensor_id {
         "KG1000" => eval_channel_with_fit(&cfg.ch1, cfg.ch1_fit.as_ref(), raw),
         "KG50" => eval_channel_with_fit(&cfg.ch0, cfg.ch0_fit.as_ref(), raw),
+        _ => None,
+    }
+}
+
+pub fn calibrated_sensor_value(
+    cfg: &LoadcellCalibrationFile,
+    sensor_id: &str,
+    raw: f32,
+) -> Option<f32> {
+    match sensor_id {
+        RAW_LOADCELL_DATA_TYPE_1000KG | RAW_LOADCELL_DATA_TYPE_50KG => {
+            calibrated_weight_kg(cfg, sensor_id, raw)
+        }
+        RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
+            eval_channel_with_fit(&cfg.iadc, cfg.iadc_fit.as_ref(), raw)
+        }
         _ => None,
     }
 }

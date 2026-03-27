@@ -1,42 +1,35 @@
+use crate::comms::CommsDevice;
 use crate::flight_sim;
+use crate::gpio_panel::IGNITION_PIN;
 use crate::layout;
 use crate::loadcell;
+use crate::rocket_commands::{ActuatorBoardCommands, FlightComputerCommands, ValveBoardCommands};
 use crate::state::AppState;
-use groundstation_shared::TelemetryRow;
-use groundstation_shared::{TelemetryCommand, u8_to_flight_state};
-use sedsprintf_rs_2026::config::DEVICE_IDENTIFIER;
-use sedsprintf_rs_2026::config::DataType;
-use sedsprintf_rs_2026::timesync::{
-    TimeSyncConfig, TimeSyncRole, TimeSyncTracker, TimeSyncUpdate, compute_offset_delay,
-    decode_timesync_request, decode_timesync_response,
-};
-
-use crate::gpio_panel::IGNITION_PIN;
-use crate::radio::RadioDevice;
-use crate::rocket_commands::FlightComputerCommands;
-use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
+#[cfg(feature = "hitl_mode")]
+use crate::types::FlightState;
+use crate::types::{Board, TelemetryCommand, TelemetryRow, u8_to_flight_state};
 use crate::web::{FlightStateMsg, emit_warning};
-use groundstation_shared::Board;
-use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
+use sedsprintf_rs_2026::config::DataType;
+use sedsprintf_rs_2026::packet::Packet;
+use sedsprintf_rs_2026::router::Router;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, interval};
 
-const TIMESYNC_PRIORITY: u64 = 50;
-const TIMESYNC_SOURCE_TIMEOUT_MS: u64 = 5_000;
-const TIMESYNC_ANNOUNCE_INTERVAL_MS: u64 = 1_000;
-const TIMESYNC_REQUEST_INTERVAL_MS: u64 = 1_000;
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
 const DB_WORK_QUEUE_SIZE: usize = 8_192;
 const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
 const DB_BATCH_MAX_DEFAULT: usize = 256;
 const DB_BATCH_WAIT_MS_DEFAULT: u64 = 8;
+const GPS_SATELLITES_DATA_TYPE: &str = "GPS_SATELLITE_NUMBER";
+const VEHICLE_SPEED_DATA_TYPE: &str = "VEHICLE_SPEED";
+const GRAVITY_MPS2: f32 = 9.80665;
 
 #[cfg(feature = "hitl_mode")]
 fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
@@ -59,30 +52,27 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
 }
 
 #[cfg(feature = "hitl_mode")]
-const HITL_FLIGHT_STATE_ORDER: [groundstation_shared::FlightState; 16] = [
-    groundstation_shared::FlightState::Startup,
-    groundstation_shared::FlightState::Idle,
-    groundstation_shared::FlightState::PreFill,
-    groundstation_shared::FlightState::FillTest,
-    groundstation_shared::FlightState::NitrogenFill,
-    groundstation_shared::FlightState::NitrousFill,
-    groundstation_shared::FlightState::Armed,
-    groundstation_shared::FlightState::Launch,
-    groundstation_shared::FlightState::Ascent,
-    groundstation_shared::FlightState::Coast,
-    groundstation_shared::FlightState::Apogee,
-    groundstation_shared::FlightState::ParachuteDeploy,
-    groundstation_shared::FlightState::Descent,
-    groundstation_shared::FlightState::Landed,
-    groundstation_shared::FlightState::Recovery,
-    groundstation_shared::FlightState::Aborted,
+const HITL_FLIGHT_STATE_ORDER: [FlightState; 16] = [
+    FlightState::Startup,
+    FlightState::Idle,
+    FlightState::PreFill,
+    FlightState::FillTest,
+    FlightState::NitrogenFill,
+    FlightState::NitrousFill,
+    FlightState::Armed,
+    FlightState::Launch,
+    FlightState::Ascent,
+    FlightState::Coast,
+    FlightState::Apogee,
+    FlightState::ParachuteDeploy,
+    FlightState::Descent,
+    FlightState::Landed,
+    FlightState::Recovery,
+    FlightState::Aborted,
 ];
 
 #[cfg(feature = "hitl_mode")]
-fn hitl_adjacent_flight_state(
-    current: groundstation_shared::FlightState,
-    delta: i32,
-) -> groundstation_shared::FlightState {
+fn hitl_adjacent_flight_state(current: FlightState, delta: i32) -> FlightState {
     let idx = HITL_FLIGHT_STATE_ORDER
         .iter()
         .position(|s| *s == current)
@@ -92,10 +82,7 @@ fn hitl_adjacent_flight_state(
 }
 
 #[cfg(feature = "hitl_mode")]
-async fn set_local_flight_state_for_hitl(
-    state: &Arc<AppState>,
-    next_state: groundstation_shared::FlightState,
-) {
+async fn set_local_flight_state_for_hitl(state: &Arc<AppState>, next_state: FlightState) {
     {
         let mut fs = state.state.lock().unwrap();
         *fs = next_state;
@@ -115,14 +102,15 @@ async fn set_local_flight_state_for_hitl(
     });
 }
 
-static TIMESYNC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static DB_BACKPRESSURE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static DB_LAST_BUCKET_BY_TYPE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 static DB_OVERFLOW_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static BATTERY_ESTIMATOR_STATE: OnceLock<Mutex<HashMap<String, BatteryEstimatorState>>> =
     OnceLock::new();
+static SPEED_ESTIMATOR_STATE: OnceLock<Mutex<SpeedEstimatorState>> = OnceLock::new();
 static BATTERY_LAYOUT_CFG: OnceLock<layout::BatteryLayoutConfig> = OnceLock::new();
+static NETWORK_TIME_ROUTER: OnceLock<Arc<Router>> = OnceLock::new();
 const BATTERY_VOLTAGE_EMA_ALPHA: f32 = 0.06;
 const BATTERY_DROP_RATE_EMA_ALPHA: f32 = 0.10;
 const BATTERY_MAX_VOLTAGE_SLEW_V_PER_SEC: f32 = 0.035;
@@ -218,6 +206,20 @@ struct BatteryEstimatorState {
     last_remaining_ts_ms: Option<i64>,
 }
 
+#[derive(Default)]
+struct SpeedEstimatorState {
+    speed_mps: Option<f32>,
+    last_update_ts_ms: Option<i64>,
+    accel_mps2: Option<f32>,
+    accel_ts_ms: Option<i64>,
+    last_baro_alt_sample: Option<(i64, f32)>,
+    baro_speed_mps: Option<f32>,
+    baro_speed_ts_ms: Option<i64>,
+    last_gps_alt_sample: Option<(i64, f32)>,
+    gps_speed_mps: Option<f32>,
+    gps_speed_ts_ms: Option<i64>,
+}
+
 fn battery_layout_cfg() -> &'static layout::BatteryLayoutConfig {
     BATTERY_LAYOUT_CFG.get_or_init(|| match layout::load_layout() {
         Ok(cfg) => cfg.battery,
@@ -240,7 +242,7 @@ fn push_battery_sample_and_compute_drop_rate(
 
     let dt_s = state
         .last_remaining_ts_ms
-        .map(|t0| ((ts_ms.saturating_sub(t0)) as f32 / 1000.0).clamp(0.0, 10.0))
+        .map(|t0| (ts_ms.saturating_sub(t0) as f32 / 1000.0).clamp(0.0, 10.0))
         .unwrap_or(0.0);
     state.last_remaining_ts_ms = Some(ts_ms);
     state.last_ts_ms = Some(ts_ms);
@@ -317,6 +319,173 @@ fn battery_percent(voltage: f32, empty: f32, full: f32, exponent: f32) -> f32 {
     let linear = ((voltage - empty) / (full - empty)).clamp(0.0, 1.0);
     let exp = exponent.max(0.1);
     (linear.powf(exp) * 100.0).clamp(0.0, 100.0)
+}
+
+fn update_speed_ema(prev: Option<f32>, sample: f32, alpha: f32) -> f32 {
+    prev.map(|v| v + alpha * (sample - v)).unwrap_or(sample)
+}
+
+fn ingest_altitude_velocity_sample(
+    prev_sample: Option<(i64, f32)>,
+    prev_speed: Option<f32>,
+    ts_ms: i64,
+    altitude_m: f32,
+    min_dt_ms: i64,
+    max_dt_ms: i64,
+    alpha: f32,
+) -> (Option<(i64, f32)>, Option<f32>, Option<i64>) {
+    let next_sample = Some((ts_ms, altitude_m));
+    let Some((prev_ts_ms, prev_altitude_m)) = prev_sample else {
+        return (next_sample, prev_speed, None);
+    };
+    let dt_ms = ts_ms.saturating_sub(prev_ts_ms);
+    if dt_ms < min_dt_ms || dt_ms > max_dt_ms {
+        return (next_sample, prev_speed, None);
+    }
+    let dt_s = dt_ms as f32 / 1000.0;
+    if dt_s <= 0.0 {
+        return (next_sample, prev_speed, None);
+    }
+    let raw_speed_mps = ((altitude_m - prev_altitude_m) / dt_s).clamp(-800.0, 800.0);
+    (
+        next_sample,
+        Some(update_speed_ema(prev_speed, raw_speed_mps, alpha)),
+        Some(ts_ms),
+    )
+}
+
+fn fresh_sensor_value(
+    sample: Option<f32>,
+    sample_ts_ms: Option<i64>,
+    now_ms: i64,
+    max_age_ms: i64,
+) -> Option<f32> {
+    let value = sample?;
+    let sample_ts_ms = sample_ts_ms?;
+    (now_ms.saturating_sub(sample_ts_ms) <= max_age_ms).then_some(value)
+}
+
+fn update_vehicle_speed_estimate(
+    data_type: &str,
+    ts_ms: i64,
+    values: &[Option<f32>],
+) -> Option<f32> {
+    let state_cell =
+        SPEED_ESTIMATOR_STATE.get_or_init(|| Mutex::new(SpeedEstimatorState::default()));
+    let mut state = state_cell.lock().unwrap();
+
+    match data_type {
+        dt if dt == DataType::AccelData.as_str() => {
+            if let Some(accel_z_mps2) = values.get(2).copied().flatten()
+                && accel_z_mps2.is_finite()
+            {
+                state.accel_mps2 = Some((accel_z_mps2 - GRAVITY_MPS2).clamp(-200.0, 200.0));
+                state.accel_ts_ms = Some(ts_ms);
+            }
+        }
+        dt if dt == DataType::BarometerData.as_str() => {
+            if let Some(altitude_m) = values.get(2).copied().flatten()
+                && altitude_m.is_finite()
+            {
+                (
+                    state.last_baro_alt_sample,
+                    state.baro_speed_mps,
+                    state.baro_speed_ts_ms,
+                ) = ingest_altitude_velocity_sample(
+                    state.last_baro_alt_sample,
+                    state.baro_speed_mps,
+                    ts_ms,
+                    altitude_m,
+                    10,
+                    2_000,
+                    0.22,
+                );
+            }
+        }
+        dt if dt == DataType::GpsData.as_str() => {
+            if let Some(altitude_m) = values.get(2).copied().flatten()
+                && altitude_m.is_finite()
+            {
+                (
+                    state.last_gps_alt_sample,
+                    state.gps_speed_mps,
+                    state.gps_speed_ts_ms,
+                ) = ingest_altitude_velocity_sample(
+                    state.last_gps_alt_sample,
+                    state.gps_speed_mps,
+                    ts_ms,
+                    altitude_m,
+                    100,
+                    10_000,
+                    0.15,
+                );
+            }
+        }
+        _ => return None,
+    }
+
+    let accel_mps2 = fresh_sensor_value(state.accel_mps2, state.accel_ts_ms, ts_ms, 600);
+    let baro_speed_mps =
+        fresh_sensor_value(state.baro_speed_mps, state.baro_speed_ts_ms, ts_ms, 1_500);
+    let gps_speed_mps =
+        fresh_sensor_value(state.gps_speed_mps, state.gps_speed_ts_ms, ts_ms, 4_500);
+
+    let dt_s = state
+        .last_update_ts_ms
+        .map(|last_ts_ms| (ts_ms.saturating_sub(last_ts_ms) as f32 / 1000.0).clamp(0.0, 0.25))
+        .unwrap_or(0.0);
+
+    let mut fused_speed_mps = state.speed_mps.unwrap_or_else(|| {
+        let mut seed = 0.0;
+        let mut weight = 0.0;
+        if let Some(v) = baro_speed_mps {
+            seed += v * 0.75;
+            weight += 0.75;
+        }
+        if let Some(v) = gps_speed_mps {
+            seed += v * 0.25;
+            weight += 0.25;
+        }
+        if weight > 0.0 { seed / weight } else { 0.0 }
+    });
+
+    if let Some(a) = accel_mps2
+        && dt_s > 0.0
+    {
+        fused_speed_mps += a * dt_s;
+    }
+
+    let mut has_measurement = false;
+    if let Some(v_baro) = baro_speed_mps {
+        fused_speed_mps += 0.35 * (v_baro - fused_speed_mps);
+        has_measurement = true;
+    }
+    if let Some(v_gps) = gps_speed_mps {
+        fused_speed_mps += 0.18 * (v_gps - fused_speed_mps);
+        has_measurement = true;
+    }
+
+    if !has_measurement && state.speed_mps.is_none() {
+        return None;
+    }
+
+    if let Some(prev_speed_mps) = state.speed_mps {
+        let smooth_alpha = if dt_s <= 0.0 {
+            1.0
+        } else {
+            (dt_s / 0.12).clamp(0.15, 1.0)
+        };
+        fused_speed_mps = prev_speed_mps + smooth_alpha * (fused_speed_mps - prev_speed_mps);
+    }
+
+    if fused_speed_mps.abs() < 0.02 {
+        fused_speed_mps = 0.0;
+    }
+
+    fused_speed_mps = fused_speed_mps.clamp(-800.0, 800.0);
+    state.speed_mps = Some(fused_speed_mps);
+    state.last_update_ts_ms = Some(ts_ms);
+    Some(fused_speed_mps)
 }
 
 fn battery_bounds_for_source(source: &layout::BatterySourceConfig) -> (f32, f32) {
@@ -427,28 +596,52 @@ async fn emit_derived_loadcell_rows(
     db_overflow: &DbOverflow,
     ts_ms: i64,
     sender_id: &str,
-    raw_kg1000: f32,
+    sensor_id: &str,
+    raw_value: f32,
     payload_json: &str,
 ) {
     let cfg = state.loadcell_calibration.lock().unwrap().clone();
-    let Some(weight_kg) =
-        loadcell::calibrated_weight_kg(&cfg, loadcell::RAW_LOADCELL_DATA_TYPE_1000KG, raw_kg1000)
+    let Some(calibrated_value) = loadcell::calibrated_sensor_value(&cfg, sensor_id, raw_value)
     else {
         return;
     };
-    let percent = loadcell::fill_percent(&cfg, weight_kg);
-    {
-        let mut latest = state.latest_fill_mass_kg.lock().unwrap();
-        *latest = Some(weight_kg);
-    }
-
-    let rows: [(&str, Vec<Option<f32>>); 2] = [
-        (loadcell::DERIVED_WEIGHT_DATA_TYPE, vec![Some(weight_kg)]),
-        (
-            loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
-            vec![Some(percent)],
-        ),
-    ];
+    let rows: Vec<(&str, Vec<Option<f32>>)> = match sensor_id {
+        loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
+            let percent = loadcell::fill_percent(&cfg, calibrated_value);
+            {
+                let mut latest = state.latest_fill_mass_kg.lock().unwrap();
+                *latest = Some(calibrated_value);
+            }
+            vec![
+                (
+                    loadcell::DERIVED_WEIGHT_DATA_TYPE,
+                    vec![Some(calibrated_value)],
+                ),
+                (
+                    loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
+                    vec![Some(percent)],
+                ),
+            ]
+        }
+        loadcell::RAW_LOADCELL_DATA_TYPE_50KG => {
+            let percent = loadcell::fill_percent(&cfg, calibrated_value);
+            vec![
+                (
+                    loadcell::DERIVED_50KG_CALIBRATED_DATA_TYPE,
+                    vec![Some(calibrated_value)],
+                ),
+                (
+                    loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
+                    vec![Some(percent)],
+                ),
+            ]
+        }
+        loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => vec![(
+            loadcell::DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE,
+            vec![Some(calibrated_value)],
+        )],
+        _ => Vec::new(),
+    };
 
     for (data_type, values) in rows {
         if should_persist_telemetry_sample(data_type, ts_ms) {
@@ -478,6 +671,169 @@ async fn emit_derived_loadcell_rows(
     }
 }
 
+async fn emit_derived_vehicle_speed_row(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbWrite>,
+    db_overflow: &DbOverflow,
+    ts_ms: i64,
+    speed_mps: f32,
+    payload_json: &str,
+) {
+    let values = vec![Some(speed_mps)];
+    if should_persist_telemetry_sample(VEHICLE_SPEED_DATA_TYPE, ts_ms) {
+        queue_db_write(
+            state,
+            db_tx,
+            db_overflow,
+            DbWrite::Telemetry {
+                timestamp_ms: ts_ms,
+                data_type: VEHICLE_SPEED_DATA_TYPE.to_string(),
+                sender_id: String::new(),
+                values_json: telemetry_values_json(&values),
+                payload_json: payload_json.to_string(),
+            },
+        )
+        .await;
+    }
+
+    let row = TelemetryRow {
+        timestamp_ms: ts_ms,
+        data_type: VEHICLE_SPEED_DATA_TYPE.to_string(),
+        sender_id: String::new(),
+        values,
+    };
+    state.cache_recent_telemetry(row.clone());
+    let _ = state.ws_tx.send(row);
+}
+
+fn normalized_gps_values(
+    state: &Arc<AppState>,
+    sender_id: &str,
+    raw_values: &[Option<f32>],
+) -> Vec<Option<f32>> {
+    let lat = raw_values.first().copied().flatten();
+    let lon = raw_values.get(1).copied().flatten();
+    let alt = raw_values.get(2).copied().flatten();
+
+    {
+        let mut fixes = state.latest_gps_fix_by_sender.lock().unwrap();
+        fixes.insert(sender_id.to_string(), vec![lat, lon, alt]);
+    }
+
+    let satellites = state
+        .latest_gps_satellites_by_sender
+        .lock()
+        .unwrap()
+        .get(sender_id)
+        .copied()
+        .map(|v| v as f32);
+
+    vec![lat, lon, alt, satellites]
+}
+
+async fn emit_normalized_gps_row(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbWrite>,
+    db_overflow: &DbOverflow,
+    ts_ms: i64,
+    sender_id: &str,
+    values: Vec<Option<f32>>,
+    payload_json: &str,
+) {
+    if should_persist_telemetry_sample(DataType::GpsData.as_str(), ts_ms) {
+        queue_db_write(
+            state,
+            db_tx,
+            db_overflow,
+            DbWrite::Telemetry {
+                timestamp_ms: ts_ms,
+                data_type: DataType::GpsData.as_str().to_string(),
+                sender_id: sender_id.to_string(),
+                values_json: telemetry_values_json(&values),
+                payload_json: payload_json.to_string(),
+            },
+        )
+        .await;
+    }
+
+    let row = TelemetryRow {
+        timestamp_ms: ts_ms,
+        data_type: DataType::GpsData.as_str().to_string(),
+        sender_id: sender_id.to_string(),
+        values,
+    };
+    state.cache_recent_telemetry(row.clone());
+    let _ = state.ws_tx.send(row);
+}
+
+async fn handle_gps_satellite_count_packet(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbWrite>,
+    db_overflow: &DbOverflow,
+    pkt: &Packet,
+    payload_json: &str,
+) -> Option<TelemetryRow> {
+    let count = pkt.data_as_u8().ok().and_then(|v| v.first().copied())?;
+    let ts_ms = pkt.timestamp() as i64;
+    let sender_id = pkt.sender().to_string();
+
+    {
+        let mut sats = state.latest_gps_satellites_by_sender.lock().unwrap();
+        sats.insert(sender_id.clone(), count);
+    }
+
+    let values = vec![Some(count as f32)];
+    if should_persist_telemetry_sample(GPS_SATELLITES_DATA_TYPE, ts_ms) {
+        queue_db_write(
+            state,
+            db_tx,
+            db_overflow,
+            DbWrite::Telemetry {
+                timestamp_ms: ts_ms,
+                data_type: GPS_SATELLITES_DATA_TYPE.to_string(),
+                sender_id: sender_id.clone(),
+                values_json: telemetry_values_json(&values),
+                payload_json: payload_json.to_string(),
+            },
+        )
+        .await;
+    }
+
+    let fix_values = {
+        state
+            .latest_gps_fix_by_sender
+            .lock()
+            .unwrap()
+            .get(&sender_id)
+            .cloned()
+    };
+    if let Some(fix_values) = fix_values {
+        let normalized = vec![
+            fix_values.first().copied().flatten(),
+            fix_values.get(1).copied().flatten(),
+            fix_values.get(2).copied().flatten(),
+            Some(count as f32),
+        ];
+        emit_normalized_gps_row(
+            state,
+            db_tx,
+            db_overflow,
+            ts_ms,
+            &sender_id,
+            normalized,
+            payload_json,
+        )
+        .await;
+    }
+
+    Some(TelemetryRow {
+        timestamp_ms: ts_ms,
+        data_type: GPS_SATELLITES_DATA_TYPE.to_string(),
+        sender_id,
+        values,
+    })
+}
+
 fn smooth_remaining_minutes(source_id: &str, ts_ms: i64, raw: Option<f32>) -> Option<f32> {
     const REMAINING_EMA_ALPHA: f32 = 0.05;
     const REMAINING_MAX_STEP_MIN_PER_SEC: f32 = 0.08;
@@ -492,7 +848,7 @@ fn smooth_remaining_minutes(source_id: &str, ts_ms: i64, raw: Option<f32>) -> Op
 
     let dt_s = state
         .last_ts_ms
-        .map(|t0| ((ts_ms.saturating_sub(t0)) as f32 / 1000.0).clamp(0.0, 10.0))
+        .map(|t0| (ts_ms.saturating_sub(t0) as f32 / 1000.0).clamp(0.0, 10.0))
         .unwrap_or(0.0);
     let prev = state.ema_remaining_min.unwrap_or(raw_val);
     let max_step = REMAINING_MAX_STEP_MIN_PER_SEC * dt_s.max(0.02);
@@ -502,47 +858,14 @@ fn smooth_remaining_minutes(source_id: &str, ts_ms: i64, raw: Option<f32>) -> Op
     state.ema_remaining_min
 }
 
-pub struct TimeSyncState {
-    tracker: TimeSyncTracker,
-    next_seq: u64,
-    pending: Option<(u64, u64)>,
-    last_request_ms: u64,
-    last_announce_ms: u64,
-    last_offset_ms: Option<i64>,
-    last_delay_ms: Option<u64>,
-}
-
-impl TimeSyncState {
-    fn new() -> Self {
-        Self {
-            tracker: TimeSyncTracker::new(TimeSyncConfig {
-                role: TimeSyncRole::Auto,
-                priority: TIMESYNC_PRIORITY,
-                source_timeout_ms: TIMESYNC_SOURCE_TIMEOUT_MS,
-            }),
-            next_seq: 1,
-            pending: None,
-            last_request_ms: 0,
-            last_announce_ms: 0,
-            last_offset_ms: None,
-            last_delay_ms: None,
-        }
-    }
-
-    fn mark_request(&mut self, seq: u64, t1_ms: u64, now_ms: u64) {
-        self.pending = Some((seq, t1_ms));
-        self.last_request_ms = now_ms;
-    }
-
-    fn clear_pending(&mut self) {
-        self.pending = None;
-    }
+pub fn set_network_time_router(router: Arc<Router>) {
+    let _ = NETWORK_TIME_ROUTER.set(router);
 }
 
 pub async fn telemetry_task(
     state: Arc<AppState>,
     router: Arc<sedsprintf_rs_2026::router::Router>,
-    radio: Vec<Arc<Mutex<Box<dyn RadioDevice>>>>,
+    radio: Vec<Arc<Mutex<Box<dyn CommsDevice>>>>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
@@ -553,7 +876,6 @@ pub async fn telemetry_task(
     let mut timesync_interval = interval(Duration::from_millis(100));
     let mut heartbeat_failed = false;
     let mut last_backpressure_log_ms: u64 = 0;
-    let timesync_state = Arc::new(Mutex::new(TimeSyncState::new()));
     let packet_work_queue_size = env_usize(
         "GS_PACKET_WORK_QUEUE_SIZE",
         PACKET_WORK_QUEUE_SIZE,
@@ -562,7 +884,7 @@ pub async fn telemetry_task(
     );
     let db_work_queue_size = env_usize("GS_DB_WORK_QUEUE_SIZE", DB_WORK_QUEUE_SIZE, 1024, 262_144);
     let packet_enqueue_burst = env_usize("GS_PACKET_ENQUEUE_BURST", PACKET_ENQUEUE_BURST, 32, 4096);
-    let (packet_tx, mut packet_rx) = mpsc::channel::<TelemetryPacket>(packet_work_queue_size);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<Packet>(packet_work_queue_size);
     let (db_tx, mut db_rx) = mpsc::channel::<DbWrite>(db_work_queue_size);
     let db_overflow = DbOverflow {
         queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -636,15 +958,11 @@ pub async fn telemetry_task(
 
     let packet_worker = {
         let state = state.clone();
-        let router = router.clone();
-        let timesync_state = timesync_state.clone();
         let db_tx = db_tx.clone();
         let db_overflow = db_overflow.clone();
         tokio::spawn(async move {
             while let Some(pkt) = packet_rx.recv().await {
-                if let Some(row) =
-                    handle_packet(&state, &router, &timesync_state, &db_tx, &db_overflow, pkt).await
-                {
+                if let Some(row) = handle_packet(&state, &db_tx, &db_overflow, pkt).await {
                     state.cache_recent_telemetry(row.clone());
                     let _ = state.ws_tx.send(row);
                 }
@@ -832,6 +1150,10 @@ pub async fn telemetry_task(
                                 }
                                 println!("Nitrous explicit close command sent");
                         }
+                        TelemetryCommand::ContinueFillSequence => {
+                                state.request_fill_sequence_continue();
+                                println!("ContinueFillSequence command accepted");
+                        }
                         TelemetryCommand::DeployParachute => {
                             if let Err(e) = router.log_queue(
                                 DataType::FlightCommand,
@@ -1012,7 +1334,7 @@ pub async fn telemetry_task(
                 }
                 _ = timesync_interval.tick() => {
                     if timesync_enabled() {
-                        handle_timesync_tick(&router, &timesync_state);
+                        let _ = router.poll_timesync();
                     }
                 }
                 recv = shutdown_rx.recv() => {
@@ -1239,11 +1561,9 @@ async fn queue_db_write(
 
 async fn handle_packet(
     state: &Arc<AppState>,
-    router: &Arc<sedsprintf_rs_2026::router::Router>,
-    timesync_state: &Arc<Mutex<TimeSyncState>>,
     db_tx: &mpsc::Sender<DbWrite>,
     db_overflow: &DbOverflow,
-    pkt: TelemetryPacket,
+    pkt: Packet,
 ) -> Option<TelemetryRow> {
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
 
@@ -1253,10 +1573,6 @@ async fn handle_packet(
         } else {
             emit_warning(state, "Warning packet with invalid UTF-8 payload");
         }
-        return None;
-    }
-
-    if handle_timesync_packet(router, timesync_state, &pkt) {
         return None;
     }
 
@@ -1346,8 +1662,16 @@ async fn handle_packet(
 
     let payload_json = payload_json_from_pkt(&pkt);
 
+    if pkt.data_type() == DataType::GpsSatelliteNumber {
+        return handle_gps_satellite_count_packet(state, db_tx, db_overflow, &pkt, &payload_json)
+            .await;
+    }
+
     if let Ok(values) = pkt.data_as_f32() {
-        let values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
+        let mut values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
+        if pkt.data_type() == DataType::GpsData {
+            values_vec = normalized_gps_values(state, pkt.sender(), &values_vec);
+        }
         if pkt.data_type() == DataType::FuelTankPressure {
             let latest = values_vec.first().copied().flatten();
             let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
@@ -1391,18 +1715,36 @@ async fn handle_packet(
             )
             .await;
 
-            if data_type_str == loadcell::RAW_LOADCELL_DATA_TYPE_1000KG {
+            if matches!(
+                data_type_str.as_str(),
+                loadcell::RAW_LOADCELL_DATA_TYPE_1000KG
+                    | loadcell::RAW_LOADCELL_DATA_TYPE_50KG
+                    | loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
+            ) {
                 emit_derived_loadcell_rows(
                     state,
                     db_tx,
                     db_overflow,
                     derived_ts_ms,
                     pkt.sender(),
+                    &data_type_str,
                     voltage,
                     &payload_json,
                 )
                 .await;
             }
+        }
+
+        if let Some(speed_mps) = update_vehicle_speed_estimate(&data_type_str, ts_ms, &values_vec) {
+            emit_derived_vehicle_speed_row(
+                state,
+                db_tx,
+                db_overflow,
+                ts_ms,
+                speed_mps,
+                &payload_json,
+            )
+            .await;
         }
 
         let row = TelemetryRow {
@@ -1434,13 +1776,10 @@ async fn handle_packet(
 }
 
 pub fn get_current_timestamp_ms() -> u64 {
-    let raw = get_system_timestamp_ms();
-    let offset = TIMESYNC_OFFSET_MS.load(Ordering::Relaxed);
-    if offset >= 0 {
-        raw.saturating_add(offset as u64)
-    } else {
-        raw.saturating_sub((-offset) as u64)
-    }
+    NETWORK_TIME_ROUTER
+        .get()
+        .and_then(|router| router.network_time_ms())
+        .unwrap_or_else(get_system_timestamp_ms)
 }
 
 fn get_system_timestamp_ms() -> u64 {
@@ -1454,148 +1793,14 @@ fn log_telemetry_error(context: &str, err: sedsprintf_rs_2026::TelemetryError) {
     eprintln!("{context}: {:?}", err);
 }
 
-fn payload_json_from_pkt(pkt: &sedsprintf_rs_2026::telemetry_packet::TelemetryPacket) -> String {
+fn payload_json_from_pkt(pkt: &Packet) -> String {
     let bytes = pkt.payload();
     serde_json::to_string(&bytes).unwrap_or_else(|_| "[]".to_string())
 }
 
-fn handle_timesync_tick(
-    router: &Arc<sedsprintf_rs_2026::router::Router>,
-    timesync_state: &Arc<Mutex<TimeSyncState>>,
-) {
-    let now_ms = get_system_timestamp_ms();
-    let mut ts = timesync_state.lock().unwrap();
-
-    if ts.tracker.refresh(now_ms) == TimeSyncUpdate::SourceChanged {
-        ts.clear_pending();
-    }
-
-    if ts.tracker.should_announce(now_ms) {
-        if now_ms.saturating_sub(ts.last_announce_ms) >= TIMESYNC_ANNOUNCE_INTERVAL_MS {
-            let _ = queue_timesync_announce(
-                router,
-                ts.tracker.config().priority,
-                get_current_timestamp_ms(),
-            );
-            ts.last_announce_ms = now_ms;
-        }
-        return;
-    }
-
-    if ts.tracker.current_source().is_some()
-        && ts.pending.is_none()
-        && now_ms.saturating_sub(ts.last_request_ms) >= TIMESYNC_REQUEST_INTERVAL_MS
-    {
-        let seq = ts.next_seq;
-        ts.next_seq = ts.next_seq.wrapping_add(1);
-        let t1_ms = get_system_timestamp_ms();
-        if queue_timesync_request(router, seq, t1_ms).is_ok() {
-            ts.mark_request(seq, t1_ms, now_ms);
-        }
-    }
-}
-
-fn handle_timesync_packet(
-    router: &Arc<sedsprintf_rs_2026::router::Router>,
-    timesync_state: &Arc<Mutex<TimeSyncState>>,
-    pkt: &sedsprintf_rs_2026::telemetry_packet::TelemetryPacket,
-) -> bool {
-    if !timesync_enabled() {
-        return false;
-    }
-
-    if pkt.sender() == DEVICE_IDENTIFIER {
-        return true;
-    }
-
-    match pkt.data_type() {
-        DataType::TimeSyncAnnounce => {
-            let now_ms = get_system_timestamp_ms();
-            let mut ts = timesync_state.lock().unwrap();
-            if ts.tracker.handle_announce(pkt, now_ms).is_ok() {
-                return true;
-            }
-            true
-        }
-        DataType::TimeSyncRequest => {
-            let now_ms = get_system_timestamp_ms();
-            let ts = timesync_state.lock().unwrap();
-            if !ts.tracker.should_announce(now_ms) {
-                return true;
-            }
-            let req = match decode_timesync_request(pkt) {
-                Ok(req) => req,
-                Err(_) => return true,
-            };
-            let t2_ms = get_current_timestamp_ms();
-            let t3_ms = get_current_timestamp_ms();
-            let _ = queue_timesync_response(router, req.seq, req.t1_ms, t2_ms, t3_ms);
-            true
-        }
-        DataType::TimeSyncResponse => {
-            let now_ms = get_system_timestamp_ms();
-            let mut ts = timesync_state.lock().unwrap();
-            let resp = match decode_timesync_response(pkt) {
-                Ok(resp) => resp,
-                Err(_) => return true,
-            };
-            let Some((pending_seq, t1_ms)) = ts.pending else {
-                return true;
-            };
-            if pending_seq != resp.seq {
-                return true;
-            }
-            if let Some(source) = ts.tracker.current_source() {
-                if source.sender != pkt.sender() {
-                    return true;
-                }
-            } else {
-                return true;
-            }
-            let sample = compute_offset_delay(t1_ms, resp.t2_ms, resp.t3_ms, now_ms);
-            TIMESYNC_OFFSET_MS.store(sample.offset_ms, Ordering::Relaxed);
-            ts.last_offset_ms = Some(sample.offset_ms);
-            ts.last_delay_ms = Some(sample.delay_ms);
-            ts.clear_pending();
-            true
-        }
-        _ => false,
-    }
-}
-
-fn timesync_enabled() -> bool {
+pub fn timesync_enabled() -> bool {
     if cfg!(feature = "testing") {
         return std::env::var("GROUNDSTATION_TIMESYNC").ok().as_deref() == Some("1");
     }
     true
-}
-
-fn queue_timesync_announce(
-    router: &sedsprintf_rs_2026::router::Router,
-    priority: u64,
-    time_ms: u64,
-) -> sedsprintf_rs_2026::TelemetryResult<()> {
-    router.log_queue_ts(DataType::TimeSyncAnnounce, time_ms, &[priority, time_ms])
-}
-
-fn queue_timesync_request(
-    router: &sedsprintf_rs_2026::router::Router,
-    seq: u64,
-    t1_ms: u64,
-) -> sedsprintf_rs_2026::TelemetryResult<()> {
-    router.log_queue_ts(DataType::TimeSyncRequest, t1_ms, &[seq, t1_ms])
-}
-
-fn queue_timesync_response(
-    router: &sedsprintf_rs_2026::router::Router,
-    seq: u64,
-    t1_ms: u64,
-    t2_ms: u64,
-    t3_ms: u64,
-) -> sedsprintf_rs_2026::TelemetryResult<()> {
-    router.log_queue_ts(
-        DataType::TimeSyncResponse,
-        t3_ms,
-        &[seq, t1_ms, t2_ms, t3_ms],
-    )
 }

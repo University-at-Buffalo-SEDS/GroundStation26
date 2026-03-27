@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "av_bay": {
+    "interface": "usb_serial",
+    "port": "/dev/ttyUSB1",
+    "baud_rate": 57600
+  },
+  "fill_box": {
+    "interface": "usb_serial",
+    "port": "/dev/ttyAMA0",
+    "baud_rate": 115200
+  }
+}

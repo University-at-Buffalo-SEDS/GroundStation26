@@ -786,7 +786,7 @@ async fn fetch_tiles_for_zoom_async(
                     "z={z} [{{bar:40.cyan/blue}}] {{percent:>3}}% ETA {{eta_precise}} {{msg}} ({{pos}}/{{len}})"
                 ),
             )?
-            .progress_chars("=> "),
+                .progress_chars("=> "),
         );
         pb.set_draw_target(ProgressDrawTarget::stdout_with_hz(10));
         pb.set_message("0.00 MiB/s");
@@ -1108,7 +1108,7 @@ async fn fetch_tiles_for_zoom_async_to_db(
                     "z={z} [{{bar:40.green/blue}}] {{percent:>3}}% ETA {{eta_precise}} {{msg}} ({{pos}}/{{len}})"
                 ),
             )?
-            .progress_chars("=> "),
+                .progress_chars("=> "),
         );
         pb.set_draw_target(ProgressDrawTarget::stdout_with_hz(10));
         pb.set_message("0.00 MiB/s");

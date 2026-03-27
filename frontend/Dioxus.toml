@@ -7,13 +7,13 @@ out_dir = "dist"
 asset_dir = "assets"
 icon = "assets/icon.png"
 category = "public.app-category.utilities"
-build = "12"
+build = "28"
 
 [web.app]
 title = "UBSEDS GroundStation"
 
 [web.watcher]
-watch_path = ["src", "assets"]
+watch_path = ["src", "assets", "static"]
 reload_html = true
 index_on_404 = true
 
@@ -25,7 +25,16 @@ debug = false
 name = "UBSEDS GS"
 identifier = "com.UBSEDS.GS26"
 publisher = "UBSEDS"
-icon = ["assets/icon.ico", "assets/icon.png"]
+resources = ["static/**/*", "assets/**/*"]
+icon = [
+    "icons/32x32.png",
+    "icons/64x64.png",
+    "icons/128x128.png",
+    "icons/128x128@2x.png",
+    "icons/256x256.png",
+    "icons/icon.png",
+    "icons/icon.ico",
+]
 
 [bundle.windows]
 name = "UBSEDS GroundStation"

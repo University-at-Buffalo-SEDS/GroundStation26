@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "session_ttl_seconds": 1209600,
+  "anonymous": {
+    "view_data": true,
+    "send_commands": false
+  },
+  "anonymous_command_access": {
+    "allowed_commands": []
+  },
+  "users": [
+    {
+      "username": "rylan",
+      "password": {
+        "algorithm": "pbkdf2_sha256",
+        "iterations": 120000,
+        "salt_b64": "QvPH4APuwFZmGsQsymlW9g==",
+        "hash_b64": "1o0ipMHSFgryCFeTJxDlEC5V9gLkCedy7NmrMAs4yQA="
+      },
+      "permissions": {
+        "view_data": true,
+        "send_commands": true
+      },
+      "command_access": {
+        "allowed_commands": [
+          "Abort",
+          "AbortAfter15",
+          "AbortAfter40",
+          "AbortAfter70",
+          "AdvanceFlightState",
+          "ConsecutiveSamples",
+          "DeployParachute",
+          "DisableIMU",
+          "Dump",
+          "EnableIMU",
+          "EvaluationAbort",
+          "EvaluationFocus",
+          "EvaluationRelax",
+          "ExpandParachute",
+          "Igniter",
+          "Launch",
+          "LaunchSignal",
+          "MonitorAltitude",
+          "Nitrogen",
+          "Nitrous",
+          "NormallyOpen",
+          "Pilot",
+          "ReinitAfter12",
+          "ReinitAfter26",
+          "ReinitAfter44",
+          "ReinitBarometer",
+          "ReinitSensors",
+          "ResetFailures",
+          "RetractPlumbing",
+          "RevokeConsecutiveSamples",
+          "RevokeMonitorAltitude",
+          "RevokeResetFailures",
+          "RevokeValidateMeasms",
+          "RewindFlightState",
+          "ValidateMeasms"
+        ]
+      },
+      "disabled": false
+    }
+  ]
+}

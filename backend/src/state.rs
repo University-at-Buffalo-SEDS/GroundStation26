@@ -1,16 +1,22 @@
+use crate::auth::AuthManager;
 use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
 use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
-use crate::web::{ErrorMsg, FlightStateMsg, WarningMsg};
-use groundstation_shared::{
-    Board, BoardStatusEntry, BoardStatusMsg, FlightState, TelemetryCommand, TelemetryRow,
+use crate::types::{
+    Board, BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyLink, NetworkTopologyMsg,
+    NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus, TelemetryCommand,
+    TelemetryRow,
 };
-use sedsprintf_rs_2026::telemetry_packet::TelemetryPacket;
+use crate::web::{AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
+use sedsprintf_rs_2026::config::DataEndpoint;
+use sedsprintf_rs_2026::discovery::TopologySnapshot;
+use sedsprintf_rs_2026::packet::Packet;
+use sedsprintf_rs_2026::router::Router;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 
@@ -24,7 +30,7 @@ pub struct BoardStatus {
 #[derive(Clone)]
 pub struct AppState {
     /// Optional ring buffer for full telemetry packets (not JSON)
-    pub ring_buffer: Arc<Mutex<RingBuffer<TelemetryPacket>>>,
+    pub ring_buffer: Arc<Mutex<RingBuffer<Packet>>>,
 
     /// Commands from frontend → server (Arm, Disarm, Abort, etc.)
     pub cmd_tx: mpsc::Sender<TelemetryCommand>,
@@ -38,8 +44,11 @@ pub struct AppState {
     /// Error messages → frontend
     pub errors_tx: broadcast::Sender<ErrorMsg>,
 
-    /// SQLite database
+    /// Main telemetry/application SQLite database.
     pub db: SqlitePool,
+
+    /// Separate SQLite database for auth sessions.
+    pub auth_db: SqlitePool,
 
     /// Current flight state
     pub state: Arc<Mutex<FlightState>>,
@@ -98,14 +107,32 @@ pub struct AppState {
     /// Last accepted command timestamp by command name.
     pub last_command_ms: Arc<Mutex<HashMap<String, u64>>>,
 
+    /// Monotonic counter for operator requests to continue a failed fill sequence.
+    pub fill_sequence_continue_requests: Arc<AtomicU64>,
+
     /// In-memory recent telemetry cache used to bridge DB write lag during reseed.
     pub recent_telemetry_cache: Arc<Mutex<VecDeque<TelemetryRow>>>,
+
+    /// Latest raw GPS fix values keyed by sender ID.
+    pub latest_gps_fix_by_sender: Arc<Mutex<HashMap<String, Vec<Option<f32>>>>>,
+
+    /// Latest GPS satellite count keyed by sender ID.
+    pub latest_gps_satellites_by_sender: Arc<Mutex<HashMap<String, u8>>>,
+
+    /// In-memory recent alerts cache used to bridge DB write lag during reseed.
+    pub recent_alerts_cache: Arc<Mutex<VecDeque<AlertDto>>>,
 
     /// Whether the av-bay (rocket) radio link is physically present.
     pub av_bay_radio_connected: Arc<AtomicBool>,
 
     /// Whether the fill-system (umbilical) radio link is physically present.
     pub fill_radio_connected: Arc<AtomicBool>,
+
+    /// Shared router handle used for exporting discovery topology.
+    pub topology_router: Arc<OnceLock<Arc<Router>>>,
+
+    /// Authentication and authorization manager.
+    pub auth: Arc<AuthManager>,
 }
 
 impl AppState {
@@ -145,6 +172,7 @@ impl AppState {
 
             boards.push(BoardStatusEntry {
                 board: *board,
+                board_label: board.as_str().to_string(),
                 sender_id: board.sender_id().to_string(),
                 seen,
                 last_seen_ms,
@@ -153,6 +181,281 @@ impl AppState {
         }
 
         BoardStatusMsg { boards }
+    }
+
+    pub fn network_topology_snapshot(&self, now_ms: u64) -> NetworkTopologyMsg {
+        let simulated = cfg!(feature = "testing");
+        let exported = self
+            .topology_router
+            .get()
+            .map(|router| router.export_topology());
+        let board_snapshot = self.board_status_snapshot(now_ms);
+
+        let rocket_radio_online = simulated || self.av_bay_radio_connected.load(Ordering::Relaxed);
+        let fill_radio_online = simulated || self.fill_radio_connected.load(Ordering::Relaxed);
+
+        let radio_status = |online: bool| {
+            if simulated {
+                NetworkTopologyStatus::Simulated
+            } else if online {
+                NetworkTopologyStatus::Online
+            } else {
+                NetworkTopologyStatus::Offline
+            }
+        };
+
+        let endpoints_for_side = |snapshot: Option<&TopologySnapshot>, side_name: &str| {
+            let mut endpoints = snapshot
+                .and_then(|snapshot| {
+                    snapshot
+                        .routes
+                        .iter()
+                        .find(|route| route.side_name == side_name)
+                })
+                .map(|route| {
+                    route
+                        .reachable_endpoints
+                        .iter()
+                        .map(DataEndpoint::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            endpoints.sort();
+            endpoints.dedup();
+            endpoints
+        };
+
+        let board_status = |board: Board| -> (NetworkTopologyStatus, Option<String>) {
+            let Some(entry) = board_snapshot
+                .boards
+                .iter()
+                .find(|entry| entry.board == board)
+            else {
+                return (NetworkTopologyStatus::Offline, None);
+            };
+
+            if entry.seen {
+                let detail = entry
+                    .age_ms
+                    .map(|age_ms| format!("Last packet {} ms ago", age_ms));
+                (NetworkTopologyStatus::Online, detail)
+            } else if simulated {
+                (
+                    NetworkTopologyStatus::Simulated,
+                    Some("Simulated network node".to_string()),
+                )
+            } else {
+                (
+                    NetworkTopologyStatus::Offline,
+                    Some("No packets received".to_string()),
+                )
+            }
+        };
+
+        let side_status = |side_name: &str, default_online: bool| {
+            if exported.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .routes
+                    .iter()
+                    .any(|route| route.side_name == side_name)
+            }) {
+                if simulated {
+                    NetworkTopologyStatus::Simulated
+                } else {
+                    NetworkTopologyStatus::Online
+                }
+            } else {
+                radio_status(default_online)
+            }
+        };
+
+        let local_endpoint_list = exported
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .advertised_endpoints
+                    .iter()
+                    .map(DataEndpoint::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let rocket_side_endpoints = endpoints_for_side(exported.as_ref(), "rocket_radio");
+        let fill_side_endpoints = endpoints_for_side(exported.as_ref(), "umbilical_radio");
+        let expected_board_endpoints = |board: Board, side_endpoints: &[String]| -> Vec<String> {
+            let mut endpoints = match board {
+                Board::GroundStation => local_endpoint_list.clone(),
+                Board::FlightComputer => vec![
+                    DataEndpoint::FlightController.as_str().to_string(),
+                    DataEndpoint::FlightState.as_str().to_string(),
+                ],
+                Board::RFBoard | Board::GatewayBoard => side_endpoints.to_vec(),
+                Board::PowerBoard => Vec::new(),
+                Board::DaqBoard => Vec::new(),
+                Board::ValveBoard => vec![
+                    DataEndpoint::ValveBoard.as_str().to_string(),
+                    DataEndpoint::Abort.as_str().to_string(),
+                ],
+                Board::ActuatorBoard => vec![
+                    DataEndpoint::ActuatorBoard.as_str().to_string(),
+                    DataEndpoint::Abort.as_str().to_string(),
+                ],
+            };
+            if simulated {
+                match board {
+                    Board::ValveBoard | Board::ActuatorBoard => {
+                        endpoints.push(DataEndpoint::FlightState.as_str().to_string());
+                    }
+                    _ => {}
+                }
+            }
+            endpoints.sort();
+            endpoints.dedup();
+            endpoints
+        };
+
+        let mut nodes = vec![NetworkTopologyNode {
+            id: "router".to_string(),
+            label: "Ground Station Router".to_string(),
+            kind: NetworkTopologyNodeKind::Router,
+            status: NetworkTopologyStatus::Online,
+            group: "local".to_string(),
+            sender_id: Some(Board::GroundStation.sender_id().to_string()),
+            endpoints: local_endpoint_list.clone(),
+            show_in_details: true,
+            detail: Some("SEDSprintf relay router".to_string()),
+        }];
+
+        let rocket_boards = [Board::FlightComputer, Board::RFBoard, Board::PowerBoard];
+        let fill_boards = [
+            Board::ValveBoard,
+            Board::ActuatorBoard,
+            Board::GatewayBoard,
+            Board::DaqBoard,
+        ];
+
+        for board in rocket_boards {
+            let (status, detail) = board_status(board);
+            let endpoints = expected_board_endpoints(board, &rocket_side_endpoints);
+            let relay_detail = if matches!(board, Board::RFBoard) {
+                Some(if rocket_side_endpoints.is_empty() {
+                    "Relay board for the rocket radio path".to_string()
+                } else {
+                    format!(
+                        "Relay board for the rocket radio path. Routed endpoints: {}",
+                        rocket_side_endpoints.join(", ")
+                    )
+                })
+            } else {
+                None
+            };
+            nodes.push(NetworkTopologyNode {
+                id: format!("board_{}", board.sender_id().to_ascii_lowercase()),
+                label: board.as_str().to_string(),
+                kind: NetworkTopologyNodeKind::Board,
+                status,
+                group: "rocket_remote".to_string(),
+                sender_id: Some(board.sender_id().to_string()),
+                endpoints: endpoints.clone(),
+                show_in_details: true,
+                detail: detail.or(relay_detail).or_else(|| {
+                    if endpoints.is_empty() {
+                        None
+                    } else {
+                        Some(format!(
+                            "Endpoints reachable on this board: {}",
+                            endpoints.join(", ")
+                        ))
+                    }
+                }),
+            });
+        }
+
+        for board in fill_boards {
+            let (status, detail) = board_status(board);
+            let endpoints = expected_board_endpoints(board, &fill_side_endpoints);
+            let relay_detail = if matches!(board, Board::GatewayBoard) {
+                Some(if fill_side_endpoints.is_empty() {
+                    "Relay board for the umbilical radio path".to_string()
+                } else {
+                    format!(
+                        "Relay board for the umbilical radio path. Routed endpoints: {}",
+                        fill_side_endpoints.join(", ")
+                    )
+                })
+            } else {
+                None
+            };
+            nodes.push(NetworkTopologyNode {
+                id: format!("board_{}", board.sender_id().to_ascii_lowercase()),
+                label: board.as_str().to_string(),
+                kind: NetworkTopologyNodeKind::Board,
+                status,
+                group: "fill_remote".to_string(),
+                sender_id: Some(board.sender_id().to_string()),
+                endpoints: endpoints.clone(),
+                show_in_details: true,
+                detail: detail.or(relay_detail).or_else(|| {
+                    if endpoints.is_empty() {
+                        None
+                    } else {
+                        Some(format!(
+                            "Endpoints reachable on this board: {}",
+                            endpoints.join(", ")
+                        ))
+                    }
+                }),
+            });
+        }
+
+        let mut links = vec![
+            NetworkTopologyLink {
+                source: "router".to_string(),
+                target: "board_rf".to_string(),
+                label: Some("rocket radio".to_string()),
+                status: side_status("rocket_radio", rocket_radio_online),
+            },
+            NetworkTopologyLink {
+                source: "router".to_string(),
+                target: "board_gw".to_string(),
+                label: Some("umbilical radio".to_string()),
+                status: side_status("umbilical_radio", fill_radio_online),
+            },
+        ];
+
+        for board in rocket_boards {
+            let (status, _) = board_status(board);
+            if matches!(board, Board::RFBoard) {
+                continue;
+            }
+            links.push(NetworkTopologyLink {
+                source: "board_rf".to_string(),
+                target: format!("board_{}", board.sender_id().to_ascii_lowercase()),
+                label: Some("physical link".to_string()),
+                status,
+            });
+        }
+
+        for board in fill_boards {
+            let (status, _) = board_status(board);
+            if matches!(board, Board::GatewayBoard) {
+                continue;
+            }
+            links.push(NetworkTopologyLink {
+                source: "board_gw".to_string(),
+                target: format!("board_{}", board.sender_id().to_ascii_lowercase()),
+                label: Some("physical link".to_string()),
+                status,
+            });
+        }
+
+        NetworkTopologyMsg {
+            generated_ms: now_ms,
+            simulated,
+            nodes,
+            links,
+        }
     }
 
     pub fn set_umbilical_valve_state(&self, cmd_id: u8, on: bool) {
@@ -184,6 +487,31 @@ impl AppState {
 
     pub fn begin_db_write(&self) {
         self.pending_db_writes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn set_local_flight_state(&self, next_state: FlightState) {
+        let mut slot = self.state.lock().unwrap();
+        if *slot == next_state {
+            return;
+        }
+        *slot = next_state;
+        drop(slot);
+        crate::flight_sim::sync_local_flight_state(next_state);
+
+        let _ = self.state_tx.send(FlightStateMsg { state: next_state });
+
+        self.begin_db_write();
+        let db = self.db.clone();
+        let state_for_task = self.clone();
+        let ts_ms = crate::telemetry_task::get_current_timestamp_ms() as i64;
+        tokio::spawn(async move {
+            let _ = sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
+                .bind(ts_ms)
+                .bind(next_state as i64)
+                .execute(&db)
+                .await;
+            state_for_task.end_db_write();
+        });
     }
 
     pub fn end_db_write(&self) {
@@ -235,6 +563,16 @@ impl AppState {
         message: S,
         persistent: bool,
     ) -> u64 {
+        self.add_notification_action(message, persistent, None, None)
+    }
+
+    pub fn add_notification_action<S: Into<String>>(
+        &self,
+        message: S,
+        persistent: bool,
+        action_label: Option<String>,
+        action_cmd: Option<String>,
+    ) -> u64 {
         let message = message.into();
         let mut notifications = self.notifications.lock().unwrap();
         if let Some(existing) = notifications.iter().find(|n| n.message == message) {
@@ -246,6 +584,8 @@ impl AppState {
             timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
             message,
             persistent,
+            action_label,
+            action_cmd,
         });
         let snapshot = notifications.clone();
         drop(notifications);
@@ -270,6 +610,18 @@ impl AppState {
         self.action_policy.lock().unwrap().clone()
     }
 
+    pub fn request_fill_sequence_continue(&self) {
+        self.fill_sequence_continue_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn consume_fill_sequence_continue_requests(&self) -> bool {
+        let prev = self
+            .fill_sequence_continue_requests
+            .swap(0, Ordering::Relaxed);
+        prev > 0
+    }
+
     pub fn set_action_policy(&self, policy: ActionPolicyMsg) {
         let mut slot = self.action_policy.lock().unwrap();
         if *slot == policy {
@@ -286,11 +638,15 @@ impl AppState {
             TelemetryCommand::Abort
                 | TelemetryCommand::NitrogenClose
                 | TelemetryCommand::NitrousClose
+                | TelemetryCommand::ContinueFillSequence
         ) {
             return true;
         }
         let name = command_name(cmd);
         let policy = self.action_policy.lock().unwrap();
+        if !policy.software_buttons_enabled {
+            return false;
+        }
         policy
             .controls
             .iter()
@@ -332,6 +688,37 @@ impl AppState {
 
     pub fn recent_telemetry_snapshot(&self) -> Vec<TelemetryRow> {
         self.recent_telemetry_cache
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn cache_recent_alert(&self, alert: AlertDto) {
+        const CACHE_WINDOW_MS: i64 = 20 * 60 * 1000;
+        const CACHE_MAX_ROWS: usize = 4_096;
+
+        let mut q = self.recent_alerts_cache.lock().unwrap();
+        q.push_back(alert);
+
+        let newest_ts = q.back().map(|r| r.timestamp_ms).unwrap_or(0);
+        let cutoff = newest_ts.saturating_sub(CACHE_WINDOW_MS);
+        while let Some(front) = q.front() {
+            if front.timestamp_ms < cutoff {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        while q.len() > CACHE_MAX_ROWS {
+            q.pop_front();
+        }
+    }
+
+    pub fn recent_alerts_snapshot(&self) -> Vec<AlertDto> {
+        self.recent_alerts_cache
             .lock()
             .unwrap()
             .iter()

@@ -3,8 +3,10 @@
 
 use dioxus_signals::{Signal, WritableExt};
 use jni::objects::{JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jdouble, jfloat};
-use jni::{JNIEnv, JavaVM};
+use jni::signature::RuntimeMethodSignature;
+use jni::strings::JNIString;
+use jni::sys::{jdouble, jfloat};
+use jni::{Env, EnvUnowned, JavaVM};
 use ndk_context::android_context;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -13,20 +15,36 @@ static HEADING_BITS: AtomicU64 = AtomicU64::new(f64::NAN.to_bits());
 
 const LOCATION_SHIM_CLASS_DOT: &str = "com.ubseds.gs26.LocationShim";
 
-fn with_android_env<R>(f: impl FnOnce(&mut JNIEnv<'_>, &JObject<'_>) -> R) -> Option<R> {
+fn with_android_env<R>(f: impl FnOnce(&mut Env<'_>, &JObject<'_>) -> R) -> Option<R> {
     let ctx = android_context();
-    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
-    let mut env = vm.attach_current_thread().ok()?;
-    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
-    let result = f(&mut env, &context);
-    let _ = context.into_raw();
-    Some(result)
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
+    vm.attach_current_thread(|env| -> jni::errors::Result<R> {
+        let context = unsafe { JObject::from_raw(env, ctx.context().cast()) };
+        let result = f(env, &context);
+        let _ = context.into_raw();
+        Ok(result)
+    })
+    .ok()
 }
 
-fn call_static_void(method: &str, sig: &str, args: &[JValue<'_, '_>]) {
+fn call_static_void(method: &str, sig: &str, args: &[JValue<'_>]) {
     let _ = with_android_env(|env, context| {
+        let method_name = method;
+        let method = JNIString::from(method_name);
+        let parsed_sig = match RuntimeMethodSignature::from_str(sig) {
+            Ok(sig) => sig,
+            Err(err) => {
+                eprintln!("Android bridge signature parse failed: {err}");
+                return;
+            }
+        };
         let class_loader = match env
-            .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+            .call_method(
+                context,
+                jni::jni_str!("getClassLoader"),
+                jni::jni_sig!("()Ljava/lang/ClassLoader;"),
+                &[],
+            )
             .and_then(|value| value.l())
         {
             Ok(loader) => loader,
@@ -45,8 +63,8 @@ fn call_static_void(method: &str, sig: &str, args: &[JValue<'_, '_>]) {
         let class = match env
             .call_method(
                 &class_loader,
-                "loadClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
+                jni::jni_str!("loadClass"),
+                jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
                 &[JValue::Object(&JObject::from(class_name))],
             )
             .and_then(|value| value.l())
@@ -57,14 +75,16 @@ fn call_static_void(method: &str, sig: &str, args: &[JValue<'_, '_>]) {
                 return;
             }
         };
-        let class = JClass::from(class);
+        let class = unsafe { JClass::from_raw(env, class.into_raw().cast()) };
         let mut owned_args = Vec::with_capacity(args.len() + 1);
         if sig.starts_with("(Landroid/content/Context;") {
             owned_args.push(JValue::Object(context));
         }
         owned_args.extend_from_slice(args);
-        if let Err(err) = env.call_static_method(&class, method, sig, &owned_args) {
-            eprintln!("Android bridge call {method} failed: {err}");
+        if let Err(err) =
+            env.call_static_method(&class, &method, &parsed_sig.method_signature(), &owned_args)
+        {
+            eprintln!("Android bridge call {method_name} failed: {err}");
         }
     });
 }
@@ -87,7 +107,7 @@ pub fn set_keep_screen_on(enabled: bool) {
     call_static_void(
         "setKeepScreenOn",
         "(Landroid/content/Context;Z)V",
-        &[JValue::Bool(if enabled { 1 } else { 0 } as jboolean)],
+        &[JValue::Bool(enabled)],
     );
 }
 
@@ -98,7 +118,7 @@ pub fn latest_heading_deg() -> Option<f64> {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_ubseds_gs26_LocationShim_nativeOnLocationUpdate(
-    _env: JNIEnv<'_>,
+    _env: EnvUnowned<'_>,
     _class: JClass<'_>,
     lat: jdouble,
     lon: jdouble,
@@ -113,7 +133,7 @@ pub extern "system" fn Java_com_ubseds_gs26_LocationShim_nativeOnLocationUpdate(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_ubseds_gs26_LocationShim_nativeOnHeadingUpdate(
-    _env: JNIEnv<'_>,
+    _env: EnvUnowned<'_>,
     _class: JClass<'_>,
     heading_deg: jfloat,
 ) {

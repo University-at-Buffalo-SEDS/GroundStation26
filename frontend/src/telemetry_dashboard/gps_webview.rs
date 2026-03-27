@@ -42,19 +42,29 @@ const GEOLOCATION_WATCH_JS: &str = r#"
 })();
 "#;
 
+#[cfg(target_arch = "wasm32")]
+async fn sleep_poll_interval() {
+    gloo_timers::future::sleep(std::time::Duration::from_millis(250)).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn sleep_poll_interval() {
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+}
+
 pub async fn run(mut user_gps: Signal<Option<(f64, f64)>>) {
     document::eval(GEOLOCATION_WATCH_JS);
 
     loop {
         if let Some((lat, lon)) = read_user_latlon_from_window().await {
             user_gps.set(Some((lat, lon)));
-        } else if let Some(message) = read_window_string("__gs26_geo_error").await {
-            if !message.is_empty() {
-                eprintln!("GPS watch error: {message}");
-            }
+        } else if let Some(message) = read_window_string("__gs26_geo_error").await
+            && !message.is_empty()
+        {
+            eprintln!("GPS watch error: {message}");
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        sleep_poll_interval().await;
     }
 }
 

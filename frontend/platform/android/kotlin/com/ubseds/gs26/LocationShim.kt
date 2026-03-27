@@ -14,13 +14,20 @@ import android.location.LocationManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.view.Surface
 import android.view.WindowManager
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
 
 object LocationShim : LocationListener, SensorEventListener {
     private const val LOCATION_PERMISSION_REQUEST_CODE = 2601
     private const val LOCATION_MIN_TIME_MS = 250L
     private const val LOCATION_MIN_DISTANCE_M = 0.25f
+    private const val HEADING_SMOOTHING_ALPHA_HIGH = 0.12f
+    private const val HEADING_SMOOTHING_ALPHA_LOW = 0.06f
+    private const val HEADING_JITTER_THRESHOLD_DEG = 1.2f
+    private const val HEADING_SAMPLE_WINDOW = 7
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -30,6 +37,9 @@ object LocationShim : LocationListener, SensorEventListener {
     private var activity: Activity? = null
     private var started = false
     private var permissionRequested = false
+    private var smoothedHeadingDeg: Float? = null
+    private var headingAccuracy: Int = SensorManager.SENSOR_STATUS_UNRELIABLE
+    private val headingSamples = ArrayDeque<Float>()
 
     @JvmStatic
     external fun nativeOnLocationUpdate(lat: Double, lon: Double)
@@ -52,11 +62,17 @@ object LocationShim : LocationListener, SensorEventListener {
                 locationManager?.removeUpdates(this)
                 sensorManager?.unregisterListener(this)
                 started = false
+                smoothedHeadingDeg = null
+                headingAccuracy = SensorManager.SENSOR_STATUS_UNRELIABLE
+                headingSamples.clear()
             }
         } else {
             locationManager?.removeUpdates(this)
             sensorManager?.unregisterListener(this)
             started = false
+            smoothedHeadingDeg = null
+            headingAccuracy = SensorManager.SENSOR_STATUS_UNRELIABLE
+            headingSamples.clear()
         }
     }
 
@@ -123,7 +139,7 @@ object LocationShim : LocationListener, SensorEventListener {
         }
 
         rotationVectorSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
 
         tryEmitLastKnownLocation(locationManager)
@@ -187,38 +203,87 @@ object LocationShim : LocationListener, SensorEventListener {
         }
 
         val rotationMatrix = FloatArray(9)
-        val adjustedRotationMatrix = FloatArray(9)
         val orientation = FloatArray(3)
         SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-        val displayRotation = activity?.display?.rotation ?: Surface.ROTATION_0
-        when (displayRotation) {
-            Surface.ROTATION_90 -> SensorManager.remapCoordinateSystem(
-                rotationMatrix,
-                SensorManager.AXIS_Y,
-                SensorManager.AXIS_MINUS_X,
-                adjustedRotationMatrix
-            )
-            Surface.ROTATION_180 -> SensorManager.remapCoordinateSystem(
-                rotationMatrix,
-                SensorManager.AXIS_MINUS_X,
-                SensorManager.AXIS_MINUS_Y,
-                adjustedRotationMatrix
-            )
-            Surface.ROTATION_270 -> SensorManager.remapCoordinateSystem(
-                rotationMatrix,
-                SensorManager.AXIS_MINUS_Y,
-                SensorManager.AXIS_X,
-                adjustedRotationMatrix
-            )
-            else -> rotationMatrix.copyInto(adjustedRotationMatrix)
-        }
-        SensorManager.getOrientation(adjustedRotationMatrix, orientation)
+        SensorManager.getOrientation(rotationMatrix, orientation)
         var headingDeg = Math.toDegrees(orientation[0].toDouble()).toFloat()
         if (headingDeg < 0f) {
             headingDeg += 360f
         }
+        if (headingAccuracy == SensorManager.SENSOR_STATUS_UNRELIABLE && smoothedHeadingDeg != null) {
+            return
+        }
+        headingDeg = smoothHeading(headingDeg)
         nativeOnHeadingUpdate(headingDeg)
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        if (sensor?.type == Sensor.TYPE_ROTATION_VECTOR) {
+            headingAccuracy = accuracy
+        }
+    }
+
+    private fun smoothHeading(sampleDeg: Float): Float {
+        headingSamples.addLast(sampleDeg)
+        while (headingSamples.size > HEADING_SAMPLE_WINDOW) {
+            headingSamples.removeFirst()
+        }
+        val averagedSample = circularMeanDeg(headingSamples)
+        val previous = smoothedHeadingDeg
+        if (previous == null) {
+            smoothedHeadingDeg = averagedSample
+            return averagedSample
+        }
+
+        var delta = averagedSample - previous
+        if (delta > 180f) {
+            delta -= 360f
+        } else if (delta < -180f) {
+            delta += 360f
+        }
+
+        if (abs(delta) < HEADING_JITTER_THRESHOLD_DEG) {
+            return previous
+        }
+
+        val alpha = if (headingAccuracy >= SensorManager.SENSOR_STATUS_ACCURACY_HIGH) {
+            HEADING_SMOOTHING_ALPHA_HIGH
+        } else {
+            HEADING_SMOOTHING_ALPHA_LOW
+        }
+        val next = normalizeHeading(previous + (delta * alpha))
+        smoothedHeadingDeg = next
+        return next
+    }
+
+    private fun circularMeanDeg(values: Iterable<Float>): Float {
+        var x = 0.0
+        var y = 0.0
+        var count = 0
+        for (deg in values) {
+            val rad = Math.toRadians(deg.toDouble())
+            x += cos(rad)
+            y += sin(rad)
+            count += 1
+        }
+        if (count == 0) {
+            return 0f
+        }
+        var deg = Math.toDegrees(atan2(y, x)).toFloat()
+        if (deg < 0f) {
+            deg += 360f
+        }
+        return deg
+    }
+
+    private fun normalizeHeading(value: Float): Float {
+        var heading = value % 360f
+        if (heading < 0f) {
+            heading += 360f
+        }
+        if (abs(heading - 360f) < 0.001f) {
+            heading = 0f
+        }
+        return heading
+    }
 }

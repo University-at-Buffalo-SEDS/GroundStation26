@@ -1,7 +1,9 @@
 #![allow(clippy::redundant_locals)]
 
-use super::types::TelemetryRow;
-use super::{http_get_json, http_post_json};
+use super::{
+    TELEMETRY_RENDER_EPOCH, http_get_json, http_post_json, latest_telemetry_row,
+    latest_telemetry_value,
+};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +34,14 @@ impl Channel {
             Self::Ch0 => "50kg",
             Self::Ch1 => "1000kg",
             Self::Iadc => "Tank Pressure",
+        }
+    }
+
+    fn fit_color(&self) -> &'static str {
+        match self {
+            Self::Ch0 => "#f59e0b",
+            Self::Ch1 => "#22d3ee",
+            Self::Iadc => "#a78bfa",
         }
     }
 }
@@ -173,7 +183,7 @@ enum CaptureMode {
     SequencePoint,
 }
 
-fn sleep_ms(ms: u32) -> impl std::future::Future<Output = ()> {
+fn sleep_ms(ms: u32) -> impl Future<Output = ()> {
     #[cfg(target_arch = "wasm32")]
     {
         gloo_timers::future::TimeoutFuture::new(ms)
@@ -184,11 +194,8 @@ fn sleep_ms(ms: u32) -> impl std::future::Future<Output = ()> {
     }
 }
 
-fn latest_raw(rows: &[TelemetryRow], data_type: &str) -> Option<f32> {
-    rows.iter()
-        .rev()
-        .find(|r| r.data_type == data_type)
-        .and_then(|r| r.values.first().copied().flatten())
+fn latest_raw(data_type: &str) -> Option<f32> {
+    latest_telemetry_value(data_type, None, 0)
 }
 
 fn fmt_fixed(v: Option<f32>, width: usize, prec: usize) -> String {
@@ -475,7 +482,8 @@ fn fit_details_text(cfg: &CalibrationFile, channel: Channel) -> Option<String> {
 }
 
 #[component]
-pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
+pub fn CalibrationTab() -> Element {
+    let _ = *TELEMETRY_RENDER_EPOCH.read();
     let layout_cfg = use_signal(|| None::<CalibrationTabLayout>);
     let sensors = layout_cfg
         .read()
@@ -551,7 +559,6 @@ pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
 
     {
         let mut capture_loop_started = capture_loop_started;
-        let rows = rows;
         let selected_sensor_id = selected_sensor_id;
         let sensors = sensors.clone();
         let capture_target = capture_target;
@@ -580,8 +587,7 @@ pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
                         continue;
                     };
                     let channel = Channel::from_layout(sensor.channel.as_str());
-                    let Some(raw) = latest_raw(rows.read().as_slice(), sensor.data_type.as_str())
-                    else {
+                    let Some(raw) = latest_raw(sensor.data_type.as_str()) else {
                         continue;
                     };
 
@@ -710,14 +716,10 @@ pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
         .unwrap_or_default();
     let raw_live = selected_sensor
         .as_ref()
-        .and_then(|s| latest_raw(rows.read().as_slice(), s.data_type.as_str()));
-    let last_ts_ms = selected_sensor.as_ref().and_then(|s| {
-        rows.read()
-            .iter()
-            .rev()
-            .find(|r| r.data_type == s.data_type)
-            .map(|r| r.timestamp_ms)
-    });
+        .and_then(|s| latest_raw(s.data_type.as_str()));
+    let last_ts_ms = selected_sensor
+        .as_ref()
+        .and_then(|s| latest_telemetry_row(&s.data_type, None).map(|r| r.timestamp_ms));
     let sequence_started = cfg.read().as_ref().is_some_and(|c| match channel {
         Channel::Ch0 => c.ch0_zero_raw.is_some(),
         Channel::Ch1 => c.ch1_zero_raw.is_some(),
@@ -742,6 +744,10 @@ pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
         .read()
         .as_ref()
         .and_then(|c| fit_details_text(c, channel));
+    let fit_equation_text = fit_meta_text
+        .clone()
+        .unwrap_or_else(|| format!("type={fit_type_s}"));
+    let fit_color = channel.fit_color();
 
     let plot_w = 900.0_f32;
     let plot_h = 260.0_f32;
@@ -810,9 +816,6 @@ pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
     rsx! {
         div { style: "padding:16px; display:flex; flex-direction:column; gap:10px; min-height:100%; overflow:visible;",
             h2 { style: "margin:0; color:#14b8a6;", "Calibration Sequence" }
-            div { style: "font-size:13px; color:#94a3b8;",
-                "Compatible with the Python calibration JSON (ch0/ch1/iadc + points + fit metadata)."
-            }
 
             div { style: "display:flex; gap:8px; flex-wrap:wrap; align-items:center;",
                 span { "Sensors" }
@@ -842,15 +845,6 @@ pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
                 {metric_card("Live Raw", raw_live_s.clone())}
                 {metric_card("Calibrated Value", calibrated_live_s.clone())}
                 {metric_card("Active Fit", fit_type_s.clone())}
-            }
-
-            if let Some(fit_meta_text) = fit_meta_text {
-                div { style: "border:1px solid #334155; border-radius:10px; padding:10px 12px; background:#0b1220; color:#94a3b8; overflow:visible; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;",
-                    div { style: "font-size:12px; color:#94a3b8; margin-bottom:4px;", "Fit Parameters" }
-                    div { style: "white-space:pre-wrap; word-break:break-word; min-height:24px; line-height:1.45;",
-                        "{fit_meta_text}"
-                    }
-                }
             }
 
             div { style: "display:flex; gap:8px; flex-wrap:wrap; align-items:center;",
@@ -1188,12 +1182,26 @@ pub fn CalibrationTab(rows: Signal<Vec<TelemetryRow>>) -> Element {
             }
 
             div { style: "border:1px solid #334155; border-radius:10px; padding:8px; background:#020617;",
+                div {
+                    style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:6px 8px 10px 8px;",
+                    svg { width: "30", height: "10", view_box: "0 0 30 10", style: "display:block; flex:0 0 auto;",
+                        line { x1:"2", y1:"5", x2:"28", y2:"5", stroke:"{fit_color}", "stroke-width":"2.5", "stroke-linecap":"round" }
+                    }
+                    div {
+                        style: "color:{fit_color}; font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase;",
+                        "Calibration Fit"
+                    }
+                    div {
+                        style: "color:{fit_color}; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums; white-space:pre-wrap; word-break:break-word; line-height:1.45; min-height:20px;",
+                        "{fit_equation_text}"
+                    }
+                }
                 svg { view_box: "0 0 {plot_w} {plot_h}", style: "width:100%; height:260px; display:block;",
                     rect { x:"0", y:"0", width:"{plot_w}", height:"{plot_h}", fill:"#020617" }
                     line { x1:"{pad_l}", y1:"{pad_t}", x2:"{pad_l}", y2:"{plot_h - pad_b}", stroke:"#334155", "stroke-width":"1" }
                     line { x1:"{pad_l}", y1:"{plot_h - pad_b}", x2:"{plot_w - pad_r}", y2:"{plot_h - pad_b}", stroke:"#334155", "stroke-width":"1" }
                     if !fit_path.is_empty() {
-                        path { d: "{fit_path}", fill:"none", stroke:"#22d3ee", "stroke-width":"2" }
+                        path { d: "{fit_path}", fill:"none", stroke:"{fit_color}", "stroke-width":"2.5" }
                     }
                     for (cx, cy) in scatter_xy.iter() {
                         circle { cx:"{cx}", cy:"{cy}", r:"3.5", fill:"#f59e0b" }

@@ -1,8 +1,8 @@
 use crate::gpio::Trigger;
 use crate::sequences::{ActionPolicyMsg, BlinkMode};
 use crate::state::AppState;
+use crate::types::TelemetryCommand;
 use crate::web::{emit_error, emit_warning};
-use groundstation_shared::TelemetryCommand;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,5 +1,79 @@
 {
   "version": 1,
+  "branding": {
+    "app_name": "Telemetry Dashboard",
+    "dashboard_title": "Telemetry Dashboard",
+    "tab_labels": {
+      "state": "Flight",
+      "connection-status": "Connection Status",
+      "map": "Map",
+      "actions": "Actions",
+      "calibration": "Calibration",
+      "notifications": "Notifications",
+      "warnings": "Warnings",
+      "errors": "Errors",
+      "data": "Data",
+      "network-topology": "Network Topology",
+      "detailed": "Detailed Info"
+    }
+  },
+  "theme": {
+    "app_background": "#020617",
+    "panel_background": "#0b1220",
+    "panel_background_alt": "#0f172a",
+    "overlay_background": "#020617ee",
+    "border": "#334155",
+    "border_strong": "#4b5563",
+    "border_soft": "#1f2937",
+    "text_primary": "#e5e7eb",
+    "text_secondary": "#cbd5e1",
+    "text_muted": "#94a3b8",
+    "text_soft": "#9ca3af",
+    "button_background": "#111827",
+    "button_border": "#334155",
+    "button_text": "#e5e7eb",
+    "tab_shell_background": "#020617ee",
+    "tab_shell_border": "#4b5563",
+    "info_accent": "#60a5fa",
+    "info_background": "#0b1a33",
+    "info_text": "#bfdbfe",
+    "success_text": "#22c55e",
+    "warning_background": "#451a03",
+    "warning_border": "#f59e0b",
+    "warning_text": "#fde68a",
+    "error_background": "#450a0a",
+    "error_border": "#ef4444",
+    "error_text": "#fecaca",
+    "notification_background": "#0b1f4d",
+    "notification_border": "#2563eb",
+    "notification_text": "#bfdbfe",
+    "main_tab_accents": {
+      "state": "#38bdf8",
+      "connection-status": "#06b6d4",
+      "detailed": "#0ea5e9",
+      "map": "#22c55e",
+      "actions": "#a78bfa",
+      "calibration": "#14b8a6",
+      "notifications": "#3b82f6",
+      "warnings": "#facc15",
+      "errors": "#ef4444",
+      "data": "#f97316",
+      "network-topology": "#8b5cf6"
+    }
+  },
+  "main_tabs": [
+    "state",
+    "connection-status",
+    "map",
+    "actions",
+    "calibration",
+    "notifications",
+    "warnings",
+    "errors",
+    "data",
+    "network-topology",
+    "detailed"
+  ],
   "connection_tab": {
     "sections": [
       {
@@ -11,6 +85,10 @@
         "title": "Packet Age (ms)"
       }
     ]
+  },
+  "network_tab": {
+    "enabled": true,
+    "title": "Network Topology"
   },
   "actions_tab": {
     "actions": [
@@ -70,13 +148,14 @@
         "bg": "#1f2937",
         "fg": "#fef9c3"
       }
-    ]
+    ],
+    "disable_actions_by_default": true
   },
   "data_tab": {
     "tabs": [
       {
         "id": "GYRO_DATA",
-        "label": "GYRO_DATA",
+        "label": "Gyro Data",
         "channels": [
           "Roll",
           "Pitch",
@@ -88,7 +167,7 @@
       },
       {
         "id": "ACCEL_DATA",
-        "label": "ACCEL_DATA",
+        "label": "Accel Data",
         "channels": [
           "X Accel",
           "Y Accel",
@@ -100,11 +179,21 @@
       },
       {
         "id": "BAROMETER_DATA",
-        "label": "BAROMETER_DATA",
+        "label": "Barometer Data",
         "channels": [
           "Pressure",
           "Temp",
           "Altitude"
+        ],
+        "chart_groups": [
+          {
+            "channels": [
+              0,
+              1,
+              2
+            ],
+            "scale_mode": "per_series"
+          }
         ],
         "chart": {
           "enabled": true
@@ -112,7 +201,7 @@
       },
       {
         "id": "KALMAN_FILTER_DATA",
-        "label": "KALMAN_FILTER_DATA",
+        "label": "Kalman Filter Data",
         "channels": [
           "X",
           "Y",
@@ -124,10 +213,36 @@
       },
       {
         "id": "GPS_DATA",
-        "label": "GPS_DATA",
+        "label": "GPS Data",
         "channels": [
           "Lat",
-          "Lon"
+          "Lon",
+          "Altitude",
+          "Satellites"
+        ],
+        "channel_formatters": [
+          {},
+          {},
+          {},
+          {
+            "kind": "integer"
+          }
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "VEHICLE_SPEED",
+        "label": "Vehicle Speed",
+        "channels": [
+          "Vertical Speed"
+        ],
+        "channel_formatters": [
+          {
+            "precision": 2,
+            "suffix": " m/s"
+          }
         ],
         "chart": {
           "enabled": true
@@ -135,7 +250,7 @@
       },
       {
         "id": "FUEL_TANK_PRESSURE",
-        "label": "FUEL_TANK_PRESSURE",
+        "label": "Fuel Tank Pressure",
         "channels": [
           "Tank Pressure"
         ],
@@ -149,6 +264,32 @@
         "channels": [
           "Voltage"
         ],
+        "subtabs": [
+          {
+            "id": "battery_voltage_pb",
+            "label": "AV Bay",
+            "data_type": "BATTERY_VOLTAGE",
+            "sender_id": "PB",
+            "channels": [
+              "Voltage"
+            ],
+            "chart": {
+              "enabled": true
+            }
+          },
+          {
+            "id": "battery_voltage_gw",
+            "label": "Ground Station",
+            "data_type": "BATTERY_VOLTAGE",
+            "sender_id": "GW",
+            "channels": [
+              "Voltage"
+            ],
+            "chart": {
+              "enabled": true
+            }
+          }
+        ],
         "chart": {
           "enabled": true
         }
@@ -158,6 +299,32 @@
         "label": "Battery Current",
         "channels": [
           "Current"
+        ],
+        "subtabs": [
+          {
+            "id": "battery_current_pb",
+            "label": "AV Bay",
+            "data_type": "BATTERY_CURRENT",
+            "sender_id": "PB",
+            "channels": [
+              "Current"
+            ],
+            "chart": {
+              "enabled": true
+            }
+          },
+          {
+            "id": "battery_current_gw",
+            "label": "Ground Station",
+            "data_type": "BATTERY_CURRENT",
+            "sender_id": "GW",
+            "channels": [
+              "Current"
+            ],
+            "chart": {
+              "enabled": true
+            }
+          }
         ],
         "chart": {
           "enabled": true
@@ -174,13 +341,63 @@
           "Ground Station Drop",
           "Ground Station Runtime"
         ],
+        "subtabs": [
+          {
+            "id": "battery_runtime_pb",
+            "label": "AV Bay",
+            "chart": {
+              "enabled": false
+            },
+            "summary_items": [
+              {
+                "label": "Battery %",
+                "data_type": "AV_BAY_BATTERY_PERCENT",
+                "index": 0
+              },
+              {
+                "label": "Drop Rate",
+                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
+                "index": 0
+              },
+              {
+                "label": "Runtime",
+                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
+                "index": 0
+              }
+            ]
+          },
+          {
+            "id": "battery_runtime_gw",
+            "label": "Ground Station",
+            "chart": {
+              "enabled": false
+            },
+            "summary_items": [
+              {
+                "label": "Battery %",
+                "data_type": "GROUND_STATION_BATTERY_PERCENT",
+                "index": 0
+              },
+              {
+                "label": "Drop Rate",
+                "data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+                "index": 0
+              },
+              {
+                "label": "Runtime",
+                "data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+                "index": 0
+              }
+            ]
+          }
+        ],
         "chart": {
           "enabled": false
         }
       },
       {
         "id": "FUEL_FLOW",
-        "label": "FUEL_FLOW",
+        "label": "Fuel Flow",
         "channels": [
           "Flow Rate"
         ],
@@ -190,7 +407,7 @@
       },
       {
         "id": "VALVE_STATE",
-        "label": "VALVE_STATE",
+        "label": "Valve State",
         "channels": [
           "Pilot",
           "NormallyOpen",
@@ -248,11 +465,178 @@
       },
       {
         "id": "LOADCELL",
-        "label": "LOADCELL",
+        "label": "Loadcell",
         "channels": [
-          "Raw Loadcell",
-          "Weight (kg)",
-          "Fill %"
+          "50kg",
+          "1000kg",
+          "Pressure Transducer"
+        ],
+        "subtabs": [
+          {
+            "id": "loadcell_50kg",
+            "label": "50kg",
+            "data_type": "KG50",
+            "channels": [
+              "50kg"
+            ],
+            "chart_groups": [
+              {
+                "title": "Raw",
+                "data_type": "KG50",
+                "labels": [
+                  "Raw"
+                ],
+                "channels": [
+                  0
+                ]
+              },
+              {
+                "title": "Calibrated",
+                "data_type": "LOADCELL_50KG_CALIBRATED",
+                "labels": [
+                  "Calibrated"
+                ],
+                "channels": [
+                  0
+                ]
+              },
+              {
+                "title": "Fill %",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "labels": [
+                  "Fill %"
+                ],
+                "channels": [
+                  0
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "label": "Raw",
+                "data_type": "KG50",
+                "index": 0
+              },
+              {
+                "label": "Calibrated",
+                "data_type": "LOADCELL_50KG_CALIBRATED",
+                "index": 0
+              },
+              {
+                "label": "Fill %",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "index": 0
+              }
+            ],
+            "chart": {
+              "enabled": true
+            }
+          },
+          {
+            "id": "loadcell_1000kg",
+            "label": "1000kg",
+            "data_type": "KG1000",
+            "channels": [
+              "1000kg"
+            ],
+            "chart_groups": [
+              {
+                "title": "Raw",
+                "data_type": "KG1000",
+                "labels": [
+                  "Raw"
+                ],
+                "channels": [
+                  0
+                ]
+              },
+              {
+                "title": "Calibrated",
+                "data_type": "LOADCELL_WEIGHT_KG",
+                "labels": [
+                  "Calibrated"
+                ],
+                "channels": [
+                  0
+                ]
+              },
+              {
+                "title": "Fill %",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "labels": [
+                  "Fill %"
+                ],
+                "channels": [
+                  0
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "label": "Raw",
+                "data_type": "KG1000",
+                "index": 0
+              },
+              {
+                "label": "Calibrated",
+                "data_type": "LOADCELL_WEIGHT_KG",
+                "index": 0
+              },
+              {
+                "label": "Fill %",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "index": 0
+              }
+            ],
+            "chart": {
+              "enabled": true
+            }
+          },
+          {
+            "id": "loadcell_pressure_transducer",
+            "label": "Pressure Transducer",
+            "data_type": "IADC",
+            "channels": [
+              "Pressure Transducer"
+            ],
+            "chart_groups": [
+              {
+                "title": "Raw",
+                "data_type": "IADC",
+                "labels": [
+                  "Raw"
+                ],
+                "channels": [
+                  0
+                ]
+              },
+              {
+                "title": "Calibrated",
+                "data_type": "PRESSURE_TRANSDUCER_CALIBRATED",
+                "labels": [
+                  "Calibrated"
+                ],
+                "channels": [
+                  0
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "label": "Raw",
+                "data_type": "IADC",
+                "index": 0
+              },
+              {
+                "label": "Calibrated",
+                "data_type": "PRESSURE_TRANSDUCER_CALIBRATED",
+                "index": 0
+              }
+            ],
+            "chart": {
+              "enabled": true
+            }
+          }
         ],
         "chart": {
           "enabled": false
@@ -311,6 +695,25 @@
             ]
           },
           {
+            "title": "GPS",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GPS_DATA",
+                "items": [
+                  {
+                    "label": "Lat",
+                    "index": 0
+                  },
+                  {
+                    "label": "Lon",
+                    "index": 1
+                  }
+                ]
+              }
+            ]
+          },
+          {
             "title": "Ground Station Battery (Gateway Board)",
             "widgets": [
               {
@@ -344,6 +747,36 @@
                 ]
               }
             ]
+          },
+          {
+            "title": "Satellites",
+            "style": {
+              "background": "#0b1220",
+              "border": "#475569",
+              "title_color": "#facc15"
+            },
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GPS_DATA",
+                "summary_style": {
+                  "background": "#1f2937",
+                  "border": "#facc15",
+                  "label_color": "#fde68a",
+                  "value_color": "#fef3c7"
+                },
+                "items": [
+                  {
+                    "label": "Satellites",
+                    "index": 3,
+                    "formatter": {
+                      "kind": "integer",
+                      "prefix": "🛰 "
+                    }
+                  }
+                ]
+              }
+            ]
           }
         ]
       },
@@ -356,7 +789,7 @@
         ],
         "sections": [
           {
-            "title": "Pressure",
+            "title": "Fill Metrics",
             "widgets": [
               {
                 "kind": "summary",
@@ -368,18 +801,6 @@
                   }
                 ]
               },
-              {
-                "kind": "chart",
-                "data_type": "FUEL_TANK_PRESSURE",
-                "chart_title": "Fuel Tank Pressure",
-                "width": 1200.0,
-                "height": 260.0
-              }
-            ]
-          },
-          {
-            "title": "Load Cell",
-            "widgets": [
               {
                 "kind": "summary",
                 "data_type": "LOADCELL_WEIGHT_KG",
@@ -402,17 +823,26 @@
               },
               {
                 "kind": "chart",
-                "data_type": "LOADCELL_WEIGHT_KG",
-                "chart_title": "Loadcell Weight",
+                "chart_title": "Pressure and Loadcell",
+                "chart_series": [
+                  {
+                    "data_type": "FUEL_TANK_PRESSURE",
+                    "index": 0,
+                    "label": "Tank Pressure"
+                  },
+                  {
+                    "data_type": "LOADCELL_WEIGHT_KG",
+                    "index": 0,
+                    "label": "Mass (kg)"
+                  },
+                  {
+                    "data_type": "LOADCELL_FILL_PERCENT",
+                    "index": 0,
+                    "label": "Fill Percent"
+                  }
+                ],
                 "width": 1200.0,
-                "height": 220.0
-              },
-              {
-                "kind": "chart",
-                "data_type": "LOADCELL_FILL_PERCENT",
-                "chart_title": "Loadcell Fill Percent",
-                "width": 1200.0,
-                "height": 220.0
+                "height": 260.0
               }
             ]
           },
@@ -572,6 +1002,36 @@
                   {
                     "label": "Remaining Minutes",
                     "index": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "title": "Satellites",
+            "style": {
+              "background": "#0b1220",
+              "border": "#475569",
+              "title_color": "#facc15"
+            },
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GPS_DATA",
+                "summary_style": {
+                  "background": "#1f2937",
+                  "border": "#facc15",
+                  "label_color": "#fde68a",
+                  "value_color": "#fef3c7"
+                },
+                "items": [
+                  {
+                    "label": "Satellites",
+                    "index": 3,
+                    "formatter": {
+                      "kind": "integer",
+                      "prefix": "🛰 "
+                    }
                   }
                 ]
               }
@@ -740,6 +1200,36 @@
                 ]
               }
             ]
+          },
+          {
+            "title": "Satellites",
+            "style": {
+              "background": "#0b1220",
+              "border": "#475569",
+              "title_color": "#facc15"
+            },
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GPS_DATA",
+                "summary_style": {
+                  "background": "#1f2937",
+                  "border": "#facc15",
+                  "label_color": "#fde68a",
+                  "value_color": "#fef3c7"
+                },
+                "items": [
+                  {
+                    "label": "Satellites",
+                    "index": 3,
+                    "formatter": {
+                      "kind": "integer",
+                      "prefix": "🛰 "
+                    }
+                  }
+                ]
+              }
+            ]
           }
         ]
       },
@@ -754,7 +1244,7 @@
         ],
         "sections": [
           {
-            "title": "Altitude",
+            "title": "Flight Overview",
             "widgets": [
               {
                 "kind": "summary",
@@ -775,16 +1265,66 @@
                 ]
               },
               {
+                "kind": "summary",
+                "data_type": "VEHICLE_SPEED",
+                "items": [
+                  {
+                    "label": "Vertical Speed",
+                    "index": 0,
+                    "formatter": {
+                      "precision": 2,
+                      "suffix": " m/s"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "GPS_DATA",
+                "summary_style": {
+                  "background": "#1f2937",
+                  "border": "#facc15",
+                  "label_color": "#fde68a",
+                  "value_color": "#fef3c7"
+                },
+                "items": [
+                  {
+                    "label": "Satellites",
+                    "index": 3,
+                    "formatter": {
+                      "kind": "integer",
+                      "prefix": "🛰 "
+                    }
+                  }
+                ]
+              },
+              {
                 "kind": "chart",
-                "data_type": "BAROMETER_DATA",
-                "chart_title": "Barometer Data",
+                "chart_title": "Altitude Estimates",
+                "chart_series": [
+                  {
+                    "data_type": "BAROMETER_DATA",
+                    "index": 2,
+                    "label": "Barometer"
+                  },
+                  {
+                    "data_type": "GPS_DATA",
+                    "index": 2,
+                    "label": "GPS"
+                  },
+                  {
+                    "data_type": "KALMAN_FILTER_DATA",
+                    "index": 0,
+                    "label": "Kalman"
+                  }
+                ],
                 "width": 1200.0,
-                "height": 280.0
+                "height": 260.0
               }
             ]
           },
           {
-            "title": "Acceleration",
+            "title": "Dynamics",
             "widgets": [
               {
                 "kind": "summary",
@@ -805,18 +1345,6 @@
                 ]
               },
               {
-                "kind": "chart",
-                "data_type": "ACCEL_DATA",
-                "chart_title": "Acceleration",
-                "width": 1200.0,
-                "height": 300.0
-              }
-            ]
-          },
-          {
-            "title": "Kalman Filter",
-            "widgets": [
-              {
                 "kind": "summary",
                 "data_type": "KALMAN_FILTER_DATA",
                 "items": [
@@ -836,10 +1364,28 @@
               },
               {
                 "kind": "chart",
-                "data_type": "KALMAN_FILTER_DATA",
-                "chart_title": "Kalman Filter",
+                "chart_title": "Vertical Speed Comparison",
+                "chart_series": [
+                  {
+                    "data_type": "VEHICLE_SPEED",
+                    "index": 0,
+                    "label": "Fused"
+                  },
+                  {
+                    "data_type": "KALMAN_FILTER_DATA",
+                    "index": 1,
+                    "label": "Kalman"
+                  }
+                ],
                 "width": 1200.0,
-                "height": 300.0
+                "height": 240.0
+              },
+              {
+                "kind": "chart",
+                "data_type": "ACCEL_DATA",
+                "chart_title": "Acceleration",
+                "width": 1200.0,
+                "height": 240.0
               }
             ]
           }
@@ -924,6 +1470,36 @@
                   {
                     "label": "Remaining Minutes",
                     "index": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "title": "Satellites",
+            "style": {
+              "background": "#0b1220",
+              "border": "#475569",
+              "title_color": "#facc15"
+            },
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GPS_DATA",
+                "summary_style": {
+                  "background": "#1f2937",
+                  "border": "#facc15",
+                  "label_color": "#fde68a",
+                  "value_color": "#fef3c7"
+                },
+                "items": [
+                  {
+                    "label": "Satellites",
+                    "index": 3,
+                    "formatter": {
+                      "kind": "integer",
+                      "prefix": "🛰 "
+                    }
                   }
                 ]
               }
@@ -1033,6 +1609,36 @@
                   {
                     "label": "Remaining Minutes",
                     "index": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "title": "Satellites",
+            "style": {
+              "background": "#0b1220",
+              "border": "#475569",
+              "title_color": "#facc15"
+            },
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "GPS_DATA",
+                "summary_style": {
+                  "background": "#1f2937",
+                  "border": "#facc15",
+                  "label_color": "#fde68a",
+                  "value_color": "#fef3c7"
+                },
+                "items": [
+                  {
+                    "label": "Satellites",
+                    "index": 3,
+                    "formatter": {
+                      "kind": "integer",
+                      "prefix": "🛰 "
+                    }
                   }
                 ]
               }

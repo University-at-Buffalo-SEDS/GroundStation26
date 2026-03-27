@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use crate::telemetry_task::get_current_timestamp_ms;
+use crate::types::{Board, FlightState};
 use crate::web::{emit_warning, emit_warning_db_only};
-use groundstation_shared::{Board, FlightState};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
 use sqlx::SqlitePool;

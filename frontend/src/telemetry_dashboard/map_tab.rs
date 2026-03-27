@@ -14,6 +14,11 @@ use serde::Deserialize;
 const RESIZE_DEBOUNCE_MS: u64 = 250;
 const FULLSCREEN_REINIT_DELAY_MS: u64 = 80;
 const DEFAULT_MAX_NATIVE_ZOOM: u32 = 12;
+const DEFAULT_MAP_CENTER_LAT: f64 = 31.0;
+const DEFAULT_MAP_CENTER_LON: f64 = -99.0;
+const DEFAULT_MAP_ZOOM: f64 = 7.0;
+const DEFAULT_MAP_TITLE: &str = "Map";
+const DEFAULT_TRACKED_ASSET_LABEL: &str = "Tracked Asset";
 
 fn tiles_url() -> String {
     map_tiles_url()
@@ -23,7 +28,10 @@ fn tiles_url() -> String {
 pub fn MapTab(
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
+    #[props(default)] title: Option<String>,
 ) -> Element {
+    let _ = *rocket_gps.read();
+    let _ = *user_gps.read();
     let mut is_fullscreen = use_signal(|| false);
     #[cfg(target_os = "ios")]
     let mut show_enable_compass = use_signal(|| false);
@@ -33,13 +41,18 @@ pub fn MapTab(
     // Browser-derived location (from navigator.geolocation inside the webview/page)
     let mut browser_user_gps = use_signal(|| None::<(f64, f64)>);
     let has_centered_on_user = use_signal(|| false);
-    let max_native_zoom = use_signal(|| DEFAULT_MAX_NATIVE_ZOOM);
+    let map_config = use_signal(MapConfig::default);
+    let resolved_title = if title.as_deref().unwrap_or_default().trim().is_empty() {
+        map_config.read().map_title.clone()
+    } else {
+        title.clone().unwrap_or_default()
+    };
 
     {
-        let mut max_native_zoom = max_native_zoom;
+        let mut map_config = map_config;
         use_future(move || async move {
             if let Ok(cfg) = http_get_json::<MapConfig>("/api/map_config").await {
-                max_native_zoom.set(cfg.max_native_zoom.max(1));
+                map_config.set(cfg.sanitized());
             }
         });
     }
@@ -47,11 +60,11 @@ pub fn MapTab(
     // --- 0) One-time JS setup (iOS/native safe: JS owns resize/orientation detection) ---
     {
         let tiles = tiles_url();
-        let max_native_zoom_sig = max_native_zoom;
+        let map_config = map_config;
         #[cfg(target_os = "ios")]
         let mut show_enable_compass = show_enable_compass;
         use_effect(move || {
-            let max_native_zoom = *max_native_zoom_sig.read();
+            let config = map_config.read().clone();
             js_eval(r#"console.error("[GS26 map] setup effect entered");"#);
             #[cfg(target_os = "ios")]
             js_eval(
@@ -69,25 +82,31 @@ pub fn MapTab(
 
             js_setup_map_touch_guard();
             js_setup_map_size_guard();
-            js_setup_js_init_retry(&tiles, max_native_zoom);
+            js_setup_js_init_retry(&tiles, &config);
             #[cfg(not(target_os = "android"))]
             _js_setup_js_geolocation_watch();
 
             // Debounced resize/orientation/visualViewport reinit path
-            js_setup_js_resize_reinit(&tiles, max_native_zoom, RESIZE_DEBOUNCE_MS);
+            js_setup_js_resize_reinit(&tiles, &config, RESIZE_DEBOUNCE_MS);
 
             // Fullscreen enter/exit explicit reinit hook (independent of rotation)
-            js_setup_js_fullscreen_reinit(&tiles, max_native_zoom);
+            js_setup_js_fullscreen_reinit(&tiles, &config);
 
-            js_eval(
-                &format!(
-                    r#"
+            js_eval(&format!(
+                r#"
                     (function() {{
                       try {{
                         console.error("[GS26 map] forcing immediate init attempt");
                         if (window.__gs26_ground_station_loaded === true &&
                             typeof window.initGroundMap === "function") {{
-                          window.initGroundMap({tiles:?}, 31.0, -99.0, 7.0, {max_native_zoom});
+                          window.initGroundMap(
+                            {tiles:?},
+                            {center_lat},
+                            {center_lon},
+                            {zoom},
+                            {max_native_zoom},
+                            {tracked_asset_label:?}
+                          );
                         }} else {{
                           console.error("[GS26 map] init prerequisites missing", {{
                             loaded: window.__gs26_ground_station_loaded,
@@ -98,22 +117,26 @@ pub fn MapTab(
                         console.error("[GS26 map] immediate init failed", String(e), e && e.stack ? e.stack : "");
                       }}
                     }})();
-                    "#
-                ),
-            );
+                    "#,
+                center_lat = config.default_center_lat,
+                center_lon = config.default_center_lon,
+                zoom = config.default_zoom,
+                max_native_zoom = config.max_native_zoom,
+                tracked_asset_label = config.tracked_asset_label
+            ));
         });
     }
 
     // --- 1) Fullscreen enter/exit ALWAYS forces a reinit + invalidate (independent of rotation) ---
     {
         let tiles = tiles_url();
-        let max_native_zoom_sig = max_native_zoom;
+        let map_config = map_config;
         let is_fullscreen_sig = is_fullscreen;
         use_effect(move || {
-            let max_native_zoom = *max_native_zoom_sig.read();
+            let config = map_config.read().clone();
             let fs = *is_fullscreen_sig.read();
             js_eval(r#"console.error("[GS26 map] fullscreen/reinit effect entered");"#);
-            js_force_map_reinit_now(&tiles, max_native_zoom, fs, FULLSCREEN_REINIT_DELAY_MS);
+            js_force_map_reinit_now(&tiles, &config, fs, FULLSCREEN_REINIT_DELAY_MS);
         });
     }
 
@@ -248,7 +271,7 @@ pub fn MapTab(
         if *is_fullscreen.read() {
             div { style: "position:fixed; inset:0; z-index:9999; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
                 div { style: "display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:space-between;",
-                    h2 { style: "margin:0; color:#22c55e;", "Rocket Map" }
+                    h2 { style: "margin:0; color:#22c55e;", "{resolved_title}" }
                     div { style: "display:flex; gap:8px; flex-wrap:wrap;",
                         button {
                             style: "padding:6px 12px; border-radius:999px; border:1px solid #22c55e; background:#022c22; color:#bbf7d0; font-size:0.85rem; cursor:pointer;",
@@ -292,7 +315,7 @@ pub fn MapTab(
                         box-shadow:0 10px 25px rgba(0,0,0,0.45);",
                 div {
                     style: "display:flex; align-items:center; gap:12px; flex-wrap:wrap;",
-                    h2 { style: "margin:0; color:#22c55e;", "Launch Site Map" }
+                    h2 { style: "margin:0; color:#22c55e;", "{resolved_title}" }
                     button {
                         style: "padding:6px 12px; border-radius:999px; border:1px solid #22c55e; background:#022c22; color:#bbf7d0; font-size:0.85rem; cursor:pointer;",
                         onclick: on_center_me,
@@ -334,9 +357,14 @@ pub fn MapTab(
  * JS bridge helpers (no wasm-bindgen imports)
  * ============================================================================================== */
 
-fn js_setup_js_fullscreen_reinit(tiles: &str, max_native_zoom: u32) {
+fn js_setup_js_fullscreen_reinit(tiles: &str, config: &MapConfig) {
     let tiles_js = serde_json::to_string(tiles).unwrap_or_else(|_| "\"\"".to_string());
-    let max_native_zoom_js = max_native_zoom.to_string();
+    let max_native_zoom_js = config.max_native_zoom.to_string();
+    let center_lat_js = config.default_center_lat.to_string();
+    let center_lon_js = config.default_center_lon.to_string();
+    let zoom_js = config.default_zoom.to_string();
+    let tracked_asset_label_js = serde_json::to_string(&config.tracked_asset_label)
+        .unwrap_or_else(|_| "\"Tracked Asset\"".to_string());
 
     let script = r#"
     (function() {
@@ -345,6 +373,10 @@ fn js_setup_js_fullscreen_reinit(tiles: &str, max_native_zoom: u32) {
 
       window.__gs26_tiles_url = __TILES__;
       window.__gs26_max_native_zoom = __MAX_NATIVE_ZOOM__;
+      window.__gs26_default_center_lat = __CENTER_LAT__;
+      window.__gs26_default_center_lon = __CENTER_LON__;
+      window.__gs26_default_zoom = __DEFAULT_ZOOM__;
+      window.__gs26_tracked_asset_title = __TRACKED_ASSET_TITLE__;
 
       function doInvalidateMulti() {
         try {
@@ -379,7 +411,14 @@ fn js_setup_js_fullscreen_reinit(tiles: &str, max_native_zoom: u32) {
             try {
               if (window.__gs26_ground_station_loaded === true &&
                   typeof window.initGroundMap === "function") {
-                window.initGroundMap(window.__gs26_tiles_url, 31.0, -99.0, 7.0, window.__gs26_max_native_zoom);
+                window.initGroundMap(
+                  window.__gs26_tiles_url,
+                  window.__gs26_default_center_lat,
+                  window.__gs26_default_center_lon,
+                  window.__gs26_default_zoom,
+                  window.__gs26_max_native_zoom,
+                  window.__gs26_tracked_asset_title
+                );
               }
             } catch(e) {}
 
@@ -400,13 +439,22 @@ fn js_setup_js_fullscreen_reinit(tiles: &str, max_native_zoom: u32) {
     js_eval(
         &script
             .replace("__TILES__", &tiles_js)
-            .replace("__MAX_NATIVE_ZOOM__", &max_native_zoom_js),
+            .replace("__MAX_NATIVE_ZOOM__", &max_native_zoom_js)
+            .replace("__CENTER_LAT__", &center_lat_js)
+            .replace("__CENTER_LON__", &center_lon_js)
+            .replace("__DEFAULT_ZOOM__", &zoom_js)
+            .replace("__TRACKED_ASSET_TITLE__", &tracked_asset_label_js),
     );
 }
 
-fn js_force_map_reinit_now(tiles: &str, max_native_zoom: u32, is_fullscreen: bool, delay_ms: u64) {
+fn js_force_map_reinit_now(tiles: &str, config: &MapConfig, is_fullscreen: bool, delay_ms: u64) {
     let tiles_js = serde_json::to_string(tiles).unwrap_or_else(|_| "\"\"".to_string());
-    let max_native_zoom_js = max_native_zoom.to_string();
+    let max_native_zoom_js = config.max_native_zoom.to_string();
+    let center_lat_js = config.default_center_lat.to_string();
+    let center_lon_js = config.default_center_lon.to_string();
+    let zoom_js = config.default_zoom.to_string();
+    let tracked_asset_label_js = serde_json::to_string(&config.tracked_asset_label)
+        .unwrap_or_else(|_| "\"Tracked Asset\"".to_string());
     let fs_js = if is_fullscreen { "true" } else { "false" };
     let delay_js = delay_ms.to_string();
 
@@ -415,6 +463,10 @@ fn js_force_map_reinit_now(tiles: &str, max_native_zoom: u32, is_fullscreen: boo
       try {
         window.__gs26_tiles_url = __TILES__;
         window.__gs26_max_native_zoom = __MAX_NATIVE_ZOOM__;
+        window.__gs26_default_center_lat = __CENTER_LAT__;
+        window.__gs26_default_center_lon = __CENTER_LON__;
+        window.__gs26_default_zoom = __DEFAULT_ZOOM__;
+        window.__gs26_tracked_asset_title = __TRACKED_ASSET_TITLE__;
         if (typeof window.__gs26_force_map_reinit === "function") {
           window.__gs26_force_map_reinit(__FS__, __DELAY__);
         }
@@ -426,14 +478,23 @@ fn js_force_map_reinit_now(tiles: &str, max_native_zoom: u32, is_fullscreen: boo
         &script
             .replace("__TILES__", &tiles_js)
             .replace("__MAX_NATIVE_ZOOM__", &max_native_zoom_js)
+            .replace("__CENTER_LAT__", &center_lat_js)
+            .replace("__CENTER_LON__", &center_lon_js)
+            .replace("__DEFAULT_ZOOM__", &zoom_js)
+            .replace("__TRACKED_ASSET_TITLE__", &tracked_asset_label_js)
             .replace("__FS__", fs_js)
             .replace("__DELAY__", &delay_js),
     );
 }
 
-fn js_setup_js_init_retry(tiles: &str, max_native_zoom: u32) {
+fn js_setup_js_init_retry(tiles: &str, config: &MapConfig) {
     let tiles_js = serde_json::to_string(tiles).unwrap_or_else(|_| "\"\"".to_string());
-    let max_native_zoom_js = max_native_zoom.to_string();
+    let max_native_zoom_js = config.max_native_zoom.to_string();
+    let center_lat_js = config.default_center_lat.to_string();
+    let center_lon_js = config.default_center_lon.to_string();
+    let zoom_js = config.default_zoom.to_string();
+    let tracked_asset_label_js = serde_json::to_string(&config.tracked_asset_label)
+        .unwrap_or_else(|_| "\"Tracked Asset\"".to_string());
 
     let script = r#"
     (function() {
@@ -442,6 +503,10 @@ fn js_setup_js_init_retry(tiles: &str, max_native_zoom: u32) {
 
       window.__gs26_tiles_url = __TILES__;
       window.__gs26_max_native_zoom = __MAX_NATIVE_ZOOM__;
+      window.__gs26_default_center_lat = __CENTER_LAT__;
+      window.__gs26_default_center_lon = __CENTER_LON__;
+      window.__gs26_default_zoom = __DEFAULT_ZOOM__;
+      window.__gs26_tracked_asset_title = __TRACKED_ASSET_TITLE__;
 
       let tries = 0;
       const maxTries = 200; // ~10s at 50ms
@@ -455,7 +520,14 @@ fn js_setup_js_init_retry(tiles: &str, max_native_zoom: u32) {
           if (window.__gs26_ground_station_loaded === true &&
               typeof window.initGroundMap === "function") {
 
-            window.initGroundMap(window.__gs26_tiles_url, 31.0, -99.0, 7.0, window.__gs26_max_native_zoom);
+            window.initGroundMap(
+              window.__gs26_tiles_url,
+              window.__gs26_default_center_lat,
+              window.__gs26_default_center_lon,
+              window.__gs26_default_zoom,
+              window.__gs26_max_native_zoom,
+              window.__gs26_tracked_asset_title
+            );
 
             try {
               if (typeof window.__gs26_map_size_hook_update === "function") {
@@ -487,7 +559,11 @@ fn js_setup_js_init_retry(tiles: &str, max_native_zoom: u32) {
     js_eval(
         &script
             .replace("__TILES__", &tiles_js)
-            .replace("__MAX_NATIVE_ZOOM__", &max_native_zoom_js),
+            .replace("__MAX_NATIVE_ZOOM__", &max_native_zoom_js)
+            .replace("__CENTER_LAT__", &center_lat_js)
+            .replace("__CENTER_LON__", &center_lon_js)
+            .replace("__DEFAULT_ZOOM__", &zoom_js)
+            .replace("__TRACKED_ASSET_TITLE__", &tracked_asset_label_js),
     );
 }
 
@@ -551,9 +627,14 @@ fn js_request_user_geolocation_once() {
     );
 }
 
-fn js_setup_js_resize_reinit(tiles: &str, max_native_zoom: u32, debounce_ms: u64) {
+fn js_setup_js_resize_reinit(tiles: &str, config: &MapConfig, debounce_ms: u64) {
     let tiles_js = serde_json::to_string(tiles).unwrap_or_else(|_| "\"\"".to_string());
-    let max_native_zoom_js = max_native_zoom.to_string();
+    let max_native_zoom_js = config.max_native_zoom.to_string();
+    let center_lat_js = config.default_center_lat.to_string();
+    let center_lon_js = config.default_center_lon.to_string();
+    let zoom_js = config.default_zoom.to_string();
+    let tracked_asset_label_js = serde_json::to_string(&config.tracked_asset_label)
+        .unwrap_or_else(|_| "\"Tracked Asset\"".to_string());
     let debounce_js = debounce_ms.to_string();
 
     let script = r#"
@@ -563,6 +644,10 @@ fn js_setup_js_resize_reinit(tiles: &str, max_native_zoom: u32, debounce_ms: u64
 
       window.__gs26_tiles_url = __TILES__;
       window.__gs26_max_native_zoom = __MAX_NATIVE_ZOOM__;
+      window.__gs26_default_center_lat = __CENTER_LAT__;
+      window.__gs26_default_center_lon = __CENTER_LON__;
+      window.__gs26_default_zoom = __DEFAULT_ZOOM__;
+      window.__gs26_tracked_asset_title = __TRACKED_ASSET_TITLE__;
       const DEBOUNCE = __DEBOUNCE__;
 
       function doInvalidateMulti() {
@@ -594,7 +679,14 @@ fn js_setup_js_resize_reinit(tiles: &str, max_native_zoom: u32, debounce_ms: u64
         try {
           if (window.__gs26_ground_station_loaded === true &&
               typeof window.initGroundMap === "function") {
-            window.initGroundMap(window.__gs26_tiles_url, 31.0, -99.0, 7.0, window.__gs26_max_native_zoom);
+            window.initGroundMap(
+              window.__gs26_tiles_url,
+              window.__gs26_default_center_lat,
+              window.__gs26_default_center_lon,
+              window.__gs26_default_zoom,
+              window.__gs26_max_native_zoom,
+              window.__gs26_tracked_asset_title
+            );
           }
         } catch (e) {}
 
@@ -644,6 +736,10 @@ fn js_setup_js_resize_reinit(tiles: &str, max_native_zoom: u32, debounce_ms: u64
         &script
             .replace("__TILES__", &tiles_js)
             .replace("__MAX_NATIVE_ZOOM__", &max_native_zoom_js)
+            .replace("__CENTER_LAT__", &center_lat_js)
+            .replace("__CENTER_LON__", &center_lon_js)
+            .replace("__DEFAULT_ZOOM__", &zoom_js)
+            .replace("__TRACKED_ASSET_TITLE__", &tracked_asset_label_js)
             .replace("__DEBOUNCE__", &debounce_js),
     );
 }
@@ -837,6 +933,71 @@ fn js_read_user_latlon_from_window() -> Option<(f64, f64)> {
 #[derive(Debug, Clone, Deserialize)]
 struct MapConfig {
     max_native_zoom: u32,
+    #[serde(default = "default_map_center_lat")]
+    default_center_lat: f64,
+    #[serde(default = "default_map_center_lon")]
+    default_center_lon: f64,
+    #[serde(default = "default_map_zoom")]
+    default_zoom: f64,
+    #[serde(default = "default_map_title")]
+    map_title: String,
+    #[serde(default = "default_tracked_asset_label")]
+    tracked_asset_label: String,
+}
+
+impl Default for MapConfig {
+    fn default() -> Self {
+        Self {
+            max_native_zoom: DEFAULT_MAX_NATIVE_ZOOM,
+            default_center_lat: default_map_center_lat(),
+            default_center_lon: default_map_center_lon(),
+            default_zoom: default_map_zoom(),
+            map_title: default_map_title(),
+            tracked_asset_label: default_tracked_asset_label(),
+        }
+    }
+}
+
+impl MapConfig {
+    fn sanitized(mut self) -> Self {
+        self.max_native_zoom = self.max_native_zoom.max(1);
+        if !self.default_center_lat.is_finite() {
+            self.default_center_lat = default_map_center_lat();
+        }
+        if !self.default_center_lon.is_finite() {
+            self.default_center_lon = default_map_center_lon();
+        }
+        if !self.default_zoom.is_finite() || self.default_zoom < 0.0 {
+            self.default_zoom = default_map_zoom();
+        }
+        if self.map_title.trim().is_empty() {
+            self.map_title = default_map_title();
+        }
+        if self.tracked_asset_label.trim().is_empty() {
+            self.tracked_asset_label = default_tracked_asset_label();
+        }
+        self
+    }
+}
+
+fn default_map_center_lat() -> f64 {
+    DEFAULT_MAP_CENTER_LAT
+}
+
+fn default_map_center_lon() -> f64 {
+    DEFAULT_MAP_CENTER_LON
+}
+
+fn default_map_zoom() -> f64 {
+    DEFAULT_MAP_ZOOM
+}
+
+fn default_map_title() -> String {
+    DEFAULT_MAP_TITLE.to_string()
+}
+
+fn default_tracked_asset_label() -> String {
+    DEFAULT_TRACKED_ASSET_LABEL.to_string()
 }
 
 #[cfg(target_os = "ios")]

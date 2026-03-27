@@ -24,8 +24,71 @@ def default_layout_path() -> Path:
 def default_layout() -> dict:
     return {
         "version": 1,
+        "branding": {
+            "app_name": None,
+            "dashboard_title": None,
+            "tab_labels": {},
+        },
+        "theme": {
+            "app_background": "#020617",
+            "panel_background": "#0b1220",
+            "panel_background_alt": "#0f172a",
+            "overlay_background": "#020617ee",
+            "border": "#334155",
+            "border_strong": "#4b5563",
+            "border_soft": "#1f2937",
+            "text_primary": "#e5e7eb",
+            "text_secondary": "#cbd5e1",
+            "text_muted": "#94a3b8",
+            "text_soft": "#9ca3af",
+            "button_background": "#111827",
+            "button_border": "#334155",
+            "button_text": "#e5e7eb",
+            "tab_shell_background": "#020617ee",
+            "tab_shell_border": "#4b5563",
+            "info_accent": "#60a5fa",
+            "info_background": "#0b1a33",
+            "info_text": "#bfdbfe",
+            "success_text": "#22c55e",
+            "warning_background": "#451a03",
+            "warning_border": "#f59e0b",
+            "warning_text": "#fde68a",
+            "error_background": "#450a0a",
+            "error_border": "#ef4444",
+            "error_text": "#fecaca",
+            "notification_background": "#0b1f4d",
+            "notification_border": "#2563eb",
+            "notification_text": "#bfdbfe",
+            "main_tab_accents": {
+                "state": "#38bdf8",
+                "connection-status": "#06b6d4",
+                "detailed": "#0ea5e9",
+                "map": "#22c55e",
+                "actions": "#a78bfa",
+                "calibration": "#14b8a6",
+                "notifications": "#3b82f6",
+                "warnings": "#facc15",
+                "errors": "#ef4444",
+                "data": "#f97316",
+                "network-topology": "#8b5cf6"
+            }
+        },
+        "main_tabs": [
+            "state",
+            "connection-status",
+            "map",
+            "actions",
+            "calibration",
+            "notifications",
+            "warnings",
+            "errors",
+            "data",
+            "detailed",
+            "network-topology",
+        ],
         "connection_tab": {"sections": []},
-        "actions_tab": {"actions": []},
+        "network_tab": {"enabled": False, "title": "SEDSprintf Network"},
+        "actions_tab": {"disable_actions_by_default": False, "actions": []},
         "data_tab": {"tabs": []},
         "state_tab": {"states": []},
         "battery": {
@@ -40,9 +103,25 @@ def validate_layout(data: dict) -> list[str]:
     if not isinstance(data, dict):
         return ["Layout root must be an object."]
 
-    for key in ("version", "connection_tab", "actions_tab", "data_tab", "state_tab"):
+    for key in (
+            "version",
+            "main_tabs",
+            "connection_tab",
+            "network_tab",
+            "actions_tab",
+            "data_tab",
+            "state_tab",
+    ):
         if key not in data:
             errors.append(f"Missing top-level key: {key}")
+
+    main_tabs = data.get("main_tabs", [])
+    if not isinstance(main_tabs, list):
+        errors.append("main_tabs must be a list.")
+
+    network = data.get("network_tab", {})
+    if not isinstance(network, dict):
+        errors.append("network_tab must be an object.")
 
     connection = data.get("connection_tab", {})
     if not isinstance(connection, dict) or not isinstance(connection.get("sections", []), list):
@@ -90,22 +169,28 @@ class LayoutEditor(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
+        self.main_tabs_frame = ttk.Frame(self.notebook)
         self.data_tab_frame = ttk.Frame(self.notebook)
         self.connection_tab_frame = ttk.Frame(self.notebook)
+        self.network_tab_frame = ttk.Frame(self.notebook)
         self.actions_tab_frame = ttk.Frame(self.notebook)
         self.state_tab_frame = ttk.Frame(self.notebook)
         self.battery_tab_frame = ttk.Frame(self.notebook)
 
+        self.notebook.add(self.main_tabs_frame, text="Dashboard Tabs")
         self.notebook.add(self.data_tab_frame, text="Data")
         self.notebook.add(self.connection_tab_frame, text="Connection")
+        self.notebook.add(self.network_tab_frame, text="Network")
         self.notebook.add(self.actions_tab_frame, text="Actions")
         self.notebook.add(self.state_tab_frame, text="State Layout")
         self.notebook.add(self.battery_tab_frame, text="Battery")
 
         self._suspend_events = False
         self._section_title_loaded = ""
+        self._build_main_tabs_tab()
         self._build_data_tab()
         self._build_connection_tab()
+        self._build_network_tab()
         self._build_actions_tab()
         self._build_state_tab()
         self._build_battery_tab()
@@ -115,6 +200,126 @@ class LayoutEditor(tk.Tk):
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     # ------------------------
+    # Dashboard tabs editor
+    # ------------------------
+    def _build_main_tabs_tab(self) -> None:
+        frame = self.main_tabs_frame
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self._main_tabs_selected_idx: int | None = None
+        self.available_main_tabs = [
+            "state",
+            "connection-status",
+            "map",
+            "actions",
+            "calibration",
+            "notifications",
+            "warnings",
+            "errors",
+            "data",
+            "detailed",
+            "network-topology",
+        ]
+
+        self.main_tabs_list = tk.Listbox(frame, height=16)
+        self.main_tabs_list.grid(row=0, column=0, sticky="ns", padx=(0, 10), pady=5)
+        self.main_tabs_list.bind("<<ListboxSelect>>", lambda _: self._on_main_tab_select())
+
+        form = ttk.Frame(frame)
+        form.grid(row=0, column=1, sticky="nsew")
+        form.columnconfigure(1, weight=1)
+
+        ttk.Label(form, text="Available dashboard tab").grid(row=0, column=0, sticky="w")
+        self.main_tab_choice = tk.StringVar(value=self.available_main_tabs[0])
+        ttk.OptionMenu(form, self.main_tab_choice, self.available_main_tabs[0], *self.available_main_tabs).grid(
+            row=0, column=1, sticky="w", padx=6, pady=3
+        )
+
+        ttk.Label(
+            form,
+            text="The runtime dashboard nav follows this list order.",
+            foreground="#94a3b8",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        self.layout_version = self._entry(form, "Layout version", 2)
+        self.branding_app_name = self._entry(form, "App name", 3)
+        self.branding_dashboard_title = self._entry(form, "Dashboard title", 4)
+
+        ttk.Label(form, text="Tab labels").grid(row=5, column=0, sticky="nw")
+        self.tab_label_entries: dict[str, ttk.Entry] = {}
+        tab_labels_frame = ttk.Frame(form)
+        tab_labels_frame.grid(row=5, column=1, sticky="ew", padx=6, pady=3)
+        tab_labels_frame.columnconfigure(1, weight=1)
+        for idx, tab_id in enumerate(self.available_main_tabs):
+            ttk.Label(tab_labels_frame, text=tab_id).grid(row=idx, column=0, sticky="w")
+            entry = ttk.Entry(tab_labels_frame)
+            entry.grid(row=idx, column=1, sticky="ew", padx=6, pady=2)
+            self.tab_label_entries[tab_id] = entry
+
+        btns = ttk.Frame(form)
+        btns.grid(row=6, column=1, sticky="w", pady=8)
+        ttk.Button(btns, text="Add", command=self._add_main_tab_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Remove", command=self._remove_main_tab_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Up", command=lambda: self._move_main_tab_item(-1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Down", command=lambda: self._move_main_tab_item(1)).pack(side=tk.LEFT, padx=4)
+
+        self.theme_entries: dict[str, ttk.Entry] = {}
+        theme_fields = [
+            ("App background", "app_background"),
+            ("Panel background", "panel_background"),
+            ("Panel alt background", "panel_background_alt"),
+            ("Overlay background", "overlay_background"),
+            ("Border", "border"),
+            ("Strong border", "border_strong"),
+            ("Soft border", "border_soft"),
+            ("Primary text", "text_primary"),
+            ("Secondary text", "text_secondary"),
+            ("Muted text", "text_muted"),
+            ("Soft text", "text_soft"),
+            ("Button background", "button_background"),
+            ("Button border", "button_border"),
+            ("Button text", "button_text"),
+            ("Tab shell background", "tab_shell_background"),
+            ("Tab shell border", "tab_shell_border"),
+            ("Info accent", "info_accent"),
+            ("Info background", "info_background"),
+            ("Info text", "info_text"),
+            ("Success text", "success_text"),
+            ("Warning background", "warning_background"),
+            ("Warning border", "warning_border"),
+            ("Warning text", "warning_text"),
+            ("Error background", "error_background"),
+            ("Error border", "error_border"),
+            ("Error text", "error_text"),
+            ("Notification background", "notification_background"),
+            ("Notification border", "notification_border"),
+            ("Notification text", "notification_text"),
+        ]
+        self.theme_frame = ttk.LabelFrame(form, text="Theme")
+        self.theme_frame.grid(row=7, column=0, columnspan=2, sticky="nsew", pady=8)
+        for col in range(6):
+            self.theme_frame.columnconfigure(col, weight=1)
+        for idx, (label, key) in enumerate(theme_fields):
+            row = idx // 2
+            col = (idx % 2) * 2
+            entry = self._color_entry_at(self.theme_frame, label, row, col * 2)
+            self.theme_entries[key] = entry
+
+        ttk.Label(self.theme_frame, text="Main tab accents").grid(row=15, column=0, sticky="nw")
+        self.theme_tab_accent_entries: dict[str, ttk.Entry] = {}
+        accents_frame = ttk.Frame(self.theme_frame)
+        accents_frame.grid(row=15, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
+        accents_frame.columnconfigure(1, weight=1)
+        for idx, tab_id in enumerate(self.available_main_tabs):
+            ttk.Label(accents_frame, text=tab_id).grid(row=idx, column=0, sticky="w")
+            entry = ttk.Entry(accents_frame)
+            entry.grid(row=idx, column=1, sticky="ew", padx=6, pady=2)
+            ttk.Button(
+                accents_frame, text="Pick", command=lambda e=entry: self._pick_color(e)
+            ).grid(row=idx, column=2, sticky="w", padx=(0, 6))
+            self.theme_tab_accent_entries[tab_id] = entry
+
+    # ------------------------
     # Data tab editor
     # ------------------------
     def _build_data_tab(self) -> None:
@@ -122,6 +327,9 @@ class LayoutEditor(tk.Tk):
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(0, weight=1)
         self._data_selected_idx: int | None = None
+        self._data_subtab_selected_idx: int | None = None
+        self._data_chart_group_selected_idx: int | None = None
+        self._data_summary_item_selected_idx: int | None = None
 
         self.data_list = tk.Listbox(frame, height=20)
         self.data_list.grid(row=0, column=0, sticky="ns", padx=(0, 10), pady=5)
@@ -169,8 +377,37 @@ class LayoutEditor(tk.Tk):
         )
         self.data_bool_per_channel_hint.grid(row=9, column=1, columnspan=2, sticky="w", padx=6)
 
+        self.data_channel_formatters_frame = ttk.LabelFrame(form, text="Channel formatters")
+        self.data_channel_formatters_frame.grid(row=10, column=0, columnspan=3, sticky="ew", padx=6, pady=6)
+        for col in range(4):
+            self.data_channel_formatters_frame.columnconfigure(col, weight=1)
+        self.data_formatter_channels = tk.Listbox(self.data_channel_formatters_frame, height=5)
+        self.data_formatter_channels.grid(row=0, column=0, rowspan=5, sticky="nsew", padx=6, pady=3)
+        self.data_formatter_channels.bind("<<ListboxSelect>>", lambda _: self._on_data_formatter_select())
+        ttk.Label(self.data_channel_formatters_frame, text="Format kind").grid(row=0, column=1, sticky="w")
+        self.data_formatter_kind = tk.StringVar(value="")
+        ttk.OptionMenu(
+            self.data_channel_formatters_frame,
+            self.data_formatter_kind,
+            "",
+            "",
+            "number",
+            "integer",
+        ).grid(row=0, column=2, sticky="w", padx=6, pady=3)
+        self.data_formatter_precision = self._entry(self.data_channel_formatters_frame, "Precision", 1, col=1)
+        self.data_formatter_prefix = self._entry(self.data_channel_formatters_frame, "Prefix", 2, col=1)
+        self.data_formatter_suffix = self._entry(self.data_channel_formatters_frame, "Suffix", 3, col=1)
+        data_formatter_btns = ttk.Frame(self.data_channel_formatters_frame)
+        data_formatter_btns.grid(row=4, column=1, columnspan=3, sticky="w", pady=4)
+        ttk.Button(data_formatter_btns, text="Apply", command=self._apply_data_formatter).pack(side=tk.LEFT, padx=4)
+        ttk.Button(data_formatter_btns, text="Clear", command=self._clear_data_formatter).pack(side=tk.LEFT, padx=4)
+        ttk.Button(data_formatter_btns, text="Sync Channels", command=self._sync_data_formatter_channels).pack(
+            side=tk.LEFT, padx=4)
+        self._data_channel_formatters: list[dict | None] = []
+        self._data_formatter_selected_idx: int | None = None
+
         btns = ttk.Frame(form)
-        btns.grid(row=10, column=1, sticky="w", pady=8)
+        btns.grid(row=11, column=1, sticky="w", pady=8)
         ttk.Button(btns, text="Add", command=self._add_data_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove", command=self._remove_data_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Up", command=lambda: self._move_data_item(-1)).pack(
@@ -179,6 +416,106 @@ class LayoutEditor(tk.Tk):
         ttk.Button(btns, text="Down", command=lambda: self._move_data_item(1)).pack(
             side=tk.LEFT, padx=4
         )
+
+        self.data_subtabs_frame = ttk.LabelFrame(form, text="Subtabs")
+        self.data_subtabs_frame.grid(row=12, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 4))
+        for col in range(4):
+            self.data_subtabs_frame.columnconfigure(col, weight=1)
+        self.data_subtabs_list = tk.Listbox(self.data_subtabs_frame, height=5)
+        self.data_subtabs_list.grid(row=0, column=0, rowspan=7, sticky="nsew", padx=6, pady=3)
+        self.data_subtabs_list.bind("<<ListboxSelect>>", lambda _: self._on_data_subtab_select())
+        self.data_subtab_id = self._entry(self.data_subtabs_frame, "Subtab ID", 0, col=1)
+        self.data_subtab_label = self._entry(self.data_subtabs_frame, "Subtab Label", 1, col=1)
+        self.data_subtab_data_type = self._entry(self.data_subtabs_frame, "Data type", 2, col=1)
+        self.data_subtab_sender_id = self._entry(self.data_subtabs_frame, "Sender ID", 3, col=1)
+        self.data_subtab_channels = self._entry(self.data_subtabs_frame, "Channels (comma)", 4, col=1)
+        self.data_subtab_chart = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.data_subtabs_frame, text="Chart enabled", variable=self.data_subtab_chart).grid(
+            row=5, column=1, sticky="w", padx=6, pady=3
+        )
+        subtab_btns = ttk.Frame(self.data_subtabs_frame)
+        subtab_btns.grid(row=6, column=1, columnspan=3, sticky="w", pady=4)
+        ttk.Button(subtab_btns, text="Add", command=self._add_data_subtab).pack(side=tk.LEFT, padx=4)
+        ttk.Button(subtab_btns, text="Update", command=self._update_data_subtab).pack(side=tk.LEFT, padx=4)
+        ttk.Button(subtab_btns, text="Remove", command=self._remove_data_subtab).pack(side=tk.LEFT, padx=4)
+        ttk.Button(subtab_btns, text="Up", command=lambda: self._move_data_subtab(-1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(subtab_btns, text="Down", command=lambda: self._move_data_subtab(1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(subtab_btns, text="Clear Editor", command=self._clear_data_subtab_editor).pack(side=tk.LEFT, padx=4)
+
+        self.data_chart_groups_frame = ttk.LabelFrame(form, text="Chart groups")
+        self.data_chart_groups_frame.grid(row=13, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 4))
+        for col in range(4):
+            self.data_chart_groups_frame.columnconfigure(col, weight=1)
+        self.data_chart_group_scope = tk.StringVar(value="Tab")
+        ttk.Label(self.data_chart_groups_frame, textvariable=self.data_chart_group_scope).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=6
+        )
+        self.data_chart_groups_list = tk.Listbox(self.data_chart_groups_frame, height=5)
+        self.data_chart_groups_list.grid(row=1, column=0, rowspan=7, sticky="nsew", padx=6, pady=3)
+        self.data_chart_groups_list.bind("<<ListboxSelect>>", lambda _: self._on_data_chart_group_select())
+        self.data_chart_group_title = self._entry(self.data_chart_groups_frame, "Title", 1, col=1)
+        self.data_chart_group_data_type = self._entry(self.data_chart_groups_frame, "Data type", 2, col=1)
+        self.data_chart_group_sender_id = self._entry(self.data_chart_groups_frame, "Sender ID", 3, col=1)
+        self.data_chart_group_labels = self._entry(self.data_chart_groups_frame, "Labels (comma)", 4, col=1)
+        self.data_chart_group_channels = self._entry(self.data_chart_groups_frame, "Channels (comma)", 5, col=1)
+        ttk.Label(self.data_chart_groups_frame, text="Scale mode").grid(row=6, column=1, sticky="w")
+        self.data_chart_group_scale_mode = tk.StringVar(value="")
+        ttk.OptionMenu(
+            self.data_chart_groups_frame,
+            self.data_chart_group_scale_mode,
+            "",
+            "",
+            "shared",
+            "per_series",
+        ).grid(row=6, column=2, sticky="w", padx=6, pady=3)
+        chart_group_btns = ttk.Frame(self.data_chart_groups_frame)
+        chart_group_btns.grid(row=7, column=1, columnspan=3, sticky="w", pady=4)
+        ttk.Button(chart_group_btns, text="Add", command=self._add_data_chart_group).pack(side=tk.LEFT, padx=4)
+        ttk.Button(chart_group_btns, text="Update", command=self._update_data_chart_group).pack(side=tk.LEFT, padx=4)
+        ttk.Button(chart_group_btns, text="Remove", command=self._remove_data_chart_group).pack(side=tk.LEFT, padx=4)
+        ttk.Button(chart_group_btns, text="Up", command=lambda: self._move_data_chart_group(-1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(chart_group_btns, text="Down", command=lambda: self._move_data_chart_group(1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(chart_group_btns, text="Clear Editor", command=self._clear_data_chart_group_editor).pack(side=tk.LEFT, padx=4)
+
+        self.data_summary_items_frame = ttk.LabelFrame(form, text="Summary items")
+        self.data_summary_items_frame.grid(row=14, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 4))
+        for col in range(4):
+            self.data_summary_items_frame.columnconfigure(col, weight=1)
+        self.data_summary_item_scope = tk.StringVar(value="Select a subtab to edit summary items")
+        ttk.Label(self.data_summary_items_frame, textvariable=self.data_summary_item_scope).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=6
+        )
+        self.data_summary_items_list = tk.Listbox(self.data_summary_items_frame, height=5)
+        self.data_summary_items_list.grid(row=1, column=0, rowspan=8, sticky="nsew", padx=6, pady=3)
+        self.data_summary_items_list.bind("<<ListboxSelect>>", lambda _: self._on_data_summary_item_select())
+        self.data_summary_item_label = self._entry(self.data_summary_items_frame, "Label", 1, col=1)
+        self.data_summary_item_data_type = self._entry(self.data_summary_items_frame, "Data type", 2, col=1)
+        self.data_summary_item_index = self._entry(self.data_summary_items_frame, "Index", 3, col=1)
+        self.data_summary_item_sender_id = self._entry(self.data_summary_items_frame, "Sender ID", 4, col=1)
+        self.data_summary_item_true = self._entry(self.data_summary_items_frame, "True label", 5, col=1)
+        self.data_summary_item_false = self._entry(self.data_summary_items_frame, "False label", 6, col=1)
+        self.data_summary_item_unknown = self._entry(self.data_summary_items_frame, "Unknown label", 7, col=1)
+        ttk.Label(self.data_summary_items_frame, text="Format kind").grid(row=1, column=2, sticky="w")
+        self.data_summary_item_format_kind = tk.StringVar(value="")
+        ttk.OptionMenu(
+            self.data_summary_items_frame,
+            self.data_summary_item_format_kind,
+            "",
+            "",
+            "number",
+            "integer",
+        ).grid(row=1, column=3, sticky="w", padx=6, pady=3)
+        self.data_summary_item_precision = self._entry(self.data_summary_items_frame, "Precision", 2, col=2)
+        self.data_summary_item_prefix = self._entry(self.data_summary_items_frame, "Prefix", 3, col=2)
+        self.data_summary_item_suffix = self._entry(self.data_summary_items_frame, "Suffix", 4, col=2)
+        data_summary_btns = ttk.Frame(self.data_summary_items_frame)
+        data_summary_btns.grid(row=8, column=1, columnspan=3, sticky="w", pady=4)
+        ttk.Button(data_summary_btns, text="Add", command=self._add_data_summary_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(data_summary_btns, text="Update", command=self._update_data_summary_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(data_summary_btns, text="Remove", command=self._remove_data_summary_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(data_summary_btns, text="Up", command=lambda: self._move_data_summary_item(-1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(data_summary_btns, text="Down", command=lambda: self._move_data_summary_item(1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(data_summary_btns, text="Clear Editor", command=self._clear_data_summary_item_editor).pack(side=tk.LEFT, padx=4)
         self._sync_data_bool_fields()
 
     # ------------------------
@@ -219,6 +556,19 @@ class LayoutEditor(tk.Tk):
         )
 
     # ------------------------
+    # Network tab editor
+    # ------------------------
+    def _build_network_tab(self) -> None:
+        frame = self.network_tab_frame
+        frame.columnconfigure(1, weight=1)
+
+        self.network_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="Enable network tab", variable=self.network_enabled).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(8, 6)
+        )
+        self.network_title = self._entry(frame, "Title", 1)
+
+    # ------------------------
     # Actions tab editor
     # ------------------------
     def _build_actions_tab(self) -> None:
@@ -238,14 +588,22 @@ class LayoutEditor(tk.Tk):
         form.grid(row=0, column=1, sticky="nsew")
         form.columnconfigure(1, weight=1)
 
-        self.action_label = self._entry(form, "Label", 0)
-        self.action_cmd = self._entry(form, "Command", 1)
-        self.action_border = self._color_entry(form, "Border color", 2)
-        self.action_bg = self._color_entry(form, "Background color", 3)
-        self.action_fg = self._color_entry(form, "Text color", 4)
+        self.disable_actions_by_default = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            form,
+            text="Disable actions by default",
+            variable=self.disable_actions_by_default,
+            command=self._store_actions_defaults,
+        ).grid(row=0, column=1, sticky="w", pady=(0, 8))
+
+        self.action_label = self._entry(form, "Label", 1)
+        self.action_cmd = self._entry(form, "Command", 2)
+        self.action_border = self._color_entry(form, "Border color", 3)
+        self.action_bg = self._color_entry(form, "Background color", 4)
+        self.action_fg = self._color_entry(form, "Text color", 5)
 
         btns = ttk.Frame(form)
-        btns.grid(row=5, column=1, sticky="w", pady=8)
+        btns.grid(row=6, column=1, sticky="w", pady=8)
         ttk.Button(btns, text="Add", command=self._add_action_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove", command=self._remove_action_item).pack(
             side=tk.LEFT, padx=4
@@ -310,6 +668,12 @@ class LayoutEditor(tk.Tk):
         self.section_title = ttk.Entry(form)
         self.section_title.grid(row=2, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
         self.section_title.bind("<KeyRelease>", lambda _: self._update_section_title_live())
+        self.section_style_frame = ttk.LabelFrame(form, text="Section style")
+        self.section_style_frame.grid(row=2, column=4, rowspan=2, columnspan=2, sticky="nsew", padx=6, pady=3)
+        self.section_style_frame.columnconfigure(1, weight=1)
+        self.section_bg = self._color_entry(self.section_style_frame, "Background", 0)
+        self.section_border = self._color_entry(self.section_style_frame, "Border", 1)
+        self.section_title_color = self._color_entry(self.section_style_frame, "Title color", 2)
         ttk.Button(form, text="Add Section", command=self._add_section).grid(
             row=3, column=1, padx=6, pady=4, sticky="w"
         )
@@ -352,80 +716,106 @@ class LayoutEditor(tk.Tk):
         self.widget_height = ttk.Entry(form)
         self.widget_height.grid(row=6, column=1, sticky="ew", padx=6, pady=3)
 
-        ttk.Label(form, text="Items (label:index,...)").grid(row=6, column=2, sticky="w")
-        self.widget_items_label = form.grid_slaves(row=6, column=2)[0]
-        self.widget_items = ttk.Entry(form)
-        self.widget_items.grid(row=6, column=3, sticky="ew", padx=6, pady=3)
+        self.chart_series_frame = ttk.LabelFrame(form, text="Chart series")
+        self.chart_series_frame.grid(row=7, column=0, columnspan=6, sticky="ew", padx=6, pady=(6, 4))
+        for col in range(4):
+            self.chart_series_frame.columnconfigure(col, weight=1)
+        self.chart_series_list = tk.Listbox(self.chart_series_frame, height=4)
+        self.chart_series_list.grid(row=0, column=0, rowspan=5, columnspan=2, sticky="nsew", padx=6, pady=3)
+        self.chart_series_list.bind("<<ListboxSelect>>", lambda _: self._on_chart_series_select())
+        self.chart_series_data_type = self._entry(self.chart_series_frame, "Data type", 0, col=2)
+        self.chart_series_index = self._entry(self.chart_series_frame, "Index", 1, col=2)
+        self.chart_series_label = self._entry(self.chart_series_frame, "Legend label", 2, col=2)
+        chart_series_btns = ttk.Frame(self.chart_series_frame)
+        chart_series_btns.grid(row=5, column=0, columnspan=4, sticky="w", pady=4)
+        ttk.Button(chart_series_btns, text="Add", command=self._add_chart_series).pack(side=tk.LEFT, padx=4)
+        ttk.Button(chart_series_btns, text="Update", command=self._update_chart_series).pack(side=tk.LEFT, padx=4)
+        ttk.Button(chart_series_btns, text="Remove", command=self._remove_chart_series).pack(side=tk.LEFT, padx=4)
+        ttk.Button(chart_series_btns, text="Up", command=lambda: self._move_chart_series(-1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(chart_series_btns, text="Down", command=lambda: self._move_chart_series(1)).pack(side=tk.LEFT,
+                                                                                                    padx=4)
+        ttk.Button(chart_series_btns, text="Clear Editor", command=self._clear_chart_series_editor).pack(side=tk.LEFT,
+                                                                                                         padx=4)
+        self._chart_series: list[dict] = []
+        self._chart_series_selected_idx: int | None = None
+
+        self.summary_style_frame = ttk.LabelFrame(form, text="Summary card style")
+        self.summary_style_frame.grid(row=4, column=4, rowspan=4, columnspan=2, sticky="nsew", padx=6, pady=3)
+        self.summary_style_frame.columnconfigure(1, weight=1)
+        self.summary_bg = self._color_entry(self.summary_style_frame, "Background", 0)
+        self.summary_border = self._color_entry(self.summary_style_frame, "Border", 1)
+        self.summary_label_color = self._color_entry(self.summary_style_frame, "Label color", 2)
+        self.summary_value_color = self._color_entry(self.summary_style_frame, "Value color", 3)
 
         self.widget_valves_label = ttk.Label(form, text="Valves (label:index,...)")
-        self.widget_valves_label.grid(row=7, column=0, sticky="w")
+        self.widget_valves_label.grid(row=8, column=0, sticky="w")
         self.widget_valves = ttk.Entry(form)
-        self.widget_valves.grid(row=7, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
+        self.widget_valves.grid(row=8, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
 
         self.widget_valve_true_label = ttk.Label(form, text="Valve true label")
-        self.widget_valve_true_label.grid(row=8, column=0, sticky="w")
+        self.widget_valve_true_label.grid(row=9, column=0, sticky="w")
         self.widget_valve_true = ttk.Entry(form)
-        self.widget_valve_true.grid(row=8, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
+        self.widget_valve_true.grid(row=9, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
 
         self.widget_valve_false_label = ttk.Label(form, text="Valve false label")
-        self.widget_valve_false_label.grid(row=9, column=0, sticky="w")
+        self.widget_valve_false_label.grid(row=10, column=0, sticky="w")
         self.widget_valve_false = ttk.Entry(form)
-        self.widget_valve_false.grid(row=9, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
+        self.widget_valve_false.grid(row=10, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
 
         self.widget_valve_unknown_label_text = ttk.Label(form, text="Valve unknown label")
-        self.widget_valve_unknown_label_text.grid(row=10, column=0, sticky="w")
+        self.widget_valve_unknown_label_text.grid(row=11, column=0, sticky="w")
         self.widget_valve_unknown_text = ttk.Entry(form)
-        self.widget_valve_unknown_text.grid(row=10, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
+        self.widget_valve_unknown_text.grid(row=11, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
 
         self.widget_valve_open_label = ttk.Label(form, text="Open colors (bg,border,fg)")
-        self.widget_valve_open_label.grid(row=11, column=0, sticky="w")
+        self.widget_valve_open_label.grid(row=12, column=0, sticky="w")
         self.widget_valve_open = ttk.Entry(form)
-        self.widget_valve_open.grid(row=11, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
+        self.widget_valve_open.grid(row=12, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
         self.widget_valve_open_btns = ttk.Frame(form)
-        self.widget_valve_open_btns.grid(row=11, column=3, sticky="w")
+        self.widget_valve_open_btns.grid(row=12, column=3, sticky="w")
         self._add_valve_color_buttons(self.widget_valve_open_btns, self.widget_valve_open)
 
         self.widget_valve_closed_label = ttk.Label(form, text="Closed colors (bg,border,fg)")
-        self.widget_valve_closed_label.grid(row=12, column=0, sticky="w")
+        self.widget_valve_closed_label.grid(row=13, column=0, sticky="w")
         self.widget_valve_closed = ttk.Entry(form)
-        self.widget_valve_closed.grid(row=12, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
+        self.widget_valve_closed.grid(row=13, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
         self.widget_valve_closed_btns = ttk.Frame(form)
-        self.widget_valve_closed_btns.grid(row=12, column=3, sticky="w")
+        self.widget_valve_closed_btns.grid(row=13, column=3, sticky="w")
         self._add_valve_color_buttons(self.widget_valve_closed_btns, self.widget_valve_closed)
 
         self.widget_valve_unknown_label = ttk.Label(form, text="Unknown colors (bg,border,fg)")
-        self.widget_valve_unknown_label.grid(row=13, column=0, sticky="w")
+        self.widget_valve_unknown_label.grid(row=14, column=0, sticky="w")
         self.widget_valve_unknown = ttk.Entry(form)
-        self.widget_valve_unknown.grid(row=13, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
+        self.widget_valve_unknown.grid(row=14, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
         self.widget_valve_unknown_btns = ttk.Frame(form)
-        self.widget_valve_unknown_btns.grid(row=13, column=3, sticky="w")
+        self.widget_valve_unknown_btns.grid(row=14, column=3, sticky="w")
         self._add_valve_color_buttons(self.widget_valve_unknown_btns, self.widget_valve_unknown)
 
         self.widget_valve_labels_label = ttk.Label(
             form, text="Valve labels (true,false,unknown | ...)"
         )
-        self.widget_valve_labels_label.grid(row=14, column=0, sticky="w")
+        self.widget_valve_labels_label.grid(row=15, column=0, sticky="w")
         self.widget_valve_labels = ttk.Entry(form)
-        self.widget_valve_labels.grid(row=14, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
+        self.widget_valve_labels.grid(row=15, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
         self.widget_valve_labels_hint = ttk.Label(
             form,
             text="Example: Open,Closed,Unknown | Installed,Removed,Unknown",
             foreground="#94a3b8",
         )
-        self.widget_valve_labels_hint.grid(row=15, column=1, columnspan=3, sticky="w", padx=6)
+        self.widget_valve_labels_hint.grid(row=16, column=1, columnspan=3, sticky="w", padx=6)
 
         self.widget_actions_available_label = ttk.Label(form, text="Available actions")
-        self.widget_actions_available_label.grid(row=16, column=0, sticky="w")
+        self.widget_actions_available_label.grid(row=17, column=0, sticky="w")
         self.widget_actions_available = tk.Listbox(form, height=5, selectmode=tk.MULTIPLE)
         self.widget_actions_available.grid(
-            row=17, column=0, columnspan=2, sticky="nsew", padx=6, pady=3
+            row=18, column=0, columnspan=2, sticky="nsew", padx=6, pady=3
         )
 
         self.widget_actions_selected_label = ttk.Label(form, text="Selected actions")
-        self.widget_actions_selected_label.grid(row=16, column=2, sticky="w")
+        self.widget_actions_selected_label.grid(row=17, column=2, sticky="w")
         self.widget_actions_selected = tk.Listbox(form, height=5)
         self.widget_actions_selected.grid(
-            row=17, column=2, columnspan=2, sticky="nsew", padx=6, pady=3
+            row=18, column=2, columnspan=2, sticky="nsew", padx=6, pady=3
         )
         self.widget_actions_labels = [
             self.widget_actions_available_label,
@@ -437,7 +827,7 @@ class LayoutEditor(tk.Tk):
 
         self.widget_actions_buttons: list[ttk.Button] = []
         action_btns = ttk.Frame(form)
-        action_btns.grid(row=18, column=2, columnspan=2, sticky="w", pady=4)
+        action_btns.grid(row=19, column=2, columnspan=2, sticky="w", pady=4)
         self.widget_actions_buttons_row = action_btns
         self.widget_actions_buttons.append(
             ttk.Button(action_btns, text="Add →", command=self._add_widget_actions)
@@ -456,17 +846,53 @@ class LayoutEditor(tk.Tk):
         )
         self.widget_actions_buttons[-1].pack(side=tk.LEFT, padx=4)
 
+        self.summary_items_frame = ttk.LabelFrame(form, text="Summary items")
+        self.summary_items_frame.grid(row=20, column=0, columnspan=6, sticky="ew", padx=6, pady=(8, 4))
+        for col in range(4):
+            self.summary_items_frame.columnconfigure(col, weight=1)
+        self.summary_item_list = tk.Listbox(self.summary_items_frame, height=5)
+        self.summary_item_list.grid(row=0, column=0, rowspan=6, columnspan=2, sticky="nsew", padx=6, pady=3)
+        self.summary_item_list.bind("<<ListboxSelect>>", lambda _: self._on_summary_item_select())
+        self.summary_item_label = self._entry(self.summary_items_frame, "Label", 0, col=2)
+        self.summary_item_index = self._entry(self.summary_items_frame, "Index", 1, col=2)
+        ttk.Label(self.summary_items_frame, text="Format kind").grid(row=2, column=2, sticky="w")
+        self.summary_item_format_kind = tk.StringVar(value="")
+        ttk.OptionMenu(
+            self.summary_items_frame,
+            self.summary_item_format_kind,
+            "",
+            "",
+            "number",
+            "integer",
+        ).grid(row=2, column=3, sticky="w", padx=6, pady=3)
+        self.summary_item_precision = self._entry(self.summary_items_frame, "Precision", 3, col=2)
+        self.summary_item_prefix = self._entry(self.summary_items_frame, "Prefix", 4, col=2)
+        self.summary_item_suffix = self._entry(self.summary_items_frame, "Suffix", 5, col=2)
+        summary_item_btns = ttk.Frame(self.summary_items_frame)
+        summary_item_btns.grid(row=6, column=0, columnspan=4, sticky="w", pady=4)
+        ttk.Button(summary_item_btns, text="Add", command=self._add_summary_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(summary_item_btns, text="Update", command=self._update_summary_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(summary_item_btns, text="Remove", command=self._remove_summary_item).pack(side=tk.LEFT, padx=4)
+        ttk.Button(summary_item_btns, text="Up", command=lambda: self._move_summary_item(-1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(summary_item_btns, text="Down", command=lambda: self._move_summary_item(1)).pack(side=tk.LEFT,
+                                                                                                    padx=4)
+        ttk.Button(summary_item_btns, text="Clear Editor", command=self._clear_summary_item_editor).pack(side=tk.LEFT,
+                                                                                                         padx=4)
+        self._summary_items: list[dict] = []
+        self._summary_item_selected_idx: int | None = None
+
         ttk.Button(form, text="Add Widget", command=self._add_widget).grid(
-            row=19, column=1, padx=6, pady=4, sticky="w"
+            row=21, column=1, padx=6, pady=4, sticky="w"
         )
         ttk.Button(form, text="Remove Widget", command=self._remove_widget).grid(
-            row=19, column=3, padx=6, pady=4, sticky="w"
+            row=20, column=3, padx=6, pady=4, sticky="w"
         )
 
         self.widget_kind.trace_add("write", lambda *_: self._sync_widget_fields())
         self._sync_widget_fields()
         self._set_actions_widget_visibility(False)
         self._set_valve_widget_visibility(False)
+        self._set_summary_widget_visibility(False)
 
     # ------------------------
     # Battery tab editor
@@ -536,6 +962,16 @@ class LayoutEditor(tk.Tk):
         parent.columnconfigure(1, weight=1)
         return entry
 
+    def _color_entry_at(self, parent: ttk.Frame, label: str, row: int, col: int) -> ttk.Entry:
+        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w")
+        entry = ttk.Entry(parent)
+        entry.grid(row=row, column=col + 1, sticky="ew", padx=6, pady=3)
+        ttk.Button(parent, text="Pick", command=lambda: self._pick_color(entry)).grid(
+            row=row, column=col + 2, sticky="w", padx=(0, 6)
+        )
+        parent.columnconfigure(col + 1, weight=1)
+        return entry
+
     def _pick_color(self, entry: ttk.Entry) -> None:
         initial = entry.get().strip() or None
         _, hex_color = colorchooser.askcolor(color=initial, parent=self)
@@ -547,6 +983,12 @@ class LayoutEditor(tk.Tk):
         self._with_suspended_events(self._refresh_lists_inner)
 
     def _refresh_lists_inner(self) -> None:
+        if hasattr(self, "main_tabs_list"):
+            self.main_tabs_list.delete(0, tk.END)
+            for tab_id in self.data.get("main_tabs", []):
+                self.main_tabs_list.insert(tk.END, tab_id)
+            self._load_main_tabs_form()
+
         self.data_list.delete(0, tk.END)
         for t in self.data["data_tab"]["tabs"]:
             self.data_list.insert(tk.END, t.get("label") or t.get("id") or "tab")
@@ -558,6 +1000,14 @@ class LayoutEditor(tk.Tk):
         self.actions_list.delete(0, tk.END)
         for a in self.data["actions_tab"]["actions"]:
             self.actions_list.insert(tk.END, a.get("label", "action"))
+        if hasattr(self, "disable_actions_by_default"):
+            self.disable_actions_by_default.set(
+                bool(
+                    self.data.get("actions_tab", {}).get(
+                        "disable_actions_by_default", False
+                    )
+                )
+            )
 
         self.state_entry_list.delete(0, tk.END)
         for entry in self.data["state_tab"]["states"]:
@@ -586,6 +1036,8 @@ class LayoutEditor(tk.Tk):
 
         self.status.set(f"Layout path: {self.path}")
         self._refresh_lists()
+        if hasattr(self, "network_title"):
+            self._load_network_tab()
 
     def save(self) -> None:
         self._commit_current_tab()
@@ -617,6 +1069,28 @@ class LayoutEditor(tk.Tk):
             messagebox.showinfo("Validation", "Layout JSON looks good.")
 
     # ------------------------
+    # Dashboard tab actions
+    # ------------------------
+    def _on_main_tab_select(self) -> None:
+        if self._suspend_events:
+            return
+        self._main_tabs_selected_idx = self._selected_index(self.main_tabs_list)
+
+    def _add_main_tab_item(self) -> None:
+        self.data.setdefault("main_tabs", []).append(self.main_tab_choice.get())
+        self._refresh_lists()
+
+    def _remove_main_tab_item(self) -> None:
+        idx = self._selected_index(self.main_tabs_list)
+        if idx is None:
+            return
+        self.data["main_tabs"].pop(idx)
+        self._refresh_lists()
+
+    def _move_main_tab_item(self, delta: int) -> None:
+        self._move_list_item(self.data["main_tabs"], self.main_tabs_list, delta)
+
+    # ------------------------
     # Data tab actions
     # ------------------------
     def _load_data_item(self) -> None:
@@ -639,6 +1113,7 @@ class LayoutEditor(tk.Tk):
         self.data_bool_unknown.delete(0, tk.END)
         labels = item.get("boolean_labels", {}) or {}
         channel_labels = item.get("channel_boolean_labels", []) or []
+        channel_formatters = item.get("channel_formatters", []) or []
         self.data_is_valve.set(bool(labels) or bool(channel_labels))
         self._sync_data_bool_fields()
         self.data_bool_true.insert(0, labels.get("true_label", ""))
@@ -646,6 +1121,15 @@ class LayoutEditor(tk.Tk):
         self.data_bool_unknown.insert(0, labels.get("unknown_label", ""))
         self.data_bool_per_channel.delete(0, tk.END)
         self.data_bool_per_channel.insert(0, self._format_valve_labels(channel_labels))
+        self._data_channel_formatters = [dict(fmt) if isinstance(fmt, dict) else None for fmt in channel_formatters]
+        self._sync_data_formatter_channels()
+        self._data_subtab_selected_idx = None
+        self._refresh_data_subtab_list()
+        self._refresh_data_chart_group_list()
+        self._refresh_data_summary_item_list()
+        self._clear_data_subtab_editor()
+        self._clear_data_chart_group_editor()
+        self._clear_data_summary_item_editor()
 
     def _add_data_item(self) -> None:
         item = {
@@ -660,6 +1144,13 @@ class LayoutEditor(tk.Tk):
         channel_labels = self._channel_labels_from_form()
         if channel_labels:
             item["channel_boolean_labels"] = channel_labels
+        self._sync_data_formatter_channels()
+        channel_formatters = [fmt for fmt in self._data_channel_formatters if fmt]
+        if channel_formatters:
+            item["channel_formatters"] = [
+                self._data_channel_formatters[i] or {}
+                for i in range(len(self._data_channel_formatters))
+            ]
         self.data["data_tab"]["tabs"].append(item)
         self._refresh_lists()
 
@@ -673,12 +1164,554 @@ class LayoutEditor(tk.Tk):
     def _move_data_item(self, delta: int) -> None:
         self._move_list_item(self.data["data_tab"]["tabs"], self.data_list, delta)
 
+    def _current_data_tab(self) -> dict | None:
+        idx = self._data_selected_idx
+        tabs = self.data.get("data_tab", {}).get("tabs", [])
+        if idx is None or idx >= len(tabs):
+            return None
+        return tabs[idx]
+
+    def _current_data_subtabs(self) -> list[dict]:
+        tab = self._current_data_tab()
+        if tab is None:
+            return []
+        return tab.setdefault("subtabs", [])
+
+    def _current_data_subtab(self) -> dict | None:
+        subtabs = self._current_data_subtabs()
+        idx = self._data_subtab_selected_idx
+        if idx is None or idx >= len(subtabs):
+            return None
+        return subtabs[idx]
+
+    def _data_chart_group_target(self) -> dict | None:
+        return self._current_data_subtab() or self._current_data_tab()
+
+    def _data_summary_items_target(self) -> dict | None:
+        return self._current_data_subtab()
+
+    def _data_subtab_label(self, item: dict) -> str:
+        return item.get("label") or item.get("id") or item.get("data_type") or "subtab"
+
+    def _data_chart_group_label(self, item: dict) -> str:
+        title = str(item.get("title", "")).strip()
+        channels = ",".join(str(v) for v in item.get("channels", []) or [])
+        scale_mode = str(item.get("scale_mode", "")).strip()
+        parts = [part for part in (title or channels, scale_mode) if part]
+        return " | ".join(parts) if parts else "chart group"
+
+    def _data_summary_item_label_text(self, item: dict) -> str:
+        label = str(item.get("label", "")).strip()
+        data_type = str(item.get("data_type", "")).strip()
+        index = item.get("index")
+        base = label or data_type or "summary item"
+        if data_type and index is not None:
+            return f"{base} [{data_type}:{index}]"
+        return base
+
+    def _refresh_data_subtab_list(self) -> None:
+        self.data_subtabs_list.delete(0, tk.END)
+        for item in self._current_data_subtabs():
+            self.data_subtabs_list.insert(tk.END, self._data_subtab_label(item))
+
+    def _refresh_data_chart_group_list(self) -> None:
+        self.data_chart_groups_list.delete(0, tk.END)
+        target = self._data_chart_group_target()
+        scope = self._current_data_subtab()
+        self.data_chart_group_scope.set(
+            f"Editing {'subtab' if scope is not None else 'tab'} chart groups"
+        )
+        for item in (target.get("chart_groups", []) if target else []):
+            self.data_chart_groups_list.insert(tk.END, self._data_chart_group_label(item))
+
+    def _refresh_data_summary_item_list(self) -> None:
+        self.data_summary_items_list.delete(0, tk.END)
+        target = self._data_summary_items_target()
+        self.data_summary_item_scope.set(
+            f"Editing subtab summary items"
+            if target is not None
+            else "Select a subtab to edit summary items"
+        )
+        for item in (target.get("summary_items", []) if target else []):
+            self.data_summary_items_list.insert(tk.END, self._data_summary_item_label_text(item))
+
+    def _subtab_from_form(self) -> dict:
+        item: dict[str, object] = {
+            "id": self.data_subtab_id.get().strip(),
+            "label": self.data_subtab_label.get().strip(),
+            "chart": {"enabled": bool(self.data_subtab_chart.get())},
+        }
+        data_type = self.data_subtab_data_type.get().strip()
+        if data_type:
+            item["data_type"] = data_type
+        sender_id = self.data_subtab_sender_id.get().strip()
+        if sender_id:
+            item["sender_id"] = sender_id
+        channels = self._clean_channels(self._split_list(self.data_subtab_channels.get()))
+        if channels:
+            item["channels"] = channels
+        existing = self._current_data_subtab() or {}
+        for key in ("chart_groups", "summary_items", "channel_formatters", "boolean_labels", "channel_boolean_labels"):
+            if key in existing and key not in item:
+                item[key] = existing[key]
+        return item
+
+    def _load_data_subtab(self, item: dict) -> None:
+        self.data_subtab_id.delete(0, tk.END)
+        self.data_subtab_id.insert(0, item.get("id", "") or "")
+        self.data_subtab_label.delete(0, tk.END)
+        self.data_subtab_label.insert(0, item.get("label", "") or "")
+        self.data_subtab_data_type.delete(0, tk.END)
+        self.data_subtab_data_type.insert(0, item.get("data_type", "") or "")
+        self.data_subtab_sender_id.delete(0, tk.END)
+        self.data_subtab_sender_id.insert(0, item.get("sender_id", "") or "")
+        self.data_subtab_channels.delete(0, tk.END)
+        self.data_subtab_channels.insert(0, ", ".join(self._clean_channels(item.get("channels", []) or [])))
+        self.data_subtab_chart.set(bool((item.get("chart", {}) or {}).get("enabled", True)))
+
+    def _clear_data_subtab_editor(self) -> None:
+        self._data_subtab_selected_idx = None
+        for entry in (
+            self.data_subtab_id,
+            self.data_subtab_label,
+            self.data_subtab_data_type,
+            self.data_subtab_sender_id,
+            self.data_subtab_channels,
+        ):
+            entry.delete(0, tk.END)
+        self.data_subtab_chart.set(True)
+        self.data_subtabs_list.selection_clear(0, tk.END)
+
+    def _commit_current_data_subtab(self) -> None:
+        subtabs = self._current_data_subtabs()
+        idx = self._data_subtab_selected_idx
+        if idx is None or idx >= len(subtabs):
+            return
+        subtabs[idx] = self._subtab_from_form()
+
+    def _on_data_subtab_select(self) -> None:
+        if self._suspend_events:
+            return
+        self._commit_current_data_subtab()
+        idx = self._selected_index(self.data_subtabs_list)
+        self._data_subtab_selected_idx = idx
+        if idx is None:
+            self._clear_data_subtab_editor()
+        else:
+            subtabs = self._current_data_subtabs()
+            if idx < len(subtabs):
+                self._load_data_subtab(subtabs[idx])
+        self._data_chart_group_selected_idx = None
+        self._data_summary_item_selected_idx = None
+        self._refresh_data_chart_group_list()
+        self._refresh_data_summary_item_list()
+        self._clear_data_chart_group_editor()
+        self._clear_data_summary_item_editor()
+
+    def _add_data_subtab(self) -> None:
+        subtabs = self._current_data_subtabs()
+        subtabs.append(self._subtab_from_form())
+        self._refresh_data_subtab_list()
+        idx = len(subtabs) - 1
+        self._with_suspended_events(lambda: self.data_subtabs_list.selection_set(idx))
+        self._data_subtab_selected_idx = idx
+        self._load_data_subtab(subtabs[idx])
+        self._refresh_data_chart_group_list()
+        self._refresh_data_summary_item_list()
+
+    def _update_data_subtab(self) -> None:
+        subtabs = self._current_data_subtabs()
+        idx = self._selected_index(self.data_subtabs_list)
+        if idx is None or idx >= len(subtabs):
+            messagebox.showwarning("Subtab", "Select a subtab first.")
+            return
+        subtabs[idx] = self._subtab_from_form()
+        self._refresh_data_subtab_list()
+        self._with_suspended_events(lambda: self.data_subtabs_list.selection_set(idx))
+        self._data_subtab_selected_idx = idx
+        self._load_data_subtab(subtabs[idx])
+
+    def _remove_data_subtab(self) -> None:
+        subtabs = self._current_data_subtabs()
+        idx = self._selected_index(self.data_subtabs_list)
+        if idx is None or idx >= len(subtabs):
+            return
+        subtabs.pop(idx)
+        if not subtabs:
+            self._current_data_tab().pop("subtabs", None)
+        self._refresh_data_subtab_list()
+        self._clear_data_subtab_editor()
+        self._refresh_data_chart_group_list()
+        self._refresh_data_summary_item_list()
+
+    def _move_data_subtab(self, delta: int) -> None:
+        subtabs = self._current_data_subtabs()
+        idx = self._selected_index(self.data_subtabs_list)
+        if idx is None:
+            return
+        new_idx = idx + delta
+        if new_idx < 0 or new_idx >= len(subtabs):
+            return
+        subtabs[idx], subtabs[new_idx] = subtabs[new_idx], subtabs[idx]
+        self._refresh_data_subtab_list()
+        self._with_suspended_events(lambda: self.data_subtabs_list.selection_set(new_idx))
+        self._data_subtab_selected_idx = new_idx
+        self._load_data_subtab(subtabs[new_idx])
+
+    def _data_chart_group_from_form(self) -> dict | None:
+        channels_raw = self._split_list(self.data_chart_group_channels.get())
+        channels: list[int] = []
+        for value in channels_raw:
+            try:
+                channels.append(int(value))
+            except ValueError:
+                continue
+        if not channels:
+            return None
+        item: dict[str, object] = {"channels": channels}
+        title = self.data_chart_group_title.get().strip()
+        if title:
+            item["title"] = title
+        data_type = self.data_chart_group_data_type.get().strip()
+        if data_type:
+            item["data_type"] = data_type
+        sender_id = self.data_chart_group_sender_id.get().strip()
+        if sender_id:
+            item["sender_id"] = sender_id
+        labels = self._clean_channels(self._split_list(self.data_chart_group_labels.get()))
+        if labels:
+            item["labels"] = labels
+        scale_mode = self.data_chart_group_scale_mode.get().strip()
+        if scale_mode:
+            item["scale_mode"] = scale_mode
+        return item
+
+    def _load_data_chart_group(self, item: dict) -> None:
+        self.data_chart_group_title.delete(0, tk.END)
+        self.data_chart_group_title.insert(0, item.get("title", "") or "")
+        self.data_chart_group_data_type.delete(0, tk.END)
+        self.data_chart_group_data_type.insert(0, item.get("data_type", "") or "")
+        self.data_chart_group_sender_id.delete(0, tk.END)
+        self.data_chart_group_sender_id.insert(0, item.get("sender_id", "") or "")
+        self.data_chart_group_labels.delete(0, tk.END)
+        self.data_chart_group_labels.insert(0, ", ".join(self._clean_channels(item.get("labels", []) or [])))
+        self.data_chart_group_channels.delete(0, tk.END)
+        self.data_chart_group_channels.insert(0, ", ".join(str(v) for v in item.get("channels", []) or []))
+        self.data_chart_group_scale_mode.set(str(item.get("scale_mode", "")).strip())
+
+    def _clear_data_chart_group_editor(self) -> None:
+        self._data_chart_group_selected_idx = None
+        for entry in (
+            self.data_chart_group_title,
+            self.data_chart_group_data_type,
+            self.data_chart_group_sender_id,
+            self.data_chart_group_labels,
+            self.data_chart_group_channels,
+        ):
+            entry.delete(0, tk.END)
+        self.data_chart_group_scale_mode.set("")
+        self.data_chart_groups_list.selection_clear(0, tk.END)
+
+    def _commit_current_data_chart_group(self) -> None:
+        target = self._data_chart_group_target()
+        idx = self._data_chart_group_selected_idx
+        if target is None or idx is None:
+            return
+        groups = target.setdefault("chart_groups", [])
+        if idx >= len(groups):
+            return
+        item = self._data_chart_group_from_form()
+        if item is not None:
+            groups[idx] = item
+
+    def _on_data_chart_group_select(self) -> None:
+        if self._suspend_events:
+            return
+        self._commit_current_data_chart_group()
+        idx = self._selected_index(self.data_chart_groups_list)
+        self._data_chart_group_selected_idx = idx
+        target = self._data_chart_group_target()
+        groups = target.get("chart_groups", []) if target else []
+        if idx is None or idx >= len(groups):
+            self._clear_data_chart_group_editor()
+            return
+        self._load_data_chart_group(groups[idx])
+
+    def _add_data_chart_group(self) -> None:
+        target = self._data_chart_group_target()
+        if target is None:
+            return
+        item = self._data_chart_group_from_form()
+        if item is None:
+            messagebox.showwarning("Chart group", "Enter at least one numeric channel index.")
+            return
+        groups = target.setdefault("chart_groups", [])
+        groups.append(item)
+        self._refresh_data_chart_group_list()
+        idx = len(groups) - 1
+        self._with_suspended_events(lambda: self.data_chart_groups_list.selection_set(idx))
+        self._data_chart_group_selected_idx = idx
+        self._load_data_chart_group(item)
+
+    def _update_data_chart_group(self) -> None:
+        target = self._data_chart_group_target()
+        idx = self._selected_index(self.data_chart_groups_list)
+        groups = target.get("chart_groups", []) if target else []
+        if idx is None or idx >= len(groups):
+            messagebox.showwarning("Chart group", "Select a chart group first.")
+            return
+        item = self._data_chart_group_from_form()
+        if item is None:
+            return
+        groups[idx] = item
+        self._refresh_data_chart_group_list()
+        self._with_suspended_events(lambda: self.data_chart_groups_list.selection_set(idx))
+        self._data_chart_group_selected_idx = idx
+        self._load_data_chart_group(item)
+
+    def _remove_data_chart_group(self) -> None:
+        target = self._data_chart_group_target()
+        idx = self._selected_index(self.data_chart_groups_list)
+        groups = target.get("chart_groups", []) if target else []
+        if idx is None or idx >= len(groups):
+            return
+        groups.pop(idx)
+        if not groups and target is not None:
+            target.pop("chart_groups", None)
+        self._refresh_data_chart_group_list()
+        self._clear_data_chart_group_editor()
+
+    def _move_data_chart_group(self, delta: int) -> None:
+        target = self._data_chart_group_target()
+        if target is None:
+            return
+        groups = target.setdefault("chart_groups", [])
+        idx = self._selected_index(self.data_chart_groups_list)
+        if idx is None:
+            return
+        new_idx = idx + delta
+        if new_idx < 0 or new_idx >= len(groups):
+            return
+        groups[idx], groups[new_idx] = groups[new_idx], groups[idx]
+        self._refresh_data_chart_group_list()
+        self._with_suspended_events(lambda: self.data_chart_groups_list.selection_set(new_idx))
+        self._data_chart_group_selected_idx = new_idx
+        self._load_data_chart_group(groups[new_idx])
+
+    def _data_summary_item_from_form(self) -> dict | None:
+        label = self.data_summary_item_label.get().strip()
+        data_type = self.data_summary_item_data_type.get().strip()
+        if not label or not data_type:
+            return None
+        try:
+            index = int(self.data_summary_item_index.get().strip())
+        except ValueError:
+            return None
+        item: dict[str, object] = {"label": label, "data_type": data_type, "index": index}
+        sender_id = self.data_summary_item_sender_id.get().strip()
+        if sender_id:
+            item["sender_id"] = sender_id
+        formatter = {}
+        kind = self.data_summary_item_format_kind.get().strip()
+        if kind:
+            formatter["kind"] = kind
+        precision_raw = self.data_summary_item_precision.get().strip()
+        if precision_raw:
+            try:
+                formatter["precision"] = int(precision_raw)
+            except ValueError:
+                pass
+        prefix = self.data_summary_item_prefix.get().strip()
+        if prefix:
+            formatter["prefix"] = prefix
+        suffix = self.data_summary_item_suffix.get().strip()
+        if suffix:
+            formatter["suffix"] = suffix
+        if formatter:
+            item["formatter"] = formatter
+        true_label = self.data_summary_item_true.get().strip()
+        false_label = self.data_summary_item_false.get().strip()
+        unknown_label = self.data_summary_item_unknown.get().strip()
+        if true_label or false_label or unknown_label:
+            labels = {
+                "true_label": true_label or "True",
+                "false_label": false_label or "False",
+            }
+            if unknown_label:
+                labels["unknown_label"] = unknown_label
+            item["boolean_labels"] = labels
+        return item
+
+    def _load_data_summary_item(self, item: dict) -> None:
+        self.data_summary_item_label.delete(0, tk.END)
+        self.data_summary_item_label.insert(0, item.get("label", "") or "")
+        self.data_summary_item_data_type.delete(0, tk.END)
+        self.data_summary_item_data_type.insert(0, item.get("data_type", "") or "")
+        self.data_summary_item_index.delete(0, tk.END)
+        self.data_summary_item_index.insert(0, str(item.get("index", "")))
+        self.data_summary_item_sender_id.delete(0, tk.END)
+        self.data_summary_item_sender_id.insert(0, item.get("sender_id", "") or "")
+        boolean_labels = item.get("boolean_labels", {}) or {}
+        self.data_summary_item_true.delete(0, tk.END)
+        self.data_summary_item_true.insert(0, boolean_labels.get("true_label", "") or "")
+        self.data_summary_item_false.delete(0, tk.END)
+        self.data_summary_item_false.insert(0, boolean_labels.get("false_label", "") or "")
+        self.data_summary_item_unknown.delete(0, tk.END)
+        self.data_summary_item_unknown.insert(0, boolean_labels.get("unknown_label", "") or "")
+        formatter = item.get("formatter", {}) or {}
+        self.data_summary_item_format_kind.set(str(formatter.get("kind", "")).strip())
+        self.data_summary_item_precision.delete(0, tk.END)
+        if formatter.get("precision") is not None:
+            self.data_summary_item_precision.insert(0, str(formatter.get("precision")))
+        self.data_summary_item_prefix.delete(0, tk.END)
+        self.data_summary_item_prefix.insert(0, formatter.get("prefix", "") or "")
+        self.data_summary_item_suffix.delete(0, tk.END)
+        self.data_summary_item_suffix.insert(0, formatter.get("suffix", "") or "")
+
+    def _clear_data_summary_item_editor(self) -> None:
+        self._data_summary_item_selected_idx = None
+        for entry in (
+            self.data_summary_item_label,
+            self.data_summary_item_data_type,
+            self.data_summary_item_index,
+            self.data_summary_item_sender_id,
+            self.data_summary_item_true,
+            self.data_summary_item_false,
+            self.data_summary_item_unknown,
+            self.data_summary_item_precision,
+            self.data_summary_item_prefix,
+            self.data_summary_item_suffix,
+        ):
+            entry.delete(0, tk.END)
+        self.data_summary_item_format_kind.set("")
+        self.data_summary_items_list.selection_clear(0, tk.END)
+
+    def _commit_current_data_summary_item(self) -> None:
+        target = self._data_summary_items_target()
+        idx = self._data_summary_item_selected_idx
+        if target is None or idx is None:
+            return
+        items = target.setdefault("summary_items", [])
+        if idx >= len(items):
+            return
+        item = self._data_summary_item_from_form()
+        if item is not None:
+            items[idx] = item
+
+    def _on_data_summary_item_select(self) -> None:
+        if self._suspend_events:
+            return
+        self._commit_current_data_summary_item()
+        target = self._data_summary_items_target()
+        items = target.get("summary_items", []) if target else []
+        idx = self._selected_index(self.data_summary_items_list)
+        self._data_summary_item_selected_idx = idx
+        if idx is None or idx >= len(items):
+            self._clear_data_summary_item_editor()
+            return
+        self._load_data_summary_item(items[idx])
+
+    def _add_data_summary_item(self) -> None:
+        target = self._data_summary_items_target()
+        if target is None:
+            messagebox.showwarning("Summary item", "Select a subtab first.")
+            return
+        item = self._data_summary_item_from_form()
+        if item is None:
+            messagebox.showwarning("Summary item", "Enter label, data type, and numeric index.")
+            return
+        items = target.setdefault("summary_items", [])
+        items.append(item)
+        self._refresh_data_summary_item_list()
+        idx = len(items) - 1
+        self._with_suspended_events(lambda: self.data_summary_items_list.selection_set(idx))
+        self._data_summary_item_selected_idx = idx
+        self._load_data_summary_item(item)
+
+    def _update_data_summary_item(self) -> None:
+        target = self._data_summary_items_target()
+        items = target.get("summary_items", []) if target else []
+        idx = self._selected_index(self.data_summary_items_list)
+        if idx is None or idx >= len(items):
+            messagebox.showwarning("Summary item", "Select a summary item first.")
+            return
+        item = self._data_summary_item_from_form()
+        if item is None:
+            return
+        items[idx] = item
+        self._refresh_data_summary_item_list()
+        self._with_suspended_events(lambda: self.data_summary_items_list.selection_set(idx))
+        self._data_summary_item_selected_idx = idx
+        self._load_data_summary_item(item)
+
+    def _remove_data_summary_item(self) -> None:
+        target = self._data_summary_items_target()
+        items = target.get("summary_items", []) if target else []
+        idx = self._selected_index(self.data_summary_items_list)
+        if idx is None or idx >= len(items):
+            return
+        items.pop(idx)
+        if not items and target is not None:
+            target.pop("summary_items", None)
+        self._refresh_data_summary_item_list()
+        self._clear_data_summary_item_editor()
+
+    def _move_data_summary_item(self, delta: int) -> None:
+        target = self._data_summary_items_target()
+        if target is None:
+            return
+        items = target.setdefault("summary_items", [])
+        idx = self._selected_index(self.data_summary_items_list)
+        if idx is None:
+            return
+        new_idx = idx + delta
+        if new_idx < 0 or new_idx >= len(items):
+            return
+        items[idx], items[new_idx] = items[new_idx], items[idx]
+        self._refresh_data_summary_item_list()
+        self._with_suspended_events(lambda: self.data_summary_items_list.selection_set(new_idx))
+        self._data_summary_item_selected_idx = new_idx
+        self._load_data_summary_item(items[new_idx])
+
     # ------------------------
     # Battery tab actions
     # ------------------------
     def _ensure_layout_shape(self) -> None:
+        self.data.setdefault(
+            "main_tabs",
+            [
+                "state",
+                "connection-status",
+                "map",
+                "actions",
+                "calibration",
+                "notifications",
+                "warnings",
+                "errors",
+                "data",
+                "detailed",
+                "network-topology",
+            ],
+        )
+        branding = self.data.setdefault("branding", {})
+        branding.setdefault("app_name", None)
+        branding.setdefault("dashboard_title", None)
+        branding.setdefault("tab_labels", {})
+        theme = self.data.setdefault("theme", {})
+        for key, value in default_layout()["theme"].items():
+            if isinstance(value, dict):
+                theme.setdefault(key, {}).update(
+                    {k: v for k, v in value.items() if k not in theme.get(key, {})}
+                )
+            else:
+                theme.setdefault(key, value)
         self.data.setdefault("connection_tab", {}).setdefault("sections", [])
-        self.data.setdefault("actions_tab", {}).setdefault("actions", [])
+        network = self.data.setdefault("network_tab", {})
+        network.setdefault("enabled", False)
+        network.setdefault("title", "SEDSprintf Network")
+        actions_tab = self.data.setdefault("actions_tab", {})
+        actions_tab.setdefault("disable_actions_by_default", False)
+        actions_tab.setdefault("actions", [])
         self.data.setdefault("data_tab", {}).setdefault("tabs", [])
         self.data.setdefault("state_tab", {}).setdefault("states", [])
         battery = self.data.setdefault("battery", {})
@@ -687,6 +1720,35 @@ class LayoutEditor(tk.Tk):
         estimator = battery["estimator"]
         estimator.setdefault("window_seconds", 300)
         estimator.setdefault("min_drop_rate_v_per_min", 0.005)
+
+    def _load_network_tab(self) -> None:
+        network = self.data.get("network_tab", {})
+        self.network_enabled.set(bool(network.get("enabled", False)))
+        self.network_title.delete(0, tk.END)
+        self.network_title.insert(0, network.get("title", "") or "")
+
+    def _load_main_tabs_form(self) -> None:
+        if not hasattr(self, "layout_version"):
+            return
+        self.layout_version.delete(0, tk.END)
+        self.layout_version.insert(0, str(self.data.get("version", 1)))
+        branding = self.data.get("branding", {}) or {}
+        self.branding_app_name.delete(0, tk.END)
+        self.branding_app_name.insert(0, branding.get("app_name", "") or "")
+        self.branding_dashboard_title.delete(0, tk.END)
+        self.branding_dashboard_title.insert(0, branding.get("dashboard_title", "") or "")
+        tab_labels = branding.get("tab_labels", {}) or {}
+        for tab_id, entry in self.tab_label_entries.items():
+            entry.delete(0, tk.END)
+            entry.insert(0, tab_labels.get(tab_id, "") or "")
+        theme = self.data.get("theme", {}) or {}
+        for key, entry in self.theme_entries.items():
+            entry.delete(0, tk.END)
+            entry.insert(0, theme.get(key, "") or "")
+        accents = theme.get("main_tab_accents", {}) or {}
+        for tab_id, entry in self.theme_tab_accent_entries.items():
+            entry.delete(0, tk.END)
+            entry.insert(0, accents.get(tab_id, "") or "")
 
     def _load_battery_item(self) -> None:
         idx = self._selected_index(self.battery_list)
@@ -875,6 +1937,11 @@ class LayoutEditor(tk.Tk):
             "fg": self.action_fg.get().strip(),
         }
 
+    def _store_actions_defaults(self) -> None:
+        self.data.setdefault("actions_tab", {})["disable_actions_by_default"] = bool(
+            self.disable_actions_by_default.get()
+        )
+
     # ------------------------
     # State layout actions
     # ------------------------
@@ -902,6 +1969,7 @@ class LayoutEditor(tk.Tk):
 
             self._with_suspended_events(_select_first)
         else:
+            self._clear_section_form()
             self._clear_widget_form()
 
     def _load_section_from_selection(self) -> None:
@@ -921,6 +1989,13 @@ class LayoutEditor(tk.Tk):
         self.section_title.delete(0, tk.END)
         self.section_title.insert(0, section.get("title", ""))
         self._section_title_loaded = section.get("title", "")
+        section_style = section.get("style", {}) or {}
+        self.section_bg.delete(0, tk.END)
+        self.section_bg.insert(0, section_style.get("background", "") or "")
+        self.section_border.delete(0, tk.END)
+        self.section_border.insert(0, section_style.get("border", "") or "")
+        self.section_title_color.delete(0, tk.END)
+        self.section_title_color.insert(0, section_style.get("title_color", "") or "")
         self.widget_list.delete(0, tk.END)
         widgets = section.get("widgets", [])
         if not isinstance(widgets, list):
@@ -951,10 +2026,23 @@ class LayoutEditor(tk.Tk):
         self.widget_width.insert(0, str(widget.get("width", "")))
         self.widget_height.delete(0, tk.END)
         self.widget_height.insert(0, str(widget.get("height", "")))
-        self.widget_items.delete(0, tk.END)
-        self.widget_items.insert(0, self._format_items(widget.get("items", [])))
+        self._chart_series = [dict(item) for item in widget.get("chart_series", []) or []]
+        self._refresh_chart_series_list()
+        self._clear_chart_series_editor()
+        self._summary_items = [dict(item) for item in widget.get("items", []) or []]
+        self._refresh_summary_item_list()
+        self._clear_summary_item_editor()
         self.widget_valves.delete(0, tk.END)
         self.widget_valves.insert(0, self._format_items(widget.get("valves", [])))
+        summary_style = widget.get("summary_style", {}) or {}
+        self.summary_bg.delete(0, tk.END)
+        self.summary_bg.insert(0, summary_style.get("background", "") or "")
+        self.summary_border.delete(0, tk.END)
+        self.summary_border.insert(0, summary_style.get("border", "") or "")
+        self.summary_label_color.delete(0, tk.END)
+        self.summary_label_color.insert(0, summary_style.get("label_color", "") or "")
+        self.summary_value_color.delete(0, tk.END)
+        self.summary_value_color.insert(0, summary_style.get("value_color", "") or "")
         self.widget_valve_true.delete(0, tk.END)
         self.widget_valve_false.delete(0, tk.END)
         self.widget_valve_unknown_text.delete(0, tk.END)
@@ -1008,6 +2096,15 @@ class LayoutEditor(tk.Tk):
 
                 self._with_suspended_events(_restore_title)
         section = {"title": self.section_title.get().strip(), "widgets": []}
+        style = self._style_dict(
+            [
+                ("background", self.section_bg),
+                ("border", self.section_border),
+                ("title_color", self.section_title_color),
+            ]
+        )
+        if style:
+            section["style"] = style
         sections.append(section)
         new_idx = len(sections) - 1
         if new_idx >= 0:
@@ -1044,6 +2141,7 @@ class LayoutEditor(tk.Tk):
             self._state_section_selected_idx = next_idx
             self._load_section_for(e_idx, next_idx)
         else:
+            self._clear_section_form()
             self._clear_widget_form()
 
     def _add_widget(self) -> None:
@@ -1055,6 +2153,15 @@ class LayoutEditor(tk.Tk):
         s_idx = self._state_section_selected_idx
         if s_idx is None or s_idx >= len(sections):
             section = {"title": self.section_title.get().strip() or "Section", "widgets": []}
+            style = self._style_dict(
+                [
+                    ("background", self.section_bg),
+                    ("border", self.section_border),
+                    ("title_color", self.section_title_color),
+                ]
+            )
+            if style:
+                section["style"] = style
             sections.append(section)
             s_idx = len(sections) - 1
             self._with_suspended_events(lambda: self.section_list.selection_set(s_idx))
@@ -1136,6 +2243,13 @@ class LayoutEditor(tk.Tk):
             return 0
         return None
 
+    def _clear_section_form(self) -> None:
+        self.section_title.delete(0, tk.END)
+        self.section_bg.delete(0, tk.END)
+        self.section_border.delete(0, tk.END)
+        self.section_title_color.delete(0, tk.END)
+        self._section_title_loaded = ""
+
     def _update_section_title_live(self) -> None:
         if self._suspend_events:
             return
@@ -1159,6 +2273,8 @@ class LayoutEditor(tk.Tk):
         label = widget.get("kind", "widget")
         if widget.get("data_type"):
             label = f"{label} ({widget.get('data_type')})"
+        elif widget.get("chart_series"):
+            label = f"{label} (combined)"
         return label
 
     def _action_pairs(self) -> list[tuple[str, str]]:
@@ -1243,6 +2359,256 @@ class LayoutEditor(tk.Tk):
             if label:
                 parts.append(f"{label}:{idx}")
         return ", ".join(parts)
+
+    def _chart_series_label(self, item: dict) -> str:
+        data_type = str(item.get("data_type", "")).strip() or "series"
+        idx = item.get("index", "?")
+        label = str(item.get("label", "")).strip()
+        return f"{data_type}:{idx}" if not label else f"{data_type}:{idx} [{label}]"
+
+    def _refresh_chart_series_list(self) -> None:
+        self.chart_series_list.delete(0, tk.END)
+        for item in self._chart_series:
+            self.chart_series_list.insert(tk.END, self._chart_series_label(item))
+
+    def _chart_series_from_form(self) -> dict | None:
+        data_type = self.chart_series_data_type.get().strip()
+        if not data_type:
+            return None
+        try:
+            idx = int(self.chart_series_index.get().strip())
+        except ValueError:
+            return None
+        item = {"data_type": data_type, "index": idx}
+        label = self.chart_series_label.get().strip()
+        if label:
+            item["label"] = label
+        return item
+
+    def _load_chart_series_editor(self, item: dict) -> None:
+        self.chart_series_data_type.delete(0, tk.END)
+        self.chart_series_data_type.insert(0, item.get("data_type", ""))
+        self.chart_series_index.delete(0, tk.END)
+        self.chart_series_index.insert(0, str(item.get("index", "")))
+        self.chart_series_label.delete(0, tk.END)
+        self.chart_series_label.insert(0, item.get("label", "") or "")
+
+    def _clear_chart_series_editor(self) -> None:
+        self._chart_series_selected_idx = None
+        self.chart_series_data_type.delete(0, tk.END)
+        self.chart_series_index.delete(0, tk.END)
+        self.chart_series_label.delete(0, tk.END)
+        if hasattr(self, "chart_series_list"):
+            self.chart_series_list.selection_clear(0, tk.END)
+
+    def _on_chart_series_select(self) -> None:
+        if self._suspend_events:
+            return
+        idx = self._selected_index(self.chart_series_list)
+        if idx is None or idx >= len(self._chart_series):
+            self._clear_chart_series_editor()
+            return
+        self._chart_series_selected_idx = idx
+        self._load_chart_series_editor(self._chart_series[idx])
+
+    def _add_chart_series(self) -> None:
+        item = self._chart_series_from_form()
+        if item is None:
+            messagebox.showwarning("Chart series", "Enter a data type and valid index.")
+            return
+        self._chart_series.append(item)
+        self._refresh_chart_series_list()
+        idx = len(self._chart_series) - 1
+        self._with_suspended_events(lambda: self.chart_series_list.selection_set(idx))
+        self._chart_series_selected_idx = idx
+        self._load_chart_series_editor(item)
+
+    def _update_chart_series(self) -> None:
+        idx = self._selected_index(self.chart_series_list)
+        if idx is None or idx >= len(self._chart_series):
+            messagebox.showwarning("Chart series", "Select a chart series first.")
+            return
+        item = self._chart_series_from_form()
+        if item is None:
+            messagebox.showwarning("Chart series", "Enter a data type and valid index.")
+            return
+        self._chart_series[idx] = item
+        self._refresh_chart_series_list()
+        self._with_suspended_events(lambda: self.chart_series_list.selection_set(idx))
+        self._chart_series_selected_idx = idx
+
+    def _remove_chart_series(self) -> None:
+        idx = self._selected_index(self.chart_series_list)
+        if idx is None or idx >= len(self._chart_series):
+            return
+        self._chart_series.pop(idx)
+        self._refresh_chart_series_list()
+        self._clear_chart_series_editor()
+
+    def _move_chart_series(self, delta: int) -> None:
+        idx = self._selected_index(self.chart_series_list)
+        if idx is None:
+            return
+        new_idx = idx + delta
+        if new_idx < 0 or new_idx >= len(self._chart_series):
+            return
+        self._chart_series[idx], self._chart_series[new_idx] = (
+            self._chart_series[new_idx],
+            self._chart_series[idx],
+        )
+        self._refresh_chart_series_list()
+        self._with_suspended_events(lambda: self.chart_series_list.selection_set(new_idx))
+        self._chart_series_selected_idx = new_idx
+        self._load_chart_series_editor(self._chart_series[new_idx])
+
+    def _summary_item_label(self, item: dict) -> str:
+        label = str(item.get("label", "")).strip() or "item"
+        idx = item.get("index", "?")
+        formatter = item.get("formatter", {}) or {}
+        fmt_kind = str(formatter.get("kind", "")).strip()
+        prefix = str(formatter.get("prefix", "")).strip()
+        suffix = str(formatter.get("suffix", "")).strip()
+        extras = [part for part in (fmt_kind, prefix, suffix) if part]
+        extra_text = f" [{' | '.join(extras)}]" if extras else ""
+        return f"{label}:{idx}{extra_text}"
+
+    def _refresh_summary_item_list(self) -> None:
+        self.summary_item_list.delete(0, tk.END)
+        for item in self._summary_items:
+            self.summary_item_list.insert(tk.END, self._summary_item_label(item))
+
+    def _summary_item_from_form(self) -> dict | None:
+        label = self.summary_item_label.get().strip()
+        if not label:
+            return None
+        try:
+            idx = int(self.summary_item_index.get().strip())
+        except ValueError:
+            return None
+        item = {"label": label, "index": idx}
+        formatter: dict[str, object] = {}
+        kind = self.summary_item_format_kind.get().strip()
+        if kind:
+            formatter["kind"] = kind
+        precision_raw = self.summary_item_precision.get().strip()
+        if precision_raw:
+            try:
+                formatter["precision"] = int(precision_raw)
+            except ValueError:
+                pass
+        prefix = self.summary_item_prefix.get().strip()
+        if prefix:
+            formatter["prefix"] = prefix
+        suffix = self.summary_item_suffix.get().strip()
+        if suffix:
+            formatter["suffix"] = suffix
+        if formatter:
+            item["formatter"] = formatter
+        return item
+
+    def _load_summary_item_editor(self, item: dict) -> None:
+        self.summary_item_label.delete(0, tk.END)
+        self.summary_item_label.insert(0, item.get("label", ""))
+        self.summary_item_index.delete(0, tk.END)
+        self.summary_item_index.insert(0, str(item.get("index", "")))
+        formatter = item.get("formatter", {}) or {}
+        self.summary_item_format_kind.set(str(formatter.get("kind", "")).strip())
+        self.summary_item_precision.delete(0, tk.END)
+        if formatter.get("precision") is not None:
+            self.summary_item_precision.insert(0, str(formatter.get("precision")))
+        self.summary_item_prefix.delete(0, tk.END)
+        self.summary_item_prefix.insert(0, formatter.get("prefix", "") or "")
+        self.summary_item_suffix.delete(0, tk.END)
+        self.summary_item_suffix.insert(0, formatter.get("suffix", "") or "")
+
+    def _clear_summary_item_editor(self) -> None:
+        self._summary_item_selected_idx = None
+        self.summary_item_label.delete(0, tk.END)
+        self.summary_item_index.delete(0, tk.END)
+        self.summary_item_format_kind.set("")
+        self.summary_item_precision.delete(0, tk.END)
+        self.summary_item_prefix.delete(0, tk.END)
+        self.summary_item_suffix.delete(0, tk.END)
+        if hasattr(self, "summary_item_list"):
+            self.summary_item_list.selection_clear(0, tk.END)
+
+    def _on_summary_item_select(self) -> None:
+        if self._suspend_events:
+            return
+        idx = self._selected_index(self.summary_item_list)
+        if (
+                self._summary_item_selected_idx is not None
+                and self._summary_item_selected_idx < len(self._summary_items)
+        ):
+            updated = self._summary_item_from_form()
+            if updated is not None:
+                self._summary_items[self._summary_item_selected_idx] = updated
+                self._refresh_summary_item_list()
+                if idx is not None and idx < len(self._summary_items):
+                    self._with_suspended_events(lambda: self.summary_item_list.selection_set(idx))
+        if idx is None or idx >= len(self._summary_items):
+            self._clear_summary_item_editor()
+            return
+        self._summary_item_selected_idx = idx
+        self._load_summary_item_editor(self._summary_items[idx])
+
+    def _add_summary_item(self) -> None:
+        item = self._summary_item_from_form()
+        if item is None:
+            messagebox.showwarning("Summary item", "Enter a label and valid index.")
+            return
+        self._summary_items.append(item)
+        self._refresh_summary_item_list()
+        idx = len(self._summary_items) - 1
+        self._with_suspended_events(lambda: self.summary_item_list.selection_set(idx))
+        self._summary_item_selected_idx = idx
+        self._load_summary_item_editor(item)
+
+    def _update_summary_item(self) -> None:
+        idx = self._selected_index(self.summary_item_list)
+        if idx is None or idx >= len(self._summary_items):
+            messagebox.showwarning("Summary item", "Select a summary item first.")
+            return
+        item = self._summary_item_from_form()
+        if item is None:
+            messagebox.showwarning("Summary item", "Enter a label and valid index.")
+            return
+        self._summary_items[idx] = item
+        self._refresh_summary_item_list()
+        self._with_suspended_events(lambda: self.summary_item_list.selection_set(idx))
+        self._summary_item_selected_idx = idx
+
+    def _remove_summary_item(self) -> None:
+        idx = self._selected_index(self.summary_item_list)
+        if idx is None or idx >= len(self._summary_items):
+            return
+        self._summary_items.pop(idx)
+        self._refresh_summary_item_list()
+        self._clear_summary_item_editor()
+
+    def _move_summary_item(self, delta: int) -> None:
+        idx = self._selected_index(self.summary_item_list)
+        if idx is None:
+            return
+        new_idx = idx + delta
+        if new_idx < 0 or new_idx >= len(self._summary_items):
+            return
+        self._summary_items[idx], self._summary_items[new_idx] = (
+            self._summary_items[new_idx],
+            self._summary_items[idx],
+        )
+        self._refresh_summary_item_list()
+        self._with_suspended_events(lambda: self.summary_item_list.selection_set(new_idx))
+        self._summary_item_selected_idx = new_idx
+        self._load_summary_item_editor(self._summary_items[new_idx])
+
+    def _style_dict(self, mapping: list[tuple[str, ttk.Entry]]) -> dict | None:
+        result = {
+            key: entry.get().strip()
+            for key, entry in mapping
+            if entry.get().strip()
+        }
+        return result or None
 
     def _format_color_triplet(self, colors: dict | None) -> str:
         if not isinstance(colors, dict):
@@ -1342,6 +2708,88 @@ class LayoutEditor(tk.Tk):
         labels = self._parse_valve_labels(self.data_bool_per_channel.get())
         return labels or None
 
+    def _sync_data_formatter_channels(self) -> None:
+        channels = self._clean_channels(self._split_list(self.data_channels.get()))
+        existing = list(self._data_channel_formatters)
+        self._data_channel_formatters = []
+        for idx, _channel in enumerate(channels):
+            self._data_channel_formatters.append(existing[idx] if idx < len(existing) else None)
+        self.data_formatter_channels.delete(0, tk.END)
+        for idx, channel in enumerate(channels):
+            formatter = self._data_channel_formatters[idx] or {}
+            kind = str(formatter.get("kind", "")).strip()
+            label = f"{channel} [{kind}]" if kind else channel
+            self.data_formatter_channels.insert(tk.END, label)
+        self._clear_data_formatter_editor()
+
+    def _load_data_formatter_editor(self, formatter: dict | None) -> None:
+        formatter = formatter or {}
+        self.data_formatter_kind.set(str(formatter.get("kind", "")).strip())
+        self.data_formatter_precision.delete(0, tk.END)
+        if formatter.get("precision") is not None:
+            self.data_formatter_precision.insert(0, str(formatter.get("precision")))
+        self.data_formatter_prefix.delete(0, tk.END)
+        self.data_formatter_prefix.insert(0, formatter.get("prefix", "") or "")
+        self.data_formatter_suffix.delete(0, tk.END)
+        self.data_formatter_suffix.insert(0, formatter.get("suffix", "") or "")
+
+    def _clear_data_formatter_editor(self) -> None:
+        self._data_formatter_selected_idx = None
+        self.data_formatter_kind.set("")
+        self.data_formatter_precision.delete(0, tk.END)
+        self.data_formatter_prefix.delete(0, tk.END)
+        self.data_formatter_suffix.delete(0, tk.END)
+        if hasattr(self, "data_formatter_channels"):
+            self.data_formatter_channels.selection_clear(0, tk.END)
+
+    def _data_formatter_from_form(self) -> dict | None:
+        formatter: dict[str, object] = {}
+        kind = self.data_formatter_kind.get().strip()
+        if kind:
+            formatter["kind"] = kind
+        precision_raw = self.data_formatter_precision.get().strip()
+        if precision_raw:
+            try:
+                formatter["precision"] = int(precision_raw)
+            except ValueError:
+                pass
+        prefix = self.data_formatter_prefix.get().strip()
+        if prefix:
+            formatter["prefix"] = prefix
+        suffix = self.data_formatter_suffix.get().strip()
+        if suffix:
+            formatter["suffix"] = suffix
+        return formatter or None
+
+    def _on_data_formatter_select(self) -> None:
+        if self._suspend_events:
+            return
+        idx = self._selected_index(self.data_formatter_channels)
+        if idx is None or idx >= len(self._data_channel_formatters):
+            self._clear_data_formatter_editor()
+            return
+        self._data_formatter_selected_idx = idx
+        self._load_data_formatter_editor(self._data_channel_formatters[idx])
+
+    def _apply_data_formatter(self) -> None:
+        idx = self._selected_index(self.data_formatter_channels)
+        if idx is None or idx >= len(self._data_channel_formatters):
+            messagebox.showwarning("Channel formatter", "Select a channel first.")
+            return
+        self._data_channel_formatters[idx] = self._data_formatter_from_form()
+        self._sync_data_formatter_channels()
+        self._with_suspended_events(lambda: self.data_formatter_channels.selection_set(idx))
+        self._data_formatter_selected_idx = idx
+        self._load_data_formatter_editor(self._data_channel_formatters[idx])
+
+    def _clear_data_formatter(self) -> None:
+        idx = self._selected_index(self.data_formatter_channels)
+        if idx is None or idx >= len(self._data_channel_formatters):
+            self._clear_data_formatter_editor()
+            return
+        self._data_channel_formatters[idx] = None
+        self._sync_data_formatter_channels()
+
     def _sync_data_bool_fields(self) -> None:
         enabled = bool(self.data_is_valve.get())
         state = "normal" if enabled else "disabled"
@@ -1407,10 +2855,32 @@ class LayoutEditor(tk.Tk):
                 widget["height"] = float(self.widget_height.get().strip())
             except ValueError:
                 pass
+        if kind == "chart":
+            if self._chart_series_selected_idx is not None and self._chart_series_selected_idx < len(
+                    self._chart_series):
+                item = self._chart_series_from_form()
+                if item is not None:
+                    self._chart_series[self._chart_series_selected_idx] = item
+            if self._chart_series:
+                widget["chart_series"] = list(self._chart_series)
         if kind == "summary":
-            items = self._parse_items(self.widget_items.get())
-            if items:
-                widget["items"] = items
+            if self._summary_item_selected_idx is not None and self._summary_item_selected_idx < len(
+                    self._summary_items):
+                item = self._summary_item_from_form()
+                if item is not None:
+                    self._summary_items[self._summary_item_selected_idx] = item
+            if self._summary_items:
+                widget["items"] = list(self._summary_items)
+            summary_style = self._style_dict(
+                [
+                    ("background", self.summary_bg),
+                    ("border", self.summary_border),
+                    ("label_color", self.summary_label_color),
+                    ("value_color", self.summary_value_color),
+                ]
+            )
+            if summary_style:
+                widget["summary_style"] = summary_style
         if kind == "valve_state":
             valves = self._parse_items(self.widget_valves.get())
             if valves:
@@ -1431,18 +2901,22 @@ class LayoutEditor(tk.Tk):
     def _sync_widget_fields(self) -> None:
         kind = self.widget_kind.get()
         enable_data_type = kind in ("summary", "chart")
-        enable_items = kind == "summary"
         enable_chart = kind == "chart"
         enable_actions = kind == "actions" and self._state_widget_selected_idx is not None
         show_valves = kind == "valve_state"
+        show_summary = kind == "summary"
 
         self._set_entry_state(self.widget_data_type, enable_data_type)
-        self._set_entry_state(self.widget_items, enable_items)
         self._set_entry_state(self.widget_chart_title, enable_chart)
         self._set_entry_state(self.widget_width, enable_chart)
         self._set_entry_state(self.widget_height, enable_chart)
         self._set_widget_field_visibility(kind)
         self._set_valve_widget_visibility(show_valves)
+        self._set_summary_widget_visibility(show_summary)
+        if enable_chart:
+            self.chart_series_frame.grid()
+        else:
+            self.chart_series_frame.grid_remove()
         self._set_listbox_state(self.widget_actions_available, enable_actions)
         self._set_listbox_state(self.widget_actions_selected, enable_actions)
         for btn in self.widget_actions_buttons:
@@ -1462,11 +2936,9 @@ class LayoutEditor(tk.Tk):
 
     def _set_widget_field_visibility(self, kind: str) -> None:
         show_data_type = kind in ("summary", "chart")
-        show_items = kind == "summary"
         show_chart = kind == "chart"
 
         self._set_widget_field_group(self.widget_data_type_label, self.widget_data_type, show_data_type)
-        self._set_widget_field_group(self.widget_items_label, self.widget_items, show_items)
         self._set_widget_field_group(self.widget_chart_title_label, self.widget_chart_title, show_chart)
         self._set_widget_field_group(self.widget_width_label, self.widget_width, show_chart)
         self._set_widget_field_group(self.widget_height_label, self.widget_height, show_chart)
@@ -1506,6 +2978,14 @@ class LayoutEditor(tk.Tk):
             self.widget_valve_closed_btns.grid_remove()
             self.widget_valve_unknown_btns.grid_remove()
 
+    def _set_summary_widget_visibility(self, show: bool) -> None:
+        if show:
+            self.summary_style_frame.grid()
+            self.summary_items_frame.grid()
+        else:
+            self.summary_style_frame.grid_remove()
+            self.summary_items_frame.grid_remove()
+
     def _clear_widget_form(self) -> None:
         self._state_widget_selected_idx = None
         self.widget_kind.set("summary")
@@ -1513,7 +2993,16 @@ class LayoutEditor(tk.Tk):
         self.widget_chart_title.delete(0, tk.END)
         self.widget_width.delete(0, tk.END)
         self.widget_height.delete(0, tk.END)
-        self.widget_items.delete(0, tk.END)
+        self._chart_series = []
+        self._refresh_chart_series_list()
+        self._clear_chart_series_editor()
+        self._summary_items = []
+        self._refresh_summary_item_list()
+        self._clear_summary_item_editor()
+        self.summary_bg.delete(0, tk.END)
+        self.summary_border.delete(0, tk.END)
+        self.summary_label_color.delete(0, tk.END)
+        self.summary_value_color.delete(0, tk.END)
         self.widget_valves.delete(0, tk.END)
         self.widget_valve_true.delete(0, tk.END)
         self.widget_valve_false.delete(0, tk.END)
@@ -1526,6 +3015,8 @@ class LayoutEditor(tk.Tk):
         self._refresh_widget_actions([])
         self._set_actions_widget_visibility(False)
         self._set_valve_widget_visibility(False)
+        self._set_summary_widget_visibility(False)
+        self.chart_series_frame.grid_remove()
 
     def _set_actions_widget_visibility(self, visible: bool) -> None:
         if visible:
@@ -1587,15 +3078,49 @@ class LayoutEditor(tk.Tk):
     def _commit_current_tab(self) -> None:
         current = self.notebook.index(self.notebook.select())
         if current == 0:
-            self._commit_data_form()
+            self._commit_main_tabs_form()
         elif current == 1:
-            self._commit_conn_form()
+            self._commit_data_form()
         elif current == 2:
-            self._commit_action_form()
+            self._commit_conn_form()
         elif current == 3:
-            self._commit_state_form()
+            self._commit_network_form()
         elif current == 4:
+            self._commit_action_form()
+        elif current == 5:
+            self._commit_state_form()
+        elif current == 6:
             self._commit_battery_form()
+
+    def _commit_main_tabs_form(self) -> None:
+        self.data["main_tabs"] = [tab for tab in self.data.get("main_tabs", []) if str(tab).strip()]
+        try:
+            self.data["version"] = max(1, int(self.layout_version.get().strip()))
+        except ValueError:
+            self.data["version"] = 1
+        branding = self.data.setdefault("branding", {})
+        branding["app_name"] = self.branding_app_name.get().strip() or None
+        branding["dashboard_title"] = self.branding_dashboard_title.get().strip() or None
+        tab_labels = {
+            tab_id: entry.get().strip()
+            for tab_id, entry in self.tab_label_entries.items()
+            if entry.get().strip()
+        }
+        branding["tab_labels"] = tab_labels
+        theme = self.data.setdefault("theme", {})
+        for key, entry in self.theme_entries.items():
+            theme[key] = entry.get().strip() or default_layout()["theme"][key]
+        theme["main_tab_accents"] = {
+            tab_id: entry.get().strip()
+            for tab_id, entry in self.theme_tab_accent_entries.items()
+            if entry.get().strip()
+        }
+
+    def _commit_network_form(self) -> None:
+        self.data["network_tab"] = {
+            "enabled": bool(self.network_enabled.get()),
+            "title": self.network_title.get().strip() or None,
+        }
 
     def _on_tab_changed(self, _event=None) -> None:
         if self._suspend_events:
@@ -1606,18 +3131,31 @@ class LayoutEditor(tk.Tk):
         idx = self._data_selected_idx
         if idx is None or idx >= len(self.data["data_tab"]["tabs"]):
             return
-        self.data["data_tab"]["tabs"][idx] = {
+        self._commit_current_data_subtab()
+        self._commit_current_data_chart_group()
+        self._commit_current_data_summary_item()
+        self._sync_data_formatter_channels()
+        existing = self.data["data_tab"]["tabs"][idx]
+        updated = {
             "id": self.data_id.get().strip(),
             "label": self.data_label.get().strip(),
             "channels": self._clean_channels(self._split_list(self.data_channels.get())),
             "chart": {"enabled": bool(self.data_chart.get())},
         }
+        for key in ("subtabs", "chart_groups"):
+            if key in existing:
+                updated[key] = existing[key]
         labels = self._boolean_labels_from_form()
         if labels:
-            self.data["data_tab"]["tabs"][idx]["boolean_labels"] = labels
+            updated["boolean_labels"] = labels
         channel_labels = self._channel_labels_from_form()
         if channel_labels:
-            self.data["data_tab"]["tabs"][idx]["channel_boolean_labels"] = channel_labels
+            updated["channel_boolean_labels"] = channel_labels
+        if any(self._data_channel_formatters):
+            updated["channel_formatters"] = [
+                formatter or {} for formatter in self._data_channel_formatters
+            ]
+        self.data["data_tab"]["tabs"][idx] = updated
 
     def _commit_conn_form(self) -> None:
         idx = self._conn_selected_idx
@@ -1647,6 +3185,17 @@ class LayoutEditor(tk.Tk):
         s_idx = self._state_section_selected_idx
         if s_idx is not None and s_idx < len(sections):
             sections[s_idx]["title"] = self.section_title.get().strip()
+            style = self._style_dict(
+                [
+                    ("background", self.section_bg),
+                    ("border", self.section_border),
+                    ("title_color", self.section_title_color),
+                ]
+            )
+            if style:
+                sections[s_idx]["style"] = style
+            else:
+                sections[s_idx].pop("style", None)
 
             widgets = sections[s_idx].get("widgets", [])
             w_idx = self._state_widget_selected_idx
@@ -1767,6 +3316,9 @@ if __name__ == "__main__":
 
         app = LayoutEditor(initial_path=args.layout)
         app.mainloop()
+    except KeyboardInterrupt:
+        print("\nLayout editor interrupted.", file=sys.stderr)
+        sys.exit(130)
     except FileNotFoundError as e:
         missing = e.filename or "<unknown>"
         print(f"Error: Required file not found: {missing}", file=sys.stderr)

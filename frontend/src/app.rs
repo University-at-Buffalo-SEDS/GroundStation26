@@ -3,14 +3,15 @@
 const _CONNECTION_TIMEOUT_MS: u64 = 8000;
 const _BODY_TRANSFER_TIMEOUT_MS: u64 = 10000;
 const _WS_TIMEOUT_MS: u64 = 4500;
+#[allow(dead_code)]
+const APP_DISPLAY_NAME: &str = "Telemetry Client";
 
+use crate::auth::{self, SessionStatus as AuthSessionStatus};
 use dioxus::prelude::*;
-use dioxus_router::{Routable, Router};
+use dioxus_router::{Routable, Router, use_navigator};
 
 #[allow(unused_imports)]
-use crate::telemetry_dashboard::UrlConfig;
-#[cfg(not(target_arch = "wasm32"))]
-use dioxus_router::use_navigator;
+use crate::telemetry_dashboard::{self, UrlConfig};
 
 // -------------------------
 // Native-only keep-awake shims (mobile)
@@ -62,11 +63,22 @@ fn all_tests_passed(checks: &[RouteCheck], ws_probe: &Option<Result<String, Stri
 
 // --- global css ---
 const GLOBAL_CSS: &str = r#"
+:root {
+    --gs26-app-height: 100dvh;
+}
+
+@supports not (height: 100dvh) {
+    :root {
+        --gs26-app-height: 100vh;
+    }
+}
+
 html, body {
     margin: 0;
     padding: 0;
     width: 100%;
-    height: 100%;
+    min-height: var(--gs26-app-height);
+    height: var(--gs26-app-height);
     background: #020617;
     overflow: hidden;
 }
@@ -77,7 +89,8 @@ html, body {
 
 #main {
     width: 100%;
-    height: 100%;
+    min-height: var(--gs26-app-height);
+    height: var(--gs26-app-height);
     background: #020617;
 }
 
@@ -94,9 +107,36 @@ pub enum Route {
     #[route("/dashboard")]
     Dashboard {},
 
+    #[route("/login")]
+    Login {},
+
     #[cfg(not(target_arch = "wasm32"))]
     #[route("/connect")]
     Connect {},
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[route("/version")]
+    Version {},
+}
+
+#[cfg(target_arch = "wasm32")]
+fn connect_route() -> Route {
+    Route::Root {}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn connect_route() -> Route {
+    Route::Connect {}
+}
+
+#[cfg(target_arch = "wasm32")]
+fn authenticated_route() -> Route {
+    Route::Root {}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn authenticated_route() -> Route {
+    Route::Dashboard {}
 }
 
 // -------------------------
@@ -144,28 +184,36 @@ mod persist {
     #[cfg(target_os = "android")]
     fn android_storage_dir() -> Option<std::path::PathBuf> {
         use jni::objects::{JObject, JString};
-        use jni::JavaVM;
+        use jni::{JavaVM, jni_sig, jni_str};
         use ndk_context::android_context;
 
         let ctx = android_context();
-        let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
-        let mut env = vm.attach_current_thread().ok()?;
-        let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+        let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
+        vm.attach_current_thread(|env| -> jni::errors::Result<std::path::PathBuf> {
+            let context = unsafe { JObject::from_raw(env, ctx.context().cast()) };
 
-        let files_dir = env
-            .call_method(&context, "getFilesDir", "()Ljava/io/File;", &[])
-            .ok()?
-            .l()
-            .ok()?;
-        let path_obj = env
-            .call_method(&files_dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
-            .ok()?
-            .l()
-            .ok()?;
-        let path = env.get_string(&JString::from(path_obj)).ok()?.to_string_lossy().into_owned();
+            let files_dir = env
+                .call_method(
+                    &context,
+                    jni_str!("getFilesDir"),
+                    jni_sig!("()Ljava/io/File;"),
+                    &[],
+                )?
+                .l()?;
+            let path_obj = env
+                .call_method(
+                    &files_dir,
+                    jni_str!("getAbsolutePath"),
+                    jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                )?
+                .l()?;
+            let path = env.as_cast::<JString>(&path_obj)?.try_to_string(env)?;
 
-        let _ = context.into_raw();
-        Some(std::path::PathBuf::from(path).join("gs26"))
+            let _ = context.into_raw();
+            Ok(std::path::PathBuf::from(path).join("gs26"))
+        })
+        .ok()
     }
 
     fn storage_dir() -> std::path::PathBuf {
@@ -594,7 +642,7 @@ pub fn App() -> Element {
         document::Script { src: asset!("static/ground_map.js") }
 
         div {
-            style: "min-height: 100vh; width: 100%; background: #020617; color: #e5e7eb;",
+            style: "min-height: var(--gs26-app-height); width: 100%; background: #020617; color: #e5e7eb;",
             Router::<Route> {}
         }
     }
@@ -615,11 +663,305 @@ pub fn Root() -> Element {
             if UrlConfig::_stored_base_url().is_some() {
                 let _ = nav.replace(Route::Dashboard {});
             } else {
-                let _ = nav.replace(Route::Connect {});
+                let _ = nav.replace(connect_route());
             }
         });
 
         rsx! { div {} }
+    }
+}
+
+#[component]
+fn LoginCard(
+    title: String,
+    subtitle: String,
+    allow_back_to_connect: bool,
+    on_success_route: Route,
+    #[props(default = false)] overlay_mode: bool,
+) -> Element {
+    let nav = use_navigator();
+    let base = UrlConfig::base_http();
+    auth::init_from_storage(&base);
+    let effect_base = base.clone();
+    let continue_logged_out_base = base.clone();
+    let skip_tls = UrlConfig::_skip_tls_verify();
+    let mut logged_out_status = use_signal(|| None::<Result<AuthSessionStatus, String>>);
+    let mut logged_out_probe_base = use_signal(String::new);
+    let continue_logged_out_route = on_success_route.clone();
+    let sign_in_route = on_success_route.clone();
+    let stored_username = auth::current_session()
+        .and_then(|session| session.session.username)
+        .unwrap_or_default();
+    let mut username = use_signal(|| stored_username);
+    let mut password = use_signal(String::new);
+    let mut remember_me = use_signal(|| true);
+    let mut status = use_signal(String::new);
+    let mut busy = use_signal(|| false);
+    let mut submit_login = move || {
+        let base = UrlConfig::base_http();
+        if base.trim().is_empty() {
+            status.set("Configure the backend URL first.".to_string());
+            return;
+        }
+        let username_value = username();
+        let password_value = password();
+        if username_value.trim().is_empty() || password_value.is_empty() {
+            status.set("Enter both username and password.".to_string());
+            return;
+        }
+        let remember = *remember_me.read();
+        let success_route = sign_in_route.clone();
+        busy.set(true);
+        status.set("Signing in...".to_string());
+        spawn(async move {
+            match auth::login(
+                &base,
+                skip_tls,
+                username_value.trim(),
+                &password_value,
+                remember,
+            )
+            .await
+            {
+                Ok(_) => {
+                    telemetry_dashboard::reconnect_and_reseed_after_auth_change();
+                    busy.set(false);
+                    status.set(String::new());
+                    let _ = nav.replace(success_route);
+                }
+                Err(err) => {
+                    busy.set(false);
+                    status.set(err);
+                }
+            }
+        });
+    };
+
+    use_effect({
+        let effect_base = effect_base.clone();
+        move || {
+            auth::init_from_storage(&effect_base);
+        }
+    });
+
+    use_effect(move || {
+        if effect_base.trim().is_empty() {
+            return;
+        }
+        if *logged_out_probe_base.read() == effect_base {
+            return;
+        }
+        logged_out_probe_base.set(effect_base.clone());
+        logged_out_status.set(None);
+        let base = effect_base.clone();
+        spawn(async move {
+            logged_out_status.set(Some(
+                auth::fetch_logged_out_session_status(&base, skip_tls).await,
+            ));
+        });
+    });
+
+    rsx! {
+        div {
+            style: if overlay_mode {
+                "width:min(560px, 92vw); color:#e5e7eb; font-family:system-ui;"
+            } else {
+                "min-height:var(--gs26-app-height); height:var(--gs26-app-height); overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;"
+            },
+            div {
+                style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
+                h1 { style: "margin:0 0 10px 0; font-size:22px;", "{title}" }
+                p { style: "margin:0 0 16px 0; color:#94a3b8;", "{subtitle}" }
+                form {
+                    onsubmit: move |evt| {
+                        evt.prevent_default();
+                        submit_login();
+                    },
+                    if base.trim().is_empty() {
+                        div {
+                            style: "margin-bottom:14px; padding:12px; border-radius:12px; border:1px solid #7c2d12; background:#451a03; color:#fed7aa;",
+                            "Configure the backend URL before logging in."
+                        }
+                    }
+
+                    label { r#for: "gs26-login-username", style: "display:block; margin-bottom:8px; font-size:13px; color:#94a3b8;", "Username" }
+                    input {
+                        id: "gs26-login-username",
+                        name: "username",
+                        autocomplete: "username",
+                        autocapitalize: "none",
+                        spellcheck: "false",
+                        style: "width:100%; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#e5e7eb; outline:none; margin-bottom:12px;",
+                        placeholder: "Username",
+                        value: "{username()}",
+                        oninput: move |evt| username.set(evt.value()),
+                    }
+
+                    label { r#for: "gs26-login-password", style: "display:block; margin-bottom:8px; font-size:13px; color:#94a3b8;", "Password" }
+                    input {
+                        id: "gs26-login-password",
+                        name: "password",
+                        autocomplete: "current-password",
+                        style: "width:100%; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#e5e7eb; outline:none;",
+                        r#type: "password",
+                        placeholder: "Password",
+                        value: "{password()}",
+                        oninput: move |evt| password.set(evt.value()),
+                    }
+
+                    div { style: "margin-top:12px; display:flex; align-items:center; gap:10px;",
+                        input {
+                            r#type: "checkbox",
+                            checked: *remember_me.read(),
+                            onclick: move |_| {
+                                let next = !*remember_me.read();
+                                remember_me.set(next);
+                            },
+                        }
+                        div { style: "font-size:13px; color:#94a3b8;", "Remember this device until the backend session expires" }
+                    }
+
+                    if !status().is_empty() {
+                        div {
+                            style: "margin-top:14px; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#cbd5e1; white-space:pre-wrap;",
+                            "{status()}"
+                        }
+                    }
+
+                    div { style: "display:flex; gap:12px; margin-top:16px; justify-content:flex-end; flex-wrap:wrap;",
+                    if matches!(logged_out_status.read().as_ref(), Some(Ok(status)) if status.permissions.view_data) {
+                        button {
+                            style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#0f172a; color:#e5e7eb; cursor:pointer;",
+                            r#type: "button",
+                            disabled: busy() || base.trim().is_empty(),
+                            onclick: move |_| {
+                                let success_route = continue_logged_out_route.clone();
+                                let base = continue_logged_out_base.clone();
+                                busy.set(true);
+                                status.set("Continuing logged out...".to_string());
+                                spawn(async move {
+                                    match auth::fetch_logged_out_session_status(&base, skip_tls).await {
+                                        Ok(session) => {
+                                            auth::set_logged_out_status(session);
+                                            busy.set(false);
+                                            status.set(String::new());
+                                            let _ = nav.replace(success_route);
+                                        }
+                                        Err(err) => {
+                                            busy.set(false);
+                                            status.set(format!("Logged-out access failed: {err}"));
+                                        }
+                                    }
+                                });
+                            },
+                            "Use Logged Out"
+                        }
+                    }
+
+                    if allow_back_to_connect {
+                        button {
+                            style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
+                            r#type: "button",
+                            onclick: move |_| {
+                                let _ = nav.replace(connect_route());
+                            },
+                            "Back"
+                        }
+                    }
+
+                    button {
+                        r#type: "submit",
+                        style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
+                        disabled: busy() || base.trim().is_empty(),
+                        if busy() { "Signing In..." } else { "Sign In" }
+                    }
+                }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ConnectionFailedCard(message: String, on_retry: EventHandler<()>) -> Element {
+    let nav = use_navigator();
+    rsx! {
+        div {
+            style: "min-height:var(--gs26-app-height); height:var(--gs26-app-height); overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            div {
+                style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
+                h1 { style: "margin:0 0 10px 0; font-size:22px;", "Failed to Connect" }
+                p { style: "margin:0 0 16px 0; color:#94a3b8; white-space:pre-wrap;", "{message}" }
+                div { style: "display:flex; gap:12px; justify-content:flex-end; flex-wrap:wrap;",
+                    button {
+                        style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
+                        onclick: move |_| {
+                            let _ = nav.replace(connect_route());
+                        },
+                        "Back to Connect"
+                    }
+                    button {
+                        style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#0f172a; color:#e5e7eb; cursor:pointer;",
+                        onclick: move |_| {
+                            on_retry.call(());
+                        },
+                        "Retry"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn LoginOverlay(
+    title: String,
+    subtitle: String,
+    allow_back_to_connect: bool,
+    on_success_route: Route,
+) -> Element {
+    rsx! {
+        div {
+            style: "position:relative; width:100%; min-height:var(--gs26-app-height);",
+            crate::telemetry_dashboard::TelemetryDashboard {}
+            div {
+                style: "position:fixed; inset:0; display:flex; align-items:center; justify-content:center; padding:24px; background:rgba(2, 6, 23, 0.78); backdrop-filter:blur(8px); z-index:1000;",
+                LoginCard {
+                    title: title.clone(),
+                    subtitle: subtitle.clone(),
+                    allow_back_to_connect,
+                    on_success_route: on_success_route.clone(),
+                    overlay_mode: true,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn Login() -> Element {
+    #[cfg(target_arch = "wasm32")]
+    let show_live_dashboard = false;
+    #[cfg(not(target_arch = "wasm32"))]
+    let show_live_dashboard = telemetry_dashboard::dashboard_has_prior_backend_connection();
+    if show_live_dashboard {
+        rsx! {
+            LoginOverlay {
+                title: "Sign In".to_string(),
+                subtitle: "Authenticate with the backend to view protected data or send commands.".to_string(),
+                allow_back_to_connect: true,
+                on_success_route: authenticated_route(),
+            }
+        }
+    } else {
+        rsx! {
+            LoginCard {
+                title: "Sign In".to_string(),
+                subtitle: "Authenticate with the backend to view protected data or send commands.".to_string(),
+                allow_back_to_connect: true,
+                on_success_route: authenticated_route(),
+            }
+        }
     }
 }
 
@@ -640,15 +982,31 @@ pub fn Connect() -> Element {
 
     rsx! {
         div {
-            style: "min-height:100vh; height:100vh; overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            style: "min-height:var(--gs26-app-height); height:var(--gs26-app-height); overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
             div {
                 style: "width:min(900px, 94vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
 
-                h1 { style: "margin:0 0 12px 0; font-size:20px;", "UBSEDS GS" }
-
+                div {
+                    style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px;",
+                    h1 { style: "margin:0; font-size:20px;", "{APP_DISPLAY_NAME}" }
+                    button {
+                        style: "
+                            padding:10px 14px;
+                            border-radius:12px;
+                            border:1px solid #334155;
+                            background:#111827;
+                            color:#e5e7eb;
+                            cursor:pointer;
+                        ",
+                        onclick: move |_| {
+                            let _ = nav.push(Route::Version {});
+                        },
+                        "Version"
+                    }
+                }
                 p { style: "margin:0 0 16px 0; color:#94a3b8;",
                     "Enter the backend URL (including http:// or https://). Example: ",
-                    code { "http://https://your-backend-url.com" }
+                    code { "https://your-backend-url.com" }
                 }
 
                 input {
@@ -699,8 +1057,35 @@ pub fn Connect() -> Element {
                 }
 
                 div { style: "display:flex; gap:12px; margin-top:16px; justify-content:flex-end; flex-wrap:wrap;",
+                    button {
+                        style: "
+                            padding:10px 14px;
+                            border-radius:12px;
+                            border:1px solid #334155;
+                            background:#111827;
+                            color:#e5e7eb;
+                            cursor:pointer;
+                        ",
+                        onclick: move |_| {
+                            let u_norm = normalize_base_url(url_edit().trim().to_string());
+                            if u_norm.is_empty() {
+                                test_status.set("Enter a URL first.".to_string());
+                                return;
+                            }
+                            if !(u_norm.starts_with("http://") || u_norm.starts_with("https://")) {
+                                test_status.set("URL must start with http:// or https://".to_string());
+                                return;
+                            }
 
-                    // TEST ROUTES (HOSTNAME ONLY)
+                            objc_poke::poke_url(&u_norm);
+                            UrlConfig::set_base_url_and_persist(u_norm.to_string());
+                            UrlConfig::_set_skip_tls_verify_for_base(&u_norm, *skip_tls.read());
+                            let _ = persist::write_connect_shown(true);
+                            let _ = nav.replace(Route::Login {});
+                        },
+                        "Sign In"
+                    }
+
                     button {
                         style: "
                             padding:10px 14px;
@@ -729,18 +1114,16 @@ pub fn Connect() -> Element {
                             testing.set(true);
                             test_status.set("Testing connection (fast probes)...".to_string());
 
-                            // Trigger iOS local-network prompt (best-effort)
                             objc_poke::poke_url(&u_norm);
 
                             let skip_tls_verify = *skip_tls.read();
                             spawn(async move {
-                                // 1) HTTP probes (concurrent)
                                 let checks = test_routes_host_only(&u_norm, skip_tls_verify).await;
 
-                                // 2) REAL websocket probe (ws/wss) (time-bounded)
                                 let ws_probe = Some(ws_connect_probe(&parsed, skip_tls_verify).await);
 
-                                let report = format_route_report_host_only(&u_norm, &parsed, &checks, ws_probe);
+                                let report =
+                                    format_route_report_host_only(&u_norm, &parsed, &checks, ws_probe);
 
                                 testing.set(false);
                                 test_status.set(report);
@@ -749,7 +1132,6 @@ pub fn Connect() -> Element {
                         if testing() { "Testing..." } else { "Test Connection" }
                     }
 
-                    // CONNECT
                     button {
                         style: "
                             padding:10px 14px;
@@ -792,6 +1174,49 @@ pub fn Connect() -> Element {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[component]
+pub fn Version() -> Element {
+    let nav = use_navigator();
+    let can_go_back = nav.can_go_back();
+    let back_action = move |_| {
+        if can_go_back {
+            nav.go_back();
+        } else if UrlConfig::_stored_base_url().is_some() {
+            let _ = nav.replace(Route::Dashboard {});
+        } else {
+            let _ = nav.replace(connect_route());
+        }
+    };
+
+    rsx! {
+        div {
+            style: "position:fixed; inset:0; overflow-y:auto; overflow-x:hidden; display:flex; align-items:flex-start; justify-content:center; padding:24px 16px; background:#020617; color:#e5e7eb; font-family:system-ui; overscroll-behavior:contain; -webkit-overflow-scrolling:touch;",
+            div {
+                style: "width:min(900px, 100%); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
+                div {
+                    style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap;",
+                    h1 { style: "margin:0; font-size:20px;", "{APP_DISPLAY_NAME}" }
+                    button {
+                        style: "
+                            padding:10px 14px;
+                            border-radius:12px;
+                            border:1px solid #334155;
+                            background:#111827;
+                            color:#e5e7eb;
+                            font-weight:700;
+                            cursor:pointer;
+                        ",
+                        onclick: back_action,
+                        "Back"
+                    }
+                }
+                crate::telemetry_dashboard::version_page::VersionTab {}
+            }
+        }
+    }
+}
+
 #[component]
 pub fn Dashboard() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
@@ -800,7 +1225,7 @@ pub fn Dashboard() -> Element {
         if UrlConfig::_stored_base_url().is_none() {
             return rsx! {
                 div {
-                    style: "height:100vh; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+                    style: "height:var(--gs26-app-height); display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
                     div {
                         style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220;",
                         h1 { style: "margin:0 0 12px 0; font-size:18px;", "Not connected" }
@@ -816,7 +1241,7 @@ pub fn Dashboard() -> Element {
                                 cursor:pointer;
                             ",
                             onclick: move |_| {
-                                let _ = nav.replace(Route::Connect {});
+                                let _ = nav.replace(connect_route());
                             },
                             "Back to Connect"
                         }
@@ -826,5 +1251,82 @@ pub fn Dashboard() -> Element {
         }
     }
 
-    rsx! { crate::telemetry_dashboard::TelemetryDashboard {} }
+    let base = UrlConfig::base_http();
+    auth::init_from_storage(&base);
+    let mut auth_state = use_signal(|| None::<Result<AuthSessionStatus, String>>);
+    let mut auth_state_base = use_signal(String::new);
+    use_effect(move || {
+        let base = UrlConfig::base_http();
+        if *auth_state_base.read() != base {
+            auth_state_base.set(base.clone());
+            auth_state.set(None);
+        }
+        let skip_tls = UrlConfig::_skip_tls_verify();
+        if auth_state.read().is_some() {
+            return;
+        }
+        spawn(async move {
+            auth_state.set(Some(auth::fetch_session_status(&base, skip_tls).await));
+        });
+    });
+
+    match auth_state.read().as_ref() {
+        None => rsx! {
+            div { style: "height:var(--gs26-app-height); display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+                div { style: "padding:20px; border:1px solid #334155; border-radius:16px; background:#0b1220;", "Checking session..." }
+            }
+        },
+        Some(Ok(status)) if status.permissions.view_data => {
+            rsx! { crate::telemetry_dashboard::TelemetryDashboard {} }
+        }
+        Some(Ok(_)) => {
+            #[cfg(target_arch = "wasm32")]
+            {
+                rsx! {
+                    LoginCard {
+                        title: "Sign In Required".to_string(),
+                        subtitle: "This backend does not allow anonymous view access. Sign in to continue.".to_string(),
+                        allow_back_to_connect: true,
+                        on_success_route: authenticated_route(),
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if telemetry_dashboard::dashboard_has_prior_backend_connection() {
+                rsx! {
+                    LoginOverlay {
+                        title: "Sign In Required".to_string(),
+                        subtitle: "This backend does not allow anonymous view access. Sign in to continue.".to_string(),
+                        allow_back_to_connect: true,
+                        on_success_route: authenticated_route(),
+                    }
+                }
+            } else {
+                rsx! {
+                    LoginCard {
+                        title: "Sign In Required".to_string(),
+                        subtitle: "This backend does not allow anonymous view access. Sign in to continue.".to_string(),
+                        allow_back_to_connect: true,
+                        on_success_route: authenticated_route(),
+                    }
+                }
+            }
+        }
+        Some(Err(err)) => rsx! {
+            ConnectionFailedCard {
+                message: format!(
+                    "The frontend could not reach the backend session endpoint.\n\n{}",
+                    err
+                ),
+                on_retry: move |_| {
+                    let base = UrlConfig::base_http();
+                    let skip_tls = UrlConfig::_skip_tls_verify();
+                    auth_state.set(None);
+                    spawn(async move {
+                        auth_state.set(Some(auth::fetch_session_status(&base, skip_tls).await));
+                    });
+                },
+            }
+        },
+    }
 }

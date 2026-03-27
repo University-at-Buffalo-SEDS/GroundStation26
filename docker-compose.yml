@@ -13,6 +13,9 @@ services:
     volumes:
       - ./data:/app/data
       - ./backend/data:/app/backend/data
+      - ./backend/users:/app/backend/users
+      - ./backend/comms:/app/backend/comms
+      - ./backend/calibration:/app/backend/calibration
     restart: always
     # Uncomment the following lines to allow GPIO access from the container. This is needed for testing on Raspberry Pi
     # devices, but should be left disabled for development on other platforms.
