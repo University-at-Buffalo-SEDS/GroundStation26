@@ -2,9 +2,9 @@ use crate::flight_sim::{_next_state_aware_packet, sim_mode_enabled};
 use crate::telemetry_task::get_current_timestamp_ms;
 use crate::types::Board;
 use rand::RngExt;
+use sedsprintf_rs_2026::TelemetryResult;
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
-use sedsprintf_rs_2026::TelemetryResult;
 use std::sync::Arc;
 
 const BASE_LAT: f32 = 31.7619;

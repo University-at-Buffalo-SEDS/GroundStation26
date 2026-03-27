@@ -30,6 +30,8 @@ pub fn MapTab(
     user_gps: Signal<Option<(f64, f64)>>,
     #[props(default)] title: Option<String>,
 ) -> Element {
+    let _ = *rocket_gps.read();
+    let _ = *user_gps.read();
     let mut is_fullscreen = use_signal(|| false);
     #[cfg(target_os = "ios")]
     let mut show_enable_compass = use_signal(|| false);

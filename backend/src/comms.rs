@@ -1,10 +1,12 @@
+use crate::comms_config::{
+    CanLinkConfig, CommsLinkConfig, I2cLinkConfig, SerialLinkConfig, SpiLinkConfig,
+};
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
-use crate::radio_config::{CanLinkConfig, RadioLinkConfig, SerialLinkConfig, SpiLinkConfig};
 use anyhow::Context;
 use sedsprintf_rs_2026::{
-    router::{Router, RouterSideId}, TelemetryError,
-    TelemetryResult,
+    TelemetryError, TelemetryResult,
+    router::{Router, RouterSideId},
 };
 use serial::{SerialPort, SystemPort};
 use std::error::Error;
@@ -20,63 +22,77 @@ use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::time::Duration;
 
-pub const ROCKET_RADIO_PORT: &str = "/dev/ttyUSB1";
-pub const UMBILICAL_RADIO_PORT: &str = "/dev/ttyUSB2";
-pub const RADIO_BAUD_RATE: usize = 57_600;
+pub const ROCKET_COMMS_PORT: &str = "/dev/ttyUSB1";
+pub const UMBILICAL_COMMS_PORT: &str = "/dev/ttyUSB2";
+pub const COMMS_BAUD_RATE: usize = 57_600;
 pub const MAX_PACKET_SIZE: usize = 256;
+#[cfg(target_os = "linux")]
+const I2C_FRAME_SIZE: usize = 258;
+#[cfg(target_os = "linux")]
+const I2C_CHUNK_SIZE: usize = 32;
+#[cfg(target_os = "linux")]
+const I2C_REQ_DATA_MAGIC: u8 = 0xA5;
+#[cfg(target_os = "linux")]
+const I2C_RESP_DATA_MAGIC: u8 = 0x5A;
 
 // ======================================================================
-//  Radio Device Trait
+//  Comms Device Trait
 // ======================================================================
-pub trait RadioDevice: Send {
+pub trait CommsDevice: Send {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()>;
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>>;
     fn set_side_id(&mut self, side_id: RouterSideId);
 }
 
-pub fn link_description(cfg: &RadioLinkConfig) -> String {
+pub fn link_description(cfg: &CommsLinkConfig) -> String {
     match cfg {
-        RadioLinkConfig::UsbSerial { serial } => serial_description("usb_serial", serial),
-        RadioLinkConfig::RaspberryPiGpioUart { serial } => {
+        CommsLinkConfig::UsbSerial { serial } => serial_description("usb_serial", serial),
+        CommsLinkConfig::RaspberryPiGpioUart { serial } => {
             serial_description("raspberry_pi_gpio_uart", serial)
         }
-        RadioLinkConfig::CustomSerial { serial } => serial_description("custom_serial", serial),
-        RadioLinkConfig::Spi { spi } => spi_description(spi),
-        RadioLinkConfig::Can { can } => can_description(can),
+        CommsLinkConfig::CustomSerial { serial } => serial_description("custom_serial", serial),
+        CommsLinkConfig::Spi { spi } => spi_description(spi),
+        CommsLinkConfig::Can { can } => can_description(can),
+        CommsLinkConfig::I2c { i2c } => i2c_description(i2c),
     }
 }
 
-pub fn open_link(cfg: &RadioLinkConfig) -> anyhow::Result<Box<dyn RadioDevice>> {
+pub fn open_link(cfg: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> {
     match cfg {
-        RadioLinkConfig::UsbSerial { serial }
-        | RadioLinkConfig::RaspberryPiGpioUart { serial }
-        | RadioLinkConfig::CustomSerial { serial } => {
-            Ok(Box::new(Radio::open(&serial.port, serial.baud_rate)?))
+        CommsLinkConfig::UsbSerial { serial }
+        | CommsLinkConfig::RaspberryPiGpioUart { serial }
+        | CommsLinkConfig::CustomSerial { serial } => {
+            Ok(Box::new(UartComms::open(&serial.port, serial.baud_rate)?))
         }
-        RadioLinkConfig::Spi { spi } => Ok(Box::new(SpiRadio::open(spi)?)),
-        RadioLinkConfig::Can { can } => Ok(Box::new(CanRadio::open(can)?)),
+        CommsLinkConfig::Spi { spi } => Ok(Box::new(SpiComms::open(spi)?)),
+        CommsLinkConfig::Can { can } => Ok(Box::new(CanComms::open(can)?)),
+        CommsLinkConfig::I2c { i2c } => Ok(Box::new(I2cComms::open(i2c)?)),
     }
 }
 
-pub fn startup_failure_hint(cfg: &RadioLinkConfig) -> String {
+pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
     match cfg {
-        RadioLinkConfig::UsbSerial { serial } | RadioLinkConfig::CustomSerial { serial } => {
+        CommsLinkConfig::UsbSerial { serial } | CommsLinkConfig::CustomSerial { serial } => {
             format!(
                 "Check that {} exists, is the correct serial device, and is not already in use. Prefer a stable /dev/serial/by-id path when available.",
                 serial.port
             )
         }
-        RadioLinkConfig::RaspberryPiGpioUart { serial } => format!(
+        CommsLinkConfig::RaspberryPiGpioUart { serial } => format!(
             "Check that {} exists and that the Raspberry Pi UART is enabled. On Raspberry Pi OS or Ubuntu on Pi: set enable_uart=1, disable the serial login console/getty, reboot, then retry. This UART path is generic Linux serial access; it does not require rppal.",
             serial.port
         ),
-        RadioLinkConfig::Spi { spi } => format!(
+        CommsLinkConfig::Spi { spi } => format!(
             "Check that {} exists and that SPI is enabled. On Raspberry Pi OS or Ubuntu on Pi: enable SPI in the boot config so /dev/spidev* appears, then confirm mode {} and {} Hz match the attached device.",
             spi.port, spi.spi_mode, spi.spi_speed_hz
         ),
-        RadioLinkConfig::Can { can } => format!(
+        CommsLinkConfig::Can { can } => format!(
             "Check that CAN interface {} exists and is up. Example: `sudo ip link set {} type can bitrate 500000` then `sudo ip link set {} up`. Confirm the remote device uses tx_id=0x{:x} / rx_id=0x{:x}.",
             can.port, can.port, can.port, can.can_tx_id, can.can_rx_id
+        ),
+        CommsLinkConfig::I2c { i2c } => format!(
+            "Check that /dev/i2c-{} exists, I2C is enabled on the Pi, the remote Pico is at address 0x{:02x}, and SDA/SCL plus pull-ups are correct.",
+            i2c.bus, i2c.addr
         ),
     }
 }
@@ -102,15 +118,22 @@ fn can_description(can: &CanLinkConfig) -> String {
     )
 }
 
+fn i2c_description(i2c: &I2cLinkConfig) -> String {
+    format!(
+        "interface=i2c bus={} addr=0x{:02x} chunk_delay_ms={} initial_wait_ms={}",
+        i2c.bus, i2c.addr, i2c.chunk_delay_ms, i2c.initial_wait_ms
+    )
+}
+
 // ======================================================================
 //  Real Radio Implementation
 // ======================================================================
-pub struct Radio {
+pub struct UartComms {
     inner: SystemPort,
     side_id: Option<RouterSideId>,
 }
 
-impl Radio {
+impl UartComms {
     pub fn open(path: &str, baud: usize) -> anyhow::Result<Self> {
         let mut inner = serial::open(path)?;
         inner
@@ -131,7 +154,7 @@ impl Radio {
     }
 }
 
-impl RadioDevice for Radio {
+impl CommsDevice for UartComms {
     /// Blocking receive of one Packet
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
@@ -178,18 +201,175 @@ impl RadioDevice for Radio {
 }
 
 // ======================================================================
+// I2C Radio Implementation
+// ======================================================================
+
+pub struct I2cComms {
+    #[cfg(target_os = "linux")]
+    inner: File,
+    side_id: Option<RouterSideId>,
+    #[cfg(target_os = "linux")]
+    addr: u16,
+    #[cfg(target_os = "linux")]
+    chunk_delay: Duration,
+    #[cfg(target_os = "linux")]
+    initial_wait: Duration,
+}
+
+impl I2cComms {
+    pub fn open(cfg: &I2cLinkConfig) -> anyhow::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let path = format!("/dev/i2c-{}", cfg.bus);
+            let inner = OpenOptions::new().read(true).write(true).open(&path)?;
+            Ok(Self {
+                inner,
+                side_id: None,
+                addr: cfg.addr,
+                chunk_delay: Duration::from_millis(cfg.chunk_delay_ms),
+                initial_wait: Duration::from_millis(cfg.initial_wait_ms),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cfg;
+            anyhow::bail!("I2C radio support is only implemented on Linux")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_frame(&mut self) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
+        let mut raw = [0u8; I2C_FRAME_SIZE];
+        let mut offset = 0usize;
+        while offset < I2C_FRAME_SIZE {
+            let read_len = (I2C_FRAME_SIZE - offset).min(I2C_CHUNK_SIZE);
+            self.transfer_read(&mut raw[offset..offset + read_len])?;
+            offset += read_len;
+            if offset < I2C_FRAME_SIZE {
+                std::thread::sleep(self.chunk_delay);
+            }
+        }
+        parse_i2c_response(&raw)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_frame(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let payload = &payload[..payload.len().min(MAX_PACKET_SIZE)];
+        let mut frame = Vec::with_capacity(payload.len() + 2);
+        frame.push(I2C_REQ_DATA_MAGIC);
+        frame.push(payload.len() as u8);
+        frame.extend_from_slice(payload);
+
+        for (idx, chunk) in frame.chunks(I2C_CHUNK_SIZE).enumerate() {
+            self.transfer_write(chunk)?;
+            if idx + 1 < frame.len().div_ceil(I2C_CHUNK_SIZE) {
+                std::thread::sleep(self.chunk_delay);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn transfer_write(&mut self, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut msg = I2cMsg {
+            addr: self.addr,
+            flags: 0,
+            len: data.len() as u16,
+            buf: data.as_ptr() as *mut u8,
+        };
+        self.transfer_ioctl(&mut msg)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn transfer_read(&mut self, data: &mut [u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut msg = I2cMsg {
+            addr: self.addr,
+            flags: I2C_M_RD,
+            len: data.len() as u16,
+            buf: data.as_mut_ptr(),
+        };
+        self.transfer_ioctl(&mut msg)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn transfer_ioctl(&mut self, msg: &mut I2cMsg) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut ioctl_data = I2cRdwrIoctlData {
+            msgs: msg as *mut _,
+            nmsgs: 1,
+        };
+
+        let rc = unsafe { libc::ioctl(self.inner.as_raw_fd(), I2C_RDWR as _, &mut ioctl_data) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+}
+
+impl CommsDevice for I2cComms {
+    fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
+        let side_id = self
+            .side_id
+            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            match self.read_frame() {
+                Ok(Some(payload)) => router.rx_serialized_queue_from_side(&payload, side_id),
+                Ok(None) => Ok(()),
+                Err(_) => Err(TelemetryError::HandlerError("i2c receive failed")),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = router;
+            let _ = side_id;
+            Err(TelemetryError::HandlerError(
+                "i2c radio support is only implemented on Linux",
+            ))
+        }
+    }
+
+    fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if payload.is_empty() || payload.len() > MAX_PACKET_SIZE {
+            return Err(
+                format!("packet too large to send over i2c: {} bytes", payload.len()).into(),
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            self.write_frame(payload)?;
+            if !self.initial_wait.is_zero() {
+                std::thread::sleep(self.initial_wait);
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = payload;
+            Err("i2c radio support is only implemented on Linux".into())
+        }
+    }
+
+    fn set_side_id(&mut self, side_id: RouterSideId) {
+        self.side_id = Some(side_id);
+    }
+}
+
+// ======================================================================
 // SPI Radio Implementation
 // ======================================================================
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub struct SpiRadio {
+pub struct SpiComms {
     inner: File,
     side_id: Option<RouterSideId>,
     speed_hz: u32,
     bits_per_word: u8,
 }
 
-impl SpiRadio {
+impl SpiComms {
     pub fn open(cfg: &SpiLinkConfig) -> anyhow::Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -244,7 +424,7 @@ impl SpiRadio {
     }
 }
 
-impl RadioDevice for SpiRadio {
+impl CommsDevice for SpiComms {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
             .side_id
@@ -314,7 +494,7 @@ impl RadioDevice for SpiRadio {
 // ======================================================================
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub struct CanRadio {
+pub struct CanComms {
     inner: File,
     side_id: Option<RouterSideId>,
     tx_id: u32,
@@ -326,7 +506,7 @@ pub struct CanRadio {
     tx_seq: u8,
 }
 
-impl CanRadio {
+impl CanComms {
     pub fn open(cfg: &CanLinkConfig) -> anyhow::Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -360,7 +540,7 @@ impl CanRadio {
     }
 }
 
-impl RadioDevice for CanRadio {
+impl CommsDevice for CanComms {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
             .side_id
@@ -479,16 +659,16 @@ impl RadioDevice for CanRadio {
 // ======================================================================
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
 #[derive(Debug)]
-pub struct DummyRadio {
+pub struct DummyComms {
     name: &'static str,
     side_id: Option<RouterSideId>,
 }
 
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
 
-impl DummyRadio {
+impl DummyComms {
     pub fn new(name: &'static str) -> Self {
-        DummyRadio {
+        DummyComms {
             name,
             side_id: None,
         }
@@ -496,7 +676,7 @@ impl DummyRadio {
 }
 
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
-impl RadioDevice for DummyRadio {
+impl CommsDevice for DummyComms {
     fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
         #[cfg(feature = "testing")]
         {
@@ -544,7 +724,7 @@ impl RadioDevice for DummyRadio {
             if now_ms.saturating_sub(prev) >= interval_ms {
                 LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
                 println!(
-                    "DummyRadio: dropping {} bytes of outgoing telemetry send from {}",
+                    "DummyComms: dropping {} bytes of outgoing telemetry send from {}",
                     payload.len(),
                     self.name
                 );
@@ -560,6 +740,10 @@ impl RadioDevice for DummyRadio {
 
 #[cfg(target_os = "linux")]
 const SPI_IOC_MAGIC: u8 = b'k';
+#[cfg(target_os = "linux")]
+const I2C_M_RD: u16 = 0x0001;
+#[cfg(target_os = "linux")]
+const I2C_RDWR: libc::c_ulong = 0x0707;
 #[cfg(target_os = "linux")]
 const SPI_IOC_WR_MODE: libc::c_ulong = ioc_write::<u8>(SPI_IOC_MAGIC, 1);
 #[cfg(target_os = "linux")]
@@ -618,6 +802,48 @@ struct SockAddrCan {
     can_family: libc::sa_family_t,
     can_ifindex: libc::c_int,
     addr: [u8; 8],
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct I2cMsg {
+    addr: u16,
+    flags: u16,
+    len: u16,
+    buf: *mut u8,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct I2cRdwrIoctlData {
+    msgs: *mut I2cMsg,
+    nmsgs: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_i2c_response(
+    raw: &[u8; I2C_FRAME_SIZE],
+) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
+    let magic = raw[0];
+    let len = raw[1] as usize;
+
+    // Treat all-0xff and all-zero idle reads as "no frame available yet" to match the
+    // permissive Python polling behavior used by the Pico groundstation tools.
+    let all_ff = raw.iter().all(|byte| *byte == 0xFF);
+    let all_zero = raw.iter().all(|byte| *byte == 0x00);
+    if all_ff || all_zero {
+        return Ok(None);
+    }
+
+    if magic != I2C_RESP_DATA_MAGIC || len > MAX_PACKET_SIZE {
+        return Ok(None);
+    }
+
+    if len == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(raw[2..2 + len].to_vec()))
 }
 
 #[cfg(target_os = "linux")]

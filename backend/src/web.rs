@@ -1,32 +1,32 @@
 use crate::auth::{AuthFailure, LoginRequest, Permission};
 use crate::layout;
 use crate::loadcell;
-use crate::map::{detect_max_native_zoom, tile_bundle_path, DEFAULT_MAP_REGION};
-use crate::sequences::{command_name, ActionPolicyMsg, PersistentNotification};
+use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_bundle_path};
+use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::state::AppState;
 use crate::types::{
     BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryCommand, TelemetryRow,
 };
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::{
-    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade}, extract::{Path, Query, State},
+    Json, Router,
+    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+    extract::{Path, Query, State},
     response::IntoResponse,
     routing::{get, get_service, post},
-    Json,
-    Router,
 };
 use futures::{SinkExt, StreamExt};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::Row;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::{OnceCell, mpsc};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -317,9 +317,9 @@ async fn get_valve_state(
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let valve_state = row.map(|r| {
         let timestamp_ms: i64 = r.get::<i64, _>("timestamp_ms");
@@ -355,9 +355,9 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
         LIMIT 1
         "#,
     )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
     let rocket = row.and_then(|r| {
         let values = values_from_row(&r);
@@ -427,7 +427,7 @@ async fn get_map_config(
         map_title: "Map".to_string(),
         tracked_asset_label: "Tracked Asset".to_string(),
     })
-        .into_response()
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -623,11 +623,11 @@ async fn read_exact_tile(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
                 match sqlx::query_scalar::<_, Vec<u8>>(
                     "SELECT image FROM tiles WHERE z = ? AND x = ? AND y = ? LIMIT 1",
                 )
-                    .bind(i64::from(z))
-                    .bind(i64::from(x))
-                    .bind(i64::from(y))
-                    .fetch_optional(&pool)
-                    .await
+                .bind(i64::from(z))
+                .bind(i64::from(x))
+                .bind(i64::from(y))
+                .fetch_optional(&pool)
+                .await
                 {
                     Ok(Some(bytes)) => return Some(bytes),
                     Ok(None) => {}
@@ -642,11 +642,11 @@ async fn read_exact_tile(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
                      WHERE t.z = ? AND t.x = ? AND t.y = ?
                      LIMIT 1",
                 )
-                    .bind(i64::from(z))
-                    .bind(i64::from(x))
-                    .bind(i64::from(y))
-                    .fetch_optional(&pool)
-                    .await
+                .bind(i64::from(z))
+                .bind(i64::from(x))
+                .bind(i64::from(y))
+                .fetch_optional(&pool)
+                .await
                 {
                     Ok(Some(bytes)) => return Some(bytes),
                     Ok(None) => {}
@@ -741,7 +741,7 @@ fn synthesize_zoom_tile_from_ancestor(
         rgb.height(),
         image::ExtendedColorType::Rgb8,
     )
-        .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?;
     Ok(out)
 }
 
@@ -749,22 +749,57 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-    let latest_db_ts: Option<i64> = sqlx::query_scalar("SELECT MAX(timestamp_ms) FROM telemetry")
-        .fetch_one(&state.db)
-        .await
-        .ok()
-        .flatten();
     let cache_snapshot = state.recent_telemetry_snapshot();
-    let latest_cache_ts = cache_snapshot.iter().map(|r| r.timestamp_ms).max();
+    let latest_cache_ts = cache_snapshot.last().map(|r| r.timestamp_ms);
+    let oldest_cache_ts = cache_snapshot.first().map(|r| r.timestamp_ms);
 
-    let now_ms = match (latest_db_ts, latest_cache_ts) {
-        (Some(a), Some(b)) => a.max(b),
-        (Some(a), None) => a,
-        (None, Some(b)) => b,
-        (None, None) => return Json(Vec::<TelemetryRow>::new()).into_response(),
+    if let Some(now_ms) = latest_cache_ts {
+        let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
+        let cache_covers_window =
+            oldest_cache_ts.is_some_and(|oldest| oldest <= cutoff + RECENT_BUCKET_MS);
+        if cache_covers_window {
+            return Json(compact_recent_rows(cache_snapshot, cutoff)).into_response();
+        }
+
+        let db_end_ms = oldest_cache_ts.unwrap_or(now_ms).saturating_sub(1);
+        let mut merged_rows = if db_end_ms >= cutoff {
+            load_recent_rows_from_db(&state, cutoff, db_end_ms).await
+        } else {
+            Vec::new()
+        };
+        merged_rows.extend(
+            cache_snapshot
+                .into_iter()
+                .filter(|row| row.timestamp_ms >= cutoff && row.timestamp_ms <= now_ms),
+        );
+        return Json(compact_recent_rows(merged_rows, cutoff)).into_response();
+    }
+
+    let Some(now_ms) =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(timestamp_ms) FROM telemetry")
+            .fetch_one(&state.db)
+            .await
+            .ok()
+            .flatten()
+    else {
+        return Json(Vec::<TelemetryRow>::new()).into_response();
     };
+    let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
+    Json(compact_recent_rows(
+        load_recent_rows_from_db(&state, cutoff, now_ms).await,
+        cutoff,
+    ))
+    .into_response()
+}
 
-    let cutoff = now_ms - RECENT_HISTORY_MS;
+async fn load_recent_rows_from_db(
+    state: &Arc<AppState>,
+    start_ms: i64,
+    end_ms: i64,
+) -> Vec<TelemetryRow> {
+    if end_ms < start_ms {
+        return Vec::new();
+    }
 
     let rows_db = sqlx::query(
         r#"
@@ -779,32 +814,22 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
         ORDER BY timestamp_ms ASC
         "#,
     )
-        .bind(cutoff)
-        .bind(now_ms)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(start_ms)
+    .bind(end_ms)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
-    let mut merged_rows: Vec<TelemetryRow> =
-        Vec::with_capacity(rows_db.len() + cache_snapshot.len());
+    let mut out = Vec::with_capacity(rows_db.len());
     for row in rows_db {
-        let item = TelemetryRow {
+        out.push(TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             data_type: row.get::<String, _>("data_type"),
             sender_id: row.get::<String, _>("sender_id"),
             values: values_from_row(&row),
-        };
-        merged_rows.push(item);
+        });
     }
-
-    for row in cache_snapshot {
-        if row.timestamp_ms < cutoff || row.timestamp_ms > now_ms {
-            continue;
-        }
-        merged_rows.push(row);
-    }
-
-    Json(compact_recent_rows(merged_rows, cutoff)).into_response()
+    out
 }
 
 async fn get_favicon() -> impl IntoResponse {
@@ -854,7 +879,7 @@ async fn get_network_time(
     Json(NetworkTimeMsg {
         timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
     })
-        .into_response()
+    .into_response()
 }
 
 async fn get_notifications(
@@ -1005,14 +1030,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         let initial_notifications = serde_json::to_string(&WsOutMsg::Notifications(
             state_for_send.notifications_snapshot(),
         ))
-            .unwrap_or_default();
+        .unwrap_or_default();
         if ws_out_tx.send(initial_notifications).await.is_err() {
             return;
         }
         let initial_action_policy = serde_json::to_string(&WsOutMsg::ActionPolicy(
             state_for_send.action_policy_snapshot(),
         ))
-            .unwrap_or_default();
+        .unwrap_or_default();
         if ws_out_tx.send(initial_action_policy).await.is_err() {
             return;
         }
@@ -1020,14 +1045,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
             state_for_send
                 .network_topology_snapshot(crate::telemetry_task::get_current_timestamp_ms()),
         ))
-            .unwrap_or_default();
+        .unwrap_or_default();
         if ws_out_tx.send(initial_network_topology).await.is_err() {
             return;
         }
         let initial_network_time = serde_json::to_string(&WsOutMsg::NetworkTime(NetworkTimeMsg {
             timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
         }))
-            .unwrap_or_default();
+        .unwrap_or_default();
         if ws_out_tx.send(initial_network_time).await.is_err() {
             return;
         }
@@ -1318,11 +1343,11 @@ async fn get_alerts(
         ORDER BY timestamp_ms DESC
         "#,
     )
-        .bind(cutoff)
-        .bind(now_ms)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .bind(cutoff)
+    .bind(now_ms)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     let mut alerts: Vec<AlertDto> = alerts_db
         .into_iter()
@@ -1384,11 +1409,11 @@ fn spawn_alert_insert(
             VALUES (?, ?, ?)
             "#,
         )
-            .bind(timestamp_ms)
-            .bind(severity)
-            .bind(message)
-            .execute(&db)
-            .await;
+        .bind(timestamp_ms)
+        .bind(severity)
+        .bind(message)
+        .execute(&db)
+        .await;
         state_for_task.end_db_write();
     });
 }

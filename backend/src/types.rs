@@ -14,6 +14,7 @@ pub enum TelemetryCommand {
     NitrogenClose,
     Nitrous,
     NitrousClose,
+    ContinueFillSequence,
     #[cfg(feature = "hitl_mode")]
     DeployParachute,
     #[cfg(feature = "hitl_mode")]

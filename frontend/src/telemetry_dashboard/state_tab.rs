@@ -14,17 +14,18 @@ use super::layout::{
 };
 use super::types::{BoardStatusEntry, FlightState, TelemetryRow};
 use super::{
-    latest_telemetry_row, latest_telemetry_value, ui_telemetry_rows_snapshot, ActionPolicyMsg, BlinkMode,
-    HISTORY_MS,
+    ActionPolicyMsg, BlinkMode, HISTORY_MS, TELEMETRY_RENDER_EPOCH, latest_telemetry_row,
+    latest_telemetry_value, ui_telemetry_rows_snapshot,
 };
 
 use crate::telemetry_dashboard::data_chart::{
-    charts_cache_get, charts_cache_get_channel_minmax, series_color, ChartCanvas, ChartRenderChunk,
+    ChartCanvas, ChartRenderChunk, charts_cache_get, charts_cache_get_channel_minmax, series_color,
 };
 use crate::telemetry_dashboard::map_tab::MapTab;
 use std::hash::{Hash, Hasher};
 
 const COMBINED_CURVE_MIN_DELTA_PX: f32 = 0.35;
+const COMBINED_SMOOTHING_MAX_POINTS: usize = 240;
 
 #[cfg(target_arch = "wasm32")]
 fn blink_epoch_ms() -> u64 {
@@ -69,18 +70,6 @@ fn action_opacity(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn target_frame_duration() -> std::time::Duration {
-    // Default 60fps; override with GS_UI_FPS if needed.
-    let fps: u64 = std::env::var("GS_UI_FPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
-
-    let fps = fps.clamp(1, 480);
-    std::time::Duration::from_micros(1_000_000 / fps)
-}
-
 #[component]
 pub fn StateTab(
     flight_state: Signal<FlightState>,
@@ -95,96 +84,7 @@ pub fn StateTab(
     abort_only_mode: bool,
     theme: ThemeConfig,
 ) -> Element {
-    // ------------------------------------------------------------
-    // Redraw driver for charts on State tab
-    // ------------------------------------------------------------
-    let redraw_tick = use_signal(|| 0u64);
-    #[cfg(target_arch = "wasm32")]
-    let raf_running = use_signal(|| std::rc::Rc::new(std::cell::Cell::new(true)));
-    #[cfg(target_arch = "wasm32")]
-    let raf_id = use_signal(|| std::rc::Rc::new(std::cell::Cell::new(None::<i32>)));
-
-    use_effect({
-        let mut redraw_tick = redraw_tick;
-        #[cfg(target_arch = "wasm32")]
-        let raf_running = raf_running.read().clone();
-        #[cfg(target_arch = "wasm32")]
-        let raf_id = raf_id.read().clone();
-
-        move || {
-            #[cfg(target_arch = "wasm32")]
-            {
-                use std::cell::RefCell;
-                use std::rc::Rc;
-                use wasm_bindgen::JsCast;
-                use wasm_bindgen::closure::Closure;
-
-                let cb: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
-                let cb2 = cb.clone();
-                let raf_running_cb = raf_running.clone();
-                let raf_id_cb = raf_id.clone();
-                let raf_id_start = raf_id.clone();
-
-                *cb2.borrow_mut() = Some(Closure::wrap(Box::new(move |_ts: f64| {
-                    if !raf_running_cb.get() {
-                        return;
-                    }
-                    let next = redraw_tick.read().wrapping_add(1);
-                    redraw_tick.set(next);
-
-                    if let Some(win) = web_sys::window() {
-                        if let Some(cb_ref) = cb.borrow().as_ref() {
-                            if let Ok(id) =
-                                win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
-                            {
-                                raf_id_cb.set(Some(id));
-                            }
-                        }
-                    }
-                }) as Box<dyn FnMut(f64)>));
-
-                if let Some(win) = web_sys::window() {
-                    if let Some(cb_ref) = cb2.borrow().as_ref() {
-                        if let Ok(id) = win.request_animation_frame(cb_ref.as_ref().unchecked_ref())
-                        {
-                            raf_id_start.set(Some(id));
-                        }
-                    }
-                }
-
-                std::mem::forget(cb2);
-            }
-
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let frame = target_frame_duration();
-                spawn(async move {
-                    loop {
-                        tokio::time::sleep(frame).await;
-                        let next = redraw_tick.read().wrapping_add(1);
-                        redraw_tick.set(next);
-                    }
-                });
-            }
-        }
-    });
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        let raf_running = raf_running.read().clone();
-        let raf_id = raf_id.read().clone();
-        use_drop(move || {
-            raf_running.set(false);
-            if let Some(win) = web_sys::window() {
-                if let Some(id) = raf_id.get() {
-                    let _ = win.cancel_animation_frame(id);
-                }
-            }
-        });
-    }
-
-    // Force rerender when redraw driver ticks
-    let _ = *redraw_tick.read();
+    let _ = *TELEMETRY_RENDER_EPOCH.read();
 
     let state = flight_state.read().clone();
     let boards_snapshot = board_status.read();
@@ -207,7 +107,8 @@ pub fn StateTab(
                     default_valve_labels.as_ref(),
                     rocket_gps,
                     user_gps,
-                    abort_only_mode
+                    abort_only_mode,
+                    &theme,
                 )}
             }
         }
@@ -262,6 +163,7 @@ fn render_state_section(
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
     abort_only_mode: bool,
+    theme: &ThemeConfig,
 ) -> Element {
     if !section_has_content(section, actions, abort_only_mode) {
         return rsx! { div {} };
@@ -283,7 +185,8 @@ fn render_state_section(
                     default_valve_labels,
                     rocket_gps,
                     user_gps,
-                    abort_only_mode
+                    abort_only_mode,
+                    theme,
                 )}
             }
         }
@@ -300,6 +203,7 @@ fn render_state_widget(
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
     abort_only_mode: bool,
+    theme: &ThemeConfig,
 ) -> Element {
     match widget.kind {
         StateWidgetKind::BoardStatus => rsx! { {board_status_table(boards)} },
@@ -315,17 +219,13 @@ fn render_state_widget(
         StateWidgetKind::Chart => {
             let w = widget.width.unwrap_or(1200.0);
             let h = widget.height.unwrap_or(260.0);
-            if let Some(series) = widget.chart_series.as_deref()
-                && !series.is_empty()
-            {
-                rsx! { {combined_state_chart_cached(series, w, h, widget.chart_title.as_deref(), data_layout)} }
-            } else {
-                let dt = widget.data_type.as_deref().unwrap_or("");
-                if dt.is_empty() {
-                    rsx! { div { style: "color:#94a3b8; font-size:12px;", "Missing chart data_type" } }
-                } else {
-                    let labels = labels_from_layout(data_layout, dt);
-                    rsx! { {data_style_chart_cached(dt, w, h, widget.chart_title.as_deref(), &labels)} }
+            rsx! {
+                StateChartPanel {
+                    widget: widget.clone(),
+                    data_layout: data_layout.clone(),
+                    theme: theme.clone(),
+                    view_w: w,
+                    view_h: h,
                 }
             }
         }
@@ -341,6 +241,86 @@ fn render_state_widget(
         StateWidgetKind::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
         StateWidgetKind::Actions => {
             rsx! { {action_section(actions, action_policy, widget.actions.as_deref(), abort_only_mode)} }
+        }
+    }
+}
+
+#[component]
+fn StateChartPanel(
+    widget: StateWidget,
+    data_layout: DataTabLayout,
+    theme: ThemeConfig,
+    view_w: f64,
+    view_h: f64,
+) -> Element {
+    let _ = *TELEMETRY_RENDER_EPOCH.read();
+    let mut is_fullscreen = use_signal(|| false);
+    let on_toggle_fullscreen = move |_| {
+        let next = !*is_fullscreen.read();
+        is_fullscreen.set(next);
+    };
+    let full_h = fullscreen_view_height().max(view_h).max(320.0);
+
+    let chart_body = if let Some(series) = widget.chart_series.as_deref()
+        && !series.is_empty()
+    {
+        combined_state_chart_cached(
+            series,
+            view_w,
+            if *is_fullscreen.read() {
+                full_h
+            } else {
+                view_h
+            },
+            widget.chart_title.as_deref(),
+            &data_layout,
+        )
+    } else {
+        let dt = widget.data_type.as_deref().unwrap_or("");
+        if dt.is_empty() {
+            rsx! { div { style: "color:#94a3b8; font-size:12px;", "Missing chart data_type" } }
+        } else {
+            let labels = labels_from_layout(&data_layout, dt);
+            data_style_chart_cached(
+                dt,
+                view_w,
+                if *is_fullscreen.read() {
+                    full_h
+                } else {
+                    view_h
+                },
+                widget.chart_title.as_deref(),
+                &labels,
+            )
+        }
+    };
+
+    rsx! {
+        div { style: "display:flex; flex-direction:column; gap:8px;",
+            div { style: "display:flex; justify-content:flex-end;",
+                button {
+                    style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
+                    onclick: on_toggle_fullscreen,
+                    if *is_fullscreen.read() { "Exit Fullscreen" } else { "Fullscreen" }
+                }
+            }
+            if *is_fullscreen.read() {
+                div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:{theme.app_background}; display:flex; flex-direction:column; gap:12px;",
+                    div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
+                        h2 { style: "margin:0; color:{theme.text_primary};", "{widget.chart_title.clone().unwrap_or_else(|| \"Flight Graph\".to_string())}" }
+                        button {
+                            style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
+                            onclick: on_toggle_fullscreen,
+                            "Exit Fullscreen"
+                        }
+                    }
+                    div { style: "flex:1; min-height:0; overflow-y:auto;",
+                        {chart_body}
+                    }
+                }
+            } else {
+                {chart_body}
+            }
         }
     }
 }
@@ -449,7 +429,7 @@ fn push_curve_point(points: &mut Vec<(f32, f32)>, x: f32, y: f32) {
     points.push((x, y));
 }
 
-fn flush_curve_segment(path: &mut String, points: &[(f32, f32)]) {
+fn flush_curve_segment(path: &mut String, points: &[(f32, f32)], smooth: bool) {
     if points.is_empty() {
         return;
     }
@@ -458,9 +438,10 @@ fn flush_curve_segment(path: &mut String, points: &[(f32, f32)]) {
     if points.len() == 1 {
         return;
     }
-    if points.len() == 2 {
-        let (x1, y1) = points[1];
-        path.push_str(&format!("L {:.2} {:.2} ", x1, y1));
+    if points.len() == 2 || !smooth || points.len() > COMBINED_SMOOTHING_MAX_POINTS {
+        for &(x, y) in &points[1..] {
+            path.push_str(&format!("L {:.2} {:.2} ", x, y));
+        }
         return;
     }
     for i in 1..(points.len() - 1) {
@@ -551,7 +532,15 @@ fn combined_chart_payload(
     data_layout: &DataTabLayout,
     view_w: f64,
     view_h: f64,
-) -> Option<(Vec<ChartRenderChunk>, f32, f32, f32, Vec<String>, bool, Vec<Option<(f32, f32)>>)> {
+) -> Option<(
+    Vec<ChartRenderChunk>,
+    f32,
+    f32,
+    f32,
+    Vec<String>,
+    bool,
+    Vec<Option<(f32, f32)>>,
+)> {
     let rows = ui_telemetry_rows_snapshot();
     let newest_ts = rows.iter().map(|row| row.timestamp_ms).max()?;
     let history_start_ts = newest_ts.saturating_sub(HISTORY_MS);
@@ -626,6 +615,7 @@ fn combined_chart_payload(
 
     let mut paths = vec![String::new(); specs.len()];
     let mut gap_paths = vec![String::new(); specs.len()];
+    let smooth_curves = span_ms <= 5.0 * 60_000.0;
 
     for (idx, points) in all_points.iter().enumerate() {
         if points.is_empty() {
@@ -664,7 +654,7 @@ fn combined_chart_payload(
             let prev_y = bottom - (prev_value - series_y_min) / (series_y_max - series_y_min) * ph;
             let gap_ms = ts_ms.saturating_sub(prev_ts_ms);
             if gap_ms > gap_threshold_ms {
-                flush_curve_segment(&mut paths[idx], &curve_points);
+                flush_curve_segment(&mut paths[idx], &curve_points, smooth_curves);
                 curve_points.clear();
                 gap_paths[idx].push_str(&format!(
                     "M {:.2} {:.2} L {:.2} {:.2} ",
@@ -673,7 +663,7 @@ fn combined_chart_payload(
             }
             push_curve_point(&mut curve_points, x, y);
         }
-        flush_curve_segment(&mut paths[idx], &curve_points);
+        flush_curve_segment(&mut paths[idx], &curve_points, smooth_curves);
     }
 
     if paths.iter().all(|path| path.is_empty()) && gap_paths.iter().all(|path| path.is_empty()) {
@@ -817,6 +807,19 @@ fn labels_from_layout(data_layout: &DataTabLayout, dt: &str) -> Vec<String> {
         .find(|tab| tab.id == dt)
         .map(|tab| tab.channels.clone())
         .unwrap_or_default()
+}
+
+fn fullscreen_view_height() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(win) = web_sys::window()
+            && let Ok(height) = win.inner_height()
+            && let Some(height) = height.as_f64()
+        {
+            return (height - 140.0).max(260.0);
+        }
+    }
+    520.0
 }
 
 // ============================================================

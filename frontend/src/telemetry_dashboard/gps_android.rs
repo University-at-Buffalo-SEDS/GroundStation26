@@ -24,7 +24,7 @@ fn with_android_env<R>(f: impl FnOnce(&mut Env<'_>, &JObject<'_>) -> R) -> Optio
         let _ = context.into_raw();
         Ok(result)
     })
-        .ok()
+    .ok()
 }
 
 fn call_static_void(method: &str, sig: &str, args: &[JValue<'_>]) {

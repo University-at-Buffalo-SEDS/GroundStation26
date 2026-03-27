@@ -82,6 +82,7 @@ const MAX_INTERP_GAP_BUCKETS: i64 = 6;
 const CURVE_MIN_DELTA_PX: f32 = 0.35;
 const RENDER_CHUNK_MS: i64 = 20_000;
 const RENDER_CHUNK_BUCKETS: i64 = RENDER_CHUNK_MS / BUCKET_MS;
+const SMOOTHING_MAX_POINTS_PER_SEGMENT: usize = 240;
 
 // Avoid zero span
 const MIN_SPAN_MS: i64 = 1_000;
@@ -367,6 +368,8 @@ struct CachedChart {
 
     // cached output
     chunks: Vec<ChartRenderChunk>,
+    subset_cache: HashMap<SubsetCacheKey, CachedSubset>,
+    subset_per_series_cache: HashMap<SubsetCacheKey, CachedSubsetPerSeries>,
 
     // per-window min/max (raw)
     raw_min: f32,
@@ -401,6 +404,8 @@ impl CachedChart {
             dirty: true,
             channel_count: 0,
             chunks: Vec::new(),
+            subset_cache: HashMap::new(),
+            subset_per_series_cache: HashMap::new(),
             raw_min: 0.0,
             raw_max: 1.0,
             chan_min: Vec::new(),
@@ -577,6 +582,8 @@ impl CachedChart {
         if !self.dirty && !size_changed {
             return;
         }
+        self.subset_cache.clear();
+        self.subset_per_series_cache.clear();
         self.last_w = w;
         self.last_h = h;
 
@@ -700,6 +707,7 @@ impl CachedChart {
             let chunk_end_x = left + pw * ((chunk_end_bid - start_bid + 1) as f32 / total);
             let chunk_width = (chunk_end_x - chunk_start_x).max(1.0);
             let allow_interp = true;
+            let smooth_chunk = should_smooth_chunk(chunk_width, chunk_bucket_count);
 
             let mut paths = vec![String::new(); self.channel_count];
             let mut gap_paths = vec![String::new(); self.channel_count];
@@ -740,7 +748,11 @@ impl CachedChart {
                                     push_segment_point(&mut segment_points[ch], xi, yi);
                                 }
                             } else {
-                                flush_smoothed_segment(&mut paths[ch], &segment_points[ch]);
+                                flush_smoothed_segment(
+                                    &mut paths[ch],
+                                    &segment_points[ch],
+                                    smooth_chunk,
+                                );
                                 segment_points[ch].clear();
                                 gap_paths[ch].push_str(&format!(
                                     "M {:.2} {:.2} L {:.2} {:.2} ",
@@ -757,7 +769,7 @@ impl CachedChart {
             }
 
             for ch in 0..self.channel_count {
-                flush_smoothed_segment(&mut paths[ch], &segment_points[ch]);
+                flush_smoothed_segment(&mut paths[ch], &segment_points[ch], smooth_chunk);
             }
 
             if paths.iter().all(|p| p.is_empty()) && gap_paths.iter().all(|p| p.is_empty()) {
@@ -797,13 +809,19 @@ impl CachedChart {
             return (Vec::new(), 0.0, 1.0, 0.0);
         }
 
-        let valid_channels: Vec<usize> = channels
-            .iter()
-            .copied()
-            .filter(|idx| *idx < self.channel_count)
-            .collect();
+        let valid_channels = self.normalize_channels(channels);
         if valid_channels.is_empty() {
             return (Vec::new(), 0.0, 1.0, 0.0);
+        }
+
+        let cache_key = SubsetCacheKey::new(&valid_channels, w, h);
+        if let Some(cached) = self.subset_cache.get(&cache_key) {
+            return (
+                cached.chunks.clone(),
+                cached.y_min,
+                cached.y_max,
+                cached.span_min,
+            );
         }
 
         let newest_bid = self.newest_bucket_id;
@@ -849,6 +867,7 @@ impl CachedChart {
             let chunk_start_x = left + pw * ((chunk_start_bid - start_bid) as f32 / total);
             let chunk_end_x = left + pw * ((chunk_end_bid - start_bid + 1) as f32 / total);
             let chunk_width = (chunk_end_x - chunk_start_x).max(1.0);
+            let smooth_chunk = should_smooth_chunk(chunk_width, chunk_bucket_count);
 
             let mut paths = vec![String::new(); valid_channels.len()];
             let mut gap_paths = vec![String::new(); valid_channels.len()];
@@ -887,6 +906,7 @@ impl CachedChart {
                                 flush_smoothed_segment(
                                     &mut paths[group_idx],
                                     &segment_points[group_idx],
+                                    smooth_chunk,
                                 );
                                 segment_points[group_idx].clear();
                                 gap_paths[group_idx].push_str(&format!(
@@ -904,7 +924,11 @@ impl CachedChart {
             }
 
             for group_idx in 0..valid_channels.len() {
-                flush_smoothed_segment(&mut paths[group_idx], &segment_points[group_idx]);
+                flush_smoothed_segment(
+                    &mut paths[group_idx],
+                    &segment_points[group_idx],
+                    smooth_chunk,
+                );
             }
 
             if paths.iter().all(|p| p.is_empty()) && gap_paths.iter().all(|p| p.is_empty()) {
@@ -929,7 +953,20 @@ impl CachedChart {
             });
         }
 
-        (chunks, y_min, y_max, self.span_min)
+        let cached = CachedSubset {
+            chunks,
+            y_min,
+            y_max,
+            span_min: self.span_min,
+        };
+        let result = (
+            cached.chunks.clone(),
+            cached.y_min,
+            cached.y_max,
+            cached.span_min,
+        );
+        self.subset_cache.insert(cache_key, cached);
+        result
     }
 
     fn build_subset_per_series(
@@ -944,13 +981,18 @@ impl CachedChart {
             return (Vec::new(), Vec::new(), 0.0);
         }
 
-        let valid_channels: Vec<usize> = channels
-            .iter()
-            .copied()
-            .filter(|idx| *idx < self.channel_count)
-            .collect();
+        let valid_channels = self.normalize_channels(channels);
         if valid_channels.is_empty() {
             return (Vec::new(), Vec::new(), 0.0);
+        }
+
+        let cache_key = SubsetCacheKey::new(&valid_channels, w, h);
+        if let Some(cached) = self.subset_per_series_cache.get(&cache_key) {
+            return (
+                cached.chunks.clone(),
+                cached.series_scales.clone(),
+                cached.span_min,
+            );
         }
 
         let newest_bid = self.newest_bucket_id;
@@ -1007,6 +1049,7 @@ impl CachedChart {
             let chunk_start_x = left + pw * ((chunk_start_bid - start_bid) as f32 / total);
             let chunk_end_x = left + pw * ((chunk_end_bid - start_bid + 1) as f32 / total);
             let chunk_width = (chunk_end_x - chunk_start_x).max(1.0);
+            let smooth_chunk = should_smooth_chunk(chunk_width, chunk_bucket_count);
 
             let mut paths = vec![String::new(); valid_channels.len()];
             let mut gap_paths = vec![String::new(); valid_channels.len()];
@@ -1047,6 +1090,7 @@ impl CachedChart {
                                 flush_smoothed_segment(
                                     &mut paths[group_idx],
                                     &segment_points[group_idx],
+                                    smooth_chunk,
                                 );
                                 segment_points[group_idx].clear();
                                 gap_paths[group_idx].push_str(&format!(
@@ -1064,7 +1108,11 @@ impl CachedChart {
             }
 
             for group_idx in 0..valid_channels.len() {
-                flush_smoothed_segment(&mut paths[group_idx], &segment_points[group_idx]);
+                flush_smoothed_segment(
+                    &mut paths[group_idx],
+                    &segment_points[group_idx],
+                    smooth_chunk,
+                );
             }
 
             if paths.iter().all(|p| p.is_empty()) && gap_paths.iter().all(|p| p.is_empty()) {
@@ -1089,7 +1137,58 @@ impl CachedChart {
             });
         }
 
-        (chunks, series_scales, self.span_min)
+        let cached = CachedSubsetPerSeries {
+            chunks,
+            series_scales,
+            span_min: self.span_min,
+        };
+        let result = (
+            cached.chunks.clone(),
+            cached.series_scales.clone(),
+            cached.span_min,
+        );
+        self.subset_per_series_cache.insert(cache_key, cached);
+        result
+    }
+
+    fn normalize_channels(&self, channels: &[usize]) -> Vec<usize> {
+        channels
+            .iter()
+            .copied()
+            .filter(|idx| *idx < self.channel_count)
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+struct CachedSubset {
+    chunks: Vec<ChartRenderChunk>,
+    y_min: f32,
+    y_max: f32,
+    span_min: f32,
+}
+
+#[derive(Clone)]
+struct CachedSubsetPerSeries {
+    chunks: Vec<ChartRenderChunk>,
+    series_scales: Vec<Option<(f32, f32)>>,
+    span_min: f32,
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct SubsetCacheKey {
+    channels: Vec<usize>,
+    width_px: u32,
+    height_px: u32,
+}
+
+impl SubsetCacheKey {
+    fn new(channels: &[usize], width: f32, height: f32) -> Self {
+        Self {
+            channels: channels.to_vec(),
+            width_px: width.max(0.0).round() as u32,
+            height_px: height.max(0.0).round() as u32,
+        }
     }
 }
 
@@ -1134,14 +1233,18 @@ pub fn series_color(i: usize) -> &'static str {
     [
         "#f97316", "#22d3ee", "#a3e635", "#f43f5e", "#8b5cf6", "#e879f9", "#10b981", "#fbbf24",
     ]
-        .get(i)
-        .copied()
-        .unwrap_or("#9ca3af")
+    .get(i)
+    .copied()
+    .unwrap_or("#9ca3af")
 }
 
 static NEXT_CANVAS_ID: AtomicU64 = AtomicU64::new(1);
 
-fn flush_smoothed_segment(path: &mut String, points: &[(f32, f32)]) {
+fn should_smooth_chunk(chunk_width: f32, chunk_bucket_count: i64) -> bool {
+    chunk_width >= 220.0 && chunk_bucket_count <= SMOOTHING_MAX_POINTS_PER_SEGMENT as i64
+}
+
+fn flush_smoothed_segment(path: &mut String, points: &[(f32, f32)], smooth: bool) {
     if points.is_empty() {
         return;
     }
@@ -1153,9 +1256,10 @@ fn flush_smoothed_segment(path: &mut String, points: &[(f32, f32)]) {
         return;
     }
 
-    if points.len() == 2 {
-        let (x1, y1) = points[1];
-        path.push_str(&format!("L {:.2} {:.2} ", x1, y1));
+    if points.len() == 2 || !smooth || points.len() > SMOOTHING_MAX_POINTS_PER_SEGMENT {
+        for &(x, y) in &points[1..] {
+            path.push_str(&format!("L {:.2} {:.2} ", x, y));
+        }
         return;
     }
 
@@ -1263,7 +1367,7 @@ pub fn ChartCanvas(
                     const cssW = Math.max(1, Math.round(rect.width || data.view_w || 1));
                     const cssH = Math.max(1, Math.round(rect.height || data.view_h || 1));
                     const dpr = Math.max(1, Math.min(5, (window.devicePixelRatio || 1)));
-                    const qualityBoost = 2.0;
+                    const qualityBoost = 1.0;
                     const maxCanvasEdge = 16384;
                     let renderScale = dpr * qualityBoost;
                     if (cssW * renderScale > maxCanvasEdge) {{

@@ -6,7 +6,7 @@ use super::types::{
     BoardStatusEntry, FlightState, NetworkTopologyMsg, NetworkTopologyNodeKind,
     NetworkTopologyStatus,
 };
-use super::{format_timestamp_ms_clock, AlertMsg, FrontendNetworkMetrics, PersistentNotification};
+use super::{AlertMsg, FrontendNetworkMetrics, PersistentNotification, format_timestamp_ms_clock};
 
 #[component]
 pub fn DetailedTab(

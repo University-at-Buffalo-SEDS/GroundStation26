@@ -8,7 +8,7 @@ const APP_DISPLAY_NAME: &str = "Telemetry Client";
 
 use crate::auth::{self, SessionStatus as AuthSessionStatus};
 use dioxus::prelude::*;
-use dioxus_router::{use_navigator, Routable, Router};
+use dioxus_router::{Routable, Router, use_navigator};
 
 #[allow(unused_imports)]
 use crate::telemetry_dashboard::{self, UrlConfig};
@@ -184,7 +184,7 @@ mod persist {
     #[cfg(target_os = "android")]
     fn android_storage_dir() -> Option<std::path::PathBuf> {
         use jni::objects::{JObject, JString};
-        use jni::{jni_sig, jni_str, JavaVM};
+        use jni::{JavaVM, jni_sig, jni_str};
         use ndk_context::android_context;
 
         let ctx = android_context();
@@ -213,7 +213,7 @@ mod persist {
             let _ = context.into_raw();
             Ok(std::path::PathBuf::from(path).join("gs26"))
         })
-            .ok()
+        .ok()
     }
 
     fn storage_dir() -> std::path::PathBuf {
@@ -525,15 +525,15 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl, skip_tls_verify: bool) -> Resu
                 false,
                 Some(tokio_tungstenite::Connector::NativeTls(tls)),
             )
-                .await
-                .map_err(|e| format!("{e}"))
+            .await
+            .map_err(|e| format!("{e}"))
         } else {
             tokio_tungstenite::connect_async(ws_url.clone())
                 .await
                 .map_err(|e| format!("{e}"))
         }
     })
-        .await;
+    .await;
 
     match res {
         Err(_) => Err(format!(
@@ -721,7 +721,7 @@ fn LoginCard(
                 &password_value,
                 remember,
             )
-                .await
+            .await
             {
                 Ok(_) => {
                     telemetry_dashboard::reconnect_and_reseed_after_auth_change();

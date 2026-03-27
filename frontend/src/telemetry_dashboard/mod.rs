@@ -58,8 +58,8 @@ use warnings_tab::WarningsTab;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
-    atomic::{AtomicBool, Ordering}, Arc,
-    Mutex,
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 
 use once_cell::sync::Lazy;
@@ -201,7 +201,7 @@ mod persist {
         #[cfg(target_os = "android")]
         fn android_storage_base_dir() -> Option<std::path::PathBuf> {
             use jni::objects::{JObject, JString};
-            use jni::{jni_sig, jni_str, JavaVM};
+            use jni::{JavaVM, jni_sig, jni_str};
             use ndk_context::android_context;
 
             let ctx = android_context();
@@ -230,7 +230,7 @@ mod persist {
                 let _ = context.into_raw();
                 Ok(std::path::PathBuf::from(path))
             })
-                .ok()
+            .ok()
         }
 
         fn storage_base_dir() -> std::path::PathBuf {
@@ -365,6 +365,10 @@ pub struct PersistentNotification {
     pub message: String,
     #[serde(default = "default_notification_persistent")]
     pub persistent: bool,
+    #[serde(default)]
+    pub action_label: Option<String>,
+    #[serde(default)]
+    pub action_cmd: Option<String>,
 }
 
 fn default_notification_persistent() -> bool {
@@ -710,7 +714,7 @@ impl UiTelemetryStore {
 
     fn apply_rows<I>(&mut self, rows: I)
     where
-        I: IntoIterator<Item=TelemetryRow>,
+        I: IntoIterator<Item = TelemetryRow>,
     {
         for row in rows {
             let key = UiRowKey {
@@ -1733,7 +1737,7 @@ fn TelemetryDashboardInner() -> Element {
                         &mut ack_error_ts_s,
                         alive.clone(),
                     )
-                        .await;
+                    .await;
 
                     match res {
                         Ok(()) => {
@@ -1753,7 +1757,7 @@ fn TelemetryDashboardInner() -> Element {
                                 tokio::time::sleep(std::time::Duration::from_millis(
                                     400 * attempt as u64,
                                 ))
-                                    .await;
+                                .await;
                             }
                         }
                     }
@@ -1846,10 +1850,10 @@ fn TelemetryDashboardInner() -> Element {
 
     let has_unacked_warnings = latest_warning_ts > 0
         && (latest_warning_ts > *ack_warning_ts.read()
-        || *warning_event_counter.read() > *ack_warning_count.read());
+            || *warning_event_counter.read() > *ack_warning_count.read());
     let has_unacked_errors = latest_error_ts > 0
         && (latest_error_ts > *ack_error_ts.read()
-        || *error_event_counter.read() > *ack_error_count.read());
+            || *error_event_counter.read() > *ack_error_count.read());
 
     let border_style = if has_unacked_errors && *flash_on.read() {
         "2px solid #ef4444"
@@ -1953,7 +1957,7 @@ fn TelemetryDashboardInner() -> Element {
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
                     && alive.load(Ordering::Relaxed)
                 {
                     log!("[WS] supervisor ended: {e}");
@@ -2903,6 +2907,20 @@ fn TelemetryDashboardInner() -> Element {
                                 div {
                                     style: "display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid #2563eb; border-radius:10px; background:#0b1f4d; color:#bfdbfe;",
                                     span { style: "flex:1;", "{n.message}" }
+                                    if let (Some(action_label), Some(action_cmd)) = (n.action_label.as_deref(), n.action_cmd.as_deref())
+                                        && auth::can_send_command(action_cmd)
+                                    {
+                                        button {
+                                            style: "padding:0.2rem 0.65rem; border-radius:999px; border:1px solid #60a5fa; background:#1e3a8a; color:#dbeafe; font-size:0.75rem; cursor:pointer;",
+                                            onclick: {
+                                                let cmd = action_cmd.to_string();
+                                                move |_| {
+                                                    send_cmd(&cmd);
+                                                }
+                                            },
+                                            "{action_label}"
+                                        }
+                                    }
                                     button {
                                         style: "padding:0.2rem 0.55rem; border-radius:999px; border:1px solid #1d4ed8; background:#111827; color:#bfdbfe; font-size:0.75rem; cursor:pointer;",
                                         onclick: {
@@ -3329,7 +3347,7 @@ async fn dismiss_notification_remote(id: u64) -> Result<(), String> {
 #[cfg(target_arch = "wasm32")]
 fn spawn_detached<F>(fut: F)
 where
-    F: std::future::Future<Output=()> + 'static,
+    F: std::future::Future<Output = ()> + 'static,
 {
     wasm_bindgen_futures::spawn_local(fut);
 }
@@ -3337,7 +3355,7 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_detached<F>(fut: F)
 where
-    F: Future<Output=()> + 'static,
+    F: Future<Output = ()> + 'static,
 {
     spawn(fut);
 }
@@ -3517,7 +3535,7 @@ fn apply_notifications_snapshot(
             tokio::time::sleep(std::time::Duration::from_millis(
                 NOTIFICATION_AUTO_DISMISS_MS as u64,
             ))
-                .await;
+            .await;
 
             let still_visible = { notifications.read().iter().any(|x| x.id == id) };
             if !still_visible {
@@ -3849,7 +3867,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -3873,7 +3891,7 @@ async fn connect_ws_supervisor(
                     user_gps,
                     alive.clone(),
                 )
-                    .await
+                .await
             }
         };
 
@@ -4032,7 +4050,7 @@ async fn connect_ws_once_wasm(
             &mut closed_rx,
             gloo_timers::future::TimeoutFuture::new(150),
         )
-            .await;
+        .await;
 
         match done {
             futures_util::future::Either::Left((_closed, _timeout)) => break,
@@ -4099,9 +4117,9 @@ async fn connect_ws_once_native(
             false,
             Some(tokio_tungstenite::Connector::NativeTls(tls)),
         )
-            .await
-            .map_err(|e| format!("[WS] connect failed: {e}"))?
-            .0
+        .await
+        .map_err(|e| format!("[WS] connect failed: {e}"))?
+        .0
     } else {
         tokio_tungstenite::connect_async(ws_url.as_str())
             .await

@@ -1,27 +1,27 @@
+use crate::comms::CommsDevice;
 use crate::flight_sim;
 use crate::gpio_panel::IGNITION_PIN;
 use crate::layout;
 use crate::loadcell;
-use crate::radio::RadioDevice;
 #[cfg(feature = "hitl_mode")]
 use crate::rocket_commands::FlightComputerCommands;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
 use crate::state::AppState;
 #[cfg(feature = "hitl_mode")]
 use crate::types::FlightState;
-use crate::types::{u8_to_flight_state, Board, TelemetryCommand, TelemetryRow};
-use crate::web::{emit_warning, FlightStateMsg};
+use crate::types::{Board, TelemetryCommand, TelemetryRow, u8_to_flight_state};
+use crate::web::{FlightStateMsg, emit_warning};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::Router;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
-use tokio::sync::{broadcast, mpsc, Notify};
-use tokio::time::{interval, Duration};
+use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::time::{Duration, interval};
 
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
@@ -533,7 +533,7 @@ fn telemetry_values_json(values: &[Option<f32>]) -> Option<String> {
             .map(|v| v.map(|n| n as f64))
             .collect::<Vec<_>>(),
     )
-        .ok()
+    .ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -594,7 +594,7 @@ async fn emit_derived_battery_rows(
                         payload_json: payload_json.to_string(),
                     },
                 )
-                    .await;
+                .await;
             }
 
             let row = TelemetryRow {
@@ -676,7 +676,7 @@ async fn emit_derived_loadcell_rows(
                     payload_json: payload_json.to_string(),
                 },
             )
-                .await;
+            .await;
         }
 
         let row = TelemetryRow {
@@ -712,7 +712,7 @@ async fn emit_derived_vehicle_speed_row(
                 payload_json: payload_json.to_string(),
             },
         )
-            .await;
+        .await;
     }
 
     let row = TelemetryRow {
@@ -772,7 +772,7 @@ async fn emit_normalized_gps_row(
                 payload_json: payload_json.to_string(),
             },
         )
-            .await;
+        .await;
     }
 
     let row = TelemetryRow {
@@ -815,7 +815,7 @@ async fn handle_gps_satellite_count_packet(
                 payload_json: payload_json.to_string(),
             },
         )
-            .await;
+        .await;
     }
 
     let fix_values = {
@@ -842,7 +842,7 @@ async fn handle_gps_satellite_count_packet(
             normalized,
             payload_json,
         )
-            .await;
+        .await;
     }
 
     Some(TelemetryRow {
@@ -884,7 +884,7 @@ pub fn set_network_time_router(router: Arc<Router>) {
 pub async fn telemetry_task(
     state: Arc<AppState>,
     router: Arc<sedsprintf_rs_2026::router::Router>,
-    radio: Vec<Arc<Mutex<Box<dyn RadioDevice>>>>,
+    radio: Vec<Arc<Mutex<Box<dyn CommsDevice>>>>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
@@ -1168,6 +1168,10 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log NitrousClose command", e);
                                 }
                                 println!("Nitrous explicit close command sent");
+                        }
+                        TelemetryCommand::ContinueFillSequence => {
+                                state.request_fill_sequence_continue();
+                                println!("ContinueFillSequence command accepted");
                         }
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::AdvanceFlightState => {
@@ -1538,7 +1542,7 @@ async fn handle_packet(
                 state_code: pkt_data as i64,
             },
         )
-            .await;
+        .await;
 
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
@@ -1564,7 +1568,7 @@ async fn handle_packet(
                         .map(|v| v.map(|n| n as f64))
                         .collect::<Vec<_>>(),
                 )
-                    .ok();
+                .ok();
                 let payload_json = payload_json_from_pkt(&pkt);
 
                 queue_db_write(
@@ -1579,7 +1583,7 @@ async fn handle_packet(
                         payload_json,
                     },
                 )
-                    .await;
+                .await;
 
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
@@ -1619,7 +1623,7 @@ async fn handle_packet(
                 .map(|v| v.map(|n| n as f64))
                 .collect::<Vec<_>>(),
         )
-            .ok();
+        .ok();
 
         if should_persist_telemetry_sample(&data_type_str, ts_ms) {
             queue_db_write(
@@ -1634,7 +1638,7 @@ async fn handle_packet(
                     payload_json: payload_json.clone(),
                 },
             )
-                .await;
+            .await;
         }
 
         if let Some(voltage) = values_vec.first().copied().flatten() {
@@ -1649,7 +1653,7 @@ async fn handle_packet(
                 voltage,
                 &payload_json,
             )
-                .await;
+            .await;
 
             if matches!(
                 data_type_str.as_str(),
@@ -1667,7 +1671,7 @@ async fn handle_packet(
                     voltage,
                     &payload_json,
                 )
-                    .await;
+                .await;
             }
         }
 
@@ -1680,7 +1684,7 @@ async fn handle_packet(
                 speed_mps,
                 &payload_json,
             )
-                .await;
+            .await;
         }
 
         let row = TelemetryRow {
@@ -1705,7 +1709,7 @@ async fn handle_packet(
                     payload_json,
                 },
             )
-                .await;
+            .await;
         }
         None
     }

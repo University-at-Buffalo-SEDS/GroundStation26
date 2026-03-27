@@ -48,6 +48,10 @@ pub struct PersistentNotification {
     pub timestamp_ms: i64,
     pub message: String,
     pub persistent: bool,
+    #[serde(default)]
+    pub action_label: Option<String>,
+    #[serde(default)]
+    pub action_cmd: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +62,7 @@ enum SequenceStep {
     NitrogenLeakCheck,
     DumpNitrogen,
     CloseDump,
+    AwaitFillTestDecision,
     OpenNitrous,
     NitrousSoak,
     CloseNitrous,
@@ -249,6 +254,7 @@ struct SequenceRuntime {
     notified_armed: bool,
     warned_rapid_drop: bool,
     warned_mass_shift: bool,
+    leak_fail_notification_id: Option<u64>,
     notified_close_nitrous: bool,
     nitrous_level_since: Option<Instant>,
     last_nitrous_pressure_psi: Option<f32>,
@@ -270,6 +276,7 @@ impl Default for SequenceRuntime {
             notified_armed: false,
             warned_rapid_drop: false,
             warned_mass_shift: false,
+            leak_fail_notification_id: None,
             notified_close_nitrous: false,
             nitrous_level_since: None,
             last_nitrous_pressure_psi: None,
@@ -312,6 +319,7 @@ impl ValveSnapshot {
             "NormallyOpen" => self.normally_open,
             "Nitrogen" => self.nitrogen_open,
             "Nitrous" => self.nitrous_open,
+            "ContinueFillSequence" => None,
             "Pilot" => self.pilot_open,
             "Igniter" => self.igniter_on,
             "RetractPlumbing" => self.retract,
@@ -341,6 +349,7 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::RetractPlumbing => "RetractPlumbing",
         TelemetryCommand::Nitrogen | TelemetryCommand::NitrogenClose => "Nitrogen",
         TelemetryCommand::Nitrous | TelemetryCommand::NitrousClose => "Nitrous",
+        TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
         #[cfg(feature = "hitl_mode")]
@@ -408,6 +417,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
+        "ContinueFillSequence",
     ]
 }
 
@@ -423,6 +433,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
+        "ContinueFillSequence",
         "DeployParachute",
         "ExpandParachute",
         "ReinitSensors",
@@ -482,6 +493,8 @@ fn policy_with_overrides(
             // Keep controls pressable while key is enabled; blink indicates recommendation.
             enabled: if cmd == "Abort" {
                 true
+            } else if cmd == "ContinueFillSequence" {
+                false
             } else if cmd == "RetractPlumbing" && valves.retract == Some(true) {
                 // Fill lines are one-way: once retracted, do not re-enable.
                 false
@@ -538,6 +551,11 @@ fn update_sequence_runtime(
 ) {
     let at_or_above = |p: Option<f32>, threshold: f32| p.is_some_and(|x| x >= threshold);
     let at_or_below = |p: Option<f32>, threshold: f32| p.is_some_and(|x| x <= threshold);
+    let dismiss_leak_fail_notification = |state: &AppState, runtime: &mut SequenceRuntime| {
+        if let Some(id) = runtime.leak_fail_notification_id.take() {
+            let _ = state.dismiss_notification(id);
+        }
+    };
 
     match runtime.step {
         SequenceStep::SetupValves => {
@@ -657,6 +675,7 @@ fn update_sequence_runtime(
             let mass_ok = current_mass_kg.is_none() || mass_shift_kg <= allowed_mass_shift;
 
             if pressure_ok && mass_ok {
+                dismiss_leak_fail_notification(state, runtime);
                 if !runtime.notified_leak_pass {
                     state.add_notification(
                         "Nitrogen hold check passed. Pressure and loadcell are stable.",
@@ -667,10 +686,13 @@ fn update_sequence_runtime(
                 runtime.step = SequenceStep::DumpNitrogen;
                 runtime.step_started_at = None;
             } else {
-                state.add_notification(
-                    "Nitrogen hold check failed: pressure or loadcell drifted. Dumping before refill.",
-                );
-                runtime.next_step_after_dump = Some(SequenceStep::NitrogenFill);
+                runtime.leak_fail_notification_id = Some(state.add_notification_action(
+                    "Nitrogen hold check failed: pressure or loadcell drifted. Dumping and awaiting operator decision.",
+                    true,
+                    Some("Continue anyway".to_string()),
+                    Some("ContinueFillSequence".to_string()),
+                ));
+                runtime.next_step_after_dump = Some(SequenceStep::AwaitFillTestDecision);
                 runtime.step = SequenceStep::DumpNitrogen;
                 runtime.step_started_at = None;
             }
@@ -690,7 +712,24 @@ fn update_sequence_runtime(
                     .unwrap_or(SequenceStep::OpenNitrous);
             }
         }
+        SequenceStep::AwaitFillTestDecision => {
+            if state.consume_fill_sequence_continue_requests() {
+                dismiss_leak_fail_notification(state, runtime);
+                state.add_notification(
+                    "Operator override accepted. Continuing fill sequence to nitrous fill.",
+                );
+                runtime.step = SequenceStep::OpenNitrous;
+                return;
+            }
+
+            if valves.nitrogen_open == Some(true) {
+                dismiss_leak_fail_notification(state, runtime);
+                runtime.auto_close_nitrogen_sent = false;
+                runtime.step = SequenceStep::NitrogenFill;
+            }
+        }
         SequenceStep::OpenNitrous => {
+            dismiss_leak_fail_notification(state, runtime);
             if valves.nitrous_open != Some(true) {
                 runtime.nitrous_level_since = None;
                 runtime.last_nitrous_pressure_psi = None;
@@ -841,6 +880,7 @@ fn maybe_drive_local_prelaunch_state(
         SequenceStep::NitrogenLeakCheck | SequenceStep::DumpNitrogen | SequenceStep::CloseDump => {
             Some(FlightState::FillTest)
         }
+        SequenceStep::AwaitFillTestDecision => Some(FlightState::FillTest),
         SequenceStep::OpenNitrous
         | SequenceStep::CloseNitrous
         | SequenceStep::NitrousSoak
@@ -985,6 +1025,14 @@ fn build_policy(
         SequenceStep::CloseDump => {
             if inputs.valves.dump_open != Some(false) {
                 recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            }
+        }
+        SequenceStep::AwaitFillTestDecision => {
+            if inputs.valves.nitrogen_open != Some(true) {
+                recommended.insert(
+                    "Nitrogen",
+                    pending_mode(state, "Nitrogen", inputs.now_ms, cfg),
+                );
             }
         }
         SequenceStep::OpenNitrous => {

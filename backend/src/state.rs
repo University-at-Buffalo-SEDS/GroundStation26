@@ -2,7 +2,7 @@ use crate::auth::AuthManager;
 use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
-use crate::sequences::{command_name, ActionPolicyMsg, PersistentNotification};
+use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::types::{
     Board, BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyLink, NetworkTopologyMsg,
     NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus, TelemetryCommand,
@@ -17,7 +17,7 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -106,6 +106,9 @@ pub struct AppState {
 
     /// Last accepted command timestamp by command name.
     pub last_command_ms: Arc<Mutex<HashMap<String, u64>>>,
+
+    /// Monotonic counter for operator requests to continue a failed fill sequence.
+    pub fill_sequence_continue_requests: Arc<AtomicU64>,
 
     /// In-memory recent telemetry cache used to bridge DB write lag during reseed.
     pub recent_telemetry_cache: Arc<Mutex<VecDeque<TelemetryRow>>>,
@@ -493,6 +496,7 @@ impl AppState {
         }
         *slot = next_state;
         drop(slot);
+        crate::flight_sim::sync_local_flight_state(next_state);
 
         let _ = self.state_tx.send(FlightStateMsg { state: next_state });
 
@@ -559,6 +563,16 @@ impl AppState {
         message: S,
         persistent: bool,
     ) -> u64 {
+        self.add_notification_action(message, persistent, None, None)
+    }
+
+    pub fn add_notification_action<S: Into<String>>(
+        &self,
+        message: S,
+        persistent: bool,
+        action_label: Option<String>,
+        action_cmd: Option<String>,
+    ) -> u64 {
         let message = message.into();
         let mut notifications = self.notifications.lock().unwrap();
         if let Some(existing) = notifications.iter().find(|n| n.message == message) {
@@ -570,6 +584,8 @@ impl AppState {
             timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
             message,
             persistent,
+            action_label,
+            action_cmd,
         });
         let snapshot = notifications.clone();
         drop(notifications);
@@ -594,6 +610,18 @@ impl AppState {
         self.action_policy.lock().unwrap().clone()
     }
 
+    pub fn request_fill_sequence_continue(&self) {
+        self.fill_sequence_continue_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn consume_fill_sequence_continue_requests(&self) -> bool {
+        let prev = self
+            .fill_sequence_continue_requests
+            .swap(0, Ordering::Relaxed);
+        prev > 0
+    }
+
     pub fn set_action_policy(&self, policy: ActionPolicyMsg) {
         let mut slot = self.action_policy.lock().unwrap();
         if *slot == policy {
@@ -610,6 +638,7 @@ impl AppState {
             TelemetryCommand::Abort
                 | TelemetryCommand::NitrogenClose
                 | TelemetryCommand::NitrousClose
+                | TelemetryCommand::ContinueFillSequence
         ) {
             return true;
         }

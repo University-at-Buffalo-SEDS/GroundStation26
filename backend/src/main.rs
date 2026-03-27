@@ -1,6 +1,8 @@
 // main.rs
 
 mod auth;
+mod comms;
+mod comms_config;
 #[cfg(feature = "testing")]
 mod dummy_packets;
 mod flight_sim;
@@ -9,8 +11,6 @@ mod gpio_panel;
 mod layout;
 mod loadcell;
 mod map;
-mod radio;
-mod radio_config;
 mod ring_buffer;
 mod rocket_commands;
 mod safety_task;
@@ -20,7 +20,7 @@ mod telemetry_task;
 mod types;
 mod web;
 
-use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
+use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
@@ -28,16 +28,16 @@ use crate::state::{AppState, BoardStatus};
 use crate::telemetry_task::{get_current_timestamp_ms, set_network_time_router, telemetry_task};
 
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
-use crate::radio::DummyRadio;
-use crate::radio::{link_description, open_link, startup_failure_hint, RadioDevice};
+use crate::comms::DummyComms;
+use crate::comms::{CommsDevice, link_description, open_link, startup_failure_hint};
 use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
+use sedsprintf_rs_2026::TelemetryError;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
 use sedsprintf_rs_2026::timesync::{TimeSyncConfig, TimeSyncRole};
-use sedsprintf_rs_2026::TelemetryError;
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Connection, Row};
 use std::collections::HashMap;
@@ -94,8 +94,8 @@ async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()>
         );
         "#,
     )
-        .execute(db)
-        .await?;
+    .execute(db)
+    .await?;
 
     let session_columns = sqlx::query("PRAGMA table_info(auth_sessions);")
         .fetch_all(db)
@@ -325,8 +325,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     // Add values_json column for older DBs.
     let cols = sqlx::query("PRAGMA table_info(telemetry)")
@@ -367,8 +367,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     ensure_auth_sessions_table(&auth_db).await?;
 
@@ -381,8 +381,8 @@ async fn main() -> anyhow::Result<()> {
         );
         "#,
     )
-        .execute(&db)
-        .await?;
+    .execute(&db)
+    .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -412,7 +412,7 @@ async fn main() -> anyhow::Result<()> {
 
     let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
     let loadcell_calibration = loadcell::load_or_default();
-    let radio_links = radio_config::load_or_default();
+    let comms_links = comms_config::load_or_default();
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let users_path = manifest_dir.join("users").join("users.json");
     let legacy_users_path = manifest_dir.join("data").join("users.json");
@@ -453,6 +453,7 @@ async fn main() -> anyhow::Result<()> {
         action_policy: Arc::new(Mutex::new(default_action_policy())),
         action_policy_tx,
         last_command_ms: Arc::new(Mutex::new(HashMap::new())),
+        fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
         recent_telemetry_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
         latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),
@@ -519,35 +520,35 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Radios ---
-    println!("AV bay config: {}", link_description(&radio_links.av_bay));
+    println!("AV bay config: {}", link_description(&comms_links.av_bay));
     println!(
         "Fill box config: {}",
-        link_description(&radio_links.fill_box)
+        link_description(&comms_links.fill_box)
     );
 
-    let (rocket_radio, av_bay_radio_connected): (Arc<Mutex<Box<dyn RadioDevice>>>, bool) =
-        match open_link(&radio_links.av_bay) {
+    let (rocket_comms, av_bay_radio_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+        match open_link(&comms_links.av_bay) {
             Ok(r) => {
-                println!("Rocket radio online");
+                println!("Rocket comms online");
                 (Arc::new(Mutex::new(r)), true)
             }
             Err(e) => {
-                println!("Rocket radio missing, using DummyRadio: {}", e);
+                println!("Rocket comms missing, using DummyComms: {}", e);
                 eprintln!(
                     "AV bay link setup hint: {}",
-                    startup_failure_hint(&radio_links.av_bay)
+                    startup_failure_hint(&comms_links.av_bay)
                 );
                 #[cfg(feature = "testing")]
                 {
                     (
-                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))),
+                        Arc::new(Mutex::new(Box::new(DummyComms::new("Rocket Comms")))),
                         false,
                     )
                 }
                 #[cfg(all(not(feature = "testing"), feature = "hitl_mode"))]
                 {
                     (
-                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Rocket Radio")))),
+                        Arc::new(Mutex::new(Box::new(DummyComms::new("Rocket Comms")))),
                         false,
                     )
                 }
@@ -557,29 +558,29 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-    let (umbilical_radio, fill_radio_connected): (Arc<Mutex<Box<dyn RadioDevice>>>, bool) =
-        match open_link(&radio_links.fill_box) {
+    let (umbilical_comms, fill_radio_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+        match open_link(&comms_links.fill_box) {
             Ok(r) => {
-                println!("Umbilical radio online");
+                println!("Umbilical comms online");
                 (Arc::new(Mutex::new(r)), true)
             }
             Err(e) => {
-                println!("Umbilical radio missing, using DummyRadio: {}", e);
+                println!("Umbilical comms missing, using DummyComms: {}", e);
                 eprintln!(
                     "Fill box link setup hint: {}",
-                    startup_failure_hint(&radio_links.fill_box)
+                    startup_failure_hint(&comms_links.fill_box)
                 );
                 #[cfg(feature = "testing")]
                 {
                     (
-                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio")))),
+                        Arc::new(Mutex::new(Box::new(DummyComms::new("Umbilical Comms")))),
                         false,
                     )
                 }
                 #[cfg(all(not(feature = "testing"), feature = "hitl_mode"))]
                 {
                     (
-                        Arc::new(Mutex::new(Box::new(DummyRadio::new("Umbilical Radio")))),
+                        Arc::new(Mutex::new(Box::new(DummyComms::new("Umbilical Comms")))),
                         false,
                     )
                 }
@@ -603,11 +604,11 @@ async fn main() -> anyhow::Result<()> {
     let _ = state.topology_router.set(router.clone());
 
     let rocket_side = {
-        let rocket_radio = Arc::clone(&rocket_radio);
-        router.add_side_serialized("rocket_radio", move |pkt| {
-            let mut guard = rocket_radio
+        let rocket_comms = Arc::clone(&rocket_comms);
+        router.add_side_serialized("rocket_comms", move |pkt| {
+            let mut guard = rocket_comms
                 .lock()
-                .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
+                .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
             guard
                 .send_data(pkt)
                 .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
@@ -616,11 +617,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let umbilical_side = {
-        let umbilical_radio = Arc::clone(&umbilical_radio);
-        router.add_side_serialized("umbilical_radio", move |pkt| {
-            let mut guard = umbilical_radio
+        let umbilical_comms = Arc::clone(&umbilical_comms);
+        router.add_side_serialized("umbilical_comms", move |pkt| {
+            let mut guard = umbilical_comms
                 .lock()
-                .map_err(|_| TelemetryError::HandlerError("Radio mutex poisoned"))?;
+                .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
             guard
                 .send_data(pkt)
                 .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
@@ -628,13 +629,13 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    rocket_radio
+    rocket_comms
         .lock()
-        .expect("failed to get rocket radio lock")
+        .expect("failed to get rocket comms lock")
         .set_side_id(rocket_side);
-    umbilical_radio
+    umbilical_comms
         .lock()
-        .expect("failed to get umbilical radio lock")
+        .expect("failed to get umbilical comms lock")
         .set_side_id(umbilical_side);
 
     router.log_queue(DataType::MessageData, "hello".as_bytes())?;
@@ -646,7 +647,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tt = tokio::spawn(telemetry_task(
         state.clone(),
         router.clone(),
-        vec![rocket_radio, umbilical_radio],
+        vec![rocket_comms, umbilical_comms],
         cmd_rx,
         telemetry_shutdown_rx,
     ));

@@ -7,10 +7,10 @@ use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 
 use super::data_chart::{
-    charts_cache_get, charts_cache_get_channel_minmax, charts_cache_get_subset, charts_cache_get_subset_per_series,
-    sender_scoped_chart_key, series_color, ChartCanvas,
+    ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, charts_cache_get_subset,
+    charts_cache_get_subset_per_series, sender_scoped_chart_key, series_color,
 };
-use super::{latest_telemetry_row, latest_telemetry_value, TELEMETRY_RENDER_EPOCH};
+use super::{TELEMETRY_RENDER_EPOCH, latest_telemetry_row, latest_telemetry_value};
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
 const _ACTIVE_SUBTAB_STORAGE_KEY: &str = "gs26_active_data_subtab";
@@ -36,8 +36,8 @@ fn localstorage_set(key: &str, value: &str) {
 #[component]
 pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeConfig) -> Element {
     let _ = *TELEMETRY_RENDER_EPOCH.read();
-    let mut is_fullscreen = use_signal(|| false);
-    let mut show_chart = use_signal(|| true);
+    let is_fullscreen = use_signal(|| false);
+    let show_chart = use_signal(|| true);
     let active_subtab = use_signal(String::new);
 
     // -------- Restore + persist active tab --------
@@ -166,7 +166,6 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
         .and_then(|subtab| subtab.chart.as_ref().map(|c| c.enabled))
         .or_else(|| current_tab.and_then(|tab| tab.chart.as_ref().map(|c| c.enabled)))
         .unwrap_or(true);
-
     let latest_row = effective_source
         .as_ref()
         .and_then(|source| latest_telemetry_row(&source.data_type, source.sender_id.as_deref()));
@@ -205,26 +204,11 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
         .as_ref()
         .map(chart_key_for_source)
         .unwrap_or_else(|| current.clone());
-    // Cache fetch (NON-FULLSCREEN)
-    //
-    // IMPORTANT: We do NOT fetch fullscreen geometry here anymore.
-    // That avoids doing two cache builds every frame (w,h=360 and w,h=full),
-    // which can interact badly with "window span" behavior and costs extra CPU.
     let (_chunks, _y_min, _y_max, _span_min) =
         charts_cache_get(&chart_key, view_w as f32, view_h as f32);
     let (chan_min, chan_max) =
         charts_cache_get_channel_minmax(&chart_key, view_w as f32, view_h as f32);
     let chart_groups = effective_chart_groups(current_tab, selected_subtab.as_ref(), labels.len());
-    let x_pct = |x: f64, total: f64| format!("{:.4}%", (x / total) * 100.0);
-    let y_pct = |y: f64, total: f64| format!("{:.4}%", (y / total) * 100.0);
-    let on_toggle_fullscreen = move |_| {
-        let next = !*is_fullscreen.read();
-        is_fullscreen.set(next);
-    };
-    let on_toggle_chart = move |_| {
-        let next = !*show_chart.read();
-        show_chart.set(next);
-    };
     let summary_content = if !summary_items.is_empty() {
         rsx! {
             div {
@@ -336,92 +320,23 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                 {summary_content}
             }
 
-            // =========================
-            // Graph (non-fullscreen)
-            // =========================
             if is_graph_allowed {
-                div { style: "flex:0; width:100%; margin-top:6px;",
-                    div { style: "width:100%;",
-
-                        div { style: "display:flex; justify-content:flex-end; gap:8px; margin-bottom:6px;",
-                            button {
-                                style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
-                                onclick: on_toggle_chart,
-                                if *show_chart.read() { "Collapse" } else { "Expand" }
-                            }
-                            button {
-                                style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
-                                onclick: on_toggle_fullscreen,
-                                "Fullscreen"
-                            }
-                        }
-
-                        if *show_chart.read() {
-                            div { style: "display:flex; flex-direction:column; gap:12px;",
-                                for group in chart_groups.iter() {
-                                    {render_chart_group(
-                                        group,
-                                        &chart_key,
-                                        &labels,
-                                        view_w,
-                                        view_h,
-                                        left,
-                                        right,
-                                        pad_top,
-                                        pad_bottom,
-                                        inner_h,
-                                        &x_pct,
-                                        &y_pct,
-                                        &theme,
-                                    )}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // =========================
-        // Fullscreen
-        // =========================
-        if is_graph_allowed && *is_fullscreen.read() {
-            {
-                let (_chunks_full, _y_min2, _y_max2, _span_min2) =
-                    charts_cache_get(&chart_key, view_w as f32, view_h_full as f32);
-
-                rsx! {
-                    div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:{theme.app_background}; display:flex; flex-direction:column; gap:12px;",
-                        div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
-                            h2 { style: "margin:0; color:{theme.main_tab_accents.get(\"data\").map(String::as_str).unwrap_or(\"#f97316\")};", "Data Graph" }
-                            button {
-                                style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
-                                onclick: on_toggle_fullscreen,
-                                "Exit Fullscreen"
-                            }
-                        }
-
-                        div {
-                            style: "flex:1; min-height:0; width:100%; overflow-y:auto; display:flex; flex-direction:column; gap:12px;",
-                            for group in chart_groups.iter() {
-                                {render_chart_group(
-                                    group,
-                                    &chart_key,
-                                    &labels,
-                                    view_w,
-                                    view_h_full,
-                                    left,
-                                    right,
-                                    pad_top,
-                                    pad_bottom,
-                                    inner_h_full,
-                                    &x_pct,
-                                    &y_pct,
-                                    &theme,
-                                )}
-                            }
-                        }
-                    }
+                DataGraphPanel {
+                    theme: theme.clone(),
+                    chart_groups: chart_groups.clone(),
+                    chart_key: chart_key.clone(),
+                    labels: labels.clone(),
+                    view_w: view_w,
+                    view_h: view_h,
+                    view_h_full: view_h_full,
+                    left: left,
+                    right: right,
+                    pad_top: pad_top,
+                    pad_bottom: pad_bottom,
+                    inner_h: inner_h,
+                    inner_h_full: inner_h_full,
+                    is_fullscreen: is_fullscreen,
+                    show_chart: show_chart,
                 }
             }
         }
@@ -538,6 +453,123 @@ struct DataSource {
     sender_id: Option<String>,
 }
 
+#[component]
+#[allow(clippy::too_many_arguments)]
+fn DataGraphPanel(
+    theme: ThemeConfig,
+    chart_groups: Vec<DataChartGroup>,
+    chart_key: String,
+    labels: Vec<String>,
+    view_w: f64,
+    view_h: f64,
+    view_h_full: f64,
+    left: f64,
+    right: f64,
+    pad_top: f64,
+    pad_bottom: f64,
+    inner_h: f64,
+    inner_h_full: f64,
+    is_fullscreen: Signal<bool>,
+    show_chart: Signal<bool>,
+) -> Element {
+    let _ = *TELEMETRY_RENDER_EPOCH.read();
+    let x_pct = |x: f64, total: f64| format!("{:.4}%", (x / total) * 100.0);
+    let y_pct = |y: f64, total: f64| format!("{:.4}%", (y / total) * 100.0);
+    let on_toggle_fullscreen = move |_: Event<MouseData>| {
+        let next = !*is_fullscreen.read();
+        is_fullscreen.set(next);
+    };
+    let on_toggle_chart = move |_: Event<MouseData>| {
+        let next = !*show_chart.read();
+        show_chart.set(next);
+    };
+
+    let (_chunks, _y_min, _y_max, _span_min) =
+        charts_cache_get(&chart_key, view_w as f32, view_h as f32);
+
+    rsx! {
+        div { style: "flex:0; width:100%; margin-top:6px;",
+            div { style: "width:100%;",
+                div { style: "display:flex; justify-content:flex-end; gap:8px; margin-bottom:6px;",
+                    button {
+                        style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
+                        onclick: on_toggle_chart,
+                        if *show_chart.read() { "Collapse" } else { "Expand" }
+                    }
+                    button {
+                        style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
+                        onclick: on_toggle_fullscreen,
+                        "Fullscreen"
+                    }
+                }
+
+                if *show_chart.read() {
+                    div { style: "display:flex; flex-direction:column; gap:12px;",
+                        for group in chart_groups.iter() {
+                            {render_chart_group(
+                                group,
+                                &chart_key,
+                                &labels,
+                                view_w,
+                                view_h,
+                                left,
+                                right,
+                                pad_top,
+                                pad_bottom,
+                                inner_h,
+                                &x_pct,
+                                &y_pct,
+                                &theme,
+                            )}
+                        }
+                    }
+                }
+            }
+        }
+
+        if *is_fullscreen.read() {
+            {
+                let (_chunks_full, _y_min2, _y_max2, _span_min2) =
+                    charts_cache_get(&chart_key, view_w as f32, view_h_full as f32);
+
+                rsx! {
+                    div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:{theme.app_background}; display:flex; flex-direction:column; gap:12px;",
+                        div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
+                            h2 { style: "margin:0; color:{theme.main_tab_accents.get(\"data\").map(String::as_str).unwrap_or(\"#f97316\")};", "Data Graph" }
+                            button {
+                                style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
+                                onclick: on_toggle_fullscreen,
+                                "Exit Fullscreen"
+                            }
+                        }
+
+                        div {
+                            style: "flex:1; min-height:0; width:100%; overflow-y:auto; display:flex; flex-direction:column; gap:12px;",
+                            for group in chart_groups.iter() {
+                                {render_chart_group(
+                                    group,
+                                    &chart_key,
+                                    &labels,
+                                    view_w,
+                                    view_h_full,
+                                    left,
+                                    right,
+                                    pad_top,
+                                    pad_bottom,
+                                    inner_h_full,
+                                    &x_pct,
+                                    &y_pct,
+                                    &theme,
+                                )}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_chart_group(
     group: &DataChartGroup,
@@ -557,8 +589,12 @@ fn render_chart_group(
     let chart_key = chart_key_for_group(group, fallback_chart_key);
     let per_series_scale = matches!(group.scale_mode, Some(DataChartScaleMode::PerSeries));
     let (filtered_chunks, y_min, y_max, span_min, per_series_scales) = if per_series_scale {
-        let (chunks, scales, span_min) =
-            charts_cache_get_subset_per_series(&chart_key, &group.channels, view_w as f32, view_h as f32);
+        let (chunks, scales, span_min) = charts_cache_get_subset_per_series(
+            &chart_key,
+            &group.channels,
+            view_w as f32,
+            view_h as f32,
+        );
         let overall_min = scales
             .iter()
             .flatten()
@@ -571,8 +607,16 @@ fn render_chart_group(
             .fold(f32::NEG_INFINITY, f32::max);
         (
             chunks,
-            if overall_min.is_finite() { overall_min } else { 0.0 },
-            if overall_max.is_finite() { overall_max } else { 1.0 },
+            if overall_min.is_finite() {
+                overall_min
+            } else {
+                0.0
+            },
+            if overall_max.is_finite() {
+                overall_max
+            } else {
+                1.0
+            },
             span_min,
             scales,
         )

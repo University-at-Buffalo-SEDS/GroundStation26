@@ -4,9 +4,9 @@ mod telemetry_dashboard;
 
 use dioxus::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
-use dioxus_desktop::wry::http::{Request as HttpRequest, Response as HttpResponse};
-#[cfg(not(target_arch = "wasm32"))]
 use dioxus_desktop::RequestAsyncResponder;
+#[cfg(not(target_arch = "wasm32"))]
+use dioxus_desktop::wry::http::{Request as HttpRequest, Response as HttpResponse};
 #[cfg(not(target_arch = "wasm32"))]
 use image::ImageFormat;
 #[cfg(not(target_arch = "wasm32"))]
@@ -14,7 +14,7 @@ use std::backtrace::Backtrace;
 #[cfg(not(target_arch = "wasm32"))]
 use std::borrow::Cow;
 #[cfg(not(target_arch = "wasm32"))]
-use std::fs::{create_dir_all, OpenOptions};
+use std::fs::{OpenOptions, create_dir_all};
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
 #[cfg(not(target_arch = "wasm32"))]
