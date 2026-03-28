@@ -50,7 +50,7 @@ pub trait CommsDevice: Send {
 
 pub fn link_description(cfg: &CommsLinkConfig) -> String {
     match cfg {
-        CommsLinkConfig::UsbSerial { serial } => serial_description("usb_serial", serial),
+        CommsLinkConfig::Serial { serial } => serial_description("serial", serial),
         CommsLinkConfig::RaspberryPiGpioUart { serial } => {
             serial_description("raspberry_pi_gpio_uart", serial)
         }
@@ -63,7 +63,7 @@ pub fn link_description(cfg: &CommsLinkConfig) -> String {
 
 pub fn open_link(cfg: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> {
     match cfg {
-        CommsLinkConfig::UsbSerial { serial }
+        CommsLinkConfig::Serial { serial }
         | CommsLinkConfig::RaspberryPiGpioUart { serial }
         | CommsLinkConfig::CustomSerial { serial } => Ok(Box::new(UartComms::open(serial)?)),
         CommsLinkConfig::Spi { spi } => Ok(Box::new(SpiComms::open(spi)?)),
@@ -74,7 +74,7 @@ pub fn open_link(cfg: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> 
 
 pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
     match cfg {
-        CommsLinkConfig::UsbSerial { serial } | CommsLinkConfig::CustomSerial { serial } => {
+        CommsLinkConfig::Serial { serial } | CommsLinkConfig::CustomSerial { serial } => {
             format!(
                 "Check that {} exists, is the correct serial device, and is not already in use. Prefer a stable /dev/serial/by-id path when available.",
                 serial.port
