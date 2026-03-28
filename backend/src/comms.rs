@@ -324,18 +324,19 @@ impl I2cComms {
 
     #[cfg(target_os = "linux")]
     fn read_frame(&mut self) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
-        self.write_request_frame(&[])?;
-        let mut raw = [0u8; I2C_FRAME_SIZE];
-        let mut offset = 0usize;
-        while offset < I2C_FRAME_SIZE {
-            let read_len = (I2C_FRAME_SIZE - offset).min(I2C_CHUNK_SIZE);
-            self.transfer_read(&mut raw[offset..offset + read_len])?;
-            offset += read_len;
-            if offset < I2C_FRAME_SIZE {
-                std::thread::sleep(self.chunk_delay);
+        match self.read_staged_frame() {
+            Ok(frame) => Ok(frame),
+            Err(read_err) => {
+                // Some Pico firmware revisions expose staged responses on plain reads and
+                // NACK explicit empty-poll writes. Fall back to the poll-write path only if
+                // the direct read failed.
+                self.write_request_frame(&[]).and_then(|_| self.read_staged_frame()).map_err(
+                    |poll_err| {
+                        format!("i2c staged read failed: {read_err}; poll-read fallback failed: {poll_err}").into()
+                    },
+                )
             }
         }
-        parse_i2c_response(&raw)
     }
 
     #[cfg(target_os = "linux")]
@@ -357,6 +358,21 @@ impl I2cComms {
             }
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_staged_frame(&mut self) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
+        let mut raw = [0u8; I2C_FRAME_SIZE];
+        let mut offset = 0usize;
+        while offset < I2C_FRAME_SIZE {
+            let read_len = (I2C_FRAME_SIZE - offset).min(I2C_CHUNK_SIZE);
+            self.transfer_read(&mut raw[offset..offset + read_len])?;
+            offset += read_len;
+            if offset < I2C_FRAME_SIZE {
+                std::thread::sleep(self.chunk_delay);
+            }
+        }
+        parse_i2c_response(&raw)
     }
 
     #[cfg(target_os = "linux")]
@@ -407,7 +423,10 @@ impl CommsDevice for I2cComms {
             match self.read_frame() {
                 Ok(Some(payload)) => router.rx_serialized_queue_from_side(&payload, side_id),
                 Ok(None) => Ok(()),
-                Err(_) => Err(TelemetryError::HandlerError("i2c receive failed")),
+                Err(err) => {
+                    eprintln!("i2c receive failed: {err}");
+                    Err(TelemetryError::HandlerError("i2c receive failed"))
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
