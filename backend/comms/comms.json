@@ -3,7 +3,8 @@
   "av_bay": {
     "interface": "usbserial",
     "port": "/dev/ttyAMA0",
-    "baud_rate": 57600
+    "baud_rate": 57600,
+    "protocol": "raw_uart"
   },
   "fill_box": {
     "interface": "i2c",
