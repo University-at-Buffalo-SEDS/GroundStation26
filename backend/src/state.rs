@@ -136,6 +136,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Updates heartbeat tracking for a board after a packet arrives from that sender.
     pub fn mark_board_seen(&self, sender: &str, timestamp_ms: u64) {
         let Some(board) = Board::from_sender_id(sender) else {
             return;
@@ -144,6 +145,8 @@ impl AppState {
         if let Some(status) = map.get_mut(&board) {
             if let Some(last_seen) = status.last_seen_ms {
                 let gap_ms = timestamp_ms.saturating_sub(last_seen);
+                // Smooth the inter-packet gap so the UI can reason about board health
+                // without reacting to every short burst or stall.
                 let ema = status
                     .ema_gap_ms
                     .map(|prev| ((prev * 7) + gap_ms) / 8)
@@ -155,11 +158,13 @@ impl AppState {
         }
     }
 
+    /// Returns whether every known board has been observed at least once.
     pub fn all_boards_seen(&self) -> bool {
         let map = self.board_status.lock().unwrap();
         map.values().all(|status| status.last_seen_ms.is_some())
     }
 
+    /// Builds the board-health payload sent to the dashboard.
     pub fn board_status_snapshot(&self, now_ms: u64) -> BoardStatusMsg {
         let map = self.board_status.lock().unwrap();
         let mut boards = Vec::with_capacity(Board::ALL.len());
@@ -183,6 +188,7 @@ impl AppState {
         BoardStatusMsg { boards }
     }
 
+    /// Projects the current router and board state into the UI-friendly topology graph.
     pub fn network_topology_snapshot(&self, now_ms: u64) -> NetworkTopologyMsg {
         let simulated = cfg!(feature = "testing");
         let exported = self
@@ -458,37 +464,45 @@ impl AppState {
         }
     }
 
+    /// Stores the most recent commanded umbilical valve state by command id.
     pub fn set_umbilical_valve_state(&self, cmd_id: u8, on: bool) {
         let mut map = self.umbilical_valve_states.lock().unwrap();
         map.insert(cmd_id, on);
     }
 
+    /// Records when any telemetry packet last reached the backend router.
     pub fn mark_packet_received(&self, timestamp_ms: u64) {
         self.last_packet_rx_ms
             .store(timestamp_ms, Ordering::Relaxed);
     }
 
+    /// Returns the timestamp of the most recent telemetry packet seen by the backend.
     pub fn last_packet_received_ms(&self) -> u64 {
         self.last_packet_rx_ms.load(Ordering::Relaxed)
     }
 
+    /// Looks up the cached state for a specific umbilical valve command id.
     pub fn get_umbilical_valve_state(&self, cmd_id: u8) -> Option<bool> {
         let map = self.umbilical_valve_states.lock().unwrap();
         map.get(&cmd_id).copied()
     }
 
+    /// Subscribes a task to the app-wide shutdown broadcast channel.
     pub fn shutdown_subscribe(&self) -> broadcast::Receiver<()> {
         self.shutdown_tx.subscribe()
     }
 
+    /// Broadcasts a shutdown request to all long-running tasks.
     pub fn request_shutdown(&self) {
         let _ = self.shutdown_tx.send(());
     }
 
+    /// Increments the count of in-flight async database writes.
     pub fn begin_db_write(&self) {
         self.pending_db_writes.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Updates local flight state, notifies subscribers, and persists the transition asynchronously.
     pub fn set_local_flight_state(&self, next_state: FlightState) {
         let mut slot = self.state.lock().unwrap();
         if *slot == next_state {
@@ -496,6 +510,7 @@ impl AppState {
         }
         *slot = next_state;
         drop(slot);
+        // Keep the simulator in lock-step with the real backend state machine.
         crate::flight_sim::sync_local_flight_state(next_state);
 
         let _ = self.state_tx.send(FlightStateMsg { state: next_state });
@@ -514,16 +529,19 @@ impl AppState {
         });
     }
 
+    /// Decrements the in-flight DB write count and wakes any shutdown waiters when it reaches zero.
     pub fn end_db_write(&self) {
         if self.pending_db_writes.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.db_write_notify.notify_waiters();
         }
     }
 
+    /// Returns the number of async database writes still in progress.
     pub fn pending_db_write_count(&self) -> usize {
         self.pending_db_writes.load(Ordering::SeqCst)
     }
 
+    /// Waits until all tracked async database writes have completed or the timeout expires.
     pub async fn wait_for_db_writes(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -546,18 +564,22 @@ impl AppState {
         }
     }
 
+    /// Clones the current notification list for HTTP or WebSocket consumers.
     pub fn notifications_snapshot(&self) -> Vec<PersistentNotification> {
         self.notifications.lock().unwrap().clone()
     }
 
+    /// Adds a persistent operator notification and returns its assigned id.
     pub fn add_notification<S: Into<String>>(&self, message: S) -> u64 {
         self.add_notification_with_persistence(message, true)
     }
 
+    /// Adds a transient operator notification and returns its assigned id.
     pub fn add_temporary_notification<S: Into<String>>(&self, message: S) -> u64 {
         self.add_notification_with_persistence(message, false)
     }
 
+    /// Adds a notification while explicitly controlling whether it persists across reloads.
     pub fn add_notification_with_persistence<S: Into<String>>(
         &self,
         message: S,
@@ -566,6 +588,7 @@ impl AppState {
         self.add_notification_action(message, persistent, None, None)
     }
 
+    /// Inserts a notification if an identical message is not already active.
     pub fn add_notification_action<S: Into<String>>(
         &self,
         message: S,
@@ -593,6 +616,7 @@ impl AppState {
         id
     }
 
+    /// Removes a notification by id and broadcasts the updated list.
     pub fn dismiss_notification(&self, id: u64) -> bool {
         let mut notifications = self.notifications.lock().unwrap();
         let before = notifications.len();
@@ -606,15 +630,18 @@ impl AppState {
         true
     }
 
+    /// Returns the latest action-policy snapshot used by the dashboard and command gate.
     pub fn action_policy_snapshot(&self) -> ActionPolicyMsg {
         self.action_policy.lock().unwrap().clone()
     }
 
+    /// Records an operator request to continue the fill sequence.
     pub fn request_fill_sequence_continue(&self) {
         self.fill_sequence_continue_requests
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Consumes any queued fill-sequence continue requests and reports whether one existed.
     pub fn consume_fill_sequence_continue_requests(&self) -> bool {
         let prev = self
             .fill_sequence_continue_requests
@@ -622,6 +649,7 @@ impl AppState {
         prev > 0
     }
 
+    /// Replaces the current action policy and broadcasts it if it changed.
     pub fn set_action_policy(&self, policy: ActionPolicyMsg) {
         let mut slot = self.action_policy.lock().unwrap();
         if *slot == policy {
@@ -632,6 +660,7 @@ impl AppState {
         let _ = self.action_policy_tx.send(policy);
     }
 
+    /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
         if matches!(
             cmd,
@@ -655,19 +684,23 @@ impl AppState {
             .unwrap_or(false)
     }
 
+    /// Records when a command was last accepted by the backend.
     pub fn record_command_accepted(&self, cmd: &TelemetryCommand, ts_ms: u64) {
         let mut map = self.last_command_ms.lock().unwrap();
         map.insert(command_name(cmd).to_string(), ts_ms);
     }
 
+    /// Looks up the last accepted timestamp for a command name.
     pub fn last_command_timestamp_ms(&self, cmd_name: &str) -> Option<u64> {
         self.last_command_ms.lock().unwrap().get(cmd_name).copied()
     }
 
+    /// Appends a telemetry row to the in-memory reseed cache and prunes old entries.
     pub fn cache_recent_telemetry(&self, row: TelemetryRow) {
         const CACHE_WINDOW_MS: i64 = 20 * 60 * 1000;
         const CACHE_MAX_ROWS: usize = 250_000;
 
+        // The cache is a bridge for startup/reconnect reseeds, not a second source of truth.
         let mut q = self.recent_telemetry_cache.lock().unwrap();
         q.push_back(row);
 
@@ -686,6 +719,7 @@ impl AppState {
         }
     }
 
+    /// Returns a point-in-time clone of the recent telemetry cache.
     pub fn recent_telemetry_snapshot(&self) -> Vec<TelemetryRow> {
         self.recent_telemetry_cache
             .lock()
@@ -695,6 +729,7 @@ impl AppState {
             .collect()
     }
 
+    /// Appends an alert to the in-memory reseed cache and prunes old entries.
     pub fn cache_recent_alert(&self, alert: AlertDto) {
         const CACHE_WINDOW_MS: i64 = 20 * 60 * 1000;
         const CACHE_MAX_ROWS: usize = 4_096;
@@ -717,6 +752,7 @@ impl AppState {
         }
     }
 
+    /// Returns a point-in-time clone of the recent alert cache.
     pub fn recent_alerts_snapshot(&self) -> Vec<AlertDto> {
         self.recent_alerts_cache
             .lock()

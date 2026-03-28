@@ -35,6 +35,8 @@ const I2C_CHUNK_SIZE: usize = 32;
 #[cfg(target_os = "linux")]
 const I2C_REQ_DATA_MAGIC: u8 = 0xA5;
 #[cfg(target_os = "linux")]
+const I2C_REQ_POLL_FRAME_LEN: usize = 2;
+#[cfg(target_os = "linux")]
 const I2C_RESP_DATA_MAGIC: u8 = 0x5A;
 
 // ======================================================================
@@ -322,6 +324,7 @@ impl I2cComms {
 
     #[cfg(target_os = "linux")]
     fn read_frame(&mut self) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
+        self.write_request_frame(&[])?;
         let mut raw = [0u8; I2C_FRAME_SIZE];
         let mut offset = 0usize;
         while offset < I2C_FRAME_SIZE {
@@ -337,11 +340,15 @@ impl I2cComms {
 
     #[cfg(target_os = "linux")]
     fn write_frame(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let payload = &payload[..payload.len().min(MAX_PACKET_SIZE)];
-        let mut frame = Vec::with_capacity(payload.len() + 2);
-        frame.push(I2C_REQ_DATA_MAGIC);
-        frame.push(payload.len() as u8);
-        frame.extend_from_slice(payload);
+        self.write_request_frame(payload)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_request_frame(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let frame = build_i2c_request_frame(payload);
 
         for (idx, chunk) in frame.chunks(I2C_CHUNK_SIZE).enumerate() {
             self.transfer_write(chunk)?;
@@ -927,6 +934,35 @@ fn parse_i2c_response(
     }
 
     Ok(Some(raw[2..2 + len].to_vec()))
+}
+
+#[cfg(target_os = "linux")]
+fn build_i2c_request_frame(payload: &[u8]) -> Vec<u8> {
+    let payload = &payload[..payload.len().min(MAX_PACKET_SIZE)];
+    let mut frame = Vec::with_capacity(payload.len().max(I2C_REQ_POLL_FRAME_LEN));
+    frame.push(I2C_REQ_DATA_MAGIC);
+    frame.push(payload.len() as u8);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_i2c_request_frame_uses_empty_data_request_for_polling() {
+        assert_eq!(build_i2c_request_frame(&[]), vec![I2C_REQ_DATA_MAGIC, 0]);
+    }
+
+    #[test]
+    fn build_i2c_request_frame_limits_payload_to_max_packet_size() {
+        let payload = vec![0x42; MAX_PACKET_SIZE + 5];
+        let frame = build_i2c_request_frame(&payload);
+        assert_eq!(frame.len(), MAX_PACKET_SIZE + 2);
+        assert_eq!(frame[0], I2C_REQ_DATA_MAGIC);
+        assert_eq!(frame[1], MAX_PACKET_SIZE as u8);
+    }
 }
 
 #[cfg(target_os = "linux")]

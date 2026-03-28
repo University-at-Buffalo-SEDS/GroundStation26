@@ -80,6 +80,7 @@ Build output notes:
 - Frontend/backend API contract: `docs/frontend/api.md`
 - Frontend architecture: `docs/frontend/architecture.md`
 - Backend architecture: `docs/backend/architecture.md`
+- Backend I2C transport: `docs/backend/i2c.md`
 - Shared contracts: `docs/shared/contracts.md`
 - System overview: `docs/system/overview.md`
 

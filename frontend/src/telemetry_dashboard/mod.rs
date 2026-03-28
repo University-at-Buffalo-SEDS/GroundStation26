@@ -93,12 +93,14 @@ struct DashboardLife {
 }
 
 impl DashboardLife {
+    /// Creates a dashboard lifetime marker that is already considered torn down.
     fn _new_dead() -> Self {
         Self {
             alive: Arc::new(AtomicBool::new(false)),
             r#gen: 0,
         }
     }
+    /// Creates a dashboard lifetime marker for a freshly mounted dashboard.
     fn new_alive() -> Self {
         Self {
             alive: Arc::new(AtomicBool::new(true)),
@@ -110,11 +112,13 @@ impl DashboardLife {
 static DASHBOARD_LIFE: GlobalSignal<DashboardLife> = Signal::global(DashboardLife::new_alive);
 
 #[inline]
+/// Returns the current shared dashboard-alive flag.
 fn dashboard_alive() -> Arc<AtomicBool> {
     DASHBOARD_LIFE.read().alive.clone()
 }
 
 #[inline]
+/// Replaces the dashboard lifetime flag and bumps the mount generation.
 fn _set_dashboard_alive(alive: bool) {
     let alive = Arc::new(AtomicBool::new(alive));
     *DASHBOARD_LIFE.write() = DashboardLife {
@@ -124,6 +128,7 @@ fn _set_dashboard_alive(alive: bool) {
 }
 
 #[inline]
+/// Returns the current dashboard mount generation.
 fn dashboard_gen() -> u64 {
     DASHBOARD_LIFE.read().r#gen
 }
@@ -134,6 +139,7 @@ fn dashboard_gen() -> u64 {
 //  - native: JSON file in app data dir
 // ----------------------------
 mod persist {
+    /// Reads a persisted string value from browser storage or the native JSON store.
     pub fn get_string(key: &str) -> Option<String> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -149,6 +155,7 @@ mod persist {
         }
     }
 
+    /// Persists a string value across app launches.
     pub fn set_string(key: &str, value: &str) {
         #[cfg(target_arch = "wasm32")]
         {
@@ -166,6 +173,7 @@ mod persist {
         }
     }
 
+    /// Removes a persisted key when the current platform supports it.
     pub fn _remove(key: &str) {
         #[cfg(target_arch = "wasm32")]
         {
@@ -183,6 +191,7 @@ mod persist {
         }
     }
 
+    /// Reads a stored string value or falls back to the provided default.
     pub fn get_or(key: &str, default: &str) -> String {
         get_string(key).unwrap_or_else(|| default.to_string())
     }
@@ -192,6 +201,7 @@ mod persist {
         use std::collections::HashMap;
         use std::io;
 
+        /// Resolves the default native storage root when no platform-specific path is available.
         fn fallback_storage_base_dir() -> std::path::PathBuf {
             dirs::data_local_dir()
                 .or_else(dirs::data_dir)
@@ -199,6 +209,7 @@ mod persist {
         }
 
         #[cfg(target_os = "android")]
+        /// Resolves the Android app-private storage root through JNI.
         fn android_storage_base_dir() -> Option<std::path::PathBuf> {
             use jni::objects::{JObject, JString};
             use jni::{JavaVM, jni_sig, jni_str};
@@ -233,6 +244,7 @@ mod persist {
             .ok()
         }
 
+        /// Picks the best native storage root for the JSON persistence file.
         fn storage_base_dir() -> std::path::PathBuf {
             #[cfg(target_os = "android")]
             {
@@ -244,6 +256,7 @@ mod persist {
             fallback_storage_base_dir()
         }
 
+        /// Returns the full path to the native JSON persistence file.
         fn storage_path() -> std::path::PathBuf {
             let mut base = storage_base_dir();
             base.push("gs26");
@@ -251,6 +264,7 @@ mod persist {
             base
         }
 
+        /// Loads the native persistence map from disk.
         fn load_map() -> Result<HashMap<String, String>, io::Error> {
             let path = storage_path();
             let bytes = match std::fs::read(&path) {
@@ -263,6 +277,7 @@ mod persist {
             Ok(map)
         }
 
+        /// Saves the native persistence map back to disk.
         fn save_map(map: &HashMap<String, String>) -> Result<(), io::Error> {
             let path = storage_path();
             if let Some(parent) = path.parent() {
@@ -273,11 +288,13 @@ mod persist {
             Ok(())
         }
 
+        /// Reads a string key from the native persistence file.
         pub fn get_string(key: &str) -> Result<Option<String>, io::Error> {
             let map = load_map()?;
             Ok(map.get(key).cloned())
         }
 
+        /// Writes a string key into the native persistence file.
         pub fn set_string(key: &str, value: &str) -> Result<(), io::Error> {
             let mut map = load_map()?;
             map.insert(key.to_string(), value.to_string());
@@ -285,6 +302,7 @@ mod persist {
             Ok(())
         }
 
+        /// Removes a key from the native persistence file.
         pub fn _remove(key: &str) -> Result<(), io::Error> {
             let mut map = load_map()?;
             map.remove(key);
@@ -345,6 +363,7 @@ pub struct ActionPolicyMsg {
 }
 
 impl ActionPolicyMsg {
+    /// Returns the startup action policy before the backend publishes a real one.
     fn default_locked() -> Self {
         Self {
             key_enabled: false,
@@ -354,6 +373,7 @@ impl ActionPolicyMsg {
     }
 }
 
+/// Provides the serde default for software action buttons.
 fn default_software_buttons_enabled() -> bool {
     true
 }
@@ -371,6 +391,7 @@ pub struct PersistentNotification {
     pub action_cmd: Option<String>,
 }
 
+/// Provides the serde default for notification persistence.
 fn default_notification_persistent() -> bool {
     true
 }
@@ -393,11 +414,13 @@ struct NetworkTimeSync {
 }
 
 #[cfg(target_arch = "wasm32")]
+/// Returns a monotonic-ish timestamp source for rate calculations in the browser.
 fn monotonic_now_ms() -> f64 {
     js_sys::Date::now()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Returns a monotonic timestamp source for rate calculations on native builds.
 fn monotonic_now_ms() -> f64 {
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -407,6 +430,7 @@ fn monotonic_now_ms() -> f64 {
 }
 
 #[inline]
+/// Projects the last synced network time forward using monotonic elapsed time.
 fn compensated_network_time_ms(sync: NetworkTimeSync) -> i64 {
     let elapsed_ms = (monotonic_now_ms() - sync.received_mono_ms)
         .max(0.0)
@@ -440,6 +464,7 @@ pub(crate) fn format_timestamp_ms_clock(ms_epoch: i64) -> String {
     format!("{}:{cs:02} {}", dt.format("%I:%M:%S"), dt.format("%p"))
 }
 
+/// Formats the network-synchronized wall clock for dashboard display.
 fn format_network_time(ms_epoch: i64) -> String {
     format_timestamp_ms_clock(ms_epoch)
 }
@@ -536,6 +561,7 @@ impl Default for FrontendNetworkMetrics {
     }
 }
 
+/// Resets the frontend-side WebSocket and HTTP metrics to a clean state.
 fn reset_frontend_network_metrics_state() {
     if let Ok(mut metrics) = FRONTEND_NETWORK_METRICS_STATE.lock() {
         *metrics = FrontendNetworkMetrics {
@@ -545,6 +571,7 @@ fn reset_frontend_network_metrics_state() {
     }
 }
 
+/// Returns a snapshot of the frontend network metrics without exposing the mutex guard.
 fn frontend_network_metrics_snapshot() -> FrontendNetworkMetrics {
     FRONTEND_NETWORK_METRICS_STATE
         .lock()
@@ -552,6 +579,7 @@ fn frontend_network_metrics_snapshot() -> FrontendNetworkMetrics {
         .unwrap_or_default()
 }
 
+/// Redacts authentication tokens from a WebSocket URL before it is shown in the UI.
 fn redact_ws_url_for_display(ws_url: &str) -> String {
     if let Some((prefix, query)) = ws_url.split_once('?') {
         let redacted_query = query
@@ -574,6 +602,7 @@ fn redact_ws_url_for_display(ws_url: &str) -> String {
     }
 }
 
+/// Records a WebSocket connection or disconnection transition for the dashboard diagnostics.
 fn note_ws_connection_state(connected: bool, ws_url: String, reason: Option<String>, epoch: u64) {
     if connected {
         DASHBOARD_HAS_CONNECTED.store(true, Ordering::Relaxed);
@@ -595,6 +624,7 @@ fn note_ws_connection_state(connected: bool, ws_url: String, reason: Option<Stri
     }
 }
 
+/// Updates the rolling HTTP round-trip measurements displayed in the dashboard.
 fn note_http_rtt(rtt_ms: f64) {
     if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
         next.http_rtt_ms = Some(rtt_ms);
@@ -606,6 +636,7 @@ fn note_http_rtt(rtt_ms: f64) {
     }
 }
 
+/// Tracks incoming WebSocket message volume and updates rate calculations.
 fn note_incoming_ws_message(raw_bytes: usize) {
     if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
         let now_mono = monotonic_now_ms();
@@ -635,6 +666,7 @@ fn note_incoming_ws_message(raw_bytes: usize) {
     }
 }
 
+/// Tracks telemetry row throughput separately from raw WebSocket message volume.
 fn note_incoming_telemetry_rows(telemetry_rows: usize, telemetry_batch_count: usize) {
     if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
         next.telemetry_rows_total = next
@@ -649,6 +681,7 @@ fn note_incoming_telemetry_rows(telemetry_rows: usize, telemetry_batch_count: us
     }
 }
 
+/// Returns the current wall-clock time in milliseconds since the Unix epoch.
 fn current_wallclock_ms() -> i64 {
     #[cfg(target_arch = "wasm32")]
     {
@@ -689,6 +722,7 @@ struct LatestTelemetryKey {
 }
 
 impl LatestTelemetryKey {
+    /// Builds the cache key used for latest-row tracking.
     fn new(data_type: &str, sender_id: &str) -> Self {
         Self {
             data_type: data_type.to_string(),
@@ -703,20 +737,24 @@ struct UiTelemetryStore {
 }
 
 impl UiTelemetryStore {
+    /// Clears all compacted UI telemetry rows.
     fn clear(&mut self) {
         self.rows.clear();
     }
 
+    /// Replaces the compacted UI store with a fresh telemetry snapshot.
     fn replace_from_rows(&mut self, rows: &[TelemetryRow]) {
         self.rows.clear();
         self.apply_rows(rows.iter().cloned());
     }
 
+    /// Inserts rows into the compacted UI store, keeping only the newest row per bucket.
     fn apply_rows<I>(&mut self, rows: I)
     where
         I: IntoIterator<Item = TelemetryRow>,
     {
         for row in rows {
+            // The UI only needs one representative row per bucket/sender/type tuple.
             let key = UiRowKey {
                 bucket: row.timestamp_ms.div_euclid(UI_ROW_BUCKET_MS),
                 data_type: row.data_type.clone(),
@@ -728,6 +766,7 @@ impl UiTelemetryStore {
         self.prune_history();
     }
 
+    /// Drops buckets that are older than the retained history window.
     fn prune_history(&mut self) {
         let Some((&newest_bucket, _)) = self.rows.last_key_value().map(|(k, v)| (&k.bucket, v))
         else {
@@ -738,6 +777,7 @@ impl UiTelemetryStore {
         self.rows.retain(|key, _| key.bucket >= min_bucket);
     }
 
+    /// Returns the compacted UI store as a sorted vector.
     fn snapshot(&self) -> Vec<TelemetryRow> {
         self.rows.values().cloned().collect()
     }
@@ -750,6 +790,7 @@ static LATEST_TELEMETRY: Lazy<Mutex<HashMap<LatestTelemetryKey, TelemetryRow>>> 
 static LATEST_TELEMETRY_BY_TYPE: Lazy<Mutex<HashMap<String, TelemetryRow>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Sorts telemetry rows into a stable UI presentation order.
 fn sort_rows(rows: &mut [TelemetryRow]) {
     rows.sort_by(|a, b| {
         a.timestamp_ms
@@ -759,6 +800,7 @@ fn sort_rows(rows: &mut [TelemetryRow]) {
     });
 }
 
+/// Trims a telemetry vector down to the retained history window.
 fn prune_history(rows: &mut Vec<TelemetryRow>) {
     if let Some(last) = rows.last() {
         let cutoff = last.timestamp_ms - HISTORY_MS;
@@ -769,6 +811,7 @@ fn prune_history(rows: &mut Vec<TelemetryRow>) {
     }
 }
 
+/// Compacts raw telemetry rows down to the newest row per UI bucket.
 fn compact_rows_for_ui(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
     let mut by_key: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
     for row in rows {
@@ -782,6 +825,7 @@ fn compact_rows_for_ui(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
     out
 }
 
+/// Rebuilds the latest-row indexes from a full telemetry snapshot.
 fn reset_latest_telemetry(rows: &[TelemetryRow]) {
     if let Ok(mut latest) = LATEST_TELEMETRY.lock()
         && let Ok(mut latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock()
@@ -794,6 +838,7 @@ fn reset_latest_telemetry(rows: &[TelemetryRow]) {
     }
 }
 
+/// Inserts a single row into the latest-row indexes.
 fn update_latest_telemetry(row: &TelemetryRow) {
     if let Ok(mut latest) = LATEST_TELEMETRY.lock()
         && let Ok(mut latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock()
@@ -802,6 +847,7 @@ fn update_latest_telemetry(row: &TelemetryRow) {
     }
 }
 
+/// Applies latest-row replacement rules while both latest-row maps are already locked.
 fn update_latest_telemetry_locked(
     latest: &mut HashMap<LatestTelemetryKey, TelemetryRow>,
     latest_by_type: &mut HashMap<String, TelemetryRow>,
@@ -823,6 +869,7 @@ fn update_latest_telemetry_locked(
     }
 }
 
+/// Returns the latest telemetry row for a given data type and optional sender.
 pub(crate) fn latest_telemetry_row(
     data_type: &str,
     sender_id: Option<&str>,
@@ -847,6 +894,7 @@ pub(crate) fn latest_telemetry_row(
     }
 }
 
+/// Returns a single channel from the latest telemetry row for the given key.
 pub(crate) fn latest_telemetry_value(
     data_type: &str,
     sender_id: Option<&str>,
@@ -856,6 +904,7 @@ pub(crate) fn latest_telemetry_value(
         .and_then(|row| row.values.get(index).copied().flatten())
 }
 
+/// Clears all telemetry runtime buffers used by the dashboard.
 fn clear_ui_telemetry_store() {
     if let Ok(mut store) = UI_TELEMETRY_STORE.lock() {
         store.clear();
@@ -870,6 +919,7 @@ fn clear_ui_telemetry_store() {
     *epoch = epoch.wrapping_add(1);
 }
 
+/// Returns the compacted UI telemetry store as a snapshot vector.
 pub(crate) fn ui_telemetry_rows_snapshot() -> Vec<TelemetryRow> {
     if let Ok(store) = UI_TELEMETRY_STORE.lock() {
         store.snapshot()
@@ -905,6 +955,7 @@ static UI_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 // Force re-seed of graphs/history from backend.
 static SEED_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 
+/// Normalizes a stored base URL down to `scheme://host[:port]`.
 fn normalize_base_url(mut url: String) -> String {
     if let Some(idx) = url.find('#') {
         url.truncate(idx);
@@ -919,6 +970,7 @@ fn normalize_base_url(mut url: String) -> String {
 }
 
 #[cfg(target_arch = "wasm32")]
+/// Builds an absolute HTTP path for the web build using the active backend base URL.
 pub fn abs_http(path: &str) -> String {
     let base = UrlConfig::base_http();
     let path = if path.starts_with('/') {
@@ -934,6 +986,7 @@ pub fn abs_http(path: &str) -> String {
     }
 }
 
+/// Returns the tile URL template appropriate for the current platform.
 pub fn map_tiles_url() -> String {
     #[cfg(target_os = "windows")]
     {
@@ -969,6 +1022,7 @@ pub fn map_tiles_url() -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Reads the persisted backend base URL for native blocking I/O paths.
 pub(crate) fn persisted_base_http_for_native_io() -> String {
     persist::get_string(BASE_URL_STORAGE_KEY)
         .map(normalize_base_url)
@@ -977,12 +1031,14 @@ pub(crate) fn persisted_base_http_for_native_io() -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Reads the persisted TLS-skip flag for the supplied native base URL.
 pub(crate) fn persisted_skip_tls_for_base_for_native_io(base: &str) -> bool {
     persist::get_string(&_tls_skip_key(base))
         .map(|v| v == "true")
         .unwrap_or(false)
 }
 
+/// Forces all WebSocket-backed tasks to tear down and reconnect on the next render tick.
 fn bump_ws_epoch() {
     *WS_SENDER.write() = None;
 
@@ -996,10 +1052,12 @@ fn bump_ws_epoch() {
     *WS_EPOCH.write() += 1;
 }
 
+/// Requests a fresh telemetry reseed from the backend.
 fn bump_seed_epoch() {
     *SEED_EPOCH.write() += 1;
 }
 // tab <-> string
+/// Converts a dashboard tab enum into its persisted string id.
 fn _main_tab_to_str(tab: MainTab) -> &'static str {
     match tab {
         MainTab::State => "state",
@@ -1016,6 +1074,7 @@ fn _main_tab_to_str(tab: MainTab) -> &'static str {
     }
 }
 
+/// Returns the default label for a dashboard tab when the layout config does not override it.
 fn _default_main_tab_label(tab: MainTab) -> &'static str {
     match tab {
         MainTab::State => "Flight",
@@ -1032,6 +1091,7 @@ fn _default_main_tab_label(tab: MainTab) -> &'static str {
     }
 }
 
+/// Resolves the visible label for a dashboard tab from the loaded layout config.
 fn _main_tab_label(layout: &LayoutConfig, tab: MainTab) -> String {
     layout
         .branding
@@ -1041,6 +1101,7 @@ fn _main_tab_label(layout: &LayoutConfig, tab: MainTab) -> String {
         .unwrap_or_else(|| _default_main_tab_label(tab).to_string())
 }
 
+/// Resolves the title shown at the top of the dashboard.
 fn _dashboard_title(layout: &LayoutConfig) -> String {
     layout
         .branding
@@ -1049,6 +1110,7 @@ fn _dashboard_title(layout: &LayoutConfig) -> String {
         .or_else(|| layout.branding.app_name.clone())
         .unwrap_or_else(|| "Telemetry Dashboard".to_string())
 }
+/// Converts a persisted tab id back into the corresponding enum.
 fn _main_tab_from_str(s: &str) -> MainTab {
     match s {
         "state" => MainTab::State,
@@ -1066,6 +1128,7 @@ fn _main_tab_from_str(s: &str) -> MainTab {
     }
 }
 
+/// Returns whether a tab is enabled by the loaded layout config.
 fn _layout_main_tab_enabled(layout: &LayoutConfig, tab: MainTab) -> bool {
     let listed = layout
         .main_tabs
@@ -1074,6 +1137,7 @@ fn _layout_main_tab_enabled(layout: &LayoutConfig, tab: MainTab) -> bool {
     listed && (tab != MainTab::NetworkTopology || layout.network_tab.enabled)
 }
 
+/// Returns whether the actions tab has at least one command the current session may send.
 fn _actions_tab_has_visible_actions(layout: &LayoutConfig, abort_only_mode: bool) -> bool {
     let _ = abort_only_mode;
     layout
@@ -1083,6 +1147,7 @@ fn _actions_tab_has_visible_actions(layout: &LayoutConfig, abort_only_mode: bool
         .any(|action| auth::can_send_command(action.cmd.as_str()))
 }
 
+/// Computes the final visible tab list after applying layout and auth filtering.
 fn _configured_main_tabs(layout: &LayoutConfig, abort_only_mode: bool) -> Vec<MainTab> {
     let mut tabs = Vec::new();
     for id in &layout.main_tabs {
@@ -1105,18 +1170,21 @@ fn _configured_main_tabs(layout: &LayoutConfig, abort_only_mode: bool) -> Vec<Ma
 pub struct UrlConfig;
 
 impl UrlConfig {
+    /// Normalizes and persists the backend base URL selected by the operator.
     pub fn set_base_url_and_persist(url: String) {
         let clean = normalize_base_url(url);
         *BASE_URL.write() = clean.clone();
         persist::set_string(BASE_URL_STORAGE_KEY, &clean);
     }
 
+    /// Returns the stored backend base URL when one exists.
     pub fn _stored_base_url() -> Option<String> {
         persist::get_string(BASE_URL_STORAGE_KEY)
             .map(normalize_base_url)
             .filter(|s| !s.trim().is_empty())
     }
 
+    /// Returns the current HTTP base URL, including platform-specific defaults.
     pub fn base_http() -> String {
         // load from storage key if present
         let base = persist::get_string(BASE_URL_STORAGE_KEY)
@@ -1170,6 +1238,7 @@ impl UrlConfig {
         }
     }
 
+    /// Persists the TLS validation override for a specific backend base URL.
     pub fn _set_skip_tls_verify_for_base(base: &str, value: bool) {
         let clean = normalize_base_url(base.to_string());
         if clean.is_empty() {
@@ -1179,6 +1248,7 @@ impl UrlConfig {
         persist::set_string(&key, if value { "true" } else { "false" });
     }
 
+    /// Returns whether TLS validation is disabled for a specific backend base URL.
     pub fn _skip_tls_verify_for_base(base: &str) -> bool {
         let clean = normalize_base_url(base.to_string());
         if clean.is_empty() {
@@ -1190,17 +1260,20 @@ impl UrlConfig {
             .unwrap_or(false)
     }
 
+    /// Persists the TLS validation override for the currently selected backend base URL.
     pub fn _set_skip_tls_verify(value: bool) {
         let base = UrlConfig::base_http();
         UrlConfig::_set_skip_tls_verify_for_base(&base, value);
     }
 
+    /// Returns whether TLS validation is disabled for the currently selected backend base URL.
     pub fn _skip_tls_verify() -> bool {
         let base = UrlConfig::base_http();
         UrlConfig::_skip_tls_verify_for_base(&base)
     }
 }
 
+/// Builds the persistence key used for the per-backend TLS validation override.
 fn _tls_skip_key(base: &str) -> String {
     let mut cleaned = String::with_capacity(base.len());
     for ch in base.chars() {
@@ -1215,6 +1288,7 @@ fn _tls_skip_key(base: &str) -> String {
 
 static BASE_URL: GlobalSignal<String> = Signal::global(String::new);
 
+/// Restarts the WebSocket connection and triggers a fresh telemetry reseed.
 fn reconnect_and_reload_ui() {
     // Always restart websockets/tasks
     bump_ws_epoch();
@@ -1224,15 +1298,18 @@ fn reconnect_and_reload_ui() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Returns whether the dashboard has ever reached a live backend connection in this process.
 pub fn dashboard_has_prior_backend_connection() -> bool {
     DASHBOARD_HAS_CONNECTED.load(Ordering::Relaxed)
 }
 
+/// Restarts backend-backed frontend state after login or logout changes.
 pub fn reconnect_and_reseed_after_auth_change() {
     reconnect_and_reload_ui();
 }
 
 #[cfg(target_arch = "wasm32")]
+/// Returns whether the browser should keep dashboard background tasks running on this route.
 fn web_dashboard_runtime_allowed() -> bool {
     web_sys::window()
         .and_then(|window| window.location().pathname().ok())
@@ -1241,10 +1318,12 @@ fn web_dashboard_runtime_allowed() -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Native builds always allow the dashboard runtime.
 fn web_dashboard_runtime_allowed() -> bool {
     true
 }
 
+/// Clears runtime telemetry buffers before a reconnect or reseed.
 fn clear_telemetry_runtime_buffers() {
     if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
         q.clear();
@@ -1263,6 +1342,7 @@ struct WsSender {
 }
 
 impl WsSender {
+    /// Sends a command over the current WebSocket transport.
     fn send_cmd(&self, cmd: &str) -> Result<(), String> {
         let msg = format!(r#"{{"cmd":"{}"}}"#, cmd);
 
@@ -1291,6 +1371,7 @@ static WS_SENDER: GlobalSignal<Option<WsSender>> = Signal::global(|| None::<WsSe
 // INNER component is keyed for native “reload UI” without tripping outer Drop.
 // ============================================================================
 #[component]
+/// Outer dashboard component that owns the real mount lifetime.
 pub fn TelemetryDashboard() -> Element {
     // Create once per real mount
     *DASHBOARD_LIFE.write() = DashboardLife::new_alive();
@@ -1307,6 +1388,7 @@ pub fn TelemetryDashboard() -> Element {
 
 // ---------- INNER dashboard (this is what we remount on native reload) ----------
 #[component]
+/// Inner dashboard component that owns the live UI state and background tasks.
 fn TelemetryDashboardInner() -> Element {
     // Always valid; becomes “real” once outer publishes it.
     let alive = dashboard_alive();

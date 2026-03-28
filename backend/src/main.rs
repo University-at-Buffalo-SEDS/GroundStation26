@@ -51,6 +51,7 @@ use tokio::time::Duration;
 use crate::web::emit_error;
 use tokio::sync::{broadcast, mpsc};
 
+/// Reads a bounded `usize` environment variable and falls back to `default`.
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -59,6 +60,7 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .clamp(min, max)
 }
 
+/// Reads a bounded `i64` environment variable and falls back to `default`.
 fn env_i64(name: &str, default: i64, min: i64, max: i64) -> i64 {
     std::env::var(name)
         .ok()
@@ -67,6 +69,7 @@ fn env_i64(name: &str, default: i64, min: i64, max: i64) -> i64 {
         .clamp(min, max)
 }
 
+/// Creates the SQLite file on disk when it does not exist and returns a stable path string.
 fn ensure_sqlite_db_file(path: &Path) -> anyhow::Result<String> {
     if !path.exists() {
         fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
@@ -79,6 +82,7 @@ fn ensure_sqlite_db_file(path: &Path) -> anyhow::Result<String> {
         .to_string())
 }
 
+/// Creates or upgrades the auth session table used by token-based login.
 async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         r#"
@@ -115,6 +119,7 @@ async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Applies runtime SQLite pragmas that trade startup defaults for better write throughput.
 async fn apply_sqlite_pragmas(db: &sqlx::SqlitePool) {
     let synchronous = std::env::var("GS_SQLITE_SYNCHRONOUS")
         .unwrap_or_else(|_| "NORMAL".to_string())
@@ -145,7 +150,9 @@ async fn apply_sqlite_pragmas(db: &sqlx::SqlitePool) {
     }
 }
 
+/// Runs the shutdown-time checkpoint and optimization pragmas against an open pool.
 async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
+    /// Retries shutdown pragmas because the pool can still be draining background writers.
     async fn exec_pragma_with_retry(
         db: &sqlx::SqlitePool,
         stmt: &str,
@@ -182,6 +189,7 @@ async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
     }
 }
 
+/// Removes leftover WAL and journal sidecar files after SQLite has been finalized.
 async fn remove_sqlite_sidecars(db_path: &str) {
     let retries = env_usize("GS_SQLITE_SIDECAR_DELETE_RETRIES", 12, 1, 120);
     let retry_delay_ms = env_i64("GS_SQLITE_SIDECAR_DELETE_DELAY_MS", 100, 10, 2_000) as u64;
@@ -203,6 +211,7 @@ async fn remove_sqlite_sidecars(db_path: &str) {
     }
 }
 
+/// Lists SQLite sidecar files that still exist beside the database.
 fn sqlite_sidecars_present(db_path: &str) -> Vec<String> {
     [".wal", ".shm", "-wal", "-shm", "-journal", ".journal"]
         .into_iter()
@@ -211,6 +220,7 @@ fn sqlite_sidecars_present(db_path: &str) -> Vec<String> {
         .collect()
 }
 
+/// Reopens the database once the pool is dropped to force a final checkpoint back to DELETE mode.
 async fn finalize_sqlite_after_pool_close(db_path: &str) {
     let url = format!("sqlite://{db_path}");
     let mut conn = match SqliteConnection::connect(&url).await {
@@ -256,6 +266,7 @@ async fn finalize_sqlite_after_pool_close(db_path: &str) {
     }
 }
 
+/// Waits for process termination signals and then fan-outs the app-wide shutdown request.
 async fn shutdown_signal(state: Arc<AppState>) {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {

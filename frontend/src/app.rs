@@ -26,6 +26,7 @@ mod keep_awake {
             fn gs26_set_idle_timer_disabled(disabled: c_int);
         }
 
+        /// Toggles the iOS idle-timer suppression used while the app is active.
         pub fn set_enabled(enabled: bool) {
             // iOS API is "idle timer disabled", so enabled=true -> disabled=1
             unsafe { gs26_set_idle_timer_disabled(if enabled { 1 } else { 0 }) };
@@ -34,11 +35,13 @@ mod keep_awake {
 
     #[cfg(target_os = "android")]
     mod android {
+        /// Forwards the keep-awake request into the Android glue code.
         pub fn set_enabled(enabled: bool) {
             crate::telemetry_dashboard::gps_android::set_keep_screen_on(enabled);
         }
     }
 
+    /// Enables or disables keep-awake on native platforms that support it.
     pub fn set_enabled(enabled: bool) {
         #[cfg(target_os = "ios")]
         ios::set_enabled(enabled);
@@ -55,6 +58,7 @@ mod keep_awake {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Returns whether every HTTP probe and the WebSocket handshake succeeded.
 fn all_tests_passed(checks: &[RouteCheck], ws_probe: &Option<Result<String, String>>) -> bool {
     let routes_ok = checks.iter().all(|c| c.ok);
     let ws_ok = matches!(ws_probe, Some(Ok(_)));
@@ -120,21 +124,25 @@ pub enum Route {
 }
 
 #[cfg(target_arch = "wasm32")]
+/// Redirects the web build's root route to the dashboard entrypoint.
 fn connect_route() -> Route {
     Route::Root {}
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Returns the native-only connection setup route.
 fn connect_route() -> Route {
     Route::Connect {}
 }
 
 #[cfg(target_arch = "wasm32")]
+/// Returns the authenticated landing route for the web build.
 fn authenticated_route() -> Route {
     Route::Root {}
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Returns the authenticated landing route for native builds.
 fn authenticated_route() -> Route {
     Route::Dashboard {}
 }
@@ -151,6 +159,7 @@ mod objc_poke {
         fn gs26_localnet_poke_url(url: *const c_char);
     }
 
+    /// Touches a LAN URL through native code so Apple platforms can surface local-network prompts.
     pub fn poke_url(url: &str) {
         if let Ok(c) = CString::new(url) {
             unsafe { gs26_localnet_poke_url(c.as_ptr()) };
@@ -163,6 +172,7 @@ mod objc_poke {
     not(any(target_os = "macos", target_os = "ios"))
 ))]
 mod objc_poke {
+    /// No-op placeholder for platforms that do not need Objective-C local-network pokes.
     pub fn poke_url(_url: &str) {}
 }
 
@@ -174,6 +184,7 @@ mod persist {
     use super::_CONNECT_SHOWN_KEY;
     use std::io;
 
+    /// Resolves the app-specific fallback directory for persisted native state.
     fn fallback_storage_dir() -> std::path::PathBuf {
         dirs::data_local_dir()
             .or_else(dirs::data_dir)
@@ -182,6 +193,7 @@ mod persist {
     }
 
     #[cfg(target_os = "android")]
+    /// Resolves the Android app-private files directory when the JNI context is available.
     fn android_storage_dir() -> Option<std::path::PathBuf> {
         use jni::objects::{JObject, JString};
         use jni::{JavaVM, jni_sig, jni_str};
@@ -216,6 +228,7 @@ mod persist {
         .ok()
     }
 
+    /// Chooses the best writable native storage directory for simple key-value persistence.
     fn storage_dir() -> std::path::PathBuf {
         #[cfg(target_os = "android")]
         {
@@ -227,10 +240,12 @@ mod persist {
         fallback_storage_dir()
     }
 
+    /// Builds the on-disk path for a persisted key.
     fn path_for(key: &str) -> std::path::PathBuf {
         storage_dir().join(format!("{key}.txt"))
     }
 
+    /// Reads and trims a persisted string value.
     fn _read_key(key: &str) -> Option<String> {
         let path = path_for(key);
         std::fs::read_to_string(path)
@@ -238,12 +253,14 @@ mod persist {
             .map(|s| s.trim().to_string())
     }
 
+    /// Writes a string key to disk, creating the storage directory on demand.
     fn write_key(key: &str, v: &str) -> Result<(), io::Error> {
         let dir = storage_dir();
         std::fs::create_dir_all(&dir)?;
         std::fs::write(path_for(key), v.as_bytes())
     }
 
+    /// Persists that the native connect screen has already been shown.
     pub fn write_connect_shown(v: bool) -> Result<(), io::Error> {
         write_key(_CONNECT_SHOWN_KEY, if v { "true" } else { "false" })
     }
@@ -261,6 +278,7 @@ struct ParsedBaseUrl {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Normalizes a base URL down to `scheme://host[:port]`.
 fn normalize_base_url(mut base: String) -> String {
     // strip fragment
     if let Some(i) = base.find('#') {
@@ -279,6 +297,7 @@ fn normalize_base_url(mut base: String) -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Joins a normalized base URL with an absolute path segment.
 fn join_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     let path = if path.starts_with('/') { path } else { "/" };
@@ -286,6 +305,7 @@ fn join_url(base: &str, path: &str) -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Parses a backend base URL into the pieces needed for HTTP and WebSocket probes.
 fn parse_base_url(url: &str) -> Result<ParsedBaseUrl, String> {
     let u = url.trim();
     let (scheme, rest) = if let Some(x) = u.strip_prefix("http://") {
@@ -313,6 +333,7 @@ fn parse_base_url(url: &str) -> Result<ParsedBaseUrl, String> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Converts an HTTP base URL into a WebSocket origin.
 fn ws_origin_for_base(parsed: &ParsedBaseUrl) -> String {
     let ws_scheme = if parsed.scheme == "https" {
         "wss"
@@ -323,6 +344,7 @@ fn ws_origin_for_base(parsed: &ParsedBaseUrl) -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Truncates a string for UI display while keeping line endings predictable.
 fn snip(mut s: String, max: usize) -> String {
     s = s.replace('\r', "");
     if s.len() > max {
@@ -348,6 +370,7 @@ struct RouteCheck {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Evaluates whether a route returned the status code expected by the connection tester.
 fn status_ok_for_path(path: &str, status: u16) -> (bool, &'static str) {
     match path {
         "/api/recent" | "/api/alerts" | "/api/layout" | "/api/map_config" | "/flightstate"
@@ -365,6 +388,7 @@ fn status_ok_for_path(path: &str, status: u16) -> (bool, &'static str) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Rewrites a `reqwest` error into a short UI-friendly category string.
 fn classify_reqwest_error(e: &reqwest::Error) -> String {
     if e.is_timeout() {
         return "timeout".into();
@@ -392,6 +416,7 @@ fn classify_reqwest_error(e: &reqwest::Error) -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Builds the short-timeout client used by the native connection test screen.
 fn build_probe_client(skip_tls_verify: bool) -> Result<reqwest::Client, String> {
     // Fast but still reliable:
     // - connect_timeout: how long we wait for TCP/TLS connect
@@ -405,6 +430,7 @@ fn build_probe_client(skip_tls_verify: bool) -> Result<reqwest::Client, String> 
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Executes a single HTTP probe and captures a small body snippet for diagnostics.
 async fn http_probe_with_client(
     client: &reqwest::Client,
     url: String,
@@ -436,6 +462,7 @@ async fn http_probe_with_client(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Probes the main backend HTTP routes concurrently against the configured host.
 async fn test_routes_host_only(base: &str, skip_tls_verify: bool) -> Vec<RouteCheck> {
     use futures_util::future::join_all;
 
@@ -506,6 +533,7 @@ async fn test_routes_host_only(base: &str, skip_tls_verify: bool) -> Vec<RouteCh
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Performs a real WebSocket handshake with a hard timeout for the connection test UI.
 async fn ws_connect_probe(parsed: &ParsedBaseUrl, skip_tls_verify: bool) -> Result<String, String> {
     use tokio::time::timeout;
 
@@ -553,6 +581,7 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl, skip_tls_verify: bool) -> Resu
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Formats the combined HTTP and WebSocket probe results for display.
 fn format_route_report_host_only(
     original_base: &str,
     parsed: &ParsedBaseUrl,
@@ -625,6 +654,7 @@ fn format_route_report_host_only(
 // App
 // -------------------------
 #[component]
+/// Top-level app component that installs global CSS and mounts the router.
 pub fn App() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -649,6 +679,7 @@ pub fn App() -> Element {
 }
 
 #[component]
+/// Root route that redirects native builds to either connect or dashboard.
 pub fn Root() -> Element {
     #[cfg(target_arch = "wasm32")]
     {
@@ -672,6 +703,7 @@ pub fn Root() -> Element {
 }
 
 #[component]
+/// Shared login card used by both the full login page and the overlay flow.
 fn LoginCard(
     title: String,
     subtitle: String,

@@ -44,6 +44,7 @@ enum TileDbMode {
     Deduped,
 }
 
+/// Extracts the numeric telemetry payload from either the newer JSON column or the legacy blob.
 fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
     let values_from_json = row
         .try_get::<Option<String>, _>("values_json")
@@ -73,16 +74,19 @@ fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
     Vec::new()
 }
 
+/// Returns the flattened channel value at `idx` when present.
 fn value_at(values: &[Option<f32>], idx: usize) -> Option<f32> {
     values.get(idx).copied().flatten()
 }
 
+/// Buckets recent telemetry so the reseed endpoint returns a bounded UI-friendly payload.
 fn compact_recent_rows(rows: Vec<TelemetryRow>, cutoff: i64) -> Vec<TelemetryRow> {
     let mut by_bucket: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
     for row in rows {
         if row.timestamp_ms < cutoff {
             continue;
         }
+        // Keep the newest row for each sender/data-type bucket so reconnect reseeds stay compact.
         let bucket = row.timestamp_ms.div_euclid(RECENT_BUCKET_MS);
         by_bucket.insert((row.data_type.clone(), row.sender_id.clone(), bucket), row);
     }
@@ -162,6 +166,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Pulls a bearer token out of the Authorization header.
 fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
@@ -171,6 +176,7 @@ fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// Converts auth-domain failures into the matching HTTP response.
 fn auth_failure_response(err: AuthFailure) -> axum::response::Response {
     match err {
         AuthFailure::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg).into_response(),
@@ -179,6 +185,7 @@ fn auth_failure_response(err: AuthFailure) -> axum::response::Response {
     }
 }
 
+/// Authorizes an HTTP request against the required permission set.
 async fn authorize_headers(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -191,6 +198,7 @@ async fn authorize_headers(
         .map_err(auth_failure_response)
 }
 
+/// Creates a new authenticated session from username/password credentials.
 async fn login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginRequest>,
@@ -201,6 +209,7 @@ async fn login(
     }
 }
 
+/// Returns whether the current request is associated with a valid session.
 async fn get_session_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -215,6 +224,7 @@ async fn get_session_status(
     }
 }
 
+/// Revokes the current session token when one is present.
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     let Some(token) = bearer_token_from_headers(&headers) else {
         return StatusCode::NO_CONTENT.into_response();
@@ -300,6 +310,7 @@ pub struct NetworkTimeMsg {
     pub timestamp_ms: i64,
 }
 
+/// Returns the most recent decoded valve-state row.
 async fn get_valve_state(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -341,6 +352,7 @@ async fn get_valve_state(
     Json(valve_state).into_response()
 }
 
+/// Returns the latest GPS fix stored in telemetry history.
 async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
@@ -373,6 +385,7 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     Json(GpsResponse { rocket }).into_response()
 }
 
+/// Serves the current frontend layout configuration.
 async fn get_layout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
@@ -383,6 +396,7 @@ async fn get_layout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
     }
 }
 
+/// Returns the UI layout metadata for the loadcell calibration tab.
 async fn get_calibration_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -403,6 +417,7 @@ struct MapConfigDto {
     tracked_asset_label: String,
 }
 
+/// Returns the map configuration derived from bundled map assets.
 async fn get_map_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -449,6 +464,7 @@ struct RefitLoadcellReq {
     mode: String,
 }
 
+/// Returns the in-memory loadcell calibration file.
 async fn get_loadcell_calibration(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -459,6 +475,7 @@ async fn get_loadcell_calibration(
     Json(state.loadcell_calibration.lock().unwrap().clone()).into_response()
 }
 
+/// Replaces the loadcell calibration file in memory and on disk.
 async fn set_loadcell_calibration(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -477,6 +494,7 @@ async fn set_loadcell_calibration(
     Json(cfg).into_response()
 }
 
+/// Captures a zero point for the selected loadcell sensor.
 async fn capture_loadcell_zero(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -496,6 +514,7 @@ async fn capture_loadcell_zero(
     Json(updated).into_response()
 }
 
+/// Captures a known-mass span point for the selected loadcell sensor.
 async fn capture_loadcell_span(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -515,6 +534,7 @@ async fn capture_loadcell_span(
     Json(updated).into_response()
 }
 
+/// Recomputes the selected calibration channel using the requested fit mode.
 async fn refit_loadcell_channel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -544,6 +564,7 @@ async fn refit_loadcell_channel(
     Json(updated).into_response()
 }
 
+/// Serves a map tile or a synthesized ancestor fallback when the exact tile is missing.
 async fn get_tile_jpg(Path((z, x, y_raw)): Path<(u32, u32, String)>) -> impl IntoResponse {
     let y_trimmed = y_raw.trim_end_matches(".jpg");
     let y: u32 = match y_trimmed.parse() {
@@ -558,10 +579,12 @@ async fn get_tile_jpg(Path((z, x, y_raw)): Path<(u32, u32, String)>) -> impl Int
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// Builds the legacy on-disk tile path for a map tile.
 fn tile_path(z: u32, x: u32, y: u32) -> PathBuf {
     format!("./backend/data/maps/{DEFAULT_MAP_REGION}/tiles/{z}/{x}/{y}.jpg").into()
 }
 
+/// Lazily opens the read-only SQLite tile bundle when one exists.
 async fn tile_db_pool() -> Option<sqlx::SqlitePool> {
     TILE_DB_POOL
         .get_or_init(|| async {
@@ -590,6 +613,7 @@ async fn tile_db_pool() -> Option<sqlx::SqlitePool> {
         .clone()
 }
 
+/// Detects whether the tile bundle uses the legacy inline-image schema or the deduped blob schema.
 async fn tile_db_mode() -> TileDbMode {
     *TILE_DB_MODE
         .get_or_init(|| async {
@@ -616,6 +640,7 @@ async fn tile_db_mode() -> TileDbMode {
         .await
 }
 
+/// Loads the exact tile from the bundle first and falls back to the legacy filesystem layout.
 async fn read_exact_tile(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
     if let Some(pool) = tile_db_pool().await {
         match tile_db_mode().await {
@@ -667,6 +692,7 @@ async fn read_exact_tile(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
     }
 }
 
+/// Walks up the tile pyramid until it can synthesize a usable child tile.
 async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
     if let Some(bytes) = read_exact_tile(z, x, y).await {
         return Some(bytes);
@@ -694,6 +720,7 @@ async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
     None
 }
 
+/// Crops and rescales an ancestor tile to approximate a missing descendant tile.
 fn synthesize_zoom_tile_from_ancestor(
     ancestor_jpg: &[u8],
     ancestor_z: u32,
@@ -745,6 +772,7 @@ fn synthesize_zoom_tile_from_ancestor(
     Ok(out)
 }
 
+/// Returns the recent telemetry window, preferring the in-memory cache to cover DB write lag.
 async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
@@ -762,6 +790,7 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
         }
 
         let db_end_ms = oldest_cache_ts.unwrap_or(now_ms).saturating_sub(1);
+        // Merge the persisted prefix with the live cache so reconnects can see just-written data.
         let mut merged_rows = if db_end_ms >= cutoff {
             load_recent_rows_from_db(&state, cutoff, db_end_ms).await
         } else {
@@ -792,6 +821,7 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
     .into_response()
 }
 
+/// Loads telemetry rows for a bounded time range directly from SQLite.
 async fn load_recent_rows_from_db(
     state: &Arc<AppState>,
     start_ms: i64,
@@ -832,6 +862,7 @@ async fn load_recent_rows_from_db(
     out
 }
 
+/// Serves the app icon and caches it after the first disk read.
 async fn get_favicon() -> impl IntoResponse {
     // Load the favicon into memory on first request, reuse later
     let bytes = FAVICON_DATA
@@ -848,6 +879,7 @@ async fn get_favicon() -> impl IntoResponse {
     // Return as an image/png response
     ([(header::CONTENT_TYPE, "image/png")], bytes)
 }
+/// Returns the latest persisted flight-state enum value.
 async fn get_flight_state(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -869,6 +901,7 @@ async fn get_flight_state(
     Json(flight_state).into_response()
 }
 
+/// Returns the backend's current network-synchronized timestamp.
 async fn get_network_time(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -882,6 +915,7 @@ async fn get_network_time(
     .into_response()
 }
 
+/// Returns the current list of operator notifications.
 async fn get_notifications(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -892,6 +926,7 @@ async fn get_notifications(
     Json(state.notifications_snapshot()).into_response()
 }
 
+/// Dismisses a persistent notification by id.
 async fn dismiss_notification(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -907,6 +942,7 @@ async fn dismiss_notification(
     }
 }
 
+/// Returns the current command gating policy for the actions UI.
 async fn get_action_policy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -917,6 +953,7 @@ async fn get_action_policy(
     Json(state.action_policy_snapshot()).into_response()
 }
 
+/// Returns the synthesized network topology graph shown in the dashboard.
 async fn get_network_topology(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -928,6 +965,7 @@ async fn get_network_topology(
         .into_response()
 }
 
+/// Validates and forwards a frontend command into the backend command channel.
 async fn send_command(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -963,6 +1001,7 @@ async fn send_command(
     (StatusCode::OK, "ok")
 }
 
+/// Query parameters accepted by the authenticated WebSocket endpoint.
 #[derive(Deserialize, Default)]
 struct WsAuthQuery {
     token: Option<String>,
