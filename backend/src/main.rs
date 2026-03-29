@@ -36,7 +36,7 @@ use sedsprintf_rs_2026::TelemetryError;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
-use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
+use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode, RouterSideOptions};
 use sedsprintf_rs_2026::timesync::{TimeSyncConfig, TimeSyncRole};
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Connection, Row};
@@ -616,7 +616,11 @@ async fn main() -> anyhow::Result<()> {
 
     let rocket_side = {
         let rocket_comms = Arc::clone(&rocket_comms);
-        router.add_side_serialized("rocket_comms", move |pkt| {
+        let opts = RouterSideOptions {
+            reliable_enabled: !matches!(comms_links.av_bay, crate::comms_config::CommsLinkConfig::I2c { .. }),
+            link_local_enabled: false,
+        };
+        router.add_side_serialized_with_options("rocket_comms", move |pkt| {
             let mut guard = rocket_comms
                 .lock()
                 .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
@@ -624,12 +628,16 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("rocket_comms send failed: {err}");
             }
             Ok(())
-        })
+        }, opts)
     };
 
     let umbilical_side = {
         let umbilical_comms = Arc::clone(&umbilical_comms);
-        router.add_side_serialized("umbilical_comms", move |pkt| {
+        let opts = RouterSideOptions {
+            reliable_enabled: !matches!(comms_links.fill_box, crate::comms_config::CommsLinkConfig::I2c { .. }),
+            link_local_enabled: false,
+        };
+        router.add_side_serialized_with_options("umbilical_comms", move |pkt| {
             let mut guard = umbilical_comms
                 .lock()
                 .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
@@ -637,7 +645,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("umbilical_comms send failed: {err}");
             }
             Ok(())
-        })
+        }, opts)
     };
 
     rocket_comms
