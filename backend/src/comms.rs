@@ -768,7 +768,13 @@ impl I2cComms {
         let Ok(assembly) = assembly else {
             return Ok(None);
         };
-        let completed = assembly.push(&slot)?;
+        let completed = match assembly.push(&slot) {
+            Ok(completed) => completed,
+            Err(_) => {
+                self.rx_assembly = None;
+                return Ok(None);
+            }
+        };
         if completed.is_some() {
             self.rx_assembly = None;
         }
@@ -852,10 +858,10 @@ impl CommsDevice for I2cComms {
                             maybe_log_i2c_decoded(&payload);
                             if kind != I2C_KIND_DATA {
                                 if kind == I2C_KIND_ERROR {
-                                    eprintln!(
-                                        "i2c error packet: {}",
-                                        String::from_utf8_lossy(&payload)
-                                    );
+                                    let msg = String::from_utf8_lossy(&payload);
+                                    if msg != "error invalid i2c slot" || i2c_debug_enabled() {
+                                        eprintln!("i2c error packet: {msg}");
+                                    }
                                 } else {
                                     eprintln!("i2c non-data packet kind {kind} ignored");
                                 }
