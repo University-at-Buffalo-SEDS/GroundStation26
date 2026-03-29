@@ -374,11 +374,10 @@ fn log_accepted_serialized_packet(link: &str, payload: &[u8]) {
                 envelope.endpoints
             );
         }
-        Err(err) => {
+        Err(_) => {
             eprintln!(
-                "{link} accepted undecoded payload: len={} err={} data={}",
+                "{link} accepted undecoded payload: len={} data={}",
                 payload.len(),
-                err,
                 hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
             );
         }
