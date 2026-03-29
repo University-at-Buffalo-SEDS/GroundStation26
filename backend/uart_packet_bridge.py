@@ -47,12 +47,10 @@ def _enum_value(enum_cls, *names: str) -> int:
 GPS_TYPE = _enum_value(DT, "GPS_DATA", "GpsData")
 HEARTBEAT_TYPE = _enum_value(DT, "HEARTBEAT", "Heartbeat")
 MESSAGE_TYPE = _enum_value(DT, "MESSAGE_DATA", "MessageData", "GENERIC_ERROR", "GenericError")
-DEFAULT_ENDPOINT = _enum_value(
+GROUNDSTATION_ENDPOINT = _enum_value(
     EP,
     "GROUND_STATION",
     "GroundStation",
-    "SD_CARD",
-    "SdCard",
 )
 FLIGHT_STATE_ENDPOINT = _enum_value(
     EP,
@@ -64,6 +62,14 @@ SD_CARD_ENDPOINT = _enum_value(
     "SD_CARD",
     "SdCard",
 )
+DISCOVERY_ENDPOINT = _enum_value(
+    EP,
+    "DISCOVERY",
+    "Discovery",
+)
+DEFAULT_ENDPOINTS = [GROUNDSTATION_ENDPOINT]
+RX_SCAN_MAX = 4096
+DISCOVERY_PUMP_PERIOD_S = 0.05
 
 BASE_LAT = 31.7619
 BASE_LON = -106.4850
@@ -86,6 +92,7 @@ class UartPacketBridge:
         self.startup_delay = startup_delay
         self.stop_event = threading.Event()
         self.serial_lock = threading.Lock()
+        self.router_lock = threading.Lock()
         self.rx_buffer = bytearray()
         self.gps_index = 0
         self.send_warning_next = False
@@ -100,25 +107,46 @@ class UartPacketBridge:
         self.router = seds.Router(
             now_ms=_now_ms,
             handlers=[
+                (GROUNDSTATION_ENDPOINT, self._handle_groundstation_packet, None),
                 (FLIGHT_STATE_ENDPOINT, self._handle_flight_state_packet, None),
                 (SD_CARD_ENDPOINT, self._handle_sd_card_packet, None),
+                (DISCOVERY_ENDPOINT, self._handle_discovery_packet, None),
             ],
             mode=RM.Sink,
         )
         self.router_side_id = self.router.add_side_serialized("UART", self._tx_serialized)
+        self.discovery_supported = hasattr(self.router, "poll_discovery")
+        self.discovery_announce_supported = hasattr(self.router, "announce_discovery")
+        if self.discovery_announce_supported:
+            with self.router_lock:
+                self.router.announce_discovery()
+                self.router.process_all_queues()
 
     def _write_packet(self, packet: seds.Packet) -> None:
-        self.router.transmit_message_queue(packet)
-        self.router.process_all_queues()
+        with self.router_lock:
+            self.router.transmit_message_queue(packet)
+            self.router.process_all_queues()
 
     def _tx_serialized(self, wire: bytes) -> None:
         with self.serial_lock:
             self.ser.write(wire)
             self.ser.flush()
+        print(f"[TX Wire] {len(wire)} bytes: {_hex(wire)}")
 
     def _dispatch_received_packet(self, frame: bytes) -> None:
-        self.router.receive_serialized_queue_from_side(self.router_side_id, frame)
-        self.router.process_all_queues()
+        with self.router_lock:
+            self.router.receive_serialized_queue_from_side(self.router_side_id, frame)
+            self.router.process_all_queues()
+
+    def _pump_router(self) -> None:
+        with self.router_lock:
+            if self.discovery_supported:
+                self.router.poll_discovery()
+            self.router.process_all_queues_with_timeout(20)
+
+    def _handle_groundstation_packet(self, pkt: seds.Packet) -> None:
+        print("[RX GroundStation]")
+        print(pkt)
 
     def _handle_flight_state_packet(self, pkt: seds.Packet) -> None:
         print("[RX FlightState]")
@@ -134,11 +162,33 @@ class UartPacketBridge:
         print("[RX SdCard]")
         print(pkt)
 
+    def _handle_discovery_packet(self, pkt: seds.Packet) -> None:
+        print("[RX Discovery]")
+        print(pkt)
+
     def _print_observed_packet(self, pkt: seds.Packet) -> None:
-        pkt_type = getattr(pkt, "ty", None)
-        if pkt_type == HEARTBEAT_TYPE:
+        print("[RX Packet]")
+        print(pkt)
+        if getattr(pkt, "ty", None) == HEARTBEAT_TYPE:
             print("[RX Heartbeat]")
-            print(pkt)
+
+    def _extract_packet_frame(self) -> bytes | None:
+        scan_len = min(len(self.rx_buffer), RX_SCAN_MAX)
+        for start in range(scan_len):
+            for end in range(start + 1, scan_len + 1):
+                candidate = bytes(self.rx_buffer[start:end])
+                try:
+                    pkt = seds.deserialize_packet_py(candidate)
+                except Exception:
+                    continue
+                wire_size = int(pkt.wire_size())
+                if wire_size != len(candidate):
+                    continue
+                del self.rx_buffer[:end]
+                return candidate
+        if len(self.rx_buffer) > RX_SCAN_MAX:
+            del self.rx_buffer[: len(self.rx_buffer) - RX_SCAN_MAX]
+        return None
 
     def _build_gps_packet(self) -> seds.Packet:
         offset = self.gps_index * 0.0001
@@ -152,7 +202,7 @@ class UartPacketBridge:
         return seds.make_packet(
             ty=GPS_TYPE,
             sender=self.sender,
-            endpoints=[DEFAULT_ENDPOINT],
+            endpoints=DEFAULT_ENDPOINTS,
             timestamp_ms=_now_ms(),
             payload=payload,
         )
@@ -162,7 +212,7 @@ class UartPacketBridge:
         return seds.make_packet(
             ty=MESSAGE_TYPE,
             sender=self.sender,
-            endpoints=[DEFAULT_ENDPOINT],
+            endpoints=DEFAULT_ENDPOINTS,
             timestamp_ms=_now_ms(),
             payload=warning,
         )
@@ -186,16 +236,14 @@ class UartPacketBridge:
         self._write_packet(packet)
 
     def _drain_rx_buffer(self) -> None:
-        try:
-            pkt = seds.deserialize_packet_py(bytes(self.rx_buffer))
-        except Exception:
-            return
-
-        frame = bytes(pkt.serialize())
-        self.rx_buffer.clear()
-        print(f"[RX Wire] {len(frame)} bytes: {_hex(frame)}")
-        self._print_observed_packet(pkt)
-        self._dispatch_received_packet(frame)
+        while True:
+            frame = self._extract_packet_frame()
+            if frame is None:
+                return
+            pkt = seds.deserialize_packet_py(frame)
+            print(f"[RX Wire] {len(frame)} bytes: {_hex(frame)}")
+            self._print_observed_packet(pkt)
+            self._dispatch_received_packet(frame)
 
     def rx_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -211,6 +259,16 @@ class UartPacketBridge:
 
             self.rx_buffer.extend(chunk)
             self._drain_rx_buffer()
+
+    def router_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self._pump_router()
+            except Exception as e:
+                print(f"Router pump failed: {e}", file=sys.stderr)
+                self.stop_event.set()
+                return
+            self.stop_event.wait(DISCOVERY_PUMP_PERIOD_S)
 
     def tx_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -250,8 +308,10 @@ class UartPacketBridge:
             time.sleep(self.startup_delay)
         rx_thread = threading.Thread(target=self.rx_loop, name="uart-rx", daemon=True)
         tx_thread = threading.Thread(target=self.tx_loop, name="uart-tx", daemon=True)
+        router_thread = threading.Thread(target=self.router_loop, name="router-pump", daemon=True)
         rx_thread.start()
         tx_thread.start()
+        router_thread.start()
 
         try:
             self.key_loop()
@@ -262,6 +322,7 @@ class UartPacketBridge:
         self.stop_event.set()
         rx_thread.join(timeout=1.0)
         tx_thread.join(timeout=1.0)
+        router_thread.join(timeout=1.0)
         self.ser.close()
         return 0
 

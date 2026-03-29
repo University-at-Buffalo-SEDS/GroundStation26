@@ -22,7 +22,7 @@ pub const IGNITION_PIN_LED: u8 = 6;
 pub const ABORT_PIN: u8 = 9;
 pub const ABORT_PIN_LED: u8 = 10;
 
-pub const LAUNCH_PIN: u8 = 25;
+pub const LAUNCH_PIN: u8 = 20;
 pub const LAUNCH_PIN_LED: u8 = 11;
 
 pub const DUMP_PIN: u8 = 4;

@@ -620,9 +620,9 @@ async fn main() -> anyhow::Result<()> {
             let mut guard = rocket_comms
                 .lock()
                 .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
-            guard
-                .send_data(pkt)
-                .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
+            if let Err(err) = guard.send_data(pkt) {
+                eprintln!("rocket_comms send failed: {err}");
+            }
             Ok(())
         })
     };
@@ -633,9 +633,9 @@ async fn main() -> anyhow::Result<()> {
             let mut guard = umbilical_comms
                 .lock()
                 .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
-            guard
-                .send_data(pkt)
-                .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
+            if let Err(err) = guard.send_data(pkt) {
+                eprintln!("umbilical_comms send failed: {err}");
+            }
             Ok(())
         })
     };
