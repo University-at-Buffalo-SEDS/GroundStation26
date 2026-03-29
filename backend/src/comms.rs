@@ -46,9 +46,6 @@ pub trait CommsDevice: Send {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()>;
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>>;
     fn set_side_id(&mut self, side_id: RouterSideId);
-    fn recv_poll_interval(&self) -> Duration {
-        Duration::from_millis(2)
-    }
 }
 
 pub fn link_description(cfg: &CommsLinkConfig) -> String {
@@ -473,10 +470,6 @@ impl CommsDevice for I2cComms {
 
     fn set_side_id(&mut self, side_id: RouterSideId) {
         self.side_id = Some(side_id);
-    }
-
-    fn recv_poll_interval(&self) -> Duration {
-        Duration::from_millis(1)
     }
 }
 

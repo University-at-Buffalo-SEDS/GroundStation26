@@ -272,7 +272,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--port", required=True, help="UART device path, for example /dev/ttyUSB0")
     parser.add_argument("--baud", type=int, default=115200, help="UART baud rate")
-    parser.add_argument("--sender", default="PY_UART_NODE", help="Telemetry sender name")
+    parser.add_argument("--sender", default="VB", help="Telemetry sender name")
     parser.add_argument(
         "--interval",
         type=float,
