@@ -906,6 +906,8 @@ impl CommsDevice for I2cComms {
                 return Ok(());
             }
 
+            log_accepted_serialized_packet("i2c tx", payload);
+
             if let Err(err) = self.write_payload(I2C_KIND_DATA, payload) {
                 if is_i2c_retryable_write_error(err.as_ref()) {
                     self.arm_tx_backoff();
