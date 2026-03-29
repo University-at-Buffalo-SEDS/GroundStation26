@@ -2945,6 +2945,22 @@ def _find_dx(path_value: str) -> Optional[Path]:
     return None
 
 
+def _npm_global_bin_dir(cwd: Path) -> Optional[Path]:
+    try:
+        prefix = subprocess.check_output(
+            ["npm", "prefix", "-g"],
+            cwd=cwd,
+            env=os.environ,
+            text=True,
+        ).strip()
+    except Exception:
+        return None
+    if not prefix:
+        return None
+    bin_dir = Path(prefix) / "bin"
+    return bin_dir if bin_dir.exists() else None
+
+
 def _find_newest_wasm_asset(frontend_dir: Path) -> Optional[Path]:
     assets_dir = frontend_dir / "dist" / "public" / "assets"
     if not assets_dir.exists():
@@ -3151,6 +3167,7 @@ def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
 
     extra_paths = [
         str(Path.home() / ".cargo" / "bin"),
+        str(frontend_dir / "node_modules" / ".bin"),
         "/usr/local/sbin",
         "/usr/local/bin",
         "/usr/sbin",
@@ -3159,6 +3176,9 @@ def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
         "/bin",
         "/opt/binaryen/bin",
     ]
+    npm_global_bin = _npm_global_bin_dir(frontend_dir)
+    if npm_global_bin is not None:
+        extra_paths.insert(1, str(npm_global_bin))
 
     env: dict[str, str] = {}
     env["PATH"] = os.pathsep.join(extra_paths + [base_path])
