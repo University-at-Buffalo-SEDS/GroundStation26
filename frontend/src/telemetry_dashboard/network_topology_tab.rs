@@ -65,15 +65,7 @@ pub fn NetworkTopologyTab(
         .filter(|node| visible_node_ids.contains(node.id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
-    let graph_links = snapshot
-        .links
-        .iter()
-        .filter(|link| {
-            visible_node_ids.contains(link.source.as_str())
-                && visible_node_ids.contains(link.target.as_str())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let graph_links = collapse_visible_links(&snapshot.nodes, &snapshot.links, &visible_node_ids);
     let graph_layout = compute_graph_layout(&graph_nodes, &graph_links);
     let endpoint_rows = collect_endpoint_rows(&snapshot.nodes);
     let viewport_id = if *is_fullscreen.read() {
@@ -930,6 +922,94 @@ fn stack_height(nodes: &[&NetworkTopologyNode], node_gap: i32) -> i32 {
         return 0;
     }
     nodes.iter().map(|node| node_diameter(node)).sum::<i32>() + node_gap * (nodes.len() as i32 - 1)
+}
+
+fn collapse_visible_links(
+    nodes: &[NetworkTopologyNode],
+    links: &[NetworkTopologyLink],
+    visible_node_ids: &HashSet<&str>,
+) -> Vec<NetworkTopologyLink> {
+    let visible = visible_node_ids
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect::<HashSet<_>>();
+    let mut adjacency = HashMap::<String, Vec<(String, NetworkTopologyStatus)>>::new();
+    for link in links {
+        adjacency
+            .entry(link.source.clone())
+            .or_default()
+            .push((link.target.clone(), link.status));
+        adjacency
+            .entry(link.target.clone())
+            .or_default()
+            .push((link.source.clone(), link.status));
+    }
+
+    let mut collapsed = BTreeMap::<(String, String), NetworkTopologyStatus>::new();
+
+    for node in nodes.iter().filter(|node| visible.contains(&node.id)) {
+        let mut queue = std::collections::VecDeque::<(String, NetworkTopologyStatus)>::new();
+        let mut visited = HashSet::<String>::new();
+        visited.insert(node.id.clone());
+
+        if let Some(neighbors) = adjacency.get(&node.id) {
+            for (neighbor, status) in neighbors {
+                queue.push_back((neighbor.clone(), *status));
+            }
+        }
+
+        while let Some((current, status_so_far)) = queue.pop_front() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+
+            if visible.contains(&current) {
+                if current != node.id {
+                    let key = if node.id < current {
+                        (node.id.clone(), current.clone())
+                    } else {
+                        (current.clone(), node.id.clone())
+                    };
+                    collapsed
+                        .entry(key)
+                        .and_modify(|existing| {
+                            *existing = merge_link_status(*existing, status_so_far);
+                        })
+                        .or_insert(status_so_far);
+                }
+                continue;
+            }
+
+            if let Some(neighbors) = adjacency.get(&current) {
+                for (neighbor, edge_status) in neighbors {
+                    if visited.contains(neighbor) {
+                        continue;
+                    }
+                    queue.push_back((neighbor.clone(), merge_link_status(status_so_far, *edge_status)));
+                }
+            }
+        }
+    }
+
+    collapsed
+        .into_iter()
+        .map(|((source, target), status)| NetworkTopologyLink {
+            source,
+            target,
+            label: None,
+            status,
+        })
+        .collect()
+}
+
+fn merge_link_status(a: NetworkTopologyStatus, b: NetworkTopologyStatus) -> NetworkTopologyStatus {
+    use NetworkTopologyStatus::{Offline, Online, Simulated};
+
+    match (a, b) {
+        (Offline, _) | (_, Offline) => Offline,
+        (Simulated, _) | (_, Simulated) => Simulated,
+        _ => Online,
+    }
 }
 
 fn compute_graph_layout(
