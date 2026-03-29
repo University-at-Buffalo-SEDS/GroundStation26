@@ -8,7 +8,7 @@ const APP_DISPLAY_NAME: &str = "Telemetry Client";
 
 use crate::auth::{self, SessionStatus as AuthSessionStatus};
 use dioxus::prelude::*;
-use dioxus_router::{Routable, Router, use_navigator};
+use dioxus_router::{use_navigator, Routable, Router};
 
 #[allow(unused_imports)]
 use crate::telemetry_dashboard::{self, UrlConfig};
@@ -196,7 +196,7 @@ mod persist {
     /// Resolves the Android app-private files directory when the JNI context is available.
     fn android_storage_dir() -> Option<std::path::PathBuf> {
         use jni::objects::{JObject, JString};
-        use jni::{JavaVM, jni_sig, jni_str};
+        use jni::{jni_sig, jni_str, JavaVM};
         use ndk_context::android_context;
 
         let ctx = android_context();
@@ -1347,7 +1347,7 @@ pub fn Dashboard() -> Element {
         Some(Err(err)) => rsx! {
             ConnectionFailedCard {
                 message: format!(
-                    "The frontend could not reach the backend session endpoint.\n\n{}",
+                    "{}\n\nThe app could not load the backend session endpoint. Check that the backend URL is correct and that the proxy or server is healthy.",
                     err
                 ),
                 on_retry: move |_| {

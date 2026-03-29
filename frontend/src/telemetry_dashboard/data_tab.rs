@@ -7,10 +7,10 @@ use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 
 use super::data_chart::{
-    ChartCanvas, charts_cache_get, charts_cache_get_channel_minmax, charts_cache_get_subset,
-    charts_cache_get_subset_per_series, sender_scoped_chart_key, series_color,
+    charts_cache_get, charts_cache_get_channel_minmax, charts_cache_get_subset, charts_cache_get_subset_per_series,
+    sender_scoped_chart_key, series_color, ChartCanvas,
 };
-use super::{TELEMETRY_RENDER_EPOCH, latest_telemetry_row, latest_telemetry_value};
+use super::{latest_telemetry_row, latest_telemetry_value, TELEMETRY_RENDER_EPOCH};
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
 const _ACTIVE_SUBTAB_STORAGE_KEY: &str = "gs26_active_data_subtab";

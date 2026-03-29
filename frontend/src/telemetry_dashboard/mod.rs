@@ -58,8 +58,8 @@ use warnings_tab::WarningsTab;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, Ordering}, Arc,
+    Mutex,
 };
 
 use once_cell::sync::Lazy;
@@ -212,7 +212,7 @@ mod persist {
         /// Resolves the Android app-private storage root through JNI.
         fn android_storage_base_dir() -> Option<std::path::PathBuf> {
             use jni::objects::{JObject, JString};
-            use jni::{JavaVM, jni_sig, jni_str};
+            use jni::{jni_sig, jni_str, JavaVM};
             use ndk_context::android_context;
 
             let ctx = android_context();

@@ -14,12 +14,12 @@ use super::layout::{
 };
 use super::types::{BoardStatusEntry, FlightState, TelemetryRow};
 use super::{
-    ActionPolicyMsg, BlinkMode, HISTORY_MS, TELEMETRY_RENDER_EPOCH, latest_telemetry_row,
-    latest_telemetry_value, ui_telemetry_rows_snapshot,
+    latest_telemetry_row, latest_telemetry_value, ui_telemetry_rows_snapshot, ActionPolicyMsg, BlinkMode,
+    HISTORY_MS, TELEMETRY_RENDER_EPOCH,
 };
 
 use crate::telemetry_dashboard::data_chart::{
-    ChartCanvas, ChartRenderChunk, charts_cache_get, charts_cache_get_channel_minmax, series_color,
+    charts_cache_get, charts_cache_get_channel_minmax, series_color, ChartCanvas, ChartRenderChunk,
 };
 use crate::telemetry_dashboard::map_tab::MapTab;
 use std::hash::{Hash, Hasher};

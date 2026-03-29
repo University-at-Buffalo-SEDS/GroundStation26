@@ -3770,6 +3770,63 @@ def _ensure_bundle_icon_compat(frontend_dir: Path) -> None:
         except Exception as exc:
             print(f"Warning: failed generating bundle icon ICO {dst_ico}: {exc}", file=sys.stderr)
 
+    dst_icns = icons_dir / "icon.icns"
+    if not dst_icns.exists() and platform.system() == "Darwin":
+        iconutil = shutil.which("iconutil")
+        if iconutil is None:
+            print("Warning: iconutil not available; cannot generate macOS .icns icon.", file=sys.stderr)
+            return
+
+        with tempfile.TemporaryDirectory(prefix="gs26-iconset-") as tmp:
+            iconset_dir = Path(tmp) / "AppIcon.iconset"
+            iconset_dir.mkdir(parents=True, exist_ok=True)
+            macos_icon_targets = {
+                "icon_16x16.png": 16,
+                "icon_16x16@2x.png": 32,
+                "icon_32x32.png": 32,
+                "icon_32x32@2x.png": 64,
+                "icon_128x128.png": 128,
+                "icon_128x128@2x.png": 256,
+                "icon_256x256.png": 256,
+                "icon_256x256@2x.png": 512,
+                "icon_512x512.png": 512,
+                "icon_512x512@2x.png": 1024,
+            }
+            for filename, size in macos_icon_targets.items():
+                img.resize((size, size), Image.LANCZOS).save(iconset_dir / filename, format="PNG")
+            try:
+                run([iconutil, "-c", "icns", str(iconset_dir), "-o", str(dst_icns)], cwd=frontend_dir)
+            except subprocess.CalledProcessError as exc:
+                print(f"Warning: failed generating macOS icon {dst_icns}: {exc}", file=sys.stderr)
+
+
+def _patch_macos_bundle_icon(frontend_dir: Path) -> None:
+    app = rename_macos_app_bundle(frontend_dir) or app_bundle_path(frontend_dir)
+    if not app.exists():
+        return
+
+    icon_src = frontend_dir / "icons" / "icon.icns"
+    if not icon_src.exists():
+        return
+
+    resources_dir = app / "Contents" / "Resources"
+    resources_dir.mkdir(parents=True, exist_ok=True)
+    icon_dst = resources_dir / "icon.icns"
+    if not icon_dst.exists() or icon_src.read_bytes() != icon_dst.read_bytes():
+        shutil.copy2(icon_src, icon_dst)
+
+    plist_path = app / "Contents" / "Info.plist"
+    if not plist_path.exists():
+        return
+
+    with plist_path.open("rb") as f:
+        info = plistlib.load(f)
+
+    if info.get("CFBundleIconFile") != "icon.icns":
+        info["CFBundleIconFile"] = "icon.icns"
+        with plist_path.open("wb") as f:
+            plistlib.dump(info, f, sort_keys=False)
+
 
 def _ensure_android_icon_compat(frontend_dir: Path, app_src_main: Path) -> None:
     src_png = frontend_dir / "assets" / "icon_1024x1024.png"
@@ -3999,6 +4056,7 @@ def build_frontend(
             rename_macos_app_bundle(frontend_dir)
             remove_legacy_app_bundle(frontend_dir)
             remove_legacy_dmgs(frontend_dir)
+            _patch_macos_bundle_icon(frontend_dir)
             sign_macos_app_and_dmg(frontend_dir)
         elif platform_name in {"windows", "linux"}:
             if not (platform_name == "linux" and linux_bundle_partial):

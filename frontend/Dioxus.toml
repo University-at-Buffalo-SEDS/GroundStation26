@@ -7,7 +7,7 @@ out_dir = "dist"
 asset_dir = "assets"
 icon = "assets/icon.png"
 category = "public.app-category.utilities"
-build = "30"
+build = "31"
 
 [web.app]
 title = "UBSEDS GroundStation"
@@ -33,6 +33,7 @@ icon = [
     "icons/128x128@2x.png",
     "icons/256x256.png",
     "icons/icon.png",
+    "icons/icon.icns",
     "icons/icon.ico",
 ]
 
