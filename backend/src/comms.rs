@@ -644,6 +644,8 @@ pub struct I2cComms {
     tx_transfer_id: u16,
     #[cfg(target_os = "linux")]
     rx_assembly: Option<I2cRxAssembly>,
+    #[cfg(target_os = "linux")]
+    rx_payload_buf: Vec<u8>,
 }
 
 impl I2cComms {
@@ -661,6 +663,7 @@ impl I2cComms {
                 tx_backoff_until: None,
                 tx_transfer_id: 1,
                 rx_assembly: None,
+                rx_payload_buf: Vec::with_capacity(MAX_PACKET_SIZE * 4),
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -773,6 +776,28 @@ impl I2cComms {
     }
 
     #[cfg(target_os = "linux")]
+    fn try_take_buffered_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
+        let scan_len = self.rx_payload_buf.len().min(RAW_UART_MAX_FRAME_BYTES);
+        for start in 0..scan_len {
+            for end in (start + 1)..=scan_len {
+                let candidate = &self.rx_payload_buf[start..end];
+                if serialize::peek_frame_info(candidate).is_ok() {
+                    let payload = candidate.to_vec();
+                    self.rx_payload_buf.drain(..end);
+                    return Ok(Some(payload));
+                }
+            }
+        }
+
+        if self.rx_payload_buf.len() > RAW_UART_MAX_FRAME_BYTES {
+            let drop_len = self.rx_payload_buf.len() - RAW_UART_MAX_FRAME_BYTES;
+            self.rx_payload_buf.drain(..drop_len);
+        }
+
+        Ok(None)
+    }
+
+    #[cfg(target_os = "linux")]
     fn transfer_write(&mut self, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut msg = I2cMsg {
             addr: self.addr,
@@ -836,12 +861,17 @@ impl CommsDevice for I2cComms {
                                 }
                                 return Ok(());
                             }
-                            if let Err(err) = router.rx_serialized_queue_from_side(&payload, side_id) {
-                                eprintln!("i2c router reject: {err}");
-                                return Err(err);
+                            self.rx_payload_buf.extend_from_slice(&payload);
+                            while let Some(packet) = self.try_take_buffered_packet()? {
+                                if let Err(err) =
+                                    router.rx_serialized_queue_from_side(&packet, side_id)
+                                {
+                                    eprintln!("i2c router reject: {err}");
+                                    return Err(err);
+                                }
+                                log_accepted_serialized_packet("i2c", &packet);
+                                return Ok(());
                             }
-                            log_accepted_serialized_packet("i2c", &payload);
-                            return Ok(());
                         }
                     }
                     Ok(None) => return Ok(()),

@@ -83,8 +83,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=["testing", "hitl-mode"],
-        help="Legacy positional mode. Use 'testing' or 'hitl-mode' to enable backend features.",
+        choices=["testing", "hitl-mode", "debug"],
+        help="Legacy positional mode. Use 'testing', 'hitl-mode', or 'debug'.",
     )
     parser.add_argument(
         "--testing",
@@ -96,6 +96,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable backend 'hitl_mode' feature.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Build and run in debug mode for faster compile times.",
+    )
     return parser.parse_args()
 
 
@@ -103,11 +108,15 @@ def main() -> None:
     args = parse_args()
     testing_mode = args.testing or args.mode == "testing"
     hitl_mode = args.hitl_mode or args.mode == "hitl-mode"
+    debug_mode = args.debug or args.mode == "debug"
     if testing_mode and hitl_mode:
         print("Error: testing mode and hitl-mode are mutually exclusive.", file=sys.stderr)
         sys.exit(2)
 
-    cmd = ["cargo", "run", "--release", "-p", "groundstation_backend"]
+    cmd = ["cargo", "run"]
+    if not debug_mode:
+        cmd.append("--release")
+    cmd.extend(["-p", "groundstation_backend"])
     features: list[str] = []
     if is_raspberry_pi():
         features.append("raspberry_pi")
@@ -119,6 +128,8 @@ def main() -> None:
         cmd.extend(["--features", ",".join(features)])
     repo_root = Path(__file__).resolve().parent
     frontend_cmd = [sys.executable, str(repo_root / "frontend" / "build.py"), "frontend_web"]
+    if debug_mode:
+        frontend_cmd.append("debug")
     print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")
     subprocess.run(frontend_cmd, cwd=repo_root, check=True)
     try:
