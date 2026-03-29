@@ -30,6 +30,8 @@ pub const MAX_PACKET_SIZE: usize = 256;
 const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
 #[cfg(target_os = "linux")]
+const I2C_DEBUG_PREVIEW_BYTES: usize = 48;
+#[cfg(target_os = "linux")]
 const I2C_FRAME_SIZE: usize = 258;
 #[cfg(target_os = "linux")]
 const I2C_CHUNK_SIZE: usize = 32;
@@ -251,6 +253,12 @@ fn raw_uart_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("GS_RAW_UART_DEBUG").ok().as_deref() == Some("1"))
 }
 
+#[cfg(target_os = "linux")]
+fn i2c_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GS_I2C_DEBUG").ok().as_deref() == Some("1"))
+}
+
 fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
     if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
         return;
@@ -283,6 +291,69 @@ fn maybe_log_raw_uart_parse_issue(context: &str, bytes: &[u8]) {
     );
 }
 
+fn maybe_log_raw_uart_decoded(payload: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    match serialize::peek_envelope(payload) {
+        Ok(envelope) => {
+            eprintln!(
+                "raw_uart decoded {} bytes: sender={} ty={:?} endpoints={:?} ts={}",
+                payload.len(),
+                envelope.sender,
+                envelope.ty,
+                envelope.endpoints,
+                envelope.timestamp_ms
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "raw_uart decoded {} bytes but peek_envelope failed: {err}; payload: {}",
+                payload.len(),
+                hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_log_i2c_frame(context: &str, bytes: &[u8]) {
+    if !i2c_debug_enabled() {
+        return;
+    }
+    eprintln!(
+        "{context}: {} bytes: {}",
+        bytes.len(),
+        hex_preview(bytes, I2C_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_log_i2c_decoded(payload: &[u8]) {
+    if !i2c_debug_enabled() {
+        return;
+    }
+    match serialize::peek_envelope(payload) {
+        Ok(envelope) => {
+            eprintln!(
+                "i2c decoded {} bytes: sender={} ty={:?} endpoints={:?} ts={}",
+                payload.len(),
+                envelope.sender,
+                envelope.ty,
+                envelope.endpoints,
+                envelope.timestamp_ms
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "i2c decoded {} bytes but peek_envelope failed: {err}; payload: {}",
+                payload.len(),
+                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+            );
+        }
+    }
+}
+
 fn hex_preview(bytes: &[u8], limit: usize) -> String {
     let preview = bytes
         .iter()
@@ -310,6 +381,7 @@ impl CommsDevice for UartComms {
             return Err(err.into());
         }
         if let Some(payload) = self.try_take_packet()? {
+            maybe_log_raw_uart_decoded(&payload, &self.protocol);
             return router.rx_serialized_queue_from_side(&payload, side_id);
         }
 
@@ -318,6 +390,7 @@ impl CommsDevice for UartComms {
         }
 
         if let Some(payload) = self.try_take_packet()? {
+            maybe_log_raw_uart_decoded(&payload, &self.protocol);
             return router.rx_serialized_queue_from_side(&payload, side_id);
         }
 
@@ -437,6 +510,7 @@ impl I2cComms {
         payload: &[u8],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let frame = build_i2c_request_frame(payload);
+        maybe_log_i2c_frame("i2c tx frame", &frame);
 
         for (idx, chunk) in frame.chunks(I2C_CHUNK_SIZE).enumerate() {
             self.transfer_write(chunk)?;
@@ -459,6 +533,7 @@ impl I2cComms {
                 std::thread::sleep(self.chunk_delay);
             }
         }
+        maybe_log_i2c_frame("i2c rx raw frame", &raw);
         parse_i2c_response(&raw)
     }
 
@@ -508,7 +583,14 @@ impl CommsDevice for I2cComms {
         #[cfg(target_os = "linux")]
         {
             match self.read_frame() {
-                Ok(Some(payload)) => router.rx_serialized_queue_from_side(&payload, side_id),
+                Ok(Some(payload)) => {
+                    maybe_log_i2c_decoded(&payload);
+                    if let Err(err) = router.rx_serialized_queue_from_side(&payload, side_id) {
+                        eprintln!("i2c router reject: {err}");
+                        return Err(err);
+                    }
+                    Ok(())
+                }
                 Ok(None) => Ok(()),
                 Err(err) => {
                     eprintln!("i2c receive failed: {err}");
@@ -1043,6 +1125,7 @@ fn parse_i2c_response(
     }
 
     if magic != I2C_RESP_DATA_MAGIC || len > MAX_PACKET_SIZE {
+        maybe_log_i2c_frame("i2c invalid response header", &raw[..2]);
         return Ok(None);
     }
 
