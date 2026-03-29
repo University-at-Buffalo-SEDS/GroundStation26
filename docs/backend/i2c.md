@@ -1,117 +1,124 @@
 # Backend I2C Transport
 
-This document describes the I2C transport contract used by the Ground Station backend when it talks to the Pico bridge device.
+This document describes the chunked I2C packet transport used by the Ground Station backend and the Python I2C host tooling.
 
 ## Scope
 
-The Linux backend is the I2C master. The Pico is an `I2C0` slave at address `0x55`.
+The Linux host is the I2C master. The Pico is the I2C slave at address `0x55`.
 
-This is not plain byte-stream I2C. It is a framed application protocol carried over a sequence of I2C transactions.
+The transport no longer treats I2C as a fake fixed-length frame buffer. Every I2C transaction is a self-describing `32` byte slot. Multi-slot transfers carry one logical packet split across as many transactions as needed.
+
+That removes the old corruption mode where repeated or restarted slave reads were stitched together as if they were one contiguous `258` byte buffer.
 
 ## Electrical Setup
 
-The Pico side uses:
-
-- `GPIO0` for `I2C0 SDA`
-- `GPIO1` for `I2C0 SCL`
-
-Typical Raspberry Pi wiring:
-
-- Pi SDA -> Pico `GPIO0`
-- Pi SCL -> Pico `GPIO1`
+- Pico `GPIO0` = `I2C0 SDA`
+- Pico `GPIO1` = `I2C0 SCL`
+- Pi physical pin `3` / `GPIO2` -> Pico `GPIO0`
+- Pi physical pin `5` / `GPIO3` -> Pico `GPIO1`
 - Pi GND -> Pico GND
 
 External pull-ups must be present on SDA and SCL if the carrier board does not already provide them.
 
-## Address And Framing Constants
+## Slot Format
 
-- slave address: `0x55`
-- maximum payload: `256` bytes
-- framed response buffer size: `258` bytes
-- host chunk size: `32` bytes
-- data request magic: `0xA5`
-- command request magic: `0xA6`
-- data response magic: `0x5A`
-- command response magic: `0x5B`
+Every master write and master read transaction is exactly `32` bytes.
 
-Frame header layout:
+Header layout:
 
-- byte `0`: magic
-- byte `1`: payload length `N`
-- bytes `2..2+N`: payload bytes
-- remaining bytes in a staged response buffer: zero-filled
+- byte `0`: magic0 = `0x49`
+- byte `1`: magic1 = `0x32`
+- byte `2`: version = `0x01`
+- byte `3`: kind
+- byte `4`: flags
+- byte `5`: reserved
+- bytes `6..9`: packet offset, little-endian `u32`
+- bytes `10..13`: total packet length, little-endian `u32`
+- bytes `14..15`: slot payload length, little-endian `u16`
+- bytes `16..17`: transfer id, little-endian `u16`
+- bytes `18..31`: slot payload bytes
 
-## Transaction Model
+Constants:
 
-The device firmware does not require the host to write a fully padded `258`-byte request frame in one transaction.
+- slot size = `32`
+- header size = `18`
+- slot payload size = `14`
+- magic = `0x49 0x32`
+- version = `1`
 
-Instead, the host writes request bytes in one or more I2C write transactions, normally up to `32` bytes each. The Pico accumulates those chunks and treats the request as complete once it has received:
+Kinds:
 
-- at least the 2-byte header, and
-- `payload_length + 2` total bytes
+- `0x00`: idle
+- `0x01`: data
+- `0x02`: command
+- `0x7f`: error
 
-That means a request with a 10-byte payload is complete after 12 received bytes, not after 258 bytes.
+Flags:
 
-The Pico stages responses in a fixed `258`-byte response buffer. The host reads that staged buffer back in one or more I2C read transactions, normally `32` bytes at a time.
+- `0x01`: start of transfer
+- `0x02`: end of transfer
 
-## Request Types
+## Transfer Rules
 
-### Data Request `0xA5`
+Each logical packet is sent as one or more slots with:
 
-Carries raw bridged payload bytes intended for the remote link behind the Pico.
+- one transfer id for the whole packet
+- offset `0` on the first slot
+- monotonically increasing offsets on later slots
+- the same total packet length on every slot
 
-Behavior:
+The first slot must have `START`.
+The last slot must have `END`.
+A one-slot packet has both `START | END`.
 
-- non-empty payload: forward payload across the Pico bridge
-- empty payload: poll request that asks the Pico to return any currently staged response
+Receivers must reject a transfer if:
 
-### Command Request `0xA6`
+- the magic or version is wrong
+- the transfer id changes mid-stream
+- the kind changes mid-stream
+- the next offset does not match the previously received byte count
+- the received bytes exceed the declared total length
+- the transfer ends before the declared total length is reached
 
-Carries an ASCII command handled locally on the Pico, such as `/ping` or `/show`.
+## Polling Model
 
-Behavior:
+I2C slaves cannot push data. The master must read.
 
-- payload is interpreted as a local command line
-- Pico replies with a `0x5B` command response frame
+The receive side therefore works as a mailbox:
 
-## Response Types
+- the master issues a `32` byte read
+- the slave returns either one packet slot or an idle slot
+- the master keeps polling until it has reassembled a full packet
 
-### Data Response `0x5A`
+Idle reads are either:
 
-Carries raw bridged payload returned from the remote side.
+- an explicit idle slot (`kind = 0x00`)
+- all-zero data
+- all-`0xff` data
 
-### Command Response `0x5B`
+Those must be treated as “no packet available yet”.
 
-Carries the Pico-local command output as bytes.
+## Large Packet Support
 
-## Polling And Idle Reads
+Packet size is no longer limited by the I2C transport itself.
 
-I2C slaves cannot transmit spontaneously. The master must read to fetch any staged response.
+The total packet length field is `u32`, so the wire format can carry payloads up to `4 GiB - 1` bytes. In practice, the usable size depends on endpoint memory, queueing, and the application producing or consuming the packet.
 
-The Pico firmware currently supports two practical polling patterns:
+The Ground Station Rust backend now streams outgoing packets across as many I2C slots as needed and reassembles incoming packets from as many slots as required.
 
-- explicit poll write: send an empty `0xA5` request, then read the staged response
-- direct read poll: issue a read transaction without a preceding empty write and consume the currently staged response buffer
+## Compatibility
 
-The current Ground Station backend relies on direct reads for receive-side polling. That works with the current Pico firmware, even though the stricter protocol description often uses the empty `0xA5` request as the canonical poll operation.
+This slot protocol is not wire-compatible with the old `258` byte `magic + len + payload` staging format.
 
-If no valid frame is staged yet, host reads may return an all-zero or mostly `0xFF` buffer. The backend should treat those as idle or garbage reads rather than valid frames.
+Every host implementation that speaks to the device must use the same slot format:
 
-## Ground Station Compatibility Notes
+- Ground Station backend Rust I2C transport
+- Python I2C tools
+- Pico I2C firmware task
 
-The current backend implementation in [comms.rs](/Users/rylan/Documents/GitKraken/GroundStation26/backend/src/comms.rs):
-
-- matches the Pico data-plane transport for `0xA5` requests and `0x5A` responses
-- uses `32`-byte chunked writes and reads
-- reads a full `258`-byte staged response buffer
-- does not currently send `0xA6` command requests
-- does not currently parse `0x5B` command responses
-- does not currently send explicit empty-payload poll writes
-
-This means the current backend is compatible with the Pico's bridged data path, but not with the full command-oriented portion of the device protocol.
+If one side is still on the old fixed-frame transport, the link will not decode correctly.
 
 ## References
 
-- Ground Station host implementation: [comms.rs](/Users/rylan/Documents/GitKraken/GroundStation26/backend/src/comms.rs)
-- Pico frame definitions: `/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs`
-- Pico I2C slave task: `/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/i2c_task.rs`
+- Rust host transport: [comms.rs](/Users/rylan/Documents/GitKraken/GroundStation26/backend/src/comms.rs)
+- Python host tools: `/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py`

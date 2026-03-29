@@ -32,15 +32,29 @@ const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
 #[cfg(target_os = "linux")]
 const I2C_DEBUG_PREVIEW_BYTES: usize = 48;
 #[cfg(target_os = "linux")]
-const I2C_FRAME_SIZE: usize = 258;
+const I2C_SLOT_SIZE: usize = 32;
 #[cfg(target_os = "linux")]
-const I2C_CHUNK_SIZE: usize = 32;
+const I2C_SLOT_HEADER_SIZE: usize = 18;
 #[cfg(target_os = "linux")]
-const I2C_REQ_DATA_MAGIC: u8 = 0xA5;
+const I2C_SLOT_PAYLOAD_SIZE: usize = I2C_SLOT_SIZE - I2C_SLOT_HEADER_SIZE;
 #[cfg(target_os = "linux")]
-const I2C_REQ_POLL_FRAME_LEN: usize = 2;
+const I2C_SLOT_MAGIC_0: u8 = 0x49;
 #[cfg(target_os = "linux")]
-const I2C_RESP_DATA_MAGIC: u8 = 0x5A;
+const I2C_SLOT_MAGIC_1: u8 = 0x32;
+#[cfg(target_os = "linux")]
+const I2C_SLOT_VERSION: u8 = 1;
+#[cfg(target_os = "linux")]
+const I2C_KIND_IDLE: u8 = 0;
+#[cfg(target_os = "linux")]
+const I2C_KIND_DATA: u8 = 1;
+#[cfg(target_os = "linux")]
+const I2C_KIND_COMMAND: u8 = 2;
+#[cfg(target_os = "linux")]
+const I2C_KIND_ERROR: u8 = 0x7f;
+#[cfg(target_os = "linux")]
+const I2C_FLAG_START: u8 = 0x01;
+#[cfg(target_os = "linux")]
+const I2C_FLAG_END: u8 = 0x02;
 
 // ======================================================================
 //  Comms Device Trait
@@ -333,25 +347,181 @@ fn maybe_log_i2c_decoded(payload: &[u8]) {
     if !i2c_debug_enabled() {
         return;
     }
-    match serialize::peek_envelope(payload) {
-        Ok(envelope) => {
+    match serialize::peek_frame_info(payload) {
+        Ok(_) => {
             eprintln!(
-                "i2c decoded {} bytes: sender={} ty={:?} endpoints={:?} ts={}",
+                "i2c decoded {} bytes: {}",
                 payload.len(),
-                envelope.sender,
-                envelope.ty,
-                envelope.endpoints,
-                envelope.timestamp_ms
+                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
             );
         }
-        Err(err) => {
+        Err(_) => {
             eprintln!(
-                "i2c decoded {} bytes but peek_envelope failed: {err}; payload: {}",
+                "i2c decoded {} bytes but payload is not a valid serialized packet: {}",
                 payload.len(),
                 hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
             );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct I2cMailboxSlot {
+    kind: u8,
+    flags: u8,
+    transfer_id: u16,
+    offset: u32,
+    total_len: u32,
+    data: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct I2cRxAssembly {
+    kind: u8,
+    transfer_id: u16,
+    total_len: usize,
+    next_offset: usize,
+    payload: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl I2cRxAssembly {
+    fn new(slot: &I2cMailboxSlot) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        if slot.flags & I2C_FLAG_START == 0 {
+            return Err(std::io::Error::other("i2c transfer must start with START flag").into());
+        }
+        if slot.offset != 0 {
+            return Err(std::io::Error::other("i2c transfer start must have offset 0").into());
+        }
+        let total_len = slot.total_len as usize;
+        if total_len < slot.data.len() {
+            return Err(
+                std::io::Error::other("i2c transfer total length smaller than first slot").into(),
+            );
+        }
+        let mut payload = Vec::with_capacity(total_len);
+        payload.extend_from_slice(&slot.data);
+        Ok(Self {
+            kind: slot.kind,
+            transfer_id: slot.transfer_id,
+            total_len,
+            next_offset: slot.data.len(),
+            payload,
+        })
+    }
+
+    fn push(&mut self, slot: &I2cMailboxSlot) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
+        if slot.kind != self.kind {
+            return Err(std::io::Error::other("i2c transfer kind changed mid-stream").into());
+        }
+        if slot.transfer_id != self.transfer_id {
+            return Err(std::io::Error::other("i2c transfer id changed mid-stream").into());
+        }
+        if slot.offset as usize != self.next_offset {
+            return Err(std::io::Error::other(format!(
+                "i2c transfer offset mismatch: expected {} got {}",
+                self.next_offset, slot.offset
+            ))
+            .into());
+        }
+        if self.payload.len() + slot.data.len() > self.total_len {
+            return Err(
+                std::io::Error::other("i2c transfer exceeded declared total length").into(),
+            );
+        }
+        if slot.offset != 0 {
+            self.payload.extend_from_slice(&slot.data);
+            self.next_offset += slot.data.len();
+        }
+        if slot.flags & I2C_FLAG_END != 0 {
+            if self.payload.len() != self.total_len {
+                return Err(std::io::Error::other(format!(
+                    "i2c transfer ended early: expected {} bytes got {}",
+                    self.total_len,
+                    self.payload.len()
+                ))
+                .into());
+            }
+            return Ok(Some(std::mem::take(&mut self.payload)));
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn encode_i2c_slot(
+    kind: u8,
+    flags: u8,
+    transfer_id: u16,
+    offset: u32,
+    total_len: u32,
+    data: &[u8],
+) -> [u8; I2C_SLOT_SIZE] {
+    let mut raw = [0u8; I2C_SLOT_SIZE];
+    let data_len = data.len().min(I2C_SLOT_PAYLOAD_SIZE);
+    raw[0] = I2C_SLOT_MAGIC_0;
+    raw[1] = I2C_SLOT_MAGIC_1;
+    raw[2] = I2C_SLOT_VERSION;
+    raw[3] = kind;
+    raw[4] = flags;
+    raw[5] = 0;
+    raw[6..10].copy_from_slice(&offset.to_le_bytes());
+    raw[10..14].copy_from_slice(&total_len.to_le_bytes());
+    raw[14..16].copy_from_slice(&(data_len as u16).to_le_bytes());
+    raw[16..18].copy_from_slice(&transfer_id.to_le_bytes());
+    raw[I2C_SLOT_HEADER_SIZE..I2C_SLOT_HEADER_SIZE + data_len].copy_from_slice(&data[..data_len]);
+    raw
+}
+
+#[cfg(target_os = "linux")]
+fn decode_i2c_slot(raw: &[u8; I2C_SLOT_SIZE]) -> Result<Option<I2cMailboxSlot>, Box<dyn Error + Send + Sync>> {
+    let all_zero = raw.iter().all(|byte| *byte == 0x00);
+    let all_ff = raw.iter().all(|byte| *byte == 0xFF);
+    if all_zero || all_ff {
+        return Ok(None);
+    }
+    if raw[0] != I2C_SLOT_MAGIC_0 || raw[1] != I2C_SLOT_MAGIC_1 {
+        return Err(
+            std::io::Error::other(format!(
+                "invalid i2c slot magic: {:02x} {:02x}",
+                raw[0], raw[1]
+            ))
+            .into(),
+        );
+    }
+    if raw[2] != I2C_SLOT_VERSION {
+        return Err(std::io::Error::other(format!(
+            "unsupported i2c slot version: {}",
+            raw[2]
+        ))
+        .into());
+    }
+    let kind = raw[3];
+    if kind == I2C_KIND_IDLE {
+        return Ok(None);
+    }
+    let flags = raw[4];
+    let offset = u32::from_le_bytes(raw[6..10].try_into().unwrap());
+    let total_len = u32::from_le_bytes(raw[10..14].try_into().unwrap());
+    let data_len = u16::from_le_bytes(raw[14..16].try_into().unwrap()) as usize;
+    let transfer_id = u16::from_le_bytes(raw[16..18].try_into().unwrap());
+    if data_len > I2C_SLOT_PAYLOAD_SIZE {
+        return Err(std::io::Error::other(format!(
+            "invalid i2c slot payload length: {data_len}"
+        ))
+        .into());
+    }
+    let data = raw[I2C_SLOT_HEADER_SIZE..I2C_SLOT_HEADER_SIZE + data_len].to_vec();
+    Ok(Some(I2cMailboxSlot {
+        kind,
+        flags,
+        transfer_id,
+        offset,
+        total_len,
+        data,
+    }))
 }
 
 fn hex_preview(bytes: &[u8], limit: usize) -> String {
@@ -440,6 +610,10 @@ pub struct I2cComms {
     initial_wait: Duration,
     #[cfg(target_os = "linux")]
     tx_backoff_until: Option<std::time::Instant>,
+    #[cfg(target_os = "linux")]
+    tx_transfer_id: u16,
+    #[cfg(target_os = "linux")]
+    rx_assembly: Option<I2cRxAssembly>,
 }
 
 impl I2cComms {
@@ -455,6 +629,8 @@ impl I2cComms {
                 chunk_delay: Duration::from_millis(cfg.chunk_delay_ms),
                 initial_wait: Duration::from_millis(cfg.initial_wait_ms),
                 tx_backoff_until: None,
+                tx_transfer_id: 1,
+                rx_assembly: None,
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -465,32 +641,16 @@ impl I2cComms {
     }
 
     #[cfg(target_os = "linux")]
-    fn read_frame(&mut self) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
-        match self.read_staged_frame() {
-            Ok(frame) => Ok(frame),
-            Err(read_err) if is_i2c_idle_read_error(read_err.as_ref()) => Ok(None),
-            Err(read_err) => {
-                // Some Pico firmware revisions expose staged responses on plain reads and
-                // NACK explicit empty-poll writes. Fall back to the poll-write path only if
-                // the direct read failed.
-                match self
-                    .write_request_frame(&[])
-                    .and_then(|_| self.read_staged_frame())
-                {
-                    Ok(frame) => Ok(frame),
-                    Err(poll_err) if is_i2c_idle_read_error(poll_err.as_ref()) => Ok(None),
-                    Err(poll_err) => Err(format!(
-                        "i2c staged read failed: {read_err}; poll-read fallback failed: {poll_err}"
-                    )
-                    .into()),
-                }
+    fn read_slot(&mut self) -> Result<Option<I2cMailboxSlot>, Box<dyn Error + Send + Sync>> {
+        let mut raw = [0u8; I2C_SLOT_SIZE];
+        match self.transfer_read(&mut raw) {
+            Ok(()) => {
+                maybe_log_i2c_frame("i2c rx slot", &raw);
+                decode_i2c_slot(&raw)
             }
+            Err(err) if is_i2c_idle_read_error(err.as_ref()) => Ok(None),
+            Err(err) => Err(err),
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn write_frame(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.write_request_frame(payload)
     }
 
     #[cfg(target_os = "linux")]
@@ -505,16 +665,43 @@ impl I2cComms {
     }
 
     #[cfg(target_os = "linux")]
-    fn write_request_frame(
+    fn next_transfer_id(&mut self) -> u16 {
+        let current = self.tx_transfer_id;
+        self.tx_transfer_id = self.tx_transfer_id.wrapping_add(1).max(1);
+        current
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_payload(
         &mut self,
+        kind: u8,
         payload: &[u8],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let frame = build_i2c_request_frame(payload);
-        maybe_log_i2c_frame("i2c tx frame", &frame);
+        let total_len = payload.len();
+        let transfer_id = self.next_transfer_id();
+        let mut offset = 0usize;
 
-        for (idx, chunk) in frame.chunks(I2C_CHUNK_SIZE).enumerate() {
-            self.transfer_write(chunk)?;
-            if idx + 1 < frame.len().div_ceil(I2C_CHUNK_SIZE) {
+        if total_len == 0 {
+            let slot = encode_i2c_slot(kind, I2C_FLAG_START | I2C_FLAG_END, transfer_id, 0, 0, &[]);
+            maybe_log_i2c_frame("i2c tx slot", &slot);
+            self.transfer_write(&slot)?;
+            return Ok(());
+        }
+
+        while offset < total_len {
+            let end = (offset + I2C_SLOT_PAYLOAD_SIZE).min(total_len);
+            let mut flags = 0u8;
+            if offset == 0 {
+                flags |= I2C_FLAG_START;
+            }
+            if end >= total_len {
+                flags |= I2C_FLAG_END;
+            }
+            let slot = encode_i2c_slot(kind, flags, transfer_id, offset as u32, total_len as u32, &payload[offset..end]);
+            maybe_log_i2c_frame("i2c tx slot", &slot);
+            self.transfer_write(&slot)?;
+            offset = end;
+            if offset < total_len {
                 std::thread::sleep(self.chunk_delay);
             }
         }
@@ -522,19 +709,32 @@ impl I2cComms {
     }
 
     #[cfg(target_os = "linux")]
-    fn read_staged_frame(&mut self) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
-        let mut raw = [0u8; I2C_FRAME_SIZE];
-        let mut offset = 0usize;
-        while offset < I2C_FRAME_SIZE {
-            let read_len = (I2C_FRAME_SIZE - offset).min(I2C_CHUNK_SIZE);
-            self.transfer_read(&mut raw[offset..offset + read_len])?;
-            offset += read_len;
-            if offset < I2C_FRAME_SIZE {
-                std::thread::sleep(self.chunk_delay);
-            }
+    fn ingest_rx_slot(
+        &mut self,
+        slot: I2cMailboxSlot,
+    ) -> Result<Option<(u8, Vec<u8>)>, Box<dyn Error + Send + Sync>> {
+        if slot.kind == I2C_KIND_IDLE {
+            return Ok(None);
         }
-        maybe_log_i2c_frame("i2c rx raw frame", &raw);
-        parse_i2c_response(&raw)
+
+        if slot.flags & I2C_FLAG_START != 0 {
+            let assembly = I2cRxAssembly::new(&slot)?;
+            if slot.flags & I2C_FLAG_END != 0 {
+                return Ok(Some((slot.kind, assembly.payload)));
+            }
+            self.rx_assembly = Some(assembly);
+            return Ok(None);
+        }
+
+        let assembly = self
+            .rx_assembly
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("i2c slot arrived without an active transfer"))?;
+        let completed = assembly.push(&slot)?;
+        if completed.is_some() {
+            self.rx_assembly = None;
+        }
+        Ok(completed.map(|payload| (slot.kind, payload)))
     }
 
     #[cfg(target_os = "linux")]
@@ -582,21 +782,33 @@ impl CommsDevice for I2cComms {
 
         #[cfg(target_os = "linux")]
         {
-            match self.read_frame() {
-                Ok(Some(payload)) => {
-                    maybe_log_i2c_decoded(&payload);
-                    if let Err(err) = router.rx_serialized_queue_from_side(&payload, side_id) {
-                        eprintln!("i2c router reject: {err}");
-                        return Err(err);
+            for _ in 0..32 {
+                match self.read_slot() {
+                    Ok(Some(slot)) => {
+                        if let Some((kind, payload)) = self.ingest_rx_slot(slot).map_err(|err| {
+                            eprintln!("i2c receive failed: {err}");
+                            TelemetryError::HandlerError("i2c receive failed")
+                        })? {
+                            maybe_log_i2c_decoded(&payload);
+                            if kind != I2C_KIND_DATA {
+                                eprintln!("i2c non-data packet kind {kind} ignored");
+                                return Ok(());
+                            }
+                            if let Err(err) = router.rx_serialized_queue_from_side(&payload, side_id) {
+                                eprintln!("i2c router reject: {err}");
+                                return Err(err);
+                            }
+                            return Ok(());
+                        }
                     }
-                    Ok(())
-                }
-                Ok(None) => Ok(()),
-                Err(err) => {
-                    eprintln!("i2c receive failed: {err}");
-                    Err(TelemetryError::HandlerError("i2c receive failed"))
+                    Ok(None) => return Ok(()),
+                    Err(err) => {
+                        eprintln!("i2c receive failed: {err}");
+                        return Err(TelemetryError::HandlerError("i2c receive failed"));
+                    }
                 }
             }
+            Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -609,19 +821,13 @@ impl CommsDevice for I2cComms {
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if payload.is_empty() || payload.len() > MAX_PACKET_SIZE {
-            return Err(
-                format!("packet too large to send over i2c: {} bytes", payload.len()).into(),
-            );
-        }
-
         #[cfg(target_os = "linux")]
         {
             if self.tx_backoff_active() {
                 return Ok(());
             }
 
-            if let Err(err) = self.write_frame(payload) {
+            if let Err(err) = self.write_payload(I2C_KIND_DATA, payload) {
                 if is_i2c_retryable_write_error(err.as_ref()) {
                     self.arm_tx_backoff();
                     return Ok(());
@@ -1110,43 +1316,6 @@ struct I2cRdwrIoctlData {
 }
 
 #[cfg(target_os = "linux")]
-fn parse_i2c_response(
-    raw: &[u8; I2C_FRAME_SIZE],
-) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
-    let magic = raw[0];
-    let len = raw[1] as usize;
-
-    // Treat all-0xff and all-zero idle reads as "no frame available yet" to match the
-    // permissive Python polling behavior used by the Pico groundstation tools.
-    let all_ff = raw.iter().all(|byte| *byte == 0xFF);
-    let all_zero = raw.iter().all(|byte| *byte == 0x00);
-    if all_ff || all_zero {
-        return Ok(None);
-    }
-
-    if magic != I2C_RESP_DATA_MAGIC || len > MAX_PACKET_SIZE {
-        maybe_log_i2c_frame("i2c invalid response header", &raw[..2]);
-        return Ok(None);
-    }
-
-    if len == 0 {
-        return Ok(None);
-    }
-
-    Ok(Some(raw[2..2 + len].to_vec()))
-}
-
-#[cfg(target_os = "linux")]
-fn build_i2c_request_frame(payload: &[u8]) -> Vec<u8> {
-    let payload = &payload[..payload.len().min(MAX_PACKET_SIZE)];
-    let mut frame = Vec::with_capacity(payload.len().max(I2C_REQ_POLL_FRAME_LEN));
-    frame.push(I2C_REQ_DATA_MAGIC);
-    frame.push(payload.len() as u8);
-    frame.extend_from_slice(payload);
-    frame
-}
-
-#[cfg(target_os = "linux")]
 fn is_i2c_idle_read_error(err: &(dyn Error + 'static)) -> bool {
     err.downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error)
@@ -1169,17 +1338,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_i2c_request_frame_uses_empty_data_request_for_polling() {
-        assert_eq!(build_i2c_request_frame(&[]), vec![I2C_REQ_DATA_MAGIC, 0]);
+    fn encode_decode_i2c_slot_roundtrip() {
+        let raw = encode_i2c_slot(I2C_KIND_DATA, I2C_FLAG_START, 7, 0, 99, b"hello");
+        let decoded = decode_i2c_slot(&raw).unwrap().unwrap();
+        assert_eq!(decoded.kind, I2C_KIND_DATA);
+        assert_eq!(decoded.flags, I2C_FLAG_START);
+        assert_eq!(decoded.transfer_id, 7);
+        assert_eq!(decoded.offset, 0);
+        assert_eq!(decoded.total_len, 99);
+        assert_eq!(decoded.data, b"hello");
     }
 
     #[test]
-    fn build_i2c_request_frame_limits_payload_to_max_packet_size() {
-        let payload = vec![0x42; MAX_PACKET_SIZE + 5];
-        let frame = build_i2c_request_frame(&payload);
-        assert_eq!(frame.len(), MAX_PACKET_SIZE + 2);
-        assert_eq!(frame[0], I2C_REQ_DATA_MAGIC);
-        assert_eq!(frame[1], MAX_PACKET_SIZE as u8);
+    fn i2c_rx_assembly_reassembles_multislot_transfer() {
+        let first = decode_i2c_slot(&encode_i2c_slot(
+            I2C_KIND_DATA,
+            I2C_FLAG_START,
+            11,
+            0,
+            20,
+            b"abcdefghijklmn",
+        ))
+        .unwrap()
+        .unwrap();
+        let second = decode_i2c_slot(&encode_i2c_slot(
+            I2C_KIND_DATA,
+            I2C_FLAG_END,
+            11,
+            14,
+            20,
+            b"opqrst",
+        ))
+        .unwrap()
+        .unwrap();
+
+        let mut assembly = I2cRxAssembly::new(&first).unwrap();
+        let payload = assembly.push(&second).unwrap().unwrap();
+        assert_eq!(payload, b"abcdefghijklmnopqrst");
     }
 
     #[test]
