@@ -363,6 +363,28 @@ fn maybe_log_i2c_decoded(payload: &[u8]) {
     }
 }
 
+fn log_accepted_serialized_packet(link: &str, payload: &[u8]) {
+    match serialize::peek_envelope(payload) {
+        Ok(envelope) => {
+            eprintln!(
+                "{link} accepted packet: sender={} ty={:?} len={} endpoints={:?}",
+                envelope.sender,
+                envelope.ty,
+                payload.len(),
+                envelope.endpoints
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "{link} accepted undecoded payload: len={} err={} data={}",
+                payload.len(),
+                err,
+                hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 struct I2cMailboxSlot {
@@ -553,7 +575,11 @@ impl CommsDevice for UartComms {
         }
         if let Some(payload) = self.try_take_packet()? {
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
-            return router.rx_serialized_queue_from_side(&payload, side_id);
+            let result = router.rx_serialized_queue_from_side(&payload, side_id);
+            if result.is_ok() {
+                log_accepted_serialized_packet("uart", &payload);
+            }
+            return result;
         }
 
         if let Err(err) = self.fill_rx_buf() {
@@ -562,7 +588,11 @@ impl CommsDevice for UartComms {
 
         if let Some(payload) = self.try_take_packet()? {
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
-            return router.rx_serialized_queue_from_side(&payload, side_id);
+            let result = router.rx_serialized_queue_from_side(&payload, side_id);
+            if result.is_ok() {
+                log_accepted_serialized_packet("uart", &payload);
+            }
+            return result;
         }
 
         Ok(())
@@ -811,6 +841,7 @@ impl CommsDevice for I2cComms {
                                 eprintln!("i2c router reject: {err}");
                                 return Err(err);
                             }
+                            log_accepted_serialized_packet("i2c", &payload);
                             return Ok(());
                         }
                     }
@@ -957,7 +988,11 @@ impl CommsDevice for SpiComms {
             }
 
             let payload = &rx[2..2 + frame_len];
-            return router.rx_serialized_queue_from_side(payload, side_id);
+            let result = router.rx_serialized_queue_from_side(payload, side_id);
+            if result.is_ok() {
+                log_accepted_serialized_packet("spi", payload);
+            }
+            return result;
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1111,7 +1146,11 @@ impl CommsDevice for CanComms {
 
             let packet = std::mem::take(&mut self.rx_buf);
             self.reset_rx();
-            return router.rx_serialized_queue_from_side(&packet, side_id);
+            let result = router.rx_serialized_queue_from_side(&packet, side_id);
+            if result.is_ok() {
+                log_accepted_serialized_packet("can", &packet);
+            }
+            return result;
         }
         #[cfg(not(target_os = "linux"))]
         {

@@ -69,7 +69,6 @@ DISCOVERY_ENDPOINT = _enum_value(
 )
 DEFAULT_ENDPOINTS = [GROUNDSTATION_ENDPOINT]
 RX_SCAN_MAX = 4096
-DISCOVERY_PUMP_PERIOD_S = 0.05
 
 BASE_LAT = 31.7619
 BASE_LON = -106.4850
@@ -95,7 +94,6 @@ class UartPacketBridge:
         self.router_lock = threading.Lock()
         self.rx_buffer = bytearray()
         self.gps_index = 0
-        self.send_warning_next = False
 
         self.ser = serial.Serial(
             port=port,
@@ -115,15 +113,6 @@ class UartPacketBridge:
             mode=RM.Sink,
         )
         self.router_side_id = self.router.add_side_serialized("UART", self._tx_serialized)
-        if not hasattr(self.router, "poll_discovery") or not hasattr(self.router, "announce_discovery"):
-            raise RuntimeError(
-                "The installed sedsprintf Python bindings do not expose discovery methods. "
-                "Rebuild or reinstall the module with discovery-enabled Router APIs."
-            )
-        with self.router_lock:
-            self.router.announce_discovery()
-            self.router.process_all_queues()
-
     def _write_packet(self, packet: seds.Packet) -> None:
         wire = bytes(packet.serialize())
         self._tx_serialized(wire)
@@ -138,11 +127,6 @@ class UartPacketBridge:
         with self.router_lock:
             self.router.receive_serialized_queue_from_side(self.router_side_id, frame)
             self.router.process_all_queues()
-
-    def _pump_router(self) -> None:
-        with self.router_lock:
-            self.router.poll_discovery()
-            self.router.process_all_queues_with_timeout(20)
 
     def _handle_groundstation_packet(self, pkt: seds.Packet) -> None:
         print("[RX GroundStation]")
@@ -220,11 +204,7 @@ class UartPacketBridge:
     def _send_once(self) -> None:
         # The wire format has no explicit frame length prefix, so this example
         # sends one frame per burst and relies on UART idle gaps for framing.
-        if self.send_warning_next:
-            packet = self._build_warning_packet()
-        else:
-            packet = self._build_gps_packet()
-        self.send_warning_next = not self.send_warning_next
+        packet = self._build_gps_packet()
         self._write_packet(packet)
 
     def send_warning_now(self) -> None:
@@ -260,16 +240,6 @@ class UartPacketBridge:
             self.rx_buffer.extend(chunk)
             self._drain_rx_buffer()
 
-    def router_loop(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                self._pump_router()
-            except Exception as e:
-                print(f"Router pump failed: {e}", file=sys.stderr)
-                self.stop_event.set()
-                return
-            self.stop_event.wait(DISCOVERY_PUMP_PERIOD_S)
-
     def tx_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -303,16 +273,14 @@ class UartPacketBridge:
     def run(self) -> int:
         print(f"Listening on {self.port} at {self.baud} baud as sender '{self.sender}'.")
         print("Keys: 'w' sends a GPS warning, 'g' sends GPS now, 'q' quits.")
-        print("Discovery: enabled")
+        print("Discovery: disabled")
         if self.startup_delay > 0:
             print(f"Waiting {self.startup_delay:.1f}s for Pico boot/bridge startup before sending.")
             time.sleep(self.startup_delay)
         rx_thread = threading.Thread(target=self.rx_loop, name="uart-rx", daemon=True)
         tx_thread = threading.Thread(target=self.tx_loop, name="uart-tx", daemon=True)
-        router_thread = threading.Thread(target=self.router_loop, name="router-pump", daemon=True)
         rx_thread.start()
         tx_thread.start()
-        router_thread.start()
 
         try:
             self.key_loop()
@@ -323,7 +291,6 @@ class UartPacketBridge:
         self.stop_event.set()
         rx_thread.join(timeout=1.0)
         tx_thread.join(timeout=1.0)
-        router_thread.join(timeout=1.0)
         self.ser.close()
         return 0
 
