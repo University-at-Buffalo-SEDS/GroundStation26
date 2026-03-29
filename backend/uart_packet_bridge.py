@@ -67,6 +67,13 @@ DISCOVERY_ENDPOINT = _enum_value(
     "DISCOVERY",
     "Discovery",
 )
+HEARTBEAT_ENDPOINT = _enum_value(
+    EP,
+    "HEART_BEAT",
+    "HeartBeat",
+    "HEARTBEAT",
+    "Heartbeat",
+)
 DEFAULT_ENDPOINTS = [GROUNDSTATION_ENDPOINT]
 RX_SCAN_MAX = 4096
 
@@ -109,6 +116,7 @@ class UartPacketBridge:
                 (FLIGHT_STATE_ENDPOINT, self._handle_flight_state_packet, None),
                 (SD_CARD_ENDPOINT, self._handle_sd_card_packet, None),
                 (DISCOVERY_ENDPOINT, self._handle_discovery_packet, None),
+                (HEARTBEAT_ENDPOINT, self._handle_heartbeat_packet, None),
             ],
             mode=RM.Sink,
         )
@@ -121,7 +129,6 @@ class UartPacketBridge:
         with self.serial_lock:
             self.ser.write(wire)
             self.ser.flush()
-        print(f"[TX Wire] {len(wire)} bytes: {_hex(wire)}")
 
     def _dispatch_received_packet(self, frame: bytes) -> None:
         with self.router_lock:
@@ -148,6 +155,10 @@ class UartPacketBridge:
 
     def _handle_discovery_packet(self, pkt: seds.Packet) -> None:
         print("[RX Discovery]")
+        print(pkt)
+
+    def _handle_heartbeat_packet(self, pkt: seds.Packet) -> None:
+        print("[RX Heartbeat Endpoint]")
         print(pkt)
 
     def _print_observed_packet(self, pkt: seds.Packet) -> None:
@@ -237,6 +248,7 @@ class UartPacketBridge:
             if not chunk:
                 continue
 
+            print(f"[RX Chunk] {len(chunk)} bytes: {_hex(chunk)}")
             self.rx_buffer.extend(chunk)
             self._drain_rx_buffer()
 

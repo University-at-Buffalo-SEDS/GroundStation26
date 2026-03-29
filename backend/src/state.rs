@@ -201,7 +201,9 @@ impl AppState {
                 let mut endpoints = snapshot
                     .advertised_endpoints
                     .iter()
-                    .map(DataEndpoint::as_str)
+                    .copied()
+                    .filter(|ep| *ep != DataEndpoint::GroundStation)
+                    .map(|ep| ep.as_str())
                     .map(str::to_string)
                     .collect::<Vec<_>>();
                 endpoints.sort();
@@ -238,7 +240,9 @@ impl AppState {
                 let mut endpoints = route
                     .reachable_endpoints
                     .iter()
-                    .map(DataEndpoint::as_str)
+                    .copied()
+                    .filter(|ep| *ep != DataEndpoint::GroundStation)
+                    .map(|ep| ep.as_str())
                     .map(str::to_string)
                     .collect::<Vec<_>>();
                 endpoints.sort();

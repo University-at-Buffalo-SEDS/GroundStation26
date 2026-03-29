@@ -101,6 +101,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Build and run in debug mode for faster compile times.",
     )
+    parser.add_argument(
+        "--backend-only-build",
+        action="store_true",
+        help="Skip the frontend rebuild and only rebuild/run the backend.",
+    )
     return parser.parse_args()
 
 
@@ -127,11 +132,12 @@ def main() -> None:
     if features:
         cmd.extend(["--features", ",".join(features)])
     repo_root = Path(__file__).resolve().parent
-    frontend_cmd = [sys.executable, str(repo_root / "frontend" / "build.py"), "frontend_web"]
-    if debug_mode:
-        frontend_cmd.append("debug")
-    print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")
-    subprocess.run(frontend_cmd, cwd=repo_root, check=True)
+    if not args.backend_only_build:
+        frontend_cmd = [sys.executable, str(repo_root / "frontend" / "build.py"), "frontend_web"]
+        if debug_mode:
+            frontend_cmd.append("debug")
+        print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")
+        subprocess.run(frontend_cmd, cwd=repo_root, check=True)
     try:
         run(cmd, cwd=repo_root)
     except subprocess.CalledProcessError as e:

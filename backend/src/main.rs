@@ -635,7 +635,10 @@ async fn main() -> anyhow::Result<()> {
         let umbilical_comms = Arc::clone(&umbilical_comms);
         let opts = RouterSideOptions {
             reliable_enabled: !matches!(comms_links.fill_box, crate::comms_config::CommsLinkConfig::I2c { .. }),
-            link_local_enabled: false,
+            // The Pico bridge on the I2C side needs router-local packets (for example
+            // GroundStation-addressed traffic and local heartbeat/discovery flow) to traverse
+            // the physical link so it can forward them back out over its UART/USB bridge.
+            link_local_enabled: true,
         };
         router.add_side_serialized_with_options("umbilical_comms", move |pkt| {
             let mut guard = umbilical_comms
