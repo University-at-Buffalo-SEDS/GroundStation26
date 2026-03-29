@@ -1538,13 +1538,6 @@ async fn handle_packet(
     db_overflow: &DbOverflow,
     pkt: Packet,
 ) -> Option<TelemetryRow> {
-    eprintln!(
-        "processing packet: sender={} ty={:?} endpoints={:?} payload_len={}",
-        pkt.sender(),
-        pkt.data_type(),
-        pkt.endpoints(),
-        pkt.payload().len()
-    );
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
 
     if pkt.data_type() == DataType::Warning {

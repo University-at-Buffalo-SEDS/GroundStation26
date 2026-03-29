@@ -330,7 +330,11 @@ impl AppState {
             }
         };
 
-        for entry in board_snapshot.boards.iter().filter(|entry| entry.seen) {
+        for entry in board_snapshot
+            .boards
+            .iter()
+            .filter(|entry| entry.seen && entry.board != Board::GroundStation)
+        {
             let node_id = format!("board_{}", entry.sender_id.to_ascii_lowercase());
             let status = if simulated {
                 NetworkTopologyStatus::Simulated
@@ -350,10 +354,7 @@ impl AppState {
                     .age_ms
                     .map(|age_ms| format!("Last packet {} ms ago", age_ms)),
             });
-
-            let source = if entry.board == Board::GroundStation {
-                "router".to_string()
-            } else if let Some(side_name) = board_side(entry.board) {
+            let source = if let Some(side_name) = board_side(entry.board) {
                 side_ids
                     .get(side_name)
                     .cloned()
