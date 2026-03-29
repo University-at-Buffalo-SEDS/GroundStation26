@@ -326,15 +326,22 @@ impl I2cComms {
     fn read_frame(&mut self) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
         match self.read_staged_frame() {
             Ok(frame) => Ok(frame),
+            Err(read_err) if is_i2c_idle_read_error(read_err.as_ref()) => Ok(None),
             Err(read_err) => {
                 // Some Pico firmware revisions expose staged responses on plain reads and
                 // NACK explicit empty-poll writes. Fall back to the poll-write path only if
                 // the direct read failed.
-                self.write_request_frame(&[]).and_then(|_| self.read_staged_frame()).map_err(
-                    |poll_err| {
-                        format!("i2c staged read failed: {read_err}; poll-read fallback failed: {poll_err}").into()
-                    },
-                )
+                match self
+                    .write_request_frame(&[])
+                    .and_then(|_| self.read_staged_frame())
+                {
+                    Ok(frame) => Ok(frame),
+                    Err(poll_err) if is_i2c_idle_read_error(poll_err.as_ref()) => Ok(None),
+                    Err(poll_err) => Err(format!(
+                        "i2c staged read failed: {read_err}; poll-read fallback failed: {poll_err}"
+                    )
+                    .into()),
+                }
             }
         }
     }
@@ -965,6 +972,15 @@ fn build_i2c_request_frame(payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+#[cfg(target_os = "linux")]
+fn is_i2c_idle_read_error(err: &(dyn Error + 'static)) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| {
+            code == libc::ETIMEDOUT || code == libc::EREMOTEIO || code == libc::ENXIO
+        })
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -981,6 +997,12 @@ mod tests {
         assert_eq!(frame.len(), MAX_PACKET_SIZE + 2);
         assert_eq!(frame[0], I2C_REQ_DATA_MAGIC);
         assert_eq!(frame[1], MAX_PACKET_SIZE as u8);
+    }
+
+    #[test]
+    fn timed_out_i2c_read_is_treated_as_idle() {
+        let err = std::io::Error::from_raw_os_error(libc::ETIMEDOUT);
+        assert!(is_i2c_idle_read_error(&err));
     }
 }
 

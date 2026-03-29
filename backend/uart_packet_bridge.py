@@ -31,6 +31,7 @@ except ModuleNotFoundError:
 
 DT = seds.DataType
 EP = seds.DataEndpoint
+RM = seds.RouterMode
 
 
 def _enum_value(enum_cls, *names: str) -> int:
@@ -49,6 +50,16 @@ DEFAULT_ENDPOINT = _enum_value(
     EP,
     "GROUND_STATION",
     "GroundStation",
+    "SD_CARD",
+    "SdCard",
+)
+FLIGHT_STATE_ENDPOINT = _enum_value(
+    EP,
+    "FLIGHT_STATE",
+    "FlightState",
+)
+SD_CARD_ENDPOINT = _enum_value(
+    EP,
     "SD_CARD",
     "SdCard",
 )
@@ -85,13 +96,42 @@ class UartPacketBridge:
             inter_byte_timeout=0.02,
             write_timeout=1.0,
         )
+        self.router = seds.Router(
+            now_ms=_now_ms,
+            handlers=[
+                (FLIGHT_STATE_ENDPOINT, self._handle_flight_state_packet, None),
+                (SD_CARD_ENDPOINT, self._handle_sd_card_packet, None),
+            ],
+            mode=RM.Sink,
+        )
+        self.router_side_id = self.router.add_side_serialized("UART", self._tx_serialized)
 
     def _write_packet(self, packet: seds.Packet) -> None:
-        wire = bytes(packet.serialize())
-        # print(wire)
+        self.router.transmit_message_queue(packet)
+        self.router.process_all_queues()
+
+    def _tx_serialized(self, wire: bytes) -> None:
         with self.serial_lock:
             self.ser.write(wire)
             self.ser.flush()
+
+    def _dispatch_received_packet(self, frame: bytes) -> None:
+        self.router.receive_serialized_queue_from_side(self.router_side_id, frame)
+        self.router.process_all_queues()
+
+    def _handle_flight_state_packet(self, pkt: seds.Packet) -> None:
+        print("[RX FlightState]")
+        print(pkt)
+        try:
+            data = pkt.data_as_u8()
+        except Exception:
+            return
+        if data:
+            print(f"[RX FlightState Value] {data[0]}")
+
+    def _handle_sd_card_packet(self, pkt: seds.Packet) -> None:
+        print("[RX SdCard]")
+        print(pkt)
 
     def _build_gps_packet(self) -> seds.Packet:
         offset = self.gps_index * 0.0001
@@ -147,8 +187,7 @@ class UartPacketBridge:
         frame = bytes(pkt.serialize())
         self.rx_buffer.clear()
         print(f"[RX Wire] {len(frame)} bytes: {_hex(frame)}")
-        print("[RX Packet]")
-        print(pkt)
+        self._dispatch_received_packet(frame)
 
     def rx_loop(self) -> None:
         while not self.stop_event.is_set():
