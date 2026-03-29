@@ -995,7 +995,11 @@ pub async fn telemetry_task(
             let router = router.clone();
             let mut comms_shutdown_rx = state.shutdown_subscribe();
             tokio::spawn(async move {
-                let mut comms_interval = interval(Duration::from_millis(2));
+                let poll_interval = {
+                    let guard = comms.lock().expect("failed to get lock");
+                    guard.recv_poll_interval()
+                };
+                let mut comms_interval = interval(poll_interval);
                 comms_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {

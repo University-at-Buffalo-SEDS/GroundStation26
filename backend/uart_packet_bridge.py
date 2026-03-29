@@ -45,6 +45,7 @@ def _enum_value(enum_cls, *names: str) -> int:
 
 
 GPS_TYPE = _enum_value(DT, "GPS_DATA", "GpsData")
+HEARTBEAT_TYPE = _enum_value(DT, "HEARTBEAT", "Heartbeat")
 MESSAGE_TYPE = _enum_value(DT, "MESSAGE_DATA", "MessageData", "GENERIC_ERROR", "GenericError")
 DEFAULT_ENDPOINT = _enum_value(
     EP,
@@ -133,6 +134,12 @@ class UartPacketBridge:
         print("[RX SdCard]")
         print(pkt)
 
+    def _print_observed_packet(self, pkt: seds.Packet) -> None:
+        pkt_type = getattr(pkt, "ty", None)
+        if pkt_type == HEARTBEAT_TYPE:
+            print("[RX Heartbeat]")
+            print(pkt)
+
     def _build_gps_packet(self) -> seds.Packet:
         offset = self.gps_index * 0.0001
         payload = struct.pack(
@@ -187,6 +194,7 @@ class UartPacketBridge:
         frame = bytes(pkt.serialize())
         self.rx_buffer.clear()
         print(f"[RX Wire] {len(frame)} bytes: {_hex(frame)}")
+        self._print_observed_packet(pkt)
         self._dispatch_received_packet(frame)
 
     def rx_loop(self) -> None:
