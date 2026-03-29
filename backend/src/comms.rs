@@ -48,6 +48,8 @@ const I2C_KIND_IDLE: u8 = 0;
 #[cfg(target_os = "linux")]
 const I2C_KIND_DATA: u8 = 1;
 #[cfg(target_os = "linux")]
+const I2C_KIND_ERROR: u8 = 127;
+#[cfg(target_os = "linux")]
 const I2C_FLAG_START: u8 = 0x01;
 #[cfg(target_os = "linux")]
 const I2C_FLAG_END: u8 = 0x02;
@@ -478,6 +480,9 @@ fn decode_i2c_slot(raw: &[u8; I2C_SLOT_SIZE]) -> Result<Option<I2cMailboxSlot>, 
     if all_zero || all_ff {
         return Ok(None);
     }
+    if raw[0] == 0x00 && raw[1] == 0x00 {
+        return Ok(None);
+    }
     if raw[0] != I2C_SLOT_MAGIC_0 || raw[1] != I2C_SLOT_MAGIC_1 {
         return Err(
             std::io::Error::other(format!(
@@ -725,7 +730,12 @@ impl I2cComms {
         let assembly = self
             .rx_assembly
             .as_mut()
-            .ok_or_else(|| std::io::Error::other("i2c slot arrived without an active transfer"))?;
+            .ok_or_else(|| {
+                std::io::Error::other("i2c slot arrived without an active transfer")
+            });
+        let Ok(assembly) = assembly else {
+            return Ok(None);
+        };
         let completed = assembly.push(&slot)?;
         if completed.is_some() {
             self.rx_assembly = None;
@@ -787,7 +797,14 @@ impl CommsDevice for I2cComms {
                         })? {
                             maybe_log_i2c_decoded(&payload);
                             if kind != I2C_KIND_DATA {
-                                eprintln!("i2c non-data packet kind {kind} ignored");
+                                if kind == I2C_KIND_ERROR {
+                                    eprintln!(
+                                        "i2c error packet: {}",
+                                        String::from_utf8_lossy(&payload)
+                                    );
+                                } else {
+                                    eprintln!("i2c non-data packet kind {kind} ignored");
+                                }
                                 return Ok(());
                             }
                             if let Err(err) = router.rx_serialized_queue_from_side(&payload, side_id) {
