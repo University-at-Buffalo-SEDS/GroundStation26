@@ -115,17 +115,18 @@ class UartPacketBridge:
             mode=RM.Sink,
         )
         self.router_side_id = self.router.add_side_serialized("UART", self._tx_serialized)
-        self.discovery_supported = hasattr(self.router, "poll_discovery")
-        self.discovery_announce_supported = hasattr(self.router, "announce_discovery")
-        if self.discovery_announce_supported:
-            with self.router_lock:
-                self.router.announce_discovery()
-                self.router.process_all_queues()
+        if not hasattr(self.router, "poll_discovery") or not hasattr(self.router, "announce_discovery"):
+            raise RuntimeError(
+                "The installed sedsprintf Python bindings do not expose discovery methods. "
+                "Rebuild or reinstall the module with discovery-enabled Router APIs."
+            )
+        with self.router_lock:
+            self.router.announce_discovery()
+            self.router.process_all_queues()
 
     def _write_packet(self, packet: seds.Packet) -> None:
-        with self.router_lock:
-            self.router.transmit_message_queue(packet)
-            self.router.process_all_queues()
+        wire = bytes(packet.serialize())
+        self._tx_serialized(wire)
 
     def _tx_serialized(self, wire: bytes) -> None:
         with self.serial_lock:
@@ -140,8 +141,7 @@ class UartPacketBridge:
 
     def _pump_router(self) -> None:
         with self.router_lock:
-            if self.discovery_supported:
-                self.router.poll_discovery()
+            self.router.poll_discovery()
             self.router.process_all_queues_with_timeout(20)
 
     def _handle_groundstation_packet(self, pkt: seds.Packet) -> None:
@@ -303,6 +303,7 @@ class UartPacketBridge:
     def run(self) -> int:
         print(f"Listening on {self.port} at {self.baud} baud as sender '{self.sender}'.")
         print("Keys: 'w' sends a GPS warning, 'g' sends GPS now, 'q' quits.")
+        print("Discovery: enabled")
         if self.startup_delay > 0:
             print(f"Waiting {self.startup_delay:.1f}s for Pico boot/bridge startup before sending.")
             time.sleep(self.startup_delay)

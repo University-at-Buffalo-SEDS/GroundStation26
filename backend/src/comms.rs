@@ -28,6 +28,7 @@ pub const UMBILICAL_COMMS_PORT: &str = "/dev/ttyUSB2";
 pub const COMMS_BAUD_RATE: usize = 57_600;
 pub const MAX_PACKET_SIZE: usize = 256;
 const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
+const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
 #[cfg(target_os = "linux")]
 const I2C_FRAME_SIZE: usize = 258;
 #[cfg(target_os = "linux")]
@@ -165,6 +166,7 @@ impl UartComms {
             Ok(0) => Ok(()),
             Ok(n) => {
                 self.rx_buf.extend_from_slice(&scratch[..n]);
+                maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
                 Ok(())
             }
             Err(err) if is_idle_serial_timeout(&err) => Ok(()),
@@ -210,7 +212,20 @@ impl UartComms {
 
         if self.rx_buf.len() > RAW_UART_MAX_FRAME_BYTES {
             let drop_len = self.rx_buf.len() - RAW_UART_MAX_FRAME_BYTES;
+            maybe_log_raw_uart_parse_issue(
+                "dropping oversized raw UART buffer",
+                &self.rx_buf[..self.rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+            );
             self.rx_buf.drain(..drop_len);
+        }
+
+        if !self.rx_buf.is_empty() {
+            if let Err(err) = serialize::peek_frame_info(&self.rx_buf) {
+                maybe_log_raw_uart_parse_issue(
+                    &format!("raw UART parse pending: {err}"),
+                    &self.rx_buf[..self.rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+                );
+            }
         }
 
         Ok(None)
@@ -229,6 +244,57 @@ fn is_idle_serial_timeout(err: &std::io::Error) -> bool {
         err.kind(),
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
     )
+}
+
+fn raw_uart_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GS_RAW_UART_DEBUG").ok().as_deref() == Some("1"))
+}
+
+fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    eprintln!(
+        "raw_uart rx {} bytes: {}",
+        bytes.len(),
+        hex_preview(bytes, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn maybe_log_raw_uart_parse_issue(context: &str, bytes: &[u8]) {
+    if !raw_uart_debug_enabled() {
+        return;
+    }
+    static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => 0,
+    };
+    let last = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 500 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "{context}; buffered {} bytes: {}",
+        bytes.len(),
+        hex_preview(bytes, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn hex_preview(bytes: &[u8], limit: usize) -> String {
+    let preview = bytes
+        .iter()
+        .take(limit)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if bytes.len() > limit {
+        format!("{preview} ...")
+    } else {
+        preview
+    }
 }
 
 impl CommsDevice for UartComms {
@@ -299,6 +365,8 @@ pub struct I2cComms {
     chunk_delay: Duration,
     #[cfg(target_os = "linux")]
     initial_wait: Duration,
+    #[cfg(target_os = "linux")]
+    tx_backoff_until: Option<std::time::Instant>,
 }
 
 impl I2cComms {
@@ -313,6 +381,7 @@ impl I2cComms {
                 addr: cfg.addr,
                 chunk_delay: Duration::from_millis(cfg.chunk_delay_ms),
                 initial_wait: Duration::from_millis(cfg.initial_wait_ms),
+                tx_backoff_until: None,
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -349,6 +418,17 @@ impl I2cComms {
     #[cfg(target_os = "linux")]
     fn write_frame(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.write_request_frame(payload)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tx_backoff_active(&self) -> bool {
+        self.tx_backoff_until
+            .is_some_and(|deadline| std::time::Instant::now() < deadline)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn arm_tx_backoff(&mut self) {
+        self.tx_backoff_until = Some(std::time::Instant::now() + Duration::from_secs(1));
     }
 
     #[cfg(target_os = "linux")]
@@ -455,10 +535,21 @@ impl CommsDevice for I2cComms {
 
         #[cfg(target_os = "linux")]
         {
-            self.write_frame(payload)?;
+            if self.tx_backoff_active() {
+                return Ok(());
+            }
+
+            if let Err(err) = self.write_frame(payload) {
+                if is_i2c_retryable_write_error(err.as_ref()) {
+                    self.arm_tx_backoff();
+                    return Ok(());
+                }
+                return Err(err);
+            }
             if !self.initial_wait.is_zero() {
                 std::thread::sleep(self.initial_wait);
             }
+            self.tx_backoff_until = None;
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
@@ -974,6 +1065,15 @@ fn build_i2c_request_frame(payload: &[u8]) -> Vec<u8> {
 
 #[cfg(target_os = "linux")]
 fn is_i2c_idle_read_error(err: &(dyn Error + 'static)) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| {
+            code == libc::ETIMEDOUT || code == libc::EREMOTEIO || code == libc::ENXIO
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn is_i2c_retryable_write_error(err: &(dyn Error + 'static)) -> bool {
     err.downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error)
         .is_some_and(|code| {
