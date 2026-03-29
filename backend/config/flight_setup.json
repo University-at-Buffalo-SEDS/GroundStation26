@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "selected_profile_id": "wind_3",
+  "profiles": [
+    {
+      "id": "wind_1",
+      "label": "Wind 1",
+      "wind_level": 1,
+      "kalman": {
+        "process_position_variance": 0.08,
+        "process_velocity_variance": 0.12,
+        "accel_variance": 0.2,
+        "baro_altitude_variance": 0.55,
+        "gps_altitude_variance": 1.1,
+        "gps_velocity_variance": 0.85
+      }
+    },
+    {
+      "id": "wind_2",
+      "label": "Wind 2",
+      "wind_level": 2,
+      "kalman": {
+        "process_position_variance": 0.1,
+        "process_velocity_variance": 0.15,
+        "accel_variance": 0.24,
+        "baro_altitude_variance": 0.65,
+        "gps_altitude_variance": 1.2,
+        "gps_velocity_variance": 0.95
+      }
+    },
+    {
+      "id": "wind_3",
+      "label": "Wind 3",
+      "wind_level": 3,
+      "kalman": {
+        "process_position_variance": 0.12,
+        "process_velocity_variance": 0.18,
+        "accel_variance": 0.3,
+        "baro_altitude_variance": 0.78,
+        "gps_altitude_variance": 1.35,
+        "gps_velocity_variance": 1.1
+      }
+    },
+    {
+      "id": "wind_4",
+      "label": "Wind 4",
+      "wind_level": 4,
+      "kalman": {
+        "process_position_variance": 0.16,
+        "process_velocity_variance": 0.23,
+        "accel_variance": 0.38,
+        "baro_altitude_variance": 0.92,
+        "gps_altitude_variance": 1.55,
+        "gps_velocity_variance": 1.28
+      }
+    },
+    {
+      "id": "wind_5",
+      "label": "Wind 5",
+      "wind_level": 5,
+      "kalman": {
+        "process_position_variance": 0.21,
+        "process_velocity_variance": 0.3,
+        "accel_variance": 0.48,
+        "baro_altitude_variance": 1.08,
+        "gps_altitude_variance": 1.8,
+        "gps_velocity_variance": 1.46
+      }
+    },
+    {
+      "id": "wind_6",
+      "label": "Wind 6",
+      "wind_level": 6,
+      "kalman": {
+        "process_position_variance": 0.27,
+        "process_velocity_variance": 0.38,
+        "accel_variance": 0.6,
+        "baro_altitude_variance": 1.28,
+        "gps_altitude_variance": 2.1,
+        "gps_velocity_variance": 1.68
+      }
+    }
+  ]
+}

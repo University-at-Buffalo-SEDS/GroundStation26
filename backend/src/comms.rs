@@ -5,9 +5,9 @@ use crate::comms_config::{
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
 use sedsprintf_rs_2026::{
-    TelemetryError, TelemetryResult,
-    router::{Router, RouterSideId},
-    serialize,
+    router::{Router, RouterSideId}, serialize,
+    TelemetryError,
+    TelemetryResult,
 };
 use serial::{SerialPort, SystemPort};
 use std::error::Error;
@@ -53,6 +53,11 @@ const I2C_KIND_ERROR: u8 = 127;
 const I2C_FLAG_START: u8 = 0x01;
 #[cfg(target_os = "linux")]
 const I2C_FLAG_END: u8 = 0x02;
+
+#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+const DUMMY_ROCKET_TIMESYNC_SOURCES: &[&str] = &["RF", "FC", "PB"];
+#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GW", "VB", "AB", "DAQ"];
 
 // ======================================================================
 //  Comms Device Trait
@@ -410,7 +415,10 @@ impl I2cRxAssembly {
         })
     }
 
-    fn push(&mut self, slot: &I2cMailboxSlot) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
+    fn push(
+        &mut self,
+        slot: &I2cMailboxSlot,
+    ) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
         if slot.kind != self.kind {
             return Err(std::io::Error::other("i2c transfer kind changed mid-stream").into());
         }
@@ -474,7 +482,9 @@ fn encode_i2c_slot(
 }
 
 #[cfg(target_os = "linux")]
-fn decode_i2c_slot(raw: &[u8; I2C_SLOT_SIZE]) -> Result<Option<I2cMailboxSlot>, Box<dyn Error + Send + Sync>> {
+fn decode_i2c_slot(
+    raw: &[u8; I2C_SLOT_SIZE],
+) -> Result<Option<I2cMailboxSlot>, Box<dyn Error + Send + Sync>> {
     let all_zero = raw.iter().all(|byte| *byte == 0x00);
     let all_ff = raw.iter().all(|byte| *byte == 0xFF);
     if all_zero || all_ff {
@@ -484,20 +494,16 @@ fn decode_i2c_slot(raw: &[u8; I2C_SLOT_SIZE]) -> Result<Option<I2cMailboxSlot>, 
         return Ok(None);
     }
     if raw[0] != I2C_SLOT_MAGIC_0 || raw[1] != I2C_SLOT_MAGIC_1 {
-        return Err(
-            std::io::Error::other(format!(
-                "invalid i2c slot magic: {:02x} {:02x}",
-                raw[0], raw[1]
-            ))
-            .into(),
-        );
-    }
-    if raw[2] != I2C_SLOT_VERSION {
         return Err(std::io::Error::other(format!(
-            "unsupported i2c slot version: {}",
-            raw[2]
+            "invalid i2c slot magic: {:02x} {:02x}",
+            raw[0], raw[1]
         ))
         .into());
+    }
+    if raw[2] != I2C_SLOT_VERSION {
+        return Err(
+            std::io::Error::other(format!("unsupported i2c slot version: {}", raw[2])).into(),
+        );
     }
     let kind = raw[3];
     if kind == I2C_KIND_IDLE {
@@ -509,10 +515,9 @@ fn decode_i2c_slot(raw: &[u8; I2C_SLOT_SIZE]) -> Result<Option<I2cMailboxSlot>, 
     let data_len = u16::from_le_bytes(raw[14..16].try_into().unwrap()) as usize;
     let transfer_id = u16::from_le_bytes(raw[16..18].try_into().unwrap());
     if data_len > I2C_SLOT_PAYLOAD_SIZE {
-        return Err(std::io::Error::other(format!(
-            "invalid i2c slot payload length: {data_len}"
-        ))
-        .into());
+        return Err(
+            std::io::Error::other(format!("invalid i2c slot payload length: {data_len}")).into(),
+        );
     }
     let data = raw[I2C_SLOT_HEADER_SIZE..I2C_SLOT_HEADER_SIZE + data_len].to_vec();
     Ok(Some(I2cMailboxSlot {
@@ -701,7 +706,14 @@ impl I2cComms {
             if end >= total_len {
                 flags |= I2C_FLAG_END;
             }
-            let slot = encode_i2c_slot(kind, flags, transfer_id, offset as u32, total_len as u32, &payload[offset..end]);
+            let slot = encode_i2c_slot(
+                kind,
+                flags,
+                transfer_id,
+                offset as u32,
+                total_len as u32,
+                &payload[offset..end],
+            );
             maybe_log_i2c_frame("i2c tx slot", &slot);
             self.transfer_write(&slot)?;
             offset = end;
@@ -733,9 +745,7 @@ impl I2cComms {
         let assembly = self
             .rx_assembly
             .as_mut()
-            .ok_or_else(|| {
-                std::io::Error::other("i2c slot arrived without an active transfer")
-            });
+            .ok_or_else(|| std::io::Error::other("i2c slot arrived without an active transfer"));
         let Ok(assembly) = assembly else {
             return Ok(None);
         };
@@ -1206,6 +1216,8 @@ impl CommsDevice for CanComms {
 pub struct DummyComms {
     name: &'static str,
     side_id: Option<RouterSideId>,
+    discovery_next_announce_ms: u64,
+    pending_rx: std::collections::VecDeque<sedsprintf_rs_2026::packet::Packet>,
 }
 
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
@@ -1215,7 +1227,73 @@ impl DummyComms {
         DummyComms {
             name,
             side_id: None,
+            discovery_next_announce_ms: 0,
+            pending_rx: std::collections::VecDeque::new(),
         }
+    }
+
+    fn simulated_discovery_sender(&self) -> &'static str {
+        match self.name {
+            "Rocket Comms" => crate::types::Board::RFBoard.sender_id(),
+            "Umbilical Comms" => crate::types::Board::GatewayBoard.sender_id(),
+            _ => crate::types::Board::GroundStation.sender_id(),
+        }
+    }
+
+    fn simulated_discovery_endpoints(&self) -> &'static [sedsprintf_rs_2026::config::DataEndpoint] {
+        use sedsprintf_rs_2026::config::DataEndpoint;
+
+        match self.name {
+            "Rocket Comms" => &[
+                DataEndpoint::FlightController,
+                DataEndpoint::FlightState,
+                DataEndpoint::SdCard,
+            ],
+            "Umbilical Comms" => &[
+                DataEndpoint::ValveBoard,
+                DataEndpoint::ActuatorBoard,
+                DataEndpoint::Abort,
+            ],
+            _ => &[],
+        }
+    }
+
+    fn simulated_timesync_sources(&self) -> &'static [&'static str] {
+        match self.name {
+            "Rocket Comms" => DUMMY_ROCKET_TIMESYNC_SOURCES,
+            "Umbilical Comms" => DUMMY_UMBILICAL_TIMESYNC_SOURCES,
+            _ => &[],
+        }
+    }
+
+    fn maybe_queue_discovery(&mut self) -> TelemetryResult<()> {
+        let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+        if now_ms < self.discovery_next_announce_ms {
+            return Ok(());
+        }
+
+        let sender = self.simulated_discovery_sender();
+        let endpoints = self.simulated_discovery_endpoints();
+        if !endpoints.is_empty() {
+            self.pending_rx
+                .push_back(sedsprintf_rs_2026::discovery::build_discovery_announce(
+                    sender, now_ms, endpoints,
+                )?);
+        }
+        let timesync_sources = self.simulated_timesync_sources();
+        if !timesync_sources.is_empty() {
+            self.pending_rx.push_back(
+                sedsprintf_rs_2026::discovery::build_discovery_timesync_sources(
+                    sender,
+                    now_ms,
+                    timesync_sources,
+                )?,
+            );
+        }
+
+        self.discovery_next_announce_ms =
+            now_ms.saturating_add(sedsprintf_rs_2026::discovery::DISCOVERY_SLOW_INTERVAL_MS);
+        Ok(())
     }
 }
 
@@ -1227,6 +1305,10 @@ impl CommsDevice for DummyComms {
             let side_id = self
                 .side_id
                 .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
+            self.maybe_queue_discovery()?;
+            if let Some(pkt) = self.pending_rx.pop_front() {
+                return _router.rx_queue_from_side(pkt, side_id);
+            }
             let pkt = get_dummy_packet()?;
             return _router.rx_queue_from_side(pkt, side_id);
         }

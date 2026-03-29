@@ -2,7 +2,7 @@ use crate::auth::AuthManager;
 use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
-use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
+use crate::sequences::{command_name, ActionPolicyMsg, PersistentNotification};
 use crate::types::{
     Board, BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyLink, NetworkTopologyMsg,
     NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus, TelemetryCommand,
@@ -16,7 +16,7 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -202,7 +202,6 @@ impl AppState {
                     .advertised_endpoints
                     .iter()
                     .copied()
-                    .filter(|ep| *ep != DataEndpoint::GroundStation)
                     .map(|ep| ep.as_str())
                     .map(str::to_string)
                     .collect::<Vec<_>>();
@@ -211,6 +210,29 @@ impl AppState {
                 endpoints
             })
             .unwrap_or_default();
+        let side_endpoints = |side_name: &str| {
+            let mut endpoints = route_snapshot
+                .and_then(|snapshot| {
+                    snapshot
+                        .routes
+                        .iter()
+                        .find(|route| route.side_name == side_name)
+                })
+                .map(|route| {
+                    route
+                        .reachable_endpoints
+                        .iter()
+                        .copied()
+                        .map(|ep| ep.as_str().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            endpoints.sort();
+            endpoints.dedup();
+            endpoints
+        };
+        let rocket_side_endpoints = side_endpoints("rocket_comms");
+        let fill_side_endpoints = side_endpoints("umbilical_comms");
 
         let mut nodes = vec![NetworkTopologyNode {
             id: "router".to_string(),
@@ -227,12 +249,6 @@ impl AppState {
         let mut endpoint_ids = std::collections::BTreeSet::new();
         let mut side_ids = std::collections::BTreeMap::<String, String>::new();
 
-        let side_physical_online = |side_name: &str| match side_name {
-            "rocket_comms" => simulated || self.av_bay_comms_connected.load(Ordering::Relaxed),
-            "umbilical_comms" => simulated || self.fill_comms_connected.load(Ordering::Relaxed),
-            _ => simulated,
-        };
-
         if let Some(snapshot) = route_snapshot {
             for route in &snapshot.routes {
                 let side_id = format!("side_{}", route.side_name.to_ascii_lowercase());
@@ -241,7 +257,6 @@ impl AppState {
                     .reachable_endpoints
                     .iter()
                     .copied()
-                    .filter(|ep| *ep != DataEndpoint::GroundStation)
                     .map(|ep| ep.as_str())
                     .map(str::to_string)
                     .collect::<Vec<_>>();
@@ -261,10 +276,7 @@ impl AppState {
                     sender_id: None,
                     endpoints: endpoints.clone(),
                     show_in_details: true,
-                    detail: Some(format!(
-                        "Last discovery route {} ms ago",
-                        route.age_ms
-                    )),
+                    detail: Some(format!("Last discovery route {} ms ago", route.age_ms)),
                 });
                 links.push(NetworkTopologyLink {
                     source: "router".to_string(),
@@ -272,7 +284,10 @@ impl AppState {
                     label: Some("route".to_string()),
                     status,
                 });
-                for endpoint in endpoints {
+                for endpoint in endpoints
+                    .into_iter()
+                    .filter(|endpoint| endpoint != DataEndpoint::GroundStation.as_str())
+                {
                     let endpoint_id = format!("endpoint_{}", endpoint.to_ascii_lowercase());
                     if endpoint_ids.insert(endpoint_id.clone()) {
                         nodes.push(NetworkTopologyNode {
@@ -297,7 +312,10 @@ impl AppState {
             }
         }
 
-        for endpoint in &local_endpoint_list {
+        for endpoint in local_endpoint_list
+            .iter()
+            .filter(|endpoint| endpoint.as_str() != DataEndpoint::GroundStation.as_str())
+        {
             let endpoint_id = format!("endpoint_{}", endpoint.to_ascii_lowercase());
             if endpoint_ids.insert(endpoint_id.clone()) {
                 nodes.push(NetworkTopologyNode {
@@ -324,11 +342,30 @@ impl AppState {
             match board {
                 Board::GroundStation => None,
                 Board::FlightComputer | Board::RFBoard | Board::PowerBoard => Some("rocket_comms"),
-                Board::ValveBoard | Board::GatewayBoard | Board::ActuatorBoard | Board::DaqBoard => {
-                    Some("umbilical_comms")
-                }
+                Board::ValveBoard
+                | Board::GatewayBoard
+                | Board::ActuatorBoard
+                | Board::DaqBoard => Some("umbilical_comms"),
             }
         };
+        let side_relay = |side_name: &str| -> Option<Board> {
+            match side_name {
+                "rocket_comms" => Some(Board::RFBoard),
+                "umbilical_comms" => Some(Board::GatewayBoard),
+                _ => None,
+            }
+        };
+        let seen_boards = board_snapshot
+            .boards
+            .iter()
+            .filter(|entry| entry.seen && entry.board != Board::GroundStation)
+            .map(|entry| {
+                (
+                    entry.board,
+                    format!("board_{}", entry.sender_id.to_ascii_lowercase()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
 
         for entry in board_snapshot
             .boards
@@ -348,41 +385,28 @@ impl AppState {
                 status,
                 group: "board".to_string(),
                 sender_id: Some(entry.sender_id.clone()),
-                endpoints: Vec::new(),
+                endpoints: modeled_board_endpoints(
+                    entry.board,
+                    simulated,
+                    &local_endpoint_list,
+                    &rocket_side_endpoints,
+                    &fill_side_endpoints,
+                ),
                 show_in_details: true,
                 detail: entry
                     .age_ms
                     .map(|age_ms| format!("Last packet {} ms ago", age_ms)),
             });
             let source = if let Some(side_name) = board_side(entry.board) {
-                side_ids
-                    .get(side_name)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        let fallback_id = format!("side_{}", side_name.to_ascii_lowercase());
-                        if !nodes.iter().any(|node| node.id == fallback_id) {
-                            nodes.push(NetworkTopologyNode {
-                                id: fallback_id.clone(),
-                                label: side_name.to_string(),
-                                kind: NetworkTopologyNodeKind::Side,
-                                status: if side_physical_online(side_name) {
-                                    if simulated {
-                                        NetworkTopologyStatus::Simulated
-                                    } else {
-                                        NetworkTopologyStatus::Online
-                                    }
-                                } else {
-                                    NetworkTopologyStatus::Offline
-                                },
-                                group: "side".to_string(),
-                                sender_id: None,
-                                endpoints: Vec::new(),
-                                show_in_details: true,
-                                detail: Some("Physical side link".to_string()),
-                            });
-                        }
-                        fallback_id
-                    })
+                if side_relay(side_name) == Some(entry.board) {
+                    "router".to_string()
+                } else if let Some(relay_id) =
+                    side_relay(side_name).and_then(|relay| seen_boards.get(&relay))
+                {
+                    relay_id.clone()
+                } else {
+                    "router".to_string()
+                }
             } else {
                 "router".to_string()
             };
@@ -699,5 +723,74 @@ impl AppState {
             .iter()
             .cloned()
             .collect()
+    }
+}
+
+fn modeled_board_endpoints(
+    board: Board,
+    simulated: bool,
+    local_endpoint_list: &[String],
+    rocket_side_endpoints: &[String],
+    fill_side_endpoints: &[String],
+) -> Vec<String> {
+    if simulated {
+        return match board {
+            Board::GroundStation => local_endpoint_list.to_vec(),
+            Board::RFBoard => {
+                let mut endpoints = crate::flight_sim::simulated_board_endpoints(board);
+                endpoints.extend_from_slice(rocket_side_endpoints);
+                endpoints.sort();
+                endpoints.dedup();
+                endpoints
+            }
+            Board::GatewayBoard => {
+                let mut endpoints = crate::flight_sim::simulated_board_endpoints(board);
+                endpoints.extend_from_slice(fill_side_endpoints);
+                endpoints.sort();
+                endpoints.dedup();
+                endpoints
+            }
+            _ => crate::flight_sim::simulated_board_endpoints(board),
+        };
+    }
+
+    let mut endpoints = match board {
+        Board::GroundStation => local_endpoint_list.to_vec(),
+        Board::FlightComputer => vec![
+            DataEndpoint::FlightController.as_str().to_string(),
+            DataEndpoint::FlightState.as_str().to_string(),
+            DataEndpoint::SdCard.as_str().to_string(),
+        ],
+        Board::RFBoard => rocket_side_endpoints.to_vec(),
+        Board::PowerBoard => Vec::new(),
+        Board::ValveBoard => vec![
+            DataEndpoint::ValveBoard.as_str().to_string(),
+            DataEndpoint::Abort.as_str().to_string(),
+        ],
+        Board::GatewayBoard => fill_side_endpoints.to_vec(),
+        Board::ActuatorBoard => vec![
+            DataEndpoint::ActuatorBoard.as_str().to_string(),
+            DataEndpoint::Abort.as_str().to_string(),
+        ],
+        Board::DaqBoard => Vec::new(),
+    };
+
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flight_computer_modeled_endpoints_include_sd_card() {
+        let endpoints = modeled_board_endpoints(Board::FlightComputer, false, &[], &[], &[]);
+        assert!(
+            endpoints
+                .iter()
+                .any(|endpoint| endpoint == DataEndpoint::SdCard.as_str())
+        );
     }
 }

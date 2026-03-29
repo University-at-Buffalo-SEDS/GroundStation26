@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 // Acceleration thresholds (m/s²)
 const ACCELERATION_X_MIN_THRESHOLD: f32 = -2.0; // m/s²

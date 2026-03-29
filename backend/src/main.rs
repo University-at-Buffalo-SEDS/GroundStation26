@@ -5,6 +5,8 @@ mod comms;
 mod comms_config;
 #[cfg(feature = "testing")]
 mod dummy_packets;
+mod fill_targets;
+mod flight_setup;
 mod flight_sim;
 mod gpio;
 mod gpio_panel;
@@ -20,7 +22,7 @@ mod telemetry_task;
 mod types;
 mod web;
 
-use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
+use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
 use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
@@ -29,15 +31,15 @@ use crate::telemetry_task::{get_current_timestamp_ms, set_network_time_router, t
 
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
 use crate::comms::DummyComms;
-use crate::comms::{CommsDevice, link_description, open_link, startup_failure_hint};
+use crate::comms::{link_description, open_link, startup_failure_hint, CommsDevice};
 use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
-use sedsprintf_rs_2026::TelemetryError;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode, RouterSideOptions};
 use sedsprintf_rs_2026::timesync::{TimeSyncConfig, TimeSyncRole};
+use sedsprintf_rs_2026::TelemetryError;
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Connection, Row};
 use std::collections::HashMap;
@@ -617,38 +619,52 @@ async fn main() -> anyhow::Result<()> {
     let rocket_side = {
         let rocket_comms = Arc::clone(&rocket_comms);
         let opts = RouterSideOptions {
-            reliable_enabled: !matches!(comms_links.av_bay, crate::comms_config::CommsLinkConfig::I2c { .. }),
+            reliable_enabled: !matches!(
+                comms_links.av_bay,
+                crate::comms_config::CommsLinkConfig::I2c { .. }
+            ),
             link_local_enabled: false,
         };
-        router.add_side_serialized_with_options("rocket_comms", move |pkt| {
-            let mut guard = rocket_comms
-                .lock()
-                .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
-            if let Err(err) = guard.send_data(pkt) {
-                eprintln!("rocket_comms send failed: {err}");
-            }
-            Ok(())
-        }, opts)
+        router.add_side_serialized_with_options(
+            "rocket_comms",
+            move |pkt| {
+                let mut guard = rocket_comms
+                    .lock()
+                    .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
+                if let Err(err) = guard.send_data(pkt) {
+                    eprintln!("rocket_comms send failed: {err}");
+                }
+                Ok(())
+            },
+            opts,
+        )
     };
 
     let umbilical_side = {
         let umbilical_comms = Arc::clone(&umbilical_comms);
         let opts = RouterSideOptions {
-            reliable_enabled: !matches!(comms_links.fill_box, crate::comms_config::CommsLinkConfig::I2c { .. }),
+            reliable_enabled: !matches!(
+                comms_links.fill_box,
+                crate::comms_config::CommsLinkConfig::I2c { .. }
+            ),
             // The Pico bridge on the I2C side needs router-local packets (for example
             // GroundStation-addressed traffic and local heartbeat/discovery flow) to traverse
             // the physical link so it can forward them back out over its UART/USB bridge.
             link_local_enabled: true,
         };
-        router.add_side_serialized_with_options("umbilical_comms", move |pkt| {
-            let mut guard = umbilical_comms
-                .lock()
-                .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
-            if let Err(err) = guard.send_data(pkt) {
-                eprintln!("umbilical_comms send failed: {err}");
-            }
-            Ok(())
-        }, opts)
+        router.add_side_serialized_with_options(
+            "umbilical_comms",
+            move |pkt| {
+                let mut guard = umbilical_comms
+                    .lock()
+                    .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
+                if let Err(err) = guard.send_data(pkt) {
+                    eprintln!("umbilical_comms send failed: {err}");
+                }
+                Ok(())
+            },
+            opts,
+        )
     };
 
     rocket_comms

@@ -473,9 +473,12 @@ class LayoutEditor(tk.Tk):
         ttk.Button(chart_group_btns, text="Add", command=self._add_data_chart_group).pack(side=tk.LEFT, padx=4)
         ttk.Button(chart_group_btns, text="Update", command=self._update_data_chart_group).pack(side=tk.LEFT, padx=4)
         ttk.Button(chart_group_btns, text="Remove", command=self._remove_data_chart_group).pack(side=tk.LEFT, padx=4)
-        ttk.Button(chart_group_btns, text="Up", command=lambda: self._move_data_chart_group(-1)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(chart_group_btns, text="Down", command=lambda: self._move_data_chart_group(1)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(chart_group_btns, text="Clear Editor", command=self._clear_data_chart_group_editor).pack(side=tk.LEFT, padx=4)
+        ttk.Button(chart_group_btns, text="Up", command=lambda: self._move_data_chart_group(-1)).pack(side=tk.LEFT,
+                                                                                                      padx=4)
+        ttk.Button(chart_group_btns, text="Down", command=lambda: self._move_data_chart_group(1)).pack(side=tk.LEFT,
+                                                                                                       padx=4)
+        ttk.Button(chart_group_btns, text="Clear Editor", command=self._clear_data_chart_group_editor).pack(
+            side=tk.LEFT, padx=4)
 
         self.data_summary_items_frame = ttk.LabelFrame(form, text="Summary items")
         self.data_summary_items_frame.grid(row=14, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 4))
@@ -513,9 +516,12 @@ class LayoutEditor(tk.Tk):
         ttk.Button(data_summary_btns, text="Add", command=self._add_data_summary_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(data_summary_btns, text="Update", command=self._update_data_summary_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(data_summary_btns, text="Remove", command=self._remove_data_summary_item).pack(side=tk.LEFT, padx=4)
-        ttk.Button(data_summary_btns, text="Up", command=lambda: self._move_data_summary_item(-1)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(data_summary_btns, text="Down", command=lambda: self._move_data_summary_item(1)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(data_summary_btns, text="Clear Editor", command=self._clear_data_summary_item_editor).pack(side=tk.LEFT, padx=4)
+        ttk.Button(data_summary_btns, text="Up", command=lambda: self._move_data_summary_item(-1)).pack(side=tk.LEFT,
+                                                                                                        padx=4)
+        ttk.Button(data_summary_btns, text="Down", command=lambda: self._move_data_summary_item(1)).pack(side=tk.LEFT,
+                                                                                                         padx=4)
+        ttk.Button(data_summary_btns, text="Clear Editor", command=self._clear_data_summary_item_editor).pack(
+            side=tk.LEFT, padx=4)
         self._sync_data_bool_fields()
 
     # ------------------------
@@ -1272,11 +1278,11 @@ class LayoutEditor(tk.Tk):
     def _clear_data_subtab_editor(self) -> None:
         self._data_subtab_selected_idx = None
         for entry in (
-            self.data_subtab_id,
-            self.data_subtab_label,
-            self.data_subtab_data_type,
-            self.data_subtab_sender_id,
-            self.data_subtab_channels,
+                self.data_subtab_id,
+                self.data_subtab_label,
+                self.data_subtab_data_type,
+                self.data_subtab_sender_id,
+                self.data_subtab_channels,
         ):
             entry.delete(0, tk.END)
         self.data_subtab_chart.set(True)
@@ -1402,11 +1408,11 @@ class LayoutEditor(tk.Tk):
     def _clear_data_chart_group_editor(self) -> None:
         self._data_chart_group_selected_idx = None
         for entry in (
-            self.data_chart_group_title,
-            self.data_chart_group_data_type,
-            self.data_chart_group_sender_id,
-            self.data_chart_group_labels,
-            self.data_chart_group_channels,
+                self.data_chart_group_title,
+                self.data_chart_group_data_type,
+                self.data_chart_group_sender_id,
+                self.data_chart_group_labels,
+                self.data_chart_group_channels,
         ):
             entry.delete(0, tk.END)
         self.data_chart_group_scale_mode.set("")
@@ -1571,16 +1577,16 @@ class LayoutEditor(tk.Tk):
     def _clear_data_summary_item_editor(self) -> None:
         self._data_summary_item_selected_idx = None
         for entry in (
-            self.data_summary_item_label,
-            self.data_summary_item_data_type,
-            self.data_summary_item_index,
-            self.data_summary_item_sender_id,
-            self.data_summary_item_true,
-            self.data_summary_item_false,
-            self.data_summary_item_unknown,
-            self.data_summary_item_precision,
-            self.data_summary_item_prefix,
-            self.data_summary_item_suffix,
+                self.data_summary_item_label,
+                self.data_summary_item_data_type,
+                self.data_summary_item_index,
+                self.data_summary_item_sender_id,
+                self.data_summary_item_true,
+                self.data_summary_item_false,
+                self.data_summary_item_unknown,
+                self.data_summary_item_precision,
+                self.data_summary_item_prefix,
+                self.data_summary_item_suffix,
         ):
             entry.delete(0, tk.END)
         self.data_summary_item_format_kind.set("")

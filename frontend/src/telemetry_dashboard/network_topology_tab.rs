@@ -67,7 +67,7 @@ pub fn NetworkTopologyTab(
         .collect::<Vec<_>>();
     let graph_links = collapse_visible_links(&snapshot.nodes, &snapshot.links, &visible_node_ids);
     let graph_layout = compute_graph_layout(&graph_nodes, &graph_links);
-    let endpoint_rows = collect_endpoint_rows(&snapshot.nodes);
+    let endpoint_rows = collect_endpoint_rows(&snapshot.nodes, &snapshot.links);
     let viewport_id = if *is_fullscreen.read() {
         GRAPH_VIEWPORT_FULLSCREEN_ID
     } else {
@@ -580,17 +580,47 @@ fn install_drag_handlers(
     ));
 }
 
-fn collect_endpoint_rows(nodes: &[NetworkTopologyNode]) -> Vec<(String, Vec<String>)> {
+fn collect_endpoint_rows(
+    nodes: &[NetworkTopologyNode],
+    links: &[NetworkTopologyLink],
+) -> Vec<(String, Vec<String>)> {
     let mut by_endpoint = BTreeMap::<String, Vec<String>>::new();
+    let mut adjacency = BTreeMap::<String, Vec<String>>::new();
+    for link in links {
+        adjacency
+            .entry(link.source.clone())
+            .or_default()
+            .push(link.target.clone());
+        adjacency
+            .entry(link.target.clone())
+            .or_default()
+            .push(link.source.clone());
+    }
+
     for node in nodes {
-        let Some(owner) = endpoint_owner_label(node) else {
-            continue;
-        };
         for endpoint in &node.endpoints {
+            if let Some(owner) = endpoint_owner_label(node, endpoint) {
+                by_endpoint
+                    .entry(endpoint.clone())
+                    .or_default()
+                    .push(owner.clone());
+            }
+        }
+
+        if node.kind != NetworkTopologyNodeKind::Endpoint {
+            continue;
+        }
+
+        let endpoint_name = node
+            .endpoints
+            .first()
+            .cloned()
+            .unwrap_or_else(|| node.label.clone());
+        for owner in endpoint_route_owners(node, nodes, &adjacency, &endpoint_name) {
             by_endpoint
-                .entry(endpoint.clone())
+                .entry(endpoint_name.clone())
                 .or_default()
-                .push(owner.clone());
+                .push(owner);
         }
     }
 
@@ -604,11 +634,60 @@ fn collect_endpoint_rows(nodes: &[NetworkTopologyNode]) -> Vec<(String, Vec<Stri
         .collect()
 }
 
-fn endpoint_owner_label(node: &NetworkTopologyNode) -> Option<String> {
+fn endpoint_route_owners(
+    endpoint_node: &NetworkTopologyNode,
+    nodes: &[NetworkTopologyNode],
+    adjacency: &BTreeMap<String, Vec<String>>,
+    endpoint_name: &str,
+) -> Vec<String> {
+    let mut owners = Vec::new();
+    let mut queue = std::collections::VecDeque::<String>::new();
+    let mut visited = HashSet::<String>::new();
+    visited.insert(endpoint_node.id.clone());
+
+    if let Some(neighbors) = adjacency.get(&endpoint_node.id) {
+        for neighbor in neighbors {
+            queue.push_back(neighbor.clone());
+        }
+    }
+
+    while let Some(current) = queue.pop_front() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        let Some(node) = nodes.iter().find(|node| node.id == current) else {
+            continue;
+        };
+        if let Some(owner) = endpoint_owner_label(node, endpoint_name) {
+            owners.push(owner);
+            continue;
+        }
+        if let Some(neighbors) = adjacency.get(&current) {
+            for neighbor in neighbors {
+                if !visited.contains(neighbor) {
+                    queue.push_back(neighbor.clone());
+                }
+            }
+        }
+    }
+
+    owners.sort();
+    owners.dedup();
+    owners
+}
+
+fn endpoint_owner_label(node: &NetworkTopologyNode, endpoint_name: &str) -> Option<String> {
     match node.kind {
-        NetworkTopologyNodeKind::Router => Some(node.label.clone()),
-        NetworkTopologyNodeKind::Board => Some(node.label.clone()),
+        NetworkTopologyNodeKind::Router | NetworkTopologyNodeKind::Board
+            if node
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint == endpoint_name) =>
+        {
+            Some(node.label.clone())
+        }
         NetworkTopologyNodeKind::Endpoint | NetworkTopologyNodeKind::Side => None,
+        _ => None,
     }
 }
 
@@ -929,65 +1008,79 @@ fn collapse_visible_links(
     links: &[NetworkTopologyLink],
     visible_node_ids: &HashSet<&str>,
 ) -> Vec<NetworkTopologyLink> {
-    let visible = visible_node_ids
+    let visible_nodes = nodes
         .iter()
-        .map(|id| (*id).to_string())
-        .collect::<HashSet<_>>();
-    let mut adjacency = HashMap::<String, Vec<(String, NetworkTopologyStatus)>>::new();
-    for link in links {
-        adjacency
-            .entry(link.source.clone())
-            .or_default()
-            .push((link.target.clone(), link.status));
-        adjacency
-            .entry(link.target.clone())
-            .or_default()
-            .push((link.source.clone(), link.status));
-    }
+        .filter(|node| visible_node_ids.contains(node.id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let Some(router) = visible_nodes
+        .iter()
+        .find(|node| node.kind == NetworkTopologyNodeKind::Router)
+    else {
+        return Vec::new();
+    };
 
     let mut collapsed = BTreeMap::<(String, String), NetworkTopologyStatus>::new();
 
-    for node in nodes.iter().filter(|node| visible.contains(&node.id)) {
-        let mut queue = std::collections::VecDeque::<(String, NetworkTopologyStatus)>::new();
-        let mut visited = HashSet::<String>::new();
-        visited.insert(node.id.clone());
+    for link in links {
+        if !visible_node_ids.contains(link.source.as_str())
+            || !visible_node_ids.contains(link.target.as_str())
+        {
+            continue;
+        }
+        let key = ordered_link_key(link.source.clone(), link.target.clone());
+        collapsed
+            .entry(key)
+            .and_modify(|existing| *existing = merge_link_status(*existing, link.status))
+            .or_insert(link.status);
+    }
 
-        if let Some(neighbors) = adjacency.get(&node.id) {
-            for (neighbor, status) in neighbors {
-                queue.push_back((neighbor.clone(), *status));
-            }
+    let side_by_board = board_side_ids(nodes, links);
+    let relay_by_side = relay_board_ids(nodes, &side_by_board);
+
+    for node in visible_nodes
+        .iter()
+        .filter(|node| node.kind == NetworkTopologyNodeKind::Board)
+    {
+        let already_connected = collapsed
+            .keys()
+            .any(|(source, target)| source == &node.id || target == &node.id);
+        if already_connected {
+            continue;
         }
 
-        while let Some((current, status_so_far)) = queue.pop_front() {
-            if !visited.insert(current.clone()) {
-                continue;
-            }
+        let Some(side_id) = side_by_board.get(&node.id) else {
+            let key = ordered_link_key(router.id.clone(), node.id.clone());
+            collapsed.entry(key).or_insert(node.status);
+            continue;
+        };
 
-            if visible.contains(&current) {
-                if current != node.id {
-                    let key = if node.id < current {
-                        (node.id.clone(), current.clone())
-                    } else {
-                        (current.clone(), node.id.clone())
-                    };
-                    collapsed
-                        .entry(key)
-                        .and_modify(|existing| {
-                            *existing = merge_link_status(*existing, status_so_far);
-                        })
-                        .or_insert(status_so_far);
-                }
-                continue;
-            }
+        if let Some(relay_id) = relay_by_side.get(side_id) {
+            let relay_status = nodes
+                .iter()
+                .find(|candidate| candidate.id == *relay_id)
+                .map(|relay| relay.status)
+                .unwrap_or(node.status);
 
-            if let Some(neighbors) = adjacency.get(&current) {
-                for (neighbor, edge_status) in neighbors {
-                    if visited.contains(neighbor) {
-                        continue;
-                    }
-                    queue.push_back((neighbor.clone(), merge_link_status(status_so_far, *edge_status)));
-                }
+            let router_key = ordered_link_key(router.id.clone(), relay_id.clone());
+            collapsed
+                .entry(router_key)
+                .and_modify(|existing| *existing = merge_link_status(*existing, relay_status))
+                .or_insert(relay_status);
+
+            if relay_id != &node.id {
+                let branch_key = ordered_link_key(relay_id.clone(), node.id.clone());
+                collapsed
+                    .entry(branch_key)
+                    .and_modify(|existing| *existing = merge_link_status(*existing, node.status))
+                    .or_insert(node.status);
             }
+        } else {
+            let key = ordered_link_key(router.id.clone(), node.id.clone());
+            collapsed
+                .entry(key)
+                .and_modify(|existing| *existing = merge_link_status(*existing, node.status))
+                .or_insert(node.status);
         }
     }
 
@@ -1010,6 +1103,51 @@ fn merge_link_status(a: NetworkTopologyStatus, b: NetworkTopologyStatus) -> Netw
         (Simulated, _) | (_, Simulated) => Simulated,
         _ => Online,
     }
+}
+
+fn ordered_link_key(a: String, b: String) -> (String, String) {
+    if a < b { (a, b) } else { (b, a) }
+}
+
+fn board_side_ids(
+    nodes: &[NetworkTopologyNode],
+    links: &[NetworkTopologyLink],
+) -> HashMap<String, String> {
+    let side_ids = nodes
+        .iter()
+        .filter(|node| node.kind == NetworkTopologyNodeKind::Side)
+        .map(|node| node.id.clone())
+        .collect::<HashSet<_>>();
+    let mut out = HashMap::new();
+    for link in links {
+        if side_ids.contains(&link.source) {
+            out.insert(link.target.clone(), link.source.clone());
+        } else if side_ids.contains(&link.target) {
+            out.insert(link.source.clone(), link.target.clone());
+        }
+    }
+    out
+}
+
+fn relay_board_ids(
+    nodes: &[NetworkTopologyNode],
+    side_by_board: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for node in nodes
+        .iter()
+        .filter(|node| node.kind == NetworkTopologyNodeKind::Board)
+    {
+        let sender = node.sender_id.as_deref();
+        if !matches!(sender, Some("RF") | Some("GW")) {
+            continue;
+        }
+        let Some(side_id) = side_by_board.get(&node.id) else {
+            continue;
+        };
+        out.insert(side_id.clone(), node.id.clone());
+    }
+    out
 }
 
 fn compute_graph_layout(

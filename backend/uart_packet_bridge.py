@@ -28,7 +28,6 @@ except ModuleNotFoundError:
             "Missing dependency 'sedsprintf_rs_2026' or 'sedsprintf_rs'. Build/install the Python module first."
         ) from e
 
-
 DT = seds.DataType
 EP = seds.DataEndpoint
 RM = seds.RouterMode
@@ -121,6 +120,7 @@ class UartPacketBridge:
             mode=RM.Sink,
         )
         self.router_side_id = self.router.add_side_serialized("UART", self._tx_serialized)
+
     def _write_packet(self, packet: seds.Packet) -> None:
         wire = bytes(packet.serialize())
         self._tx_serialized(wire)

@@ -1,6 +1,7 @@
 // frontend/src/telemetry_dashboard/actions_tab.rs
 
 use dioxus::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::auth;
 
@@ -107,6 +108,83 @@ fn btn_style(
     )
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct KalmanFilterConstants {
+    process_position_variance: f32,
+    process_velocity_variance: f32,
+    accel_variance: f32,
+    baro_altitude_variance: f32,
+    gps_altitude_variance: f32,
+    gps_velocity_variance: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FlightProfileConfig {
+    id: String,
+    label: String,
+    wind_level: u8,
+    kalman: KalmanFilterConstants,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FlightSetupConfig {
+    version: u32,
+    selected_profile_id: String,
+    profiles: Vec<FlightProfileConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FlightSetupApplyResponse {
+    selected_profile_id: String,
+    wind_level: u8,
+    payload_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EmptyApplyReq {}
+
+fn selected_profile(cfg: &FlightSetupConfig) -> Option<&FlightProfileConfig> {
+    cfg.profiles
+        .iter()
+        .find(|profile| profile.id == cfg.selected_profile_id)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FluidFillTarget {
+    target_mass_kg: f32,
+    target_pressure_psi: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FillTargetsConfig {
+    version: u32,
+    nitrogen: FluidFillTarget,
+    nitrous: FluidFillTarget,
+}
+
+fn setup_panel_style(theme: &ThemeConfig) -> String {
+    format!(
+        "padding:14px; border-radius:14px; border:1px solid {}; background:{}; display:flex; flex-direction:column; gap:12px;",
+        theme.border, theme.panel_background
+    )
+}
+
+fn input_style(theme: &ThemeConfig) -> String {
+    format!(
+        "width:100%; padding:10px 12px; border-radius:10px; border:1px solid {}; background:{}; color:{};",
+        theme.border, theme.panel_background_alt, theme.text_primary
+    )
+}
+
+fn apply_button_style(theme: &ThemeConfig, enabled: bool) -> String {
+    let opacity = if enabled { "1.0" } else { "0.55" };
+    let cursor = if enabled { "pointer" } else { "not-allowed" };
+    format!(
+        "padding:10px 14px; border-radius:10px; border:1px solid {}; background:{}; color:{}; font-weight:700; cursor:{}; opacity:{};",
+        theme.button_border, theme.button_background, theme.button_text, cursor, opacity
+    )
+}
+
 #[component]
 pub fn ActionsTab(
     layout: ActionsTabLayout,
@@ -115,12 +193,42 @@ pub fn ActionsTab(
     theme: ThemeConfig,
 ) -> Element {
     let mut redraw_tick = use_signal(|| 0u64);
+    let mut flight_setup = use_signal(|| None::<FlightSetupConfig>);
+    let mut flight_setup_status = use_signal(String::new);
+    let mut flight_setup_busy = use_signal(|| false);
+    let mut fill_targets = use_signal(|| None::<FillTargetsConfig>);
+    let mut fill_targets_status = use_signal(String::new);
+    let mut fill_targets_busy = use_signal(|| false);
     use_effect(move || {
         spawn(async move {
             loop {
                 sleep_for_frame(target_frame_duration()).await;
                 let next = redraw_tick.read().wrapping_add(1);
                 redraw_tick.set(next);
+            }
+        });
+    });
+    use_effect(move || {
+        spawn(async move {
+            match crate::telemetry_dashboard::http_get_json::<FlightSetupConfig>(
+                "/api/flight_setup",
+            )
+            .await
+            {
+                Ok(cfg) => flight_setup.set(Some(cfg)),
+                Err(err) => flight_setup_status.set(format!("Flight setup load failed: {err}")),
+            }
+        });
+    });
+    use_effect(move || {
+        spawn(async move {
+            match crate::telemetry_dashboard::http_get_json::<FillTargetsConfig>(
+                "/api/fill_targets",
+            )
+            .await
+            {
+                Ok(cfg) => fill_targets.set(Some(cfg)),
+                Err(err) => fill_targets_status.set(format!("Fill targets load failed: {err}")),
             }
         });
     });
@@ -143,6 +251,145 @@ pub fn ActionsTab(
             p  { style: "margin:0 0 12px 0; color:{theme.text_soft}; font-size:0.9rem;",
                 "All available actions are available all the time, use with caution as improper use \
                 can and will damage the system."
+            }
+            div { style: "{setup_panel_style(&theme)}",
+                h3 { style: "margin:0; color:{theme.text_primary};", "Flight Setup" }
+                p { style: "margin:0; color:{theme.text_soft}; font-size:0.9rem;",
+                    "Select the preloaded wind profile to apply before launch. Kalman constants come from `backend/config/flight_setup.json`."
+                }
+                if let Some(cfg) = flight_setup.read().clone() {
+                    div { style: "display:grid; grid-template-columns:minmax(220px, 320px) minmax(0, 1fr); gap:12px; align-items:start;",
+                        div { style: "display:flex; flex-direction:column; gap:8px;",
+                            label { style: "font-size:12px; color:{theme.text_muted}; text-transform:uppercase; letter-spacing:0.08em;", "Flight profile" }
+                            select {
+                                style: "{input_style(&theme)}",
+                                value: "{cfg.selected_profile_id}",
+                                onchange: {
+                                    move |evt| {
+                                        let next_id = evt.value();
+                                        let Some(mut next_cfg) = flight_setup.read().clone() else {
+                                            return;
+                                        };
+                                        next_cfg.selected_profile_id = next_id.clone();
+                                        flight_setup.set(Some(next_cfg.clone()));
+                                        flight_setup_status.set("Saving flight setup…".to_string());
+                                        spawn(async move {
+                                            match crate::telemetry_dashboard::http_post_json::<FlightSetupConfig, FlightSetupConfig>(
+                                                "/api/flight_setup",
+                                                &next_cfg,
+                                            ).await {
+                                                Ok(saved) => {
+                                                    flight_setup.set(Some(saved));
+                                                    flight_setup_status.set(format!("Selected profile {next_id}."));
+                                                }
+                                                Err(err) => {
+                                                    flight_setup_status.set(format!("Flight setup save failed: {err}"));
+                                                }
+                                            }
+                                        });
+                                    }
+                                },
+                                for profile in cfg.profiles.iter() {
+                                    option {
+                                        value: "{profile.id}",
+                                        "{profile.label} (wind {profile.wind_level})"
+                                    }
+                                }
+                            }
+                            button {
+                                style: "{apply_button_style(&theme, !*flight_setup_busy.read() && !abort_only_mode)}",
+                                disabled: *flight_setup_busy.read() || abort_only_mode,
+                                onclick: move |_| {
+                                    if *flight_setup_busy.read() || abort_only_mode {
+                                        return;
+                                    }
+                                    flight_setup_busy.set(true);
+                                    flight_setup_status.set("Applying flight setup…".to_string());
+                                    spawn(async move {
+                                        let body = EmptyApplyReq {};
+                                        match crate::telemetry_dashboard::http_post_json::<EmptyApplyReq, FlightSetupApplyResponse>(
+                                            "/api/flight_setup/apply",
+                                            &body,
+                                        ).await {
+                                            Ok(resp) => {
+                                                flight_setup_status.set(format!(
+                                                    "Applied wind {} profile ({} bytes queued).",
+                                                    resp.wind_level, resp.payload_bytes
+                                                ));
+                                            }
+                                            Err(err) => {
+                                                flight_setup_status.set(format!("Flight setup apply failed: {err}"));
+                                            }
+                                        }
+                                        flight_setup_busy.set(false);
+                                    });
+                                },
+                                "Apply To Flight Computer"
+                            }
+                            if !flight_setup_status.read().is_empty() {
+                                div { style: "font-size:12px; color:{theme.text_muted};", "{flight_setup_status.read().clone()}" }
+                            }
+                        }
+                        div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px;",
+                            if let Some(profile) = selected_profile(&cfg) {
+                                {flight_setup_metric("Profile", profile.label.clone(), &theme)}
+                                {flight_setup_metric("Wind", format!("{}", profile.wind_level), &theme)}
+                                {flight_setup_metric("Q Position", format!("{:.3}", profile.kalman.process_position_variance), &theme)}
+                                {flight_setup_metric("Q Velocity", format!("{:.3}", profile.kalman.process_velocity_variance), &theme)}
+                                {flight_setup_metric("Accel R", format!("{:.3}", profile.kalman.accel_variance), &theme)}
+                                {flight_setup_metric("Baro R", format!("{:.3}", profile.kalman.baro_altitude_variance), &theme)}
+                                {flight_setup_metric("GPS Alt R", format!("{:.3}", profile.kalman.gps_altitude_variance), &theme)}
+                                {flight_setup_metric("GPS Vel R", format!("{:.3}", profile.kalman.gps_velocity_variance), &theme)}
+                            }
+                        }
+                    }
+                } else {
+                    div { style: "font-size:13px; color:{theme.text_muted};", "Loading flight setup…" }
+                }
+            }
+            div { style: "{setup_panel_style(&theme)}",
+                h3 { style: "margin:0; color:{theme.text_primary};", "Fill Targets" }
+                p { style: "margin:0; color:{theme.text_soft}; font-size:0.9rem;",
+                    "Set nitrogen and nitrous mass/pressure targets ahead of time. The Ground Station fill sequence and sim read these values from `backend/config/fill_targets.json`."
+                }
+                if let Some(cfg) = fill_targets.read().clone() {
+                    div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px;",
+                        {fill_target_editor("Nitrogen", "nitrogen", &cfg.nitrogen, &theme, fill_targets, fill_targets_status)}
+                        {fill_target_editor("Nitrous", "nitrous", &cfg.nitrous, &theme, fill_targets, fill_targets_status)}
+                    }
+                    button {
+                        style: "{apply_button_style(&theme, !*fill_targets_busy.read())}",
+                        disabled: *fill_targets_busy.read(),
+                        onclick: move |_| {
+                            let Some(next_cfg) = fill_targets.read().clone() else {
+                                return;
+                            };
+                            fill_targets_busy.set(true);
+                            fill_targets_status.set("Saving fill targets…".to_string());
+                            spawn(async move {
+                                match crate::telemetry_dashboard::http_post_json::<FillTargetsConfig, FillTargetsConfig>(
+                                    "/api/fill_targets",
+                                    &next_cfg,
+                                ).await {
+                                    Ok(saved) => {
+                                        fill_targets.set(Some(saved));
+                                        fill_targets_status.set("Fill targets saved.".to_string());
+                                    }
+                                    Err(err) => {
+                                        fill_targets_status.set(format!("Fill targets save failed: {err}"));
+                                    }
+                                }
+                                fill_targets_busy.set(false);
+                            });
+                        },
+                        "Save Fill Targets"
+                    }
+                    if !fill_targets_status.read().is_empty() {
+                        div { style: "font-size:12px; color:{theme.text_muted};", "{fill_targets_status.read().clone()}" }
+                    }
+                } else {
+                    div { style: "font-size:13px; color:{theme.text_muted};", "Loading fill targets…" }
+                }
             }
             if abort_only_mode {
                 div {
@@ -197,6 +444,80 @@ pub fn ActionsTab(
                                     "{action.label}"
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn flight_setup_metric(label: &str, value: String, theme: &ThemeConfig) -> Element {
+    rsx! {
+        div { style: "padding:10px 12px; border-radius:10px; border:1px solid {theme.border}; background:{theme.panel_background_alt};",
+            div { style: "font-size:11px; color:{theme.text_muted}; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:4px;", "{label}" }
+            div { style: "font-size:14px; color:{theme.text_primary}; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;", "{value}" }
+        }
+    }
+}
+
+fn fill_target_editor(
+    title: &'static str,
+    field: &'static str,
+    target: &FluidFillTarget,
+    theme: &ThemeConfig,
+    mut fill_targets: Signal<Option<FillTargetsConfig>>,
+    mut fill_targets_status: Signal<String>,
+) -> Element {
+    let mass_value = format!("{:.2}", target.target_mass_kg);
+    let pressure_value = format!("{:.1}", target.target_pressure_psi);
+    rsx! {
+        div { style: "padding:12px; border-radius:12px; border:1px solid {theme.border}; background:{theme.panel_background_alt}; display:flex; flex-direction:column; gap:10px;",
+            div { style: "font-size:14px; font-weight:700; color:{theme.text_primary};", "{title}" }
+            div { style: "display:flex; flex-direction:column; gap:6px;",
+                label { style: "font-size:12px; color:{theme.text_muted}; text-transform:uppercase; letter-spacing:0.08em;", "Target mass (kg)" }
+                input {
+                    r#type: "number",
+                    step: "0.01",
+                    min: "0",
+                    style: "{input_style(theme)}",
+                    value: "{mass_value}",
+                    oninput: move |evt| {
+                        let Some(mut next_cfg) = fill_targets.read().clone() else {
+                            return;
+                        };
+                        if let Ok(value) = evt.value().parse::<f32>() {
+                            match field {
+                                "nitrogen" => next_cfg.nitrogen.target_mass_kg = value.max(0.01),
+                                "nitrous" => next_cfg.nitrous.target_mass_kg = value.max(0.01),
+                                _ => {}
+                            }
+                            fill_targets.set(Some(next_cfg));
+                            fill_targets_status.set("Unsaved fill target changes.".to_string());
+                        }
+                    }
+                }
+            }
+            div { style: "display:flex; flex-direction:column; gap:6px;",
+                label { style: "font-size:12px; color:{theme.text_muted}; text-transform:uppercase; letter-spacing:0.08em;", "Target pressure (psi)" }
+                input {
+                    r#type: "number",
+                    step: "0.1",
+                    min: "0",
+                    style: "{input_style(theme)}",
+                    value: "{pressure_value}",
+                    oninput: move |evt| {
+                        let Some(mut next_cfg) = fill_targets.read().clone() else {
+                            return;
+                        };
+                        if let Ok(value) = evt.value().parse::<f32>() {
+                            match field {
+                                "nitrogen" => next_cfg.nitrogen.target_pressure_psi = value.max(0.0),
+                                "nitrous" => next_cfg.nitrous.target_pressure_psi = value.max(0.0),
+                                _ => {}
+                            }
+                            fill_targets.set(Some(next_cfg));
+                            fill_targets_status.set("Unsaved fill target changes.".to_string());
                         }
                     }
                 }

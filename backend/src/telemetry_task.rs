@@ -9,19 +9,19 @@ use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCo
 use crate::state::AppState;
 #[cfg(feature = "hitl_mode")]
 use crate::types::FlightState;
-use crate::types::{Board, TelemetryCommand, TelemetryRow, u8_to_flight_state};
-use crate::web::{FlightStateMsg, emit_warning};
+use crate::types::{u8_to_flight_state, Board, TelemetryCommand, TelemetryRow};
+use crate::web::{emit_warning, FlightStateMsg};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::Router;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
-use tokio::sync::{Notify, broadcast, mpsc};
-use tokio::time::{Duration, interval};
+use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::time::{interval, Duration};
 
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;

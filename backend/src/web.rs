@@ -1,32 +1,34 @@
 use crate::auth::{AuthFailure, LoginRequest, Permission};
+use crate::fill_targets::{self, FillTargetsConfig};
+use crate::flight_setup::{self, FlightSetupConfig};
 use crate::layout;
 use crate::loadcell;
-use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_bundle_path};
-use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
+use crate::map::{detect_max_native_zoom, tile_bundle_path, DEFAULT_MAP_REGION};
+use crate::sequences::{command_name, ActionPolicyMsg, PersistentNotification};
 use crate::state::AppState;
 use crate::types::{
     BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryCommand, TelemetryRow,
 };
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::{
-    Json, Router,
-    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
-    extract::{Path, Query, State},
+    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade}, extract::{Path, Query, State},
     response::IntoResponse,
     routing::{get, get_service, post},
+    Json,
+    Router,
 };
 use futures::{SinkExt, StreamExt};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::Row;
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{OnceCell, mpsc};
+use tokio::sync::{mpsc, OnceCell};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -154,6 +156,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(dismiss_notification),
         )
         .route("/api/action_policy", get(get_action_policy))
+        .route(
+            "/api/flight_setup",
+            get(get_flight_setup).post(set_flight_setup),
+        )
+        .route("/api/flight_setup/apply", post(apply_flight_setup))
+        .route(
+            "/api/fill_targets",
+            get(get_fill_targets).post(set_fill_targets),
+        )
         .route("/favicon", get(get_favicon))
         .route("/flightstate", get(get_flight_state))
         .route("/api/gps", get(get_gps))
@@ -951,6 +962,126 @@ async fn get_action_policy(
         return response;
     }
     Json(state.action_policy_snapshot()).into_response()
+}
+
+/// Returns the persisted flight setup profiles and current selection.
+async fn get_flight_setup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(flight_setup::load_or_default()).into_response()
+}
+
+/// Persists the current flight setup profile selection and constants.
+async fn set_flight_setup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(cfg): Json<FlightSetupConfig>,
+) -> impl IntoResponse {
+    let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal.permissions.send_commands {
+        return (StatusCode::FORBIDDEN, "permission denied").into_response();
+    }
+    match flight_setup::save(&cfg) {
+        Ok(()) => Json(flight_setup::load_or_default()).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
+    }
+}
+
+/// Returns the persisted nitrogen/nitrous fill targets used by the local sequence logic.
+async fn get_fill_targets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(fill_targets::load_or_default()).into_response()
+}
+
+/// Persists the local fill targets used by the Ground Station fill sequence.
+async fn set_fill_targets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(cfg): Json<FillTargetsConfig>,
+) -> impl IntoResponse {
+    let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal.permissions.send_commands {
+        return (StatusCode::FORBIDDEN, "permission denied").into_response();
+    }
+    match fill_targets::save(&cfg) {
+        Ok(()) => Json(fill_targets::load_or_default()).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct FlightSetupApplyResponse {
+    selected_profile_id: String,
+    wind_level: u8,
+    payload_bytes: usize,
+}
+
+/// Encodes the current flight setup selection and queues it for the flight side.
+async fn apply_flight_setup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal.permissions.send_commands {
+        return (StatusCode::FORBIDDEN, "permission denied").into_response();
+    }
+
+    let cfg = flight_setup::load_or_default();
+    let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+    let profile = match flight_setup::selected_profile(&cfg) {
+        Some(profile) => profile,
+        None => {
+            return (StatusCode::BAD_REQUEST, "selected flight profile missing").into_response();
+        }
+    };
+    let payload = match flight_setup::build_apply_payload(&cfg, now_ms) {
+        Ok(payload) => payload,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    let Some(router) = state.topology_router.get() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "router unavailable").into_response();
+    };
+
+    match router.log_queue(
+        sedsprintf_rs_2026::config::DataType::FlightCommand,
+        &payload,
+    ) {
+        Ok(()) => Json(FlightSetupApplyResponse {
+            selected_profile_id: profile.id.clone(),
+            wind_level: profile.wind_level,
+            payload_bytes: payload.len(),
+        })
+        .into_response(),
+        Err(err) => {
+            emit_warning(
+                &state,
+                format!("Failed to queue flight setup for transmission: {err}"),
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                "failed to queue flight setup for transmission",
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Returns the synthesized network topology graph shown in the dashboard.
