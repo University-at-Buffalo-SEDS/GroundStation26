@@ -281,6 +281,7 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                                     format!(
                                         "padding:6px 10px; border-radius:999px; border:1px solid {accent}; background:{}; color:{accent}; cursor:pointer;\
                                          display:inline-flex; align-items:center; justify-content:center;\
+                                         font:inherit;\
                                          min-width:0; max-width:100%; text-align:center; line-height:1.2;\
                                          white-space:normal; overflow-wrap:anywhere; word-break:break-word;",
                                         theme.button_background
@@ -290,6 +291,7 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                                 format!(
                                     "padding:6px 10px; border-radius:999px; border:1px solid {}; background:{}; color:{}; cursor:pointer;\
                                      display:inline-flex; align-items:center; justify-content:center;\
+                                     font:inherit;\
                                      min-width:0; max-width:100%; text-align:center; line-height:1.2;\
                                      white-space:normal; overflow-wrap:anywhere; word-break:break-word;",
                                     theme.border, theme.panel_background, theme.text_primary
@@ -319,6 +321,7 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                                         format!(
                                             "padding:5px 10px; border-radius:999px; border:1px solid {accent}; background:{}; color:{accent}; cursor:pointer; font-size:12px;\
                                              display:inline-flex; align-items:center; justify-content:center;\
+                                             font-family:inherit;\
                                              min-width:0; max-width:100%; text-align:center; line-height:1.2;\
                                              white-space:normal; overflow-wrap:anywhere; word-break:break-word;",
                                             theme.button_background
@@ -328,6 +331,7 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                                     format!(
                                         "padding:5px 10px; border-radius:999px; border:1px solid {}; background:{}; color:{}; cursor:pointer; font-size:12px;\
                                          display:inline-flex; align-items:center; justify-content:center;\
+                                         font-family:inherit;\
                                          min-width:0; max-width:100%; text-align:center; line-height:1.2;\
                                          white-space:normal; overflow-wrap:anywhere; word-break:break-word;",
                                         theme.border_soft, theme.panel_background, theme.text_secondary

@@ -2400,6 +2400,7 @@ fn TelemetryDashboardInner() -> Element {
         format!(
             "padding:0.4rem 0.8rem; border-radius:0.5rem;\
              display:inline-flex; align-items:center; justify-content:center; gap:0.35rem;\
+             font:inherit;\
              min-width:0; max-width:100%; text-align:center; line-height:1.2;\
              white-space:normal; overflow-wrap:anywhere; word-break:break-word;\
              border:1px solid {color}; background:{};\
@@ -2410,12 +2411,14 @@ fn TelemetryDashboardInner() -> Element {
     let tab_style_inactive = format!(
         "padding:0.4rem 0.8rem; border-radius:0.5rem;\
          display:inline-flex; align-items:center; justify-content:center; gap:0.35rem;\
+         font:inherit;\
          min-width:0; max-width:100%; text-align:center; line-height:1.2;\
          white-space:normal; overflow-wrap:anywhere; word-break:break-word;\
          border:1px solid {}; background:{};\
          color:{}; cursor:pointer;",
         theme.tab_shell_border, theme.app_background, theme.text_primary
     );
+    let dashboard_font_stack = "system-ui, -apple-system, BlinkMacSystemFont";
 
     // Native-only CONNECT button
     let connect_button: Element = {
@@ -2726,15 +2729,12 @@ fn TelemetryDashboardInner() -> Element {
                             overflow-y:auto;
                             overflow-x:hidden;
                             background:{theme.app_background};
+                            font-family:{dashboard_font_stack};
                             backdrop-filter:blur(6px);
                             overscroll-behavior:contain;
                             -webkit-overflow-scrolling:touch;
                         ",
                         onclick: {
-                            let mut show_version_overlay = show_version_overlay;
-                            move |_| show_version_overlay.set(false)
-                        },
-                        ontouchend: {
                             let mut show_version_overlay = show_version_overlay;
                             move |_| show_version_overlay.set(false)
                         },
@@ -2745,9 +2745,11 @@ fn TelemetryDashboardInner() -> Element {
                                 border:1px solid {theme.border_strong};
                                 border-radius:16px;
                                 background:{theme.panel_background};
+                                font-family:{dashboard_font_stack};
                                 box-shadow:0 12px 30px rgba(0,0,0,0.5);
                             ",
                             onclick: move |evt| evt.stop_propagation(),
+                            ontouchend: move |evt| evt.stop_propagation(),
                             div {
                                 style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap;",
                                 h1 { style: "margin:0; font-size:20px;", "{_version_title}" }
@@ -2797,15 +2799,12 @@ fn TelemetryDashboardInner() -> Element {
                         overflow-y:auto;
                         overflow-x:hidden;
                         background:{theme.app_background};
+                        font-family:{dashboard_font_stack};
                         backdrop-filter:blur(6px);
                         overscroll-behavior:contain;
                         -webkit-overflow-scrolling:touch;
                     ",
                     onclick: {
-                        let mut show_settings_overlay = show_settings_overlay;
-                        move |_| show_settings_overlay.set(false)
-                    },
-                    ontouchend: {
                         let mut show_settings_overlay = show_settings_overlay;
                         move |_| show_settings_overlay.set(false)
                     },
@@ -2816,9 +2815,11 @@ fn TelemetryDashboardInner() -> Element {
                             border:1px solid {theme.border_strong};
                             border-radius:16px;
                             background:{theme.panel_background};
+                            font-family:{dashboard_font_stack};
                             box-shadow:0 12px 30px rgba(0,0,0,0.5);
                         ",
                         onclick: move |evt| evt.stop_propagation(),
+                        ontouchend: move |evt| evt.stop_propagation(),
                         div {
                             style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap;",
                             h1 { style: "margin:0; font-size:20px;", "{settings_title}" }
@@ -2904,6 +2905,7 @@ fn TelemetryDashboardInner() -> Element {
                  display:inline-flex;
                  align-items:center;
                  justify-content:center;
+                 font:inherit;
                  width:fit-content;
                  max-width:100%;
                  align-self:center;

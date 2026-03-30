@@ -96,7 +96,7 @@ pub fn VersionTab() -> Element {
     let info = &*VERSION_INFO;
 
     rsx! {
-        div { style: "padding:16px; overflow:visible;",
+        div { style: "padding:16px; overflow:visible; font-family:system-ui, -apple-system, BlinkMacSystemFont; color:inherit;",
             h2 { style: "margin:0 0 14px 0;", "Version & Credits" }
 
             div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:12px;",
@@ -139,7 +139,7 @@ pub fn VersionTab() -> Element {
 #[component]
 fn SectionCard(title: &'static str, rows: Vec<(&'static str, String)>) -> Element {
     rsx! {
-        div { style: "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220;",
+        div { style: "padding:14px; border:1px solid #334155; border-radius:14px; background:#0b1220; font-family:system-ui, -apple-system, BlinkMacSystemFont; color:inherit;",
             div { style: "font-size:14px; color:#94a3b8; margin-bottom:10px;", "{title}" }
             div { style: "display:flex; flex-direction:column; gap:10px;",
                 for (label, value) in rows {

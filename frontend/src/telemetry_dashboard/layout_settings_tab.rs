@@ -23,11 +23,11 @@ pub fn SettingsPage(
         theme.border, theme.panel_background
     );
     let chip_selected = format!(
-        "padding:8px 12px; border-radius:999px; border:1px solid {}; background:{}; color:{}; font-size:0.9rem; font-weight:700; cursor:pointer;",
+        "padding:8px 12px; border-radius:999px; border:1px solid {}; background:{}; color:{}; font-family:system-ui, -apple-system, BlinkMacSystemFont; font-size:0.9rem; font-weight:700; cursor:pointer;",
         theme.info_accent, theme.info_background, theme.text_primary
     );
     let chip_idle = format!(
-        "padding:8px 12px; border-radius:999px; border:1px solid {}; background:{}; color:{}; font-size:0.9rem; font-weight:600; cursor:pointer;",
+        "padding:8px 12px; border-radius:999px; border:1px solid {}; background:{}; color:{}; font-family:system-ui, -apple-system, BlinkMacSystemFont; font-size:0.9rem; font-weight:600; cursor:pointer;",
         theme.border, theme.button_background, theme.text_secondary
     );
 
@@ -99,7 +99,7 @@ pub fn SettingsPage(
     );
 
     rsx! {
-        div { style: "padding:16px; overflow:visible;",
+        div { style: "padding:16px; overflow:visible; font-family:system-ui, -apple-system, BlinkMacSystemFont; color:{theme.text_primary};",
             h2 { style: "margin:0 0 14px 0; color:{theme.text_primary};", "{title}" }
 
             div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px;",
