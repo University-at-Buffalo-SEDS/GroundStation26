@@ -224,3 +224,5 @@ mod dummy {
 
 #[cfg(feature = "raspberry_pi")]
 pub use real::GpioPinsReal as GpioPins;
+#[cfg(not(feature = "raspberry_pi"))]
+pub type GpioPins = dummy::GpioPins;
