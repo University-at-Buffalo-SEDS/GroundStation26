@@ -3983,7 +3983,10 @@ def build_frontend(
             cmd.extend(["--platform", platform_name])
             if platform_name == "ios":
                 is_ios_sim_target = bool(rust_target and ("ios-sim" in rust_target or "simulator" in rust_target))
-                if not is_ios_sim_target:
+                if is_ios_sim_target:
+                    cmd.extend(["--package-types", "ios"])
+                else:
+                    cmd.extend(["--package-types", "ipa"])
                     cmd.extend(["--device", "true"])
             elif platform_name == "windows":
                 _ensure_windows_icon_compat(frontend_dir)

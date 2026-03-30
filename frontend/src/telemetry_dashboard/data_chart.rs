@@ -68,6 +68,22 @@ fn battery_sender_channel(sender_id: &str) -> Option<usize> {
 //
 // 20ms = 50Hz plotted. 40ms = 25Hz plotted. 100ms = 10Hz plotted.
 const BUCKET_MS: i64 = 20;
+const LOD_BUCKET_MS_LEVELS: &[(i64, i64)] = &[
+    (2 * 60_000, BUCKET_MS),
+    (5 * 60_000, 50),
+    (10 * 60_000, 100),
+    (15 * 60_000, 200),
+    (HISTORY_MS, 500),
+];
+
+pub const CHART_GRID_LEFT: f64 = 96.0;
+pub const CHART_GRID_RIGHT_PAD: f64 = 20.0;
+pub const CHART_GRID_TOP: f64 = 20.0;
+pub const CHART_GRID_BOTTOM_PAD: f64 = 40.0;
+pub const CHART_X_LABEL_LEFT_INSET: f64 = 28.0;
+pub const CHART_X_LABEL_BOTTOM: f64 = 10.0;
+pub const CHART_Y_LABEL_LEFT: f64 = 10.0;
+pub const CHART_Y_LABEL_MAX_WIDTH: f64 = 64.0;
 
 // Only this many most-recent buckets are kept (hard cap besides HISTORY_MS).
 // Keep enough to cover the full HISTORY_MS window at BUCKET_MS granularity.
@@ -82,7 +98,6 @@ const MAX_INTERP_POINTS_PER_GAP: i64 = 64;
 const MAX_INTERP_GAP_BUCKETS: i64 = 6;
 const CURVE_MIN_DELTA_PX: f32 = 0.35;
 const RENDER_CHUNK_MS: i64 = 20_000;
-const RENDER_CHUNK_BUCKETS: i64 = RENDER_CHUNK_MS / BUCKET_MS;
 const SMOOTHING_MAX_POINTS_PER_SEGMENT: usize = 240;
 
 // Avoid zero span
@@ -396,6 +411,15 @@ struct CachedChart {
     refit_pending: bool,
 }
 
+fn lod_bucket_ms_for_span(span_ms: i64) -> i64 {
+    for &(span_threshold_ms, bucket_ms) in LOD_BUCKET_MS_LEVELS {
+        if span_ms <= span_threshold_ms {
+            return bucket_ms.max(BUCKET_MS);
+        }
+    }
+    BUCKET_MS
+}
+
 impl CachedChart {
     fn new() -> Self {
         Self {
@@ -578,6 +602,72 @@ impl CachedChart {
         self.disp_max = hi;
     }
 
+    fn view_buckets(&self, start_bid: i64, newest_bid: i64, bucket_ms: i64) -> Vec<Bucket> {
+        let effective_bucket_ms = bucket_ms.max(BUCKET_MS);
+        let start_ts = start_bid.saturating_mul(BUCKET_MS);
+        let newest_ts = newest_bid.saturating_mul(BUCKET_MS);
+
+        if effective_bucket_ms <= BUCKET_MS {
+            return self
+                .buckets
+                .iter()
+                .filter(|bucket| bucket.id >= start_bid && bucket.id <= newest_bid)
+                .cloned()
+                .collect();
+        }
+
+        let mut out = Vec::new();
+        let mut current: Option<Bucket> = None;
+        let mut current_id = i64::MIN;
+
+        for bucket in self.buckets.iter() {
+            if bucket.id < start_bid || bucket.id > newest_bid {
+                continue;
+            }
+
+            let bucket_ts = bucket.id.saturating_mul(BUCKET_MS);
+            if bucket_ts < start_ts || bucket_ts > newest_ts {
+                continue;
+            }
+
+            let agg_id = bucket_ts.div_euclid(effective_bucket_ms);
+            if current.is_none() || current_id != agg_id {
+                if let Some(done) = current.take() {
+                    out.push(done);
+                }
+                current_id = agg_id;
+                current = Some(Bucket::new(agg_id, self.channel_count));
+            }
+
+            if let Some(agg) = current.as_mut() {
+                for ch in 0..self.channel_count {
+                    if !bucket.has[ch] {
+                        continue;
+                    }
+                    let last = bucket.last[ch];
+                    let min = bucket.min[ch];
+                    let max = bucket.max[ch];
+                    if !agg.has[ch] {
+                        agg.has[ch] = true;
+                        agg.last[ch] = last;
+                        agg.min[ch] = min;
+                        agg.max[ch] = max;
+                    } else {
+                        agg.last[ch] = last;
+                        agg.min[ch] = agg.min[ch].min(min);
+                        agg.max[ch] = agg.max[ch].max(max);
+                    }
+                }
+            }
+        }
+
+        if let Some(done) = current.take() {
+            out.push(done);
+        }
+
+        out
+    }
+
     fn build_if_needed(&mut self, w: f32, h: f32) {
         let size_changed = (self.last_w - w).abs() > 0.5 || (self.last_h - h).abs() > 0.5;
         if !self.dirty && !size_changed {
@@ -630,10 +720,18 @@ impl CachedChart {
         };
         span_ms = span_ms.min(HISTORY_MS);
         self.prev_span_ms = span_ms;
+        let lod_bucket_ms = lod_bucket_ms_for_span(span_ms);
 
         // Determine how many buckets to render from that span (stable)
         let want_buckets = span_ms.div_euclid(BUCKET_MS).max(1);
         let start_bid = newest_bid.saturating_sub(want_buckets - 1);
+        let view_buckets = self.view_buckets(start_bid, newest_bid, lod_bucket_ms);
+        let start_view_id = start_bid
+            .saturating_mul(BUCKET_MS)
+            .div_euclid(lod_bucket_ms);
+        let newest_view_id = newest_bid
+            .saturating_mul(BUCKET_MS)
+            .div_euclid(lod_bucket_ms);
 
         // Build window min/max from buckets in [start_bid, newest_bid]
         let mut chan_min: Vec<Option<f32>> = vec![None; self.channel_count];
@@ -641,10 +739,7 @@ impl CachedChart {
         let mut min = f32::INFINITY;
         let mut max = f32::NEG_INFINITY;
 
-        for b in self.buckets.iter() {
-            if b.id < start_bid || b.id > newest_bid {
-                continue;
-            }
+        for b in &view_buckets {
             for ch in 0..self.channel_count {
                 if b.has[ch] {
                     let v = b.last[ch];
@@ -682,10 +777,10 @@ impl CachedChart {
         }
 
         // Viewport mapping (match DataTab geometry)
-        let left = 60.0_f32;
-        let right = (w - 20.0).max(left + 1.0);
-        let top = 20.0_f32;
-        let bottom = (h - 20.0).max(top + 1.0);
+        let left = CHART_GRID_LEFT as f32;
+        let right = (w - CHART_GRID_RIGHT_PAD as f32).max(left + 1.0);
+        let top = CHART_GRID_TOP as f32;
+        let bottom = (h - CHART_GRID_BOTTOM_PAD as f32).max(top + 1.0);
 
         let pw = right - left;
         let ph = bottom - top;
@@ -696,19 +791,22 @@ impl CachedChart {
 
         let mut chunks = Vec::new();
 
-        let total = (newest_bid - start_bid + 1).max(1) as f32;
-        let first_chunk_id = start_bid.div_euclid(RENDER_CHUNK_BUCKETS);
-        let last_chunk_id = newest_bid.div_euclid(RENDER_CHUNK_BUCKETS);
+        let total = (newest_view_id - start_view_id + 1).max(1) as f32;
+        let render_chunk_buckets = (RENDER_CHUNK_MS / lod_bucket_ms).max(1);
+        let first_chunk_id = start_view_id.div_euclid(render_chunk_buckets);
+        let last_chunk_id = newest_view_id.div_euclid(render_chunk_buckets);
+        let max_interp_gap_buckets = ((MAX_INTERP_GAP_BUCKETS * BUCKET_MS) / lod_bucket_ms).max(1);
 
         for chunk_id in first_chunk_id..=last_chunk_id {
-            let chunk_start_bid = (chunk_id * RENDER_CHUNK_BUCKETS).max(start_bid);
-            let chunk_end_bid = ((chunk_id + 1) * RENDER_CHUNK_BUCKETS - 1).min(newest_bid);
+            let chunk_start_bid = (chunk_id * render_chunk_buckets).max(start_view_id);
+            let chunk_end_bid = ((chunk_id + 1) * render_chunk_buckets - 1).min(newest_view_id);
             let chunk_bucket_count = (chunk_end_bid - chunk_start_bid + 1).max(1);
-            let chunk_start_x = left + pw * ((chunk_start_bid - start_bid) as f32 / total);
-            let chunk_end_x = left + pw * ((chunk_end_bid - start_bid + 1) as f32 / total);
+            let chunk_start_x = left + pw * ((chunk_start_bid - start_view_id) as f32 / total);
+            let chunk_end_x = left + pw * ((chunk_end_bid - start_view_id + 1) as f32 / total);
             let chunk_width = (chunk_end_x - chunk_start_x).max(1.0);
             let allow_interp = true;
-            let smooth_chunk = should_smooth_chunk(chunk_width, chunk_bucket_count);
+            let smooth_chunk =
+                lod_bucket_ms <= 100 && should_smooth_chunk(chunk_width, chunk_bucket_count);
 
             let mut paths = vec![String::new(); self.channel_count];
             let mut gap_paths = vec![String::new(); self.channel_count];
@@ -716,7 +814,7 @@ impl CachedChart {
             let mut last_bucket_id_drawn: Vec<Option<i64>> = vec![None; self.channel_count];
             let mut last_point_drawn: Vec<Option<(f32, f32)>> = vec![None; self.channel_count];
 
-            for b in self.buckets.iter() {
+            for b in &view_buckets {
                 if b.id < chunk_start_bid || b.id > chunk_end_bid {
                     continue;
                 }
@@ -739,7 +837,7 @@ impl CachedChart {
                         if gap_buckets > 1
                             && let Some((prev_x, prev_y)) = last_point_drawn[ch]
                         {
-                            if allow_interp && gap_buckets <= MAX_INTERP_GAP_BUCKETS {
+                            if allow_interp && gap_buckets <= max_interp_gap_buckets {
                                 let missing = gap_buckets - 1;
                                 let interp_pts = missing.clamp(1, MAX_INTERP_POINTS_PER_GAP);
                                 for j in 1..=interp_pts {
@@ -796,7 +894,7 @@ impl CachedChart {
 
         self.chunks = Rc::new(chunks);
 
-        self.span_min = (want_buckets as f32 * BUCKET_MS as f32) / 60_000.0;
+        self.span_min = span_ms as f32 / 60_000.0;
         self.dirty = false;
     }
 
@@ -829,22 +927,27 @@ impl CachedChart {
 
         let newest_bid = self.newest_bucket_id;
         let span_ms = self.prev_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
+        let lod_bucket_ms = lod_bucket_ms_for_span(span_ms);
         let want_buckets = span_ms.div_euclid(BUCKET_MS).max(1);
         let start_bid = newest_bid.saturating_sub(want_buckets - 1);
+        let view_buckets = self.view_buckets(start_bid, newest_bid, lod_bucket_ms);
+        let start_view_id = start_bid
+            .saturating_mul(BUCKET_MS)
+            .div_euclid(lod_bucket_ms);
+        let newest_view_id = newest_bid
+            .saturating_mul(BUCKET_MS)
+            .div_euclid(lod_bucket_ms);
 
-        let left = 60.0_f32;
-        let right = (w - 20.0).max(left + 1.0);
-        let top = 20.0_f32;
-        let bottom = (h - 20.0).max(top + 1.0);
+        let left = CHART_GRID_LEFT as f32;
+        let right = (w - CHART_GRID_RIGHT_PAD as f32).max(left + 1.0);
+        let top = CHART_GRID_TOP as f32;
+        let bottom = (h - CHART_GRID_BOTTOM_PAD as f32).max(top + 1.0);
         let pw = right - left;
         let ph = bottom - top;
 
         let mut raw_min = f32::INFINITY;
         let mut raw_max = f32::NEG_INFINITY;
-        for b in self.buckets.iter() {
-            if b.id < start_bid || b.id > newest_bid {
-                continue;
-            }
+        for b in &view_buckets {
             for &ch in &valid_channels {
                 if b.has[ch] {
                     let v = b.last[ch];
@@ -858,19 +961,22 @@ impl CachedChart {
         let (y_min, y_max) = Self::apply_padding(raw_min, raw_max);
         let map_y = |v: f32| -> f32 { bottom - (v - y_min) / (y_max - y_min) * ph };
 
-        let total = (newest_bid - start_bid + 1).max(1) as f32;
-        let first_chunk_id = start_bid.div_euclid(RENDER_CHUNK_BUCKETS);
-        let last_chunk_id = newest_bid.div_euclid(RENDER_CHUNK_BUCKETS);
+        let total = (newest_view_id - start_view_id + 1).max(1) as f32;
+        let render_chunk_buckets = (RENDER_CHUNK_MS / lod_bucket_ms).max(1);
+        let first_chunk_id = start_view_id.div_euclid(render_chunk_buckets);
+        let last_chunk_id = newest_view_id.div_euclid(render_chunk_buckets);
+        let max_interp_gap_buckets = ((MAX_INTERP_GAP_BUCKETS * BUCKET_MS) / lod_bucket_ms).max(1);
         let mut chunks = Vec::new();
 
         for chunk_id in first_chunk_id..=last_chunk_id {
-            let chunk_start_bid = (chunk_id * RENDER_CHUNK_BUCKETS).max(start_bid);
-            let chunk_end_bid = ((chunk_id + 1) * RENDER_CHUNK_BUCKETS - 1).min(newest_bid);
+            let chunk_start_bid = (chunk_id * render_chunk_buckets).max(start_view_id);
+            let chunk_end_bid = ((chunk_id + 1) * render_chunk_buckets - 1).min(newest_view_id);
             let chunk_bucket_count = (chunk_end_bid - chunk_start_bid + 1).max(1);
-            let chunk_start_x = left + pw * ((chunk_start_bid - start_bid) as f32 / total);
-            let chunk_end_x = left + pw * ((chunk_end_bid - start_bid + 1) as f32 / total);
+            let chunk_start_x = left + pw * ((chunk_start_bid - start_view_id) as f32 / total);
+            let chunk_end_x = left + pw * ((chunk_end_bid - start_view_id + 1) as f32 / total);
             let chunk_width = (chunk_end_x - chunk_start_x).max(1.0);
-            let smooth_chunk = should_smooth_chunk(chunk_width, chunk_bucket_count);
+            let smooth_chunk =
+                lod_bucket_ms <= 100 && should_smooth_chunk(chunk_width, chunk_bucket_count);
 
             let mut paths = vec![String::new(); valid_channels.len()];
             let mut gap_paths = vec![String::new(); valid_channels.len()];
@@ -878,7 +984,7 @@ impl CachedChart {
             let mut last_bucket_id_drawn: Vec<Option<i64>> = vec![None; valid_channels.len()];
             let mut last_point_drawn: Vec<Option<(f32, f32)>> = vec![None; valid_channels.len()];
 
-            for b in self.buckets.iter() {
+            for b in &view_buckets {
                 if b.id < chunk_start_bid || b.id > chunk_end_bid {
                     continue;
                 }
@@ -896,7 +1002,7 @@ impl CachedChart {
                         if gap_buckets > 1
                             && let Some((prev_x, prev_y)) = last_point_drawn[group_idx]
                         {
-                            if gap_buckets <= MAX_INTERP_GAP_BUCKETS {
+                            if gap_buckets <= max_interp_gap_buckets {
                                 let missing = gap_buckets - 1;
                                 let interp_pts = missing.clamp(1, MAX_INTERP_POINTS_PER_GAP);
                                 for j in 1..=interp_pts {
@@ -1000,13 +1106,21 @@ impl CachedChart {
 
         let newest_bid = self.newest_bucket_id;
         let span_ms = self.prev_span_ms.clamp(MIN_SPAN_MS, HISTORY_MS);
+        let lod_bucket_ms = lod_bucket_ms_for_span(span_ms);
         let want_buckets = span_ms.div_euclid(BUCKET_MS).max(1);
         let start_bid = newest_bid.saturating_sub(want_buckets - 1);
+        let view_buckets = self.view_buckets(start_bid, newest_bid, lod_bucket_ms);
+        let start_view_id = start_bid
+            .saturating_mul(BUCKET_MS)
+            .div_euclid(lod_bucket_ms);
+        let newest_view_id = newest_bid
+            .saturating_mul(BUCKET_MS)
+            .div_euclid(lod_bucket_ms);
 
-        let left = 60.0_f32;
-        let right = (w - 20.0).max(left + 1.0);
-        let top = 20.0_f32;
-        let bottom = (h - 20.0).max(top + 1.0);
+        let left = CHART_GRID_LEFT as f32;
+        let right = (w - CHART_GRID_RIGHT_PAD as f32).max(left + 1.0);
+        let top = CHART_GRID_TOP as f32;
+        let bottom = (h - CHART_GRID_BOTTOM_PAD as f32).max(top + 1.0);
         let pw = right - left;
         let ph = bottom - top;
 
@@ -1014,10 +1128,7 @@ impl CachedChart {
         let mut raw_max = f32::NEG_INFINITY;
         let mut channel_ranges: Vec<Option<(f32, f32)>> = vec![None; valid_channels.len()];
 
-        for b in self.buckets.iter() {
-            if b.id < start_bid || b.id > newest_bid {
-                continue;
-            }
+        for b in &view_buckets {
             for (group_idx, &ch) in valid_channels.iter().enumerate() {
                 if !b.has[ch] {
                     continue;
@@ -1040,19 +1151,22 @@ impl CachedChart {
             .map(|range| range.map(|(min, max)| anchored_series_range(min, max, zero_ratio)))
             .collect();
 
-        let total = (newest_bid - start_bid + 1).max(1) as f32;
-        let first_chunk_id = start_bid.div_euclid(RENDER_CHUNK_BUCKETS);
-        let last_chunk_id = newest_bid.div_euclid(RENDER_CHUNK_BUCKETS);
+        let total = (newest_view_id - start_view_id + 1).max(1) as f32;
+        let render_chunk_buckets = (RENDER_CHUNK_MS / lod_bucket_ms).max(1);
+        let first_chunk_id = start_view_id.div_euclid(render_chunk_buckets);
+        let last_chunk_id = newest_view_id.div_euclid(render_chunk_buckets);
+        let max_interp_gap_buckets = ((MAX_INTERP_GAP_BUCKETS * BUCKET_MS) / lod_bucket_ms).max(1);
         let mut chunks = Vec::new();
 
         for chunk_id in first_chunk_id..=last_chunk_id {
-            let chunk_start_bid = (chunk_id * RENDER_CHUNK_BUCKETS).max(start_bid);
-            let chunk_end_bid = ((chunk_id + 1) * RENDER_CHUNK_BUCKETS - 1).min(newest_bid);
+            let chunk_start_bid = (chunk_id * render_chunk_buckets).max(start_view_id);
+            let chunk_end_bid = ((chunk_id + 1) * render_chunk_buckets - 1).min(newest_view_id);
             let chunk_bucket_count = (chunk_end_bid - chunk_start_bid + 1).max(1);
-            let chunk_start_x = left + pw * ((chunk_start_bid - start_bid) as f32 / total);
-            let chunk_end_x = left + pw * ((chunk_end_bid - start_bid + 1) as f32 / total);
+            let chunk_start_x = left + pw * ((chunk_start_bid - start_view_id) as f32 / total);
+            let chunk_end_x = left + pw * ((chunk_end_bid - start_view_id + 1) as f32 / total);
             let chunk_width = (chunk_end_x - chunk_start_x).max(1.0);
-            let smooth_chunk = should_smooth_chunk(chunk_width, chunk_bucket_count);
+            let smooth_chunk =
+                lod_bucket_ms <= 100 && should_smooth_chunk(chunk_width, chunk_bucket_count);
 
             let mut paths = vec![String::new(); valid_channels.len()];
             let mut gap_paths = vec![String::new(); valid_channels.len()];
@@ -1060,7 +1174,7 @@ impl CachedChart {
             let mut last_bucket_id_drawn: Vec<Option<i64>> = vec![None; valid_channels.len()];
             let mut last_point_drawn: Vec<Option<(f32, f32)>> = vec![None; valid_channels.len()];
 
-            for b in self.buckets.iter() {
+            for b in &view_buckets {
                 if b.id < chunk_start_bid || b.id > chunk_end_bid {
                     continue;
                 }
@@ -1080,7 +1194,7 @@ impl CachedChart {
                         if gap_buckets > 1
                             && let Some((prev_x, prev_y)) = last_point_drawn[group_idx]
                         {
-                            if gap_buckets <= MAX_INTERP_GAP_BUCKETS {
+                            if gap_buckets <= max_interp_gap_buckets {
                                 let missing = gap_buckets - 1;
                                 let interp_pts = missing.clamp(1, MAX_INTERP_POINTS_PER_GAP);
                                 for j in 1..=interp_pts {
@@ -1445,10 +1559,10 @@ pub fn ChartCanvas(
                       bctx.clearRect(0, 0, gridBuffer.width, gridBuffer.height);
                       bctx.scale(pxW / data.view_w, pxH / data.view_h);
 
-                      const left = Number.isFinite(data.grid_left) ? data.grid_left : 60.0;
-                      const right = Number.isFinite(data.grid_right) ? data.grid_right : (data.view_w - 20.0);
-                      const top = Number.isFinite(data.grid_top) ? data.grid_top : 20.0;
-                      const bottom = Number.isFinite(data.grid_bottom) ? data.grid_bottom : (data.view_h - 20.0);
+                      const left = Number.isFinite(data.grid_left) ? data.grid_left : {chart_grid_left};
+                      const right = Number.isFinite(data.grid_right) ? data.grid_right : (data.view_w - {chart_grid_right_pad});
+                      const top = Number.isFinite(data.grid_top) ? data.grid_top : {chart_grid_top};
+                      const bottom = Number.isFinite(data.grid_bottom) ? data.grid_bottom : (data.view_h - {chart_grid_bottom_pad});
                       const gridXStep = (right - left) / 6.0;
                       const gridYStep = (bottom - top) / 6.0;
 
@@ -1611,7 +1725,11 @@ pub fn ChartCanvas(
                     setTimeout(draw, 0);
                   }}
                 }})();
-                "##
+        "##,
+        chart_grid_left = CHART_GRID_LEFT,
+        chart_grid_right_pad = CHART_GRID_RIGHT_PAD,
+        chart_grid_top = CHART_GRID_TOP,
+        chart_grid_bottom_pad = CHART_GRID_BOTTOM_PAD,
     );
 
     super::js_eval(&draw_js);

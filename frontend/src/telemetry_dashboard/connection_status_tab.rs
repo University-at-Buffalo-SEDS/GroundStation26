@@ -247,10 +247,10 @@ fn render_latency_chart(points: Option<&Vec<(i64, f64)>>, height: f64) -> Elemen
     }
 
     let width = 1200.0_f64;
-    let left = 60.0_f64;
+    let left = 74.0_f64;
     let right = width - 20.0_f64;
     let pad_top = 20.0_f64;
-    let pad_bottom = 20.0_f64;
+    let pad_bottom = 34.0_f64;
     let inner_w = right - left;
     let inner_h = height - pad_top - pad_bottom;
     let grid_x_step = inner_w / 6.0_f64;
@@ -292,14 +292,14 @@ fn render_latency_chart(points: Option<&Vec<(i64, f64)>>, height: f64) -> Elemen
                 line { x1:"{left}", y1:"{pad_top}",  x2:"{left}",   y2:"{height - pad_bottom}", stroke:"#334155", "stroke-width":"1" }
 
                 // y labels
-                text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", {format!("{y_max}")} }
-                text { x:"10", y:"{pad_top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{}", (y_min + y_max) / 2f64)} }
-                text { x:"10", y:"{height - pad_bottom + 4.0}", fill:"#94a3b8", "font-size":"10", {format!("{y_min}")} }
+                text { x:"10", y:"{pad_top + 6.0}", fill:"#94a3b8", "font-size":"10", text_length:"56", length_adjust:"spacingAndGlyphs", {format!("{y_max}")} }
+                text { x:"10", y:"{pad_top + inner_h / 2.0 + 4.0}", fill:"#94a3b8", "font-size":"10", text_length:"56", length_adjust:"spacingAndGlyphs", {format!("{}", (y_min + y_max) / 2f64)} }
+                text { x:"10", y:"{height - pad_bottom + 2.0}", fill:"#94a3b8", "font-size":"10", text_length:"56", length_adjust:"spacingAndGlyphs", {format!("{y_min}")} }
 
                 // x labels (span in minutes)
-                text { x:"{left + 10.0}",   y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
-                text { x:"{width * 0.5}",  y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min * 0.5)} }
-                text { x:"{right - 60.0}", y:"{height - 5.0}", fill:"#94a3b8", "font-size":"10", "now" }
+                text { x:"{left + 16.0}",   y:"{height - 8.0}", fill:"#94a3b8", "font-size":"10", {format!("-{:.1} min", span_min)} }
+                text { x:"{width * 0.5}",  y:"{height - 8.0}", fill:"#94a3b8", "font-size":"10", "text-anchor":"middle", {format!("-{:.1} min", span_min * 0.5)} }
+                text { x:"{right - 52.0}", y:"{height - 8.0}", fill:"#94a3b8", "font-size":"10", "now" }
 
                 for pts in solid.iter() {
                     if !pts.is_empty() {

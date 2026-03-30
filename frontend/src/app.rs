@@ -13,6 +13,13 @@ use dioxus_router::{use_navigator, Routable, Router};
 #[allow(unused_imports)]
 use crate::telemetry_dashboard::{self, UrlConfig};
 
+#[cfg(not(target_arch = "wasm32"))]
+const INLINE_LEAFLET_CSS: &str = include_str!("../static/vendor/leaflet/leaflet.css");
+#[cfg(not(target_arch = "wasm32"))]
+const INLINE_LEAFLET_JS: &str = include_str!("../static/vendor/leaflet/leaflet.js");
+#[cfg(not(target_arch = "wasm32"))]
+const INLINE_GROUND_MAP_JS: &str = include_str!("../static/ground_map.js");
+
 // -------------------------
 // Native-only keep-awake shims (mobile)
 // -------------------------
@@ -660,16 +667,32 @@ pub fn App() -> Element {
     {
         keep_awake::set_enabled(true);
     }
+    let map_assets: Element = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            rsx! {
+                document::Link {
+                    rel: "stylesheet",
+                    href: asset!("static/vendor/leaflet/leaflet.css"),
+                }
+                document::Script { src: asset!("static/vendor/leaflet/leaflet.js") }
+                document::Script { src: asset!("static/ground_map.js") }
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            rsx! {
+                document::Style { "{INLINE_LEAFLET_CSS}" }
+                document::Script { "{INLINE_LEAFLET_JS}" }
+                document::Script { "{INLINE_GROUND_MAP_JS}" }
+            }
+        }
+    };
     rsx! {
         document::Style { "{GLOBAL_CSS}" }
         Meta { name: "viewport", content: "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" }
-
-        document::Link {
-            rel: "stylesheet",
-            href: asset!("static/vendor/leaflet/leaflet.css"),
-        }
-        document::Script { src: asset!("static/vendor/leaflet/leaflet.js") }
-        document::Script { src: asset!("static/ground_map.js") }
+        {map_assets}
 
         div {
             style: "min-height: var(--gs26-app-height); width: 100%; background: #020617; color: #e5e7eb;",

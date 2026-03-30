@@ -1251,6 +1251,28 @@ fn localized_theme(base: &layout::ThemeConfig, preset: &str) -> layout::ThemeCon
 
 #[component]
 fn NetworkTimeBadge(network_time: Signal<Option<NetworkTimeSync>>, language: String) -> Element {
+    let tick = use_signal(|| 0u64);
+    {
+        let mut tick = tick;
+        use_effect(move || {
+            spawn(async move {
+                loop {
+                    #[cfg(target_arch = "wasm32")]
+                    gloo_timers::future::TimeoutFuture::new(100).await;
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                    let next_tick = {
+                        let current_tick = *tick.read();
+                        current_tick.wrapping_add(1)
+                    };
+                    tick.set(next_tick);
+                }
+            });
+        });
+    }
+    let _tick_snapshot = *tick.read();
     let Some(ts) = network_time
         .read()
         .as_ref()
@@ -2377,6 +2399,9 @@ fn TelemetryDashboardInner() -> Element {
     let tab_style_active = |color: &str| {
         format!(
             "padding:0.4rem 0.8rem; border-radius:0.5rem;\
+             display:inline-flex; align-items:center; justify-content:center; gap:0.35rem;\
+             min-width:0; max-width:100%; text-align:center; line-height:1.2;\
+             white-space:normal; overflow-wrap:anywhere; word-break:break-word;\
              border:1px solid {color}; background:{};\
              color:{color}; cursor:pointer;",
             theme.button_background
@@ -2384,6 +2409,9 @@ fn TelemetryDashboardInner() -> Element {
     };
     let tab_style_inactive = format!(
         "padding:0.4rem 0.8rem; border-radius:0.5rem;\
+         display:inline-flex; align-items:center; justify-content:center; gap:0.35rem;\
+         min-width:0; max-width:100%; text-align:center; line-height:1.2;\
+         white-space:normal; overflow-wrap:anywhere; word-break:break-word;\
          border:1px solid {}; background:{};\
          color:{}; cursor:pointer;",
         theme.tab_shell_border, theme.app_background, theme.text_primary
@@ -2449,7 +2477,7 @@ fn TelemetryDashboardInner() -> Element {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut show_version_overlay = show_version_overlay;
+            let show_version_overlay = show_version_overlay;
             rsx! {
                 button {
                     style: format!("
@@ -2461,8 +2489,17 @@ fn TelemetryDashboardInner() -> Element {
                         font-weight:800;
                         cursor:pointer;
                     ", theme.button_border, theme.button_background, theme.button_text),
-                    onclick: move |_| {
-                        show_version_overlay.set(true);
+                    onclick: {
+                        let mut show_version_overlay = show_version_overlay;
+                        move |_| {
+                            show_version_overlay.set(true);
+                        }
+                    },
+                    ontouchend: {
+                        let mut show_version_overlay = show_version_overlay;
+                        move |_| {
+                            show_version_overlay.set(true);
+                        }
                     },
                     {localized_copy(&language_snapshot, "VERSION", "VERSION", "VERSION")}
                 }
@@ -2471,7 +2508,7 @@ fn TelemetryDashboardInner() -> Element {
     };
 
     let settings_button: Element = {
-        let mut show_settings_overlay = show_settings_overlay;
+        let show_settings_overlay = show_settings_overlay;
         rsx! {
             button {
                 style: format!("
@@ -2483,8 +2520,17 @@ fn TelemetryDashboardInner() -> Element {
                     font-weight:800;
                     cursor:pointer;
                 ", theme.button_border, theme.button_background, theme.button_text),
-                onclick: move |_| {
-                    show_settings_overlay.set(true);
+                onclick: {
+                    let mut show_settings_overlay = show_settings_overlay;
+                    move |_| {
+                        show_settings_overlay.set(true);
+                    }
+                },
+                ontouchend: {
+                    let mut show_settings_overlay = show_settings_overlay;
+                    move |_| {
+                        show_settings_overlay.set(true);
+                    }
                 },
                 {localized_copy(&language_snapshot, "SETTINGS", "AJUSTES", "PARAMETRES")}
             }
@@ -2657,6 +2703,7 @@ fn TelemetryDashboardInner() -> Element {
     let layout_snapshot = layout_config.read().clone();
     let layout_error_snapshot = layout_error.read().clone();
     let layout_loading_snapshot = *layout_loading.read();
+    let version_overlay_open = *show_version_overlay.read();
     let version_overlay: Element = {
         #[cfg(target_arch = "wasm32")]
         {
@@ -2665,7 +2712,7 @@ fn TelemetryDashboardInner() -> Element {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            if *show_version_overlay.read() {
+            if version_overlay_open {
                 rsx! {
                     div {
                         style: "
@@ -2684,6 +2731,10 @@ fn TelemetryDashboardInner() -> Element {
                             -webkit-overflow-scrolling:touch;
                         ",
                         onclick: {
+                            let mut show_version_overlay = show_version_overlay;
+                            move |_| show_version_overlay.set(false)
+                        },
+                        ontouchend: {
                             let mut show_version_overlay = show_version_overlay;
                             move |_| show_version_overlay.set(false)
                         },
@@ -2714,6 +2765,10 @@ fn TelemetryDashboardInner() -> Element {
                                         let mut show_version_overlay = show_version_overlay;
                                         move |_| show_version_overlay.set(false)
                                     },
+                                    ontouchend: {
+                                        let mut show_version_overlay = show_version_overlay;
+                                        move |_| show_version_overlay.set(false)
+                                    },
                                     "{close_button_label}"
                                 }
                             }
@@ -2726,8 +2781,9 @@ fn TelemetryDashboardInner() -> Element {
             }
         }
     };
+    let settings_overlay_open = *show_settings_overlay.read();
     let settings_overlay: Element = {
-        if *show_settings_overlay.read() {
+        if settings_overlay_open {
             rsx! {
                 div {
                     style: "
@@ -2746,6 +2802,10 @@ fn TelemetryDashboardInner() -> Element {
                         -webkit-overflow-scrolling:touch;
                     ",
                     onclick: {
+                        let mut show_settings_overlay = show_settings_overlay;
+                        move |_| show_settings_overlay.set(false)
+                    },
+                    ontouchend: {
                         let mut show_settings_overlay = show_settings_overlay;
                         move |_| show_settings_overlay.set(false)
                     },
@@ -2773,6 +2833,10 @@ fn TelemetryDashboardInner() -> Element {
                                     cursor:pointer;
                                 ",
                                 onclick: {
+                                    let mut show_settings_overlay = show_settings_overlay;
+                                    move |_| show_settings_overlay.set(false)
+                                },
+                                ontouchend: {
                                     let mut show_settings_overlay = show_settings_overlay;
                                     move |_| show_settings_overlay.set(false)
                                 },
@@ -2844,7 +2908,11 @@ fn TelemetryDashboardInner() -> Element {
                  max-width:100%;
                  align-self:center;
                  justify-self:center;
-                 white-space:nowrap;
+                 text-align:center;
+                 line-height:1.2;
+                 white-space:normal;
+                 overflow-wrap:anywhere;
+                 word-break:break-word;
                  padding:0.7rem 0.9rem;
                  border-radius:0.75rem;
                  border:1px solid #334155;
@@ -2868,6 +2936,7 @@ fn TelemetryDashboardInner() -> Element {
                .gs26-tab-shell[data-expanded=\"true\"] .gs26-tab-nav button {{
                  width:18ch;
                  max-width:100%;
+                 min-width:0;
                  justify-content:center;
                  margin-left:auto;
                  margin-right:auto;
@@ -3298,8 +3367,6 @@ fn TelemetryDashboardInner() -> Element {
                                         },
                     }
                 }
-            {settings_overlay}
-            {version_overlay}
         }
     }
 
@@ -3563,6 +3630,8 @@ fn TelemetryDashboardInner() -> Element {
                     }
                 }
                 }
+                {settings_overlay}
+                {version_overlay}
             }
 }
 

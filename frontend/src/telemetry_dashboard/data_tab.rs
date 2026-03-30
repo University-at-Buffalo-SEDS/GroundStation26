@@ -9,7 +9,9 @@ use std::rc::Rc;
 
 use super::data_chart::{
     charts_cache_get, charts_cache_get_channel_minmax, charts_cache_get_subset, charts_cache_get_subset_per_series,
-    sender_scoped_chart_key, series_color, ChartCanvas,
+    sender_scoped_chart_key, series_color, ChartCanvas, CHART_GRID_BOTTOM_PAD,
+    CHART_GRID_LEFT, CHART_GRID_RIGHT_PAD, CHART_GRID_TOP, CHART_X_LABEL_BOTTOM,
+    CHART_X_LABEL_LEFT_INSET, CHART_Y_LABEL_LEFT, CHART_Y_LABEL_MAX_WIDTH,
 };
 use super::{latest_telemetry_row, latest_telemetry_value, translate_text, TELEMETRY_RENDER_EPOCH};
 
@@ -193,10 +195,10 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
     let view_h = 360.0_f64;
     let view_h_full = fullscreen_view_height().max(260.0);
 
-    let left = 60.0_f64;
-    let right = view_w - 20.0_f64;
-    let pad_top = 20.0_f64;
-    let pad_bottom = 20.0_f64;
+    let left = CHART_GRID_LEFT;
+    let right = view_w - CHART_GRID_RIGHT_PAD;
+    let pad_top = CHART_GRID_TOP;
+    let pad_bottom = CHART_GRID_BOTTOM_PAD;
 
     let inner_h = view_h - pad_top - pad_bottom;
     let inner_h_full = view_h_full - pad_top - pad_bottom;
@@ -276,10 +278,22 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                                         .get("data")
                                         .map(String::as_str)
                                         .unwrap_or("#f97316");
-                                    format!("padding:6px 10px; border-radius:999px; border:1px solid {accent}; background:{}; color:{accent}; cursor:pointer;", theme.button_background)
+                                    format!(
+                                        "padding:6px 10px; border-radius:999px; border:1px solid {accent}; background:{}; color:{accent}; cursor:pointer;\
+                                         display:inline-flex; align-items:center; justify-content:center;\
+                                         min-width:0; max-width:100%; text-align:center; line-height:1.2;\
+                                         white-space:normal; overflow-wrap:anywhere; word-break:break-word;",
+                                        theme.button_background
+                                    )
                                 }
                             } else {
-                                format!("padding:6px 10px; border-radius:999px; border:1px solid {}; background:{}; color:{}; cursor:pointer;", theme.border, theme.panel_background, theme.text_primary)
+                                format!(
+                                    "padding:6px 10px; border-radius:999px; border:1px solid {}; background:{}; color:{}; cursor:pointer;\
+                                     display:inline-flex; align-items:center; justify-content:center;\
+                                     min-width:0; max-width:100%; text-align:center; line-height:1.2;\
+                                     white-space:normal; overflow-wrap:anywhere; word-break:break-word;",
+                                    theme.border, theme.panel_background, theme.text_primary
+                                )
                             },
                             onclick: {
                                 let t = t.id.clone();
@@ -302,10 +316,22 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                                             .get("data")
                                             .map(String::as_str)
                                             .unwrap_or("#f97316");
-                                        format!("padding:5px 10px; border-radius:999px; border:1px solid {accent}; background:{}; color:{accent}; cursor:pointer; font-size:12px;", theme.button_background)
+                                        format!(
+                                            "padding:5px 10px; border-radius:999px; border:1px solid {accent}; background:{}; color:{accent}; cursor:pointer; font-size:12px;\
+                                             display:inline-flex; align-items:center; justify-content:center;\
+                                             min-width:0; max-width:100%; text-align:center; line-height:1.2;\
+                                             white-space:normal; overflow-wrap:anywhere; word-break:break-word;",
+                                            theme.button_background
+                                        )
                                     }
                                 } else {
-                                    format!("padding:5px 10px; border-radius:999px; border:1px solid {}; background:{}; color:{}; cursor:pointer; font-size:12px;", theme.border_soft, theme.panel_background, theme.text_secondary)
+                                    format!(
+                                        "padding:5px 10px; border-radius:999px; border:1px solid {}; background:{}; color:{}; cursor:pointer; font-size:12px;\
+                                         display:inline-flex; align-items:center; justify-content:center;\
+                                         min-width:0; max-width:100%; text-align:center; line-height:1.2;\
+                                         white-space:normal; overflow-wrap:anywhere; word-break:break-word;",
+                                        theme.border_soft, theme.panel_background, theme.text_secondary
+                                    )
                                 },
                                 onclick: {
                                     let id = subtab.id.clone();
@@ -664,9 +690,9 @@ fn render_chart_group(
             if let Some(title) = group.title.as_ref() {
                 div { style: "font-size:13px; font-weight:600; color:{theme.text_primary};", "{translate_text(title)}" }
             }
-            div { style: "display:flex; gap:2px; align-items:stretch;",
+            div { style: "display:flex; gap:6px; align-items:stretch;",
                 if per_series_scale {
-                    div { style: "flex:0 0 88px; width:88px; min-width:88px; display:flex; flex-direction:column; justify-content:space-between; align-items:flex-end; font-size:10px; padding-top:4px; padding-bottom:16px; overflow:hidden;",
+                    div { style: "flex:0 0 96px; width:96px; min-width:96px; display:flex; flex-direction:column; justify-content:space-between; align-items:flex-end; font-size:clamp(8px, 1.8vw, 10px); padding-top:4px; padding-bottom:28px; overflow:hidden;",
                         div { style: "display:flex; justify-content:flex-end; flex-wrap:nowrap; gap:6px; white-space:nowrap; width:100%; text-align:right;",
                             for (i, _) in group.channels.iter().enumerate() {
                                 if let Some((_, series_max)) = per_series_scales.get(i).and_then(|scale| *scale) {
@@ -695,21 +721,21 @@ fn render_chart_group(
                         view_w: view_w,
                         view_h: view_h,
                         chunks: filtered_chunks,
-                        grid_left: None,
-                        grid_right: None,
-                        grid_top: None,
-                        grid_bottom: None,
+                        grid_left: Some(left),
+                        grid_right: Some(right),
+                        grid_top: Some(pad_top),
+                        grid_bottom: Some(view_h - pad_bottom),
                         style: "position:absolute; inset:0; width:100%; height:100%; display:block;".to_string(),
                     }
-                    div { style: "position:absolute; inset:0; pointer-events:none; font-size:10px; color:{theme.text_muted};",
+                    div { style: "position:absolute; inset:0; pointer-events:none; font-size:clamp(8px, 1.8vw, 10px); color:{theme.text_muted};",
                         if !per_series_scale {
-                            span { style: "position:absolute; left:10px; top:{y_pct(pad_top + 6.0, view_h)};", "{y_max_s}" }
-                            span { style: "position:absolute; left:10px; top:{y_pct(pad_top + inner_h / 2.0 + 4.0, view_h)}; transform:translateY(-50%);", "{y_mid_s}" }
-                            span { style: "position:absolute; left:10px; top:{y_pct(view_h - pad_bottom + 4.0, view_h)}; transform:translateY(-100%);", "{y_min_s}" }
+                            span { style: "position:absolute; left:{CHART_Y_LABEL_LEFT}px; top:{y_pct(pad_top + 6.0, view_h)}; max-width:{CHART_Y_LABEL_MAX_WIDTH}px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", "{y_max_s}" }
+                            span { style: "position:absolute; left:{CHART_Y_LABEL_LEFT}px; top:{y_pct(pad_top + inner_h / 2.0 + 4.0, view_h)}; transform:translateY(-50%); max-width:{CHART_Y_LABEL_MAX_WIDTH}px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", "{y_mid_s}" }
+                            span { style: "position:absolute; left:{CHART_Y_LABEL_LEFT}px; top:{y_pct(view_h - pad_bottom + 1.0, view_h)}; transform:translateY(-100%); max-width:{CHART_Y_LABEL_MAX_WIDTH}px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", "{y_min_s}" }
                         }
-                        span { style: "position:absolute; left:{x_pct(left + 10.0, view_w)}; bottom:5px;", "{x_left_s}" }
-                        span { style: "position:absolute; left:{x_pct(view_w * 0.5, view_w)}; bottom:5px; transform:translateX(-50%);", "{x_mid_s}" }
-                        span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "{translate_text(\"now\")}" }
+                        span { style: "position:absolute; left:{x_pct(left + CHART_X_LABEL_LEFT_INSET, view_w)}; bottom:{CHART_X_LABEL_BOTTOM}px;", "{x_left_s}" }
+                        span { style: "position:absolute; left:{x_pct(view_w * 0.5, view_w)}; bottom:{CHART_X_LABEL_BOTTOM}px; transform:translateX(-50%);", "{x_mid_s}" }
+                        span { style: "position:absolute; left:{x_pct(right - 52.0, view_w)}; bottom:{CHART_X_LABEL_BOTTOM}px;", "{translate_text(\"now\")}" }
                     }
                 }
             }

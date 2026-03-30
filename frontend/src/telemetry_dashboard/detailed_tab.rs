@@ -23,6 +23,28 @@ pub fn DetailedTab(
     notifications: Signal<Vec<PersistentNotification>>,
     network_time: Signal<Option<NetworkTimeSync>>,
 ) -> Element {
+    let tick = use_signal(|| 0u64);
+    {
+        let mut tick = tick;
+        use_effect(move || {
+            spawn(async move {
+                loop {
+                    #[cfg(target_arch = "wasm32")]
+                    gloo_timers::future::TimeoutFuture::new(100).await;
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                    let next_tick = {
+                        let current_tick = *tick.read();
+                        current_tick.wrapping_add(1)
+                    };
+                    tick.set(next_tick);
+                }
+            });
+        });
+    }
+    let _tick_snapshot = *tick.read();
     let metrics_snapshot = metrics.read().clone();
     let boards = board_status.read().clone();
     let topology = network_topology.read().clone();
