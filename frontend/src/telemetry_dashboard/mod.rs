@@ -2699,7 +2699,7 @@ fn TelemetryDashboardInner() -> Element {
                             onclick: move |evt| evt.stop_propagation(),
                             div {
                                 style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap;",
-                                h1 { style: "margin:0; font-size:20px;", "{version_title}" }
+                                h1 { style: "margin:0; font-size:20px;", "{_version_title}" }
                                 button {
                                     style: "
                                         padding:10px 14px;
