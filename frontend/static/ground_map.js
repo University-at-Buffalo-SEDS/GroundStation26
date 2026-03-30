@@ -11,6 +11,7 @@ let groundMap = null;
 let groundTileLayer = null;
 let rocketMarker = null;
 let userMarker = null;
+let rocketGuideLine = null;
 
 // Remember last-known positions across tab switches
 let lastRocketLatLng = null;
@@ -224,6 +225,34 @@ function setGroundMapUserHeading(deg) {
     updateUserMarkerRotation();
 }
 
+function syncRocketGuideLine(rocketLatLng, userLatLng) {
+    if (!groundMap) return;
+    const L = getLeaflet();
+
+    if (!rocketLatLng || !userLatLng) {
+        if (rocketGuideLine) {
+            try {
+                groundMap.removeLayer(rocketGuideLine);
+            } catch (e) {
+            }
+            rocketGuideLine = null;
+        }
+        return;
+    }
+
+    const points = [userLatLng, rocketLatLng];
+    if (!rocketGuideLine) {
+        rocketGuideLine = L.polyline(points, {
+            color: "#ef4444",
+            weight: 3,
+            opacity: 0.95,
+        }).addTo(groundMap);
+        return;
+    }
+
+    rocketGuideLine.setLatLngs(points);
+}
+
 // ============================================================================
 // Compass handling
 // ============================================================================
@@ -388,6 +417,7 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom, asse
         groundMap.remove();
         window.__gs26_ground_map = null;
         groundTileLayer = null;
+        rocketGuideLine = null;
     }
 
     groundMap = L.map(el, {
@@ -420,13 +450,17 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom, asse
         }).addTo(groundMap);
         updateUserMarkerRotation();
     }
+
+    syncRocketGuideLine(lastRocketLatLng, lastUserLatLng);
 }
 
 function updateGroundMapMarkers(rLat, rLon, uLat, uLon) {
     if (!groundMap) return;
     const L = getLeaflet();
+    const hasRocket = Number.isFinite(rLat) && Number.isFinite(rLon);
+    const hasUser = Number.isFinite(uLat) && Number.isFinite(uLon);
 
-    if (Number.isFinite(rLat) && Number.isFinite(rLon)) {
+    if (hasRocket) {
         lastRocketLatLng = [rLat, rLon];
         if (!rocketMarker) {
             rocketMarker = L.marker(lastRocketLatLng, {
@@ -438,7 +472,7 @@ function updateGroundMapMarkers(rLat, rLon, uLat, uLon) {
         }
     }
 
-    if (Number.isFinite(uLat) && Number.isFinite(uLon)) {
+    if (hasUser) {
         lastUserLatLng = [uLat, uLon];
         if (!userMarker) {
             userMarker = L.marker(lastUserLatLng, {
@@ -450,6 +484,8 @@ function updateGroundMapMarkers(rLat, rLon, uLat, uLon) {
             userMarker.setLatLng(lastUserLatLng);
         }
     }
+
+    syncRocketGuideLine(hasRocket ? lastRocketLatLng : null, hasUser ? lastUserLatLng : null);
 }
 
 // ---- keep as global script ----
@@ -480,6 +516,7 @@ function updateGroundMapMarkers(rLat, rLon, uLat, uLon) {
     api.makeUserIcon = makeUserIcon;
     api.updateUserMarkerRotation = updateUserMarkerRotation;
     api.setGroundMapUserHeading = setGroundMapUserHeading;
+    api.syncRocketGuideLine = syncRocketGuideLine;
 
     // Pin state too (lets you debug on-device):
     api.state = api.state || {};

@@ -1,6 +1,7 @@
 use crate::auth::{AuthFailure, LoginRequest, Permission};
 use crate::fill_targets::{self, FillTargetsConfig};
 use crate::flight_setup::{self, FlightSetupConfig};
+use crate::i18n::{self, TranslateRequest, TranslateResponse, TranslationCatalogResponse};
 use crate::layout;
 use crate::loadcell;
 use crate::map::{detect_max_native_zoom, tile_bundle_path, DEFAULT_MAP_REGION};
@@ -44,6 +45,16 @@ const RECENT_BUCKET_MS: i64 = 20;
 enum TileDbMode {
     LegacyInline,
     Deduped,
+}
+
+#[derive(Deserialize)]
+struct TranslationCatalogQuery {
+    #[serde(default = "default_translation_lang")]
+    lang: String,
+}
+
+fn default_translation_lang() -> String {
+    "en".to_string()
 }
 
 /// Extracts the numeric telemetry payload from either the newer JSON column or the legacy blob.
@@ -123,6 +134,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alerts", get(get_alerts))
         .route("/api/boards", get(get_boards))
         .route("/api/layout", get(get_layout))
+        .route("/api/i18n/catalog", get(get_translation_catalog))
+        .route("/api/i18n/translate", post(post_translate_texts))
         .route("/api/calibration_config", get(get_calibration_config))
         .route("/api/map_config", get(get_map_config))
         .route(
@@ -405,6 +418,28 @@ async fn get_layout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
         Ok(layout) => Json(layout).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
+}
+
+async fn get_translation_catalog(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<TranslationCatalogQuery>,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json::<TranslationCatalogResponse>(i18n::catalog_for_lang(&query.lang)).into_response()
+}
+
+async fn post_translate_texts(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TranslateRequest>,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json::<TranslateResponse>(i18n::translate_texts(req).await).into_response()
 }
 
 /// Returns the UI layout metadata for the loadcell calibration tab.

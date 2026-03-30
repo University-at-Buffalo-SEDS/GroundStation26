@@ -6,7 +6,11 @@ use super::types::{
     BoardStatusEntry, FlightState, NetworkTopologyMsg, NetworkTopologyNodeKind,
     NetworkTopologyStatus,
 };
-use super::{format_timestamp_ms_clock, AlertMsg, FrontendNetworkMetrics, PersistentNotification};
+use super::{
+    compensated_network_time_ms, format_network_time, format_timestamp_ms_clock, monotonic_now_ms,
+    translate_text, AlertMsg, FrontendNetworkMetrics, NetworkTimeSync,
+    PersistentNotification,
+};
 
 #[component]
 pub fn DetailedTab(
@@ -17,13 +21,12 @@ pub fn DetailedTab(
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
-    network_time_display: Option<String>,
-    network_clock_delta_ms: Option<i64>,
-    network_time_age_ms: Option<i64>,
+    network_time: Signal<Option<NetworkTimeSync>>,
 ) -> Element {
     let metrics_snapshot = metrics.read().clone();
     let boards = board_status.read().clone();
     let topology = network_topology.read().clone();
+    let network_time_snapshot = *network_time.read();
     let visible_topology_nodes = visible_topology_nodes(&topology.nodes);
     let visible_topology_links = collapse_visible_links(&topology.nodes, &topology.links);
     let warnings_count = warnings.read().len();
@@ -86,6 +89,17 @@ pub fn DetailedTab(
     } else {
         None
     };
+    let network_time_display = network_time_snapshot
+        .map(compensated_network_time_ms)
+        .map(format_network_time);
+    let network_clock_delta_ms = network_time_snapshot
+        .map(compensated_network_time_ms)
+        .map(|ms| current_wallclock_ms().saturating_sub(ms));
+    let network_time_age_ms = network_time_snapshot.map(|sync| {
+        (monotonic_now_ms() - sync.received_mono_ms)
+            .max(0.0)
+            .round() as i64
+    });
     let topology_age_ms = if topology.generated_ms > 0 {
         Some(now_ms.saturating_sub(topology.generated_ms as i64))
     } else {
@@ -106,7 +120,7 @@ pub fn DetailedTab(
                 {metric_card(
                     "Frontend ↔ Backend",
                     vec![
-                        ("Status", if metrics_snapshot.ws_connected { "Connected".to_string() } else { "Disconnected".to_string() }),
+                        ("Status", if metrics_snapshot.ws_connected { translate_text("Connected") } else { translate_text("Disconnected") }),
                         ("Base URL", metrics_snapshot.base_http.clone()),
                         ("WebSocket", metrics_snapshot.ws_url.clone()),
                         ("HTTP RTT", opt_ms(metrics_snapshot.http_rtt_ms)),
@@ -135,15 +149,15 @@ pub fn DetailedTab(
                         ("Connected for", opt_i64_ms(ws_connected_for_ms)),
                         ("WS idle", opt_i64_ms(ws_idle_ms)),
                         ("Last WS message", opt_timestamp(metrics_snapshot.last_ws_message_wall_ms)),
-                        ("Last disconnect", metrics_snapshot.last_disconnect_reason.clone().unwrap_or_else(|| "None".to_string())),
+                        ("Last disconnect", metrics_snapshot.last_disconnect_reason.clone().map(|v| translate_text(&v)).unwrap_or_else(|| translate_text("None"))),
                         ("Last connect", opt_timestamp(metrics_snapshot.last_connect_wall_ms)),
                     ],
                 )}
                 {metric_card(
                     "Mission State",
                     vec![
-                        ("Flight state", flight_state.read().to_string().to_string()),
-                        ("Rocket time", network_time_display.unwrap_or_else(|| "Unavailable".to_string())),
+                        ("Flight state", translate_text(&flight_state.read().to_string())),
+                        ("Rocket time", network_time_display.unwrap_or_else(|| translate_text("Unavailable"))),
                         ("Clock delta", opt_signed_ms(network_clock_delta_ms)),
                         ("Server time age", opt_i64_ms(network_time_age_ms)),
                         ("Warnings", warnings_count.to_string()),
@@ -165,7 +179,7 @@ pub fn DetailedTab(
                         ("Online links", online_links.to_string()),
                         ("Offline links", offline_links.to_string()),
                         ("Topology age", opt_i64_ms(topology_age_ms)),
-                        ("Topology simulated", yes_no(topology.simulated)),
+                        ("Topology simulated", translate_text(&yes_no(topology.simulated))),
                     ],
                 )}
                 {metric_card(

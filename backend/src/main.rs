@@ -10,6 +10,7 @@ mod flight_setup;
 mod flight_sim;
 mod gpio;
 mod gpio_panel;
+mod i18n;
 mod layout;
 mod loadcell;
 mod map;

@@ -7,16 +7,16 @@ use blake3::Hasher;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::Client;
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::fs as async_fs;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{Duration, Instant, sleep};
 
 /// Region name (used for directory layout)
 const REGION: &str = "north_america";

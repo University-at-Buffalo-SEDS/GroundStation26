@@ -5,12 +5,13 @@ use super::layout::{
 // frontend/src/telemetry_dashboard/data_tab.rs
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
+use std::rc::Rc;
 
 use super::data_chart::{
     charts_cache_get, charts_cache_get_channel_minmax, charts_cache_get_subset, charts_cache_get_subset_per_series,
     sender_scoped_chart_key, series_color, ChartCanvas,
 };
-use super::{latest_telemetry_row, latest_telemetry_value, TELEMETRY_RENDER_EPOCH};
+use super::{latest_telemetry_row, latest_telemetry_value, translate_text, TELEMETRY_RENDER_EPOCH};
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
 const _ACTIVE_SUBTAB_STORAGE_KEY: &str = "gs26_active_data_subtab";
@@ -215,7 +216,7 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                 style: "display:grid; gap:10px; align-items:stretch; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); width:100%;",
                 for (i, item) in summary_items.iter().enumerate() {
                     SummaryCard {
-                        label: item.label.clone(),
+                        label: translate_text(&item.label),
                         min: None,
                         max: None,
                         value: summary_item_value(item),
@@ -227,10 +228,10 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
     } else {
         match latest_row {
             None => rsx! {
-                div { style: "color:{theme.text_muted}; padding:2px 2px;", "Waiting for telemetry…" }
+                div { style: "color:{theme.text_muted}; padding:2px 2px;", "{translate_text(\"Waiting for telemetry…\")}" }
             },
             Some(row) => {
-                let vals = row.values.clone();
+                let vals = &row.values;
                 rsx! {
                     div {
                         style: "display:grid; gap:10px; align-items:stretch; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); width:100%;",
@@ -285,7 +286,7 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                                 let mut active_tab2 = active_tab;
                                 move |_| active_tab2.set(t.clone())
                             },
-                            "{t.label}"
+                            "{translate_text(&t.label)}"
                         }
                     }
                 }
@@ -311,7 +312,7 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                                     let mut active_subtab = active_subtab;
                                     move |_| active_subtab.set(id.clone())
                                 },
-                                "{subtab.label}"
+                                "{translate_text(&subtab.label)}"
                             }
                         }
                     }
@@ -363,9 +364,15 @@ fn effective_source(
 
 fn effective_labels(tab: Option<&DataTabSpec>, subtab: Option<&DataSubtabSpec>) -> Vec<String> {
     if let Some(channels) = subtab.and_then(|subtab| subtab.channels.as_ref()) {
-        return channels.clone();
+        return channels.iter().map(|label| translate_text(label)).collect();
     }
-    tab.map(|tab| tab.channels.clone()).unwrap_or_default()
+    tab.map(|tab| {
+        tab.channels
+            .iter()
+            .map(|label| translate_text(label))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn effective_channel_formatters<'a>(
@@ -494,12 +501,16 @@ fn DataGraphPanel(
                     button {
                         style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
                         onclick: on_toggle_chart,
-                        if *show_chart.read() { "Collapse" } else { "Expand" }
+                        if *show_chart.read() {
+                            "{translate_text(\"Collapse\")}"
+                        } else {
+                            "{translate_text(\"Expand\")}"
+                        }
                     }
                     button {
                         style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
                         onclick: on_toggle_fullscreen,
-                        "Fullscreen"
+                        "{translate_text(\"Fullscreen\")}"
                     }
                 }
 
@@ -535,11 +546,11 @@ fn DataGraphPanel(
                 rsx! {
                     div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:{theme.app_background}; display:flex; flex-direction:column; gap:12px;",
                         div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
-                            h2 { style: "margin:0; color:{theme.main_tab_accents.get(\"data\").map(String::as_str).unwrap_or(\"#f97316\")};", "Data Graph" }
+                            h2 { style: "margin:0; color:{theme.main_tab_accents.get(\"data\").map(String::as_str).unwrap_or(\"#f97316\")};", "{translate_text(\"Data Graph\")}" }
                             button {
                                 style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
                                 onclick: on_toggle_fullscreen,
-                                "Exit Fullscreen"
+                                "{translate_text(\"Exit Fullscreen\")}"
                             }
                         }
 
@@ -623,7 +634,7 @@ fn render_chart_group(
     } else {
         let (chunks, y_min, y_max, span_min) =
             charts_cache_get_subset(&chart_key, &group.channels, view_w as f32, view_h as f32);
-        (chunks, y_min, y_max, span_min, Vec::new())
+        (chunks, y_min, y_max, span_min, Rc::new(Vec::new()))
     };
     if filtered_chunks.is_empty() {
         return rsx! {};
@@ -651,7 +662,7 @@ fn render_chart_group(
     rsx! {
         div { style: "width:100%; background:{theme.app_background}; border-radius:14px; border:1px solid {theme.border}; padding:12px; display:flex; flex-direction:column; gap:8px;",
             if let Some(title) = group.title.as_ref() {
-                div { style: "font-size:13px; font-weight:600; color:{theme.text_primary};", "{title}" }
+                div { style: "font-size:13px; font-weight:600; color:{theme.text_primary};", "{translate_text(title)}" }
             }
             div { style: "display:flex; gap:2px; align-items:stretch;",
                 if per_series_scale {
@@ -698,7 +709,7 @@ fn render_chart_group(
                         }
                         span { style: "position:absolute; left:{x_pct(left + 10.0, view_w)}; bottom:5px;", "{x_left_s}" }
                         span { style: "position:absolute; left:{x_pct(view_w * 0.5, view_w)}; bottom:5px; transform:translateX(-50%);", "{x_mid_s}" }
-                        span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "now" }
+                        span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "{translate_text(\"now\")}" }
                     }
                 }
             }
@@ -709,7 +720,7 @@ fn render_chart_group(
                             svg { width:"26", height:"8", view_box:"0 0 26 8",
                                 line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(*i)}", "stroke-width":"2", "stroke-linecap":"round" }
                             }
-                            "{label}"
+                            "{translate_text(label)}"
                         }
                     }
                 }
@@ -727,7 +738,11 @@ fn SummaryCard(
     color: &'static str,
 ) -> Element {
     let mm = match (min.as_deref(), max.as_deref()) {
-        (Some(mi), Some(ma)) => Some(format!("min {mi} • max {ma}")),
+        (Some(mi), Some(ma)) => Some(format!(
+            "{} {mi} • {} {ma}",
+            translate_text("min"),
+            translate_text("max")
+        )),
         _ => None,
     };
 
@@ -772,9 +787,9 @@ fn boolean_value_text(v: Option<f32>, labels: Option<&BooleanLabels>) -> String 
         .and_then(|l| l.unknown_label.as_deref())
         .unwrap_or("Unknown");
     match v {
-        Some(val) if val >= 0.5 => true_label.to_string(),
-        Some(_) => false_label.to_string(),
-        None => unknown_label.to_string(),
+        Some(val) if val >= 0.5 => translate_text(true_label),
+        Some(_) => translate_text(false_label),
+        None => translate_text(unknown_label),
     }
 }
 
