@@ -166,6 +166,80 @@ pub async fn fetch_session_status(
     Ok(status)
 }
 
+fn body_looks_like_html(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || lower.contains("<body")
+        || lower.contains("<script")
+}
+
+fn compact_error_body(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() || body_looks_like_html(trimmed) {
+        return None;
+    }
+
+    let single_line = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() {
+        return None;
+    }
+
+    const MAX_LEN: usize = 180;
+    if single_line.len() > MAX_LEN {
+        Some(format!("{}...", &single_line[..MAX_LEN]))
+    } else {
+        Some(single_line)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn format_http_error(status: u16, body: &str) -> String {
+    let label = match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
+    };
+    let headline = if label.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status} {label}")
+    };
+
+    if let Some(details) = compact_error_body(body) {
+        format!("{headline}\n{details}")
+    } else {
+        format!(
+            "{headline}\nThe backend returned an error page instead of the expected API response."
+        )
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn format_http_error(status: reqwest::StatusCode, body: &str) -> String {
+    let headline = match status.canonical_reason() {
+        Some(reason) => format!("HTTP {} {reason}", status.as_u16()),
+        None => format!("HTTP {}", status.as_u16()),
+    };
+
+    if let Some(details) = compact_error_body(body) {
+        format!("{headline}\n{details}")
+    } else {
+        format!(
+            "{headline}\nThe backend returned an error page instead of the expected API response."
+        )
+    }
+}
+
 pub async fn fetch_logged_out_session_status(
     base: &str,
     skip_tls_verify: bool,
@@ -231,7 +305,7 @@ async fn auth_request_get(
         clear_current_session();
     }
     if !(200..300).contains(&status) {
-        return Err(format!("HTTP {status}: {}", text.trim()));
+        return Err(format_http_error(status, &text));
     }
     Ok(text)
 }
@@ -258,7 +332,7 @@ async fn auth_request_get(
         clear_current_session();
     }
     if !status.is_success() {
-        return Err(format!("HTTP {status}: {}", text.trim()));
+        return Err(format_http_error(status, &text));
     }
     Ok(text)
 }
@@ -287,7 +361,7 @@ async fn auth_request_post_json(
         clear_current_session();
     }
     if !(200..300).contains(&status) {
-        return Err(format!("HTTP {status}: {}", text.trim()));
+        return Err(format_http_error(status, &text));
     }
     Ok(text)
 }
@@ -316,7 +390,7 @@ async fn auth_request_post_json(
         clear_current_session();
     }
     if !status.is_success() {
-        return Err(format!("HTTP {status}: {}", text.trim()));
+        return Err(format_http_error(status, &text));
     }
     Ok(text)
 }
@@ -336,7 +410,7 @@ async fn auth_request_post_empty(url: &str, _skip_tls_verify: bool) -> Result<()
         clear_current_session();
     }
     if !(200..300).contains(&status) {
-        return Err(format!("HTTP {status}: {}", text.trim()));
+        return Err(format_http_error(status, &text));
     }
     Ok(())
 }
@@ -358,7 +432,7 @@ async fn auth_request_post_empty(url: &str, skip_tls_verify: bool) -> Result<(),
         clear_current_session();
     }
     if !status.is_success() {
-        return Err(format!("HTTP {status}: {}", text.trim()));
+        return Err(format_http_error(status, &text));
     }
     Ok(())
 }

@@ -1,8 +1,8 @@
 #![allow(clippy::redundant_locals)]
 
 use super::{
-    TELEMETRY_RENDER_EPOCH, http_get_json, http_post_json, latest_telemetry_row,
-    latest_telemetry_value,
+    http_get_json, http_post_json, latest_telemetry_row, latest_telemetry_value,
+    translate_text, TELEMETRY_RENDER_EPOCH,
 };
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -746,7 +746,7 @@ pub fn CalibrationTab() -> Element {
         .and_then(|c| fit_details_text(c, channel));
     let fit_equation_text = fit_meta_text
         .clone()
-        .unwrap_or_else(|| format!("type={fit_type_s}"));
+        .unwrap_or_else(|| format!("{}={}", translate_text("type"), translate_text(&fit_type_s)));
     let fit_color = channel.fit_color();
 
     let plot_w = 900.0_f32;

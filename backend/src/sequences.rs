@@ -2,6 +2,7 @@ use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 use crate::state::AppState;
 use crate::types::{FlightState, TelemetryCommand};
 use crate::web::emit_warning;
+use crate::{fill_targets, loadcell};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,6 +95,7 @@ struct SequenceConfig {
 
 impl SequenceConfig {
     fn from_env() -> Self {
+        let fill_cfg = fill_targets::load_or_default();
         let leak_check_duration = std::env::var("GS_SEQUENCE_LEAK_CHECK_SEC")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -109,17 +111,21 @@ impl SequenceConfig {
             std::env::var("GS_SEQUENCE_NITROGEN_PRESSURE_TARGET_PSI")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(DEFAULT_NITROGEN_PRESSURE_TARGET_PSI);
+                .unwrap_or(fill_cfg.nitrogen.target_pressure_psi)
+                .max(
+                    DEFAULT_NITROGEN_PRESSURE_TARGET_PSI.min(fill_cfg.nitrogen.target_pressure_psi),
+                );
 
         let nitrous_pressure_min_psi = std::env::var("GS_SEQUENCE_NITROUS_PRESSURE_MIN_PSI")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(pressure_min_psi);
+            .unwrap_or(fill_cfg.nitrous.target_pressure_psi.max(pressure_min_psi));
 
         let nitrogen_target_mass_kg = std::env::var("GS_SEQUENCE_NITROGEN_TARGET_MASS_KG")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v > 0.0);
+            .filter(|v| *v > 0.0)
+            .or(Some(fill_cfg.nitrogen.target_mass_kg.max(0.01)));
 
         let nitrogen_autoclose_mode = std::env::var("GS_SEQUENCE_NITROGEN_AUTOCLOSE_MODE")
             .ok()
@@ -727,13 +733,16 @@ fn update_sequence_runtime(
             }
 
             let target_mass_kg = {
-                state
-                    .loadcell_calibration
-                    .lock()
-                    .unwrap()
-                    .full_mass_kg
-                    .unwrap_or(crate::loadcell::DEFAULT_FULL_MASS_KG)
-                    .max(0.0001)
+                let cfg_target = fill_targets::load_or_default().nitrous.target_mass_kg;
+                cfg_target.max(
+                    state
+                        .loadcell_calibration
+                        .lock()
+                        .unwrap()
+                        .full_mass_kg
+                        .unwrap_or(loadcell::DEFAULT_FULL_MASS_KG)
+                        .max(0.0001),
+                )
             };
             if current_mass_kg.is_some_and(|m| m >= target_mass_kg) {
                 if !runtime.auto_close_nitrous_sent {

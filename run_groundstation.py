@@ -4,6 +4,7 @@ import signal
 import subprocess
 import sys
 import time
+import platform
 from pathlib import Path
 
 
@@ -60,6 +61,21 @@ def run(cmd: list[str], cwd: Path) -> None:
         raise subprocess.CalledProcessError(code, cmd)
 
 
+def is_raspberry_pi() -> bool:
+    if platform.system() != "Linux":
+        return False
+    for path in (
+        Path("/sys/firmware/devicetree/base/model"),
+        Path("/proc/device-tree/model"),
+    ):
+        try:
+            if "raspberry pi" in path.read_text(errors="ignore").lower():
+                return True
+        except FileNotFoundError:
+            continue
+    return False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build frontend and run groundstation backend."
@@ -67,8 +83,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=["testing", "hitl-mode"],
-        help="Legacy positional mode. Use 'testing' or 'hitl-mode' to enable backend features.",
+        choices=["testing", "hitl-mode", "debug"],
+        help="Legacy positional mode. Use 'testing', 'hitl-mode', or 'debug'.",
     )
     parser.add_argument(
         "--testing",
@@ -80,6 +96,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable backend 'hitl_mode' feature.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Build and run in debug mode for faster compile times.",
+    )
+    parser.add_argument(
+        "--backend-only-build",
+        action="store_true",
+        help="Skip the frontend rebuild and only rebuild/run the backend.",
+    )
     return parser.parse_args()
 
 
@@ -87,12 +113,18 @@ def main() -> None:
     args = parse_args()
     testing_mode = args.testing or args.mode == "testing"
     hitl_mode = args.hitl_mode or args.mode == "hitl-mode"
+    debug_mode = args.debug or args.mode == "debug"
     if testing_mode and hitl_mode:
         print("Error: testing mode and hitl-mode are mutually exclusive.", file=sys.stderr)
         sys.exit(2)
 
-    cmd = ["cargo", "run", "--release", "-p", "groundstation_backend"]
+    cmd = ["cargo", "run"]
+    if not debug_mode:
+        cmd.append("--release")
+    cmd.extend(["-p", "groundstation_backend"])
     features: list[str] = []
+    if is_raspberry_pi():
+        features.append("raspberry_pi")
     if testing_mode:
         features.append("testing")
     if hitl_mode:
@@ -100,9 +132,12 @@ def main() -> None:
     if features:
         cmd.extend(["--features", ",".join(features)])
     repo_root = Path(__file__).resolve().parent
-    frontend_cmd = [sys.executable, str(repo_root / "frontend" / "build.py"), "frontend_web"]
-    print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")
-    subprocess.run(frontend_cmd, cwd=repo_root, check=True)
+    if not args.backend_only_build:
+        frontend_cmd = [sys.executable, str(repo_root / "frontend" / "build.py"), "frontend_web"]
+        if debug_mode:
+            frontend_cmd.append("debug")
+        print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")
+        subprocess.run(frontend_cmd, cwd=repo_root, check=True)
     try:
         run(cmd, cwd=repo_root)
     except subprocess.CalledProcessError as e:

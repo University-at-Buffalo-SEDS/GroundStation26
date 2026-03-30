@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 // Acceleration thresholds (m/s²)
 const ACCELERATION_X_MIN_THRESHOLD: f32 = -2.0; // m/s²
@@ -271,7 +271,8 @@ pub async fn safety_task(
                     let abort_eligible = *board != Board::ValveBoard
                         && !suppress_disconnect_warnings
                         && (on_ground || !is_ground_board);
-                    if abort_eligible
+                    if current_state != FlightState::Startup
+                        && abort_eligible
                         && !in_flight_ignored_board
                         && let Some(last_seen_ms) = status.last_seen_ms
                     {
@@ -333,7 +334,9 @@ pub async fn safety_task(
         }
 
         let last_packet_ms = state.last_packet_received_ms();
-        if last_packet_ms == 0 || now_ms.saturating_sub(last_packet_ms) > 10_000 {
+        if current_state == FlightState::Startup {
+            last_no_packet_warning_ms = 0;
+        } else if last_packet_ms == 0 || now_ms.saturating_sub(last_packet_ms) > 10_000 {
             if last_no_packet_warning_ms == 0
                 || now_ms.saturating_sub(last_no_packet_warning_ms) >= 10_000
             {

@@ -5,7 +5,8 @@ use crate::telemetry_dashboard::gps_android;
 #[cfg(target_os = "ios")]
 use crate::telemetry_dashboard::gps_apple;
 use crate::telemetry_dashboard::{
-    http_get_json, js_eval, js_is_ground_map_ready, js_read_window_string, map_tiles_url,
+    http_get_json, js_eval, js_is_ground_map_ready, js_read_window_string, layout::ThemeConfig,
+    map_tiles_url,
 };
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
@@ -24,10 +25,63 @@ fn tiles_url() -> String {
     map_tiles_url()
 }
 
+fn format_distance_label(
+    rocket: Option<(f64, f64)>,
+    user: Option<(f64, f64)>,
+    metric: bool,
+) -> Option<String> {
+    let (rocket_lat, rocket_lon) = rocket?;
+    let (user_lat, user_lon) = user?;
+    let meters = haversine_meters(rocket_lat, rocket_lon, user_lat, user_lon);
+    Some(format_human_distance(meters, metric))
+}
+
+fn haversine_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    let lat1 = lat1.to_radians();
+    let lon1 = lon1.to_radians();
+    let lat2 = lat2.to_radians();
+    let lon2 = lon2.to_radians();
+    let d_lat = lat2 - lat1;
+    let d_lon = lon2 - lon1;
+    let a = (d_lat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (d_lon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    EARTH_RADIUS_M * c
+}
+
+fn format_human_distance(meters: f64, metric: bool) -> String {
+    if metric {
+        if meters < 1_000.0 {
+            format!("{:.0} m", meters.round())
+        } else {
+            let km = meters / 1_000.0;
+            if km < 10.0 {
+                format!("{km:.1} km")
+            } else {
+                format!("{km:.0} km")
+            }
+        }
+    } else {
+        let feet = meters * 3.280_839_895;
+        if feet < 1_000.0 {
+            format!("{:.0} ft", feet.round())
+        } else {
+            let miles = feet / 5_280.0;
+            if miles < 10.0 {
+                format!("{miles:.1} mi")
+            } else {
+                format!("{miles:.0} mi")
+            }
+        }
+    }
+}
+
 #[component]
 pub fn MapTab(
     rocket_gps: Signal<Option<(f64, f64)>>,
     user_gps: Signal<Option<(f64, f64)>>,
+    #[props(default = false)] distance_units_metric: bool,
+    #[props(default)] theme: Option<ThemeConfig>,
     #[props(default)] title: Option<String>,
 ) -> Element {
     let _ = *rocket_gps.read();
@@ -42,6 +96,7 @@ pub fn MapTab(
     let mut browser_user_gps = use_signal(|| None::<(f64, f64)>);
     let has_centered_on_user = use_signal(|| false);
     let map_config = use_signal(MapConfig::default);
+    let theme = theme.unwrap_or_default();
     let resolved_title = if title.as_deref().unwrap_or_default().trim().is_empty() {
         map_config.read().map_title.clone()
     } else {
@@ -206,6 +261,8 @@ pub fn MapTab(
     // Effective user GPS: browser > parent
     let effective_user =
         move || -> Option<(f64, f64)> { browser_user_gps.read().or_else(|| *user_gps.read()) };
+    let distance_text =
+        format_distance_label(*rocket_gps.read(), effective_user(), distance_units_metric);
 
     // --- 3) Update markers whenever rocket/user changes ---
     {
@@ -269,9 +326,14 @@ pub fn MapTab(
 
     rsx! {
         if *is_fullscreen.read() {
-            div { style: "position:fixed; inset:0; z-index:9999; padding:16px; background:#020617; display:flex; flex-direction:column; gap:12px;",
+            div { style: "position:fixed; inset:0; z-index:9999; padding:16px; background:{theme.app_background}; display:flex; flex-direction:column; gap:12px;",
                 div { style: "display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:space-between;",
-                    h2 { style: "margin:0; color:#22c55e;", "{resolved_title}" }
+                    div { style: "display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;",
+                        h2 { style: "margin:0; color:#22c55e;", "{resolved_title}" }
+                        if let Some(distance_text) = distance_text.clone() {
+                            span { style: "color:#fecaca; font-size:0.95rem; font-weight:700;", "(Distance: {distance_text})" }
+                        }
+                    }
                     div { style: "display:flex; gap:8px; flex-wrap:wrap;",
                         button {
                             style: "padding:6px 12px; border-radius:999px; border:1px solid #22c55e; background:#022c22; color:#bbf7d0; font-size:0.85rem; cursor:pointer;",
@@ -295,7 +357,7 @@ pub fn MapTab(
                 div { style: "flex:1; min-height:0; width:100%;",
                     div {
                         id: "ground-map",
-                        style: "width:100%; height:100%; border-radius:12px; overflow:hidden; background:#000; border:1px solid #4b5563; touch-action:manipulation; overscroll-behavior:contain;",
+                        style: "width:100%; height:100%; border-radius:12px; overflow:hidden; background:{theme.panel_background}; border:1px solid {theme.border_strong}; touch-action:manipulation; overscroll-behavior:contain;",
                         ontouchstart: move |e| {
                             let touches = e.touches();
                             if touches.len() > 1 {
@@ -311,11 +373,14 @@ pub fn MapTab(
                 id: "map-card",
                 style: "display:flex; flex-direction:column; gap:12px; width:100%; height:var(--gs26-map-max, 60vh); \
                         max-height:var(--gs26-map-max, 60vh); \
-                        border-radius:12px; background:#020617ee; border:1px solid #4b5563; \
+                        border-radius:12px; background:{theme.tab_shell_background}; border:1px solid {theme.border_strong}; \
                         box-shadow:0 10px 25px rgba(0,0,0,0.45);",
                 div {
                     style: "display:flex; align-items:center; gap:12px; flex-wrap:wrap;",
                     h2 { style: "margin:0; color:#22c55e;", "{resolved_title}" }
+                    if let Some(distance_text) = distance_text {
+                        span { style: "color:#fecaca; font-size:0.95rem; font-weight:700;", "(Distance: {distance_text})" }
+                    }
                     button {
                         style: "padding:6px 12px; border-radius:999px; border:1px solid #22c55e; background:#022c22; color:#bbf7d0; font-size:0.85rem; cursor:pointer;",
                         onclick: on_center_me,
@@ -338,7 +403,7 @@ pub fn MapTab(
                 div { style: "flex:1; min-height:0; width:100%;",
                     div {
                         id: "ground-map",
-                        style: "width:100%; height:100%; border-radius:12px; overflow:hidden; background:#000; border:1px solid #4b5563; touch-action:manipulation; overscroll-behavior:contain;",
+                        style: "width:100%; height:100%; border-radius:12px; overflow:hidden; background:{theme.panel_background}; border:1px solid {theme.border_strong}; touch-action:manipulation; overscroll-behavior:contain;",
                         ontouchstart: move |e| {
                             let touches = e.touches();
                             if touches.len() > 1 {

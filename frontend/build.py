@@ -26,10 +26,12 @@ from typing import Optional, Literal, BinaryIO, cast
 APP_NAME = "UBSEDS GS"
 WINDOWS_APP_NAME = "UBSEDS GroundStation"
 ANDROID_APP_NAME = "SEDS GS"
+MACOS_ALT_APP_NAME = "SEDS GS"
 LINUX_PACKAGE_NAME = "ubseds-groundstation"
 LEGACY_APP_NAME = "GroundstationFrontend"
 DIST_DIRNAME = "dist"
 APP_BUNDLE_NAME = f"{APP_NAME}.app"
+MACOS_ALT_APP_BUNDLE_NAME = f"{MACOS_ALT_APP_NAME}.app"
 LEGACY_APP_BUNDLE_NAME = f"{LEGACY_APP_NAME}.app"
 
 # fixed provisioning profile path (repo-local)
@@ -299,18 +301,17 @@ def build_docker(repo_root: Path, pi_build: bool, testing: bool, plain_progress:
     run(cmd, cwd=repo_root)
 
 
-def patch_plist(frontend_dir: Path) -> None:
+def patch_plist(frontend_dir: Path, app_dir: Optional[Path] = None) -> None:
     script = frontend_dir / "scripts" / "patch_plist.sh"
     version = _read_frontend_version(frontend_dir)
     build = _read_dioxus_build(frontend_dir)
-    run_script(
-        script,
-        cwd=frontend_dir,
-        env={
-            "APP_VERSION": version,
-            "APP_BUILD": build,
-        },
-    )
+    env = {
+        "APP_VERSION": version,
+        "APP_BUILD": build,
+    }
+    if app_dir is not None:
+        env["APP_DIR"] = str(app_dir)
+    run_script(script, cwd=frontend_dir, env=env)
 
 
 def _read_frontend_version(frontend_dir: Path) -> str:
@@ -360,20 +361,61 @@ def dist_dir(frontend_dir: Path) -> Path:
 def app_bundle_path(frontend_dir: Path) -> Path:
     dist = dist_dir(frontend_dir)
     preferred = dist / APP_BUNDLE_NAME
+    alt = dist / MACOS_ALT_APP_BUNDLE_NAME
     legacy = dist / LEGACY_APP_BUNDLE_NAME
     if preferred.exists():
         return preferred
+    if alt.exists():
+        return alt
     if legacy.exists():
         return legacy
     return preferred
 
 
+def _stage_app_bundle_from_dx(
+        frontend_dir: Path,
+        *,
+        platform_name: str,
+        preferred_bundle_name: str,
+) -> Optional[Path]:
+    dist = dist_dir(frontend_dir)
+    dist.mkdir(parents=True, exist_ok=True)
+    preferred = dist / preferred_bundle_name
+    pkg_name = _frontend_package_name(frontend_dir)
+    target_root = frontend_dir.parent / "target" / "dx" / pkg_name
+    candidates = [
+        target_root / "release" / platform_name / LEGACY_APP_BUNDLE_NAME,
+        target_root / "release" / platform_name / APP_BUNDLE_NAME,
+        target_root / "release" / platform_name / MACOS_ALT_APP_BUNDLE_NAME,
+        target_root / "debug" / platform_name / LEGACY_APP_BUNDLE_NAME,
+        target_root / "debug" / platform_name / APP_BUNDLE_NAME,
+        target_root / "debug" / platform_name / MACOS_ALT_APP_BUNDLE_NAME,
+    ]
+
+    for src in candidates:
+        if not src.exists():
+            continue
+        print(f"Staging {platform_name} app bundle: {src} -> {preferred}")
+        if preferred.exists():
+            shutil.rmtree(preferred)
+        shutil.copytree(src, preferred, symlinks=True)
+        return preferred
+    return None
+
+
 def rename_macos_app_bundle(frontend_dir: Path) -> Optional[Path]:
     dist = dist_dir(frontend_dir)
     preferred = dist / APP_BUNDLE_NAME
+    alt = dist / MACOS_ALT_APP_BUNDLE_NAME
     legacy = dist / LEGACY_APP_BUNDLE_NAME
 
     if preferred.exists():
+        return preferred
+    if alt.exists():
+        print(f"Renaming macOS app bundle: {alt.name} -> {preferred.name}")
+        if preferred.exists():
+            shutil.rmtree(preferred)
+        alt.rename(preferred)
         return preferred
     if legacy.exists():
         print(f"Renaming macOS app bundle: {legacy.name} -> {preferred.name}")
@@ -381,13 +423,21 @@ def rename_macos_app_bundle(frontend_dir: Path) -> Optional[Path]:
             shutil.rmtree(preferred)
         legacy.rename(preferred)
         return preferred
-    return None
+    return _stage_app_bundle_from_dx(
+        frontend_dir,
+        platform_name="macos",
+        preferred_bundle_name=APP_BUNDLE_NAME,
+    )
 
 
 def remove_legacy_app_bundle(frontend_dir: Path) -> None:
     dist = dist_dir(frontend_dir)
     preferred = dist / APP_BUNDLE_NAME
+    alt = dist / MACOS_ALT_APP_BUNDLE_NAME
     legacy = dist / LEGACY_APP_BUNDLE_NAME
+    if preferred.exists() and alt.exists():
+        print(f"Removing alternate macOS app bundle: {alt}")
+        shutil.rmtree(alt)
     if preferred.exists() and legacy.exists():
         print(f"Removing legacy macOS app bundle: {legacy}")
         shutil.rmtree(legacy)
@@ -2411,7 +2461,7 @@ def capture_android_screenshot(
 
 def clear_app_bundle(frontend_dir: Path) -> None:
     dist = dist_dir(frontend_dir)
-    bundles = [dist / APP_BUNDLE_NAME, dist / LEGACY_APP_BUNDLE_NAME]
+    bundles = [dist / APP_BUNDLE_NAME, dist / MACOS_ALT_APP_BUNDLE_NAME, dist / LEGACY_APP_BUNDLE_NAME]
     for bundle in bundles:
         if bundle.exists():
             print(f"Removing existing app bundle: {bundle}")
@@ -2895,6 +2945,22 @@ def _find_dx(path_value: str) -> Optional[Path]:
     return None
 
 
+def _npm_global_bin_dir(cwd: Path) -> Optional[Path]:
+    try:
+        prefix = subprocess.check_output(
+            ["npm", "prefix", "-g"],
+            cwd=cwd,
+            env=os.environ,
+            text=True,
+        ).strip()
+    except Exception:
+        return None
+    if not prefix:
+        return None
+    bin_dir = Path(prefix) / "bin"
+    return bin_dir if bin_dir.exists() else None
+
+
 def _find_newest_wasm_asset(frontend_dir: Path) -> Optional[Path]:
     assets_dir = frontend_dir / "dist" / "public" / "assets"
     if not assets_dir.exists():
@@ -3101,6 +3167,7 @@ def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
 
     extra_paths = [
         str(Path.home() / ".cargo" / "bin"),
+        str(frontend_dir / "node_modules" / ".bin"),
         "/usr/local/sbin",
         "/usr/local/bin",
         "/usr/sbin",
@@ -3109,6 +3176,9 @@ def _dx_bundle_env(frontend_dir: Path) -> dict[str, str]:
         "/bin",
         "/opt/binaryen/bin",
     ]
+    npm_global_bin = _npm_global_bin_dir(frontend_dir)
+    if npm_global_bin is not None:
+        extra_paths.insert(1, str(npm_global_bin))
 
     env: dict[str, str] = {}
     env["PATH"] = os.pathsep.join(extra_paths + [base_path])
@@ -3156,11 +3226,15 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
         print("Error: iOS packaging/signing requires macOS.", file=sys.stderr)
         sys.exit(1)
 
-    app = app_bundle_path(frontend_dir)
+    app = _stage_app_bundle_from_dx(
+        frontend_dir,
+        platform_name="ios",
+        preferred_bundle_name=APP_BUNDLE_NAME,
+    ) or app_bundle_path(frontend_dir)
     if not app.exists():
         raise FileNotFoundError(f"App bundle not found: {app}")
 
-    patch_plist(frontend_dir)
+    patch_plist(frontend_dir, app)
 
     profile = fixed_mobileprovision_path(frontend_dir)
 
@@ -3168,8 +3242,13 @@ def package_ios_ipa_with_script(frontend_dir: Path, *, sign_kind: SignKind) -> P
     if not signer.exists():
         raise FileNotFoundError(f"Missing signer script: {signer}")
 
+    dist = frontend_dir / "dist"
     ipas_dir = frontend_dir / "dist" / "ipas"
     ipas_dir.mkdir(parents=True, exist_ok=True)
+
+    for stale_ipa in sorted(dist.glob("*.ipa")):
+        print(f"Removing stale IPA artifact: {stale_ipa}")
+        stale_ipa.unlink()
 
     ipa_name = "UBSEDS GS.ipa"
     ipa_out = ipas_dir / ipa_name
@@ -3257,7 +3336,11 @@ def ios_sim_deploy(frontend_dir: Path) -> tuple[str, str]:
         print("Error: iOS simulator deploy requires macOS.", file=sys.stderr)
         sys.exit(1)
 
-    app = app_bundle_path(frontend_dir)
+    app = _stage_app_bundle_from_dx(
+        frontend_dir,
+        platform_name="ios",
+        preferred_bundle_name=APP_BUNDLE_NAME,
+    ) or app_bundle_path(frontend_dir)
     if not app.exists():
         raise FileNotFoundError(f"Simulator app bundle not found: {app}")
 
@@ -3290,7 +3373,11 @@ def capture_ios_sim_screenshot(
         print("Error: iOS simulator screenshot requires macOS.", file=sys.stderr)
         sys.exit(1)
 
-    app = app_bundle_path(frontend_dir)
+    app = _stage_app_bundle_from_dx(
+        frontend_dir,
+        platform_name="ios",
+        preferred_bundle_name=APP_BUNDLE_NAME,
+    ) or app_bundle_path(frontend_dir)
     if not app.exists():
         raise FileNotFoundError(f"Simulator app bundle not found: {app}")
 
@@ -3683,6 +3770,63 @@ def _ensure_bundle_icon_compat(frontend_dir: Path) -> None:
         except Exception as exc:
             print(f"Warning: failed generating bundle icon ICO {dst_ico}: {exc}", file=sys.stderr)
 
+    dst_icns = icons_dir / "icon.icns"
+    if not dst_icns.exists() and platform.system() == "Darwin":
+        iconutil = shutil.which("iconutil")
+        if iconutil is None:
+            print("Warning: iconutil not available; cannot generate macOS .icns icon.", file=sys.stderr)
+            return
+
+        with tempfile.TemporaryDirectory(prefix="gs26-iconset-") as tmp:
+            iconset_dir = Path(tmp) / "AppIcon.iconset"
+            iconset_dir.mkdir(parents=True, exist_ok=True)
+            macos_icon_targets = {
+                "icon_16x16.png": 16,
+                "icon_16x16@2x.png": 32,
+                "icon_32x32.png": 32,
+                "icon_32x32@2x.png": 64,
+                "icon_128x128.png": 128,
+                "icon_128x128@2x.png": 256,
+                "icon_256x256.png": 256,
+                "icon_256x256@2x.png": 512,
+                "icon_512x512.png": 512,
+                "icon_512x512@2x.png": 1024,
+            }
+            for filename, size in macos_icon_targets.items():
+                img.resize((size, size), Image.LANCZOS).save(iconset_dir / filename, format="PNG")
+            try:
+                run([iconutil, "-c", "icns", str(iconset_dir), "-o", str(dst_icns)], cwd=frontend_dir)
+            except subprocess.CalledProcessError as exc:
+                print(f"Warning: failed generating macOS icon {dst_icns}: {exc}", file=sys.stderr)
+
+
+def _patch_macos_bundle_icon(frontend_dir: Path) -> None:
+    app = rename_macos_app_bundle(frontend_dir) or app_bundle_path(frontend_dir)
+    if not app.exists():
+        return
+
+    icon_src = frontend_dir / "icons" / "icon.icns"
+    if not icon_src.exists():
+        return
+
+    resources_dir = app / "Contents" / "Resources"
+    resources_dir.mkdir(parents=True, exist_ok=True)
+    icon_dst = resources_dir / "icon.icns"
+    if not icon_dst.exists() or icon_src.read_bytes() != icon_dst.read_bytes():
+        shutil.copy2(icon_src, icon_dst)
+
+    plist_path = app / "Contents" / "Info.plist"
+    if not plist_path.exists():
+        return
+
+    with plist_path.open("rb") as f:
+        info = plistlib.load(f)
+
+    if info.get("CFBundleIconFile") != "icon.icns":
+        info["CFBundleIconFile"] = "icon.icns"
+        with plist_path.open("wb") as f:
+            plistlib.dump(info, f, sort_keys=False)
+
 
 def _ensure_android_icon_compat(frontend_dir: Path, app_src_main: Path) -> None:
     src_png = frontend_dir / "assets" / "icon_1024x1024.png"
@@ -3912,6 +4056,7 @@ def build_frontend(
             rename_macos_app_bundle(frontend_dir)
             remove_legacy_app_bundle(frontend_dir)
             remove_legacy_dmgs(frontend_dir)
+            _patch_macos_bundle_icon(frontend_dir)
             sign_macos_app_and_dmg(frontend_dir)
         elif platform_name in {"windows", "linux"}:
             if not (platform_name == "linux" and linux_bundle_partial):
@@ -3931,7 +4076,12 @@ def build_frontend(
                 build_android_universal_apk(frontend_dir)
 
         if platform_name == "ios":
-            patch_plist(frontend_dir)
+            staged_app = _stage_app_bundle_from_dx(
+                frontend_dir,
+                platform_name="ios",
+                preferred_bundle_name=APP_BUNDLE_NAME,
+            ) or app_bundle_path(frontend_dir)
+            patch_plist(frontend_dir, staged_app)
 
     except FileNotFoundError as e:
         _print_missing_tool("Frontend build", e, frontend_dir)

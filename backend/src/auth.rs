@@ -1,5 +1,5 @@
-use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
+use base64::Engine;
 use ring::pbkdf2;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};

@@ -58,7 +58,7 @@ pub fn GpsDriver(
 
     #[cfg(target_os = "windows")]
     {
-        use dioxus_sdk_geolocation::{PowerMode, init_geolocator, use_geolocation};
+        use dioxus_sdk_geolocation::{init_geolocator, use_geolocation, PowerMode};
 
         let _geo = init_geolocator(PowerMode::High);
         let geo = use_geolocation();

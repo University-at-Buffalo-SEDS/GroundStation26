@@ -5,9 +5,12 @@ mod comms;
 mod comms_config;
 #[cfg(feature = "testing")]
 mod dummy_packets;
+mod fill_targets;
+mod flight_setup;
 mod flight_sim;
 mod gpio;
 mod gpio_panel;
+mod i18n;
 mod layout;
 mod loadcell;
 mod map;
@@ -20,7 +23,7 @@ mod telemetry_task;
 mod types;
 mod web;
 
-use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
+use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
 use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
@@ -29,15 +32,15 @@ use crate::telemetry_task::{get_current_timestamp_ms, set_network_time_router, t
 
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
 use crate::comms::DummyComms;
-use crate::comms::{CommsDevice, link_description, open_link, startup_failure_hint};
+use crate::comms::{link_description, open_link, startup_failure_hint, CommsDevice};
 use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
-use sedsprintf_rs_2026::TelemetryError;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
-use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode};
+use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode, RouterSideOptions};
 use sedsprintf_rs_2026::timesync::{TimeSyncConfig, TimeSyncRole};
+use sedsprintf_rs_2026::TelemetryError;
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Connection, Row};
 use std::collections::HashMap;
@@ -51,6 +54,7 @@ use tokio::time::Duration;
 use crate::web::emit_error;
 use tokio::sync::{broadcast, mpsc};
 
+/// Reads a bounded `usize` environment variable and falls back to `default`.
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -59,6 +63,7 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .clamp(min, max)
 }
 
+/// Reads a bounded `i64` environment variable and falls back to `default`.
 fn env_i64(name: &str, default: i64, min: i64, max: i64) -> i64 {
     std::env::var(name)
         .ok()
@@ -67,6 +72,7 @@ fn env_i64(name: &str, default: i64, min: i64, max: i64) -> i64 {
         .clamp(min, max)
 }
 
+/// Creates the SQLite file on disk when it does not exist and returns a stable path string.
 fn ensure_sqlite_db_file(path: &Path) -> anyhow::Result<String> {
     if !path.exists() {
         fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
@@ -79,6 +85,7 @@ fn ensure_sqlite_db_file(path: &Path) -> anyhow::Result<String> {
         .to_string())
 }
 
+/// Creates or upgrades the auth session table used by token-based login.
 async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         r#"
@@ -115,6 +122,7 @@ async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Applies runtime SQLite pragmas that trade startup defaults for better write throughput.
 async fn apply_sqlite_pragmas(db: &sqlx::SqlitePool) {
     let synchronous = std::env::var("GS_SQLITE_SYNCHRONOUS")
         .unwrap_or_else(|_| "NORMAL".to_string())
@@ -145,7 +153,9 @@ async fn apply_sqlite_pragmas(db: &sqlx::SqlitePool) {
     }
 }
 
+/// Runs the shutdown-time checkpoint and optimization pragmas against an open pool.
 async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
+    /// Retries shutdown pragmas because the pool can still be draining background writers.
     async fn exec_pragma_with_retry(
         db: &sqlx::SqlitePool,
         stmt: &str,
@@ -182,6 +192,7 @@ async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
     }
 }
 
+/// Removes leftover WAL and journal sidecar files after SQLite has been finalized.
 async fn remove_sqlite_sidecars(db_path: &str) {
     let retries = env_usize("GS_SQLITE_SIDECAR_DELETE_RETRIES", 12, 1, 120);
     let retry_delay_ms = env_i64("GS_SQLITE_SIDECAR_DELETE_DELAY_MS", 100, 10, 2_000) as u64;
@@ -203,6 +214,7 @@ async fn remove_sqlite_sidecars(db_path: &str) {
     }
 }
 
+/// Lists SQLite sidecar files that still exist beside the database.
 fn sqlite_sidecars_present(db_path: &str) -> Vec<String> {
     [".wal", ".shm", "-wal", "-shm", "-journal", ".journal"]
         .into_iter()
@@ -211,6 +223,7 @@ fn sqlite_sidecars_present(db_path: &str) -> Vec<String> {
         .collect()
 }
 
+/// Reopens the database once the pool is dropped to force a final checkpoint back to DELETE mode.
 async fn finalize_sqlite_after_pool_close(db_path: &str) {
     let url = format!("sqlite://{db_path}");
     let mut conn = match SqliteConnection::connect(&url).await {
@@ -256,6 +269,7 @@ async fn finalize_sqlite_after_pool_close(db_path: &str) {
     }
 }
 
+/// Waits for process termination signals and then fan-outs the app-wide shutdown request.
 async fn shutdown_signal(state: Arc<AppState>) {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
@@ -458,8 +472,8 @@ async fn main() -> anyhow::Result<()> {
         latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
         latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),
         recent_alerts_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-        av_bay_radio_connected: Arc::new(AtomicBool::new(false)),
-        fill_radio_connected: Arc::new(AtomicBool::new(false)),
+        av_bay_comms_connected: Arc::new(AtomicBool::new(false)),
+        fill_comms_connected: Arc::new(AtomicBool::new(false)),
         topology_router: Arc::new(std::sync::OnceLock::new()),
         auth,
     });
@@ -526,7 +540,7 @@ async fn main() -> anyhow::Result<()> {
         link_description(&comms_links.fill_box)
     );
 
-    let (rocket_comms, av_bay_radio_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+    let (rocket_comms, av_bay_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
         match open_link(&comms_links.av_bay) {
             Ok(r) => {
                 println!("Rocket comms online");
@@ -554,11 +568,11 @@ async fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(not(feature = "testing"))]
                 #[cfg(not(feature = "hitl_mode"))]
-                panic!("Rocket radio missing and testing mode not enabled")
+                panic!("Rocket comms missing and testing mode not enabled")
             }
         };
 
-    let (umbilical_comms, fill_radio_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+    let (umbilical_comms, fill_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
         match open_link(&comms_links.fill_box) {
             Ok(r) => {
                 println!("Umbilical comms online");
@@ -586,15 +600,15 @@ async fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(not(feature = "testing"))]
                 #[cfg(not(feature = "hitl_mode"))]
-                panic!("Umbilical radio missing and testing mode not enabled")
+                panic!("Umbilical comms missing and testing mode not enabled")
             }
         };
     state
-        .av_bay_radio_connected
-        .store(av_bay_radio_connected, Ordering::Relaxed);
+        .av_bay_comms_connected
+        .store(av_bay_comms_connected, Ordering::Relaxed);
     state
-        .fill_radio_connected
-        .store(fill_radio_connected, Ordering::Relaxed);
+        .fill_comms_connected
+        .store(fill_comms_connected, Ordering::Relaxed);
 
     let router = Arc::new(sedsprintf_rs_2026::router::Router::new(
         RouterMode::Relay,
@@ -605,28 +619,53 @@ async fn main() -> anyhow::Result<()> {
 
     let rocket_side = {
         let rocket_comms = Arc::clone(&rocket_comms);
-        router.add_side_serialized("rocket_comms", move |pkt| {
-            let mut guard = rocket_comms
-                .lock()
-                .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
-            guard
-                .send_data(pkt)
-                .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
-            Ok(())
-        })
+        let opts = RouterSideOptions {
+            reliable_enabled: !matches!(
+                comms_links.av_bay,
+                crate::comms_config::CommsLinkConfig::I2c { .. }
+            ),
+            link_local_enabled: false,
+        };
+        router.add_side_serialized_with_options(
+            "rocket_comms",
+            move |pkt| {
+                let mut guard = rocket_comms
+                    .lock()
+                    .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
+                if let Err(err) = guard.send_data(pkt) {
+                    eprintln!("rocket_comms send failed: {err}");
+                }
+                Ok(())
+            },
+            opts,
+        )
     };
 
     let umbilical_side = {
         let umbilical_comms = Arc::clone(&umbilical_comms);
-        router.add_side_serialized("umbilical_comms", move |pkt| {
-            let mut guard = umbilical_comms
-                .lock()
-                .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
-            guard
-                .send_data(pkt)
-                .map_err(|_| TelemetryError::HandlerError("Tx Handler failed"))?;
-            Ok(())
-        })
+        let opts = RouterSideOptions {
+            reliable_enabled: !matches!(
+                comms_links.fill_box,
+                crate::comms_config::CommsLinkConfig::I2c { .. }
+            ),
+            // The Pico bridge on the I2C side needs router-local packets (for example
+            // GroundStation-addressed traffic and local heartbeat/discovery flow) to traverse
+            // the physical link so it can forward them back out over its UART/USB bridge.
+            link_local_enabled: true,
+        };
+        router.add_side_serialized_with_options(
+            "umbilical_comms",
+            move |pkt| {
+                let mut guard = umbilical_comms
+                    .lock()
+                    .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
+                if let Err(err) = guard.send_data(pkt) {
+                    eprintln!("umbilical_comms send failed: {err}");
+                }
+                Ok(())
+            },
+            opts,
+        )
     };
 
     rocket_comms
@@ -637,6 +676,10 @@ async fn main() -> anyhow::Result<()> {
         .lock()
         .expect("failed to get umbilical comms lock")
         .set_side_id(umbilical_side);
+
+    if let Err(err) = router.announce_discovery() {
+        eprintln!("WARNING: failed to queue initial discovery announce: {err}");
+    }
 
     router.log_queue(DataType::MessageData, "hello".as_bytes())?;
     router.log_queue(DataType::FlightState, &[FlightStateMode::Startup as u8])?;

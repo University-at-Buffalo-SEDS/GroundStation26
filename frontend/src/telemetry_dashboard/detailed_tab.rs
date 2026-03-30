@@ -1,12 +1,16 @@
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use super::types::{
     BoardStatusEntry, FlightState, NetworkTopologyMsg, NetworkTopologyNodeKind,
     NetworkTopologyStatus,
 };
-use super::{AlertMsg, FrontendNetworkMetrics, PersistentNotification, format_timestamp_ms_clock};
+use super::{
+    compensated_network_time_ms, format_network_time, format_timestamp_ms_clock, monotonic_now_ms,
+    translate_text, AlertMsg, FrontendNetworkMetrics, NetworkTimeSync,
+    PersistentNotification,
+};
 
 #[component]
 pub fn DetailedTab(
@@ -17,13 +21,14 @@ pub fn DetailedTab(
     warnings: Signal<Vec<AlertMsg>>,
     errors: Signal<Vec<AlertMsg>>,
     notifications: Signal<Vec<PersistentNotification>>,
-    network_time_display: Option<String>,
-    network_clock_delta_ms: Option<i64>,
-    network_time_age_ms: Option<i64>,
+    network_time: Signal<Option<NetworkTimeSync>>,
 ) -> Element {
     let metrics_snapshot = metrics.read().clone();
     let boards = board_status.read().clone();
     let topology = network_topology.read().clone();
+    let network_time_snapshot = *network_time.read();
+    let visible_topology_nodes = visible_topology_nodes(&topology.nodes);
+    let visible_topology_links = collapse_visible_links(&topology.nodes, &topology.links);
     let warnings_count = warnings.read().len();
     let errors_count = errors.read().len();
     let notifications_count = notifications.read().len();
@@ -31,48 +36,31 @@ pub fn DetailedTab(
 
     let board_seen = boards.iter().filter(|board| board.seen).count();
     let board_total = boards.len();
-    let online_nodes = topology
-        .nodes
+    let online_nodes = visible_topology_nodes
         .iter()
         .filter(|node| node.status == NetworkTopologyStatus::Online)
         .count();
-    let offline_nodes = topology
-        .nodes
+    let offline_nodes = visible_topology_nodes
         .iter()
         .filter(|node| node.status == NetworkTopologyStatus::Offline)
         .count();
-    let simulated_nodes = topology
-        .nodes
+    let simulated_nodes = visible_topology_nodes
         .iter()
         .filter(|node| node.status == NetworkTopologyStatus::Simulated)
         .count();
-    let online_links = topology
-        .links
+    let online_links = visible_topology_links
         .iter()
         .filter(|link| link.status == NetworkTopologyStatus::Online)
         .count();
-    let offline_links = topology
-        .links
+    let offline_links = visible_topology_links
         .iter()
         .filter(|link| link.status == NetworkTopologyStatus::Offline)
         .count();
-    let router_nodes = topology
-        .nodes
+    let router_nodes = visible_topology_nodes
         .iter()
         .filter(|node| node.kind == NetworkTopologyNodeKind::Router)
         .count();
-    let endpoint_nodes = topology
-        .nodes
-        .iter()
-        .filter(|node| node.kind == NetworkTopologyNodeKind::Endpoint)
-        .count();
-    let side_nodes = topology
-        .nodes
-        .iter()
-        .filter(|node| node.kind == NetworkTopologyNodeKind::Side)
-        .count();
-    let board_nodes = topology
-        .nodes
+    let board_nodes = visible_topology_nodes
         .iter()
         .filter(|node| node.kind == NetworkTopologyNodeKind::Board)
         .count();
@@ -101,30 +89,30 @@ pub fn DetailedTab(
     } else {
         None
     };
+    let network_time_display = network_time_snapshot
+        .map(compensated_network_time_ms)
+        .map(format_network_time);
+    let network_clock_delta_ms = network_time_snapshot
+        .map(compensated_network_time_ms)
+        .map(|ms| current_wallclock_ms().saturating_sub(ms));
+    let network_time_age_ms = network_time_snapshot.map(|sync| {
+        (monotonic_now_ms() - sync.received_mono_ms)
+            .max(0.0)
+            .round() as i64
+    });
     let topology_age_ms = if topology.generated_ms > 0 {
         Some(now_ms.saturating_sub(topology.generated_ms as i64))
     } else {
         None
     };
-    let topology_links_preview = topology
-        .links
+    let topology_links_preview = visible_topology_links
         .iter()
-        .take(8)
-        .map(|link| {
-            (
-                link.source.clone(),
-                link.target.clone(),
-                link.label.clone().unwrap_or_else(|| "--".to_string()),
-                link.status,
-            )
-        })
+        .take(12)
+        .map(|link| (link.source.clone(), link.target.clone(), link.status))
         .collect::<Vec<_>>();
-    let topology_nodes_only = topology
-        .nodes
-        .iter()
-        .filter(|node| node.show_in_details)
-        .collect::<Vec<_>>();
-    let endpoint_rows = collect_endpoint_rows(&topology.nodes);
+    let endpoint_rows = collect_endpoint_rows(&topology.nodes, &topology.links);
+    let board_route_rows =
+        collect_board_route_rows(&visible_topology_nodes, &visible_topology_links);
 
     rsx! {
         div { style: "padding:18px; height:100%; overflow-y:auto; overflow-x:hidden; color:#dbe7f3;",
@@ -132,7 +120,7 @@ pub fn DetailedTab(
                 {metric_card(
                     "Frontend ↔ Backend",
                     vec![
-                        ("Status", if metrics_snapshot.ws_connected { "Connected".to_string() } else { "Disconnected".to_string() }),
+                        ("Status", if metrics_snapshot.ws_connected { translate_text("Connected") } else { translate_text("Disconnected") }),
                         ("Base URL", metrics_snapshot.base_http.clone()),
                         ("WebSocket", metrics_snapshot.ws_url.clone()),
                         ("HTTP RTT", opt_ms(metrics_snapshot.http_rtt_ms)),
@@ -161,15 +149,15 @@ pub fn DetailedTab(
                         ("Connected for", opt_i64_ms(ws_connected_for_ms)),
                         ("WS idle", opt_i64_ms(ws_idle_ms)),
                         ("Last WS message", opt_timestamp(metrics_snapshot.last_ws_message_wall_ms)),
-                        ("Last disconnect", metrics_snapshot.last_disconnect_reason.clone().unwrap_or_else(|| "None".to_string())),
+                        ("Last disconnect", metrics_snapshot.last_disconnect_reason.clone().map(|v| translate_text(&v)).unwrap_or_else(|| translate_text("None"))),
                         ("Last connect", opt_timestamp(metrics_snapshot.last_connect_wall_ms)),
                     ],
                 )}
                 {metric_card(
                     "Mission State",
                     vec![
-                        ("Flight state", flight_state.read().to_string().to_string()),
-                        ("Rocket time", network_time_display.unwrap_or_else(|| "Unavailable".to_string())),
+                        ("Flight state", translate_text(&flight_state.read().to_string())),
+                        ("Rocket time", network_time_display.unwrap_or_else(|| translate_text("Unavailable"))),
                         ("Clock delta", opt_signed_ms(network_clock_delta_ms)),
                         ("Server time age", opt_i64_ms(network_time_age_ms)),
                         ("Warnings", warnings_count.to_string()),
@@ -181,31 +169,29 @@ pub fn DetailedTab(
                     "Topology",
                     vec![
                         ("Boards seen", format!("{board_seen}/{board_total}")),
-                        ("Topology nodes", topology.nodes.len().to_string()),
-                        ("Topology links", topology.links.len().to_string()),
+                        ("Visible nodes", visible_topology_nodes.len().to_string()),
+                        ("Visible links", visible_topology_links.len().to_string()),
+                        ("Routers", router_nodes.to_string()),
+                        ("Boards", board_nodes.to_string()),
                         ("Online nodes", online_nodes.to_string()),
                         ("Offline nodes", offline_nodes.to_string()),
                         ("Simulated nodes", simulated_nodes.to_string()),
                         ("Online links", online_links.to_string()),
                         ("Offline links", offline_links.to_string()),
                         ("Topology age", opt_i64_ms(topology_age_ms)),
-                        ("Topology simulated", yes_no(topology.simulated)),
+                        ("Topology simulated", translate_text(&yes_no(topology.simulated))),
                     ],
                 )}
                 {metric_card(
-                    "Node Mix",
+                    "Board Timing",
                     vec![
-                        ("Routers", router_nodes.to_string()),
-                        ("Endpoints", endpoint_nodes.to_string()),
-                        ("Sides", side_nodes.to_string()),
-                        ("Boards", board_nodes.to_string()),
                         ("Fastest board", opt_u64_ms(min_board_age_ms)),
                         ("Slowest board", opt_u64_ms(max_board_age_ms)),
                     ],
                 )}
             }
 
-            div { style: "display:grid; gap:14px; grid-template-columns:repeat(auto-fit, minmax(min(100%, 360px), 1fr)); align-items:start; width:100%;",
+            div { style: "display:grid; gap:14px; grid-template-columns:minmax(0, 1.2fr) minmax(0, 0.8fr); align-items:start; width:100%;",
                 div { style: "display:flex; flex-direction:column; gap:14px; min-width:0;",
                     div { style: section_style(),
                     h3 { style: section_title_style(), "Board Latency Detail" }
@@ -235,26 +221,29 @@ pub fn DetailedTab(
                     }
                 }
                     div { style: section_style(),
-                    h3 { style: section_title_style(), "Topology Nodes" }
+                    h3 { style: section_title_style(), "Board Routes" }
                     div { style: "width:100%; overflow-x:auto;",
                     table { style: table_style(),
                         thead {
                             tr {
-                                th { style: th_style(), "Node" }
-                                th { style: th_style(), "Kind" }
+                                th { style: th_style(), "Board" }
+                                th { style: th_style(), "Upstream" }
                                 th { style: th_style(), "Status" }
-                                th { style: th_style(), "Group" }
                                 th { style: th_style(), "Sender" }
                             }
                         }
                         tbody {
-                            for node in topology_nodes_only.iter() {
+                            for (label, upstream, status, sender_id) in board_route_rows.iter() {
                                 tr {
-                                    td { style: td_style(), "{node.label}" }
-                                    td { style: td_style(), "{format_kind(node.kind)}" }
-                                    td { style: td_style(), "{format_status(node.status)}" }
-                                    td { style: td_style(), "{node.group}" }
-                                    td { style: td_style_mono(), "{node.sender_id.clone().unwrap_or_else(|| \"--\".to_string())}" }
+                                    td { style: td_style(), "{label}" }
+                                    td { style: td_style(), "{upstream}" }
+                                    td { style: td_style(), "{format_status(*status)}" }
+                                    td { style: td_style_mono(), "{sender_id}" }
+                                }
+                            }
+                            if board_route_rows.is_empty() {
+                                tr {
+                                    td { style: td_style(), colspan: "4", "No board routes are visible yet." }
                                 }
                             }
                         }
@@ -295,19 +284,20 @@ pub fn DetailedTab(
                         table { style: table_style(),
                             thead {
                                 tr {
-                                    th { style: th_style(), "Source" }
-                                    th { style: th_style(), "Target" }
-                                    th { style: th_style(), "Label" }
+                                    th { style: th_style(), "Path" }
                                     th { style: th_style(), "Status" }
                                 }
                             }
                             tbody {
-                                for (source, target, label, status) in topology_links_preview.iter() {
+                                for (source, target, status) in topology_links_preview.iter() {
                                     tr {
-                                        td { style: td_style_mono(), "{node_label(source, &topology.nodes)}" }
-                                        td { style: td_style_mono(), "{node_label(target, &topology.nodes)}" }
-                                        td { style: td_style(), "{label}" }
+                                        td { style: td_style_mono(), "{node_label(source, &visible_topology_nodes)} -> {node_label(target, &visible_topology_nodes)}" }
                                         td { style: td_style(), "{format_status(*status)}" }
+                                    }
+                                }
+                                if topology_links_preview.is_empty() {
+                                    tr {
+                                        td { style: td_style(), colspan: "2", "No topology links are visible yet." }
                                     }
                                 }
                             }
@@ -417,15 +407,6 @@ fn format_status(status: NetworkTopologyStatus) -> &'static str {
     }
 }
 
-fn format_kind(kind: NetworkTopologyNodeKind) -> &'static str {
-    match kind {
-        NetworkTopologyNodeKind::Router => "router",
-        NetworkTopologyNodeKind::Endpoint => "endpoint",
-        NetworkTopologyNodeKind::Side => "side",
-        NetworkTopologyNodeKind::Board => "board",
-    }
-}
-
 fn node_label(id: &str, nodes: &[super::types::NetworkTopologyNode]) -> String {
     nodes
         .iter()
@@ -434,19 +415,110 @@ fn node_label(id: &str, nodes: &[super::types::NetworkTopologyNode]) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
+fn visible_topology_nodes(
+    nodes: &[super::types::NetworkTopologyNode],
+) -> Vec<super::types::NetworkTopologyNode> {
+    nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                NetworkTopologyNodeKind::Router | NetworkTopologyNodeKind::Board
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn collapse_visible_links(
+    nodes: &[super::types::NetworkTopologyNode],
+    links: &[super::types::NetworkTopologyLink],
+) -> Vec<super::types::NetworkTopologyLink> {
+    let visible = visible_topology_nodes(nodes);
+    let visible_ids = visible
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<HashSet<_>>();
+    let mut collapsed = BTreeMap::<(String, String), NetworkTopologyStatus>::new();
+    for link in links {
+        if !visible_ids.contains(&link.source) || !visible_ids.contains(&link.target) {
+            continue;
+        }
+        let key = if link.source < link.target {
+            (link.source.clone(), link.target.clone())
+        } else {
+            (link.target.clone(), link.source.clone())
+        };
+        collapsed
+            .entry(key)
+            .and_modify(|existing| *existing = merge_link_status(*existing, link.status))
+            .or_insert(link.status);
+    }
+
+    collapsed
+        .into_iter()
+        .map(
+            |((source, target), status)| super::types::NetworkTopologyLink {
+                source,
+                target,
+                label: None,
+                status,
+            },
+        )
+        .collect()
+}
+
+fn merge_link_status(a: NetworkTopologyStatus, b: NetworkTopologyStatus) -> NetworkTopologyStatus {
+    use NetworkTopologyStatus::{Offline, Online, Simulated};
+
+    match (a, b) {
+        (Offline, _) | (_, Offline) => Offline,
+        (Simulated, _) | (_, Simulated) => Simulated,
+        _ => Online,
+    }
+}
+
 fn collect_endpoint_rows(
     nodes: &[super::types::NetworkTopologyNode],
+    links: &[super::types::NetworkTopologyLink],
 ) -> Vec<(String, Vec<String>)> {
     let mut by_endpoint = BTreeMap::<String, Vec<String>>::new();
+    let mut adjacency = BTreeMap::<String, Vec<String>>::new();
+    for link in links {
+        adjacency
+            .entry(link.source.clone())
+            .or_default()
+            .push(link.target.clone());
+        adjacency
+            .entry(link.target.clone())
+            .or_default()
+            .push(link.source.clone());
+    }
+
     for node in nodes {
-        let Some(owner) = endpoint_owner_label(node) else {
-            continue;
-        };
         for endpoint in &node.endpoints {
+            if let Some(owner) = endpoint_owner_label(node, endpoint) {
+                by_endpoint
+                    .entry(endpoint.clone())
+                    .or_default()
+                    .push(owner.clone());
+            }
+        }
+
+        if node.kind != NetworkTopologyNodeKind::Endpoint {
+            continue;
+        }
+
+        let endpoint_name = node
+            .endpoints
+            .first()
+            .cloned()
+            .unwrap_or_else(|| node.label.clone());
+        for owner in endpoint_route_owners(node, nodes, &adjacency, &endpoint_name) {
             by_endpoint
-                .entry(endpoint.clone())
+                .entry(endpoint_name.clone())
                 .or_default()
-                .push(owner.clone());
+                .push(owner);
         }
     }
 
@@ -460,11 +532,120 @@ fn collect_endpoint_rows(
         .collect()
 }
 
-fn endpoint_owner_label(node: &super::types::NetworkTopologyNode) -> Option<String> {
+fn endpoint_route_owners(
+    endpoint_node: &super::types::NetworkTopologyNode,
+    nodes: &[super::types::NetworkTopologyNode],
+    adjacency: &BTreeMap<String, Vec<String>>,
+    endpoint_name: &str,
+) -> Vec<String> {
+    let mut owners = Vec::new();
+    let mut queue = std::collections::VecDeque::<String>::new();
+    let mut visited = HashSet::<String>::new();
+    visited.insert(endpoint_node.id.clone());
+
+    if let Some(neighbors) = adjacency.get(&endpoint_node.id) {
+        for neighbor in neighbors {
+            queue.push_back(neighbor.clone());
+        }
+    }
+
+    while let Some(current) = queue.pop_front() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        let Some(node) = nodes.iter().find(|node| node.id == current) else {
+            continue;
+        };
+        if let Some(owner) = endpoint_owner_label(node, endpoint_name) {
+            owners.push(owner);
+            continue;
+        }
+        if let Some(neighbors) = adjacency.get(&current) {
+            for neighbor in neighbors {
+                if !visited.contains(neighbor) {
+                    queue.push_back(neighbor.clone());
+                }
+            }
+        }
+    }
+
+    owners.sort();
+    owners.dedup();
+    owners
+}
+
+fn collect_board_route_rows(
+    nodes: &[super::types::NetworkTopologyNode],
+    links: &[super::types::NetworkTopologyLink],
+) -> Vec<(String, String, NetworkTopologyStatus, String)> {
+    let labels = nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.label.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut adjacency = BTreeMap::<String, Vec<(String, NetworkTopologyStatus)>>::new();
+    for link in links {
+        adjacency
+            .entry(link.source.clone())
+            .or_default()
+            .push((link.target.clone(), link.status));
+        adjacency
+            .entry(link.target.clone())
+            .or_default()
+            .push((link.source.clone(), link.status));
+    }
+
+    let mut rows = nodes
+        .iter()
+        .filter(|node| node.kind == NetworkTopologyNodeKind::Board)
+        .map(|node| {
+            let upstream = adjacency.get(&node.id).and_then(|neighbors| {
+                neighbors
+                    .iter()
+                    .find(|(neighbor, _)| {
+                        nodes.iter().any(|candidate| {
+                            candidate.id == *neighbor
+                                && matches!(
+                                    candidate.kind,
+                                    NetworkTopologyNodeKind::Router
+                                        | NetworkTopologyNodeKind::Board
+                                )
+                        })
+                    })
+                    .cloned()
+            });
+            let (upstream_label, status) = upstream
+                .map(|(neighbor, status)| {
+                    (labels.get(&neighbor).cloned().unwrap_or(neighbor), status)
+                })
+                .unwrap_or_else(|| ("--".to_string(), node.status));
+            (
+                node.label.clone(),
+                upstream_label,
+                status,
+                node.sender_id.clone().unwrap_or_else(|| "--".to_string()),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+fn endpoint_owner_label(
+    node: &super::types::NetworkTopologyNode,
+    endpoint_name: &str,
+) -> Option<String> {
     match node.kind {
-        NetworkTopologyNodeKind::Router => Some(node.label.clone()),
-        NetworkTopologyNodeKind::Board => Some(node.label.clone()),
+        NetworkTopologyNodeKind::Router | NetworkTopologyNodeKind::Board
+            if node
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint == endpoint_name) =>
+        {
+            Some(node.label.clone())
+        }
         NetworkTopologyNodeKind::Endpoint | NetworkTopologyNodeKind::Side => None,
+        _ => None,
     }
 }
 

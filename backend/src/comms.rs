@@ -1,12 +1,13 @@
 use crate::comms_config::{
-    CanLinkConfig, CommsLinkConfig, I2cLinkConfig, SerialLinkConfig, SpiLinkConfig,
+    CanLinkConfig, CommsLinkConfig, I2cLinkConfig, SerialLinkConfig, SerialProtocol, SpiLinkConfig,
 };
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
 use sedsprintf_rs_2026::{
-    TelemetryError, TelemetryResult,
-    router::{Router, RouterSideId},
+    router::{Router, RouterSideId}, serialize,
+    TelemetryError,
+    TelemetryResult,
 };
 use serial::{SerialPort, SystemPort};
 use std::error::Error;
@@ -26,14 +27,37 @@ pub const ROCKET_COMMS_PORT: &str = "/dev/ttyUSB1";
 pub const UMBILICAL_COMMS_PORT: &str = "/dev/ttyUSB2";
 pub const COMMS_BAUD_RATE: usize = 57_600;
 pub const MAX_PACKET_SIZE: usize = 256;
+const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
+const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
 #[cfg(target_os = "linux")]
-const I2C_FRAME_SIZE: usize = 258;
+const I2C_DEBUG_PREVIEW_BYTES: usize = 48;
 #[cfg(target_os = "linux")]
-const I2C_CHUNK_SIZE: usize = 32;
+const I2C_SLOT_SIZE: usize = 32;
 #[cfg(target_os = "linux")]
-const I2C_REQ_DATA_MAGIC: u8 = 0xA5;
+const I2C_SLOT_HEADER_SIZE: usize = 18;
 #[cfg(target_os = "linux")]
-const I2C_RESP_DATA_MAGIC: u8 = 0x5A;
+const I2C_SLOT_PAYLOAD_SIZE: usize = I2C_SLOT_SIZE - I2C_SLOT_HEADER_SIZE;
+#[cfg(target_os = "linux")]
+const I2C_SLOT_MAGIC_0: u8 = 0x49;
+#[cfg(target_os = "linux")]
+const I2C_SLOT_MAGIC_1: u8 = 0x32;
+#[cfg(target_os = "linux")]
+const I2C_SLOT_VERSION: u8 = 1;
+#[cfg(target_os = "linux")]
+const I2C_KIND_IDLE: u8 = 0;
+#[cfg(target_os = "linux")]
+const I2C_KIND_DATA: u8 = 1;
+#[cfg(target_os = "linux")]
+const I2C_KIND_ERROR: u8 = 127;
+#[cfg(target_os = "linux")]
+const I2C_FLAG_START: u8 = 0x01;
+#[cfg(target_os = "linux")]
+const I2C_FLAG_END: u8 = 0x02;
+
+#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+const DUMMY_ROCKET_TIMESYNC_SOURCES: &[&str] = &["RF", "FC", "PB"];
+#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GW", "VB", "AB", "DAQ"];
 
 // ======================================================================
 //  Comms Device Trait
@@ -46,7 +70,7 @@ pub trait CommsDevice: Send {
 
 pub fn link_description(cfg: &CommsLinkConfig) -> String {
     match cfg {
-        CommsLinkConfig::UsbSerial { serial } => serial_description("usb_serial", serial),
+        CommsLinkConfig::Serial { serial } => serial_description("serial", serial),
         CommsLinkConfig::RaspberryPiGpioUart { serial } => {
             serial_description("raspberry_pi_gpio_uart", serial)
         }
@@ -59,11 +83,9 @@ pub fn link_description(cfg: &CommsLinkConfig) -> String {
 
 pub fn open_link(cfg: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> {
     match cfg {
-        CommsLinkConfig::UsbSerial { serial }
+        CommsLinkConfig::Serial { serial }
         | CommsLinkConfig::RaspberryPiGpioUart { serial }
-        | CommsLinkConfig::CustomSerial { serial } => {
-            Ok(Box::new(UartComms::open(&serial.port, serial.baud_rate)?))
-        }
+        | CommsLinkConfig::CustomSerial { serial } => Ok(Box::new(UartComms::open(serial)?)),
         CommsLinkConfig::Spi { spi } => Ok(Box::new(SpiComms::open(spi)?)),
         CommsLinkConfig::Can { can } => Ok(Box::new(CanComms::open(can)?)),
         CommsLinkConfig::I2c { i2c } => Ok(Box::new(I2cComms::open(i2c)?)),
@@ -72,7 +94,7 @@ pub fn open_link(cfg: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> 
 
 pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
     match cfg {
-        CommsLinkConfig::UsbSerial { serial } | CommsLinkConfig::CustomSerial { serial } => {
+        CommsLinkConfig::Serial { serial } | CommsLinkConfig::CustomSerial { serial } => {
             format!(
                 "Check that {} exists, is the correct serial device, and is not already in use. Prefer a stable /dev/serial/by-id path when available.",
                 serial.port
@@ -99,8 +121,8 @@ pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
 
 fn serial_description(name: &str, serial: &SerialLinkConfig) -> String {
     format!(
-        "interface={name} port={} baud_rate={}",
-        serial.port, serial.baud_rate
+        "interface={name} port={} baud_rate={} protocol={:?}",
+        serial.port, serial.baud_rate, serial.protocol
     )
 }
 
@@ -126,19 +148,21 @@ fn i2c_description(i2c: &I2cLinkConfig) -> String {
 }
 
 // ======================================================================
-//  Real Radio Implementation
+//  Real Comms Implementation
 // ======================================================================
 pub struct UartComms {
     inner: SystemPort,
     side_id: Option<RouterSideId>,
+    rx_buf: Vec<u8>,
+    protocol: SerialProtocol,
 }
 
 impl UartComms {
-    pub fn open(path: &str, baud: usize) -> anyhow::Result<Self> {
-        let mut inner = serial::open(path)?;
+    pub fn open(cfg: &SerialLinkConfig) -> anyhow::Result<Self> {
+        let mut inner = serial::open(&cfg.port)?;
         inner
             .reconfigure(&|settings| {
-                settings.set_baud_rate(serial::BaudRate::from_speed(baud))?;
+                settings.set_baud_rate(serial::BaudRate::from_speed(cfg.baud_rate))?;
                 settings.set_char_size(serial::CharSize::Bits8);
                 settings.set_parity(serial::Parity::ParityNone);
                 settings.set_stop_bits(serial::StopBits::Stop1);
@@ -146,11 +170,377 @@ impl UartComms {
                 Ok(())
             })
             .context("failed to configure serial port")?;
-        inner.set_timeout(Duration::from_millis(200))?;
+        inner.set_timeout(Duration::from_millis(10))?;
         Ok(Self {
             inner,
             side_id: None,
+            rx_buf: Vec::with_capacity(MAX_PACKET_SIZE * 2),
+            protocol: cfg.protocol.clone(),
         })
+    }
+
+    fn fill_rx_buf(&mut self) -> std::io::Result<()> {
+        let mut scratch = [0u8; 512];
+        match self.inner.read(&mut scratch) {
+            Ok(0) => Ok(()),
+            Ok(n) => {
+                self.rx_buf.extend_from_slice(&scratch[..n]);
+                maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
+                Ok(())
+            }
+            Err(err) if is_idle_serial_timeout(&err) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn try_take_framed_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
+        if self.rx_buf.len() < 2 {
+            return Ok(None);
+        }
+
+        let frame_len = u16::from_le_bytes([self.rx_buf[0], self.rx_buf[1]]) as usize;
+        if frame_len == 0 || frame_len > MAX_PACKET_SIZE {
+            self.rx_buf.clear();
+            return Err(TelemetryError::HandlerError(
+                "invalid frame length from comms",
+            ));
+        }
+
+        let total_len = 2 + frame_len;
+        if self.rx_buf.len() < total_len {
+            return Ok(None);
+        }
+
+        let payload = self.rx_buf[2..total_len].to_vec();
+        self.rx_buf.drain(..total_len);
+        Ok(Some(payload))
+    }
+
+    fn try_take_raw_uart_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
+        let scan_len = self.rx_buf.len().min(RAW_UART_MAX_FRAME_BYTES);
+        for start in 0..scan_len {
+            for end in (start + 1)..=scan_len {
+                let candidate = &self.rx_buf[start..end];
+                if serialize::peek_frame_info(candidate).is_ok() {
+                    let payload = candidate.to_vec();
+                    self.rx_buf.drain(..end);
+                    return Ok(Some(payload));
+                }
+            }
+        }
+
+        if self.rx_buf.len() > RAW_UART_MAX_FRAME_BYTES {
+            let drop_len = self.rx_buf.len() - RAW_UART_MAX_FRAME_BYTES;
+            maybe_log_raw_uart_parse_issue(
+                "dropping oversized raw UART buffer",
+                &self.rx_buf[..self.rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+            );
+            self.rx_buf.drain(..drop_len);
+        }
+
+        if !self.rx_buf.is_empty() {
+            if let Err(err) = serialize::peek_frame_info(&self.rx_buf) {
+                maybe_log_raw_uart_parse_issue(
+                    &format!("raw UART parse pending: {err}"),
+                    &self.rx_buf[..self.rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+                );
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn try_take_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
+        match self.protocol {
+            SerialProtocol::PacketFramed => self.try_take_framed_packet(),
+            SerialProtocol::RawUart => self.try_take_raw_uart_packet(),
+        }
+    }
+}
+
+fn is_idle_serial_timeout(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+fn raw_uart_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GS_RAW_UART_DEBUG").ok().as_deref() == Some("1"))
+}
+
+#[cfg(target_os = "linux")]
+fn i2c_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GS_I2C_DEBUG").ok().as_deref() == Some("1"))
+}
+
+fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    eprintln!(
+        "raw_uart rx {} bytes: {}",
+        bytes.len(),
+        hex_preview(bytes, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn maybe_log_raw_uart_parse_issue(context: &str, bytes: &[u8]) {
+    if !raw_uart_debug_enabled() {
+        return;
+    }
+    static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => 0,
+    };
+    let last = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 500 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "{context}; buffered {} bytes: {}",
+        bytes.len(),
+        hex_preview(bytes, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn maybe_log_raw_uart_decoded(payload: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    match serialize::peek_envelope(payload) {
+        Ok(envelope) => {
+            eprintln!(
+                "raw_uart decoded {} bytes: sender={} ty={:?} endpoints={:?} ts={}",
+                payload.len(),
+                envelope.sender,
+                envelope.ty,
+                envelope.endpoints,
+                envelope.timestamp_ms
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "raw_uart decoded {} bytes but peek_envelope failed: {err}; payload: {}",
+                payload.len(),
+                hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_log_i2c_frame(context: &str, bytes: &[u8]) {
+    if !i2c_debug_enabled() {
+        return;
+    }
+    eprintln!(
+        "{context}: {} bytes: {}",
+        bytes.len(),
+        hex_preview(bytes, I2C_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_log_i2c_decoded(payload: &[u8]) {
+    if !i2c_debug_enabled() {
+        return;
+    }
+    match serialize::peek_frame_info(payload) {
+        Ok(_) => {
+            eprintln!(
+                "i2c decoded {} bytes: {}",
+                payload.len(),
+                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+            );
+        }
+        Err(_) => {
+            eprintln!(
+                "i2c decoded {} bytes but payload is not a valid serialized packet: {}",
+                payload.len(),
+                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct I2cMailboxSlot {
+    kind: u8,
+    flags: u8,
+    transfer_id: u16,
+    offset: u32,
+    total_len: u32,
+    data: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct I2cRxAssembly {
+    kind: u8,
+    transfer_id: u16,
+    total_len: usize,
+    next_offset: usize,
+    payload: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl I2cRxAssembly {
+    fn new(slot: &I2cMailboxSlot) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        if slot.flags & I2C_FLAG_START == 0 {
+            return Err(std::io::Error::other("i2c transfer must start with START flag").into());
+        }
+        if slot.offset != 0 {
+            return Err(std::io::Error::other("i2c transfer start must have offset 0").into());
+        }
+        let total_len = slot.total_len as usize;
+        if total_len < slot.data.len() {
+            return Err(
+                std::io::Error::other("i2c transfer total length smaller than first slot").into(),
+            );
+        }
+        let mut payload = Vec::with_capacity(total_len);
+        payload.extend_from_slice(&slot.data);
+        Ok(Self {
+            kind: slot.kind,
+            transfer_id: slot.transfer_id,
+            total_len,
+            next_offset: slot.data.len(),
+            payload,
+        })
+    }
+
+    fn push(
+        &mut self,
+        slot: &I2cMailboxSlot,
+    ) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
+        if slot.kind != self.kind {
+            return Err(std::io::Error::other("i2c transfer kind changed mid-stream").into());
+        }
+        if slot.transfer_id != self.transfer_id {
+            return Err(std::io::Error::other("i2c transfer id changed mid-stream").into());
+        }
+        if slot.offset as usize != self.next_offset {
+            return Err(std::io::Error::other(format!(
+                "i2c transfer offset mismatch: expected {} got {}",
+                self.next_offset, slot.offset
+            ))
+            .into());
+        }
+        if self.payload.len() + slot.data.len() > self.total_len {
+            return Err(
+                std::io::Error::other("i2c transfer exceeded declared total length").into(),
+            );
+        }
+        if slot.offset != 0 {
+            self.payload.extend_from_slice(&slot.data);
+            self.next_offset += slot.data.len();
+        }
+        if slot.flags & I2C_FLAG_END != 0 {
+            if self.payload.len() != self.total_len {
+                return Err(std::io::Error::other(format!(
+                    "i2c transfer ended early: expected {} bytes got {}",
+                    self.total_len,
+                    self.payload.len()
+                ))
+                .into());
+            }
+            return Ok(Some(std::mem::take(&mut self.payload)));
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn encode_i2c_slot(
+    kind: u8,
+    flags: u8,
+    transfer_id: u16,
+    offset: u32,
+    total_len: u32,
+    data: &[u8],
+) -> [u8; I2C_SLOT_SIZE] {
+    let mut raw = [0u8; I2C_SLOT_SIZE];
+    let data_len = data.len().min(I2C_SLOT_PAYLOAD_SIZE);
+    raw[0] = I2C_SLOT_MAGIC_0;
+    raw[1] = I2C_SLOT_MAGIC_1;
+    raw[2] = I2C_SLOT_VERSION;
+    raw[3] = kind;
+    raw[4] = flags;
+    raw[5] = 0;
+    raw[6..10].copy_from_slice(&offset.to_le_bytes());
+    raw[10..14].copy_from_slice(&total_len.to_le_bytes());
+    raw[14..16].copy_from_slice(&(data_len as u16).to_le_bytes());
+    raw[16..18].copy_from_slice(&transfer_id.to_le_bytes());
+    raw[I2C_SLOT_HEADER_SIZE..I2C_SLOT_HEADER_SIZE + data_len].copy_from_slice(&data[..data_len]);
+    raw
+}
+
+#[cfg(target_os = "linux")]
+fn decode_i2c_slot(
+    raw: &[u8; I2C_SLOT_SIZE],
+) -> Result<Option<I2cMailboxSlot>, Box<dyn Error + Send + Sync>> {
+    let all_zero = raw.iter().all(|byte| *byte == 0x00);
+    let all_ff = raw.iter().all(|byte| *byte == 0xFF);
+    if all_zero || all_ff {
+        return Ok(None);
+    }
+    if raw[0] == 0x00 && raw[1] == 0x00 {
+        return Ok(None);
+    }
+    if raw[0] != I2C_SLOT_MAGIC_0 || raw[1] != I2C_SLOT_MAGIC_1 {
+        return Err(std::io::Error::other(format!(
+            "invalid i2c slot magic: {:02x} {:02x}",
+            raw[0], raw[1]
+        ))
+        .into());
+    }
+    if raw[2] != I2C_SLOT_VERSION {
+        return Err(
+            std::io::Error::other(format!("unsupported i2c slot version: {}", raw[2])).into(),
+        );
+    }
+    let kind = raw[3];
+    if kind == I2C_KIND_IDLE {
+        return Ok(None);
+    }
+    let flags = raw[4];
+    let offset = u32::from_le_bytes(raw[6..10].try_into().unwrap());
+    let total_len = u32::from_le_bytes(raw[10..14].try_into().unwrap());
+    let data_len = u16::from_le_bytes(raw[14..16].try_into().unwrap()) as usize;
+    let transfer_id = u16::from_le_bytes(raw[16..18].try_into().unwrap());
+    if data_len > I2C_SLOT_PAYLOAD_SIZE {
+        return Err(
+            std::io::Error::other(format!("invalid i2c slot payload length: {data_len}")).into(),
+        );
+    }
+    let data = raw[I2C_SLOT_HEADER_SIZE..I2C_SLOT_HEADER_SIZE + data_len].to_vec();
+    Ok(Some(I2cMailboxSlot {
+        kind,
+        flags,
+        transfer_id,
+        offset,
+        total_len,
+        data,
+    }))
+}
+
+fn hex_preview(bytes: &[u8], limit: usize) -> String {
+    let preview = bytes
+        .iter()
+        .take(limit)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if bytes.len() > limit {
+        format!("{preview} ...")
+    } else {
+        preview
     }
 }
 
@@ -159,38 +549,48 @@ impl CommsDevice for UartComms {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
             .side_id
-            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+            .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
 
-        // read length prefix
-        let mut len_buf = [0u8; 2];
-        self.inner.read_exact(&mut len_buf)?;
-        let frame_len = u16::from_le_bytes(len_buf) as usize;
-
-        if frame_len == 0 || frame_len > MAX_PACKET_SIZE {
-            return Err(TelemetryError::HandlerError(
-                "invalid frame length from radio",
-            ));
+        if self.rx_buf.len() < 2
+            && let Err(err) = self.fill_rx_buf()
+        {
+            return Err(err.into());
+        }
+        if let Some(payload) = self.try_take_packet()? {
+            maybe_log_raw_uart_decoded(&payload, &self.protocol);
+            return router.rx_serialized_queue_from_side(&payload, side_id);
         }
 
-        // read payload
-        let mut payload = vec![0u8; frame_len];
-        self.inner.read_exact(&mut payload)?;
+        if let Err(err) = self.fill_rx_buf() {
+            return Err(err.into());
+        }
 
-        router.rx_serialized_queue_from_side(&payload, side_id)
+        if let Some(payload) = self.try_take_packet()? {
+            maybe_log_raw_uart_decoded(&payload, &self.protocol);
+            return router.rx_serialized_queue_from_side(&payload, side_id);
+        }
+
+        Ok(())
     }
 
-    /// Blocking send of serialized bytes (length-prefixed).
+    /// Blocking send of serialized bytes.
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         let len = payload.len();
 
         if len == 0 || len > u16::MAX as usize {
-            return Err(format!("packet too large to send over radio: {len} bytes").into());
+            return Err(format!("packet too large to send over comms: {len} bytes").into());
         }
 
-        let len_bytes = (len as u16).to_le_bytes();
-
-        self.inner.write_all(&len_bytes)?;
-        self.inner.write_all(payload)?;
+        match self.protocol {
+            SerialProtocol::PacketFramed => {
+                let len_bytes = (len as u16).to_le_bytes();
+                self.inner.write_all(&len_bytes)?;
+                self.inner.write_all(payload)?;
+            }
+            SerialProtocol::RawUart => {
+                self.inner.write_all(payload)?;
+            }
+        }
         self.inner.flush()?;
         Ok(())
     }
@@ -201,7 +601,7 @@ impl CommsDevice for UartComms {
 }
 
 // ======================================================================
-// I2C Radio Implementation
+// I2C Comms Implementation
 // ======================================================================
 
 pub struct I2cComms {
@@ -214,6 +614,14 @@ pub struct I2cComms {
     chunk_delay: Duration,
     #[cfg(target_os = "linux")]
     initial_wait: Duration,
+    #[cfg(target_os = "linux")]
+    tx_backoff_until: Option<std::time::Instant>,
+    #[cfg(target_os = "linux")]
+    tx_transfer_id: u16,
+    #[cfg(target_os = "linux")]
+    rx_assembly: Option<I2cRxAssembly>,
+    #[cfg(target_os = "linux")]
+    rx_payload_buf: Vec<u8>,
 }
 
 impl I2cComms {
@@ -228,45 +636,152 @@ impl I2cComms {
                 addr: cfg.addr,
                 chunk_delay: Duration::from_millis(cfg.chunk_delay_ms),
                 initial_wait: Duration::from_millis(cfg.initial_wait_ms),
+                tx_backoff_until: None,
+                tx_transfer_id: 1,
+                rx_assembly: None,
+                rx_payload_buf: Vec::with_capacity(MAX_PACKET_SIZE * 4),
             })
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = cfg;
-            anyhow::bail!("I2C radio support is only implemented on Linux")
+            anyhow::bail!("I2C comms support is only implemented on Linux")
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn read_frame(&mut self) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
-        let mut raw = [0u8; I2C_FRAME_SIZE];
-        let mut offset = 0usize;
-        while offset < I2C_FRAME_SIZE {
-            let read_len = (I2C_FRAME_SIZE - offset).min(I2C_CHUNK_SIZE);
-            self.transfer_read(&mut raw[offset..offset + read_len])?;
-            offset += read_len;
-            if offset < I2C_FRAME_SIZE {
-                std::thread::sleep(self.chunk_delay);
+    fn read_slot(&mut self) -> Result<Option<I2cMailboxSlot>, Box<dyn Error + Send + Sync>> {
+        let mut raw = [0u8; I2C_SLOT_SIZE];
+        match self.transfer_read(&mut raw) {
+            Ok(()) => {
+                maybe_log_i2c_frame("i2c rx slot", &raw);
+                decode_i2c_slot(&raw)
             }
+            Err(err) if is_i2c_idle_read_error(err.as_ref()) => Ok(None),
+            Err(err) => Err(err),
         }
-        parse_i2c_response(&raw)
     }
 
     #[cfg(target_os = "linux")]
-    fn write_frame(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let payload = &payload[..payload.len().min(MAX_PACKET_SIZE)];
-        let mut frame = Vec::with_capacity(payload.len() + 2);
-        frame.push(I2C_REQ_DATA_MAGIC);
-        frame.push(payload.len() as u8);
-        frame.extend_from_slice(payload);
+    fn tx_backoff_active(&self) -> bool {
+        self.tx_backoff_until
+            .is_some_and(|deadline| std::time::Instant::now() < deadline)
+    }
 
-        for (idx, chunk) in frame.chunks(I2C_CHUNK_SIZE).enumerate() {
-            self.transfer_write(chunk)?;
-            if idx + 1 < frame.len().div_ceil(I2C_CHUNK_SIZE) {
+    #[cfg(target_os = "linux")]
+    fn arm_tx_backoff(&mut self) {
+        self.tx_backoff_until = Some(std::time::Instant::now() + Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn next_transfer_id(&mut self) -> u16 {
+        let current = self.tx_transfer_id;
+        self.tx_transfer_id = self.tx_transfer_id.wrapping_add(1).max(1);
+        current
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_payload(
+        &mut self,
+        kind: u8,
+        payload: &[u8],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let total_len = payload.len();
+        let transfer_id = self.next_transfer_id();
+        let mut offset = 0usize;
+
+        if total_len == 0 {
+            let slot = encode_i2c_slot(kind, I2C_FLAG_START | I2C_FLAG_END, transfer_id, 0, 0, &[]);
+            maybe_log_i2c_frame("i2c tx slot", &slot);
+            self.transfer_write(&slot)?;
+            return Ok(());
+        }
+
+        while offset < total_len {
+            let end = (offset + I2C_SLOT_PAYLOAD_SIZE).min(total_len);
+            let mut flags = 0u8;
+            if offset == 0 {
+                flags |= I2C_FLAG_START;
+            }
+            if end >= total_len {
+                flags |= I2C_FLAG_END;
+            }
+            let slot = encode_i2c_slot(
+                kind,
+                flags,
+                transfer_id,
+                offset as u32,
+                total_len as u32,
+                &payload[offset..end],
+            );
+            maybe_log_i2c_frame("i2c tx slot", &slot);
+            self.transfer_write(&slot)?;
+            offset = end;
+            if offset < total_len {
                 std::thread::sleep(self.chunk_delay);
             }
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ingest_rx_slot(
+        &mut self,
+        slot: I2cMailboxSlot,
+    ) -> Result<Option<(u8, Vec<u8>)>, Box<dyn Error + Send + Sync>> {
+        if slot.kind == I2C_KIND_IDLE {
+            return Ok(None);
+        }
+
+        if slot.flags & I2C_FLAG_START != 0 {
+            let assembly = I2cRxAssembly::new(&slot)?;
+            if slot.flags & I2C_FLAG_END != 0 {
+                return Ok(Some((slot.kind, assembly.payload)));
+            }
+            self.rx_assembly = Some(assembly);
+            return Ok(None);
+        }
+
+        let assembly = self
+            .rx_assembly
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("i2c slot arrived without an active transfer"));
+        let Ok(assembly) = assembly else {
+            return Ok(None);
+        };
+        let completed = match assembly.push(&slot) {
+            Ok(completed) => completed,
+            Err(_) => {
+                self.rx_assembly = None;
+                return Ok(None);
+            }
+        };
+        if completed.is_some() {
+            self.rx_assembly = None;
+        }
+        Ok(completed.map(|payload| (slot.kind, payload)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_take_buffered_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
+        let scan_len = self.rx_payload_buf.len().min(RAW_UART_MAX_FRAME_BYTES);
+        for start in 0..scan_len {
+            for end in (start + 1)..=scan_len {
+                let candidate = &self.rx_payload_buf[start..end];
+                if serialize::peek_frame_info(candidate).is_ok() {
+                    let payload = candidate.to_vec();
+                    self.rx_payload_buf.drain(..end);
+                    return Ok(Some(payload));
+                }
+            }
+        }
+
+        if self.rx_payload_buf.len() > RAW_UART_MAX_FRAME_BYTES {
+            let drop_len = self.rx_payload_buf.len() - RAW_UART_MAX_FRAME_BYTES;
+            self.rx_payload_buf.drain(..drop_len);
+        }
+
+        Ok(None)
     }
 
     #[cfg(target_os = "linux")]
@@ -310,45 +825,84 @@ impl CommsDevice for I2cComms {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
             .side_id
-            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+            .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
 
         #[cfg(target_os = "linux")]
         {
-            match self.read_frame() {
-                Ok(Some(payload)) => router.rx_serialized_queue_from_side(&payload, side_id),
-                Ok(None) => Ok(()),
-                Err(_) => Err(TelemetryError::HandlerError("i2c receive failed")),
+            for _ in 0..32 {
+                match self.read_slot() {
+                    Ok(Some(slot)) => {
+                        if let Some((kind, payload)) = self.ingest_rx_slot(slot).map_err(|err| {
+                            eprintln!("i2c receive failed: {err}");
+                            TelemetryError::HandlerError("i2c receive failed")
+                        })? {
+                            maybe_log_i2c_decoded(&payload);
+                            if kind != I2C_KIND_DATA {
+                                if kind == I2C_KIND_ERROR {
+                                    let msg = String::from_utf8_lossy(&payload);
+                                    if msg != "error invalid i2c slot" || i2c_debug_enabled() {
+                                        eprintln!("i2c error packet: {msg}");
+                                    }
+                                } else {
+                                    eprintln!("i2c non-data packet kind {kind} ignored");
+                                }
+                                return Ok(());
+                            }
+                            self.rx_payload_buf.extend_from_slice(&payload);
+                            while let Some(packet) = self.try_take_buffered_packet()? {
+                                if let Err(err) =
+                                    router.rx_serialized_queue_from_side(&packet, side_id)
+                                {
+                                    eprintln!("i2c router reject: {err}");
+                                    return Err(err);
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(err) => {
+                        eprintln!("i2c receive failed: {err}");
+                        return Err(TelemetryError::HandlerError("i2c receive failed"));
+                    }
+                }
             }
+            Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = router;
             let _ = side_id;
             Err(TelemetryError::HandlerError(
-                "i2c radio support is only implemented on Linux",
+                "i2c comms support is only implemented on Linux",
             ))
         }
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if payload.is_empty() || payload.len() > MAX_PACKET_SIZE {
-            return Err(
-                format!("packet too large to send over i2c: {} bytes", payload.len()).into(),
-            );
-        }
-
         #[cfg(target_os = "linux")]
         {
-            self.write_frame(payload)?;
+            if self.tx_backoff_active() {
+                return Ok(());
+            }
+
+            if let Err(err) = self.write_payload(I2C_KIND_DATA, payload) {
+                if is_i2c_retryable_write_error(err.as_ref()) {
+                    self.arm_tx_backoff();
+                    return Ok(());
+                }
+                return Err(err);
+            }
             if !self.initial_wait.is_zero() {
                 std::thread::sleep(self.initial_wait);
             }
+            self.tx_backoff_until = None;
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = payload;
-            Err("i2c radio support is only implemented on Linux".into())
+            Err("i2c comms support is only implemented on Linux".into())
         }
     }
 
@@ -358,7 +912,7 @@ impl CommsDevice for I2cComms {
 }
 
 // ======================================================================
-// SPI Radio Implementation
+// SPI Comms Implementation
 // ======================================================================
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -393,7 +947,7 @@ impl SpiComms {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = cfg;
-            anyhow::bail!("SPI radio support is only implemented on Linux")
+            anyhow::bail!("SPI comms support is only implemented on Linux")
         }
     }
 
@@ -428,7 +982,7 @@ impl CommsDevice for SpiComms {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
             .side_id
-            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+            .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
 
         #[cfg(target_os = "linux")]
         {
@@ -456,7 +1010,7 @@ impl CommsDevice for SpiComms {
             let _ = router;
             let _ = side_id;
             Err(TelemetryError::HandlerError(
-                "spi radio support is only implemented on Linux",
+                "spi comms support is only implemented on Linux",
             ))
         }
     }
@@ -480,7 +1034,7 @@ impl CommsDevice for SpiComms {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = payload;
-            Err("spi radio support is only implemented on Linux".into())
+            Err("spi comms support is only implemented on Linux".into())
         }
     }
 
@@ -490,7 +1044,7 @@ impl CommsDevice for SpiComms {
 }
 
 // ======================================================================
-// CAN Radio Implementation
+// CAN Comms Implementation
 // ======================================================================
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -527,7 +1081,7 @@ impl CanComms {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = cfg;
-            anyhow::bail!("CAN radio support is only implemented on Linux")
+            anyhow::bail!("CAN comms support is only implemented on Linux")
         }
     }
 
@@ -544,7 +1098,7 @@ impl CommsDevice for CanComms {
     fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
         let side_id = self
             .side_id
-            .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+            .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
 
         #[cfg(target_os = "linux")]
         {
@@ -610,7 +1164,7 @@ impl CommsDevice for CanComms {
             let _ = router;
             let _ = side_id;
             Err(TelemetryError::HandlerError(
-                "can radio support is only implemented on Linux",
+                "can comms support is only implemented on Linux",
             ))
         }
     }
@@ -645,7 +1199,7 @@ impl CommsDevice for CanComms {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = payload;
-            Err("can radio support is only implemented on Linux".into())
+            Err("can comms support is only implemented on Linux".into())
         }
     }
 
@@ -655,13 +1209,15 @@ impl CommsDevice for CanComms {
 }
 
 // ======================================================================
-//  Dummy Radio (fallback when hardware missing)
+//  Dummy Comms (fallback when hardware missing)
 // ======================================================================
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
 #[derive(Debug)]
 pub struct DummyComms {
     name: &'static str,
     side_id: Option<RouterSideId>,
+    discovery_next_announce_ms: u64,
+    pending_rx: std::collections::VecDeque<sedsprintf_rs_2026::packet::Packet>,
 }
 
 #[cfg(any(feature = "testing", feature = "hitl_mode"))]
@@ -671,7 +1227,73 @@ impl DummyComms {
         DummyComms {
             name,
             side_id: None,
+            discovery_next_announce_ms: 0,
+            pending_rx: std::collections::VecDeque::new(),
         }
+    }
+
+    fn simulated_discovery_sender(&self) -> &'static str {
+        match self.name {
+            "Rocket Comms" => crate::types::Board::RFBoard.sender_id(),
+            "Umbilical Comms" => crate::types::Board::GatewayBoard.sender_id(),
+            _ => crate::types::Board::GroundStation.sender_id(),
+        }
+    }
+
+    fn simulated_discovery_endpoints(&self) -> &'static [sedsprintf_rs_2026::config::DataEndpoint] {
+        use sedsprintf_rs_2026::config::DataEndpoint;
+
+        match self.name {
+            "Rocket Comms" => &[
+                DataEndpoint::FlightController,
+                DataEndpoint::FlightState,
+                DataEndpoint::SdCard,
+            ],
+            "Umbilical Comms" => &[
+                DataEndpoint::ValveBoard,
+                DataEndpoint::ActuatorBoard,
+                DataEndpoint::Abort,
+            ],
+            _ => &[],
+        }
+    }
+
+    fn simulated_timesync_sources(&self) -> &'static [&'static str] {
+        match self.name {
+            "Rocket Comms" => DUMMY_ROCKET_TIMESYNC_SOURCES,
+            "Umbilical Comms" => DUMMY_UMBILICAL_TIMESYNC_SOURCES,
+            _ => &[],
+        }
+    }
+
+    fn maybe_queue_discovery(&mut self) -> TelemetryResult<()> {
+        let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+        if now_ms < self.discovery_next_announce_ms {
+            return Ok(());
+        }
+
+        let sender = self.simulated_discovery_sender();
+        let endpoints = self.simulated_discovery_endpoints();
+        if !endpoints.is_empty() {
+            self.pending_rx
+                .push_back(sedsprintf_rs_2026::discovery::build_discovery_announce(
+                    sender, now_ms, endpoints,
+                )?);
+        }
+        let timesync_sources = self.simulated_timesync_sources();
+        if !timesync_sources.is_empty() {
+            self.pending_rx.push_back(
+                sedsprintf_rs_2026::discovery::build_discovery_timesync_sources(
+                    sender,
+                    now_ms,
+                    timesync_sources,
+                )?,
+            );
+        }
+
+        self.discovery_next_announce_ms =
+            now_ms.saturating_add(sedsprintf_rs_2026::discovery::DISCOVERY_SLOW_INTERVAL_MS);
+        Ok(())
     }
 }
 
@@ -682,7 +1304,11 @@ impl CommsDevice for DummyComms {
         {
             let side_id = self
                 .side_id
-                .ok_or(TelemetryError::HandlerError("radio side id not set"))?;
+                .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
+            self.maybe_queue_discovery()?;
+            if let Some(pkt) = self.pending_rx.pop_front() {
+                return _router.rx_queue_from_side(pkt, side_id);
+            }
             let pkt = get_dummy_packet()?;
             return _router.rx_queue_from_side(pkt, side_id);
         }
@@ -690,7 +1316,7 @@ impl CommsDevice for DummyComms {
         #[cfg(not(feature = "testing"))]
         {
             let _ = _router;
-            // In hitl_mode, dummy radios are used only as disconnected-link placeholders.
+            // In hitl_mode, dummy comms links are used only as disconnected-link placeholders.
             return Ok(());
         }
 
@@ -821,29 +1447,72 @@ struct I2cRdwrIoctlData {
 }
 
 #[cfg(target_os = "linux")]
-fn parse_i2c_response(
-    raw: &[u8; I2C_FRAME_SIZE],
-) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
-    let magic = raw[0];
-    let len = raw[1] as usize;
+fn is_i2c_idle_read_error(err: &(dyn Error + 'static)) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| {
+            code == libc::ETIMEDOUT || code == libc::EREMOTEIO || code == libc::ENXIO
+        })
+}
 
-    // Treat all-0xff and all-zero idle reads as "no frame available yet" to match the
-    // permissive Python polling behavior used by the Pico groundstation tools.
-    let all_ff = raw.iter().all(|byte| *byte == 0xFF);
-    let all_zero = raw.iter().all(|byte| *byte == 0x00);
-    if all_ff || all_zero {
-        return Ok(None);
+#[cfg(target_os = "linux")]
+fn is_i2c_retryable_write_error(err: &(dyn Error + 'static)) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| {
+            code == libc::ETIMEDOUT || code == libc::EREMOTEIO || code == libc::ENXIO
+        })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_decode_i2c_slot_roundtrip() {
+        let raw = encode_i2c_slot(I2C_KIND_DATA, I2C_FLAG_START, 7, 0, 99, b"hello");
+        let decoded = decode_i2c_slot(&raw).unwrap().unwrap();
+        assert_eq!(decoded.kind, I2C_KIND_DATA);
+        assert_eq!(decoded.flags, I2C_FLAG_START);
+        assert_eq!(decoded.transfer_id, 7);
+        assert_eq!(decoded.offset, 0);
+        assert_eq!(decoded.total_len, 99);
+        assert_eq!(decoded.data, b"hello");
     }
 
-    if magic != I2C_RESP_DATA_MAGIC || len > MAX_PACKET_SIZE {
-        return Ok(None);
+    #[test]
+    fn i2c_rx_assembly_reassembles_multislot_transfer() {
+        let first = decode_i2c_slot(&encode_i2c_slot(
+            I2C_KIND_DATA,
+            I2C_FLAG_START,
+            11,
+            0,
+            20,
+            b"abcdefghijklmn",
+        ))
+        .unwrap()
+        .unwrap();
+        let second = decode_i2c_slot(&encode_i2c_slot(
+            I2C_KIND_DATA,
+            I2C_FLAG_END,
+            11,
+            14,
+            20,
+            b"opqrst",
+        ))
+        .unwrap()
+        .unwrap();
+
+        let mut assembly = I2cRxAssembly::new(&first).unwrap();
+        let payload = assembly.push(&second).unwrap().unwrap();
+        assert_eq!(payload, b"abcdefghijklmnopqrst");
     }
 
-    if len == 0 {
-        return Ok(None);
+    #[test]
+    fn timed_out_i2c_read_is_treated_as_idle() {
+        let err = std::io::Error::from_raw_os_error(libc::ETIMEDOUT);
+        assert!(is_i2c_idle_read_error(&err));
     }
-
-    Ok(Some(raw[2..2 + len].to_vec()))
 }
 
 #[cfg(target_os = "linux")]

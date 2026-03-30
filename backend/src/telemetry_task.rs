@@ -7,19 +7,19 @@ use crate::rocket_commands::{ActuatorBoardCommands, FlightComputerCommands, Valv
 use crate::state::AppState;
 #[cfg(feature = "hitl_mode")]
 use crate::types::FlightState;
-use crate::types::{Board, TelemetryCommand, TelemetryRow, u8_to_flight_state};
-use crate::web::{FlightStateMsg, emit_warning};
+use crate::types::{u8_to_flight_state, Board, TelemetryCommand, TelemetryRow};
+use crate::web::{emit_warning, FlightStateMsg};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::Router;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
-use tokio::sync::{Notify, broadcast, mpsc};
-use tokio::time::{Duration, interval};
+use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::time::{interval, Duration};
 
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
@@ -865,11 +865,10 @@ pub fn set_network_time_router(router: Arc<Router>) {
 pub async fn telemetry_task(
     state: Arc<AppState>,
     router: Arc<sedsprintf_rs_2026::router::Router>,
-    radio: Vec<Arc<Mutex<Box<dyn CommsDevice>>>>,
+    comms: Vec<Arc<Mutex<Box<dyn CommsDevice>>>>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    let mut radio_interval = interval(Duration::from_millis(10));
     let mut handle_interval = interval(Duration::from_millis(1));
     let mut router_interval = interval(Duration::from_millis(10));
     let mut heartbeat_interval = interval(Duration::from_millis(500));
@@ -970,21 +969,44 @@ pub async fn telemetry_task(
         })
     };
 
-    loop {
-        tokio::select! {
-                _ = radio_interval.tick() => {
-                    for radio in &radio {
-                        match radio.lock().expect("failed to get lock").recv_packet(&router){
-                            Ok(_) => {
-                                // Packet received and handled by router
+    let comms_workers: Vec<_> = comms
+        .iter()
+        .cloned()
+        .map(|comms| {
+            let router = router.clone();
+            let mut comms_shutdown_rx = state.shutdown_subscribe();
+            tokio::spawn(async move {
+                let mut comms_interval = interval(Duration::from_millis(2));
+                comms_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = comms_interval.tick() => {
+                            match comms.lock().expect("failed to get lock").recv_packet(&router) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    log_telemetry_error("comms_task recv_packet failed", e);
+                                }
                             }
-                            Err(e) => {
-                                log_telemetry_error("radio_task recv_packet failed", e);
+                        }
+                        recv = comms_shutdown_rx.recv() => {
+                            match recv {
+                                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
+            })
+        })
+        .collect();
+
+    loop {
+        tokio::select! {
             _= router_interval.tick() => {
+                    if let Err(e) = router.poll_discovery() {
+                        log_telemetry_error("router discovery polling failed", e);
+                    }
                     if let Err(e) = router.process_all_queues_with_timeout(20) {
                         log_telemetry_error("router queue processing failed", e);
                     }
@@ -1348,6 +1370,17 @@ pub async fn telemetry_task(
     }
 
     let worker_shutdown_timeout = Duration::from_secs(10);
+
+    for worker in comms_workers {
+        match tokio::time::timeout(worker_shutdown_timeout, worker).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("Comms worker ended with error: {e}"),
+            Err(_) => eprintln!(
+                "Comms worker did not shut down within {:?}",
+                worker_shutdown_timeout
+            ),
+        }
+    }
 
     // Stop intake first, then wait for packet worker to drain packet queue.
     drop(packet_tx);

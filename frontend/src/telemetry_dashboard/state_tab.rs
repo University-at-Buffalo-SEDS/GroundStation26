@@ -14,12 +14,12 @@ use super::layout::{
 };
 use super::types::{BoardStatusEntry, FlightState, TelemetryRow};
 use super::{
-    ActionPolicyMsg, BlinkMode, HISTORY_MS, TELEMETRY_RENDER_EPOCH, latest_telemetry_row,
-    latest_telemetry_value, ui_telemetry_rows_snapshot,
+    latest_telemetry_row, latest_telemetry_value, translate_text, ui_telemetry_rows_snapshot, ActionPolicyMsg,
+    BlinkMode, HISTORY_MS, TELEMETRY_RENDER_EPOCH,
 };
 
 use crate::telemetry_dashboard::data_chart::{
-    ChartCanvas, ChartRenderChunk, charts_cache_get, charts_cache_get_channel_minmax, series_color,
+    charts_cache_get, charts_cache_get_channel_minmax, series_color, ChartCanvas, ChartRenderChunk,
 };
 use crate::telemetry_dashboard::map_tab::MapTab;
 use std::hash::{Hash, Hasher};
@@ -113,16 +113,16 @@ pub fn StateTab(
             }
         }
     } else {
-        rsx! { div { style: "color:{theme.text_muted}; font-size:12px;", "No layout for this flight state." } }
+        rsx! { div { style: "color:{theme.text_muted}; font-size:12px;", "{translate_text(\"No layout for this flight state.\")}" } }
     };
 
     rsx! {
         div { style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto; display:flex; flex-direction:column; gap:16px; padding-bottom:100px;",
-            h2 { style: "margin:0; color:{theme.text_primary};", "State" }
+            h2 { style: "margin:0; color:{theme.text_primary};", "{translate_text(\"State\")}" }
             div { style: "padding:14px; border:1px solid {theme.border}; border-radius:14px; background:{theme.panel_background};",
-                div { style: "font-size:14px; color:{theme.text_muted};", "Current Flight State" }
+                div { style: "font-size:14px; color:{theme.text_muted};", "{translate_text(\"Current Flight State\")}" }
                 div { style: "font-size:22px; font-weight:700; margin-top:6px; color:{theme.text_primary};",
-                    "{state.to_string()}"
+                    "{translate_text(&state.to_string())}"
                 }
             }
             {content}
@@ -147,7 +147,7 @@ fn Section(title: String, style: Option<StateSectionStyle>, children: Element) -
 
     rsx! {
         div { style: "padding:14px; border:1px solid {border}; border-radius:14px; background:{background};",
-            div { style: "font-size:15px; color:{title_color}; font-weight:600; margin-bottom:10px;", "{title}" }
+            div { style: "font-size:15px; color:{title_color}; font-weight:600; margin-bottom:10px;", "{translate_text(&title)}" }
             {children}
         }
     }
@@ -171,7 +171,8 @@ fn render_state_section(
     let title = section
         .title
         .clone()
-        .unwrap_or_else(|| "Section".to_string());
+        .map(|title| translate_text(&title))
+        .unwrap_or_else(|| translate_text("Section"));
 
     rsx! {
         Section { title: title, style: section.style.clone(),
@@ -211,7 +212,7 @@ fn render_state_widget(
             let dt = widget.data_type.as_deref().unwrap_or("");
             let items = widget.items.as_deref().unwrap_or(&[]);
             if dt.is_empty() {
-                rsx! { div { style: "color:#94a3b8; font-size:12px;", "Missing summary data_type" } }
+                rsx! { div { style: "color:#94a3b8; font-size:12px;", "{translate_text(\"Missing summary data_type\")}" } }
             } else {
                 rsx! { {summary_row(dt, items, widget.summary_style.as_ref())} }
             }
@@ -238,7 +239,13 @@ fn render_state_widget(
                 widget.valve_labels.as_deref(),
             )} }
         }
-        StateWidgetKind::Map => rsx! { MapTab { rocket_gps: rocket_gps, user_gps: user_gps } },
+        StateWidgetKind::Map => rsx! {
+            MapTab {
+                rocket_gps: rocket_gps,
+                user_gps: user_gps,
+                theme: theme.clone(),
+            }
+        },
         StateWidgetKind::Actions => {
             rsx! { {action_section(actions, action_policy, widget.actions.as_deref(), abort_only_mode)} }
         }
@@ -260,6 +267,11 @@ fn StateChartPanel(
         is_fullscreen.set(next);
     };
     let full_h = fullscreen_view_height().max(view_h).max(320.0);
+    let fullscreen_button_label = if *is_fullscreen.read() {
+        translate_text("Exit Fullscreen")
+    } else {
+        translate_text("Fullscreen")
+    };
 
     let chart_body = if let Some(series) = widget.chart_series.as_deref()
         && !series.is_empty()
@@ -278,7 +290,7 @@ fn StateChartPanel(
     } else {
         let dt = widget.data_type.as_deref().unwrap_or("");
         if dt.is_empty() {
-            rsx! { div { style: "color:#94a3b8; font-size:12px;", "Missing chart data_type" } }
+            rsx! { div { style: "color:#94a3b8; font-size:12px;", "{translate_text(\"Missing chart data_type\")}" } }
         } else {
             let labels = labels_from_layout(&data_layout, dt);
             data_style_chart_cached(
@@ -301,17 +313,17 @@ fn StateChartPanel(
                 button {
                     style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
                     onclick: on_toggle_fullscreen,
-                    if *is_fullscreen.read() { "Exit Fullscreen" } else { "Fullscreen" }
+                    "{fullscreen_button_label}"
                 }
             }
             if *is_fullscreen.read() {
                 div { style: "position:fixed; inset:0; z-index:9998; padding:16px; background:{theme.app_background}; display:flex; flex-direction:column; gap:12px;",
                     div { style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
-                        h2 { style: "margin:0; color:{theme.text_primary};", "{widget.chart_title.clone().unwrap_or_else(|| \"Flight Graph\".to_string())}" }
+                        h2 { style: "margin:0; color:{theme.text_primary};", "{widget.chart_title.clone().map(|title| translate_text(&title)).unwrap_or_else(|| translate_text(\"Flight Graph\"))}" }
                         button {
                             style: "padding:6px 12px; border-radius:999px; border:1px solid {theme.info_accent}; background:{theme.info_background}; color:{theme.info_text}; font-size:0.85rem; cursor:pointer;",
                             onclick: on_toggle_fullscreen,
-                            "Exit Fullscreen"
+                            "{translate_text(\"Exit Fullscreen\")}"
                         }
                     }
                     div { style: "flex:1; min-height:0; overflow-y:auto;",
@@ -379,14 +391,14 @@ fn data_style_chart_cached(
     rsx! {
         div { style: "width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:12px; display:flex; flex-direction:column; gap:8px;",
             if let Some(t) = title {
-                div { style: "color:#e5e7eb; font-weight:700; font-size:14px;", "{t}" }
+                div { style: "color:#e5e7eb; font-weight:700; font-size:14px;", "{translate_text(t)}" }
             }
 
             div { style: "position:relative; width:100%; aspect-ratio:{view_w}/{view_h};",
                 ChartCanvas {
                     view_w: view_w,
                     view_h: view_h,
-                    chunks: chunks,
+                    chunks: chunks.into(),
                     grid_left: None,
                     grid_right: None,
                     grid_top: None,
@@ -399,7 +411,7 @@ fn data_style_chart_cached(
                     span { style: "position:absolute; left:10px; top:{y_pct(bottom + 4.0, view_h)}; transform:translateY(-100%);", {format!("{:.2}", y_min)} }
                     span { style: "position:absolute; left:{x_pct(left + 10.0, view_w)}; bottom:5px;", {format!("-{:.1} min", span_min)} }
                     span { style: "position:absolute; left:{x_pct(view_w * 0.5, view_w)}; bottom:5px; transform:translateX(-50%);", {format!("-{:.1} min", span_min * 0.5)} }
-                    span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "now" }
+                    span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "{translate_text(\"now\")}" }
                 }
             }
 
@@ -410,7 +422,7 @@ fn data_style_chart_cached(
                             svg { width:"26", height:"8", view_box:"0 0 26 8",
                                 line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(i)}", stroke_width:"2", stroke_linecap:"round" }
                             }
-                            "{label}"
+                            "{translate_text(label)}"
                         }
                     }
                 }
@@ -516,7 +528,7 @@ fn default_series_label(data_layout: &DataTabLayout, spec: &ChartSeriesSpec) -> 
     if let Some(label) = spec.label.as_ref()
         && !label.trim().is_empty()
     {
-        return label.clone();
+        return translate_text(label);
     }
     data_layout
         .tabs
@@ -524,7 +536,8 @@ fn default_series_label(data_layout: &DataTabLayout, spec: &ChartSeriesSpec) -> 
         .find(|tab| tab.id == spec.data_type)
         .and_then(|tab| tab.channels.get(spec.index).cloned())
         .filter(|label| !label.is_empty())
-        .unwrap_or_else(|| format!("{}[{}]", spec.data_type, spec.index))
+        .map(|label| translate_text(&label))
+        .unwrap_or_else(|| format!("{}[{}]", translate_text(&spec.data_type), spec.index))
 }
 
 fn combined_chart_payload(
@@ -730,7 +743,7 @@ fn combined_state_chart_cached(
     rsx! {
         div { style: "width:100%; background:#020617; border-radius:14px; border:1px solid #334155; padding:6px; display:flex; flex-direction:column; gap:4px;",
             if let Some(t) = title {
-                div { style: "color:#e5e7eb; font-weight:700; font-size:14px;", "{t}" }
+                div { style: "color:#e5e7eb; font-weight:700; font-size:14px;", "{translate_text(t)}" }
             }
             div { style: "display:flex; gap:2px; align-items:stretch;",
                 if normalize_per_series {
@@ -762,7 +775,7 @@ fn combined_state_chart_cached(
                     ChartCanvas {
                         view_w: view_w,
                         view_h: view_h,
-                        chunks: chunks,
+                        chunks: chunks.into(),
                         grid_left: Some(left),
                         grid_right: Some(right),
                         grid_top: Some(top),
@@ -777,13 +790,13 @@ fn combined_state_chart_cached(
                         }
                         span { style: "position:absolute; left:{x_pct(left + 10.0, view_w)}; bottom:5px;", {format!("-{:.1} min", span_min)} }
                         span { style: "position:absolute; left:{x_pct(view_w * 0.5, view_w)}; bottom:5px; transform:translateX(-50%);", {format!("-{:.1} min", span_min * 0.5)} }
-                        span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "now" }
+                        span { style: "position:absolute; left:{x_pct(right - 60.0, view_w)}; bottom:5px;", "{translate_text(\"now\")}" }
                     }
                 }
             }
             div { style: "display:flex; flex-wrap:wrap; gap:6px; padding:4px 6px; background:rgba(2,6,23,0.75); border:1px solid #1f2937; border-radius:10px;",
                 if normalize_per_series {
-                    div { style: "font-size:11px; color:#94a3b8; margin-right:6px;", "Scaled per series" }
+                    div { style: "font-size:11px; color:#94a3b8; margin-right:6px;", "{translate_text(\"Scaled per series\")}" }
                 }
                 for (i, label) in labels.iter().enumerate() {
                     if !label.is_empty() {
@@ -791,7 +804,7 @@ fn combined_state_chart_cached(
                             svg { width:"26", height:"8", view_box:"0 0 26 8",
                                 line { x1:"1", y1:"4", x2:"25", y2:"4", stroke:"{series_color(i)}", stroke_width:"2", stroke_linecap:"round" }
                             }
-                            "{label}"
+                            "{translate_text(label)}"
                         }
                     }
                 }
@@ -805,7 +818,12 @@ fn labels_from_layout(data_layout: &DataTabLayout, dt: &str) -> Vec<String> {
         .tabs
         .iter()
         .find(|tab| tab.id == dt)
-        .map(|tab| tab.channels.clone())
+        .map(|tab| {
+            tab.channels
+                .iter()
+                .map(|label| translate_text(label))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -840,37 +858,37 @@ fn valve_state_grid(
 
     let default_items = [
         SummaryItem {
-            label: "Pilot".to_string(),
+            label: translate_text("Pilot"),
             index: 0,
             formatter: None,
         },
         SummaryItem {
-            label: "NormallyOpen".to_string(),
+            label: translate_text("NormallyOpen"),
             index: 1,
             formatter: None,
         },
         SummaryItem {
-            label: "Dump".to_string(),
+            label: translate_text("Dump"),
             index: 2,
             formatter: None,
         },
         SummaryItem {
-            label: "Igniter".to_string(),
+            label: translate_text("Igniter"),
             index: 3,
             formatter: None,
         },
         SummaryItem {
-            label: "Nitrogen".to_string(),
+            label: translate_text("Nitrogen"),
             index: 4,
             formatter: None,
         },
         SummaryItem {
-            label: "Nitrous".to_string(),
+            label: translate_text("Nitrous"),
             index: 5,
             formatter: None,
         },
         SummaryItem {
-            label: "Fill Lines".to_string(),
+            label: translate_text("Fill Lines"),
             index: 6,
             formatter: None,
         },
@@ -893,7 +911,7 @@ fn valve_state_grid(
         div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-bottom:12px;",
             for (idx, (label, value)) in items.iter().enumerate() {
                 ValveStateCard {
-                    label: label.clone(),
+                    label: translate_text(label),
                     value: *value,
                     open: open.clone(),
                     closed: closed.clone(),
@@ -950,8 +968,8 @@ fn ValveStateCard(
 
     rsx! {
         div { style: "padding:10px; border-radius:12px; background:{bg}; border:1px solid {border};",
-            div { style: "font-size:12px; color:{fg};", "{label}" }
-            div { style: "font-size:18px; font-weight:700; color:{fg};", "{text}" }
+            div { style: "font-size:12px; color:{fg};", "{translate_text(&label)}" }
+            div { style: "font-size:18px; font-weight:700; color:{fg};", "{translate_text(text)}" }
         }
     }
 }
@@ -1031,7 +1049,7 @@ fn action_section(
                                     }
                                 }
                             },
-                            "{action.label}"
+                            "{translate_text(&action.label)}"
                         }
                     }
                 }
@@ -1137,7 +1155,7 @@ fn summary_row(dt: &str, items: &[SummaryItem], style: Option<&SummaryCardStyle>
         div { style: "display:grid; gap:10px; margin-bottom:12px; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); width:100%;",
             for (label, idx, value, formatter) in latest {
                 SummaryCard {
-                    label: label,
+                    label: translate_text(&label),
                     value: format_summary_value(value, formatter),
                     min: if want_minmax { chan_min.get(idx).copied().flatten().map(|v| format_summary_value(Some(v), formatter)) } else { None },
                     max: if want_minmax { chan_max.get(idx).copied().flatten().map(|v| format_summary_value(Some(v), formatter)) } else { None },
@@ -1157,7 +1175,11 @@ fn SummaryCard(
     style: Option<SummaryCardStyle>,
 ) -> Element {
     let mm = match (min.as_deref(), max.as_deref()) {
-        (Some(mi), Some(ma)) => Some(format!("min {mi} • max {ma}")),
+        (Some(mi), Some(ma)) => Some(format!(
+            "{} {mi} • {} {ma}",
+            translate_text("min"),
+            translate_text("max")
+        )),
         _ => None,
     };
     let background = style
@@ -1179,7 +1201,7 @@ fn SummaryCard(
 
     rsx! {
         div { style: "padding:10px; border-radius:12px; background:{background}; border:1px solid {border}; width:100%; min-width:0; box-sizing:border-box;",
-            div { style: "font-size:12px; color:{label_color};", "{label}" }
+            div { style: "font-size:12px; color:{label_color};", "{translate_text(&label)}" }
             div { style: "font-size:18px; color:{value_color}; line-height:1.1;", "{value}" }
             if let Some(t) = mm {
                 div { style: "font-size:11px; color:#94a3b8; margin-top:4px;", "{t}" }

@@ -1,4 +1,6 @@
 #[cfg(feature = "testing")]
+use crate::fill_targets;
+#[cfg(feature = "testing")]
 use crate::loadcell;
 #[cfg(feature = "testing")]
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
@@ -9,10 +11,10 @@ use crate::types::TelemetryCommand;
 use crate::types::{Board, FlightState};
 #[cfg(feature = "testing")]
 use rand::RngExt;
-use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
+use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
@@ -61,9 +63,14 @@ const GRAVITY_FPS2: f32 = 32.174;
 fn sim_full_mass_kg() -> f32 {
     static FULL_MASS_KG: OnceLock<f32> = OnceLock::new();
     *FULL_MASS_KG.get_or_init(|| {
-        loadcell::load_or_default()
-            .full_mass_kg
-            .unwrap_or(loadcell::DEFAULT_FULL_MASS_KG)
+        fill_targets::load_or_default()
+            .nitrous
+            .target_mass_kg
+            .max(
+                loadcell::load_or_default()
+                    .full_mass_kg
+                    .unwrap_or(loadcell::DEFAULT_FULL_MASS_KG),
+            )
             .max(0.1)
     })
 }
@@ -76,7 +83,12 @@ fn sim_nitrogen_target_mass_kg() -> f32 {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| *v > 0.0)
-            .unwrap_or_else(sim_full_mass_kg)
+            .unwrap_or_else(|| {
+                fill_targets::load_or_default()
+                    .nitrogen
+                    .target_mass_kg
+                    .max(0.1)
+            })
     })
 }
 
@@ -89,7 +101,7 @@ fn sim_nitrogen_pressure_ceiling_psi() -> f32 {
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| *v > 0.0)
             .map(|target| target + 5.0)
-            .unwrap_or(NITROGEN_PRESSURE_MAX_PSI)
+            .unwrap_or(fill_targets::load_or_default().nitrogen.target_pressure_psi + 5.0)
             .max(NITROGEN_PRESSURE_MAX_PSI)
     })
 }
@@ -833,6 +845,59 @@ pub fn sim_mode_enabled() -> bool {
             .map(|v| !matches!(v, "0" | "false" | "FALSE" | "off" | "OFF"))
             .unwrap_or(true)
     })
+}
+
+#[cfg(feature = "testing")]
+pub fn simulated_board_endpoints(board: Board) -> Vec<String> {
+    let mut endpoints = match board {
+        Board::GroundStation => Vec::new(),
+        Board::FlightComputer => vec![
+            DataEndpoint::FlightController.as_str().to_string(),
+            DataEndpoint::FlightState.as_str().to_string(),
+            DataEndpoint::SdCard.as_str().to_string(),
+        ],
+        Board::RFBoard => vec![
+            DataEndpoint::FlightController.as_str().to_string(),
+            DataEndpoint::FlightState.as_str().to_string(),
+        ],
+        Board::PowerBoard => Vec::new(),
+        Board::ValveBoard => vec![
+            DataEndpoint::ValveBoard.as_str().to_string(),
+            DataEndpoint::Abort.as_str().to_string(),
+            DataEndpoint::FlightState.as_str().to_string(),
+        ],
+        Board::GatewayBoard => vec![
+            DataEndpoint::ValveBoard.as_str().to_string(),
+            DataEndpoint::ActuatorBoard.as_str().to_string(),
+            DataEndpoint::Abort.as_str().to_string(),
+        ],
+        Board::ActuatorBoard => vec![
+            DataEndpoint::ActuatorBoard.as_str().to_string(),
+            DataEndpoint::Abort.as_str().to_string(),
+            DataEndpoint::FlightState.as_str().to_string(),
+        ],
+        Board::DaqBoard => Vec::new(),
+    };
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints
+}
+
+#[cfg(not(feature = "testing"))]
+pub fn simulated_board_endpoints(_board: crate::types::Board) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "testing")]
+    #[test]
+    fn flight_computer_simulated_endpoints_include_sd_card() {
+        let endpoints = super::simulated_board_endpoints(crate::types::Board::FlightComputer);
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint == sedsprintf_rs_2026::config::DataEndpoint::SdCard.as_str()
+        }));
+    }
 }
 
 #[cfg(feature = "testing")]

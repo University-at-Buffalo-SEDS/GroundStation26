@@ -13,10 +13,19 @@ const LEGACY_CONFIG_PATHS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SerialProtocol {
+    PacketFramed,
+    RawUart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SerialLinkConfig {
     pub port: String,
     #[serde(default = "default_baud_rate")]
     pub baud_rate: usize,
+    #[serde(default = "default_serial_protocol")]
+    pub protocol: SerialProtocol,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -54,7 +63,8 @@ pub struct I2cLinkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "interface", rename_all = "snake_case")]
 pub enum CommsLinkConfig {
-    UsbSerial {
+    #[serde(alias = "usb_serial")]
+    Serial {
         #[serde(flatten)]
         serial: SerialLinkConfig,
     },
@@ -94,6 +104,10 @@ fn default_config_version() -> u32 {
 
 fn default_baud_rate() -> usize {
     COMMS_BAUD_RATE
+}
+
+fn default_serial_protocol() -> SerialProtocol {
+    SerialProtocol::PacketFramed
 }
 
 fn default_spi_speed_hz() -> u32 {
@@ -136,16 +150,18 @@ impl Default for CommsLinksConfig {
     fn default() -> Self {
         Self {
             version: default_config_version(),
-            av_bay: CommsLinkConfig::UsbSerial {
+            av_bay: CommsLinkConfig::Serial {
                 serial: SerialLinkConfig {
                     port: ROCKET_COMMS_PORT.to_string(),
                     baud_rate: default_baud_rate(),
+                    protocol: default_serial_protocol(),
                 },
             },
-            fill_box: CommsLinkConfig::UsbSerial {
+            fill_box: CommsLinkConfig::Serial {
                 serial: SerialLinkConfig {
                     port: UMBILICAL_COMMS_PORT.to_string(),
-                    baud_rate: default_baud_rate(),
+                    baud_rate: 115_200,
+                    protocol: SerialProtocol::RawUart,
                 },
             },
         }
@@ -156,7 +172,7 @@ impl Default for CommsLinksConfig {
 impl CommsLinkConfig {
     pub fn port(&self) -> &str {
         match self {
-            Self::UsbSerial { serial }
+            Self::Serial { serial }
             | Self::RaspberryPiGpioUart { serial }
             | Self::CustomSerial { serial } => &serial.port,
             Self::Spi { spi } => &spi.port,
@@ -177,16 +193,19 @@ pub fn load_or_default() -> CommsLinksConfig {
     let path = config_path();
     migrate_legacy_config(&path);
     match fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<CommsLinksConfig>(&raw) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                eprintln!(
-                    "WARNING: invalid comms link config at {}: {err}. Falling back to defaults.",
-                    path.display()
-                );
-                CommsLinksConfig::default()
+        Ok(raw) => {
+            let raw = migrate_serial_protocol_defaults(raw, &path);
+            match serde_json::from_str::<CommsLinksConfig>(&raw) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    eprintln!(
+                        "WARNING: invalid comms link config at {}: {err}. Falling back to defaults.",
+                        path.display()
+                    );
+                    CommsLinksConfig::default()
+                }
             }
-        },
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let cfg = CommsLinksConfig::default();
             if let Err(write_err) = save(&cfg) {
@@ -255,11 +274,72 @@ fn migrate_legacy_config(target_path: &PathBuf) {
     }
 }
 
+fn migrate_serial_protocol_defaults(raw: String, path: &PathBuf) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return raw;
+    };
+
+    let mut changed = false;
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(av_bay) = obj.get_mut("av_bay") {
+            changed |= ensure_serial_protocol(av_bay, SerialProtocol::PacketFramed);
+        }
+        if let Some(fill_box) = obj.get_mut("fill_box") {
+            changed |= ensure_serial_protocol(fill_box, SerialProtocol::RawUart);
+        }
+    }
+
+    if !changed {
+        return raw;
+    }
+
+    match serde_json::to_string_pretty(&value) {
+        Ok(updated) => {
+            if let Err(err) = fs::write(path, &updated) {
+                eprintln!(
+                    "WARNING: failed to persist comms protocol migration {}: {err}",
+                    path.display()
+                );
+            }
+            updated
+        }
+        Err(_) => raw,
+    }
+}
+
+fn ensure_serial_protocol(link: &mut serde_json::Value, protocol: SerialProtocol) -> bool {
+    let Some(obj) = link.as_object_mut() else {
+        return false;
+    };
+    let Some(interface) = obj.get("interface").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if !matches!(
+        interface,
+        "serial" | "usb_serial" | "raspberry_pi_gpio_uart" | "custom_serial"
+    ) {
+        return false;
+    }
+    if obj.contains_key("protocol") {
+        return false;
+    }
+
+    let protocol = match protocol {
+        SerialProtocol::PacketFramed => "packet_framed",
+        SerialProtocol::RawUart => "raw_uart",
+    };
+    obj.insert(
+        "protocol".to_string(),
+        serde_json::Value::String(protocol.to_string()),
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CanLinkConfig, CommsLinkConfig, CommsLinksConfig, I2cLinkConfig, SerialLinkConfig,
-        SpiLinkConfig,
+        SerialProtocol, SpiLinkConfig,
     };
 
     #[test]
@@ -268,19 +348,21 @@ mod tests {
         assert_eq!(cfg.version, 1);
         assert_eq!(
             cfg.av_bay,
-            CommsLinkConfig::UsbSerial {
+            CommsLinkConfig::Serial {
                 serial: SerialLinkConfig {
                     port: "/dev/ttyUSB1".to_string(),
                     baud_rate: 57_600,
+                    protocol: SerialProtocol::PacketFramed,
                 },
             }
         );
         assert_eq!(
             cfg.fill_box,
-            CommsLinkConfig::UsbSerial {
+            CommsLinkConfig::Serial {
                 serial: SerialLinkConfig {
                     port: "/dev/ttyUSB2".to_string(),
-                    baud_rate: 57_600,
+                    baud_rate: 115_200,
+                    protocol: SerialProtocol::RawUart,
                 },
             }
         );
@@ -315,5 +397,28 @@ mod tests {
         assert_eq!(spi.port(), "/dev/spidev0.0");
         assert_eq!(can.port(), "can0");
         assert_eq!(i2c.port(), "/dev/i2c-*");
+    }
+
+    #[test]
+    fn legacy_usb_serial_alias_deserializes_as_serial() {
+        let raw = r#"{
+            "version": 1,
+            "av_bay": {
+                "interface": "usb_serial",
+                "port": "/dev/ttyUSB1",
+                "baud_rate": 57600,
+                "protocol": "packet_framed"
+            },
+            "fill_box": {
+                "interface": "serial",
+                "port": "/dev/ttyUSB2",
+                "baud_rate": 115200,
+                "protocol": "raw_uart"
+            }
+        }"#;
+
+        let cfg: CommsLinksConfig = serde_json::from_str(raw).expect("legacy config should parse");
+        assert!(matches!(cfg.av_bay, CommsLinkConfig::Serial { .. }));
+        assert!(matches!(cfg.fill_box, CommsLinkConfig::Serial { .. }));
     }
 }

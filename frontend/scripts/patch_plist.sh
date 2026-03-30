@@ -17,8 +17,9 @@ set -euo pipefail
 debug=false
 
 APP_NAME="UBSEDS GS"
+ALT_APP_NAME="SEDS GS"
 LEGACY_APP_NAME="GroundstationFrontend"
-APP_DIR="./dist/${APP_NAME}.app"
+APP_DIR="${APP_DIR:-./dist/${APP_NAME}.app}"
 PLIST="${APP_DIR}/Info.plist"
 VERSION_INPUT="${1:-${APP_VERSION:-}}"
 BUILD_INPUT="${2:-${APP_BUILD:-}}"
@@ -46,7 +47,14 @@ trap 'rc=$?; printf "\n[FAIL] line=%s rc=%s cmd: %s\n" "$LINENO" "$rc" "$BASH_CO
 
 [[ -x "$PB" ]] || die "PlistBuddy not found/executable at: $PB"
 
-# Handle legacy bundle name if build produced a different folder name
+# Handle alternate/legacy bundle names if build produced a different folder name
+if [[ ! -d "$APP_DIR" && -d "./dist/${ALT_APP_NAME}.app" ]]; then
+  log "Renaming app bundle to ${APP_NAME}.app"
+  mv "./dist/${ALT_APP_NAME}.app" "./dist/${APP_NAME}.app"
+  APP_DIR="./dist/${APP_NAME}.app"
+  PLIST="${APP_DIR}/Info.plist"
+fi
+
 if [[ ! -d "$APP_DIR" && -d "./dist/${LEGACY_APP_NAME}.app" ]]; then
   log "Renaming app bundle to ${APP_NAME}.app"
   mv "./dist/${LEGACY_APP_NAME}.app" "$APP_DIR"

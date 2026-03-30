@@ -220,13 +220,9 @@ mod dummy {
             Ok(())
         }
     }
-
-    pub use GpioPins as GpioPinsDummy;
 }
 
-// Public type alias: outside code just uses `GpioPins`
 #[cfg(feature = "raspberry_pi")]
 pub use real::GpioPinsReal as GpioPins;
-
 #[cfg(not(feature = "raspberry_pi"))]
-pub use dummy::GpioPinsDummy as GpioPins;
+pub type GpioPins = dummy::GpioPins;

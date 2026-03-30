@@ -4,9 +4,9 @@ mod telemetry_dashboard;
 
 use dioxus::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
-use dioxus_desktop::RequestAsyncResponder;
-#[cfg(not(target_arch = "wasm32"))]
 use dioxus_desktop::wry::http::{Request as HttpRequest, Response as HttpResponse};
+#[cfg(not(target_arch = "wasm32"))]
+use dioxus_desktop::RequestAsyncResponder;
 #[cfg(not(target_arch = "wasm32"))]
 use image::ImageFormat;
 #[cfg(not(target_arch = "wasm32"))]
@@ -14,7 +14,7 @@ use std::backtrace::Backtrace;
 #[cfg(not(target_arch = "wasm32"))]
 use std::borrow::Cow;
 #[cfg(not(target_arch = "wasm32"))]
-use std::fs::{OpenOptions, create_dir_all};
+use std::fs::{create_dir_all, OpenOptions};
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
 #[cfg(not(target_arch = "wasm32"))]
@@ -25,11 +25,13 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_arch = "wasm32")]
+/// Installs a browser panic hook so Rust panics appear in the JS console.
 fn init_panic_hook() {
     console_error_panic_hook::set_once();
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Installs a native panic hook that appends panic details to the frontend log file.
 fn init_panic_hook() {
     panic::set_hook(Box::new(|panic_info| {
         let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
@@ -51,6 +53,7 @@ fn init_panic_hook() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Resolves the native frontend log file path, honoring the override environment variable.
 fn log_file_path() -> PathBuf {
     if let Ok(p) = std::env::var("GS26_FRONTEND_LOG")
         && !p.trim().is_empty()
@@ -61,6 +64,7 @@ fn log_file_path() -> PathBuf {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Appends a timestamped line to the native frontend log file.
 fn append_native_log(message: &str) {
     let path = log_file_path();
     if let Some(parent) = path.parent() {
@@ -77,6 +81,7 @@ fn append_native_log(message: &str) {
 }
 
 #[cfg(target_arch = "wasm32")]
+/// Launches the web build of the frontend.
 fn main() {
     init_panic_hook();
 
@@ -86,6 +91,7 @@ fn main() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Launches the desktop build and wires in the custom tile proxy protocol.
 fn main() {
     init_panic_hook();
     append_native_log("[startup] native main entered");
@@ -105,6 +111,7 @@ fn main() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Loads the desktop window icon from the bundled PNG asset.
 fn load_desktop_window_icon() -> Option<dioxus_desktop::tao::window::Icon> {
     let image =
         image::load_from_memory_with_format(include_bytes!("../assets/icon.png"), ImageFormat::Png)
@@ -115,7 +122,9 @@ fn load_desktop_window_icon() -> Option<dioxus_desktop::tao::window::Icon> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Handles `gs26://` requests by proxying tile image reads to the configured backend.
 fn handle_gs26_protocol(request: HttpRequest<Vec<u8>>) -> HttpResponse<Cow<'static, [u8]>> {
+    /// Builds a protocol response while falling back to an empty 500 on builder failure.
     fn build_response(
         status: u16,
         content_type: Option<&str>,
@@ -208,6 +217,7 @@ fn handle_gs26_protocol(request: HttpRequest<Vec<u8>>) -> HttpResponse<Cow<'stat
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Runs the custom protocol handler on a dedicated thread so blocking tile fetches do not stall the UI.
 fn _handle_gs26_protocol_async(request: HttpRequest<Vec<u8>>, responder: RequestAsyncResponder) {
     let _ = std::thread::Builder::new()
         .name("gs26-proto-req".to_string())

@@ -14,6 +14,7 @@ pub(crate) mod gps_android;
 mod gps_webview;
 mod latency_chart;
 pub mod layout;
+mod layout_settings_tab;
 mod network_topology_tab;
 mod notifications_tab;
 pub mod types;
@@ -46,6 +47,7 @@ use dioxus::prelude::*;
 use dioxus_signals::Signal;
 use errors_tab::ErrorsTab;
 use layout::LayoutConfig;
+use layout_settings_tab::SettingsPage;
 use map_tab::MapTab;
 use network_topology_tab::NetworkTopologyTab;
 use notifications_tab::NotificationsTab;
@@ -58,8 +60,8 @@ use warnings_tab::WarningsTab;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, Ordering}, Arc,
+    Mutex,
 };
 
 use once_cell::sync::Lazy;
@@ -76,6 +78,9 @@ static RESEED_LIVE_BUFFER: Lazy<Mutex<Vec<TelemetryRow>>> = Lazy::new(|| Mutex::
 static DASHBOARD_HAS_CONNECTED: AtomicBool = AtomicBool::new(false);
 static FRONTEND_NETWORK_METRICS_STATE: Lazy<Mutex<FrontendNetworkMetrics>> =
     Lazy::new(|| Mutex::new(FrontendNetworkMetrics::default()));
+static TRANSLATION_MISS_QUEUE: Lazy<Mutex<HashSet<String>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+static TRANSLATION_REQUEST_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
 // Dashboard lifetime: STATIC + ALWAYS PRESENT (never Option)
@@ -93,12 +98,14 @@ struct DashboardLife {
 }
 
 impl DashboardLife {
+    /// Creates a dashboard lifetime marker that is already considered torn down.
     fn _new_dead() -> Self {
         Self {
             alive: Arc::new(AtomicBool::new(false)),
             r#gen: 0,
         }
     }
+    /// Creates a dashboard lifetime marker for a freshly mounted dashboard.
     fn new_alive() -> Self {
         Self {
             alive: Arc::new(AtomicBool::new(true)),
@@ -110,11 +117,13 @@ impl DashboardLife {
 static DASHBOARD_LIFE: GlobalSignal<DashboardLife> = Signal::global(DashboardLife::new_alive);
 
 #[inline]
+/// Returns the current shared dashboard-alive flag.
 fn dashboard_alive() -> Arc<AtomicBool> {
     DASHBOARD_LIFE.read().alive.clone()
 }
 
 #[inline]
+/// Replaces the dashboard lifetime flag and bumps the mount generation.
 fn _set_dashboard_alive(alive: bool) {
     let alive = Arc::new(AtomicBool::new(alive));
     *DASHBOARD_LIFE.write() = DashboardLife {
@@ -124,6 +133,7 @@ fn _set_dashboard_alive(alive: bool) {
 }
 
 #[inline]
+/// Returns the current dashboard mount generation.
 fn dashboard_gen() -> u64 {
     DASHBOARD_LIFE.read().r#gen
 }
@@ -134,6 +144,7 @@ fn dashboard_gen() -> u64 {
 //  - native: JSON file in app data dir
 // ----------------------------
 mod persist {
+    /// Reads a persisted string value from browser storage or the native JSON store.
     pub fn get_string(key: &str) -> Option<String> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -149,6 +160,7 @@ mod persist {
         }
     }
 
+    /// Persists a string value across app launches.
     pub fn set_string(key: &str, value: &str) {
         #[cfg(target_arch = "wasm32")]
         {
@@ -166,6 +178,7 @@ mod persist {
         }
     }
 
+    /// Removes a persisted key when the current platform supports it.
     pub fn _remove(key: &str) {
         #[cfg(target_arch = "wasm32")]
         {
@@ -183,6 +196,7 @@ mod persist {
         }
     }
 
+    /// Reads a stored string value or falls back to the provided default.
     pub fn get_or(key: &str, default: &str) -> String {
         get_string(key).unwrap_or_else(|| default.to_string())
     }
@@ -192,6 +206,7 @@ mod persist {
         use std::collections::HashMap;
         use std::io;
 
+        /// Resolves the default native storage root when no platform-specific path is available.
         fn fallback_storage_base_dir() -> std::path::PathBuf {
             dirs::data_local_dir()
                 .or_else(dirs::data_dir)
@@ -199,9 +214,10 @@ mod persist {
         }
 
         #[cfg(target_os = "android")]
+        /// Resolves the Android app-private storage root through JNI.
         fn android_storage_base_dir() -> Option<std::path::PathBuf> {
             use jni::objects::{JObject, JString};
-            use jni::{JavaVM, jni_sig, jni_str};
+            use jni::{jni_sig, jni_str, JavaVM};
             use ndk_context::android_context;
 
             let ctx = android_context();
@@ -233,6 +249,7 @@ mod persist {
             .ok()
         }
 
+        /// Picks the best native storage root for the JSON persistence file.
         fn storage_base_dir() -> std::path::PathBuf {
             #[cfg(target_os = "android")]
             {
@@ -244,6 +261,7 @@ mod persist {
             fallback_storage_base_dir()
         }
 
+        /// Returns the full path to the native JSON persistence file.
         fn storage_path() -> std::path::PathBuf {
             let mut base = storage_base_dir();
             base.push("gs26");
@@ -251,6 +269,7 @@ mod persist {
             base
         }
 
+        /// Loads the native persistence map from disk.
         fn load_map() -> Result<HashMap<String, String>, io::Error> {
             let path = storage_path();
             let bytes = match std::fs::read(&path) {
@@ -263,6 +282,7 @@ mod persist {
             Ok(map)
         }
 
+        /// Saves the native persistence map back to disk.
         fn save_map(map: &HashMap<String, String>) -> Result<(), io::Error> {
             let path = storage_path();
             if let Some(parent) = path.parent() {
@@ -273,11 +293,13 @@ mod persist {
             Ok(())
         }
 
+        /// Reads a string key from the native persistence file.
         pub fn get_string(key: &str) -> Result<Option<String>, io::Error> {
             let map = load_map()?;
             Ok(map.get(key).cloned())
         }
 
+        /// Writes a string key into the native persistence file.
         pub fn set_string(key: &str, value: &str) -> Result<(), io::Error> {
             let mut map = load_map()?;
             map.insert(key.to_string(), value.to_string());
@@ -285,6 +307,7 @@ mod persist {
             Ok(())
         }
 
+        /// Removes a key from the native persistence file.
         pub fn _remove(key: &str) -> Result<(), io::Error> {
             let mut map = load_map()?;
             map.remove(key);
@@ -345,6 +368,7 @@ pub struct ActionPolicyMsg {
 }
 
 impl ActionPolicyMsg {
+    /// Returns the startup action policy before the backend publishes a real one.
     fn default_locked() -> Self {
         Self {
             key_enabled: false,
@@ -354,6 +378,7 @@ impl ActionPolicyMsg {
     }
 }
 
+/// Provides the serde default for software action buttons.
 fn default_software_buttons_enabled() -> bool {
     true
 }
@@ -371,6 +396,7 @@ pub struct PersistentNotification {
     pub action_cmd: Option<String>,
 }
 
+/// Provides the serde default for notification persistence.
 fn default_notification_persistent() -> bool {
     true
 }
@@ -386,6 +412,24 @@ pub struct NetworkTimeMsg {
     pub timestamp_ms: i64,
 }
 
+#[derive(Deserialize, Debug, Clone, Default)]
+struct TranslationCatalogResponse {
+    lang: String,
+    translations: HashMap<String, String>,
+}
+
+#[derive(Serialize, Debug, Clone, Default)]
+struct TranslationRequest {
+    target_lang: String,
+    texts: Vec<String>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct TranslationResponse {
+    lang: String,
+    translations: HashMap<String, String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct NetworkTimeSync {
     network_ms: i64,
@@ -393,11 +437,13 @@ struct NetworkTimeSync {
 }
 
 #[cfg(target_arch = "wasm32")]
+/// Returns a monotonic-ish timestamp source for rate calculations in the browser.
 fn monotonic_now_ms() -> f64 {
     js_sys::Date::now()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Returns a monotonic timestamp source for rate calculations on native builds.
 fn monotonic_now_ms() -> f64 {
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -407,6 +453,7 @@ fn monotonic_now_ms() -> f64 {
 }
 
 #[inline]
+/// Projects the last synced network time forward using monotonic elapsed time.
 fn compensated_network_time_ms(sync: NetworkTimeSync) -> i64 {
     let elapsed_ms = (monotonic_now_ms() - sync.received_mono_ms)
         .max(0.0)
@@ -440,6 +487,7 @@ pub(crate) fn format_timestamp_ms_clock(ms_epoch: i64) -> String {
     format!("{}:{cs:02} {}", dt.format("%I:%M:%S"), dt.format("%p"))
 }
 
+/// Formats the network-synchronized wall clock for dashboard display.
 fn format_network_time(ms_epoch: i64) -> String {
     format_timestamp_ms_clock(ms_epoch)
 }
@@ -536,6 +584,7 @@ impl Default for FrontendNetworkMetrics {
     }
 }
 
+/// Resets the frontend-side WebSocket and HTTP metrics to a clean state.
 fn reset_frontend_network_metrics_state() {
     if let Ok(mut metrics) = FRONTEND_NETWORK_METRICS_STATE.lock() {
         *metrics = FrontendNetworkMetrics {
@@ -545,6 +594,7 @@ fn reset_frontend_network_metrics_state() {
     }
 }
 
+/// Returns a snapshot of the frontend network metrics without exposing the mutex guard.
 fn frontend_network_metrics_snapshot() -> FrontendNetworkMetrics {
     FRONTEND_NETWORK_METRICS_STATE
         .lock()
@@ -552,6 +602,7 @@ fn frontend_network_metrics_snapshot() -> FrontendNetworkMetrics {
         .unwrap_or_default()
 }
 
+/// Redacts authentication tokens from a WebSocket URL before it is shown in the UI.
 fn redact_ws_url_for_display(ws_url: &str) -> String {
     if let Some((prefix, query)) = ws_url.split_once('?') {
         let redacted_query = query
@@ -574,6 +625,7 @@ fn redact_ws_url_for_display(ws_url: &str) -> String {
     }
 }
 
+/// Records a WebSocket connection or disconnection transition for the dashboard diagnostics.
 fn note_ws_connection_state(connected: bool, ws_url: String, reason: Option<String>, epoch: u64) {
     if connected {
         DASHBOARD_HAS_CONNECTED.store(true, Ordering::Relaxed);
@@ -595,17 +647,7 @@ fn note_ws_connection_state(connected: bool, ws_url: String, reason: Option<Stri
     }
 }
 
-fn note_http_rtt(rtt_ms: f64) {
-    if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
-        next.http_rtt_ms = Some(rtt_ms);
-        next.http_rtt_ema_ms = Some(
-            next.http_rtt_ema_ms
-                .map(|prev| prev * 0.8 + rtt_ms * 0.2)
-                .unwrap_or(rtt_ms),
-        );
-    }
-}
-
+/// Tracks incoming WebSocket message volume and updates rate calculations.
 fn note_incoming_ws_message(raw_bytes: usize) {
     if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
         let now_mono = monotonic_now_ms();
@@ -635,6 +677,7 @@ fn note_incoming_ws_message(raw_bytes: usize) {
     }
 }
 
+/// Tracks telemetry row throughput separately from raw WebSocket message volume.
 fn note_incoming_telemetry_rows(telemetry_rows: usize, telemetry_batch_count: usize) {
     if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
         next.telemetry_rows_total = next
@@ -649,6 +692,7 @@ fn note_incoming_telemetry_rows(telemetry_rows: usize, telemetry_batch_count: us
     }
 }
 
+/// Returns the current wall-clock time in milliseconds since the Unix epoch.
 fn current_wallclock_ms() -> i64 {
     #[cfg(target_arch = "wasm32")]
     {
@@ -689,6 +733,7 @@ struct LatestTelemetryKey {
 }
 
 impl LatestTelemetryKey {
+    /// Builds the cache key used for latest-row tracking.
     fn new(data_type: &str, sender_id: &str) -> Self {
         Self {
             data_type: data_type.to_string(),
@@ -703,20 +748,24 @@ struct UiTelemetryStore {
 }
 
 impl UiTelemetryStore {
+    /// Clears all compacted UI telemetry rows.
     fn clear(&mut self) {
         self.rows.clear();
     }
 
+    /// Replaces the compacted UI store with a fresh telemetry snapshot.
     fn replace_from_rows(&mut self, rows: &[TelemetryRow]) {
         self.rows.clear();
         self.apply_rows(rows.iter().cloned());
     }
 
+    /// Inserts rows into the compacted UI store, keeping only the newest row per bucket.
     fn apply_rows<I>(&mut self, rows: I)
     where
         I: IntoIterator<Item = TelemetryRow>,
     {
         for row in rows {
+            // The UI only needs one representative row per bucket/sender/type tuple.
             let key = UiRowKey {
                 bucket: row.timestamp_ms.div_euclid(UI_ROW_BUCKET_MS),
                 data_type: row.data_type.clone(),
@@ -728,6 +777,7 @@ impl UiTelemetryStore {
         self.prune_history();
     }
 
+    /// Drops buckets that are older than the retained history window.
     fn prune_history(&mut self) {
         let Some((&newest_bucket, _)) = self.rows.last_key_value().map(|(k, v)| (&k.bucket, v))
         else {
@@ -738,6 +788,7 @@ impl UiTelemetryStore {
         self.rows.retain(|key, _| key.bucket >= min_bucket);
     }
 
+    /// Returns the compacted UI store as a sorted vector.
     fn snapshot(&self) -> Vec<TelemetryRow> {
         self.rows.values().cloned().collect()
     }
@@ -750,6 +801,7 @@ static LATEST_TELEMETRY: Lazy<Mutex<HashMap<LatestTelemetryKey, TelemetryRow>>> 
 static LATEST_TELEMETRY_BY_TYPE: Lazy<Mutex<HashMap<String, TelemetryRow>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Sorts telemetry rows into a stable UI presentation order.
 fn sort_rows(rows: &mut [TelemetryRow]) {
     rows.sort_by(|a, b| {
         a.timestamp_ms
@@ -759,6 +811,7 @@ fn sort_rows(rows: &mut [TelemetryRow]) {
     });
 }
 
+/// Trims a telemetry vector down to the retained history window.
 fn prune_history(rows: &mut Vec<TelemetryRow>) {
     if let Some(last) = rows.last() {
         let cutoff = last.timestamp_ms - HISTORY_MS;
@@ -769,6 +822,7 @@ fn prune_history(rows: &mut Vec<TelemetryRow>) {
     }
 }
 
+/// Compacts raw telemetry rows down to the newest row per UI bucket.
 fn compact_rows_for_ui(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
     let mut by_key: HashMap<(String, String, i64), TelemetryRow> = HashMap::new();
     for row in rows {
@@ -782,6 +836,7 @@ fn compact_rows_for_ui(rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
     out
 }
 
+/// Rebuilds the latest-row indexes from a full telemetry snapshot.
 fn reset_latest_telemetry(rows: &[TelemetryRow]) {
     if let Ok(mut latest) = LATEST_TELEMETRY.lock()
         && let Ok(mut latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock()
@@ -794,6 +849,7 @@ fn reset_latest_telemetry(rows: &[TelemetryRow]) {
     }
 }
 
+/// Inserts a single row into the latest-row indexes.
 fn update_latest_telemetry(row: &TelemetryRow) {
     if let Ok(mut latest) = LATEST_TELEMETRY.lock()
         && let Ok(mut latest_by_type) = LATEST_TELEMETRY_BY_TYPE.lock()
@@ -802,6 +858,7 @@ fn update_latest_telemetry(row: &TelemetryRow) {
     }
 }
 
+/// Applies latest-row replacement rules while both latest-row maps are already locked.
 fn update_latest_telemetry_locked(
     latest: &mut HashMap<LatestTelemetryKey, TelemetryRow>,
     latest_by_type: &mut HashMap<String, TelemetryRow>,
@@ -823,6 +880,7 @@ fn update_latest_telemetry_locked(
     }
 }
 
+/// Returns the latest telemetry row for a given data type and optional sender.
 pub(crate) fn latest_telemetry_row(
     data_type: &str,
     sender_id: Option<&str>,
@@ -847,6 +905,7 @@ pub(crate) fn latest_telemetry_row(
     }
 }
 
+/// Returns a single channel from the latest telemetry row for the given key.
 pub(crate) fn latest_telemetry_value(
     data_type: &str,
     sender_id: Option<&str>,
@@ -856,6 +915,7 @@ pub(crate) fn latest_telemetry_value(
         .and_then(|row| row.values.get(index).copied().flatten())
 }
 
+/// Clears all telemetry runtime buffers used by the dashboard.
 fn clear_ui_telemetry_store() {
     if let Ok(mut store) = UI_TELEMETRY_STORE.lock() {
         store.clear();
@@ -870,6 +930,7 @@ fn clear_ui_telemetry_store() {
     *epoch = epoch.wrapping_add(1);
 }
 
+/// Returns the compacted UI telemetry store as a snapshot vector.
 pub(crate) fn ui_telemetry_rows_snapshot() -> Vec<TelemetryRow> {
     if let Ok(store) = UI_TELEMETRY_STORE.lock() {
         store.snapshot()
@@ -884,6 +945,9 @@ const ERROR_ACK_STORAGE_KEY: &str = "gs_last_error_ack_ts";
 const MAIN_TAB_STORAGE_KEY: &str = "gs_main_tab";
 const DATA_TAB_STORAGE_KEY: &str = "gs_data_tab";
 const BASE_URL_STORAGE_KEY: &str = "gs_base_url";
+const MAP_DISTANCE_UNITS_STORAGE_KEY: &str = "gs_map_distance_units";
+const THEME_PRESET_STORAGE_KEY: &str = "gs_theme_preset";
+const LANGUAGE_STORAGE_KEY: &str = "gs_language";
 const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v8";
 const NOTIFICATION_DISMISSED_STORAGE_KEY: &str = "gs_notification_dismissed_ids_v1";
 const _SKIP_TLS_VERIFY_KEY_PREFIX: &str = "gs_skip_tls_verify_";
@@ -894,6 +958,8 @@ const MAX_NOTIFICATION_HISTORY: usize = 500;
 // When this number changes, we tear down and rebuild the websocket connection.
 static WS_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 static TELEMETRY_RENDER_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
+static PREFERRED_LANGUAGE: GlobalSignal<String> = Signal::global(|| "en".to_string());
+static TRANSLATION_CATALOG: GlobalSignal<HashMap<String, String>> = Signal::global(HashMap::new);
 
 #[cfg(target_arch = "wasm32")]
 static WS_RAW: GlobalSignal<Option<web_sys::WebSocket>> = Signal::global(|| None);
@@ -905,6 +971,7 @@ static UI_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 // Force re-seed of graphs/history from backend.
 static SEED_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 
+/// Normalizes a stored base URL down to `scheme://host[:port]`.
 fn normalize_base_url(mut url: String) -> String {
     if let Some(idx) = url.find('#') {
         url.truncate(idx);
@@ -919,6 +986,7 @@ fn normalize_base_url(mut url: String) -> String {
 }
 
 #[cfg(target_arch = "wasm32")]
+/// Builds an absolute HTTP path for the web build using the active backend base URL.
 pub fn abs_http(path: &str) -> String {
     let base = UrlConfig::base_http();
     let path = if path.starts_with('/') {
@@ -934,6 +1002,7 @@ pub fn abs_http(path: &str) -> String {
     }
 }
 
+/// Returns the tile URL template appropriate for the current platform.
 pub fn map_tiles_url() -> String {
     #[cfg(target_os = "windows")]
     {
@@ -951,10 +1020,21 @@ pub fn map_tiles_url() -> String {
         "https://gs26.local/tiles/{z}/{x}/{y}.jpg".to_string()
     }
 
+    #[cfg(target_os = "ios")]
+    {
+        // iOS does not use the desktop custom-protocol registration path, so
+        // `gs26://...` tile URLs never reach our proxy handler there.
+        format!(
+            "{}/tiles/{{z}}/{{x}}/{{y}}.jpg",
+            UrlConfig::base_http().trim_end_matches('/')
+        )
+    }
+
     #[cfg(all(
         not(target_arch = "wasm32"),
         not(target_os = "windows"),
-        not(target_os = "android")
+        not(target_os = "android"),
+        not(target_os = "ios")
     ))]
     {
         // Native WebViews can block plain-http tile fetches; always proxy through
@@ -969,6 +1049,7 @@ pub fn map_tiles_url() -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Reads the persisted backend base URL for native blocking I/O paths.
 pub(crate) fn persisted_base_http_for_native_io() -> String {
     persist::get_string(BASE_URL_STORAGE_KEY)
         .map(normalize_base_url)
@@ -977,12 +1058,14 @@ pub(crate) fn persisted_base_http_for_native_io() -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Reads the persisted TLS-skip flag for the supplied native base URL.
 pub(crate) fn persisted_skip_tls_for_base_for_native_io(base: &str) -> bool {
     persist::get_string(&_tls_skip_key(base))
         .map(|v| v == "true")
         .unwrap_or(false)
 }
 
+/// Forces all WebSocket-backed tasks to tear down and reconnect on the next render tick.
 fn bump_ws_epoch() {
     *WS_SENDER.write() = None;
 
@@ -996,10 +1079,204 @@ fn bump_ws_epoch() {
     *WS_EPOCH.write() += 1;
 }
 
+/// Requests a fresh telemetry reseed from the backend.
 fn bump_seed_epoch() {
     *SEED_EPOCH.write() += 1;
 }
+
+pub(crate) fn localized_copy(lang: &str, en: &str, es: &str, fr: &str) -> String {
+    match lang {
+        "es" => es.to_string(),
+        "fr" => fr.to_string(),
+        _ => en.to_string(),
+    }
+}
+
+pub(crate) fn current_language() -> String {
+    PREFERRED_LANGUAGE.read().clone()
+}
+
+pub(crate) fn set_preferred_language(code: &str) {
+    let value = code.to_string();
+    *PREFERRED_LANGUAGE.write() = value.clone();
+    persist::set_string(LANGUAGE_STORAGE_KEY, &value);
+}
+
+pub(crate) fn translate_text(input: &str) -> String {
+    let text = input.trim();
+    if text.is_empty() {
+        return input.to_string();
+    }
+    if let Some(value) = TRANSLATION_CATALOG.read().get(text) {
+        return value.clone();
+    }
+    if let Ok(mut pending) = TRANSLATION_MISS_QUEUE.lock() {
+        pending.insert(text.to_string());
+    }
+    input.to_string()
+}
+
+fn drain_translation_misses(limit: usize, catalog: &HashMap<String, String>) -> Vec<String> {
+    let Ok(mut pending) = TRANSLATION_MISS_QUEUE.lock() else {
+        return Vec::new();
+    };
+    let mut batch = Vec::new();
+    let keys: Vec<String> = pending.iter().cloned().collect();
+    for key in keys {
+        if batch.len() >= limit {
+            break;
+        }
+        if catalog.contains_key(&key) {
+            pending.remove(&key);
+            continue;
+        }
+        pending.remove(&key);
+        batch.push(key);
+    }
+    batch
+}
+
+fn merge_translation_map(items: HashMap<String, String>) {
+    if items.is_empty() {
+        return;
+    }
+    let mut next = TRANSLATION_CATALOG.read().clone();
+    for (key, value) in items {
+        if !key.trim().is_empty() && !value.trim().is_empty() {
+            next.insert(key, value);
+        }
+    }
+    *TRANSLATION_CATALOG.write() = next;
+}
+
+fn localized_theme(base: &layout::ThemeConfig, preset: &str) -> layout::ThemeConfig {
+    if preset == "backend" || preset == "layout" {
+        return base.clone();
+    }
+
+    let mut out = if preset == "default" {
+        layout::ThemeConfig::default()
+    } else {
+        base.clone()
+    };
+    match preset {
+        "sunset" => {
+            out.app_background = "#1a0f0a".to_string();
+            out.panel_background = "#2a1711".to_string();
+            out.panel_background_alt = "#341d16".to_string();
+            out.overlay_background = "#1a0f0aee".to_string();
+            out.border = "#7c2d12".to_string();
+            out.border_strong = "#9a3412".to_string();
+            out.border_soft = "#4a1d14".to_string();
+            out.text_primary = "#ffedd5".to_string();
+            out.text_secondary = "#fed7aa".to_string();
+            out.text_muted = "#fdba74".to_string();
+            out.text_soft = "#f59e0b".to_string();
+            out.button_background = "#3b1f17".to_string();
+            out.button_border = "#c2410c".to_string();
+            out.button_text = "#ffedd5".to_string();
+            out.tab_shell_background = "#2a1711ee".to_string();
+            out.tab_shell_border = "#c2410c".to_string();
+            out.info_accent = "#fb923c".to_string();
+            out.info_background = "#431407".to_string();
+            out.info_text = "#fdba74".to_string();
+            out.success_text = "#facc15".to_string();
+            out.warning_background = "#451a03".to_string();
+            out.warning_border = "#f59e0b".to_string();
+            out.warning_text = "#fde68a".to_string();
+            out.error_background = "#4c0519".to_string();
+            out.error_border = "#fb7185".to_string();
+            out.error_text = "#fecdd3".to_string();
+        }
+        "forest" => {
+            out.app_background = "#071510".to_string();
+            out.panel_background = "#0d1f18".to_string();
+            out.panel_background_alt = "#123126".to_string();
+            out.overlay_background = "#071510ee".to_string();
+            out.border = "#1f4d3a".to_string();
+            out.border_strong = "#2f6b51".to_string();
+            out.border_soft = "#163327".to_string();
+            out.text_primary = "#e7f7ef".to_string();
+            out.text_secondary = "#bde7d0".to_string();
+            out.text_muted = "#86c9a8".to_string();
+            out.text_soft = "#6fbf91".to_string();
+            out.button_background = "#11261d".to_string();
+            out.button_border = "#2f6b51".to_string();
+            out.button_text = "#e7f7ef".to_string();
+            out.tab_shell_background = "#0d1f18ee".to_string();
+            out.tab_shell_border = "#2f6b51".to_string();
+            out.info_accent = "#34d399".to_string();
+            out.info_background = "#0c2b20".to_string();
+            out.info_text = "#a7f3d0".to_string();
+            out.success_text = "#4ade80".to_string();
+            out.warning_background = "#3f3411".to_string();
+            out.warning_border = "#facc15".to_string();
+            out.warning_text = "#fde68a".to_string();
+            out.error_background = "#3b0d18".to_string();
+            out.error_border = "#fb7185".to_string();
+            out.error_text = "#fecdd3".to_string();
+        }
+        "high_contrast" => {
+            out.app_background = "#000000".to_string();
+            out.panel_background = "#0a0a0a".to_string();
+            out.panel_background_alt = "#141414".to_string();
+            out.overlay_background = "#000000f2".to_string();
+            out.border = "#ffffff".to_string();
+            out.border_strong = "#ffffff".to_string();
+            out.border_soft = "#6b7280".to_string();
+            out.text_primary = "#ffffff".to_string();
+            out.text_secondary = "#f3f4f6".to_string();
+            out.text_muted = "#d1d5db".to_string();
+            out.text_soft = "#e5e7eb".to_string();
+            out.button_background = "#111111".to_string();
+            out.button_border = "#ffffff".to_string();
+            out.button_text = "#ffffff".to_string();
+            out.tab_shell_background = "#050505f2".to_string();
+            out.tab_shell_border = "#ffffff".to_string();
+            out.info_accent = "#60a5fa".to_string();
+            out.info_background = "#0f172a".to_string();
+            out.info_text = "#dbeafe".to_string();
+            out.success_text = "#4ade80".to_string();
+            out.warning_background = "#2b1800".to_string();
+            out.warning_border = "#facc15".to_string();
+            out.warning_text = "#fef08a".to_string();
+            out.error_background = "#2b0a0a".to_string();
+            out.error_border = "#f87171".to_string();
+            out.error_text = "#fee2e2".to_string();
+        }
+        _ => {}
+    }
+    out
+}
+
+#[component]
+fn NetworkTimeBadge(network_time: Signal<Option<NetworkTimeSync>>, language: String) -> Element {
+    let Some(ts) = network_time
+        .read()
+        .as_ref()
+        .copied()
+        .map(compensated_network_time_ms)
+        .map(format_network_time)
+    else {
+        return rsx! { div {} };
+    };
+
+    let label = localized_copy(&language, "Network Time", "Hora de red", "Heure réseau");
+    rsx! {
+        div { style: "display:flex; align-items:center; flex:0 0 auto; min-width:0;",
+            span { style: "color:#cbd5e1; display:inline-flex; align-items:baseline; white-space:nowrap;",
+                "({label}:"
+                span {
+                    style: "display:inline-flex; align-items:baseline; width:16ch; padding-left:0.4ch; white-space:nowrap; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;",
+                    span { "{ts}" }
+                    span { ")" }
+                }
+            }
+        }
+    }
+}
 // tab <-> string
+/// Converts a dashboard tab enum into its persisted string id.
 fn _main_tab_to_str(tab: MainTab) -> &'static str {
     match tab {
         MainTab::State => "state",
@@ -1016,39 +1293,67 @@ fn _main_tab_to_str(tab: MainTab) -> &'static str {
     }
 }
 
-fn _default_main_tab_label(tab: MainTab) -> &'static str {
+/// Returns the default label for a dashboard tab when the layout config does not override it.
+fn _default_main_tab_label(tab: MainTab) -> String {
+    let lang = current_language();
     match tab {
-        MainTab::State => "Flight",
-        MainTab::ConnectionStatus => "Connection Status",
-        MainTab::Detailed => "Detailed Info",
-        MainTab::NetworkTopology => "Network Topology",
-        MainTab::Map => "Map",
-        MainTab::Actions => "Actions",
-        MainTab::Calibration => "Calibration",
-        MainTab::Notifications => "Notifications",
-        MainTab::Warnings => "Warnings",
-        MainTab::Errors => "Errors",
-        MainTab::Data => "Data",
+        MainTab::State => localized_copy(&lang, "Flight", "Vuelo", "Vol"),
+        MainTab::ConnectionStatus => localized_copy(
+            &lang,
+            "Connection Status",
+            "Estado de Conexion",
+            "Etat Connexion",
+        ),
+        MainTab::Detailed => {
+            localized_copy(&lang, "Detailed Info", "Info Detallada", "Infos Detaillees")
+        }
+        MainTab::NetworkTopology => localized_copy(
+            &lang,
+            "Network Topology",
+            "Topologia Red",
+            "Topologie Reseau",
+        ),
+        MainTab::Map => localized_copy(&lang, "Map", "Mapa", "Carte"),
+        MainTab::Actions => localized_copy(&lang, "Actions", "Acciones", "Actions"),
+        MainTab::Calibration => localized_copy(&lang, "Calibration", "Calibracion", "Calibration"),
+        MainTab::Notifications => {
+            localized_copy(&lang, "Notifications", "Notificaciones", "Notifications")
+        }
+        MainTab::Warnings => localized_copy(&lang, "Warnings", "Avisos", "Alertes"),
+        MainTab::Errors => localized_copy(&lang, "Errors", "Errores", "Erreurs"),
+        MainTab::Data => localized_copy(&lang, "Data", "Datos", "Donnees"),
     }
 }
 
+/// Resolves the visible label for a dashboard tab from the loaded layout config.
 fn _main_tab_label(layout: &LayoutConfig, tab: MainTab) -> String {
     layout
         .branding
         .tab_labels
         .get(_main_tab_to_str(tab))
-        .cloned()
-        .unwrap_or_else(|| _default_main_tab_label(tab).to_string())
+        .map(|label| translate_text(label))
+        .unwrap_or_else(|| _default_main_tab_label(tab))
 }
 
+/// Resolves the title shown at the top of the dashboard.
 fn _dashboard_title(layout: &LayoutConfig) -> String {
     layout
         .branding
         .dashboard_title
         .clone()
         .or_else(|| layout.branding.app_name.clone())
-        .unwrap_or_else(|| "Telemetry Dashboard".to_string())
+        .map(|title| translate_text(&title))
+        .unwrap_or_else(|| {
+            let lang = current_language();
+            localized_copy(
+                &lang,
+                "Telemetry Dashboard",
+                "Panel de Telemetria",
+                "Tableau Telemetrie",
+            )
+        })
 }
+/// Converts a persisted tab id back into the corresponding enum.
 fn _main_tab_from_str(s: &str) -> MainTab {
     match s {
         "state" => MainTab::State,
@@ -1066,6 +1371,7 @@ fn _main_tab_from_str(s: &str) -> MainTab {
     }
 }
 
+/// Returns whether a tab is enabled by the loaded layout config.
 fn _layout_main_tab_enabled(layout: &LayoutConfig, tab: MainTab) -> bool {
     let listed = layout
         .main_tabs
@@ -1074,6 +1380,7 @@ fn _layout_main_tab_enabled(layout: &LayoutConfig, tab: MainTab) -> bool {
     listed && (tab != MainTab::NetworkTopology || layout.network_tab.enabled)
 }
 
+/// Returns whether the actions tab has at least one command the current session may send.
 fn _actions_tab_has_visible_actions(layout: &LayoutConfig, abort_only_mode: bool) -> bool {
     let _ = abort_only_mode;
     layout
@@ -1083,6 +1390,7 @@ fn _actions_tab_has_visible_actions(layout: &LayoutConfig, abort_only_mode: bool
         .any(|action| auth::can_send_command(action.cmd.as_str()))
 }
 
+/// Computes the final visible tab list after applying layout and auth filtering.
 fn _configured_main_tabs(layout: &LayoutConfig, abort_only_mode: bool) -> Vec<MainTab> {
     let mut tabs = Vec::new();
     for id in &layout.main_tabs {
@@ -1105,18 +1413,21 @@ fn _configured_main_tabs(layout: &LayoutConfig, abort_only_mode: bool) -> Vec<Ma
 pub struct UrlConfig;
 
 impl UrlConfig {
+    /// Normalizes and persists the backend base URL selected by the operator.
     pub fn set_base_url_and_persist(url: String) {
         let clean = normalize_base_url(url);
         *BASE_URL.write() = clean.clone();
         persist::set_string(BASE_URL_STORAGE_KEY, &clean);
     }
 
+    /// Returns the stored backend base URL when one exists.
     pub fn _stored_base_url() -> Option<String> {
         persist::get_string(BASE_URL_STORAGE_KEY)
             .map(normalize_base_url)
             .filter(|s| !s.trim().is_empty())
     }
 
+    /// Returns the current HTTP base URL, including platform-specific defaults.
     pub fn base_http() -> String {
         // load from storage key if present
         let base = persist::get_string(BASE_URL_STORAGE_KEY)
@@ -1170,6 +1481,7 @@ impl UrlConfig {
         }
     }
 
+    /// Persists the TLS validation override for a specific backend base URL.
     pub fn _set_skip_tls_verify_for_base(base: &str, value: bool) {
         let clean = normalize_base_url(base.to_string());
         if clean.is_empty() {
@@ -1179,6 +1491,7 @@ impl UrlConfig {
         persist::set_string(&key, if value { "true" } else { "false" });
     }
 
+    /// Returns whether TLS validation is disabled for a specific backend base URL.
     pub fn _skip_tls_verify_for_base(base: &str) -> bool {
         let clean = normalize_base_url(base.to_string());
         if clean.is_empty() {
@@ -1190,17 +1503,20 @@ impl UrlConfig {
             .unwrap_or(false)
     }
 
+    /// Persists the TLS validation override for the currently selected backend base URL.
     pub fn _set_skip_tls_verify(value: bool) {
         let base = UrlConfig::base_http();
         UrlConfig::_set_skip_tls_verify_for_base(&base, value);
     }
 
+    /// Returns whether TLS validation is disabled for the currently selected backend base URL.
     pub fn _skip_tls_verify() -> bool {
         let base = UrlConfig::base_http();
         UrlConfig::_skip_tls_verify_for_base(&base)
     }
 }
 
+/// Builds the persistence key used for the per-backend TLS validation override.
 fn _tls_skip_key(base: &str) -> String {
     let mut cleaned = String::with_capacity(base.len());
     for ch in base.chars() {
@@ -1215,6 +1531,7 @@ fn _tls_skip_key(base: &str) -> String {
 
 static BASE_URL: GlobalSignal<String> = Signal::global(String::new);
 
+/// Restarts the WebSocket connection and triggers a fresh telemetry reseed.
 fn reconnect_and_reload_ui() {
     // Always restart websockets/tasks
     bump_ws_epoch();
@@ -1224,15 +1541,18 @@ fn reconnect_and_reload_ui() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Returns whether the dashboard has ever reached a live backend connection in this process.
 pub fn dashboard_has_prior_backend_connection() -> bool {
     DASHBOARD_HAS_CONNECTED.load(Ordering::Relaxed)
 }
 
+/// Restarts backend-backed frontend state after login or logout changes.
 pub fn reconnect_and_reseed_after_auth_change() {
     reconnect_and_reload_ui();
 }
 
 #[cfg(target_arch = "wasm32")]
+/// Returns whether the browser should keep dashboard background tasks running on this route.
 fn web_dashboard_runtime_allowed() -> bool {
     web_sys::window()
         .and_then(|window| window.location().pathname().ok())
@@ -1241,10 +1561,12 @@ fn web_dashboard_runtime_allowed() -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Native builds always allow the dashboard runtime.
 fn web_dashboard_runtime_allowed() -> bool {
     true
 }
 
+/// Clears runtime telemetry buffers before a reconnect or reseed.
 fn clear_telemetry_runtime_buffers() {
     if let Ok(mut q) = TELEMETRY_QUEUE.lock() {
         q.clear();
@@ -1263,6 +1585,7 @@ struct WsSender {
 }
 
 impl WsSender {
+    /// Sends a command over the current WebSocket transport.
     fn send_cmd(&self, cmd: &str) -> Result<(), String> {
         let msg = format!(r#"{{"cmd":"{}"}}"#, cmd);
 
@@ -1291,6 +1614,7 @@ static WS_SENDER: GlobalSignal<Option<WsSender>> = Signal::global(|| None::<WsSe
 // INNER component is keyed for native “reload UI” without tripping outer Drop.
 // ============================================================================
 #[component]
+/// Outer dashboard component that owns the real mount lifetime.
 pub fn TelemetryDashboard() -> Element {
     // Create once per real mount
     *DASHBOARD_LIFE.write() = DashboardLife::new_alive();
@@ -1307,6 +1631,7 @@ pub fn TelemetryDashboard() -> Element {
 
 // ---------- INNER dashboard (this is what we remount on native reload) ----------
 #[component]
+/// Inner dashboard component that owns the live UI state and background tasks.
 fn TelemetryDashboardInner() -> Element {
     // Always valid; becomes “real” once outer publishes it.
     let alive = dashboard_alive();
@@ -1319,6 +1644,20 @@ fn TelemetryDashboardInner() -> Element {
     let st_main_tab = use_signal(|| persist::get_or(MAIN_TAB_STORAGE_KEY, "state"));
     let st_data_tab = use_signal(|| persist::get_or(DATA_TAB_STORAGE_KEY, "GYRO_DATA"));
     let st_base_url = use_signal(|| persist::get_or(BASE_URL_STORAGE_KEY, ""));
+    let distance_units_metric = use_signal(|| {
+        persist::get_string(MAP_DISTANCE_UNITS_STORAGE_KEY)
+            .map(|v| v == "metric")
+            .unwrap_or(false)
+    });
+    let theme_preset = use_signal(|| {
+        let stored = persist::get_or(THEME_PRESET_STORAGE_KEY, "default");
+        if stored == "layout" {
+            "backend".to_string()
+        } else {
+            stored
+        }
+    });
+    let language_code = use_signal(|| persist::get_or(LANGUAGE_STORAGE_KEY, "en"));
 
     let layout_config = use_signal(|| None::<LayoutConfig>);
     let layout_loading = use_signal(|| true);
@@ -1347,25 +1686,9 @@ fn TelemetryDashboardInner() -> Element {
     let abort_only_mode = use_signal(|| false);
     let tabs_expanded = use_signal(|| false);
     let last_applied_disable_actions_default = use_signal(|| None::<bool>);
+    let show_settings_overlay = use_signal(|| false);
     #[cfg(not(target_arch = "wasm32"))]
     let show_version_overlay = use_signal(|| false);
-    let detailed_network_time_display = network_time
-        .read()
-        .as_ref()
-        .copied()
-        .map(compensated_network_time_ms)
-        .map(format_network_time);
-    let detailed_clock_delta_ms = network_time
-        .read()
-        .as_ref()
-        .copied()
-        .map(compensated_network_time_ms)
-        .map(|ms| current_wallclock_ms().saturating_sub(ms));
-    let detailed_network_time_age_ms = network_time.read().as_ref().map(|sync| {
-        (monotonic_now_ms() - sync.received_mono_ms)
-            .max(0.0)
-            .round() as i64
-    });
 
     let active_main_tab = use_signal(|| _main_tab_from_str(st_main_tab.read().as_str()));
 
@@ -1389,19 +1712,15 @@ fn TelemetryDashboardInner() -> Element {
     {
         let mut frontend_network_metrics = frontend_network_metrics;
         let alive = alive.clone();
+        let active_main_tab = active_main_tab;
         use_effect(move || {
             reset_frontend_network_metrics_state();
             let alive = alive.clone();
             let epoch = *WS_EPOCH.read();
             spawn(async move {
                 while alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
-                    frontend_network_metrics.set(frontend_network_metrics_snapshot());
-                    let started = monotonic_now_ms();
-                    if http_get_json::<NetworkTimeMsg>("/api/network_time")
-                        .await
-                        .is_ok()
-                    {
-                        note_http_rtt(monotonic_now_ms() - started);
+                    if *active_main_tab.read() == MainTab::Detailed {
+                        frontend_network_metrics.set(frontend_network_metrics_snapshot());
                     }
                     #[cfg(target_arch = "wasm32")]
                     gloo_timers::future::TimeoutFuture::new(1_000).await;
@@ -1454,8 +1773,6 @@ fn TelemetryDashboardInner() -> Element {
     let ack_error_count = use_signal(|| 0u64);
 
     let flash_on = use_signal(|| false);
-    let clock_tick = use_signal(|| 0u64);
-
     let rocket_gps = use_signal(|| None::<(f64, f64)>);
     let user_gps = use_signal(|| None::<(f64, f64)>);
 
@@ -1560,6 +1877,7 @@ fn TelemetryDashboardInner() -> Element {
                     return;
                 }
                 startup_seed_ready.set(true);
+                bump_seed_epoch();
             });
         });
     }
@@ -1596,6 +1914,109 @@ fn TelemetryDashboardInner() -> Element {
             let v = active_data_tab.read().clone();
             st_data_tab.set(v.clone());
             persist::set_string(DATA_TAB_STORAGE_KEY, &v);
+        });
+    }
+    {
+        let distance_units_metric = distance_units_metric;
+        use_effect(move || {
+            let value = if *distance_units_metric.read() {
+                "metric"
+            } else {
+                "imperial"
+            };
+            persist::set_string(MAP_DISTANCE_UNITS_STORAGE_KEY, value);
+        });
+    }
+    {
+        let theme_preset = theme_preset;
+        use_effect(move || {
+            let value = theme_preset.read().clone();
+            persist::set_string(THEME_PRESET_STORAGE_KEY, &value);
+        });
+    }
+    {
+        let language_code = language_code;
+        use_effect(move || {
+            let value = language_code.read().clone();
+            *PREFERRED_LANGUAGE.write() = value.clone();
+            persist::set_string(LANGUAGE_STORAGE_KEY, &value);
+        });
+    }
+    {
+        let language_code = language_code;
+        let alive = alive.clone();
+        use_effect(move || {
+            let lang = language_code.read().clone();
+            *TRANSLATION_CATALOG.write() = HashMap::new();
+            if let Ok(mut pending) = TRANSLATION_MISS_QUEUE.lock() {
+                pending.clear();
+            }
+            let alive = alive.clone();
+            spawn(async move {
+                if !alive.load(Ordering::Relaxed) {
+                    return;
+                }
+                let path = format!("/api/i18n/catalog?lang={lang}");
+                if let Ok(response) = http_get_json::<TranslationCatalogResponse>(&path).await
+                    && alive.load(Ordering::Relaxed)
+                    && response.lang == lang
+                {
+                    *TRANSLATION_CATALOG.write() = response.translations;
+                }
+            });
+        });
+    }
+    {
+        let alive = alive.clone();
+        use_effect(move || {
+            let alive = alive.clone();
+            let epoch = *WS_EPOCH.read();
+            spawn(async move {
+                while alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
+                    #[cfg(target_arch = "wasm32")]
+                    gloo_timers::future::TimeoutFuture::new(300).await;
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+                    if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
+                        break;
+                    }
+
+                    if TRANSLATION_REQUEST_ACTIVE
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    let lang = current_language();
+                    let catalog = TRANSLATION_CATALOG.read().clone();
+                    let batch = drain_translation_misses(64, &catalog);
+                    if batch.is_empty() {
+                        TRANSLATION_REQUEST_ACTIVE.store(false, Ordering::Release);
+                        continue;
+                    }
+
+                    let result = http_post_json::<TranslationRequest, TranslationResponse>(
+                        "/api/i18n/translate",
+                        &TranslationRequest {
+                            target_lang: lang.clone(),
+                            texts: batch,
+                        },
+                    )
+                    .await;
+
+                    if let Ok(response) = result
+                        && alive.load(Ordering::Relaxed)
+                        && response.lang == lang
+                    {
+                        merge_translation_map(response.translations);
+                    }
+
+                    TRANSLATION_REQUEST_ACTIVE.store(false, Ordering::Release);
+                }
+            });
         });
     }
     {
@@ -1700,9 +2121,8 @@ fn TelemetryDashboardInner() -> Element {
                 return;
             }
 
-            // Startup seed waits until layout has loaded and a short settle delay completes.
-            // Explicit reseeds (seed epoch > 0) bypass this gate.
-            if current_seed == 0 && !*startup_seed_ready.read() {
+            // Initial seed waits until layout has loaded and the startup delay completes.
+            if !*startup_seed_ready.read() {
                 return;
             }
             last_seed_epoch.set(Some(current_seed));
@@ -1795,33 +2215,6 @@ fn TelemetryDashboardInner() -> Element {
 
                     let next = !*flash_on.read();
                     flash_on.set(next);
-                }
-            });
-        });
-    }
-
-    // Rocket clock loop: keep header time moving even when no other UI state changes.
-    {
-        let mut clock_tick = clock_tick;
-        let alive = alive.clone();
-
-        use_effect(move || {
-            let alive = alive.clone();
-            let epoch = *WS_EPOCH.read();
-            spawn(async move {
-                while alive.load(Ordering::Relaxed) && *WS_EPOCH.read() == epoch {
-                    #[cfg(target_arch = "wasm32")]
-                    gloo_timers::future::TimeoutFuture::new(100).await;
-
-                    #[cfg(not(target_arch = "wasm32"))]
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                    if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
-                        break;
-                    }
-
-                    let next = clock_tick.read().saturating_add(1);
-                    clock_tick.set(next);
                 }
             });
         });
@@ -1966,11 +2359,13 @@ fn TelemetryDashboardInner() -> Element {
         });
     }
 
-    let theme = layout_config
+    let base_theme = layout_config
         .read()
         .as_ref()
         .map(|cfg| cfg.theme.clone())
         .unwrap_or_default();
+    let language_snapshot = language_code.read().clone();
+    let theme = localized_theme(&base_theme, theme_preset.read().as_str());
     let main_tab_accent = |tab_id: &str, fallback: &str| {
         theme
             .main_tab_accents
@@ -2009,6 +2404,8 @@ fn TelemetryDashboardInner() -> Element {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let alive_for_click = alive.clone();
+            let connect_button_label =
+                localized_copy(&current_language(), "CONNECT", "CONECTAR", "CONNECTER");
 
             rsx! {
 
@@ -2038,7 +2435,7 @@ fn TelemetryDashboardInner() -> Element {
 
                         let _ = nav.push(Route::Connect {});
                     },
-                    "CONNECT"
+                    "{connect_button_label}"
                 }
             }
         }
@@ -2067,10 +2464,67 @@ fn TelemetryDashboardInner() -> Element {
                     onclick: move |_| {
                         show_version_overlay.set(true);
                     },
-                    "VERSION"
+                    {localized_copy(&language_snapshot, "VERSION", "VERSION", "VERSION")}
                 }
             }
         }
+    };
+
+    let settings_button: Element = {
+        let mut show_settings_overlay = show_settings_overlay;
+        rsx! {
+            button {
+                style: format!("
+                    padding:0.45rem 0.85rem;
+                    border-radius:0.75rem;
+                    border:1px solid {};
+                    background:{};
+                    color:{};
+                    font-weight:800;
+                    cursor:pointer;
+                ", theme.button_border, theme.button_background, theme.button_text),
+                onclick: move |_| {
+                    show_settings_overlay.set(true);
+                },
+                {localized_copy(&language_snapshot, "SETTINGS", "AJUSTES", "PARAMETRES")}
+            }
+        }
+    };
+
+    let reload_button_label = localized_copy(&language_snapshot, "RELOAD", "RECARGAR", "RECHARGER");
+    let close_button_label = localized_copy(&language_snapshot, "Close", "Cerrar", "Fermer");
+    let _version_title = localized_copy(&language_snapshot, "UBSEDS GS", "UBSEDS GS", "UBSEDS GS");
+    let settings_title = localized_copy(&language_snapshot, "Settings", "Ajustes", "Parametres");
+    let sign_in_label = localized_copy(
+        &language_snapshot,
+        "SIGN IN",
+        "INICIAR SESION",
+        "SE CONNECTER",
+    );
+    let sign_out_prefix = localized_copy(
+        &language_snapshot,
+        "SIGN OUT",
+        "CERRAR SESION",
+        "SE DECONNECTER",
+    );
+    let auth_label = auth::current_session()
+        .and_then(|session| session.session.username)
+        .map(|username| format!("{sign_out_prefix} {username}"))
+        .unwrap_or(sign_in_label);
+    let disable_actions_label = if *abort_only_mode.read() {
+        localized_copy(
+            &language_snapshot,
+            "DISABLE ACTIONS ON",
+            "DESACTIVAR ACCIONES ON",
+            "DESACTIVER ACTIONS ON",
+        )
+    } else {
+        localized_copy(
+            &language_snapshot,
+            "DISABLE ACTIONS OFF",
+            "DESACTIVAR ACCIONES OFF",
+            "DESACTIVER ACTIONS OFF",
+        )
     };
 
     let auth_button: Element = {
@@ -2078,10 +2532,6 @@ fn TelemetryDashboardInner() -> Element {
         let nav = use_navigator();
         let base = UrlConfig::base_http();
         let skip_tls = UrlConfig::_skip_tls_verify();
-        let label = auth::current_session()
-            .and_then(|session| session.session.username)
-            .map(|username| format!("SIGN OUT {username}"))
-            .unwrap_or_else(|| "SIGN IN".to_string());
         rsx! {
             button {
                 style: format!("
@@ -2118,7 +2568,7 @@ fn TelemetryDashboardInner() -> Element {
                         let _ = nav.push(Route::Login {});
                     }
                 },
-                "{label}"
+                "{auth_label}"
             }
         }
     };
@@ -2191,7 +2641,7 @@ fn TelemetryDashboardInner() -> Element {
                 }
                 reconnect_and_reload_ui();
             },
-            "RELOAD"
+            "{reload_button_label}"
         }
     };
 
@@ -2207,13 +2657,6 @@ fn TelemetryDashboardInner() -> Element {
     let layout_snapshot = layout_config.read().clone();
     let layout_error_snapshot = layout_error.read().clone();
     let layout_loading_snapshot = *layout_loading.read();
-    let _clock_tick_snapshot = *clock_tick.read();
-    let network_time_snapshot = network_time
-        .read()
-        .as_ref()
-        .copied()
-        .map(compensated_network_time_ms)
-        .map(format_network_time);
     let version_overlay: Element = {
         #[cfg(target_arch = "wasm32")]
         {
@@ -2235,7 +2678,7 @@ fn TelemetryDashboardInner() -> Element {
                             padding:24px 16px;
                             overflow-y:auto;
                             overflow-x:hidden;
-                            background:rgba(2, 6, 23, 0.78);
+                            background:{theme.app_background};
                             backdrop-filter:blur(6px);
                             overscroll-behavior:contain;
                             -webkit-overflow-scrolling:touch;
@@ -2248,22 +2691,22 @@ fn TelemetryDashboardInner() -> Element {
                             style: "
                                 width:min(900px, 100%);
                                 padding:24px;
-                                border:1px solid #334155;
+                                border:1px solid {theme.border_strong};
                                 border-radius:16px;
-                                background:#0b1220;
+                                background:{theme.panel_background};
                                 box-shadow:0 12px 30px rgba(0,0,0,0.5);
                             ",
                             onclick: move |evt| evt.stop_propagation(),
                             div {
                                 style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap;",
-                                h1 { style: "margin:0; font-size:20px;", "UBSEDS GS" }
+                                h1 { style: "margin:0; font-size:20px;", "{_version_title}" }
                                 button {
                                     style: "
                                         padding:10px 14px;
                                         border-radius:12px;
-                                        border:1px solid #334155;
-                                        background:#111827;
-                                        color:#e5e7eb;
+                                        border:1px solid {theme.button_border};
+                                        background:{theme.button_background};
+                                        color:{theme.button_text};
                                         font-weight:700;
                                         cursor:pointer;
                                     ",
@@ -2271,7 +2714,7 @@ fn TelemetryDashboardInner() -> Element {
                                         let mut show_version_overlay = show_version_overlay;
                                         move |_| show_version_overlay.set(false)
                                     },
-                                    "Close"
+                                    "{close_button_label}"
                                 }
                             }
                             VersionTab {}
@@ -2281,6 +2724,73 @@ fn TelemetryDashboardInner() -> Element {
             } else {
                 rsx! { div {} }
             }
+        }
+    };
+    let settings_overlay: Element = {
+        if *show_settings_overlay.read() {
+            rsx! {
+                div {
+                    style: "
+                        position:fixed;
+                        inset:0;
+                        z-index:1000;
+                        display:flex;
+                        align-items:flex-start;
+                        justify-content:center;
+                        padding:24px 16px;
+                        overflow-y:auto;
+                        overflow-x:hidden;
+                        background:{theme.app_background};
+                        backdrop-filter:blur(6px);
+                        overscroll-behavior:contain;
+                        -webkit-overflow-scrolling:touch;
+                    ",
+                    onclick: {
+                        let mut show_settings_overlay = show_settings_overlay;
+                        move |_| show_settings_overlay.set(false)
+                    },
+                    div {
+                        style: "
+                            width:min(980px, 100%);
+                            padding:24px;
+                            border:1px solid {theme.border_strong};
+                            border-radius:16px;
+                            background:{theme.panel_background};
+                            box-shadow:0 12px 30px rgba(0,0,0,0.5);
+                        ",
+                        onclick: move |evt| evt.stop_propagation(),
+                        div {
+                            style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap;",
+                            h1 { style: "margin:0; font-size:20px;", "{settings_title}" }
+                            button {
+                                style: "
+                                    padding:10px 14px;
+                                    border-radius:12px;
+                                    border:1px solid {theme.button_border};
+                                    background:{theme.button_background};
+                                    color:{theme.button_text};
+                                    font-weight:700;
+                                    cursor:pointer;
+                                ",
+                                onclick: {
+                                    let mut show_settings_overlay = show_settings_overlay;
+                                    move |_| show_settings_overlay.set(false)
+                                },
+                                "{close_button_label}"
+                            }
+                        }
+                        SettingsPage {
+                            distance_units_metric: distance_units_metric,
+                            theme_preset: theme_preset,
+                            language_code: language_code,
+                            theme: theme.clone(),
+                            title: settings_title.clone(),
+                        }
+                    }
+                }
+            }
+        } else {
+            rsx! { div {} }
         }
     };
 
@@ -2369,9 +2879,9 @@ fn TelemetryDashboardInner() -> Element {
                         style: "
                     height:var(--gs26-app-height);
                     padding:24px;
-                    color:#e5e7eb;
+                    color:{theme.text_primary};
                     font-family:system-ui, -apple-system, BlinkMacSystemFont;
-                    background:#020617;
+                    background:{theme.app_background};
                     display:flex;
                     align-items:center;
                     justify-content:center;
@@ -2392,9 +2902,9 @@ fn TelemetryDashboardInner() -> Element {
                         style: "
                     height:var(--gs26-app-height);
                     padding:24px;
-                    color:#e5e7eb;
+                    color:{theme.text_primary};
                     font-family:system-ui, -apple-system, BlinkMacSystemFont;
-                    background:#020617;
+                    background:{theme.app_background};
                     display:flex;
                     align-items:center;
                     justify-content:center;
@@ -2419,9 +2929,9 @@ fn TelemetryDashboardInner() -> Element {
                     style: "
                 height:var(--gs26-app-height);
                 padding:24px;
-                color:#e5e7eb;
+                color:{theme.text_primary};
                 font-family:system-ui, -apple-system, BlinkMacSystemFont;
-                background:#020617;
+                background:{theme.app_background};
                 display:flex;
                 flex-direction:column;
                 border:{border_style};
@@ -2477,11 +2987,12 @@ fn TelemetryDashboardInner() -> Element {
                                         abort_only_mode.set(next);
                                     }
                                 },
-                                if *abort_only_mode.read() { "DISABLE ACTIONS ON" } else { "DISABLE ACTIONS OFF" }
+                                "{disable_actions_label}"
                             }
                             }
 
                             {reload_button}
+                            {settings_button}
                             {auth_button}
                             {version_button}
                             {connect_button}
@@ -2787,6 +3298,7 @@ fn TelemetryDashboardInner() -> Element {
                                         },
                     }
                 }
+            {settings_overlay}
             {version_overlay}
         }
     }
@@ -2806,30 +3318,30 @@ fn TelemetryDashboardInner() -> Element {
                         min-width:260px;
                     ",
                             div { style: "display:flex; align-items:center; flex-wrap:wrap; gap:0.5rem; min-width:0;",
-                                span { style: "color:{theme.text_soft};", "Status:" }
+                                span { style: "color:{theme.text_soft};", {localized_copy(&language_snapshot, "Status:", "Estado:", "Statut:")} }
 
                                 if !has_warnings && !has_errors {
-                                    span { style: "color:{theme.success_text}; font-weight:600; flex:0 0 auto;", "Nominal" }
+                                    span { style: "color:{theme.success_text}; font-weight:600; flex:0 0 auto;", {translate_text("Nominal")} }
                                     span { style: "color:{theme.info_text}; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
-                                        "(Flight state:"
+                                        "({localized_copy(&language_snapshot, \"Flight state\", \"Estado de vuelo\", \"Etat de vol\")}:"
                                         span {
                                             style: "display:inline-flex; align-items:baseline; width:15.5ch; padding-left:0.4ch; white-space:nowrap;",
-                                            span { "{flight_state.read().to_string()}" }
+                                            span { {translate_text(&flight_state.read().to_string())} }
                                             span { ")" }
                                         }
                                     }
                                 } else {
                                     if has_errors {
-                                        span { style: "color:{theme.error_text}; flex:0 0 auto;", {format!("{err_count} error(s)")} }
+                                        span { style: "color:{theme.error_text}; flex:0 0 auto;", {format!("{}: {err_count}", translate_text("Errors"))} }
                                     }
                                     if has_warnings {
-                                        span { style: "color:{theme.warning_text}; flex:0 0 auto;", {format!("{warn_count} warnings(s)")} }
+                                        span { style: "color:{theme.warning_text}; flex:0 0 auto;", {format!("{}: {warn_count}", translate_text("Warnings"))} }
                                     }
                                     span { style: "color:{theme.info_text}; display:inline-flex; flex:0 0 auto; align-items:baseline; white-space:nowrap;",
-                                        "(Flight state:"
+                                        "({localized_copy(&language_snapshot, \"Flight state\", \"Estado de vuelo\", \"Etat de vol\")}:"
                                         span {
                                             style: "display:inline-flex; align-items:baseline; width:15.5ch; padding-left:0.4ch; white-space:nowrap;",
-                                            span { "{flight_state.read().to_string()}" }
+                                            span { {translate_text(&flight_state.read().to_string())} }
                                             span { ")" }
                                         }
                                     }
@@ -2854,7 +3366,7 @@ fn TelemetryDashboardInner() -> Element {
                                                     ack_warning_count.set(*warning_event_counter.read());
                                                 }
                                             },
-                                            "Acknowledge warnings"
+                                            {translate_text("Acknowledge warnings")}
                                         }
                                     }
 
@@ -2878,24 +3390,13 @@ fn TelemetryDashboardInner() -> Element {
                                                     ack_error_count.set(*error_event_counter.read());
                                                 }
                                             },
-                                            "Acknowledge errors"
+                                            {translate_text("Acknowledge errors")}
                                         }
                                     }
                                 }
                             }
 
-                            if let Some(ts) = network_time_snapshot {
-                                div { style: "display:flex; align-items:center; flex:0 0 auto; min-width:0;",
-                                    span { style: "color:#cbd5e1; display:inline-flex; align-items:baseline; white-space:nowrap;",
-                                        "(Network Time:"
-                                        span {
-                                            style: "display:inline-flex; align-items:baseline; width:16ch; padding-left:0.4ch; white-space:nowrap; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-variant-numeric:tabular-nums;",
-                                            span { "{ts}" }
-                                            span { ")" }
-                                        }
-                                    }
-                                }
-                            }
+                            NetworkTimeBadge { network_time: network_time, language: language_snapshot.clone() }
                         }
                     }
 
@@ -2906,7 +3407,7 @@ fn TelemetryDashboardInner() -> Element {
                             for n in notifications.read().iter() {
                                 div {
                                     style: "display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid #2563eb; border-radius:10px; background:#0b1f4d; color:#bfdbfe;",
-                                    span { style: "flex:1;", "{n.message}" }
+                                    span { style: "flex:1;", {translate_text(&n.message)} }
                                     if let (Some(action_label), Some(action_cmd)) = (n.action_label.as_deref(), n.action_cmd.as_deref())
                                         && auth::can_send_command(action_cmd)
                                     {
@@ -2918,7 +3419,7 @@ fn TelemetryDashboardInner() -> Element {
                                                     send_cmd(&cmd);
                                                 }
                                             },
-                                            "{action_label}"
+                                            {translate_text(action_label)}
                                         }
                                     }
                                     button {
@@ -2952,7 +3453,7 @@ fn TelemetryDashboardInner() -> Element {
                                                 });
                                             }
                                         },
-                                        "Dismiss"
+                                        {translate_text("Dismiss")}
                                     }
                                 }
                             }
@@ -2979,7 +3480,7 @@ fn TelemetryDashboardInner() -> Element {
                                                 .find(|t| t.id == "VALVE_STATE")
                                                 .and_then(|t| t.boolean_labels.clone()),
                                             abort_only_mode: *abort_only_mode.read(),
-                                            theme: layout.theme.clone(),
+                                            theme: theme.clone(),
                                         }
                                     }
                             },
@@ -2988,7 +3489,7 @@ fn TelemetryDashboardInner() -> Element {
                                     boards: board_status,
                                     layout: layout.connection_tab.clone(),
                                     title: _main_tab_label(&layout, MainTab::ConnectionStatus),
-                                    theme: layout.theme.clone(),
+                                    theme: theme.clone(),
                                 }
                             },
                             MainTab::Detailed => rsx! {
@@ -3000,9 +3501,7 @@ fn TelemetryDashboardInner() -> Element {
                                     warnings: warnings,
                                     errors: errors,
                                     notifications: notifications,
-                                    network_time_display: detailed_network_time_display.clone(),
-                                    network_clock_delta_ms: detailed_clock_delta_ms,
-                                    network_time_age_ms: detailed_network_time_age_ms,
+                                    network_time: network_time,
                                 }
                             },
                             MainTab::NetworkTopology => rsx! {
@@ -3018,6 +3517,8 @@ fn TelemetryDashboardInner() -> Element {
                                     key: "{*WS_EPOCH.read()}",
                                     rocket_gps: rocket_gps,
                                     user_gps: user_gps,
+                                    distance_units_metric: *distance_units_metric.read(),
+                                    theme: theme.clone(),
                                     title: _main_tab_label(&layout, MainTab::Map),
                                 }
                             },
@@ -3027,7 +3528,7 @@ fn TelemetryDashboardInner() -> Element {
                                         layout: layout.actions_tab.clone(),
                                         action_policy: action_policy,
                                         abort_only_mode: *abort_only_mode.read(),
-                                        theme: layout.theme.clone(),
+                                        theme: theme.clone(),
                                     }
                                 }
                             },
@@ -3055,7 +3556,7 @@ fn TelemetryDashboardInner() -> Element {
                                 DataTab {
                                     active_tab: active_data_tab,
                                     layout: layout.data_tab.clone(),
-                                    theme: layout.theme.clone(),
+                                    theme: theme.clone(),
                                 }
                             },
                         }

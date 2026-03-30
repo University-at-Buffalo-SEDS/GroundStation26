@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "av_bay": {
+    "interface": "serial",
+    "port": "/dev/ttyAMA0",
+    "baud_rate": 57600,
+    "protocol": "raw_uart"
+  },
+  "fill_box": {
+    "interface": "i2c",
+    "port": "/dev/i2c-1",
+    "baud_rate": 115200
+  }
+}

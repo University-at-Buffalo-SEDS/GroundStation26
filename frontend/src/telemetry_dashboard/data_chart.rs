@@ -30,6 +30,7 @@ use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::HISTORY_MS;
@@ -175,7 +176,7 @@ pub fn charts_cache_get(
     data_type: &str,
     width: f32,
     height: f32,
-) -> (Vec<ChartRenderChunk>, f32, f32, f32) {
+) -> (Rc<Vec<ChartRenderChunk>>, f32, f32, f32) {
     CHARTS_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         c.get(data_type, width, height)
@@ -187,13 +188,13 @@ pub fn charts_cache_get_subset(
     channels: &[usize],
     width: f32,
     height: f32,
-) -> (Vec<ChartRenderChunk>, f32, f32, f32) {
+) -> (Rc<Vec<ChartRenderChunk>>, f32, f32, f32) {
     CHARTS_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if let Some(chart) = c.charts.get_mut(data_type) {
             chart.build_subset(channels, width, height)
         } else {
-            (Vec::new(), 0.0, 1.0, 0.0)
+            (Rc::new(Vec::new()), 0.0, 1.0, 0.0)
         }
     })
 }
@@ -203,13 +204,13 @@ pub fn charts_cache_get_subset_per_series(
     channels: &[usize],
     width: f32,
     height: f32,
-) -> (Vec<ChartRenderChunk>, Vec<Option<(f32, f32)>>, f32) {
+) -> (Rc<Vec<ChartRenderChunk>>, Rc<Vec<Option<(f32, f32)>>>, f32) {
     CHARTS_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if let Some(chart) = c.charts.get_mut(data_type) {
             chart.build_subset_per_series(channels, width, height)
         } else {
-            (Vec::new(), Vec::new(), 0.0)
+            (Rc::new(Vec::new()), Rc::new(Vec::new()), 0.0)
         }
     })
 }
@@ -288,12 +289,12 @@ impl ChartsCache {
         combined_chart.ingest(&combined_row);
     }
 
-    fn get(&mut self, dt: &str, w: f32, h: f32) -> (Vec<ChartRenderChunk>, f32, f32, f32) {
+    fn get(&mut self, dt: &str, w: f32, h: f32) -> (Rc<Vec<ChartRenderChunk>>, f32, f32, f32) {
         if let Some(c) = self.charts.get_mut(dt) {
             c.build_if_needed(w, h);
             (c.chunks.clone(), c.disp_min, c.disp_max, c.span_min)
         } else {
-            (Vec::new(), 0.0, 1.0, 0.0)
+            (Rc::new(Vec::new()), 0.0, 1.0, 0.0)
         }
     }
 
@@ -367,7 +368,7 @@ struct CachedChart {
     channel_count: usize,
 
     // cached output
-    chunks: Vec<ChartRenderChunk>,
+    chunks: Rc<Vec<ChartRenderChunk>>,
     subset_cache: HashMap<SubsetCacheKey, CachedSubset>,
     subset_per_series_cache: HashMap<SubsetCacheKey, CachedSubsetPerSeries>,
 
@@ -403,7 +404,7 @@ impl CachedChart {
             newest_ts: 0,
             dirty: true,
             channel_count: 0,
-            chunks: Vec::new(),
+            chunks: Rc::new(Vec::new()),
             subset_cache: HashMap::new(),
             subset_per_series_cache: HashMap::new(),
             raw_min: 0.0,
@@ -588,7 +589,7 @@ impl CachedChart {
         self.last_h = h;
 
         if self.buckets.is_empty() {
-            self.chunks.clear();
+            self.chunks = Rc::new(Vec::new());
             self.raw_min = 0.0;
             self.raw_max = 1.0;
             self.chan_min = vec![None; self.channel_count];
@@ -693,7 +694,7 @@ impl CachedChart {
         let y_max = self.disp_max;
         let map_y = |v: f32| -> f32 { bottom - (v - y_min) / (y_max - y_min) * ph };
 
-        self.chunks.clear();
+        let mut chunks = Vec::new();
 
         let total = (newest_bid - start_bid + 1).max(1) as f32;
         let first_chunk_id = start_bid.div_euclid(RENDER_CHUNK_BUCKETS);
@@ -781,7 +782,7 @@ impl CachedChart {
             paths.hash(&mut hasher);
             gap_paths.hash(&mut hasher);
 
-            self.chunks.push(ChartRenderChunk {
+            chunks.push(ChartRenderChunk {
                 id: chunk_id,
                 x: chunk_start_x as f64,
                 width: chunk_width as f64,
@@ -793,6 +794,8 @@ impl CachedChart {
             });
         }
 
+        self.chunks = Rc::new(chunks);
+
         self.span_min = (want_buckets as f32 * BUCKET_MS as f32) / 60_000.0;
         self.dirty = false;
     }
@@ -802,16 +805,16 @@ impl CachedChart {
         channels: &[usize],
         w: f32,
         h: f32,
-    ) -> (Vec<ChartRenderChunk>, f32, f32, f32) {
+    ) -> (Rc<Vec<ChartRenderChunk>>, f32, f32, f32) {
         self.build_if_needed(w, h);
 
         if self.buckets.is_empty() || channels.is_empty() {
-            return (Vec::new(), 0.0, 1.0, 0.0);
+            return (Rc::new(Vec::new()), 0.0, 1.0, 0.0);
         }
 
         let valid_channels = self.normalize_channels(channels);
         if valid_channels.is_empty() {
-            return (Vec::new(), 0.0, 1.0, 0.0);
+            return (Rc::new(Vec::new()), 0.0, 1.0, 0.0);
         }
 
         let cache_key = SubsetCacheKey::new(&valid_channels, w, h);
@@ -954,7 +957,7 @@ impl CachedChart {
         }
 
         let cached = CachedSubset {
-            chunks,
+            chunks: Rc::new(chunks),
             y_min,
             y_max,
             span_min: self.span_min,
@@ -974,16 +977,16 @@ impl CachedChart {
         channels: &[usize],
         w: f32,
         h: f32,
-    ) -> (Vec<ChartRenderChunk>, Vec<Option<(f32, f32)>>, f32) {
+    ) -> (Rc<Vec<ChartRenderChunk>>, Rc<Vec<Option<(f32, f32)>>>, f32) {
         self.build_if_needed(w, h);
 
         if self.buckets.is_empty() || channels.is_empty() {
-            return (Vec::new(), Vec::new(), 0.0);
+            return (Rc::new(Vec::new()), Rc::new(Vec::new()), 0.0);
         }
 
         let valid_channels = self.normalize_channels(channels);
         if valid_channels.is_empty() {
-            return (Vec::new(), Vec::new(), 0.0);
+            return (Rc::new(Vec::new()), Rc::new(Vec::new()), 0.0);
         }
 
         let cache_key = SubsetCacheKey::new(&valid_channels, w, h);
@@ -1138,8 +1141,8 @@ impl CachedChart {
         }
 
         let cached = CachedSubsetPerSeries {
-            chunks,
-            series_scales,
+            chunks: Rc::new(chunks),
+            series_scales: Rc::new(series_scales),
             span_min: self.span_min,
         };
         let result = (
@@ -1162,7 +1165,7 @@ impl CachedChart {
 
 #[derive(Clone)]
 struct CachedSubset {
-    chunks: Vec<ChartRenderChunk>,
+    chunks: Rc<Vec<ChartRenderChunk>>,
     y_min: f32,
     y_max: f32,
     span_min: f32,
@@ -1170,8 +1173,8 @@ struct CachedSubset {
 
 #[derive(Clone)]
 struct CachedSubsetPerSeries {
-    chunks: Vec<ChartRenderChunk>,
-    series_scales: Vec<Option<(f32, f32)>>,
+    chunks: Rc<Vec<ChartRenderChunk>>,
+    series_scales: Rc<Vec<Option<(f32, f32)>>>,
     span_min: f32,
 }
 
@@ -1298,10 +1301,10 @@ pub struct ChartRenderChunk {
 }
 
 #[derive(Serialize)]
-struct CanvasChartPayload {
+struct CanvasChartPayload<'a> {
     view_w: f64,
     view_h: f64,
-    chunks: Vec<ChartRenderChunk>,
+    chunks: &'a [ChartRenderChunk],
     colors: Vec<&'static str>,
     grid_left: Option<f64>,
     grid_right: Option<f64>,
@@ -1314,7 +1317,7 @@ struct CanvasChartPayload {
 pub fn ChartCanvas(
     view_w: f64,
     view_h: f64,
-    chunks: Vec<ChartRenderChunk>,
+    chunks: Rc<Vec<ChartRenderChunk>>,
     grid_left: Option<f64>,
     grid_right: Option<f64>,
     grid_top: Option<f64>,
@@ -1331,7 +1334,7 @@ pub fn ChartCanvas(
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     view_w.to_bits().hash(&mut hasher);
     view_h.to_bits().hash(&mut hasher);
-    for chunk in &chunks {
+    for chunk in chunks.iter() {
         chunk.id.hash(&mut hasher);
         chunk.signature.hash(&mut hasher);
         chunk.x.to_bits().hash(&mut hasher);
@@ -1347,7 +1350,7 @@ pub fn ChartCanvas(
         grid_right,
         grid_top,
         grid_bottom,
-        chunks,
+        chunks: chunks.as_slice(),
         signature: hasher.finish(),
     };
     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());

@@ -11,6 +11,8 @@ independently.
   Frontend runtime architecture and file-by-file ownership for `frontend/src`.
 - `docs/backend/architecture.md`
   Backend runtime architecture and file-by-file ownership for `backend/src`.
+- `docs/backend/i2c.md`
+  Backend-facing I2C transport contract for the Pico bridge link.
 - `docs/shared/contracts.md`
   Shared Rust types and the contracts they create between frontend, backend, and devices.
 - `docs/system/overview.md`
@@ -22,3 +24,4 @@ independently.
 2. Read `docs/shared/contracts.md`.
 3. Read the frontend or backend architecture doc depending on which side you are changing.
 4. Use `docs/frontend/api.md` when changing HTTP or WebSocket behavior.
+5. Use `docs/backend/i2c.md` when changing the Linux-to-Pico I2C transport.
