@@ -144,14 +144,14 @@ pub fn SettingsPage(
                     div { style: "font-size:13px; color:{theme.text_soft};", "{theme_desc}" }
                     div { style: "display:flex; gap:8px; flex-wrap:wrap;",
                         button {
-                            style: if selected_theme == "default" { chip_selected.clone() } else { chip_idle.clone() },
-                            onclick: move |_| theme_preset.set("default".to_string()),
-                            "{default_theme_label}"
-                        }
-                        button {
                             style: if selected_theme == "backend" { chip_selected.clone() } else { chip_idle.clone() },
                             onclick: move |_| theme_preset.set("backend".to_string()),
                             "{backend_theme_label}"
+                        }
+                        button {
+                            style: if selected_theme == "default" { chip_selected.clone() } else { chip_idle.clone() },
+                            onclick: move |_| theme_preset.set("default".to_string()),
+                            "{default_theme_label}"
                         }
                         button {
                             style: if selected_theme == "sunset" { chip_selected.clone() } else { chip_idle.clone() },

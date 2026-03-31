@@ -2742,9 +2742,10 @@ fn TelemetryDashboardInner() -> Element {
                             style: "
                                 width:min(900px, 100%);
                                 padding:24px;
-                                border:1px solid {theme.border_strong};
+                                color:{theme.text_primary};
+                                border:1px solid {theme.tab_shell_border};
                                 border-radius:16px;
-                                background:{theme.panel_background};
+                                background:{theme.tab_shell_background};
                                 font-family:{dashboard_font_stack};
                                 box-shadow:0 12px 30px rgba(0,0,0,0.5);
                             ",
@@ -2760,6 +2761,7 @@ fn TelemetryDashboardInner() -> Element {
                                         border:1px solid {theme.button_border};
                                         background:{theme.button_background};
                                         color:{theme.button_text};
+                                        font-family:{dashboard_font_stack};
                                         font-weight:700;
                                         cursor:pointer;
                                     ",
@@ -2812,9 +2814,10 @@ fn TelemetryDashboardInner() -> Element {
                         style: "
                             width:min(980px, 100%);
                             padding:24px;
-                            border:1px solid {theme.border_strong};
+                            color:{theme.text_primary};
+                            border:1px solid {theme.tab_shell_border};
                             border-radius:16px;
-                            background:{theme.panel_background};
+                            background:{theme.tab_shell_background};
                             font-family:{dashboard_font_stack};
                             box-shadow:0 12px 30px rgba(0,0,0,0.5);
                         ",
@@ -2830,6 +2833,7 @@ fn TelemetryDashboardInner() -> Element {
                                     border:1px solid {theme.button_border};
                                     background:{theme.button_background};
                                     color:{theme.button_text};
+                                    font-family:{dashboard_font_stack};
                                     font-weight:700;
                                     cursor:pointer;
                                 ",
