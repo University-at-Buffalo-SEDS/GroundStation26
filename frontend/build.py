@@ -1156,6 +1156,9 @@ def _write_windows_install_script(script_path: Path) -> None:
     # registry commands must stay on one physical line for reliable execution.
     script = "\n".join([
         '$ErrorActionPreference = "Stop"',
+        '$logPath = Join-Path $env:TEMP "gs26-install.log"',
+        'function Write-InstallLog($message) { Add-Content -Path $logPath -Value ("[{0}] {1}" -f (Get-Date -Format "s"), $message) }',
+        'Write-InstallLog "install.ps1 started"',
         "Add-Type -AssemblyName System.Windows.Forms",
         "",
         f'$appName = "{WINDOWS_APP_NAME}"',
@@ -1164,8 +1167,10 @@ def _write_windows_install_script(script_path: Path) -> None:
         "$folderDialog = New-Object System.Windows.Forms.FolderBrowserDialog",
         '$folderDialog.Description = "Choose install folder for $appName"',
         "$folderDialog.SelectedPath = $defaultInstallDir",
+        'Write-InstallLog ("showing folder picker with default path: " + $defaultInstallDir)',
         "$dialogResult = $folderDialog.ShowDialog()",
         'if ($dialogResult -ne [System.Windows.Forms.DialogResult]::OK -or [string]::IsNullOrWhiteSpace($folderDialog.SelectedPath)) {',
+        '    Write-InstallLog "installation cancelled from folder picker"',
         '    throw "Installation cancelled"',
         "}",
         "$installDir = $folderDialog.SelectedPath",
@@ -1174,6 +1179,7 @@ def _write_windows_install_script(script_path: Path) -> None:
         '$startMenuDir = Join-Path $env:ProgramData "Microsoft\\Windows\\Start Menu\\Programs\\$appName"',
         '$desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "$appName.lnk"',
         "",
+        'Write-InstallLog ("installing to: " + $installDir)',
         "New-Item -ItemType Directory -Force -Path $installDir | Out-Null",
         "Expand-Archive -LiteralPath $zipPath -DestinationPath $installDir -Force",
         "",
@@ -1202,6 +1208,7 @@ def _write_windows_install_script(script_path: Path) -> None:
         'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")',
         'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoModify" -Type DWord -Value 1',
         'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoRepair" -Type DWord -Value 1',
+        'Write-InstallLog "install.ps1 completed successfully"',
     ])
     script_path.write_text(script, encoding="utf-8")
 
@@ -1242,9 +1249,9 @@ DisplayLicense=
 FinishMessage={WINDOWS_APP_NAME} installation completed.
 TargetName={installer_path}
 FriendlyName={WINDOWS_APP_NAME} Installer
-AppLaunched=cmd.exe /c powershell.exe -ExecutionPolicy Bypass -File install.ps1
-AdminQuietInstCmd=cmd.exe /c powershell.exe -ExecutionPolicy Bypass -File install.ps1
-UserQuietInstCmd=cmd.exe /c powershell.exe -ExecutionPolicy Bypass -File install.ps1
+AppLaunched=cmd.exe /c powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File install.ps1
+AdminQuietInstCmd=cmd.exe /c powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File install.ps1
+UserQuietInstCmd=cmd.exe /c powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File install.ps1
 FILE0="payload.zip"
 FILE1="install.ps1"
 
