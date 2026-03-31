@@ -2180,9 +2180,9 @@ fn TelemetryDashboardInner() -> Element {
             // This avoids visible graph "blanking" during reconnect/reseed.
 
             let alive = alive.clone();
-            let epoch = *WS_EPOCH.read();
+            let seed_epoch = current_seed;
             spawn(async move {
-                if !alive.load(Ordering::Relaxed) || *WS_EPOCH.read() != epoch {
+                if !alive.load(Ordering::Relaxed) || *SEED_EPOCH.read() != seed_epoch {
                     return;
                 }
 
@@ -2217,7 +2217,7 @@ fn TelemetryDashboardInner() -> Element {
                             last_err = Some(e);
                             if attempt < RESEED_ATTEMPTS
                                 && alive.load(Ordering::Relaxed)
-                                && *WS_EPOCH.read() == epoch
+                                && *SEED_EPOCH.read() == seed_epoch
                             {
                                 #[cfg(target_arch = "wasm32")]
                                 gloo_timers::future::TimeoutFuture::new(400 * attempt as u32).await;
@@ -2234,7 +2234,7 @@ fn TelemetryDashboardInner() -> Element {
 
                 if let Some(e) = last_err
                     && alive.load(Ordering::Relaxed)
-                    && *WS_EPOCH.read() == epoch
+                    && *SEED_EPOCH.read() == seed_epoch
                 {
                     log!("seed_from_db failed after retries: {e}");
                 }
