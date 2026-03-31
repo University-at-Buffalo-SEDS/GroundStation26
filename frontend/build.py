@@ -1152,66 +1152,57 @@ Remove-Item $installDir -Recurse -Force
 
 
 def _write_windows_install_script(script_path: Path) -> None:
-    # fmt: off
-    # Keep this generated PowerShell block stable. Reflowing command lines can
-    # break quoted Windows install paths and uninstall command strings.
-    script = f"""
-$ErrorActionPreference = "Stop"
-Add-Type -AssemblyName System.Windows.Forms
-
-$appName = "{WINDOWS_APP_NAME}"
-$defaultInstallDir = Join-Path $env:LOCALAPPDATA $appName
-$zipPath = Join-Path $PSScriptRoot "payload.zip"
-$folderDialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$folderDialog.Description = "Choose install folder for $appName"
-$folderDialog.SelectedPath = $defaultInstallDir
-$dialogResult = $folderDialog.ShowDialog()
-if ($dialogResult -ne [System.Windows.Forms.DialogResult]::OK -or [string]::IsNullOrWhiteSpace(
-$folderDialog.SelectedPath)) {{
-    throw "Installation cancelled"
-}}
-$installDir = $folderDialog.SelectedPath
-$uninstallScript = Join-Path $installDir "uninstall.ps1"
-$exePath = Join-Path $installDir "{WINDOWS_APP_NAME}.exe"
-$startMenuDir = Join-Path $env:ProgramData "Microsoft\\Windows\\Start Menu\\Programs\\$appName"
-$desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "$appName.lnk"
-
-New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-Expand-Archive -LiteralPath $zipPath -DestinationPath $installDir -Force
-
-$wsh = New-Object -ComObject WScript.Shell
-New-Item -ItemType Directory -Force -Path $startMenuDir | Out-Null
-
-$startShortcut = $wsh.CreateShortcut((Join-Path $startMenuDir "$appName.lnk"))
-$startShortcut.TargetPath = $exePath
-$startShortcut.WorkingDirectory = $installDir
-$startShortcut.IconLocation = $exePath
-$startShortcut.Save()
-
-$desktop = $wsh.CreateShortcut($desktopShortcut)
-$desktop.TargetPath = $exePath
-$desktop.WorkingDirectory = $installDir
-$desktop.IconLocation = $exePath
-$desktop.Save()
-
-New-Item -Path "HKCU:\\Software\\UBSEDS\\$appName" -Force | Out-Null
-Set-ItemProperty -Path "HKCU:\\Software\\UBSEDS\\$appName" -Name "InstallDir" -Value $installDir
-
-New-Item -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Force | Out-Null
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayName" 
--Value $appName
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayIcon" 
--Value $exePath
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name 
-"InstallLocation" -Value $installDir
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name 
-"UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoModify" 
--Type DWord -Value 1
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoRepair" 
--Type DWord -Value 1
-""".strip()
-    # fmt: on
+    # Keep this generated PowerShell block as explicit lines. The path and
+    # registry commands must stay on one physical line for reliable execution.
+    script = "\n".join([
+        '$ErrorActionPreference = "Stop"',
+        "Add-Type -AssemblyName System.Windows.Forms",
+        "",
+        f'$appName = "{WINDOWS_APP_NAME}"',
+        "$defaultInstallDir = Join-Path $env:LOCALAPPDATA $appName",
+        '$zipPath = Join-Path $PSScriptRoot "payload.zip"',
+        "$folderDialog = New-Object System.Windows.Forms.FolderBrowserDialog",
+        '$folderDialog.Description = "Choose install folder for $appName"',
+        "$folderDialog.SelectedPath = $defaultInstallDir",
+        "$dialogResult = $folderDialog.ShowDialog()",
+        'if ($dialogResult -ne [System.Windows.Forms.DialogResult]::OK -or [string]::IsNullOrWhiteSpace($folderDialog.SelectedPath)) {',
+        '    throw "Installation cancelled"',
+        "}",
+        "$installDir = $folderDialog.SelectedPath",
+        '$uninstallScript = Join-Path $installDir "uninstall.ps1"',
+        f'$exePath = Join-Path $installDir "{WINDOWS_APP_NAME}.exe"',
+        '$startMenuDir = Join-Path $env:ProgramData "Microsoft\\Windows\\Start Menu\\Programs\\$appName"',
+        '$desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "$appName.lnk"',
+        "",
+        "New-Item -ItemType Directory -Force -Path $installDir | Out-Null",
+        "Expand-Archive -LiteralPath $zipPath -DestinationPath $installDir -Force",
+        "",
+        "$wsh = New-Object -ComObject WScript.Shell",
+        "New-Item -ItemType Directory -Force -Path $startMenuDir | Out-Null",
+        "",
+        '$startShortcut = $wsh.CreateShortcut((Join-Path $startMenuDir "$appName.lnk"))',
+        "$startShortcut.TargetPath = $exePath",
+        "$startShortcut.WorkingDirectory = $installDir",
+        "$startShortcut.IconLocation = $exePath",
+        "$startShortcut.Save()",
+        "",
+        "$desktop = $wsh.CreateShortcut($desktopShortcut)",
+        "$desktop.TargetPath = $exePath",
+        "$desktop.WorkingDirectory = $installDir",
+        "$desktop.IconLocation = $exePath",
+        "$desktop.Save()",
+        "",
+        'New-Item -Path "HKCU:\\Software\\UBSEDS\\$appName" -Force | Out-Null',
+        'Set-ItemProperty -Path "HKCU:\\Software\\UBSEDS\\$appName" -Name "InstallDir" -Value $installDir',
+        "",
+        'New-Item -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Force | Out-Null',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayName" -Value $appName',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayIcon" -Value $exePath',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "InstallLocation" -Value $installDir',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoModify" -Type DWord -Value 1',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoRepair" -Type DWord -Value 1',
+    ])
     script_path.write_text(script, encoding="utf-8")
 
 
