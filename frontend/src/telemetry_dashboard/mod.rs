@@ -1085,7 +1085,9 @@ fn bump_ws_epoch() {
 
 /// Requests a fresh telemetry reseed from the backend.
 fn bump_seed_epoch() {
-    *SEED_EPOCH.write() += 1;
+    let mut epoch = SEED_EPOCH.write();
+    *epoch += 1;
+    log!("[seed] bump_seed_epoch -> {}", *epoch);
 }
 
 pub(crate) fn localized_copy(lang: &str, en: &str, es: &str, fr: &str) -> String {
@@ -2187,12 +2189,14 @@ fn TelemetryDashboardInner() -> Element {
                         continue;
                     }
                     handled_seed_epoch = Some(seed_epoch);
+                    log!("[seed] watcher picked up epoch={seed_epoch}");
 
                     // Keep current in-memory rows visible until reseed data arrives.
                     // This avoids visible graph "blanking" during reconnect/reseed.
                     let mut last_err: Option<String> = None;
                     const RESEED_ATTEMPTS: usize = 3;
                     for attempt in 1..=RESEED_ATTEMPTS {
+                        log!("[seed] epoch={seed_epoch} attempt={attempt} starting seed_from_db");
                         let res = seed_from_db(
                             &mut warnings_s,
                             &mut errors_s,
@@ -2214,10 +2218,12 @@ fn TelemetryDashboardInner() -> Element {
 
                         match res {
                             Ok(()) => {
+                                log!("[seed] epoch={seed_epoch} attempt={attempt} completed");
                                 last_err = None;
                                 break;
                             }
                             Err(e) => {
+                                log!("[seed] epoch={seed_epoch} attempt={attempt} failed: {e}");
                                 last_err = Some(e);
                                 if attempt < RESEED_ATTEMPTS
                                     && alive.load(Ordering::Relaxed)
@@ -3855,6 +3861,26 @@ pub(crate) async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> R
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn native_http_timeouts(path: &str) -> (std::time::Duration, std::time::Duration) {
+    if path == "/api/recent" {
+        let secs = std::env::var("GS_RECENT_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(90)
+            .clamp(15, 600);
+        return (
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(secs),
+        );
+    }
+
+    (
+        std::time::Duration::from_secs(8),
+        std::time::Duration::from_secs(8),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, String> {
     let path = if path.starts_with('/') {
         path.to_string()
@@ -3868,21 +3894,44 @@ pub(crate) async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> R
     } else {
         format!("{base}{path}")
     };
+    let (connect_timeout, timeout) = native_http_timeouts(&path);
 
     let client = auth::build_native_http_client(
         UrlConfig::_skip_tls_verify(),
-        std::time::Duration::from_secs(8),
-        std::time::Duration::from_secs(8),
+        connect_timeout,
+        timeout,
     )?;
+    let skip_tls = UrlConfig::_skip_tls_verify();
+    log!(
+        "[http] GET {} skip_tls={} connect_timeout_ms={} timeout_ms={}",
+        url,
+        skip_tls,
+        connect_timeout.as_millis(),
+        timeout.as_millis()
+    );
 
     let mut request = client.get(url);
     if let Some(token) = auth::current_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(|e| e.to_string())?;
+    let response = request.send().await.map_err(|e| {
+        let msg = format!(
+            "request send failed: {e:?} (base={} skip_tls={skip_tls} path={path})",
+            UrlConfig::base_http()
+        );
+        log!("[http] {msg}");
+        msg
+    })?;
 
     let status = response.status();
-    let body = response.text().await.map_err(|e| e.to_string())?;
+    let body = response.text().await.map_err(|e| {
+        let msg = format!(
+            "response body read failed: {e:?} (base={} skip_tls={skip_tls} path={path})",
+            UrlConfig::base_http()
+        );
+        log!("[http] {msg}");
+        msg
+    })?;
     if !status.is_success() {
         if status == reqwest::StatusCode::UNAUTHORIZED {
             auth::clear_current_session();
@@ -4304,6 +4353,7 @@ async fn seed_from_db(
     ack_error_ts: &mut Signal<i64>,
     alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    log!("[seed] seed_from_db entered");
     struct ReseedGuard;
     impl Drop for ReseedGuard {
         fn drop(&mut self) {
@@ -4312,6 +4362,7 @@ async fn seed_from_db(
                 v.clear();
             }
             charts_cache_cancel_reseed_build();
+            log!("[seed] seed_from_db exiting");
         }
     }
     RESEED_IN_PROGRESS.store(true, Ordering::Relaxed);
@@ -4344,6 +4395,10 @@ async fn seed_from_db(
 
     // ---- Telemetry history (/api/recent) ----
     let existing_rows_before_seed = ui_telemetry_rows_snapshot();
+    log!(
+        "[seed] /api/recent begin existing_rows_before_seed={}",
+        existing_rows_before_seed.len()
+    );
     match http_get_json::<Vec<TelemetryRow>>("/api/recent").await {
         Ok(mut list) => {
             if !alive.load(Ordering::Relaxed) {
@@ -4353,6 +4408,7 @@ async fn seed_from_db(
             sort_rows(&mut list);
             prune_history(&mut list);
             list = compact_rows_for_ui(list);
+            log!("[seed] /api/recent ok compacted_rows={}", list.len());
 
             // Capture rows that arrived while reseed was running and keep them.
             let mut live_rows = ui_telemetry_rows_snapshot();
@@ -4363,6 +4419,7 @@ async fn seed_from_db(
                 sort_rows(&mut live_rows);
                 prune_history(&mut live_rows);
                 live_rows = compact_rows_for_ui(live_rows);
+                log!("[seed] /api/recent merging live_rows={}", live_rows.len());
                 list = merge_db_and_live(list, live_rows);
             }
 
@@ -4372,6 +4429,7 @@ async fn seed_from_db(
 
             if list.is_empty() && !existing_rows_before_seed.is_empty() {
                 // Treat empty reseed as transient and keep already-visible history.
+                log!("[seed] /api/recent empty -> keeping existing rows");
                 list = existing_rows_before_seed;
             } else {
                 // Build reseed cache in a double buffer while active cache keeps live updates.
@@ -4412,6 +4470,7 @@ async fn seed_from_db(
                 // Atomically swap the prepared reseed cache in.
                 charts_cache_finish_reseed_build();
             }
+            log!("[seed] applying reseed rows={}", list.len());
             if let Ok(mut store) = UI_TELEMETRY_STORE.lock() {
                 store.replace_from_rows(&list);
             }
@@ -4423,6 +4482,7 @@ async fn seed_from_db(
             *render_epoch = render_epoch.wrapping_add(1);
         }
         Err(err) => {
+            log!("[seed] /api/recent failed: {err}");
             if existing_rows_before_seed.is_empty() {
                 return Err(format!("telemetry reseed failed: {err}"));
             }
@@ -4688,6 +4748,7 @@ async fn connect_ws_once_wasm(
         let onopen: Closure<dyn FnMut(Event)> = Closure::new(move |_e: Event| {
             log!("[WS] open");
             note_ws_connection_state(true, ws_url_for_open.clone(), None, epoch);
+            bump_seed_epoch();
         });
         ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
         onopen.forget();
@@ -4958,6 +5019,7 @@ async fn connect_ws_once_native(
 
     let (mut write, mut read) = ws_stream.split();
     note_ws_connection_state(true, ws_url.clone(), None, epoch);
+    bump_seed_epoch();
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {

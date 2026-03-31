@@ -180,6 +180,9 @@ pub(crate) fn build_native_http_client(
             .danger_accept_invalid_certs(skip_tls_verify)
             .connect_timeout(connect_timeout)
             .timeout(timeout)
+            // Keep native HTTPS aligned with the successful WebSocket/upgrade path.
+            // Some proxies behave differently for reqwest+rustrls over HTTP/2.
+            .http1_only()
     };
 
     #[cfg(target_os = "android")]
@@ -202,7 +205,7 @@ pub(crate) fn build_native_http_client(
 
     make_builder()
         .build()
-        .map_err(|e| format_native_auth_error(&e.to_string(), skip_tls_verify))
+        .map_err(|e| format_native_auth_error(&format!("{e:?}"), skip_tls_verify))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
