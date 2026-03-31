@@ -2742,10 +2742,7 @@ fn TelemetryDashboardInner() -> Element {
                 cursor:pointer;
             ", theme.button_border, theme.button_background, theme.button_text),
             onclick: move |_| {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    clear_and_reconnect_after_connect();
-                }
+                clear_and_reconnect_after_connect();
             },
             "{reload_button_label}"
         }
