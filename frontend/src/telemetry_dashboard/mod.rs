@@ -960,14 +960,6 @@ static WS_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 static TELEMETRY_RENDER_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 static PREFERRED_LANGUAGE: GlobalSignal<String> = Signal::global(|| "en".to_string());
 static TRANSLATION_CATALOG: GlobalSignal<HashMap<String, String>> = Signal::global(HashMap::new);
-pub(crate) static APP_THEME_PRESET: GlobalSignal<String> = Signal::global(|| {
-    let stored = persist::get_or(THEME_PRESET_STORAGE_KEY, "default");
-    if stored == "layout" {
-        "backend".to_string()
-    } else {
-        stored
-    }
-});
 pub(crate) static APP_THEME_CONFIG: GlobalSignal<layout::ThemeConfig> = Signal::global(|| {
     let stored = persist::get_or(THEME_PRESET_STORAGE_KEY, "default");
     let preset = if stored == "layout" {
@@ -977,15 +969,9 @@ pub(crate) static APP_THEME_CONFIG: GlobalSignal<layout::ThemeConfig> = Signal::
     };
     localized_theme(&layout::ThemeConfig::default(), preset)
 });
-pub(crate) static APP_SHELL_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 
 #[cfg(target_arch = "wasm32")]
 static WS_RAW: GlobalSignal<Option<web_sys::WebSocket>> = Signal::global(|| None);
-
-// Native “reload UI” remount key.
-// IMPORTANT: this key is applied ONLY to the INNER component, so it does NOT
-// trigger TelemetryDashboard’s unmount guard.
-static UI_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 // Force re-seed of graphs/history from backend.
 static SEED_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 
@@ -1673,7 +1659,7 @@ pub fn TelemetryDashboard() -> Element {
     );
 
     rsx! {
-        TelemetryDashboardInner { key: "{*UI_EPOCH.read()}" }
+        TelemetryDashboardInner {}
     }
 }
 
@@ -1697,9 +1683,15 @@ fn TelemetryDashboardInner() -> Element {
             .map(|v| v == "metric")
             .unwrap_or(false)
     });
-    let theme_preset = use_signal(|| APP_THEME_PRESET.read().clone());
+    let theme_preset = use_signal(|| {
+        let stored = persist::get_or(THEME_PRESET_STORAGE_KEY, "default");
+        if stored == "layout" {
+            "backend".to_string()
+        } else {
+            stored
+        }
+    });
     let language_code = use_signal(|| persist::get_or(LANGUAGE_STORAGE_KEY, "en"));
-    let last_applied_theme_preset = use_signal(|| None::<String>);
 
     let layout_config = use_signal(|| None::<LayoutConfig>);
     let layout_loading = use_signal(|| true);
@@ -1972,24 +1964,9 @@ fn TelemetryDashboardInner() -> Element {
     }
     {
         let theme_preset = theme_preset;
-        let mut last_applied_theme_preset = last_applied_theme_preset;
         use_effect(move || {
             let value = theme_preset.read().clone();
-            *APP_THEME_PRESET.write() = value.clone();
             persist::set_string(THEME_PRESET_STORAGE_KEY, &value);
-            let next_shell_epoch = APP_SHELL_EPOCH.read().wrapping_add(1);
-            *APP_SHELL_EPOCH.write() = next_shell_epoch;
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let next_ui_epoch = UI_EPOCH.read().wrapping_add(1);
-                *UI_EPOCH.write() = next_ui_epoch;
-            }
-
-            let previous = last_applied_theme_preset.read().clone();
-            last_applied_theme_preset.set(Some(value.clone()));
-            if previous.as_deref().is_some_and(|prev| prev != value) {
-                js_eval("window.location.reload();");
-            }
         });
     }
     {
@@ -2784,6 +2761,7 @@ fn TelemetryDashboardInner() -> Element {
     let layout_snapshot = layout_config.read().clone();
     let layout_error_snapshot = layout_error.read().clone();
     let layout_loading_snapshot = *layout_loading.read();
+    #[cfg(not(target_arch = "wasm32"))]
     let version_overlay_open = *show_version_overlay.read();
     let version_overlay: Element = {
         #[cfg(target_arch = "wasm32")]
@@ -2956,7 +2934,7 @@ fn TelemetryDashboardInner() -> Element {
              .gs26-tab-shell {{ min-width:260px; }}
              .gs26-tab-toggle {{ display:none; }}
              .gs26-tab-nav {{ display:flex; gap:0.5rem; flex-wrap:wrap; }}
-             .gs26-header-actions-shell {{ margin-left:auto; position:relative; }}
+             .gs26-header-actions-shell {{ margin-left:auto; position:relative; z-index:2000; }}
              .gs26-header-actions-list {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }}
              .gs26-header-menu-toggle {{ display:none; }}
              @media (max-width: 900px) {{
@@ -3149,6 +3127,8 @@ fn TelemetryDashboardInner() -> Element {
                     width:100%;
                     margin-bottom:12px;
                     flex-wrap:wrap;
+                    position:relative;
+                    z-index:2000;
                 ",
                         h1 { style: "color:#f97316; margin:0; font-size:22px; font-weight:800;", "{_dashboard_title(&layout)}" }
 
@@ -4671,7 +4651,9 @@ async fn connect_ws_once_wasm(
     alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
     use futures_channel::oneshot;
+    use js_sys::Reflect;
     use wasm_bindgen::JsCast;
+    use wasm_bindgen::JsValue;
     use wasm_bindgen::closure::Closure;
     use web_sys::{CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
 
@@ -4741,7 +4723,12 @@ async fn connect_ws_once_wasm(
             if !alive_for_error.load(Ordering::Relaxed) {
                 return;
             }
-            log!("[WS] error: {}", e.message());
+            let message = Reflect::get(e.as_ref(), &JsValue::from_str("message"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "websocket error event".to_string());
+            log!("[WS] error: {message}");
             if let Some(tx) = closed_tx.borrow_mut().take() {
                 let _ = tx.send(());
             }
@@ -5068,6 +5055,7 @@ fn handle_ws_message(
 // --------------------------------------------------------------------------------------------
 // JS helpers
 // --------------------------------------------------------------------------------------------
+#[cfg(any(target_arch = "wasm32", target_os = "ios"))]
 fn js_read_window_string(key: &str) -> Option<String> {
     js_eval(&format!(
         r#"
@@ -5102,7 +5090,7 @@ fn js_get_tmp_str() -> Option<String> {
     v.as_string()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "ios"))]
 fn js_get_tmp_str() -> Option<String> {
     None
 }

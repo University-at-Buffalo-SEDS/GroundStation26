@@ -4,9 +4,10 @@
 use crate::telemetry_dashboard::gps_android;
 #[cfg(target_os = "ios")]
 use crate::telemetry_dashboard::gps_apple;
+#[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+use crate::telemetry_dashboard::js_read_window_string;
 use crate::telemetry_dashboard::{
-    http_get_json, js_eval, js_is_ground_map_ready, js_read_window_string, layout::ThemeConfig,
-    map_tiles_url,
+    http_get_json, js_eval, js_is_ground_map_ready, layout::ThemeConfig, map_tiles_url,
 };
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
@@ -92,7 +93,7 @@ pub fn MapTab(
     #[cfg(not(target_os = "ios"))]
     let show_enable_compass = use_signal(|| false);
 
-    // Browser-derived location (from navigator.geolocation inside the webview/page)
+    #[cfg(target_arch = "wasm32")]
     let mut browser_user_gps = use_signal(|| None::<(f64, f64)>);
     let has_centered_on_user = use_signal(|| false);
     let map_config = use_signal(MapConfig::default);
@@ -116,20 +117,9 @@ pub fn MapTab(
     {
         let tiles = tiles_url();
         let map_config = map_config;
-        #[cfg(target_os = "ios")]
-        let mut show_enable_compass = show_enable_compass;
         use_effect(move || {
             let config = map_config.read().clone();
             js_eval(r#"console.error("[GS26 map] setup effect entered");"#);
-            #[cfg(target_os = "ios")]
-            js_eval(
-                r#"
-                (function() {
-                  window.__gs26_disable_browser_geo = true;
-                  window.__gs26_disable_compass = true;
-                })();
-                "#,
-            );
             #[cfg(target_os = "ios")]
             {
                 *show_enable_compass.write() = js_is_compass_denied();
@@ -138,7 +128,7 @@ pub fn MapTab(
             js_setup_map_touch_guard();
             js_setup_map_size_guard();
             js_setup_js_init_retry(&tiles, &config);
-            #[cfg(not(target_os = "android"))]
+            #[cfg(target_arch = "wasm32")]
             _js_setup_js_geolocation_watch();
 
             // Debounced resize/orientation/visualViewport reinit path
@@ -196,6 +186,7 @@ pub fn MapTab(
     }
 
     // --- 2) Hydrate browser_user_gps once from JS cache/window vars ---
+    #[cfg(target_arch = "wasm32")]
     {
         let mut browser_user_gps = browser_user_gps;
         let mut has_centered_on_user = has_centered_on_user;
@@ -217,9 +208,9 @@ pub fn MapTab(
     }
 
     // --- 2b) Keep browser geolocation in sync (watchPosition updates window vars asynchronously) ---
+    #[cfg(target_arch = "wasm32")]
     {
         let mut browser_user_gps = browser_user_gps;
-        let mut user_gps = user_gps;
         let mut has_centered_on_user = has_centered_on_user;
         use_future(move || async move {
             loop {
@@ -227,15 +218,35 @@ pub fn MapTab(
                     if *browser_user_gps.read() != Some((lat, lon)) {
                         browser_user_gps.set(Some((lat, lon)));
                     }
-                    if *user_gps.read() != Some((lat, lon)) {
-                        user_gps.set(Some((lat, lon)));
-                    }
                     if !*has_centered_on_user.read() {
                         js_center_on(lat, lon);
                         has_centered_on_user.set(true);
                     }
                 }
 
+                gloo_timers::future::TimeoutFuture::new(20).await;
+            }
+        });
+    }
+
+    // --- 2c) Native platforms trust the parent/native GPS signal directly ---
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut has_centered_on_user = has_centered_on_user;
+        use_effect(move || {
+            if let Some((lat, lon)) = *user_gps.read() {
+                if !*has_centered_on_user.read() {
+                    js_center_on(lat, lon);
+                    has_centered_on_user.set(true);
+                }
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use_future(move || async move {
+            loop {
                 #[cfg(target_os = "ios")]
                 if let Some(deg) = gps_apple::latest_heading_deg() {
                     js_set_user_heading(deg);
@@ -246,23 +257,46 @@ pub fn MapTab(
                     js_set_user_heading(deg);
                 }
 
-                #[cfg(target_arch = "wasm32")]
-                gloo_timers::future::TimeoutFuture::new(20).await;
-
-                #[cfg(target_os = "ios")]
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-                #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         });
     }
 
-    // Effective user GPS: browser > parent
-    let effective_user =
-        move || -> Option<(f64, f64)> { browser_user_gps.read().or_else(|| *user_gps.read()) };
+    // Effective user GPS:
+    // native prefers the parent/native GPS signal, web prefers browser geolocation.
+    #[cfg(not(target_arch = "wasm32"))]
+    let effective_user = move || -> Option<(f64, f64)> { *user_gps.read() };
+    #[cfg(target_arch = "wasm32")]
+    let effective_user = move || -> Option<(f64, f64)> { *browser_user_gps.read() };
     let distance_text =
         format_distance_label(*rocket_gps.read(), effective_user(), distance_units_metric);
+    #[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]
+    let native_location_warning = if (*user_gps.read()).is_none() {
+        Some("User location unavailable. Native GPS has not provided coordinates yet.".to_string())
+    } else {
+        None
+    };
+    #[cfg(not(any(
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "android"
+    )))]
+    let native_location_warning = None::<String>;
+    #[cfg(target_os = "ios")]
+    let native_compass_warning =
+        if gps_apple::latest_heading_deg().is_none() && *show_enable_compass.read() {
+            Some(
+                "Compass unavailable. Orientation permission was denied or has not initialized."
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+    #[cfg(not(target_os = "ios"))]
+    let native_compass_warning = None::<String>;
+    let diagnostics_warning = native_location_warning
+        .clone()
+        .or_else(|| native_compass_warning.clone());
 
     // --- 3) Update markers whenever rocket/user changes ---
     {
@@ -278,10 +312,17 @@ pub fn MapTab(
     }
 
     let on_center_me = move |_| {
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((lat, lon)) = *user_gps.read() {
+            js_center_on(lat, lon);
+            return;
+        }
+
+        #[cfg(target_arch = "wasm32")]
         js_request_user_geolocation_once();
 
         // Refresh from JS at click-time
+        #[cfg(target_arch = "wasm32")]
         if let Some((lat, lon)) = js_cached_user_latlon().or_else(js_read_user_latlon_from_window) {
             browser_user_gps.set(Some((lat, lon)));
             js_center_on(lat, lon);
@@ -354,6 +395,11 @@ pub fn MapTab(
                         }
                     }
                 }
+                if let Some(warning_text) = diagnostics_warning.clone() {
+                    div { style: "padding:10px 12px; border-radius:12px; border:1px solid #f59e0b; background:#451a03; color:#fde68a; font-size:0.92rem; font-weight:700;",
+                        "{warning_text}"
+                    }
+                }
                 div { style: "flex:1; min-height:0; width:100%;",
                     div {
                         id: "ground-map",
@@ -397,6 +443,11 @@ pub fn MapTab(
                         style: "padding:6px 12px; border-radius:999px; border:1px solid #60a5fa; background:#0b1a33; color:#bfdbfe; font-size:0.85rem; cursor:pointer;",
                         onclick: on_toggle_fullscreen,
                         "Fullscreen"
+                    }
+                }
+                if let Some(warning_text) = diagnostics_warning {
+                    div { style: "margin:0 12px; padding:10px 12px; border-radius:12px; border:1px solid #f59e0b; background:#451a03; color:#fde68a; font-size:0.92rem; font-weight:700;",
+                        "{warning_text}"
                     }
                 }
 
@@ -601,6 +652,17 @@ fn js_setup_js_init_retry(tiles: &str, config: &MapConfig) {
             } catch (e) {}
 
             try {
+              if (typeof window.updateGroundMapMarkers === "function") {
+                window.updateGroundMapMarkers(
+                  window.__gs26_pending_r_lat,
+                  window.__gs26_pending_r_lon,
+                  window.__gs26_pending_u_lat,
+                  window.__gs26_pending_u_lon
+                );
+              }
+            } catch (e) {}
+
+            try {
               const m = window.__gs26_ground_map;
               if (m && typeof m.invalidateSize === "function") {
                 requestAnimationFrame(() => { try { m.invalidateSize(); } catch(e) {} });
@@ -667,7 +729,7 @@ fn _js_setup_js_geolocation_watch() {
     );
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(target_arch = "wasm32")]
 fn js_request_user_geolocation_once() {
     js_eval(
         r#"
@@ -960,6 +1022,7 @@ fn js_set_user_heading(deg: f64) {
     ));
 }
 
+#[cfg(target_arch = "wasm32")]
 fn js_cached_user_latlon() -> Option<(f64, f64)> {
     js_eval(
         r#"
@@ -989,6 +1052,7 @@ fn js_cached_user_latlon() -> Option<(f64, f64)> {
     Some((lat, lon))
 }
 
+#[cfg(target_arch = "wasm32")]
 fn js_read_user_latlon_from_window() -> Option<(f64, f64)> {
     let lat = js_read_window_f64("__gs26_user_lat")?;
     let lon = js_read_window_f64("__gs26_user_lon")?;
@@ -1085,6 +1149,7 @@ fn js_is_compass_denied() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_arch = "wasm32")]
 fn js_read_window_f64(key: &str) -> Option<f64> {
     js_eval(&format!(
         r#"

@@ -7,7 +7,7 @@ out_dir = "dist"
 asset_dir = "assets"
 icon = "assets/icon.png"
 category = "public.app-category.utilities"
-build = "36"
+build = "38"
 
 [web.app]
 title = "UBSEDS GroundStation"
@@ -49,4 +49,5 @@ hardened_runtime = true
 
 
 [bundle.ios]
+info_plist_path = "platform/macos/Info.plist"
 icon = "assets/icon.png"

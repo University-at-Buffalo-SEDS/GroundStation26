@@ -29,13 +29,87 @@
 typedef void (*LocationCallback)(double lat, double lon);
 typedef void (*HeadingCallback)(double heading_deg);
 
+static volatile int g_gs26_auth_status = -999;
+static volatile int g_gs26_location_started = 0;
+static volatile int g_gs26_heading_started = 0;
+static volatile int g_gs26_location_callback_seen = 0;
+static volatile int g_gs26_heading_callback_seen = 0;
+static volatile int g_gs26_last_location_error_code = 0;
+
 @interface GS26LocationShim : NSObject <CLLocationManagerDelegate>
 @property(nonatomic, strong) CLLocationManager *mgr;
 @property(nonatomic, assign) LocationCallback cb;
 @property(nonatomic, assign) HeadingCallback headingCb;
+- (void)kickLocationAuthFlow;
+- (void)requestAuthorizationIfNeeded;
+- (void)startSensorsIfAuthorized;
 @end
 
 @implementation GS26LocationShim
+
+- (void)startSensorsIfAuthorized {
+  CLAuthorizationStatus status;
+  if ([self.mgr respondsToSelector:@selector(authorizationStatus)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+    status = self.mgr.authorizationStatus;
+#pragma clang diagnostic pop
+  } else {
+    status = [CLLocationManager authorizationStatus];
+  }
+  g_gs26_auth_status = (int)status;
+
+  BOOL authorized = (status == kCLAuthorizationStatusAuthorizedAlways);
+#if TARGET_OS_IOS
+  authorized = authorized || (status == kCLAuthorizationStatusAuthorizedWhenInUse);
+#endif
+
+  if (authorized) {
+    [self.mgr startUpdatingLocation];
+    g_gs26_location_started = 1;
+    if ([CLLocationManager headingAvailable]) {
+      [self.mgr startUpdatingHeading];
+      g_gs26_heading_started = 1;
+    }
+  }
+}
+
+- (void)requestAuthorizationIfNeeded {
+  CLAuthorizationStatus status;
+  if ([self.mgr respondsToSelector:@selector(authorizationStatus)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+    status = self.mgr.authorizationStatus;
+#pragma clang diagnostic pop
+  } else {
+    status = [CLLocationManager authorizationStatus];
+  }
+  g_gs26_auth_status = (int)status;
+
+  if (status == kCLAuthorizationStatusNotDetermined &&
+      [self.mgr respondsToSelector:@selector(requestWhenInUseAuthorization)]) {
+    [self.mgr requestWhenInUseAuthorization];
+  }
+}
+
+- (void)kickLocationAuthFlow {
+  [self requestAuthorizationIfNeeded];
+  [self startSensorsIfAuthorized];
+
+#if TARGET_OS_IOS
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
+                 dispatch_get_main_queue(), ^{
+                   [self requestAuthorizationIfNeeded];
+                   [self startSensorsIfAuthorized];
+                 });
+
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1200 * NSEC_PER_MSEC)),
+                 dispatch_get_main_queue(), ^{
+                   [self requestAuthorizationIfNeeded];
+                   [self startSensorsIfAuthorized];
+                 });
+#endif
+}
 
 - (instancetype)initWithCallback:(LocationCallback)cb {
   self = [super init];
@@ -49,26 +123,33 @@ typedef void (*HeadingCallback)(double heading_deg);
   _mgr.desiredAccuracy = kCLLocationAccuracyBest;
   _mgr.headingFilter = kCLHeadingFilterNone;
 
-  CLAuthorizationStatus status;
-  if ([_mgr respondsToSelector:@selector(authorizationStatus)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunguarded-availability-new"
-    status = _mgr.authorizationStatus;
-#pragma clang diagnostic pop
-  } else {
-    status = [CLLocationManager authorizationStatus];
-  }
+  // iOS can ignore an early auth request if it happens before the app is fully active.
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self kickLocationAuthFlow];
+  });
 
-  if (status == kCLAuthorizationStatusNotDetermined &&
-      [_mgr respondsToSelector:@selector(requestWhenInUseAuthorization)]) {
-    [_mgr requestWhenInUseAuthorization];
-  }
-
-  [_mgr startUpdatingLocation];
-  if ([CLLocationManager headingAvailable]) {
-    [_mgr startUpdatingHeading];
-  }
+#if TARGET_OS_IOS
+  [[NSNotificationCenter defaultCenter]
+      addObserverForName:UIApplicationDidBecomeActiveNotification
+                  object:nil
+                   queue:[NSOperationQueue mainQueue]
+              usingBlock:^(__unused NSNotification *note) {
+                [self kickLocationAuthFlow];
+              }];
+#endif
   return self;
+}
+
+- (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
+  (void)manager;
+  [self startSensorsIfAuthorized];
+}
+
+- (void)locationManager:(CLLocationManager *)manager
+didChangeAuthorizationStatus:(CLAuthorizationStatus)status {
+  (void)manager;
+  g_gs26_auth_status = (int)status;
+  [self startSensorsIfAuthorized];
 }
 
 - (void)locationManager:(CLLocationManager *)manager
@@ -77,13 +158,14 @@ typedef void (*HeadingCallback)(double heading_deg);
   CLLocation *last = locations.lastObject;
   if (!last || !self.cb)
     return;
+  g_gs26_location_callback_seen = 1;
   self.cb(last.coordinate.latitude, last.coordinate.longitude);
 }
 
 - (void)locationManager:(CLLocationManager *)manager
        didFailWithError:(NSError *)error {
   (void)manager;
-  (void)error;
+  g_gs26_last_location_error_code = (int)error.code;
 }
 
 - (void)locationManager:(CLLocationManager *)manager
@@ -99,6 +181,7 @@ typedef void (*HeadingCallback)(double heading_deg);
   if (heading < 0)
     return;
 
+  g_gs26_heading_callback_seen = 1;
   self.headingCb((double)heading);
 }
 
@@ -108,22 +191,31 @@ static GS26LocationShim *g_shim = nil;
 
 // Export a plain C symbol Rust can link against.
 void gs26_location_start(LocationCallback cb) {
-  @autoreleasepool {
-    g_shim = [[GS26LocationShim alloc] initWithCallback:cb];
-  }
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @autoreleasepool {
+      g_shim = [[GS26LocationShim alloc] initWithCallback:cb];
+    }
+  });
 }
 
 void gs26_heading_start(HeadingCallback cb) {
-  @autoreleasepool {
-    if (!g_shim) {
-      g_shim = [[GS26LocationShim alloc] initWithCallback:NULL];
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @autoreleasepool {
+      if (!g_shim) {
+        g_shim = [[GS26LocationShim alloc] initWithCallback:NULL];
+      }
+      g_shim.headingCb = cb;
+      [g_shim startSensorsIfAuthorized];
     }
-    g_shim.headingCb = cb;
-    if ([CLLocationManager headingAvailable]) {
-      [g_shim.mgr startUpdatingHeading];
-    }
-  }
+  });
 }
+
+int gs26_location_auth_status(void) { return g_gs26_auth_status; }
+int gs26_location_started(void) { return g_gs26_location_started; }
+int gs26_heading_started(void) { return g_gs26_heading_started; }
+int gs26_location_callback_seen(void) { return g_gs26_location_callback_seen; }
+int gs26_heading_callback_seen(void) { return g_gs26_heading_callback_seen; }
+int gs26_last_location_error_code(void) { return g_gs26_last_location_error_code; }
 
 #pragma mark - Keep awake (iOS only)
 

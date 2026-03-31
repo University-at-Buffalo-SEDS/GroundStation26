@@ -455,13 +455,21 @@ function initGroundMap(tilesUrl, centerLat, centerLon, zoom, maxNativeZoom, asse
 }
 
 function updateGroundMapMarkers(rLat, rLon, uLat, uLon) {
-    if (!groundMap) return;
-    const L = getLeaflet();
     const hasRocket = Number.isFinite(rLat) && Number.isFinite(rLon);
     const hasUser = Number.isFinite(uLat) && Number.isFinite(uLon);
 
     if (hasRocket) {
         lastRocketLatLng = [rLat, rLon];
+    }
+
+    if (hasUser) {
+        lastUserLatLng = [uLat, uLon];
+    }
+
+    if (!groundMap) return;
+    const L = getLeaflet();
+
+    if (hasRocket) {
         if (!rocketMarker) {
             rocketMarker = L.marker(lastRocketLatLng, {
                 icon: makeEmojiIcon("🚀", "rocket-marker"),
@@ -473,7 +481,6 @@ function updateGroundMapMarkers(rLat, rLon, uLat, uLon) {
     }
 
     if (hasUser) {
-        lastUserLatLng = [uLat, uLon];
         if (!userMarker) {
             userMarker = L.marker(lastUserLatLng, {
                 icon: makeUserIcon(),

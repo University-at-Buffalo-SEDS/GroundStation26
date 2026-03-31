@@ -377,19 +377,22 @@ def _stage_app_bundle_from_dx(
         *,
         platform_name: str,
         preferred_bundle_name: str,
+        debug_mode: bool = False,
 ) -> Optional[Path]:
     dist = dist_dir(frontend_dir)
     dist.mkdir(parents=True, exist_ok=True)
     preferred = dist / preferred_bundle_name
     pkg_name = _frontend_package_name(frontend_dir)
     target_root = frontend_dir.parent / "target" / "dx" / pkg_name
+    preferred_profile = "debug" if debug_mode else "release"
+    fallback_profile = "release" if debug_mode else "debug"
     candidates = [
-        target_root / "release" / platform_name / LEGACY_APP_BUNDLE_NAME,
-        target_root / "release" / platform_name / APP_BUNDLE_NAME,
-        target_root / "release" / platform_name / MACOS_ALT_APP_BUNDLE_NAME,
-        target_root / "debug" / platform_name / LEGACY_APP_BUNDLE_NAME,
-        target_root / "debug" / platform_name / APP_BUNDLE_NAME,
-        target_root / "debug" / platform_name / MACOS_ALT_APP_BUNDLE_NAME,
+        target_root / preferred_profile / platform_name / LEGACY_APP_BUNDLE_NAME,
+        target_root / preferred_profile / platform_name / APP_BUNDLE_NAME,
+        target_root / preferred_profile / platform_name / MACOS_ALT_APP_BUNDLE_NAME,
+        target_root / fallback_profile / platform_name / LEGACY_APP_BUNDLE_NAME,
+        target_root / fallback_profile / platform_name / APP_BUNDLE_NAME,
+        target_root / fallback_profile / platform_name / MACOS_ALT_APP_BUNDLE_NAME,
     ]
 
     for src in candidates:
@@ -403,7 +406,7 @@ def _stage_app_bundle_from_dx(
     return None
 
 
-def rename_macos_app_bundle(frontend_dir: Path) -> Optional[Path]:
+def rename_macos_app_bundle(frontend_dir: Path, debug_mode: bool = False) -> Optional[Path]:
     dist = dist_dir(frontend_dir)
     preferred = dist / APP_BUNDLE_NAME
     alt = dist / MACOS_ALT_APP_BUNDLE_NAME
@@ -427,6 +430,7 @@ def rename_macos_app_bundle(frontend_dir: Path) -> Optional[Path]:
         frontend_dir,
         platform_name="macos",
         preferred_bundle_name=APP_BUNDLE_NAME,
+        debug_mode=debug_mode,
     )
 
 
@@ -3331,7 +3335,7 @@ def _bundle_id_from_app(app: Path) -> str:
     return str(bundle_id)
 
 
-def ios_sim_deploy(frontend_dir: Path) -> tuple[str, str]:
+def ios_sim_deploy(frontend_dir: Path, debug_mode: bool = False) -> tuple[str, str]:
     if platform.system() != "Darwin":
         print("Error: iOS simulator deploy requires macOS.", file=sys.stderr)
         sys.exit(1)
@@ -3340,9 +3344,11 @@ def ios_sim_deploy(frontend_dir: Path) -> tuple[str, str]:
         frontend_dir,
         platform_name="ios",
         preferred_bundle_name=APP_BUNDLE_NAME,
+        debug_mode=debug_mode,
     ) or app_bundle_path(frontend_dir)
     if not app.exists():
         raise FileNotFoundError(f"Simulator app bundle not found: {app}")
+    patch_plist(frontend_dir, app)
 
     udid = _simctl_booted_device_udid(frontend_dir)
     if not udid:
@@ -3377,9 +3383,11 @@ def capture_ios_sim_screenshot(
         frontend_dir,
         platform_name="ios",
         preferred_bundle_name=APP_BUNDLE_NAME,
+        debug_mode=False,
     ) or app_bundle_path(frontend_dir)
     if not app.exists():
         raise FileNotFoundError(f"Simulator app bundle not found: {app}")
+    patch_plist(frontend_dir, app)
 
     udid, bundle_id = ios_sim_deploy(frontend_dir)
     if delay_seconds > 0:
@@ -4056,7 +4064,7 @@ def build_frontend(
             rebuild_patched_android_bundle(frontend_dir, debug_mode, env)
 
         if platform_name == "macos":
-            rename_macos_app_bundle(frontend_dir)
+            rename_macos_app_bundle(frontend_dir, debug_mode=debug_mode)
             remove_legacy_app_bundle(frontend_dir)
             remove_legacy_dmgs(frontend_dir)
             _patch_macos_bundle_icon(frontend_dir)
@@ -4083,6 +4091,7 @@ def build_frontend(
                 frontend_dir,
                 platform_name="ios",
                 preferred_bundle_name=APP_BUNDLE_NAME,
+                debug_mode=debug_mode,
             ) or app_bundle_path(frontend_dir)
             patch_plist(frontend_dir, staged_app)
 
@@ -4393,7 +4402,7 @@ def main() -> None:
                     debug_mode=debug_mode,
                     max_size=max_size_mode,
                 )
-            udid, bundle_id = ios_sim_deploy(frontend_dir)
+            udid, bundle_id = ios_sim_deploy(frontend_dir, debug_mode=debug_mode)
             print(f"Simulator deploy complete ({udid}) for {bundle_id}")
             return
 

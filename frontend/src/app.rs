@@ -4,7 +4,7 @@ const _CONNECTION_TIMEOUT_MS: u64 = 8000;
 const _BODY_TRANSFER_TIMEOUT_MS: u64 = 10000;
 const _WS_TIMEOUT_MS: u64 = 4500;
 #[allow(dead_code)]
-const APP_DISPLAY_NAME: &str = "Telemetry Client";
+const APP_DISPLAY_NAME: &str = "UBSEDS GS";
 
 use crate::auth::{self, SessionStatus as AuthSessionStatus};
 use crate::telemetry_dashboard::layout::ThemeConfig;
@@ -16,11 +16,8 @@ use dioxus_router::{use_navigator, Routable, Router};
 #[allow(unused_imports)]
 use crate::telemetry_dashboard::{self, UrlConfig};
 
-#[cfg(not(target_arch = "wasm32"))]
 const INLINE_LEAFLET_CSS: &str = include_str!("../static/vendor/leaflet/leaflet.css");
-#[cfg(not(target_arch = "wasm32"))]
 const INLINE_LEAFLET_JS: &str = include_str!("../static/vendor/leaflet/leaflet.js");
-#[cfg(not(target_arch = "wasm32"))]
 const INLINE_GROUND_MAP_JS: &str = include_str!("../static/ground_map.js");
 
 // -------------------------
@@ -76,12 +73,9 @@ fn all_tests_passed(checks: &[RouteCheck], ws_probe: &Option<Result<String, Stri
 }
 
 // --- global css ---
-fn global_css() -> &'static str {
-    r#"
+const GLOBAL_CSS: &str = r#"
 :root {
     --gs26-app-height: 100dvh;
-    --gs26-app-background: #020617;
-    --gs26-app-text: #e5e7eb;
 }
 
 @supports not (height: 100dvh) {
@@ -96,8 +90,7 @@ html, body {
     width: 100%;
     min-height: var(--gs26-app-height);
     height: var(--gs26-app-height);
-    background: var(--gs26-app-background);
-    color: var(--gs26-app-text);
+    background: #020617;
     overflow: hidden;
 }
 
@@ -109,38 +102,16 @@ html, body {
     width: 100%;
     min-height: var(--gs26-app-height);
     height: var(--gs26-app-height);
-    background: var(--gs26-app-background);
-    color: var(--gs26-app-text);
+    background: #020617;
 }
 
 * { box-sizing: border-box; }
-"#
-}
+"#;
 
 const _CONNECT_SHOWN_KEY: &str = "gs_connect_shown";
 
 fn shell_theme() -> ThemeConfig {
     telemetry_dashboard::app_shell_theme()
-}
-
-fn hex_to_rgba(color: &str) -> Option<(u8, u8, u8, u8)> {
-    let hex = color.trim().trim_start_matches('#');
-    match hex.len() {
-        6 => {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            Some((r, g, b, 255))
-        }
-        8 => {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
-            Some((r, g, b, a))
-        }
-        _ => None,
-    }
 }
 
 fn shell_page_style(theme: &ThemeConfig) -> String {
@@ -756,90 +727,27 @@ pub fn App() -> Element {
     {
         keep_awake::set_enabled(true);
     }
-    let app_shell_epoch = *telemetry_dashboard::APP_SHELL_EPOCH.read();
-    let shell_theme = telemetry_dashboard::app_shell_theme();
-    let global_css = global_css();
-    {
-        use_effect(move || {
-            let theme = telemetry_dashboard::APP_THEME_CONFIG.read().clone();
-            let app_background = theme.app_background;
-            let text_primary = theme.text_primary;
-            telemetry_dashboard::js_eval(&format!(
-                r#"
-                (function() {{
-                  try {{
-                    const bg = {bg:?};
-                    const fg = {fg:?};
-                    document.documentElement.style.setProperty('--gs26-app-background', bg);
-                    document.documentElement.style.setProperty('--gs26-app-text', fg);
-                    document.documentElement.style.backgroundColor = bg;
-                    document.documentElement.style.color = fg;
-                    if (document.body) {{
-                      document.body.style.setProperty('--gs26-app-background', bg);
-                      document.body.style.setProperty('--gs26-app-text', fg);
-                      document.body.style.backgroundColor = bg;
-                      document.body.style.color = fg;
-                    }}
-                    const main = document.getElementById("main");
-                    if (main) {{
-                      main.style.setProperty('--gs26-app-background', bg);
-                      main.style.setProperty('--gs26-app-text', fg);
-                      main.style.backgroundColor = bg;
-                      main.style.color = fg;
-                    }}
-                  }} catch (_) {{}}
-                }})();
-                "#,
-                bg = app_background,
-                fg = text_primary,
-            ));
-        });
-    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let window = use_window();
         use_effect(move || {
-            let app_background = telemetry_dashboard::APP_THEME_CONFIG
-                .read()
-                .app_background
-                .clone();
-            let rgba = hex_to_rgba(&app_background);
-            window.set_background_color(rgba);
-            if let Some(rgba) = rgba {
-                let _ = window.webview.set_background_color(rgba);
-            }
-            window.request_redraw();
+            window.set_title(APP_DISPLAY_NAME);
         });
     }
     let map_assets: Element = {
-        #[cfg(target_arch = "wasm32")]
-        {
-            rsx! {
-                document::Link {
-                    rel: "stylesheet",
-                    href: asset!("static/vendor/leaflet/leaflet.css"),
-                }
-                document::Script { src: asset!("static/vendor/leaflet/leaflet.js") }
-                document::Script { src: asset!("static/ground_map.js") }
-            }
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            rsx! {
-                document::Style { "{INLINE_LEAFLET_CSS}" }
-                document::Script { "{INLINE_LEAFLET_JS}" }
-                document::Script { "{INLINE_GROUND_MAP_JS}" }
-            }
+        rsx! {
+            document::Style { "{INLINE_LEAFLET_CSS}" }
+            document::Script { "{INLINE_LEAFLET_JS}" }
+            document::Script { "{INLINE_GROUND_MAP_JS}" }
         }
     };
     rsx! {
+        document::Style { "{GLOBAL_CSS}" }
+        Meta { name: "viewport", content: "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" }
+        {map_assets}
+
         div {
-            key: "{app_shell_epoch}",
-            style: "min-height: var(--gs26-app-height); width: 100%; --gs26-app-background: {shell_theme.app_background}; --gs26-app-text: {shell_theme.text_primary}; background: var(--gs26-app-background); color: var(--gs26-app-text);",
-            document::Style { "{global_css}" }
-            Meta { name: "viewport", content: "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" }
-            {map_assets}
+            style: "min-height: var(--gs26-app-height); width: 100%; background: #020617; color: #e5e7eb;",
             Router::<Route> {}
         }
     }
