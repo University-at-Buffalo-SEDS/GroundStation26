@@ -8,6 +8,8 @@ use dioxus_desktop::wry::http::{Request as HttpRequest, Response as HttpResponse
 #[cfg(not(target_arch = "wasm32"))]
 use dioxus_desktop::RequestAsyncResponder;
 #[cfg(not(target_arch = "wasm32"))]
+use dioxus_desktop::tao::window::WindowBuilder;
+#[cfg(not(target_arch = "wasm32"))]
 use image::ImageFormat;
 #[cfg(not(target_arch = "wasm32"))]
 use std::backtrace::Backtrace;
@@ -135,6 +137,7 @@ fn main() {
             _handle_gs26_protocol_async(request, responder);
         },
     );
+    cfg = cfg.with_window(WindowBuilder::new().with_title(app::APP_DISPLAY_NAME));
     if let Some(icon) = load_desktop_window_icon() {
         cfg = cfg.with_icon(icon);
     }

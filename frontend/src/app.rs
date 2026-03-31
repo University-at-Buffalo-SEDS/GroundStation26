@@ -3,8 +3,7 @@
 const _CONNECTION_TIMEOUT_MS: u64 = 8000;
 const _BODY_TRANSFER_TIMEOUT_MS: u64 = 10000;
 const _WS_TIMEOUT_MS: u64 = 4500;
-#[allow(dead_code)]
-const APP_DISPLAY_NAME: &str = "UBSEDS GS";
+pub(crate) const APP_DISPLAY_NAME: &str = "UBSEDS GS";
 
 use crate::auth::{self, SessionStatus as AuthSessionStatus};
 use crate::telemetry_dashboard::layout::ThemeConfig;

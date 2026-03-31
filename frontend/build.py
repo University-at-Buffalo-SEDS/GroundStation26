@@ -1096,14 +1096,10 @@ Section "Install"
   CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk" "$INSTDIR\\Uninstall.exe"
 
   WriteRegStr HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}" "InstallDir" "$INSTDIR"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "
-{WINDOWS_APP_NAME}"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" 
-  "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" 
-  "$INSTDIR\\Uninstall.exe"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" 
-  "$INSTDIR"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "{WINDOWS_APP_NAME}"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" "$INSTDIR\\Uninstall.exe"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" "$INSTDIR"
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoModify" 1
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoRepair" 1
 SectionEnd
@@ -1197,18 +1193,12 @@ New-Item -Path "HKCU:\\Software\\UBSEDS\\$appName" -Force | Out-Null
 Set-ItemProperty -Path "HKCU:\\Software\\UBSEDS\\$appName" -Name "InstallDir" -Value $installDir
 
 New-Item -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Force | Out-Null
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayName" 
--Value $appName
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayIcon" 
--Value $exePath
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name 
-"InstallLocation" -Value $installDir
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name 
-"UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoModify" 
--Type DWord -Value 1
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoRepair" 
--Type DWord -Value 1
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayName" -Value $appName
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayIcon" -Value $exePath
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "InstallLocation" -Value $installDir
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoModify" -Type DWord -Value 1
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoRepair" -Type DWord -Value 1
 """.strip()
     script_path.write_text(script, encoding="utf-8")
 

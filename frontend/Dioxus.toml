@@ -1,6 +1,6 @@
 [application]
 name = "UBSEDS GS"
-title = "UBSEDS GroundStation"
+title = "UBSEDS GS"
 default_platform = "web"
 out_dir = "dist"
 # This folder is copied into the output dir after build/serve
@@ -10,7 +10,7 @@ category = "public.app-category.utilities"
 build = "39"
 
 [web.app]
-title = "UBSEDS GroundStation"
+title = "UBSEDS GS"
 
 [web.watcher]
 watch_path = ["src", "assets", "static"]
