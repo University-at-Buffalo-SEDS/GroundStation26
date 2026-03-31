@@ -3,9 +3,7 @@ use crate::flight_sim;
 use crate::gpio_panel::IGNITION_PIN;
 use crate::layout;
 use crate::loadcell;
-#[cfg(feature = "hitl_mode")]
-use crate::rocket_commands::FlightComputerCommands;
-use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
+use crate::rocket_commands::{ActuatorBoardCommands, FlightComputerCommands, ValveBoardCommands};
 use crate::state::AppState;
 #[cfg(feature = "hitl_mode")]
 use crate::types::FlightState;
@@ -36,36 +34,19 @@ const GRAVITY_MPS2: f32 = 9.80665;
 #[cfg(feature = "hitl_mode")]
 fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     Some(match cmd {
-        TelemetryCommand::DeployParachute => FlightComputerCommands::DeployParachute as u8,
-        TelemetryCommand::ExpandParachute => FlightComputerCommands::ExpandParachute as u8,
-        TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
-        TelemetryCommand::LaunchSignal => FlightComputerCommands::LaunchSignal as u8,
         TelemetryCommand::EvaluationRelax => FlightComputerCommands::EvaluationRelax as u8,
         TelemetryCommand::EvaluationFocus => FlightComputerCommands::EvaluationFocus as u8,
         TelemetryCommand::EvaluationAbort => FlightComputerCommands::EvaluationAbort as u8,
-        TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
-        TelemetryCommand::EnableIMU => FlightComputerCommands::EnableIMU as u8,
         TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
-        TelemetryCommand::MonitorAltitude => FlightComputerCommands::MonitorAltitude as u8,
-        TelemetryCommand::RevokeMonitorAltitude => {
-            FlightComputerCommands::RevokeMonitorAltitude as u8
-        }
         TelemetryCommand::ConsecutiveSamples => FlightComputerCommands::ConsecutiveSamples as u8,
-        TelemetryCommand::RevokeConsecutiveSamples => {
-            FlightComputerCommands::RevokeConsecutiveSamples as u8
-        }
+        TelemetryCommand::RevokeConsecutiveSamples => FlightComputerCommands::RevokeConsecutiveSamples as u8,
         TelemetryCommand::ResetFailures => FlightComputerCommands::ResetFailures as u8,
         TelemetryCommand::RevokeResetFailures => FlightComputerCommands::RevokeResetFailures as u8,
-        TelemetryCommand::ValidateMeasms => FlightComputerCommands::ValidateMeasms as u8,
-        TelemetryCommand::RevokeValidateMeasms => {
-            FlightComputerCommands::RevokeValidateMeasms as u8
-        }
-        TelemetryCommand::AbortAfter15 => FlightComputerCommands::AbortAfter15 as u8,
         TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
-        TelemetryCommand::AbortAfter70 => FlightComputerCommands::AbortAfter70 as u8,
-        TelemetryCommand::ReinitAfter12 => FlightComputerCommands::ReinitAfter12 as u8,
-        TelemetryCommand::ReinitAfter26 => FlightComputerCommands::ReinitAfter26 as u8,
-        TelemetryCommand::ReinitAfter44 => FlightComputerCommands::ReinitAfter44 as u8,
+        TelemetryCommand::AbortAfter100 => FlightComputerCommands::AbortAfter100 as u8,
+        TelemetryCommand::ReinitAfter15 => FlightComputerCommands::ReinitAfter15 as u8,
+        TelemetryCommand::ReinitAfter30 => FlightComputerCommands::ReinitAfter30 as u8,
+        TelemetryCommand::ReinitAfter50 => FlightComputerCommands::ReinitAfter50 as u8,
         _ => return None,
     })
 }
@@ -1043,144 +1024,144 @@ pub async fn telemetry_task(
                         continue;
                     }
                     match cmd {
-                        TelemetryCommand::Launch => {
-                                if let Err(e) = router.log_queue(
-                                    DataType::FlightCommand,
-                                    &[FlightCommands::Launch as u8],
-                                ) {
-                                    log_telemetry_error("failed to log Launch command", e);
-                                }
-                                let gpio = &state.gpio;
-                                gpio.write_output_pin(IGNITION_PIN, true).expect("failed to set gpio output");
-                                println!("Launch command sent");
+                        TelemetryCommand::LaunchSignal => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightComputerCommands::LaunchSignal as u8],
+                            ) {
+                                log_telemetry_error("failed to log Launch command", e);
+                            }
+                            let gpio = &state.gpio;
+                            gpio.write_output_pin(IGNITION_PIN, true).expect("failed to set gpio output");
+                            println!("Launch command sent");
 
-                            }
+                        }
                         TelemetryCommand::Dump => {
-                                let key = ValveBoardCommands::DumpOpen as u8;
-                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
-                                let cmd = if is_on {
-                                    ValveBoardCommands::DumpClose
-                                } else {
-                                    ValveBoardCommands::DumpOpen
-                                };
-                                if let Err(e) = router.log_queue(
-                                    DataType::ValveCommand,
-                                    &[cmd as u8],
-                                ) {
-                                    log_telemetry_error("failed to log Dump command", e);
-                                }
-                                {
-                                    let gpio = &state.gpio;
-                                    gpio.write_output_pin(IGNITION_PIN, false).expect("failed to set gpio output");
-                                }
-                                println!("Dump command sent {:?}", cmd);
+                            let key = ValveBoardCommands::DumpOpen as u8;
+                            let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                            let cmd = if is_on {
+                                ValveBoardCommands::DumpClose
+                            } else {
+                                ValveBoardCommands::DumpOpen
+                            };
+                            if let Err(e) = router.log_queue(
+                                DataType::ValveCommand,
+                                &[cmd as u8],
+                            ) {
+                                log_telemetry_error("failed to log Dump command", e);
                             }
+                            {
+                                let gpio = &state.gpio;
+                                gpio.write_output_pin(IGNITION_PIN, false).expect("failed to set gpio output");
+                            }
+                            println!("Dump command sent {:?}", cmd);
+                        }
                         TelemetryCommand::Abort => {
-                                if let Err(e) = router.log(
-                                    DataType::Abort,
-                                    "Manual Abort Command Issued".as_ref(),
-                                ) {
-                                    log_telemetry_error("failed to log Abort command", e);
-                                }
-                                println!("Abort command sent");
+                            if let Err(e) = router.log(
+                                DataType::Abort,
+                                "Manual Abort Command Issued".as_ref(),
+                            ) {
+                                log_telemetry_error("failed to log Abort command", e);
                             }
+                            println!("Abort command sent");
+                        }
                         TelemetryCommand::Igniter => {
-                                let key = ActuatorBoardCommands::IgniterOn as u8;
-                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
-                                let cmd = if is_on {
-                                    ActuatorBoardCommands::IgniterOff
-                                } else {
-                                    ActuatorBoardCommands::IgniterOn
-                                };
-                                if let Err(e) = router.log_queue(
-                                    DataType::ActuatorCommand,
-                                    &[cmd as u8],
-                                ) {
-                                    log_telemetry_error("failed to log Igniter command", e);
-                                }
-                                println!("Igniter command sent {:?}", cmd);
+                            let key = ActuatorBoardCommands::IgniterOn as u8;
+                            let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                            let cmd = if is_on {
+                                ActuatorBoardCommands::IgniterOff
+                            } else {
+                                ActuatorBoardCommands::IgniterOn
+                            };
+                            if let Err(e) = router.log_queue(
+                                DataType::ActuatorCommand,
+                                &[cmd as u8],
+                            ) {
+                                log_telemetry_error("failed to log Igniter command", e);
                             }
+                            println!("Igniter command sent {:?}", cmd);
+                        }
                         TelemetryCommand::Pilot => {
-                                let key = ValveBoardCommands::PilotOpen as u8;
-                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
-                                let cmd = if is_on {
-                                    ValveBoardCommands::PilotClose
-                                } else {
-                                    ValveBoardCommands::PilotOpen
-                                };
-                                if let Err(e) = router.log_queue(
-                                    DataType::ValveCommand,
-                                    &[cmd as u8],
-                                ) {
-                                    log_telemetry_error("failed to log Pilot command", e);
-                                }
-                                println!("Pilot command sent {:?}", cmd);
+                            let key = ValveBoardCommands::PilotOpen as u8;
+                            let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                            let cmd = if is_on {
+                                ValveBoardCommands::PilotClose
+                            } else {
+                                ValveBoardCommands::PilotOpen
+                            };
+                            if let Err(e) = router.log_queue(
+                                DataType::ValveCommand,
+                                &[cmd as u8],
+                            ) {
+                                log_telemetry_error("failed to log Pilot command", e);
                             }
+                            println!("Pilot command sent {:?}", cmd);
+                        }
                         TelemetryCommand::NormallyOpen => {
-                                let key = ValveBoardCommands::NormallyOpenOpen as u8;
-                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
-                                let cmd = if is_on {
-                                    ValveBoardCommands::NormallyOpenClose
-                                } else {
-                                    ValveBoardCommands::NormallyOpenOpen
-                                };
-                                if let Err(e) = router.log_queue(
-                                    DataType::ValveCommand,
-                                    &[cmd as u8],
-                                ) {
-                                    log_telemetry_error("failed to log NormallyOpen command", e);
-                                }
-                                println!("Tanks command sent {:?}", cmd);
+                            let key = ValveBoardCommands::NormallyOpenOpen as u8;
+                            let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                            let cmd = if is_on {
+                                ValveBoardCommands::NormallyOpenClose
+                            } else {
+                                ValveBoardCommands::NormallyOpenOpen
+                            };
+                            if let Err(e) = router.log_queue(
+                                DataType::ValveCommand,
+                                &[cmd as u8],
+                            ) {
+                                log_telemetry_error("failed to log NormallyOpen command", e);
                             }
+                            println!("Tanks command sent {:?}", cmd);
+                        }
                         TelemetryCommand::Nitrogen => {
-                                let cmd_id = ActuatorBoardCommands::NitrogenOpen as u8;
-                                let is_on = state.get_umbilical_valve_state(cmd_id).unwrap_or(false);
-                                let cmd = if is_on {
-                                    ActuatorBoardCommands::NitrogenClose
-                                } else {
-                                    ActuatorBoardCommands::NitrogenOpen
-                                };
-                                if let Err(e) = router.log_queue(
-                                    DataType::ActuatorCommand,
-                                    &[cmd as u8],
-                                ) {
-                                    log_telemetry_error("failed to log Nitrogen command", e);
-                                }
-                                println!("Nitrogen command sent {:?}", cmd);
+                            let cmd_id = ActuatorBoardCommands::NitrogenOpen as u8;
+                            let is_on = state.get_umbilical_valve_state(cmd_id).unwrap_or(false);
+                            let cmd = if is_on {
+                                ActuatorBoardCommands::NitrogenClose
+                            } else {
+                                ActuatorBoardCommands::NitrogenOpen
+                            };
+                            if let Err(e) = router.log_queue(
+                                DataType::ActuatorCommand,
+                                &[cmd as u8],
+                            ) {
+                                log_telemetry_error("failed to log Nitrogen command", e);
                             }
+                            println!("Nitrogen command sent {:?}", cmd);
+                        }
                         TelemetryCommand::NitrogenClose => {
-                                if let Err(e) = router.log_queue(
-                                    DataType::ActuatorCommand,
-                                    &[ActuatorBoardCommands::NitrogenClose as u8],
-                                ) {
-                                    log_telemetry_error("failed to log NitrogenClose command", e);
-                                }
-                                println!("Nitrogen explicit close command sent");
+                            if let Err(e) = router.log_queue(
+                                DataType::ActuatorCommand,
+                                &[ActuatorBoardCommands::NitrogenClose as u8],
+                            ) {
+                                log_telemetry_error("failed to log NitrogenClose command", e);
                             }
+                            println!("Nitrogen explicit close command sent");
+                        }
                         TelemetryCommand::RetractPlumbing => {
-                                if let Err(e) = router.log_queue(
-                                    DataType::ActuatorCommand,
-                                    &[ActuatorBoardCommands::RetractPlumbing as u8],
-                                ) {
-                                    log_telemetry_error("failed to log RetractPlumbing command", e);
-                                }
-                                println!("RetractPlumbing command sent");
+                            if let Err(e) = router.log_queue(
+                                DataType::ActuatorCommand,
+                                &[ActuatorBoardCommands::RetractPlumbing as u8],
+                            ) {
+                                log_telemetry_error("failed to log RetractPlumbing command", e);
+                            }
+                            println!("RetractPlumbing command sent");
                         }
                         TelemetryCommand::Nitrous => {
-                                let cmd_id = ActuatorBoardCommands::NitrousOpen as u8;
-                                let is_on = state.get_umbilical_valve_state(cmd_id).unwrap_or(false);
-                                let cmd = if is_on {
-                                    ActuatorBoardCommands::NitrousClose
-                                } else {
-                                    ActuatorBoardCommands::NitrousOpen
-                                };
-                                if let Err(e) = router.log_queue(
-                                    DataType::ActuatorCommand,
-                                    &[cmd as u8],
-                                ) {
-                                    log_telemetry_error("failed to log Nitrous command", e);
-                                }
-                                println!("Nitrous command sent: {:?}", cmd);
+                            let cmd_id = ActuatorBoardCommands::NitrousOpen as u8;
+                            let is_on = state.get_umbilical_valve_state(cmd_id).unwrap_or(false);
+                            let cmd = if is_on {
+                                ActuatorBoardCommands::NitrousClose
+                            } else {
+                                ActuatorBoardCommands::NitrousOpen
+                            };
+                            if let Err(e) = router.log_queue(
+                                DataType::ActuatorCommand,
+                                &[cmd as u8],
+                            ) {
+                                log_telemetry_error("failed to log Nitrous command", e);
+                            }
+                            println!("Nitrous command sent: {:?}", cmd);
                         }
                         TelemetryCommand::NitrousClose => {
                                 if let Err(e) = router.log_queue(
@@ -1194,6 +1175,96 @@ pub async fn telemetry_task(
                         TelemetryCommand::ContinueFillSequence => {
                                 state.request_fill_sequence_continue();
                                 println!("ContinueFillSequence command accepted");
+                        }
+                        TelemetryCommand::DeployParachute => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightComputerCommands::DeployParachute as u8],
+                            ) {
+                                log_telemetry_error("failed to log DeployParachute command", e);
+                            }
+                            println!("DeployParachute command sent");
+                        }
+                        TelemetryCommand::ExpandParachute => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightComputerCommands::ExpandParachute as u8],
+                            ) {
+                                log_telemetry_error("failed to log ExpandParachute command", e);
+                            }
+                            println!("ExpandParachute command sent");
+                        }
+                        TelemetryCommand::ReinitSensors => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightComputerCommands::ReinitSensors as u8],
+                            ) {
+                                log_telemetry_error("failed to log ReinitSensors command", e);
+                            }
+                            println!("ReinitSensors command sent");
+                        }
+                        TelemetryCommand::ReinitBarometer => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightComputerCommands::ReinitBarometer as u8],
+                            ) {
+                                log_telemetry_error("failed to log ReinitBarometer command", e);
+                            }
+                            println!("ReinitBarometer command sent");
+                        }
+                        TelemetryCommand::ReinitIMU => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightComputerCommands::ReinitIMU as u8],
+                            ) {
+                                log_telemetry_error("failed to log EnableIMU command", e);
+                            }
+                            println!("ReinitIMU command sent");
+                        }
+                        TelemetryCommand::MonitorAltitude => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightComputerCommands::MonitorAltitude as u8],
+                            ) {
+                                log_telemetry_error("failed to log MonitorAltitude command", e);
+                            }
+                            println!("MonitorAltitude command sent");
+                        }
+                        TelemetryCommand::RevokeMonitorAltitude => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightComputerCommands::RevokeMonitorAltitude as u8],
+                            ) {
+                                log_telemetry_error("failed to log RevokeMonitorAltitude command", e);
+                            }
+                            println!("RevokeMonitorAltitude command sent");
+                        }
+                        TelemetryCommand::ValidateMeasms => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightComputerCommands::ValidateMeasms as u8],
+                            ) {
+                                log_telemetry_error("failed to log ValidateMeasms command", e);
+                            }
+                            println!("ValidateMeasms command sent");
+                        }
+                        TelemetryCommand::RevokeValidateMeasms => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightComputerCommands::RevokeValidateMeasms as u8],
+                            ) {
+                                log_telemetry_error("failed to log RevokeValidateMeasms command", e);
+                            }
+                            println!("RevokeValidateMeasms command sent");
+                        }
+                        TelemetryCommand::AbortAfter250 => {
+                            if let Err(e) = router.log_queue(
+                                DataType::FlightCommand,
+                                &[FlightComputerCommands::AbortAfter250 as u8],
+                            ) {
+                                log_telemetry_error("failed to log AbortAfter250 command", e);
+                            }
+                            println!("AbortAfter250 command sent");
                         }
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::AdvanceFlightState => {
@@ -1210,36 +1281,25 @@ pub async fn telemetry_task(
                                 println!("HITL flight state rewound: {:?} -> {:?}", current, next);
                         }
                         #[cfg(feature = "hitl_mode")]
-                        TelemetryCommand::DeployParachute
-                        | TelemetryCommand::ExpandParachute
-                        | TelemetryCommand::ReinitSensors
-                        | TelemetryCommand::LaunchSignal
-                        | TelemetryCommand::EvaluationRelax
+                        TelemetryCommand::EvaluationRelax
                         | TelemetryCommand::EvaluationFocus
                         | TelemetryCommand::EvaluationAbort
-                        | TelemetryCommand::ReinitBarometer
-                        | TelemetryCommand::EnableIMU
                         | TelemetryCommand::DisableIMU
-                        | TelemetryCommand::MonitorAltitude
-                        | TelemetryCommand::RevokeMonitorAltitude
                         | TelemetryCommand::ConsecutiveSamples
                         | TelemetryCommand::RevokeConsecutiveSamples
                         | TelemetryCommand::ResetFailures
                         | TelemetryCommand::RevokeResetFailures
-                        | TelemetryCommand::ValidateMeasms
-                        | TelemetryCommand::RevokeValidateMeasms
-                        | TelemetryCommand::AbortAfter15
                         | TelemetryCommand::AbortAfter40
-                        | TelemetryCommand::AbortAfter70
-                        | TelemetryCommand::ReinitAfter12
-                        | TelemetryCommand::ReinitAfter26
-                        | TelemetryCommand::ReinitAfter44 => {
-                                if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
-                                    if let Err(e) = router.log_queue(DataType::FlightCommand, &[cmd_id]) {
-                                        log_telemetry_error("failed to log HITL flight command", e);
-                                    }
-                                    println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
+                        | TelemetryCommand::AbortAfter100
+                        | TelemetryCommand::ReinitAfter15
+                        | TelemetryCommand::ReinitAfter30
+                        | TelemetryCommand::ReinitAfter50 => {
+                            if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
+                                if let Err(e) = router.log_queue(DataType::FlightComputerCommand, &[cmd_id]) {
+                                    log_telemetry_error("failed to log HITL flight command", e);
                                 }
+                                println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
+                            }
                         }
                     }
                 }

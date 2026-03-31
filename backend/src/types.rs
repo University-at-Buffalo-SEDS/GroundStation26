@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TelemetryCommand {
-    Launch,
     Dump,
     Abort,
     NormallyOpen,
@@ -15,13 +14,9 @@ pub enum TelemetryCommand {
     Nitrous,
     NitrousClose,
     ContinueFillSequence,
-    #[cfg(feature = "hitl_mode")]
     DeployParachute,
-    #[cfg(feature = "hitl_mode")]
     ExpandParachute,
-    #[cfg(feature = "hitl_mode")]
     ReinitSensors,
-    #[cfg(feature = "hitl_mode")]
     LaunchSignal,
     #[cfg(feature = "hitl_mode")]
     EvaluationRelax,
@@ -29,15 +24,11 @@ pub enum TelemetryCommand {
     EvaluationFocus,
     #[cfg(feature = "hitl_mode")]
     EvaluationAbort,
-    #[cfg(feature = "hitl_mode")]
     ReinitBarometer,
-    #[cfg(feature = "hitl_mode")]
-    EnableIMU,
+    ReinitIMU,
     #[cfg(feature = "hitl_mode")]
     DisableIMU,
-    #[cfg(feature = "hitl_mode")]
     MonitorAltitude,
-    #[cfg(feature = "hitl_mode")]
     RevokeMonitorAltitude,
     #[cfg(feature = "hitl_mode")]
     ConsecutiveSamples,
@@ -47,22 +38,19 @@ pub enum TelemetryCommand {
     ResetFailures,
     #[cfg(feature = "hitl_mode")]
     RevokeResetFailures,
-    #[cfg(feature = "hitl_mode")]
     ValidateMeasms,
-    #[cfg(feature = "hitl_mode")]
     RevokeValidateMeasms,
-    #[cfg(feature = "hitl_mode")]
-    AbortAfter15,
     #[cfg(feature = "hitl_mode")]
     AbortAfter40,
     #[cfg(feature = "hitl_mode")]
-    AbortAfter70,
+    AbortAfter100,
+    AbortAfter250,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter12,
+    ReinitAfter15,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter26,
+    ReinitAfter30,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter44,
+    ReinitAfter50,
     #[cfg(feature = "hitl_mode")]
     AdvanceFlightState,
     #[cfg(feature = "hitl_mode")]

@@ -346,7 +346,7 @@ fn is_fill_state(state: FlightState) -> bool {
 
 pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
     match cmd {
-        TelemetryCommand::Launch => "Launch",
+        TelemetryCommand::LaunchSignal => "LaunchSignal",
         TelemetryCommand::Dump => "Dump",
         TelemetryCommand::Abort => "Abort",
         TelemetryCommand::NormallyOpen => "NormallyOpen",
@@ -356,29 +356,24 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::Nitrogen | TelemetryCommand::NitrogenClose => "Nitrogen",
         TelemetryCommand::Nitrous | TelemetryCommand::NitrousClose => "Nitrous",
         TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ExpandParachute => "ExpandParachute",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitSensors => "ReinitSensors",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::LaunchSignal => "LaunchSignal",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationRelax => "EvaluationRelax",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationFocus => "EvaluationFocus",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationAbort => "EvaluationAbort",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitBarometer => "ReinitBarometer",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::EnableIMU => "EnableIMU",
+        TelemetryCommand::ReinitIMU => "ReinitIMU",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DisableIMU => "DisableIMU",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::MonitorAltitude => "MonitorAltitude",
+        TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
         #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::RewindFlightState => "RewindFlightState",
+        TelemetryCommand::MonitorAltitude => "MonitorAltitude",
         TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
@@ -388,26 +383,19 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::ResetFailures => "ResetFailures",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::RevokeResetFailures => "RevokeResetFailures",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ValidateMeasms => "ValidateMeasms",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::AbortAfter15 => "AbortAfter15",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter40 => "AbortAfter40",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::AbortAfter70 => "AbortAfter70",
+        TelemetryCommand::AbortAfter100 => "AbortAfter100",
+        TelemetryCommand::AbortAfter250 => "AbortAfter250",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter12 => "ReinitAfter12",
+        TelemetryCommand::ReinitAfter15 => "ReinitAfter15",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter26 => "ReinitAfter26",
+        TelemetryCommand::ReinitAfter30 => "ReinitAfter30",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter44 => "ReinitAfter44",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::RewindFlightState => "RewindFlightState",
+        TelemetryCommand::ReinitAfter50 => "ReinitAfter50",
     }
 }
 
