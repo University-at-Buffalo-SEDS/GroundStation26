@@ -2144,8 +2144,6 @@ fn TelemetryDashboardInner() -> Element {
 
     // Seed from DB (HTTP) on mount
     {
-        let mut last_seed_epoch = use_signal(|| None::<u64>);
-
         let mut warnings_s = warnings;
         let mut errors_s = errors;
         let mut board_status_s = board_status;
@@ -2165,78 +2163,86 @@ fn TelemetryDashboardInner() -> Element {
         let startup_seed_ready = startup_seed_ready;
 
         use_effect(move || {
-            let current_seed = *SEED_EPOCH.read();
-            if last_seed_epoch.read().as_ref() == Some(&current_seed) {
-                return;
-            }
-
-            // Initial seed waits until layout has loaded and the startup delay completes.
-            if !*startup_seed_ready.read() {
-                return;
-            }
-            last_seed_epoch.set(Some(current_seed));
-
-            // Keep current in-memory rows visible until reseed data arrives.
-            // This avoids visible graph "blanking" during reconnect/reseed.
-
             let alive = alive.clone();
-            let seed_epoch = current_seed;
             spawn(async move {
-                if !alive.load(Ordering::Relaxed) || *SEED_EPOCH.read() != seed_epoch {
-                    return;
-                }
+                let mut handled_seed_epoch: Option<u64> = None;
+                while alive.load(Ordering::Relaxed) {
+                    // Initial seed waits until layout has loaded and the startup delay completes.
+                    if !*startup_seed_ready.read() {
+                        #[cfg(target_arch = "wasm32")]
+                        gloo_timers::future::TimeoutFuture::new(150).await;
 
-                let mut last_err: Option<String> = None;
-                const RESEED_ATTEMPTS: usize = 3;
-                for attempt in 1..=RESEED_ATTEMPTS {
-                    let res = seed_from_db(
-                        &mut warnings_s,
-                        &mut errors_s,
-                        &mut notifications_s,
-                        &mut notification_history_s,
-                        &mut dismissed_notifications_s,
-                        &mut unread_notification_ids_s,
-                        &mut action_policy_s,
-                        &mut network_time_s,
-                        &mut network_topology_s,
-                        &mut board_status_s,
-                        &mut rocket_gps_s,
-                        &mut user_gps_s,
-                        &mut ack_warning_ts_s,
-                        &mut ack_error_ts_s,
-                        alive.clone(),
-                    )
-                    .await;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        continue;
+                    }
 
-                    match res {
-                        Ok(()) => {
-                            last_err = None;
-                            break;
-                        }
-                        Err(e) => {
-                            last_err = Some(e);
-                            if attempt < RESEED_ATTEMPTS
-                                && alive.load(Ordering::Relaxed)
-                                && *SEED_EPOCH.read() == seed_epoch
-                            {
-                                #[cfg(target_arch = "wasm32")]
-                                gloo_timers::future::TimeoutFuture::new(400 * attempt as u32).await;
+                    let seed_epoch = *SEED_EPOCH.read();
+                    if handled_seed_epoch == Some(seed_epoch) {
+                        #[cfg(target_arch = "wasm32")]
+                        gloo_timers::future::TimeoutFuture::new(150).await;
 
-                                #[cfg(not(target_arch = "wasm32"))]
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    400 * attempt as u64,
-                                ))
-                                .await;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        continue;
+                    }
+                    handled_seed_epoch = Some(seed_epoch);
+
+                    // Keep current in-memory rows visible until reseed data arrives.
+                    // This avoids visible graph "blanking" during reconnect/reseed.
+                    let mut last_err: Option<String> = None;
+                    const RESEED_ATTEMPTS: usize = 3;
+                    for attempt in 1..=RESEED_ATTEMPTS {
+                        let res = seed_from_db(
+                            &mut warnings_s,
+                            &mut errors_s,
+                            &mut notifications_s,
+                            &mut notification_history_s,
+                            &mut dismissed_notifications_s,
+                            &mut unread_notification_ids_s,
+                            &mut action_policy_s,
+                            &mut network_time_s,
+                            &mut network_topology_s,
+                            &mut board_status_s,
+                            &mut rocket_gps_s,
+                            &mut user_gps_s,
+                            &mut ack_warning_ts_s,
+                            &mut ack_error_ts_s,
+                            alive.clone(),
+                        )
+                        .await;
+
+                        match res {
+                            Ok(()) => {
+                                last_err = None;
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                                if attempt < RESEED_ATTEMPTS
+                                    && alive.load(Ordering::Relaxed)
+                                    && *SEED_EPOCH.read() == seed_epoch
+                                {
+                                    #[cfg(target_arch = "wasm32")]
+                                    gloo_timers::future::TimeoutFuture::new(400 * attempt as u32)
+                                        .await;
+
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        400 * attempt as u64,
+                                    ))
+                                    .await;
+                                }
                             }
                         }
                     }
-                }
 
-                if let Some(e) = last_err
-                    && alive.load(Ordering::Relaxed)
-                    && *SEED_EPOCH.read() == seed_epoch
-                {
-                    log!("seed_from_db failed after retries: {e}");
+                    if let Some(e) = last_err
+                        && alive.load(Ordering::Relaxed)
+                        && *SEED_EPOCH.read() == seed_epoch
+                    {
+                        log!("seed_from_db failed after retries: {e}");
+                    }
                 }
             });
         });
