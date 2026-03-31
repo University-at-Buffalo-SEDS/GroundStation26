@@ -1062,6 +1062,9 @@ def _write_windows_nsis_script(
         icon_path: Path,
         installer_path: Path,
 ) -> None:
+    # fmt: off
+    # Keep this generated NSIS block stable. Reflowing quoted path/value lines can
+    # produce invalid installer scripts with unterminated strings.
     script = f"""
 Unicode True
 SetCompressor /SOLID lzma
@@ -1096,10 +1099,14 @@ Section "Install"
   CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk" "$INSTDIR\\Uninstall.exe"
 
   WriteRegStr HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}" "InstallDir" "$INSTDIR"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "{WINDOWS_APP_NAME}"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" "$INSTDIR\\Uninstall.exe"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "
+{WINDOWS_APP_NAME}"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" 
+  "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" 
+  "$INSTDIR\\Uninstall.exe"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" 
+  "$INSTDIR"
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoModify" 1
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoRepair" 1
 SectionEnd
@@ -1114,6 +1121,7 @@ Section "Uninstall"
   DeleteRegKey HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}"
 SectionEnd
 """.strip()
+    # fmt: on
     script_path.write_text(script, encoding="utf-8")
 
 
@@ -1150,6 +1158,9 @@ Remove-Item $installDir -Recurse -Force
 
 
 def _write_windows_install_script(script_path: Path) -> None:
+    # fmt: off
+    # Keep this generated PowerShell block stable. Reflowing command lines can
+    # break quoted Windows install paths and uninstall command strings.
     script = f"""
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
@@ -1193,13 +1204,20 @@ New-Item -Path "HKCU:\\Software\\UBSEDS\\$appName" -Force | Out-Null
 Set-ItemProperty -Path "HKCU:\\Software\\UBSEDS\\$appName" -Name "InstallDir" -Value $installDir
 
 New-Item -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Force | Out-Null
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayName" -Value $appName
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayIcon" -Value $exePath
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "InstallLocation" -Value $installDir
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoModify" -Type DWord -Value 1
-Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoRepair" -Type DWord -Value 1
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayName" 
+-Value $appName
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayIcon" 
+-Value $exePath
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name 
+"InstallLocation" -Value $installDir
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name 
+"UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoModify" 
+-Type DWord -Value 1
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoRepair" 
+-Type DWord -Value 1
 """.strip()
+    # fmt: on
     script_path.write_text(script, encoding="utf-8")
 
 
@@ -3951,10 +3969,24 @@ def _patch_macos_bundle_icon(frontend_dir: Path) -> None:
     with plist_path.open("rb") as f:
         info = plistlib.load(f)
 
+    executable_name = str(info.get("CFBundleExecutable") or "").strip()
+    macos_dir = app / "Contents" / "MacOS"
+    if executable_name and macos_dir.exists() and executable_name != APP_NAME:
+        src_executable = macos_dir / executable_name
+        dst_executable = macos_dir / APP_NAME
+        if src_executable.exists() and not dst_executable.exists():
+            src_executable.rename(dst_executable)
+
+    if info.get("CFBundleDisplayName") != APP_NAME:
+        info["CFBundleDisplayName"] = APP_NAME
+    if info.get("CFBundleName") != APP_NAME:
+        info["CFBundleName"] = APP_NAME
+    if info.get("CFBundleExecutable") != APP_NAME:
+        info["CFBundleExecutable"] = APP_NAME
     if info.get("CFBundleIconFile") != "icon.icns":
         info["CFBundleIconFile"] = "icon.icns"
-        with plist_path.open("wb") as f:
-            plistlib.dump(info, f, sort_keys=False)
+    with plist_path.open("wb") as f:
+        plistlib.dump(info, f, sort_keys=False)
 
 
 def _ensure_android_icon_compat(frontend_dir: Path, app_src_main: Path) -> None:
@@ -4069,6 +4101,11 @@ def build_frontend(
                 env = os.environ.copy()
             env["DIOXUS_PRODUCT_NAME"] = WINDOWS_APP_NAME
             env["DIOXUS_APP_TITLE"] = WINDOWS_APP_NAME
+        elif platform_name == "macos":
+            if env is None:
+                env = os.environ.copy()
+            env["DIOXUS_PRODUCT_NAME"] = APP_NAME
+            env["DIOXUS_APP_TITLE"] = APP_NAME
         elif platform_name == "linux":
             if env is None:
                 env = os.environ.copy()
@@ -4126,7 +4163,7 @@ def build_frontend(
         if not rust_target:
             rust_target = _default_rust_target_for_frontend(platform_name)
 
-        if platform_name in {"windows", "linux"}:
+        if platform_name in {"windows", "linux", "macos"}:
             _clear_dioxus_bundle_identity_cache(frontend_dir, rust_target, debug_mode, platform_name)
         if platform_name == "windows":
             prepare_windows_dist_for_bundle(frontend_dir)

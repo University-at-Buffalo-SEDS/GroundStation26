@@ -2777,7 +2777,7 @@ fn TelemetryDashboardInner() -> Element {
                         style: "
                             position:fixed;
                             inset:0;
-                            z-index:1000;
+                            z-index:3000;
                             display:flex;
                             align-items:flex-start;
                             justify-content:center;
@@ -2849,7 +2849,7 @@ fn TelemetryDashboardInner() -> Element {
                     style: "
                         position:fixed;
                         inset:0;
-                        z-index:1000;
+                        z-index:3000;
                         display:flex;
                         align-items:flex-start;
                         justify-content:center;
@@ -4791,6 +4791,18 @@ async fn connect_ws_once_wasm(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn insecure_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let connector = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .build()
+            .map_err(|e| format!("native-tls connector build failed: {e}"))?;
+        return Ok(tokio_tungstenite::Connector::NativeTls(connector));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
     #[derive(Debug)]
     struct NoCertificateVerification(std::sync::Arc<rustls::crypto::CryptoProvider>);
 
@@ -4851,6 +4863,7 @@ fn insecure_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
     Ok(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
         config,
     )))
+    }
 }
 
 #[cfg(target_os = "android")]

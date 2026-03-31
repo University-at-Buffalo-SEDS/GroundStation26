@@ -600,6 +600,18 @@ async fn test_routes_host_only(base: &str, skip_tls_verify: bool) -> Vec<RouteCh
 
 #[cfg(not(target_arch = "wasm32"))]
 fn insecure_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let connector = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .build()
+            .map_err(|e| format!("native-tls connector build failed: {e}"))?;
+        return Ok(tokio_tungstenite::Connector::NativeTls(connector));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
     #[derive(Debug)]
     struct NoCertificateVerification(std::sync::Arc<rustls::crypto::CryptoProvider>);
 
@@ -660,6 +672,7 @@ fn insecure_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
     Ok(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
         config,
     )))
+    }
 }
 
 #[cfg(target_os = "android")]
