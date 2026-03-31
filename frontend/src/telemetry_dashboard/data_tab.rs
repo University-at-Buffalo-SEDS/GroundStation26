@@ -17,6 +17,43 @@ use super::{latest_telemetry_row, latest_telemetry_value, translate_text, TELEME
 
 const _ACTIVE_TAB_STORAGE_KEY: &str = "gs26_active_tab";
 const _ACTIVE_SUBTAB_STORAGE_KEY: &str = "gs26_active_data_subtab";
+const DATA_TAB_RESPONSIVE_CSS: &str = r#"
+.gs26-data-tab-shell, .gs26-data-subtab-shell { min-width: 0; }
+.gs26-data-tab-toggle, .gs26-data-subtab-toggle { display:none; }
+.gs26-data-tab-nav, .gs26-data-subtab-nav { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+@media (max-width: 720px), (max-height: 780px) {
+  .gs26-data-tab-shell, .gs26-data-subtab-shell {
+    display:grid;
+    grid-template-columns:1fr;
+    gap:0.75rem;
+    width:100%;
+  }
+  .gs26-data-tab-toggle, .gs26-data-subtab-toggle {
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    justify-self:start;
+    padding:0.55rem 0.9rem;
+    border-radius:0.75rem;
+    border:1px solid var(--gs26-data-toggle-border);
+    background:var(--gs26-data-toggle-background);
+    color:var(--gs26-data-toggle-text);
+    font:inherit;
+    font-weight:800;
+    cursor:pointer;
+  }
+  .gs26-data-tab-nav, .gs26-data-subtab-nav { display:none; width:100%; }
+  .gs26-data-tab-shell[data-expanded="true"] .gs26-data-tab-nav,
+  .gs26-data-subtab-shell[data-expanded="true"] .gs26-data-subtab-nav {
+    display:flex;
+    flex-direction:column;
+    align-items:stretch;
+  }
+  .gs26-data-tab-nav button, .gs26-data-subtab-nav button {
+    width:100%;
+  }
+}
+"#;
 
 #[cfg(target_arch = "wasm32")]
 fn localstorage_get(key: &str) -> Option<String> {
@@ -42,6 +79,8 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
     let is_fullscreen = use_signal(|| false);
     let show_chart = use_signal(|| true);
     let active_subtab = use_signal(String::new);
+    let tabs_expanded = use_signal(|| false);
+    let subtabs_expanded = use_signal(|| false);
 
     // -------- Restore + persist active tab --------
     let did_restore = use_signal(|| false);
@@ -212,6 +251,23 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
     let (chan_min, chan_max) =
         charts_cache_get_channel_minmax(&chart_key, view_w as f32, view_h as f32);
     let chart_groups = effective_chart_groups(current_tab, selected_subtab.as_ref(), labels.len());
+    let data_tabs_toggle_label = if *tabs_expanded.read() {
+        "Hide data tabs".to_string()
+    } else {
+        let label = current_tab
+            .map(|tab| translate_text(&tab.label))
+            .unwrap_or_else(|| translate_text("Data tabs"));
+        format!("Show data tabs ({label})")
+    };
+    let data_subtabs_toggle_label = if *subtabs_expanded.read() {
+        "Hide subtabs".to_string()
+    } else {
+        let label = selected_subtab
+            .as_ref()
+            .map(|subtab| translate_text(&subtab.label))
+            .unwrap_or_else(|| translate_text("Subtabs"));
+        format!("Show subtabs ({label})")
+    };
     let summary_content = if !summary_items.is_empty() {
         rsx! {
             div {
@@ -263,12 +319,29 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
     };
 
     rsx! {
+        style {
+            "{DATA_TAB_RESPONSIVE_CSS}"
+        }
         div {
-            style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto; display:flex; flex-direction:column; gap:12px; padding-bottom:10px;",
+            style: "padding:16px; height:100%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:auto; display:flex; flex-direction:column; gap:12px; padding-bottom:10px; --gs26-data-toggle-background:{theme.tab_shell_background}; --gs26-data-toggle-border:{theme.tab_shell_border}; --gs26-data-toggle-text:{theme.button_text};",
 
             div { style: "display:flex; flex-direction:column; gap:10px;",
 
-                div { style: "display:flex; gap:8px; flex-wrap:wrap; align-items:center;",
+                div {
+                    class: "gs26-data-tab-shell",
+                    "data-expanded": if *tabs_expanded.read() { "true" } else { "false" },
+                    button {
+                        class: "gs26-data-tab-toggle",
+                        onclick: {
+                            let mut tabs_expanded = tabs_expanded;
+                            move |_| {
+                                let next = !*tabs_expanded.read();
+                                tabs_expanded.set(next);
+                            }
+                        },
+                        "{data_tabs_toggle_label}"
+                    }
+                div { class: "gs26-data-tab-nav",
                     for t in types.iter().take(32) {
                         button {
                             style: if t.id == current {
@@ -300,15 +373,36 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                             onclick: {
                                 let t = t.id.clone();
                                 let mut active_tab2 = active_tab;
-                                move |_| active_tab2.set(t.clone())
+                                let mut tabs_expanded = tabs_expanded;
+                                let mut subtabs_expanded = subtabs_expanded;
+                                move |_| {
+                                    active_tab2.set(t.clone());
+                                    tabs_expanded.set(false);
+                                    subtabs_expanded.set(false);
+                                }
                             },
                             "{translate_text(&t.label)}"
                         }
                     }
                 }
+                }
 
                 if !current_subtabs.is_empty() {
-                    div { style: "display:flex; gap:8px; flex-wrap:wrap; align-items:center;",
+                    div {
+                        class: "gs26-data-subtab-shell",
+                        "data-expanded": if *subtabs_expanded.read() { "true" } else { "false" },
+                        button {
+                            class: "gs26-data-subtab-toggle",
+                            onclick: {
+                                let mut subtabs_expanded = subtabs_expanded;
+                                move |_| {
+                                    let next = !*subtabs_expanded.read();
+                                    subtabs_expanded.set(next);
+                                }
+                            },
+                            "{data_subtabs_toggle_label}"
+                        }
+                    div { class: "gs26-data-subtab-nav",
                         for subtab in current_subtabs.iter() {
                             button {
                                 style: if selected_subtab.as_ref().is_some_and(|active| active.id == subtab.id) {
@@ -340,11 +434,16 @@ pub fn DataTab(active_tab: Signal<String>, layout: DataTabLayout, theme: ThemeCo
                                 onclick: {
                                     let id = subtab.id.clone();
                                     let mut active_subtab = active_subtab;
-                                    move |_| active_subtab.set(id.clone())
+                                    let mut subtabs_expanded = subtabs_expanded;
+                                    move |_| {
+                                        active_subtab.set(id.clone());
+                                        subtabs_expanded.set(false);
+                                    }
                                 },
                                 "{translate_text(&subtab.label)}"
                             }
                         }
+                    }
                     }
                 }
 

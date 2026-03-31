@@ -124,8 +124,13 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .layer(CompressionLayer::new())
         .route("/", get_service(spa_index.clone()))
+        .route("/connect", get_service(spa_index.clone()))
         .route("/login", get_service(spa_index.clone()))
         .route("/dashboard", get_service(spa_index))
+        .route(
+            "/version",
+            get_service(ServeFile::new("./frontend/dist/public/index.html")),
+        )
         .route("/api/auth/login", post(login))
         .route("/api/auth/session", get(get_session_status))
         .route("/api/auth/logout", post(logout))

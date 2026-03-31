@@ -1092,10 +1092,14 @@ Section "Install"
   CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk" "$INSTDIR\\Uninstall.exe"
 
   WriteRegStr HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}" "InstallDir" "$INSTDIR"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "{WINDOWS_APP_NAME}"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" "$INSTDIR\\Uninstall.exe"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "
+{WINDOWS_APP_NAME}"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" 
+  "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" 
+  "$INSTDIR\\Uninstall.exe"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" 
+  "$INSTDIR"
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoModify" 1
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoRepair" 1
 SectionEnd

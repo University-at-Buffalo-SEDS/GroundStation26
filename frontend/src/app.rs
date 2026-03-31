@@ -7,7 +7,10 @@ const _WS_TIMEOUT_MS: u64 = 4500;
 const APP_DISPLAY_NAME: &str = "Telemetry Client";
 
 use crate::auth::{self, SessionStatus as AuthSessionStatus};
+use crate::telemetry_dashboard::layout::ThemeConfig;
 use dioxus::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
+use dioxus_desktop::use_window;
 use dioxus_router::{use_navigator, Routable, Router};
 
 #[allow(unused_imports)]
@@ -73,9 +76,12 @@ fn all_tests_passed(checks: &[RouteCheck], ws_probe: &Option<Result<String, Stri
 }
 
 // --- global css ---
-const GLOBAL_CSS: &str = r#"
+fn global_css() -> &'static str {
+    r#"
 :root {
     --gs26-app-height: 100dvh;
+    --gs26-app-background: #020617;
+    --gs26-app-text: #e5e7eb;
 }
 
 @supports not (height: 100dvh) {
@@ -90,7 +96,8 @@ html, body {
     width: 100%;
     min-height: var(--gs26-app-height);
     height: var(--gs26-app-height);
-    background: #020617;
+    background: var(--gs26-app-background);
+    color: var(--gs26-app-text);
     overflow: hidden;
 }
 
@@ -102,13 +109,95 @@ html, body {
     width: 100%;
     min-height: var(--gs26-app-height);
     height: var(--gs26-app-height);
-    background: #020617;
+    background: var(--gs26-app-background);
+    color: var(--gs26-app-text);
 }
 
 * { box-sizing: border-box; }
-"#;
+"#
+}
 
 const _CONNECT_SHOWN_KEY: &str = "gs_connect_shown";
+
+fn shell_theme() -> ThemeConfig {
+    telemetry_dashboard::app_shell_theme()
+}
+
+fn hex_to_rgba(color: &str) -> Option<(u8, u8, u8, u8)> {
+    let hex = color.trim().trim_start_matches('#');
+    match hex.len() {
+        6 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some((r, g, b, 255))
+        }
+        8 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+            Some((r, g, b, a))
+        }
+        _ => None,
+    }
+}
+
+fn shell_page_style(theme: &ThemeConfig) -> String {
+    format!(
+        "min-height:var(--gs26-app-height); height:var(--gs26-app-height); overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:{}; color:{}; font-family:system-ui, -apple-system, BlinkMacSystemFont;",
+        theme.app_background, theme.text_primary
+    )
+}
+
+fn shell_card_style(theme: &ThemeConfig, width: &str) -> String {
+    format!(
+        "width:{width}; padding:24px; border:1px solid {}; border-radius:16px; background:{}; color:{}; box-shadow:0 12px 30px rgba(0,0,0,0.34);",
+        theme.border_strong, theme.panel_background, theme.text_primary
+    )
+}
+
+fn shell_button_style(theme: &ThemeConfig) -> String {
+    format!(
+        "padding:10px 14px; border-radius:12px; border:1px solid {}; background:{}; color:{}; font-family:system-ui, -apple-system, BlinkMacSystemFont; cursor:pointer;",
+        theme.button_border, theme.button_background, theme.button_text
+    )
+}
+
+fn shell_button_alt_style(theme: &ThemeConfig) -> String {
+    format!(
+        "padding:10px 14px; border-radius:12px; border:1px solid {}; background:{}; color:{}; font-family:system-ui, -apple-system, BlinkMacSystemFont; cursor:pointer;",
+        theme.tab_shell_border, theme.panel_background_alt, theme.text_primary
+    )
+}
+
+fn shell_input_style(theme: &ThemeConfig, margin_bottom: bool) -> String {
+    format!(
+        "width:100%; padding:12px; border-radius:12px; border:1px solid {}; background:{}; color:{}; outline:none;{}",
+        theme.border,
+        theme.app_background,
+        theme.text_primary,
+        if margin_bottom {
+            " margin-bottom:12px;"
+        } else {
+            ""
+        }
+    )
+}
+
+fn shell_notice_style(theme: &ThemeConfig) -> String {
+    format!(
+        "margin-top:14px; padding:12px; border-radius:12px; border:1px solid {}; background:{}; color:{}; white-space:pre-wrap;",
+        theme.border, theme.app_background, theme.text_secondary
+    )
+}
+
+fn shell_warning_style(theme: &ThemeConfig) -> String {
+    format!(
+        "margin-bottom:14px; padding:12px; border-radius:12px; border:1px solid {}; background:{}; color:{};",
+        theme.warning_border, theme.warning_background, theme.warning_text
+    )
+}
 
 #[derive(Clone, Routable, PartialEq)]
 pub enum Route {
@@ -667,6 +756,61 @@ pub fn App() -> Element {
     {
         keep_awake::set_enabled(true);
     }
+    let app_shell_epoch = *telemetry_dashboard::APP_SHELL_EPOCH.read();
+    let shell_theme = telemetry_dashboard::app_shell_theme();
+    let global_css = global_css();
+    {
+        use_effect(move || {
+            let theme = telemetry_dashboard::APP_THEME_CONFIG.read().clone();
+            let app_background = theme.app_background;
+            let text_primary = theme.text_primary;
+            telemetry_dashboard::js_eval(&format!(
+                r#"
+                (function() {{
+                  try {{
+                    const bg = {bg:?};
+                    const fg = {fg:?};
+                    document.documentElement.style.setProperty('--gs26-app-background', bg);
+                    document.documentElement.style.setProperty('--gs26-app-text', fg);
+                    document.documentElement.style.backgroundColor = bg;
+                    document.documentElement.style.color = fg;
+                    if (document.body) {{
+                      document.body.style.setProperty('--gs26-app-background', bg);
+                      document.body.style.setProperty('--gs26-app-text', fg);
+                      document.body.style.backgroundColor = bg;
+                      document.body.style.color = fg;
+                    }}
+                    const main = document.getElementById("main");
+                    if (main) {{
+                      main.style.setProperty('--gs26-app-background', bg);
+                      main.style.setProperty('--gs26-app-text', fg);
+                      main.style.backgroundColor = bg;
+                      main.style.color = fg;
+                    }}
+                  }} catch (_) {{}}
+                }})();
+                "#,
+                bg = app_background,
+                fg = text_primary,
+            ));
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let window = use_window();
+        use_effect(move || {
+            let app_background = telemetry_dashboard::APP_THEME_CONFIG
+                .read()
+                .app_background
+                .clone();
+            let rgba = hex_to_rgba(&app_background);
+            window.set_background_color(rgba);
+            if let Some(rgba) = rgba {
+                let _ = window.webview.set_background_color(rgba);
+            }
+            window.request_redraw();
+        });
+    }
     let map_assets: Element = {
         #[cfg(target_arch = "wasm32")]
         {
@@ -690,12 +834,12 @@ pub fn App() -> Element {
         }
     };
     rsx! {
-        document::Style { "{GLOBAL_CSS}" }
-        Meta { name: "viewport", content: "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" }
-        {map_assets}
-
         div {
-            style: "min-height: var(--gs26-app-height); width: 100%; background: #020617; color: #e5e7eb;",
+            key: "{app_shell_epoch}",
+            style: "min-height: var(--gs26-app-height); width: 100%; --gs26-app-background: {shell_theme.app_background}; --gs26-app-text: {shell_theme.text_primary}; background: var(--gs26-app-background); color: var(--gs26-app-text);",
+            document::Style { "{global_css}" }
+            Meta { name: "viewport", content: "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" }
+            {map_assets}
             Router::<Route> {}
         }
     }
@@ -734,6 +878,7 @@ fn LoginCard(
     on_success_route: Route,
     #[props(default = false)] overlay_mode: bool,
 ) -> Element {
+    let theme = shell_theme();
     let nav = use_navigator();
     let base = UrlConfig::base_http();
     auth::init_from_storage(&base);
@@ -819,14 +964,17 @@ fn LoginCard(
     rsx! {
         div {
             style: if overlay_mode {
-                "width:min(560px, 92vw); color:#e5e7eb; font-family:system-ui;"
+                format!(
+                    "width:min(560px, 92vw); color:{}; font-family:system-ui, -apple-system, BlinkMacSystemFont;",
+                    theme.text_primary
+                )
             } else {
-                "min-height:var(--gs26-app-height); height:var(--gs26-app-height); overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;"
+                shell_page_style(&theme)
             },
             div {
-                style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
+                style: shell_card_style(&theme, "min(560px, 92vw)"),
                 h1 { style: "margin:0 0 10px 0; font-size:22px;", "{title}" }
-                p { style: "margin:0 0 16px 0; color:#94a3b8;", "{subtitle}" }
+                p { style: "margin:0 0 16px 0; color:{theme.text_muted};", "{subtitle}" }
                 form {
                     onsubmit: move |evt| {
                         evt.prevent_default();
@@ -834,30 +982,30 @@ fn LoginCard(
                     },
                     if base.trim().is_empty() {
                         div {
-                            style: "margin-bottom:14px; padding:12px; border-radius:12px; border:1px solid #7c2d12; background:#451a03; color:#fed7aa;",
+                            style: shell_warning_style(&theme),
                             "Configure the backend URL before logging in."
                         }
                     }
 
-                    label { r#for: "gs26-login-username", style: "display:block; margin-bottom:8px; font-size:13px; color:#94a3b8;", "Username" }
+                    label { r#for: "gs26-login-username", style: "display:block; margin-bottom:8px; font-size:13px; color:{theme.text_muted};", "Username" }
                     input {
                         id: "gs26-login-username",
                         name: "username",
                         autocomplete: "username",
                         autocapitalize: "none",
                         spellcheck: "false",
-                        style: "width:100%; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#e5e7eb; outline:none; margin-bottom:12px;",
+                        style: shell_input_style(&theme, true),
                         placeholder: "Username",
                         value: "{username()}",
                         oninput: move |evt| username.set(evt.value()),
                     }
 
-                    label { r#for: "gs26-login-password", style: "display:block; margin-bottom:8px; font-size:13px; color:#94a3b8;", "Password" }
+                    label { r#for: "gs26-login-password", style: "display:block; margin-bottom:8px; font-size:13px; color:{theme.text_muted};", "Password" }
                     input {
                         id: "gs26-login-password",
                         name: "password",
                         autocomplete: "current-password",
-                        style: "width:100%; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#e5e7eb; outline:none;",
+                        style: shell_input_style(&theme, false),
                         r#type: "password",
                         placeholder: "Password",
                         value: "{password()}",
@@ -873,12 +1021,12 @@ fn LoginCard(
                                 remember_me.set(next);
                             },
                         }
-                        div { style: "font-size:13px; color:#94a3b8;", "Remember this device until the backend session expires" }
+                        div { style: "font-size:13px; color:{theme.text_muted};", "Remember this device until the backend session expires" }
                     }
 
                     if !status().is_empty() {
                         div {
-                            style: "margin-top:14px; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#cbd5e1; white-space:pre-wrap;",
+                            style: shell_notice_style(&theme),
                             "{status()}"
                         }
                     }
@@ -886,7 +1034,7 @@ fn LoginCard(
                     div { style: "display:flex; gap:12px; margin-top:16px; justify-content:flex-end; flex-wrap:wrap;",
                     if matches!(logged_out_status.read().as_ref(), Some(Ok(status)) if status.permissions.view_data) {
                         button {
-                            style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#0f172a; color:#e5e7eb; cursor:pointer;",
+                            style: shell_button_alt_style(&theme),
                             r#type: "button",
                             disabled: busy() || base.trim().is_empty(),
                             onclick: move |_| {
@@ -915,7 +1063,7 @@ fn LoginCard(
 
                     if allow_back_to_connect {
                         button {
-                            style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
+                            style: shell_button_style(&theme),
                             r#type: "button",
                             onclick: move |_| {
                                 let _ = nav.replace(connect_route());
@@ -926,7 +1074,7 @@ fn LoginCard(
 
                     button {
                         r#type: "submit",
-                        style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
+                        style: shell_button_style(&theme),
                         disabled: busy() || base.trim().is_empty(),
                         if busy() { "Signing In..." } else { "Sign In" }
                     }
@@ -939,24 +1087,25 @@ fn LoginCard(
 
 #[component]
 fn ConnectionFailedCard(message: String, on_retry: EventHandler<()>) -> Element {
+    let theme = shell_theme();
     let nav = use_navigator();
     rsx! {
         div {
-            style: "min-height:var(--gs26-app-height); height:var(--gs26-app-height); overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            style: shell_page_style(&theme),
             div {
-                style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
+                style: shell_card_style(&theme, "min(560px, 92vw)"),
                 h1 { style: "margin:0 0 10px 0; font-size:22px;", "Failed to Connect" }
-                p { style: "margin:0 0 16px 0; color:#94a3b8; white-space:pre-wrap;", "{message}" }
+                p { style: "margin:0 0 16px 0; color:{theme.text_muted}; white-space:pre-wrap;", "{message}" }
                 div { style: "display:flex; gap:12px; justify-content:flex-end; flex-wrap:wrap;",
                     button {
-                        style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer;",
+                        style: shell_button_style(&theme),
                         onclick: move |_| {
                             let _ = nav.replace(connect_route());
                         },
                         "Back to Connect"
                     }
                     button {
-                        style: "padding:10px 14px; border-radius:12px; border:1px solid #334155; background:#0f172a; color:#e5e7eb; cursor:pointer;",
+                        style: shell_button_alt_style(&theme),
                         onclick: move |_| {
                             on_retry.call(());
                         },
@@ -975,12 +1124,16 @@ fn LoginOverlay(
     allow_back_to_connect: bool,
     on_success_route: Route,
 ) -> Element {
+    let theme = shell_theme();
     rsx! {
         div {
             style: "position:relative; width:100%; min-height:var(--gs26-app-height);",
             crate::telemetry_dashboard::TelemetryDashboard {}
             div {
-                style: "position:fixed; inset:0; display:flex; align-items:center; justify-content:center; padding:24px; background:rgba(2, 6, 23, 0.78); backdrop-filter:blur(8px); z-index:1000;",
+                style: format!(
+                    "position:fixed; inset:0; display:flex; align-items:center; justify-content:center; padding:24px; background:{}; backdrop-filter:blur(8px); z-index:1000;",
+                    theme.overlay_background
+                ),
                 LoginCard {
                     title: title.clone(),
                     subtitle: subtitle.clone(),
@@ -1023,6 +1176,7 @@ pub fn Login() -> Element {
 #[cfg(not(target_arch = "wasm32"))]
 #[component]
 pub fn Connect() -> Element {
+    let theme = shell_theme();
     let nav = use_navigator();
 
     let initial =
@@ -1037,35 +1191,28 @@ pub fn Connect() -> Element {
 
     rsx! {
         div {
-            style: "min-height:var(--gs26-app-height); height:var(--gs26-app-height); overflow-y:auto; overflow-x:hidden; display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+            style: shell_page_style(&theme),
             div {
-                style: "width:min(900px, 94vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
+                style: shell_card_style(&theme, "min(900px, 94vw)"),
 
                 div {
                     style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px;",
                     h1 { style: "margin:0; font-size:20px;", "{APP_DISPLAY_NAME}" }
                     button {
-                        style: "
-                            padding:10px 14px;
-                            border-radius:12px;
-                            border:1px solid #334155;
-                            background:#111827;
-                            color:#e5e7eb;
-                            cursor:pointer;
-                        ",
+                        style: shell_button_style(&theme),
                         onclick: move |_| {
                             let _ = nav.push(Route::Version {});
                         },
                         "Version"
                     }
                 }
-                p { style: "margin:0 0 16px 0; color:#94a3b8;",
+                p { style: "margin:0 0 16px 0; color:{theme.text_muted};",
                     "Enter the backend URL (including http:// or https://). Example: ",
                     code { "https://your-backend-url.com" }
                 }
 
                 input {
-                    style: "width:100%; padding:12px; border-radius:12px; border:1px solid #334155; background:#020617; color:#e5e7eb; outline:none;",
+                    style: shell_input_style(&theme, false),
                     value: "{url_edit()}",
                     oninput: move |evt| {
                         url_edit.set(evt.value());
@@ -1086,7 +1233,7 @@ pub fn Connect() -> Element {
                             }
                         }
                     }
-                    div { style: "font-size:13px; color:#94a3b8;",
+                    div { style: "font-size:13px; color:{theme.text_muted};",
                         "Disable TLS certificate verification for this host (self-signed certs)"
                     }
                 }
@@ -1097,9 +1244,9 @@ pub fn Connect() -> Element {
                             margin:14px 0 0 0;
                             padding:12px;
                             border-radius:12px;
-                            border:1px solid #334155;
-                            background:#020617;
-                            color:#cbd5e1;
+                            border:1px solid {theme.border};
+                            background:{theme.app_background};
+                            color:{theme.text_secondary};
                             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
                             font-size:12px;
                             line-height:1.35;
@@ -1113,14 +1260,7 @@ pub fn Connect() -> Element {
 
                 div { style: "display:flex; gap:12px; margin-top:16px; justify-content:flex-end; flex-wrap:wrap;",
                     button {
-                        style: "
-                            padding:10px 14px;
-                            border-radius:12px;
-                            border:1px solid #334155;
-                            background:#111827;
-                            color:#e5e7eb;
-                            cursor:pointer;
-                        ",
+                        style: shell_button_style(&theme),
                         onclick: move |_| {
                             let u_norm = normalize_base_url(url_edit().trim().to_string());
                             if u_norm.is_empty() {
@@ -1142,14 +1282,7 @@ pub fn Connect() -> Element {
                     }
 
                     button {
-                        style: "
-                            padding:10px 14px;
-                            border-radius:12px;
-                            border:1px solid #334155;
-                            background:#0f172a;
-                            color:#e5e7eb;
-                            cursor:pointer;
-                        ",
+                        style: shell_button_alt_style(&theme),
                         disabled: testing(),
                         onclick: move |_| {
                             let u_norm = normalize_base_url(url_edit().trim().to_string());
@@ -1188,14 +1321,7 @@ pub fn Connect() -> Element {
                     }
 
                     button {
-                        style: "
-                            padding:10px 14px;
-                            border-radius:12px;
-                            border:1px solid #334155;
-                            background:#111827;
-                            color:#e5e7eb;
-                            cursor:pointer;
-                        ",
+                        style: shell_button_style(&theme),
                         onclick: move |_| {
                             let u_norm = normalize_base_url(url_edit().trim().to_string());
                             if u_norm.is_empty() {
@@ -1232,6 +1358,7 @@ pub fn Connect() -> Element {
 #[cfg(not(target_arch = "wasm32"))]
 #[component]
 pub fn Version() -> Element {
+    let theme = shell_theme();
     let nav = use_navigator();
     let can_go_back = nav.can_go_back();
     let back_action = move |_| {
@@ -1246,22 +1373,18 @@ pub fn Version() -> Element {
 
     rsx! {
         div {
-            style: "position:fixed; inset:0; overflow-y:auto; overflow-x:hidden; display:flex; align-items:flex-start; justify-content:center; padding:24px 16px; background:#020617; color:#e5e7eb; font-family:system-ui; overscroll-behavior:contain; -webkit-overflow-scrolling:touch;",
+            style: format!(
+                "position:fixed; inset:0; overflow-y:auto; overflow-x:hidden; display:flex; align-items:flex-start; justify-content:center; padding:24px 16px; background:{}; color:{}; font-family:system-ui, -apple-system, BlinkMacSystemFont; overscroll-behavior:contain; -webkit-overflow-scrolling:touch;",
+                theme.app_background,
+                theme.text_primary
+            ),
             div {
-                style: "width:min(900px, 100%); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220; box-shadow:0 12px 30px rgba(0,0,0,0.5);",
+                style: shell_card_style(&theme, "min(900px, 100%)"),
                 div {
                     style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap;",
                     h1 { style: "margin:0; font-size:20px;", "{APP_DISPLAY_NAME}" }
                     button {
-                        style: "
-                            padding:10px 14px;
-                            border-radius:12px;
-                            border:1px solid #334155;
-                            background:#111827;
-                            color:#e5e7eb;
-                            font-weight:700;
-                            cursor:pointer;
-                        ",
+                        style: shell_button_style(&theme),
                         onclick: back_action,
                         "Back"
                     }
@@ -1278,23 +1401,20 @@ pub fn Dashboard() -> Element {
     {
         let nav = use_navigator();
         if UrlConfig::_stored_base_url().is_none() {
+            let theme = shell_theme();
             return rsx! {
                 div {
-                    style: "height:var(--gs26-app-height); display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
+                    style: format!(
+                        "height:var(--gs26-app-height); display:flex; align-items:center; justify-content:center; background:{}; color:{}; font-family:system-ui, -apple-system, BlinkMacSystemFont;",
+                        theme.app_background,
+                        theme.text_primary
+                    ),
                     div {
-                        style: "width:min(560px, 92vw); padding:24px; border:1px solid #334155; border-radius:16px; background:#0b1220;",
+                        style: shell_card_style(&theme, "min(560px, 92vw)"),
                         h1 { style: "margin:0 0 12px 0; font-size:18px;", "Not connected" }
-                        p { style: "margin:0 0 16px 0; color:#94a3b8;", "Please configure the backend URL on the Connect screen." }
+                        p { style: "margin:0 0 16px 0; color:{theme.text_muted};", "Please configure the backend URL on the Connect screen." }
                         button {
-                            style: "
-                                padding:10px 14px;
-                                border-radius:10px;
-                                border:1px solid #334155;
-                                background:#111827;
-                                color:#e5e7eb;
-                                font-weight:700;
-                                cursor:pointer;
-                            ",
+                            style: shell_button_style(&theme),
                             onclick: move |_| {
                                 let _ = nav.replace(connect_route());
                             },
@@ -1327,8 +1447,8 @@ pub fn Dashboard() -> Element {
 
     match auth_state.read().as_ref() {
         None => rsx! {
-            div { style: "height:var(--gs26-app-height); display:flex; align-items:center; justify-content:center; background:#020617; color:#e5e7eb; font-family:system-ui;",
-                div { style: "padding:20px; border:1px solid #334155; border-radius:16px; background:#0b1220;", "Checking session..." }
+            div { style: format!("height:var(--gs26-app-height); display:flex; align-items:center; justify-content:center; background:{}; color:{}; font-family:system-ui, -apple-system, BlinkMacSystemFont;", shell_theme().app_background, shell_theme().text_primary),
+                div { style: format!("padding:20px; border:1px solid {}; border-radius:16px; background:{};", shell_theme().border_strong, shell_theme().panel_background), "Checking session..." }
             }
         },
         Some(Ok(status)) if status.permissions.view_data => {

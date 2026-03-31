@@ -960,6 +960,24 @@ static WS_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 static TELEMETRY_RENDER_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 static PREFERRED_LANGUAGE: GlobalSignal<String> = Signal::global(|| "en".to_string());
 static TRANSLATION_CATALOG: GlobalSignal<HashMap<String, String>> = Signal::global(HashMap::new);
+pub(crate) static APP_THEME_PRESET: GlobalSignal<String> = Signal::global(|| {
+    let stored = persist::get_or(THEME_PRESET_STORAGE_KEY, "default");
+    if stored == "layout" {
+        "backend".to_string()
+    } else {
+        stored
+    }
+});
+pub(crate) static APP_THEME_CONFIG: GlobalSignal<layout::ThemeConfig> = Signal::global(|| {
+    let stored = persist::get_or(THEME_PRESET_STORAGE_KEY, "default");
+    let preset = if stored == "layout" {
+        "backend"
+    } else {
+        &stored
+    };
+    localized_theme(&layout::ThemeConfig::default(), preset)
+});
+pub(crate) static APP_SHELL_EPOCH: GlobalSignal<u64> = Signal::global(|| 0);
 
 #[cfg(target_arch = "wasm32")]
 static WS_RAW: GlobalSignal<Option<web_sys::WebSocket>> = Signal::global(|| None);
@@ -1161,65 +1179,65 @@ fn localized_theme(base: &layout::ThemeConfig, preset: &str) -> layout::ThemeCon
     };
     match preset {
         "sunset" => {
-            out.app_background = "#1a0f0a".to_string();
-            out.panel_background = "#2a1711".to_string();
-            out.panel_background_alt = "#341d16".to_string();
-            out.overlay_background = "#1a0f0aee".to_string();
-            out.border = "#7c2d12".to_string();
-            out.border_strong = "#9a3412".to_string();
-            out.border_soft = "#4a1d14".to_string();
-            out.text_primary = "#ffedd5".to_string();
-            out.text_secondary = "#fed7aa".to_string();
-            out.text_muted = "#fdba74".to_string();
-            out.text_soft = "#f59e0b".to_string();
-            out.button_background = "#3b1f17".to_string();
-            out.button_border = "#c2410c".to_string();
-            out.button_text = "#ffedd5".to_string();
-            out.tab_shell_background = "#2a1711ee".to_string();
-            out.tab_shell_border = "#c2410c".to_string();
-            out.info_accent = "#fb923c".to_string();
-            out.info_background = "#431407".to_string();
-            out.info_text = "#fdba74".to_string();
-            out.success_text = "#facc15".to_string();
-            out.warning_background = "#451a03".to_string();
-            out.warning_border = "#f59e0b".to_string();
-            out.warning_text = "#fde68a".to_string();
-            out.error_background = "#4c0519".to_string();
-            out.error_border = "#fb7185".to_string();
-            out.error_text = "#fecdd3".to_string();
+            out.app_background = "#140d0c".to_string();
+            out.panel_background = "#201514".to_string();
+            out.panel_background_alt = "#2b1c1a".to_string();
+            out.overlay_background = "#140d0cf0".to_string();
+            out.border = "#6d4538".to_string();
+            out.border_strong = "#8c5a48".to_string();
+            out.border_soft = "#3b2622".to_string();
+            out.text_primary = "#f5e7dd".to_string();
+            out.text_secondary = "#ddc3b4".to_string();
+            out.text_muted = "#b99582".to_string();
+            out.text_soft = "#d8a15f".to_string();
+            out.button_background = "#32211d".to_string();
+            out.button_border = "#9d6a50".to_string();
+            out.button_text = "#f8ece3".to_string();
+            out.tab_shell_background = "#201514ee".to_string();
+            out.tab_shell_border = "#9d6a50".to_string();
+            out.info_accent = "#e59b57".to_string();
+            out.info_background = "#37201a".to_string();
+            out.info_text = "#f3c79d".to_string();
+            out.success_text = "#9fd28e".to_string();
+            out.warning_background = "#402616".to_string();
+            out.warning_border = "#d7a15c".to_string();
+            out.warning_text = "#f4ddaf".to_string();
+            out.error_background = "#3a171d".to_string();
+            out.error_border = "#d9888f".to_string();
+            out.error_text = "#f4c7cb".to_string();
         }
         "forest" => {
-            out.app_background = "#071510".to_string();
-            out.panel_background = "#0d1f18".to_string();
-            out.panel_background_alt = "#123126".to_string();
-            out.overlay_background = "#071510ee".to_string();
-            out.border = "#1f4d3a".to_string();
-            out.border_strong = "#2f6b51".to_string();
-            out.border_soft = "#163327".to_string();
-            out.text_primary = "#e7f7ef".to_string();
-            out.text_secondary = "#bde7d0".to_string();
-            out.text_muted = "#86c9a8".to_string();
-            out.text_soft = "#6fbf91".to_string();
-            out.button_background = "#11261d".to_string();
-            out.button_border = "#2f6b51".to_string();
-            out.button_text = "#e7f7ef".to_string();
-            out.tab_shell_background = "#0d1f18ee".to_string();
-            out.tab_shell_border = "#2f6b51".to_string();
-            out.info_accent = "#34d399".to_string();
-            out.info_background = "#0c2b20".to_string();
-            out.info_text = "#a7f3d0".to_string();
-            out.success_text = "#4ade80".to_string();
-            out.warning_background = "#3f3411".to_string();
-            out.warning_border = "#facc15".to_string();
-            out.warning_text = "#fde68a".to_string();
-            out.error_background = "#3b0d18".to_string();
-            out.error_border = "#fb7185".to_string();
-            out.error_text = "#fecdd3".to_string();
+            out.app_background = "#091311".to_string();
+            out.panel_background = "#101c19".to_string();
+            out.panel_background_alt = "#162723".to_string();
+            out.overlay_background = "#091311f0".to_string();
+            out.border = "#335248".to_string();
+            out.border_strong = "#4b6f62".to_string();
+            out.border_soft = "#213630".to_string();
+            out.text_primary = "#e6f0eb".to_string();
+            out.text_secondary = "#bfd2c8".to_string();
+            out.text_muted = "#8eafa2".to_string();
+            out.text_soft = "#75a58d".to_string();
+            out.button_background = "#1b2d28".to_string();
+            out.button_border = "#5d8677".to_string();
+            out.button_text = "#edf5f1".to_string();
+            out.tab_shell_background = "#101c19ee".to_string();
+            out.tab_shell_border = "#5d8677".to_string();
+            out.info_accent = "#7cc7a5".to_string();
+            out.info_background = "#17312a".to_string();
+            out.info_text = "#c2ecd8".to_string();
+            out.success_text = "#93d39f".to_string();
+            out.warning_background = "#3b3320".to_string();
+            out.warning_border = "#c9ad63".to_string();
+            out.warning_text = "#efe0b2".to_string();
+            out.error_background = "#34181d".to_string();
+            out.error_border = "#cf8790".to_string();
+            out.error_text = "#f0c7cc".to_string();
         }
         "high_contrast" => {
             out.app_background = "#000000".to_string();
-            out.panel_background = "#0a0a0a".to_string();
-            out.panel_background_alt = "#141414".to_string();
+            out.panel_background = "#0b0b0b".to_string();
+            out.panel_background_alt = "#171717".to_string();
             out.overlay_background = "#000000f2".to_string();
             out.border = "#ffffff".to_string();
             out.border_strong = "#ffffff".to_string();
@@ -1247,6 +1265,14 @@ fn localized_theme(base: &layout::ThemeConfig, preset: &str) -> layout::ThemeCon
         _ => {}
     }
     out
+}
+
+/// Returns the app-shell theme derived from the persisted preset.
+///
+/// Outside the live dashboard we do not have a backend-provided theme available, so
+/// the "backend" preset falls back to the default theme config for shell styling.
+pub fn app_shell_theme() -> layout::ThemeConfig {
+    APP_THEME_CONFIG.read().clone()
 }
 
 #[component]
@@ -1671,15 +1697,9 @@ fn TelemetryDashboardInner() -> Element {
             .map(|v| v == "metric")
             .unwrap_or(false)
     });
-    let theme_preset = use_signal(|| {
-        let stored = persist::get_or(THEME_PRESET_STORAGE_KEY, "default");
-        if stored == "layout" {
-            "backend".to_string()
-        } else {
-            stored
-        }
-    });
+    let theme_preset = use_signal(|| APP_THEME_PRESET.read().clone());
     let language_code = use_signal(|| persist::get_or(LANGUAGE_STORAGE_KEY, "en"));
+    let last_applied_theme_preset = use_signal(|| None::<String>);
 
     let layout_config = use_signal(|| None::<LayoutConfig>);
     let layout_loading = use_signal(|| true);
@@ -1707,6 +1727,7 @@ fn TelemetryDashboardInner() -> Element {
     let frontend_network_metrics = use_signal(FrontendNetworkMetrics::default);
     let abort_only_mode = use_signal(|| false);
     let tabs_expanded = use_signal(|| false);
+    let header_actions_expanded = use_signal(|| false);
     let last_applied_disable_actions_default = use_signal(|| None::<bool>);
     let show_settings_overlay = use_signal(|| false);
     #[cfg(not(target_arch = "wasm32"))]
@@ -1951,9 +1972,24 @@ fn TelemetryDashboardInner() -> Element {
     }
     {
         let theme_preset = theme_preset;
+        let mut last_applied_theme_preset = last_applied_theme_preset;
         use_effect(move || {
             let value = theme_preset.read().clone();
+            *APP_THEME_PRESET.write() = value.clone();
             persist::set_string(THEME_PRESET_STORAGE_KEY, &value);
+            let next_shell_epoch = APP_SHELL_EPOCH.read().wrapping_add(1);
+            *APP_SHELL_EPOCH.write() = next_shell_epoch;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let next_ui_epoch = UI_EPOCH.read().wrapping_add(1);
+                *UI_EPOCH.write() = next_ui_epoch;
+            }
+
+            let previous = last_applied_theme_preset.read().clone();
+            last_applied_theme_preset.set(Some(value.clone()));
+            if previous.as_deref().is_some_and(|prev| prev != value) {
+                js_eval("window.location.reload();");
+            }
         });
     }
     {
@@ -2388,6 +2424,48 @@ fn TelemetryDashboardInner() -> Element {
         .unwrap_or_default();
     let language_snapshot = language_code.read().clone();
     let theme = localized_theme(&base_theme, theme_preset.read().as_str());
+    {
+        let layout_config = layout_config;
+        let theme_preset = theme_preset;
+        use_effect(move || {
+            let base_theme = layout_config
+                .read()
+                .as_ref()
+                .map(|cfg| cfg.theme.clone())
+                .unwrap_or_default();
+            let theme = localized_theme(&base_theme, theme_preset.read().as_str());
+            *APP_THEME_CONFIG.write() = theme.clone();
+            js_eval(&format!(
+                r#"
+                (function() {{
+                  try {{
+                    const bg = {bg:?};
+                    const fg = {fg:?};
+                    document.documentElement.style.setProperty('--gs26-app-background', bg);
+                    document.documentElement.style.setProperty('--gs26-app-text', fg);
+                    document.documentElement.style.backgroundColor = bg;
+                    document.documentElement.style.color = fg;
+                    if (document.body) {{
+                      document.body.style.setProperty('--gs26-app-background', bg);
+                      document.body.style.setProperty('--gs26-app-text', fg);
+                      document.body.style.backgroundColor = bg;
+                      document.body.style.color = fg;
+                    }}
+                    const main = document.getElementById("main");
+                    if (main) {{
+                      main.style.setProperty('--gs26-app-background', bg);
+                      main.style.setProperty('--gs26-app-text', fg);
+                      main.style.backgroundColor = bg;
+                      main.style.color = fg;
+                    }}
+                  }} catch (_) {{}}
+                }})();
+                "#,
+                bg = theme.app_background,
+                fg = theme.text_primary,
+            ));
+        });
+    }
     let main_tab_accent = |tab_id: &str, fallback: &str| {
         theme
             .main_tab_accents
@@ -2878,7 +2956,54 @@ fn TelemetryDashboardInner() -> Element {
              .gs26-tab-shell {{ min-width:260px; }}
              .gs26-tab-toggle {{ display:none; }}
              .gs26-tab-nav {{ display:flex; gap:0.5rem; flex-wrap:wrap; }}
-             @media (max-width: 720px) {{
+             .gs26-header-actions-shell {{ margin-left:auto; position:relative; }}
+             .gs26-header-actions-list {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }}
+             .gs26-header-menu-toggle {{ display:none; }}
+             @media (max-width: 900px) {{
+               .gs26-header-actions-shell {{
+                 display:flex;
+                 align-items:center;
+                 justify-content:flex-end;
+               }}
+               .gs26-header-menu-toggle {{
+                 display:inline-flex;
+                 align-items:center;
+                 justify-content:center;
+                 padding:0.55rem 0.9rem;
+                 border-radius:0.75rem;
+                 border:1px solid var(--gs26-header-menu-border);
+                 background:var(--gs26-header-menu-background);
+                 color:var(--gs26-header-menu-text);
+                 font:inherit;
+                 font-weight:800;
+                 cursor:pointer;
+               }}
+               .gs26-header-actions-list {{
+                 display:none;
+                 position:absolute;
+                 top:calc(100% + 8px);
+                 right:0;
+                 z-index:60;
+                 min-width:min(320px, calc(100vw - 32px));
+                 max-width:calc(100vw - 32px);
+                 padding:0.8rem;
+                 border-radius:0.9rem;
+                 border:1px solid var(--gs26-header-menu-border);
+                 background:var(--gs26-header-menu-background);
+                 box-shadow:0 18px 40px rgba(0,0,0,0.4);
+                 flex-direction:column;
+                 align-items:stretch;
+                 gap:8px;
+               }}
+               .gs26-header-actions-shell[data-expanded=\"true\"] .gs26-header-actions-list {{
+                 display:flex;
+               }}
+               .gs26-header-actions-list button {{
+                 width:100%;
+                 margin-left:0 !important;
+               }}
+             }}
+             @media (max-width: 720px), (max-height: 780px) {{
                .gs26-tab-shell {{
                  flex:1 1 100%;
                  min-width:0;
@@ -2954,9 +3079,9 @@ fn TelemetryDashboardInner() -> Element {
                         style: "
                     height:var(--gs26-app-height);
                     padding:24px;
-                    color:{theme.text_primary};
+                    color:var(--gs26-app-text);
                     font-family:system-ui, -apple-system, BlinkMacSystemFont;
-                    background:{theme.app_background};
+                    background:var(--gs26-app-background);
                     display:flex;
                     align-items:center;
                     justify-content:center;
@@ -2977,9 +3102,9 @@ fn TelemetryDashboardInner() -> Element {
                         style: "
                     height:var(--gs26-app-height);
                     padding:24px;
-                    color:{theme.text_primary};
+                    color:var(--gs26-app-text);
                     font-family:system-ui, -apple-system, BlinkMacSystemFont;
-                    background:{theme.app_background};
+                    background:var(--gs26-app-background);
                     display:flex;
                     align-items:center;
                     justify-content:center;
@@ -3004,9 +3129,9 @@ fn TelemetryDashboardInner() -> Element {
                     style: "
                 height:var(--gs26-app-height);
                 padding:24px;
-                color:{theme.text_primary};
+                color:var(--gs26-app-text);
                 font-family:system-ui, -apple-system, BlinkMacSystemFont;
-                background:{theme.app_background};
+                background:var(--gs26-app-background);
                 display:flex;
                 flex-direction:column;
                 border:{border_style};
@@ -3030,7 +3155,31 @@ fn TelemetryDashboardInner() -> Element {
                         {
                             let show_disable_actions = _actions_tab_has_visible_actions(&layout, *abort_only_mode.read());
                             rsx! {
-                        div { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-left:auto;",
+                        div {
+                            class: "gs26-header-actions-shell",
+                            "data-expanded": if *header_actions_expanded.read() { "true" } else { "false" },
+                            style: "
+                                margin-left:auto;
+                                --gs26-header-menu-background:{theme.tab_shell_background};
+                                --gs26-header-menu-border:{theme.tab_shell_border};
+                                --gs26-header-menu-text:{theme.button_text};
+                            ",
+                            button {
+                                class: "gs26-header-menu-toggle",
+                                onclick: {
+                                    let mut header_actions_expanded = header_actions_expanded;
+                                    move |_| {
+                                        let next = !*header_actions_expanded.read();
+                                        header_actions_expanded.set(next);
+                                    }
+                                },
+                                if *header_actions_expanded.read() {
+                                    "Close menu"
+                                } else {
+                                    "Menu"
+                                }
+                            }
+                        div { class: "gs26-header-actions-list",
                             if show_disable_actions {
                             button {
                                 style: if *abort_only_mode.read() {
@@ -3057,9 +3206,11 @@ fn TelemetryDashboardInner() -> Element {
                                 },
                                 onclick: {
                                     let mut abort_only_mode = abort_only_mode;
+                                    let mut header_actions_expanded = header_actions_expanded;
                                     move |_| {
                                         let next = !*abort_only_mode.read();
                                         abort_only_mode.set(next);
+                                        header_actions_expanded.set(false);
                                     }
                                 },
                                 "{disable_actions_label}"
@@ -3107,9 +3258,13 @@ fn TelemetryDashboardInner() -> Element {
                                         button {
                                             style: "{abort_style}",
                                             disabled: !abort_allowed,
-                                            onclick: move |_| {
+                                            onclick: {
+                                                let mut header_actions_expanded = header_actions_expanded;
+                                                move |_| {
+                                                    header_actions_expanded.set(false);
                                                 if abort_allowed {
                                                     send_cmd("Abort")
+                                                }
                                                 }
                                             },
                                             "ABORT"
@@ -3117,6 +3272,7 @@ fn TelemetryDashboardInner() -> Element {
                                     }
                                 }
                             }
+                        }
                         }
                             }
                         }
