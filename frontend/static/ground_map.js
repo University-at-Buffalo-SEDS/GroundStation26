@@ -47,6 +47,8 @@ const ARROW_RADIUS = Math.round(MARKER_PX * 0.5) - 1; // ▲ distance from cente
 // Raw + filtered heading (0..360, 0 = North)
 let userHeadingDegRaw = null;
 let userHeadingDeg = null;
+let nativeHeadingDeg = null;
+let deviceHeadingDeg = null;
 let compassInitialized = false;
 
 // ============================================================================
@@ -73,6 +75,48 @@ function shortestAngleDiff(a, b) {
     if (diff > 180) diff -= 360;
     if (diff < -180) diff += 360;
     return diff;
+}
+
+function circularMeanDeg(a, b, wa, wb) {
+    const ar = normalizeAngle(a) * Math.PI / 180.0;
+    const br = normalizeAngle(b) * Math.PI / 180.0;
+    const x = Math.cos(ar) * wa + Math.cos(br) * wb;
+    const y = Math.sin(ar) * wa + Math.sin(br) * wb;
+    if (!Number.isFinite(x) || !Number.isFinite(y) || (x === 0 && y === 0)) {
+        return normalizeAngle(a);
+    }
+    return normalizeAngle(Math.atan2(y, x) * 180.0 / Math.PI);
+}
+
+function fusedHeadingTarget() {
+    const hasNative = Number.isFinite(nativeHeadingDeg);
+    const hasDevice = Number.isFinite(deviceHeadingDeg);
+    if (hasNative && hasDevice) {
+        // Bias to native compass (north-referenced), blend in device orientation for smoothness.
+        return circularMeanDeg(nativeHeadingDeg, deviceHeadingDeg, 0.7, 0.3);
+    }
+    if (hasNative) return normalizeAngle(nativeHeadingDeg);
+    if (hasDevice) return normalizeAngle(deviceHeadingDeg);
+    return null;
+}
+
+function applyFusedHeading() {
+    const target = fusedHeadingTarget();
+    if (!Number.isFinite(target)) return;
+
+    userHeadingDegRaw = target;
+
+    if (!Number.isFinite(userHeadingDeg)) {
+        userHeadingDeg = target;
+    } else {
+        const diff = shortestAngleDiff(userHeadingDeg, target);
+        // Wrap-safe adaptive smoothing:
+        // small deltas are damped; large deltas catch up quickly without snap.
+        const gain = Math.min(0.55, Math.max(0.16, Math.abs(diff) / 90.0));
+        userHeadingDeg = normalizeAngle(userHeadingDeg + diff * gain);
+    }
+
+    updateUserMarkerRotation();
 }
 
 // ============================================================================
@@ -220,9 +264,8 @@ function updateUserMarkerRotation() {
 
 function setGroundMapUserHeading(deg) {
     if (!Number.isFinite(deg)) return;
-    userHeadingDegRaw = normalizeAngle(deg);
-    userHeadingDeg = userHeadingDegRaw;
-    updateUserMarkerRotation();
+    nativeHeadingDeg = normalizeAngle(deg);
+    applyFusedHeading();
 }
 
 function syncRocketGuideLine(rocketLatLng, userLatLng) {
@@ -269,18 +312,8 @@ function handleOrientation(event) {
     }
 
     if (heading == null) return;
-
-    userHeadingDegRaw = heading;
-
-    if (userHeadingDeg == null) {
-        userHeadingDeg = heading;
-    } else {
-        const diff = shortestAngleDiff(userHeadingDeg, heading);
-        if (Math.abs(diff) < 2) return;
-        userHeadingDeg = normalizeAngle(userHeadingDeg + diff * 0.15);
-    }
-
-    updateUserMarkerRotation();
+    deviceHeadingDeg = heading;
+    applyFusedHeading();
 }
 
 function initCompassOnce() {

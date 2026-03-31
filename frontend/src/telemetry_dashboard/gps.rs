@@ -86,6 +86,20 @@ pub fn GpsDriver(
             }
         });
 
+        #[cfg(target_os = "android")]
+        use_effect(move || {
+            spawn(async move {
+                loop {
+                    if let Some((lat, lon)) =
+                        crate::telemetry_dashboard::gps_android::latest_location()
+                    {
+                        user_gps.set(Some((lat, lon)));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            });
+        });
+
         // Stop when this component is dropped (unmounted)
         use_drop(|| {
             stop_gps_updates();
@@ -118,8 +132,8 @@ mod imp {
 mod imp {
     use super::*;
 
-    pub fn start(user_gps: Signal<Option<(f64, f64)>>) {
-        crate::telemetry_dashboard::gps_android::start(user_gps);
+    pub fn start(_user_gps: Signal<Option<(f64, f64)>>) {
+        crate::telemetry_dashboard::gps_android::start();
     }
 
     pub fn stop() {

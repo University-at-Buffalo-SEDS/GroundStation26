@@ -256,7 +256,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py ios_sim_deploy")
     print("  ./build.py ios_sign")
     print("  ./build.py ios_dist_sign")
-    print("  ./build.py android_install")
+    print("  ./build.py android_install        # build APK if needed, install it to a connected emulator/device")
     print("  ./build.py publisher_screenshots")
     print("  ./build.py macos_deploy")
     print("  ./build.py macos_sign")

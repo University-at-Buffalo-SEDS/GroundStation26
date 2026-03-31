@@ -1,16 +1,16 @@
 #![allow(dead_code)]
 #![cfg(target_os = "android")]
 
-use dioxus_signals::{Signal, WritableExt};
-use jni::objects::{JClass, JObject, JString, JValue};
-use jni::signature::RuntimeMethodSignature;
-use jni::strings::JNIString;
-use jni::sys::{jdouble, jfloat};
-use jni::{Env, EnvUnowned, JavaVM};
+use ::jni::objects::{JClass, JObject, JString, JValue};
+use ::jni::signature::RuntimeMethodSignature;
+use ::jni::strings::JNIString;
+use ::jni::sys::{jdouble, jfloat};
+use ::jni::{Env, EnvUnowned, JavaVM};
 use ndk_context::android_context;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-static mut GPS_SIGNAL: Option<Signal<Option<(f64, f64)>>> = None;
+static LAT_BITS: AtomicU64 = AtomicU64::new(f64::NAN.to_bits());
+static LON_BITS: AtomicU64 = AtomicU64::new(f64::NAN.to_bits());
 static HEADING_BITS: AtomicU64 = AtomicU64::new(f64::NAN.to_bits());
 
 const LOCATION_SHIM_CLASS_DOT: &str = "com.ubseds.gs26.LocationShim";
@@ -18,7 +18,7 @@ const LOCATION_SHIM_CLASS_DOT: &str = "com.ubseds.gs26.LocationShim";
 fn with_android_env<R>(f: impl FnOnce(&mut Env<'_>, &JObject<'_>) -> R) -> Option<R> {
     let ctx = android_context();
     let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
-    vm.attach_current_thread(|env| -> jni::errors::Result<R> {
+    vm.attach_current_thread(|env| -> ::jni::errors::Result<R> {
         let context = unsafe { JObject::from_raw(env, ctx.context().cast()) };
         let result = f(env, &context);
         let _ = context.into_raw();
@@ -41,8 +41,8 @@ fn call_static_void(method: &str, sig: &str, args: &[JValue<'_>]) {
         let class_loader = match env
             .call_method(
                 context,
-                jni::jni_str!("getClassLoader"),
-                jni::jni_sig!("()Ljava/lang/ClassLoader;"),
+                ::jni::jni_str!("getClassLoader"),
+                ::jni::jni_sig!("()Ljava/lang/ClassLoader;"),
                 &[],
             )
             .and_then(|value| value.l())
@@ -63,8 +63,8 @@ fn call_static_void(method: &str, sig: &str, args: &[JValue<'_>]) {
         let class = match env
             .call_method(
                 &class_loader,
-                jni::jni_str!("loadClass"),
-                jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
+                ::jni::jni_str!("loadClass"),
+                ::jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
                 &[JValue::Object(&JObject::from(class_name))],
             )
             .and_then(|value| value.l())
@@ -89,17 +89,11 @@ fn call_static_void(method: &str, sig: &str, args: &[JValue<'_>]) {
     });
 }
 
-pub fn start(user_gps: Signal<Option<(f64, f64)>>) {
-    unsafe {
-        GPS_SIGNAL = Some(user_gps);
-    }
+pub fn start() {
     call_static_void("start", "(Landroid/content/Context;)V", &[]);
 }
 
 pub fn stop() {
-    unsafe {
-        GPS_SIGNAL = None;
-    }
     call_static_void("stop", "()V", &[]);
 }
 
@@ -116,6 +110,16 @@ pub fn latest_heading_deg() -> Option<f64> {
     if v.is_finite() { Some(v) } else { None }
 }
 
+pub fn latest_location() -> Option<(f64, f64)> {
+    let lat = f64::from_bits(LAT_BITS.load(Ordering::Relaxed));
+    let lon = f64::from_bits(LON_BITS.load(Ordering::Relaxed));
+    if lat.is_finite() && lon.is_finite() {
+        Some((lat, lon))
+    } else {
+        None
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_ubseds_gs26_LocationShim_nativeOnLocationUpdate(
     _env: EnvUnowned<'_>,
@@ -123,11 +127,9 @@ pub extern "system" fn Java_com_ubseds_gs26_LocationShim_nativeOnLocationUpdate(
     lat: jdouble,
     lon: jdouble,
 ) {
-    unsafe {
-        let Some(mut sig) = GPS_SIGNAL else { return };
-        if let Ok(mut w) = sig.try_write() {
-            *w = Some((lat, lon));
-        }
+    if lat.is_finite() && lon.is_finite() {
+        LAT_BITS.store(lat.to_bits(), Ordering::Relaxed);
+        LON_BITS.store(lon.to_bits(), Ordering::Relaxed);
     }
 }
 

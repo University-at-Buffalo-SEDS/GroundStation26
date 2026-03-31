@@ -80,6 +80,37 @@ fn append_native_log(message: &str) {
     }
 }
 
+#[cfg(target_os = "android")]
+/// Initializes rustls-platform-verifier with Android JVM/context handles.
+fn init_android_platform_tls_verifier() {
+    let ctx = ndk_context::android_context();
+    let vm = match unsafe { dioxus::prelude::jni::JavaVM::from_raw(ctx.vm().cast()) } {
+        Ok(vm) => vm,
+        Err(e) => {
+            append_native_log(&format!(
+                "[startup] android TLS verifier init failed (JavaVM): {e}"
+            ));
+            return;
+        }
+    };
+
+    let mut env = match vm.attach_current_thread() {
+        Ok(env) => env,
+        Err(e) => {
+            append_native_log(&format!(
+                "[startup] android TLS verifier init failed (attach): {e}"
+            ));
+            return;
+        }
+    };
+
+    let context = unsafe { dioxus::prelude::jni::objects::JObject::from_raw(ctx.context().cast()) };
+    match rustls_platform_verifier::android::init_with_env(&mut env, context) {
+        Ok(_) => append_native_log("[startup] android TLS verifier initialized"),
+        Err(e) => append_native_log(&format!("[startup] android TLS verifier init failed: {e}")),
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 /// Launches the web build of the frontend.
 fn main() {
@@ -95,6 +126,8 @@ fn main() {
 fn main() {
     init_panic_hook();
     append_native_log("[startup] native main entered");
+    #[cfg(target_os = "android")]
+    init_android_platform_tls_verifier();
     let mut cfg = dioxus_desktop::Config::new().with_asynchronous_custom_protocol(
         "gs26",
         |_id, request, responder| {

@@ -2,6 +2,9 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
+#[cfg(not(target_arch = "wasm32"))]
+const AUTH_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 static CURRENT_SESSION: Lazy<Mutex<Option<StoredAuthSession>>> = Lazy::new(|| Mutex::new(None));
 static CURRENT_STATUS: Lazy<Mutex<SessionStatus>> =
     Lazy::new(|| Mutex::new(SessionStatus::default()));
@@ -166,6 +169,72 @@ pub async fn fetch_session_status(
     Ok(status)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn build_native_http_client(
+    skip_tls_verify: bool,
+    connect_timeout: std::time::Duration,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, String> {
+    let make_builder = || {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(skip_tls_verify)
+            .connect_timeout(connect_timeout)
+            .timeout(timeout)
+    };
+
+    #[cfg(target_os = "android")]
+    if !skip_tls_verify {
+        use rustls_platform_verifier::ConfigVerifierExt;
+        if let Ok(tls_config) = rustls::ClientConfig::with_platform_verifier() {
+            match make_builder()
+                .use_preconfigured_tls(std::sync::Arc::new(tls_config))
+                .build()
+            {
+                Ok(client) => return Ok(client),
+                Err(err) => {
+                    eprintln!(
+                        "Android platform-verifier TLS client build failed, falling back to default rustls: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    make_builder()
+        .build()
+        .map_err(|e| format_native_auth_error(&e.to_string(), skip_tls_verify))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_native_auth_client(skip_tls_verify: bool) -> Result<reqwest::Client, String> {
+    build_native_http_client(skip_tls_verify, AUTH_HTTP_TIMEOUT, AUTH_HTTP_TIMEOUT)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn format_native_auth_error(raw: &str, skip_tls_verify: bool) -> String {
+    let lower = raw.to_ascii_lowercase();
+    let tls_like = lower.contains("certificate")
+        || lower.contains("tls")
+        || lower.contains("ssl")
+        || lower.contains("unknown issuer")
+        || lower.contains("self signed")
+        || lower.contains("invalid peer certificate");
+
+    if tls_like {
+        if skip_tls_verify {
+            format!("SSL/TLS connection failed even with certificate verification disabled.\n{raw}")
+        } else {
+            format!(
+                "SSL/TLS certificate verification failed.\nEnable 'Skip SSL verification' for this backend if you trust the certificate.\n{raw}"
+            )
+        }
+    } else if lower.contains("timed out") {
+        format!("Backend session check timed out.\n{raw}")
+    } else {
+        raw.to_string()
+    }
+}
+
 fn body_looks_like_html(body: &str) -> bool {
     let trimmed = body.trim_start();
     let lower = trimmed.to_ascii_lowercase();
@@ -317,15 +386,15 @@ async fn auth_request_get(
     include_token: bool,
     clear_on_unauthorized: bool,
 ) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(skip_tls_verify)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = build_native_auth_client(skip_tls_verify)?;
     let mut request = client.get(url.to_string());
     if include_token && let Some(token) = current_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(|e| e.to_string())?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format_native_auth_error(&e.to_string(), skip_tls_verify))?;
     let status = response.status();
     let text = response.text().await.map_err(|e| e.to_string())?;
     if clear_on_unauthorized && status == reqwest::StatusCode::UNAUTHORIZED {
@@ -372,10 +441,7 @@ async fn auth_request_post_json(
     body: &str,
     skip_tls_verify: bool,
 ) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(skip_tls_verify)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = build_native_auth_client(skip_tls_verify)?;
     let mut request = client
         .post(url.to_string())
         .header("Content-Type", "application/json")
@@ -383,7 +449,10 @@ async fn auth_request_post_json(
     if let Some(token) = current_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(|e| e.to_string())?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format_native_auth_error(&e.to_string(), skip_tls_verify))?;
     let status = response.status();
     let text = response.text().await.map_err(|e| e.to_string())?;
     if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -417,15 +486,15 @@ async fn auth_request_post_empty(url: &str, _skip_tls_verify: bool) -> Result<()
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn auth_request_post_empty(url: &str, skip_tls_verify: bool) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(skip_tls_verify)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = build_native_auth_client(skip_tls_verify)?;
     let mut request = client.post(url.to_string());
     if let Some(token) = current_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(|e| e.to_string())?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format_native_auth_error(&e.to_string(), skip_tls_verify))?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if status == reqwest::StatusCode::UNAUTHORIZED {

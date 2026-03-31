@@ -1896,6 +1896,95 @@ def _android_sdk_levels() -> tuple[int, int, int]:
     return min_sdk, target_sdk, compile_sdk
 
 
+def _find_rustls_platform_verifier_maven(frontend_dir: Path) -> Optional[Path]:
+    repo_root = frontend_dir.parent
+    cargo_manifest = repo_root / "Cargo.toml"
+    if not cargo_manifest.exists():
+        return None
+
+    try:
+        out = subprocess.check_output(
+            [
+                "cargo",
+                "metadata",
+                "--format-version",
+                "1",
+                "--filter-platform",
+                "aarch64-linux-android",
+                "--manifest-path",
+                str(cargo_manifest),
+            ],
+            cwd=repo_root,
+            text=True,
+        )
+        payload = json.loads(out)
+    except Exception:
+        return None
+
+    for pkg in payload.get("packages", []):
+        if pkg.get("name") == "rustls-platform-verifier-android":
+            manifest_path = pkg.get("manifest_path")
+            if not manifest_path:
+                continue
+            maven_dir = Path(manifest_path).parent / "maven"
+            if maven_dir.exists():
+                return maven_dir
+    return None
+
+
+def _find_rustls_platform_verifier_version(maven_dir: Path) -> Optional[str]:
+    base = maven_dir / "rustls" / "rustls-platform-verifier"
+    if not base.exists():
+        return None
+    versions = sorted([p.name for p in base.iterdir() if p.is_dir()])
+    if not versions:
+        return None
+    return versions[-1]
+
+
+def _inject_settings_gradle_maven_repo(settings_raw: str, maven_path: str) -> tuple[str, bool]:
+    cleaned = re.sub(
+        r"\nallprojects\s*\{\s*repositories\s*\{.*?\}\s*\}\s*",
+        "\n",
+        settings_raw,
+        flags=re.DOTALL,
+    )
+    changed = cleaned != settings_raw
+    settings_raw = cleaned
+
+    if maven_path in settings_raw:
+        return settings_raw, changed
+
+    repo_line = f'        maven {{ url uri({json.dumps(maven_path)}) }}\n'
+
+    dep_idx = settings_raw.find("dependencyResolutionManagement")
+    if dep_idx >= 0:
+        repos_idx = settings_raw.find("repositories {", dep_idx)
+        if repos_idx >= 0:
+            insert_at = settings_raw.find("\n", repos_idx)
+            if insert_at >= 0:
+                insert_at += 1
+                return settings_raw[:insert_at] + repo_line + settings_raw[insert_at:], True
+
+    plugin_idx = settings_raw.find("pluginManagement")
+    if plugin_idx >= 0:
+        repos_idx = settings_raw.find("repositories {", plugin_idx)
+        if repos_idx >= 0:
+            insert_at = settings_raw.find("\n", repos_idx)
+            if insert_at >= 0:
+                insert_at += 1
+                return settings_raw[:insert_at] + repo_line + settings_raw[insert_at:], True
+
+    suffix = (
+        "\ndependencyResolutionManagement {\n"
+        "    repositories {\n"
+        f"{repo_line}"
+        "    }\n"
+        "}\n"
+    )
+    return settings_raw + suffix, True
+
+
 def _configure_android_app_gradle(frontend_dir: Path, project_dir: Path) -> None:
     gradle_file = project_dir / "app" / "build.gradle.kts"
     if not gradle_file.exists():
@@ -1910,7 +1999,49 @@ def _configure_android_app_gradle(frontend_dir: Path, project_dir: Path) -> None
     raw = re.sub(r"targetSdk\s*=\s*\d+", f"targetSdk = {target_sdk}", raw)
     raw = re.sub(r'versionCode\s*=\s*\d+', f"versionCode = {int(version_code)}", raw)
     raw = re.sub(r'versionName\s*=\s*"[^"]+"', f'versionName = "{version_name}"', raw)
+    maven_dir = _find_rustls_platform_verifier_maven(frontend_dir)
+    if maven_dir is not None:
+        maven_path = str(maven_dir)
+        version = _find_rustls_platform_verifier_version(maven_dir) or "0.1.1"
+        dep_line = f'    implementation("rustls:rustls-platform-verifier:{version}")\n'
+
+        raw = re.sub(
+            r'^\s*implementation\("rustls:rustls-platform-verifier:[^"]+"\)\s*$',
+            dep_line.rstrip(),
+            raw,
+            flags=re.MULTILINE,
+        )
+        if 'implementation("rustls:rustls-platform-verifier:' not in raw:
+            marker = "dependencies {\n"
+            if marker in raw:
+                raw = raw.replace(marker, marker + dep_line, 1)
+
+        if maven_path not in raw:
+            repo_line = f'        maven {{ url = uri({json.dumps(maven_path)}) }}\n'
+            repo_idx = raw.find("repositories {")
+            if repo_idx >= 0:
+                insert_at = raw.find("\n", repo_idx)
+                if insert_at >= 0:
+                    insert_at += 1
+                    raw = raw[:insert_at] + repo_line + raw[insert_at:]
+            else:
+                raw += (
+                    "\nrepositories {\n"
+                    f"{repo_line}"
+                    "}\n"
+                )
+
     gradle_file.write_text(raw, encoding="utf-8")
+
+    settings_gradle = project_dir / "settings.gradle"
+    if maven_dir is not None and settings_gradle.exists():
+        settings_raw = settings_gradle.read_text(encoding="utf-8")
+        maven_path = str(maven_dir)
+        settings_raw, changed = _inject_settings_gradle_maven_repo(settings_raw, maven_path)
+        if changed:
+            settings_gradle.write_text(settings_raw, encoding="utf-8")
+            print(f"Configured Android Gradle maven repo for rustls platform verifier: {maven_path}")
+
     print(
         "Configured Android app Gradle values: "
         f"minSdk={min_sdk}, targetSdk={target_sdk}, compileSdk={compile_sdk}, "
@@ -4132,7 +4263,8 @@ def print_usage(exit_code: int = 1) -> None:
         "screenshot_out=<path>] [screenshot_name=<name>]")
     print("  ./frontend/build.py ios_sign [debug] [existing]")
     print("  ./frontend/build.py ios_dist_sign [debug] [existing]")
-    print("  ./frontend/build.py android_install [debug] [existing]")
+    print(
+        "  ./frontend/build.py android_install [debug] [existing]   # build/install APK to a connected emulator/device")
     print(
         "  ./frontend/build.py android_screenshot [debug] [existing] [screenshot_delay=<seconds>] ["
         "screenshot_out=<path>] [screenshot_name=<name>]")

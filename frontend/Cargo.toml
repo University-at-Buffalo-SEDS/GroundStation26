@@ -6,16 +6,13 @@ description.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
-
 [dependencies]
-# Dioxus core + router
 dioxus = { version = "0.7", default-features = false }
 dioxus-router = "0.7"
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Cross-platform time helpers
 web-sys = "0.3.91"
 gloo-net = "0.6.0"
 wasm-bindgen = "0.2.114"
@@ -26,15 +23,12 @@ dirs = "6.0.0"
 futures-channel = "0.3.32"
 once_cell = "1.21.4"
 
-# ---------- Web (wasm32) ----------
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 dioxus = { version = "0.7.3", features = ["web", "macro"] }
 dioxus-signals = "0.7.3"
 dioxus-sdk-geolocation = "0.7.0"
-
 gloo-net = { version = "0.6.0", features = ["http"] }
 gloo-timers = { version = "0.3.0", features = ["futures"] }
-
 wasm-bindgen = "0.2.114"
 futures-util = "0.3.32"
 wasm-bindgen-futures = "0.4.64"
@@ -50,26 +44,23 @@ web-sys = { version = "0.3.91", features = [
     "Position",
     "PositionError",
     "Coordinates",
-    "Permissions", # Optional (for permission queries)
-    "PermissionStatus", # Optional",
+    "Permissions",
+    "PermissionStatus",
 ] }
 
-# ---------- Native (desktop/mobile) ----------
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 dioxus = { version = "0.7.3", features = ["desktop", "macro"] }
-# For mobile builds we still compile the same code; `dx` selects the right platform features.
-# If you want to be explicit, you can swap to features=["mobile"] in a mobile-only profile.
 dioxus-signals = "0.7.3"
 dioxus-desktop = "0.7.3"
 chrono = { version = "0.4.44", default-features = false, features = ["std", "clock"] }
 tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "time"] }
-reqwest = { version = "0.13.2", default-features = true, features = ["json", "rustls", "blocking"] }
-tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots", "native-tls"] }
-native-tls = "0.2.18"
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "blocking", "rustls"] }
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+rustls = "0.23"
+rustls-platform-verifier = "0.6.2"
 futures-util = "0.3.32"
 url = "2.5.8"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-
 
 [target.'cfg(target_os = "windows")'.dependencies]
 dioxus-sdk-geolocation = "0.7.0"
@@ -78,16 +69,12 @@ dioxus-sdk-geolocation = "0.7.0"
 jni = "0.22.4"
 ndk-context = "0.1.1"
 
-
-
 [features]
-# Dioxus CLI uses these conventions. :contentReference[oaicite:3]{index=3}
 default = ["web"]
 web = ["dioxus/web"]
 desktop = ["dioxus/desktop"]
 mobile = ["dioxus/mobile"]
 
-
 [build-dependencies]
-reqwest = { version = "0.13.2", features = ["blocking", "rustls"] }
-winres = "0.1"
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls"] }
+winres = "0.1.12"

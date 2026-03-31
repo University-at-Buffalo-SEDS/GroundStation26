@@ -216,13 +216,13 @@ mod persist {
         #[cfg(target_os = "android")]
         /// Resolves the Android app-private storage root through JNI.
         fn android_storage_base_dir() -> Option<std::path::PathBuf> {
-            use jni::objects::{JObject, JString};
-            use jni::{jni_sig, jni_str, JavaVM};
+            use ::jni::objects::{JObject, JString};
+            use ::jni::{jni_sig, jni_str, JavaVM};
             use ndk_context::android_context;
 
             let ctx = android_context();
             let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
-            vm.attach_current_thread(|env| -> jni::errors::Result<std::path::PathBuf> {
+            vm.attach_current_thread(|env| -> ::jni::errors::Result<std::path::PathBuf> {
                 let context = unsafe { JObject::from_raw(env, ctx.context().cast()) };
 
                 let files_dir = env
@@ -3864,10 +3864,11 @@ pub(crate) async fn http_get_json<T: for<'de> Deserialize<'de>>(path: &str) -> R
         format!("{base}{path}")
     };
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(UrlConfig::_skip_tls_verify())
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = auth::build_native_http_client(
+        UrlConfig::_skip_tls_verify(),
+        std::time::Duration::from_secs(8),
+        std::time::Duration::from_secs(8),
+    )?;
 
     let mut request = client.get(url);
     if let Some(token) = auth::current_token() {
@@ -3956,10 +3957,11 @@ pub(crate) async fn http_post_json<B: Serialize, T: for<'de> Deserialize<'de>>(
         format!("{base}{path}")
     };
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(UrlConfig::_skip_tls_verify())
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = auth::build_native_http_client(
+        UrlConfig::_skip_tls_verify(),
+        std::time::Duration::from_secs(8),
+        std::time::Duration::from_secs(8),
+    )?;
 
     let mut request = client.post(url).json(body);
     if let Some(token) = auth::current_token() {
@@ -4031,10 +4033,11 @@ async fn http_post_empty(path: &str) -> Result<(), String> {
         format!("{base}{path}")
     };
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(UrlConfig::_skip_tls_verify())
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = auth::build_native_http_client(
+        UrlConfig::_skip_tls_verify(),
+        std::time::Duration::from_secs(8),
+        std::time::Duration::from_secs(8),
+    )?;
 
     let mut request = client.post(url);
     if let Some(token) = auth::current_token() {
@@ -4787,6 +4790,80 @@ async fn connect_ws_once_wasm(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn insecure_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
+    #[derive(Debug)]
+    struct NoCertificateVerification(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .ok_or_else(|| "rustls default crypto provider is not set".to_string())?;
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification(provider)))
+        .with_no_client_auth();
+
+    Ok(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+        config,
+    )))
+}
+
+#[cfg(target_os = "android")]
+fn android_platform_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
+    use rustls_platform_verifier::ConfigVerifierExt;
+    let tls_config = rustls::ClientConfig::with_platform_verifier()
+        .map_err(|e| format!("android TLS verifier setup failed: {e}"))?;
+    Ok(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+        tls_config,
+    )))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 async fn connect_ws_once_native(
     epoch: u64,
@@ -4826,19 +4903,34 @@ async fn connect_ws_once_native(
     *WS_SENDER.write() = Some(WsSender { tx });
 
     let ws_stream = if UrlConfig::_skip_tls_verify() && ws_url.starts_with("wss://") {
-        let tls = native_tls::TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .map_err(|e| format!("[WS] tls build failed: {e}"))?;
-        tokio_tungstenite::connect_async_tls_with_config(
-            ws_url.as_str(),
-            None,
-            false,
-            Some(tokio_tungstenite::Connector::NativeTls(tls)),
-        )
-        .await
-        .map_err(|e| format!("[WS] connect failed: {e}"))?
-        .0
+        let tls = insecure_rustls_connector()
+            .map_err(|e| format!("[WS] rustls connector build failed: {e}"))?;
+        tokio_tungstenite::connect_async_tls_with_config(ws_url.as_str(), None, false, Some(tls))
+            .await
+            .map_err(|e| format!("[WS] connect failed: {e}"))?
+            .0
+    } else if ws_url.starts_with("wss://") {
+        #[cfg(target_os = "android")]
+        {
+            let tls = android_platform_rustls_connector()
+                .map_err(|e| format!("[WS] android rustls connector build failed: {e}"))?;
+            tokio_tungstenite::connect_async_tls_with_config(
+                ws_url.as_str(),
+                None,
+                false,
+                Some(tls),
+            )
+            .await
+            .map_err(|e| format!("[WS] connect failed: {e}"))?
+            .0
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            tokio_tungstenite::connect_async(ws_url.as_str())
+                .await
+                .map_err(|e| format!("[WS] connect failed: {e}"))?
+                .0
+        }
     } else {
         tokio_tungstenite::connect_async(ws_url.as_str())
             .await

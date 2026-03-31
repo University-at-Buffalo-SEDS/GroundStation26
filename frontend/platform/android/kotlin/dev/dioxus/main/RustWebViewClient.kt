@@ -63,9 +63,14 @@ class RustWebViewClient(private val context: Context): WebViewClient() {
             assetLoader.shouldInterceptRequest(request.url)
         } else {
             val rustWebview = view as RustWebView
-            val response = handleRequest(rustWebview.id, request, rustWebview.isDocumentStartScriptEnabled)
-            interceptedState[request.url.toString()] = response != null
-            Log.e(tag, "intercept result url=${request.url} handled=${response != null}")
+            val normalizedRequest = normalizeDioxusInternalRequest(request)
+            val effectiveUrl = normalizedRequest.url.toString()
+            val response = handleRequest(rustWebview.id, normalizedRequest, rustWebview.isDocumentStartScriptEnabled)
+            interceptedState[effectiveUrl] = response != null
+            if (effectiveUrl != request.url.toString()) {
+                interceptedState[request.url.toString()] = response != null
+            }
+            Log.e(tag, "intercept result url=${request.url} effectiveUrl=$effectiveUrl handled=${response != null}")
             response
         }
     }
@@ -246,9 +251,36 @@ class RustWebViewClient(private val context: Context): WebViewClient() {
         return base.trimEnd('/')
     }
 
+    private fun normalizeDioxusInternalRequest(request: WebResourceRequest): WebResourceRequest {
+        val url = request.url
+        val host = url.host ?: return request
+        val encodedPath = url.encodedPath ?: return request
+
+        // Dioxus internal event endpoint sometimes appears as `//__events` on Android.
+        // Normalize to `/__events` before handing off to native request routing.
+        if (host != "dioxus.index.html" || !encodedPath.startsWith("//")) {
+            return request
+        }
+
+        val normalized = url.buildUpon().encodedPath(encodedPath.replaceFirst("//", "/")).build()
+        if (normalized == url) {
+            return request
+        }
+
+        Log.e(tag, "normalized dioxus request url=$url -> $normalized")
+        return object : WebResourceRequest {
+            override fun getUrl(): Uri = normalized
+            override fun isForMainFrame(): Boolean = request.isForMainFrame
+            override fun isRedirect(): Boolean = request.isRedirect()
+            override fun hasGesture(): Boolean = request.hasGesture()
+            override fun getMethod(): String = request.method
+            override fun getRequestHeaders(): MutableMap<String, String> = request.requestHeaders
+        }
+    }
+
     companion object {
         init {
-            System.loadLibrary("dioxusmain")
+            System.loadLibrary("main")
         }
     }
 

@@ -276,11 +276,7 @@ pub fn MapTab(
     } else {
         None
     };
-    #[cfg(not(any(
-        target_os = "ios",
-        target_os = "macos",
-        target_os = "android"
-    )))]
+    #[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
     let native_location_warning = None::<String>;
     #[cfg(target_os = "ios")]
     let native_compass_warning =
@@ -989,13 +985,36 @@ fn js_center_on(lat: f64, lon: f64) {
         r#"
         (function() {{
           try {{
-            if (typeof window.centerGroundMapOn === "function") {{
-              window.centerGroundMapOn({lat}, {lon});
-            }} else {{
-              console.warn("centerGroundMapOn not found on window");
+            // Cache the requested center so first-time permission grants can
+            // still center once the map bridge finishes initializing.
+            window.__gs26_pending_center_lat = {lat};
+            window.__gs26_pending_center_lon = {lon};
+
+            const tryCenter = function() {{
+              try {{
+                if (typeof window.centerGroundMapOn !== "function") return false;
+                const clat = window.__gs26_pending_center_lat;
+                const clon = window.__gs26_pending_center_lon;
+                if (!Number.isFinite(clat) || !Number.isFinite(clon)) return false;
+                window.centerGroundMapOn(clat, clon);
+                return true;
+              }} catch (e) {{
+                console.warn("centerGroundMapOn threw:", e);
+                return false;
+              }}
+            }};
+
+            if (tryCenter()) {{
+              return;
+            }}
+
+            // Retry a few times for startup races (permission granted before map ready).
+            const retryMs = [50, 150, 300, 600, 1000];
+            for (const ms of retryMs) {{
+              setTimeout(tryCenter, ms);
             }}
           }} catch (e) {{
-            console.warn("centerGroundMapOn threw:", e);
+            console.warn("queue center request failed:", e);
           }}
         }})();
         "#,
