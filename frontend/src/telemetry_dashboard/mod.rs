@@ -1574,6 +1574,20 @@ fn reconnect_and_reload_ui() {
     // Native: keep current UI mounted so charts/history remain visible while reseed runs.
 }
 
+/// Mirrors the explicit reload button behavior before reconnecting to a backend.
+pub fn clear_and_reconnect_after_connect() {
+    clear_telemetry_runtime_buffers();
+    charts_cache_request_refit();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        clear_ui_telemetry_store();
+        charts_cache_reset_and_ingest(&[]);
+    }
+
+    reconnect_and_reload_ui();
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 /// Returns whether the dashboard has ever reached a live backend connection in this process.
 pub fn dashboard_has_prior_backend_connection() -> bool {
@@ -2728,22 +2742,10 @@ fn TelemetryDashboardInner() -> Element {
                 cursor:pointer;
             ", theme.button_border, theme.button_background, theme.button_text),
             onclick: move |_| {
-                // Clear transient telemetry buffers first.
-                clear_telemetry_runtime_buffers();
-                charts_cache_request_refit();
-
-                // Native reload should visibly clear graph history immediately.
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    clear_ui_telemetry_store();
-                    charts_cache_reset_and_ingest(&[]);
+                    clear_and_reconnect_after_connect();
                 }
-
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    _refresh_layout();
-                }
-                reconnect_and_reload_ui();
             },
             "{reload_button_label}"
         }

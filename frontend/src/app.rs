@@ -1351,6 +1351,7 @@ pub fn Connect() -> Element {
                                 );
                                 return;
                             }
+                            crate::telemetry_dashboard::clear_and_reconnect_after_connect();
                             let _ = persist::write_connect_shown(true);
                             let _ = nav.replace(Route::Dashboard {});
                         },
