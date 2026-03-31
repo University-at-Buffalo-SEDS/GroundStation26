@@ -1584,6 +1584,11 @@ pub fn ChartCanvas(
                     targetCtx.lineTo(right, bottom);
                     targetCtx.stroke();
                     targetCtx.restore();
+                    if (typeof targetCtx.resetTransform === "function") {{
+                      targetCtx.resetTransform();
+                    }} else {{
+                      targetCtx.setTransform(1, 0, 0, 1, 0, 0);
+                    }}
                   }};
                   const drawChunkDirect = (targetCtx, chunk, destX, destW) => {{
                     targetCtx.save();

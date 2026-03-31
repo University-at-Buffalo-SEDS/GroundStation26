@@ -3866,7 +3866,7 @@ fn native_http_timeouts(path: &str) -> (std::time::Duration, std::time::Duration
         let secs = std::env::var("GS_RECENT_HTTP_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(90)
+            .unwrap_or(300)
             .clamp(15, 600);
         return (
             std::time::Duration::from_secs(10),
