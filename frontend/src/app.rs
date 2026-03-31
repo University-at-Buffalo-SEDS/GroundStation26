@@ -3,6 +3,7 @@
 const _CONNECTION_TIMEOUT_MS: u64 = 8000;
 const _BODY_TRANSFER_TIMEOUT_MS: u64 = 10000;
 const _WS_TIMEOUT_MS: u64 = 4500;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const APP_DISPLAY_NAME: &str = "UBSEDS GS";
 
 use crate::auth::{self, SessionStatus as AuthSessionStatus};
@@ -1465,7 +1466,7 @@ pub fn Dashboard() -> Element {
                         button {
                             style: shell_button_style(&shell_theme()),
                             onclick: move |_| {
-                                let _ = nav.replace(Route::Connect {});
+                                let _ = nav.replace(connect_route());
                             },
                             "Cancel"
                         }
