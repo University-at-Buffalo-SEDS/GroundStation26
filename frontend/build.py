@@ -1062,66 +1062,60 @@ def _write_windows_nsis_script(
         icon_path: Path,
         installer_path: Path,
 ) -> None:
-    # fmt: off
-    # Keep this generated NSIS block stable. Reflowing quoted path/value lines can
-    # produce invalid installer scripts with unterminated strings.
-    script = f"""
-Unicode True
-SetCompressor /SOLID lzma
-!include "MUI2.nsh"
-
-Name "{WINDOWS_APP_NAME}"
-OutFile "{installer_path}"
-InstallDir "$LOCALAPPDATA\\{WINDOWS_APP_NAME}"
-InstallDirRegKey HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}" "InstallDir"
-RequestExecutionLevel user
-BrandingText "UBSEDS"
-
-!define MUI_ABORTWARNING
-!define MUI_ICON "{icon_path}"
-!define MUI_UNICON "{icon_path}"
-
-!insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_DIRECTORY
-!insertmacro MUI_PAGE_INSTFILES
-!insertmacro MUI_PAGE_FINISH
-!insertmacro MUI_UNPAGE_CONFIRM
-!insertmacro MUI_UNPAGE_INSTFILES
-!insertmacro MUI_LANGUAGE "English"
-
-Section "Install"
-  SetOutPath "$INSTDIR"
-  File /r "{stage_dir}\\*"
-  WriteUninstaller "$INSTDIR\\Uninstall.exe"
-
-  CreateDirectory "$SMPROGRAMS\\{WINDOWS_APP_NAME}"
-  CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\{WINDOWS_APP_NAME}.lnk" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
-  CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk" "$INSTDIR\\Uninstall.exe"
-
-  WriteRegStr HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}" "InstallDir" "$INSTDIR"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "
-{WINDOWS_APP_NAME}"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" 
-  "$INSTDIR\\{WINDOWS_APP_NAME}.exe"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" 
-  "$INSTDIR\\Uninstall.exe"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" 
-  "$INSTDIR"
-  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoModify" 1
-  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoRepair" 1
-SectionEnd
-
-Section "Uninstall"
-  Delete "$DESKTOP\\{WINDOWS_APP_NAME}.lnk"
-  Delete "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\{WINDOWS_APP_NAME}.lnk"
-  Delete "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk"
-  RMDir "$SMPROGRAMS\\{WINDOWS_APP_NAME}"
-  RMDir /r "$INSTDIR"
-  DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}"
-  DeleteRegKey HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}"
-SectionEnd
-""".strip()
-    # fmt: on
+    # Keep this generated NSIS block as explicit lines. The registry/path entries
+    # must stay on one physical line or NSIS reports an unterminated string.
+    script = "\n".join([
+        "Unicode True",
+        "SetCompressor /SOLID lzma",
+        '!include "MUI2.nsh"',
+        "",
+        f'Name "{WINDOWS_APP_NAME}"',
+        f'OutFile "{installer_path}"',
+        f'InstallDir "$LOCALAPPDATA\\{WINDOWS_APP_NAME}"',
+        f'InstallDirRegKey HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}" "InstallDir"',
+        "RequestExecutionLevel user",
+        'BrandingText "UBSEDS"',
+        "",
+        "!define MUI_ABORTWARNING",
+        f'!define MUI_ICON "{icon_path}"',
+        f'!define MUI_UNICON "{icon_path}"',
+        "",
+        "!insertmacro MUI_PAGE_WELCOME",
+        "!insertmacro MUI_PAGE_DIRECTORY",
+        "!insertmacro MUI_PAGE_INSTFILES",
+        "!insertmacro MUI_PAGE_FINISH",
+        "!insertmacro MUI_UNPAGE_CONFIRM",
+        "!insertmacro MUI_UNPAGE_INSTFILES",
+        '!insertmacro MUI_LANGUAGE "English"',
+        "",
+        'Section "Install"',
+        '  SetOutPath "$INSTDIR"',
+        f'  File /r "{stage_dir}\\*"',
+        '  WriteUninstaller "$INSTDIR\\Uninstall.exe"',
+        "",
+        f'  CreateDirectory "$SMPROGRAMS\\{WINDOWS_APP_NAME}"',
+        f'  CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\{WINDOWS_APP_NAME}.lnk" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"',
+        f'  CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk" "$INSTDIR\\Uninstall.exe"',
+        "",
+        f'  WriteRegStr HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}" "InstallDir" "$INSTDIR"',
+        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "{WINDOWS_APP_NAME}"',
+        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"',
+        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" "$INSTDIR\\Uninstall.exe"',
+        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" "$INSTDIR"',
+        f'  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoModify" 1',
+        f'  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoRepair" 1',
+        "SectionEnd",
+        "",
+        'Section "Uninstall"',
+        f'  Delete "$DESKTOP\\{WINDOWS_APP_NAME}.lnk"',
+        f'  Delete "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\{WINDOWS_APP_NAME}.lnk"',
+        f'  Delete "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk"',
+        f'  RMDir "$SMPROGRAMS\\{WINDOWS_APP_NAME}"',
+        '  RMDir /r "$INSTDIR"',
+        f'  DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}"',
+        f'  DeleteRegKey HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}"',
+        "SectionEnd",
+    ])
     script_path.write_text(script, encoding="utf-8")
 
 
