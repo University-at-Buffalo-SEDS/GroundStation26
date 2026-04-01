@@ -4,32 +4,32 @@ use crate::flight_setup::{self, FlightSetupConfig};
 use crate::i18n::{self, TranslateRequest, TranslateResponse, TranslationCatalogResponse};
 use crate::layout;
 use crate::loadcell;
-use crate::map::{detect_max_native_zoom, tile_bundle_path, DEFAULT_MAP_REGION};
-use crate::sequences::{command_name, ActionPolicyMsg, PersistentNotification};
+use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_bundle_path};
+use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::state::AppState;
 use crate::types::{
     BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryCommand, TelemetryRow,
 };
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::{
-    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade}, extract::{Path, Query, State},
+    Json, Router,
+    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+    extract::{Path, Query, State},
     response::IntoResponse,
     routing::{get, get_service, post},
-    Json,
-    Router,
 };
 use futures::{SinkExt, StreamExt};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::Row;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::{OnceCell, mpsc};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 

@@ -314,16 +314,16 @@ pub fn ActionsTab(
                     }
                 }
             }
-            div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(360px, 1fr)); gap:12px; align-items:start;",
+            div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap:12px; align-items:start;",
                 if layout.show_flight_setup {
                     div { style: "{setup_panel_style(&theme)}",
                     h3 { style: "margin:0; color:{theme.text_primary};", "Flight Setup" }
                     if let Some(cfg) = flight_setup.read().clone() {
-                        div { style: "display:grid; grid-template-columns:minmax(220px, 320px) minmax(0, 1fr); gap:12px; align-items:start;",
-                            div { style: "display:flex; flex-direction:column; gap:8px;",
+                        div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap:12px; align-items:start; min-width:0;",
+                            div { style: "display:flex; flex-direction:column; gap:8px; min-width:0;",
                                 label { style: "font-size:12px; color:{theme.text_muted}; text-transform:uppercase; letter-spacing:0.08em;", "Flight profile" }
                                 select {
-                                    style: "{input_style(&theme)}",
+                                    style: "{input_style(&theme)} max-width:100%; min-width:0;",
                                     value: "{cfg.selected_profile_id}",
                                     onchange: {
                                         move |evt| {
@@ -391,7 +391,7 @@ pub fn ActionsTab(
                                     div { style: "font-size:12px; color:{theme.text_muted};", "{flight_setup_status.read().clone()}" }
                                 }
                             }
-                            div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px;",
+                            div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap:10px; min-width:0;",
                                 if let Some(profile) = selected_profile(&cfg) {
                                     {flight_setup_metric("Profile", profile.label.clone(), &theme)}
                                     {flight_setup_metric("Wind", format!("{}", profile.wind_level), &theme)}
@@ -413,7 +413,7 @@ pub fn ActionsTab(
                     div { style: "{setup_panel_style(&theme)}",
                     h3 { style: "margin:0; color:{theme.text_primary};", "Fill Targets" }
                     if let Some(cfg) = fill_targets.read().clone() {
-                        div { style: "display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px;",
+                        div { style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap:10px;",
                             {fill_target_editor("Nitrogen", "nitrogen", &cfg.nitrogen, &theme, fill_targets, fill_targets_status, fill_targets_editable)}
                             {fill_target_editor("Nitrous", "nitrous", &cfg.nitrous, &theme, fill_targets, fill_targets_status, fill_targets_editable)}
                         }

@@ -7,9 +7,9 @@ use super::types::{
     NetworkTopologyStatus,
 };
 use super::{
+    AlertMsg, FrontendNetworkMetrics, NetworkTimeSync, PersistentNotification,
     compensated_network_time_ms, format_network_time, format_timestamp_ms_clock, monotonic_now_ms,
-    translate_text, AlertMsg, FrontendNetworkMetrics, NetworkTimeSync,
-    PersistentNotification,
+    translate_text,
 };
 
 #[component]
@@ -217,7 +217,7 @@ pub fn DetailedTab(
                 )}
             }
 
-            div { style: "display:grid; gap:14px; grid-template-columns:minmax(0, 1.2fr) minmax(0, 0.8fr); align-items:start; width:100%;",
+            div { style: "display:grid; gap:14px; grid-template-columns:repeat(auto-fit, minmax(min(100%, 340px), 1fr)); align-items:start; width:100%;",
                 div { style: "display:flex; flex-direction:column; gap:14px; min-width:0;",
                     div { style: section_style(),
                     h3 { style: section_title_style(), "Board Latency Detail" }

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
-use whatlang::{detect, Lang};
+use whatlang::{Lang, detect};
 
 #[derive(Serialize, Deserialize, Default)]
 struct TranslationCacheFile {

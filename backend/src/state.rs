@@ -2,7 +2,7 @@ use crate::auth::AuthManager;
 use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
-use crate::sequences::{command_name, ActionPolicyMsg, PersistentNotification};
+use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::types::{
     Board, BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyLink, NetworkTopologyMsg,
     NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus, TelemetryCommand,
@@ -16,7 +16,7 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -290,6 +290,11 @@ impl AppState {
                 endpoints
             })
             .unwrap_or_default();
+        let local_visible_endpoint_list = local_endpoint_list
+            .iter()
+            .filter(|endpoint| endpoint.as_str() != DataEndpoint::GroundStation.as_str())
+            .cloned()
+            .collect::<Vec<_>>();
         let side_endpoints = |side_name: &str| {
             let mut endpoints = route_snapshot
                 .and_then(|snapshot| {
@@ -321,7 +326,7 @@ impl AppState {
             status: NetworkTopologyStatus::Online,
             group: "local".to_string(),
             sender_id: Some(Board::GroundStation.sender_id().to_string()),
-            endpoints: local_endpoint_list.clone(),
+            endpoints: local_visible_endpoint_list.clone(),
             show_in_details: true,
             detail: Some("SEDSprintf relay router".to_string()),
         }];
@@ -392,10 +397,7 @@ impl AppState {
             }
         }
 
-        for endpoint in local_endpoint_list
-            .iter()
-            .filter(|endpoint| endpoint.as_str() != DataEndpoint::GroundStation.as_str())
-        {
+        for endpoint in &local_visible_endpoint_list {
             let endpoint_id = format!("endpoint_{}", endpoint.to_ascii_lowercase());
             if endpoint_ids.insert(endpoint_id.clone()) {
                 nodes.push(NetworkTopologyNode {
@@ -468,7 +470,7 @@ impl AppState {
                 endpoints: modeled_board_endpoints(
                     entry.board,
                     simulated,
-                    &local_endpoint_list,
+                    &local_visible_endpoint_list,
                     &rocket_side_endpoints,
                     &fill_side_endpoints,
                 ),

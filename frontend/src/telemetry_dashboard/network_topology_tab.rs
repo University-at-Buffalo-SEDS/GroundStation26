@@ -198,6 +198,7 @@ pub fn NetworkTopologyTab(
                 render_height,
                 viewport_focus,
             );
+            graph_zoom_reset();
         });
     }
 
@@ -239,6 +240,7 @@ pub fn NetworkTopologyTab(
                 graph_height,
                 viewport_focus,
             );
+            graph_zoom_reset();
         });
     };
 
@@ -632,18 +634,30 @@ fn install_drag_handlers(
           }};
 
           fitAndCenterGraph();
+          if (typeof window.__gs26NetworkGraphZoomReset === "function") {{
+            window.__gs26NetworkGraphZoomReset();
+          }}
           window.requestAnimationFrame(() => {{
             if (typeof window.__gs26NetworkGraphRefresh === "function") {{
               window.__gs26NetworkGraphRefresh();
+            }}
+            if (typeof window.__gs26NetworkGraphZoomReset === "function") {{
+              window.__gs26NetworkGraphZoomReset();
             }}
           }});
           window.setTimeout(() => {{
             if (typeof window.__gs26NetworkGraphRefresh === "function") {{
               window.__gs26NetworkGraphRefresh();
             }}
+            if (typeof window.__gs26NetworkGraphZoomReset === "function") {{
+              window.__gs26NetworkGraphZoomReset();
+            }}
           }}, 60);
           window.setTimeout(() => {{
             fitAndCenterGraph();
+            if (typeof window.__gs26NetworkGraphZoomReset === "function") {{
+              window.__gs26NetworkGraphZoomReset();
+            }}
           }}, 140);
           if (state.listenersInstalled) return;
           state.listenersInstalled = true;

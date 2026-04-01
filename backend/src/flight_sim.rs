@@ -11,10 +11,10 @@ use crate::types::TelemetryCommand;
 use crate::types::{Board, FlightState};
 #[cfg(feature = "testing")]
 use rand::RngExt;
+use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
-use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;

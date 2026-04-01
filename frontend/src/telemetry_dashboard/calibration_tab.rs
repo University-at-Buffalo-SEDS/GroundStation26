@@ -1,8 +1,8 @@
 #![allow(clippy::redundant_locals)]
 
 use super::{
-    http_get_json, http_post_json, latest_telemetry_row, latest_telemetry_value,
-    translate_text, TELEMETRY_RENDER_EPOCH,
+    TELEMETRY_RENDER_EPOCH, http_get_json, http_post_json, latest_telemetry_row,
+    latest_telemetry_value, translate_text,
 };
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
