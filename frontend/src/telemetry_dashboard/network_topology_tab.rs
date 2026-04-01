@@ -30,12 +30,27 @@ struct GraphLayout {
     placements: HashMap<String, NodePlacement>,
 }
 
+#[derive(Clone, Copy)]
+struct GraphViewportFocus {
+    center_x: i32,
+    center_y: i32,
+    min_x: i32,
+    max_x: i32,
+    min_y: i32,
+    max_y: i32,
+    left_extent: i32,
+    right_extent: i32,
+    top_extent: i32,
+    bottom_extent: i32,
+}
+
 const GRAPH_MIN_WIDTH: i32 = 1080;
 const GRAPH_MIN_HEIGHT: i32 = 720;
 const EMBEDDED_GRAPH_MIN_HEIGHT: i32 = 520;
 const ZOOM_MIN: f32 = 0.12;
 const ZOOM_MAX: f32 = 2.2;
 const ZOOM_STEP: f32 = 0.2;
+const GRAPH_LINK_CHANNEL_COLOR: &str = "#243447";
 
 fn graph_viewport_style(min_height_px: i32, max_height: Option<&str>, fullscreen: bool) -> String {
     let size_constraints = if fullscreen {
@@ -83,6 +98,61 @@ pub fn NetworkTopologyTab(
         .collect::<Vec<_>>();
     let graph_links = collapse_visible_links(&snapshot.nodes, &snapshot.links, &visible_node_ids);
     let graph_layout = compute_graph_layout(&graph_nodes, &graph_links);
+    let router_placement = graph_nodes
+        .iter()
+        .find(|node| node.kind == NetworkTopologyNodeKind::Router)
+        .and_then(|node| graph_layout.placements.get(&node.id).copied());
+    let graph_bounds = graph_layout
+        .placements
+        .values()
+        .fold(None::<(i32, i32, i32, i32)>, |acc, placement| {
+            let left = placement.x - placement.size / 2;
+            let right = placement.x + placement.size / 2;
+            let top = placement.y - placement.size / 2;
+            let bottom = placement.y + placement.size / 2;
+            match acc {
+                Some((min_x, max_x, min_y, max_y)) => Some((
+                    min_x.min(left),
+                    max_x.max(right),
+                    min_y.min(top),
+                    max_y.max(bottom),
+                )),
+                None => Some((left, right, top, bottom)),
+            }
+        })
+        .unwrap_or((0, graph_layout.width, 0, graph_layout.height));
+    let (bound_min_x, bound_max_x, bound_min_y, bound_max_y) = graph_bounds;
+    let render_width = (bound_max_x - bound_min_x).max(GRAPH_MIN_WIDTH);
+    let render_height = (bound_max_y - bound_min_y).max(GRAPH_MIN_HEIGHT);
+    let render_placements = graph_layout
+        .placements
+        .iter()
+        .map(|(id, placement)| {
+            (
+                id.clone(),
+                NodePlacement {
+                    x: placement.x - bound_min_x,
+                    y: placement.y - bound_min_y,
+                    size: placement.size,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let viewport_focus = router_placement.map(|router| {
+        let router_radius = router.size / 2;
+        GraphViewportFocus {
+            center_x: router.x - bound_min_x,
+            center_y: router.y - bound_min_y,
+            min_x: 0,
+            max_x: bound_max_x - bound_min_x,
+            min_y: 0,
+            max_y: bound_max_y - bound_min_y,
+            left_extent: (router.x - bound_min_x).max(router_radius),
+            right_extent: (bound_max_x - router.x).max(router_radius),
+            top_extent: (router.y - bound_min_y).max(router_radius),
+            bottom_extent: (bound_max_y - router.y).max(router_radius),
+        }
+    });
     let endpoint_rows = collect_endpoint_rows(&snapshot.nodes, &snapshot.links);
     let viewport_id = if *is_fullscreen.read() {
         GRAPH_VIEWPORT_FULLSCREEN_ID
@@ -124,8 +194,9 @@ pub fn NetworkTopologyTab(
                 viewport_id,
                 surface_id,
                 canvas_id,
-                graph_layout.width,
-                graph_layout.height,
+                render_width,
+                render_height,
+                viewport_focus,
             );
         });
     }
@@ -150,8 +221,8 @@ pub fn NetworkTopologyTab(
         } else {
             GRAPH_CANVAS_ID
         };
-        let graph_width = graph_layout.width;
-        let graph_height = graph_layout.height;
+        let graph_width = render_width;
+        let graph_height = render_height;
         spawn(async move {
             #[cfg(target_arch = "wasm32")]
             gloo_timers::future::TimeoutFuture::new(20).await;
@@ -166,6 +237,7 @@ pub fn NetworkTopologyTab(
                 canvas_id,
                 graph_width,
                 graph_height,
+                viewport_focus,
             );
         });
     };
@@ -224,18 +296,18 @@ pub fn NetworkTopologyTab(
                     style: "{graph_viewport_style(EMBEDDED_GRAPH_MIN_HEIGHT, None, true)}",
                     id: "{viewport_id}",
                     div {
-                        id: "{surface_id}",
-                        style: "position:relative; width:{graph_layout.width}px; height:{graph_layout.height}px; min-width:{graph_layout.width}px; min-height:{graph_layout.height}px;",
+                            id: "{surface_id}",
+                        style: "position:relative; width:{render_width}px; height:{render_height}px; min-width:{render_width}px; min-height:{render_height}px;",
                         div {
                             id: "{canvas_id}",
-                            style: "position:absolute; inset:0 auto auto 0; width:{graph_layout.width}px; height:{graph_layout.height}px; transform:scale(1); transform-origin:top left;",
+                            style: "position:absolute; inset:0 auto auto 0; width:{render_width}px; height:{render_height}px; transform:scale(1); transform-origin:top left;",
                             svg {
-                                width: "{graph_layout.width}",
-                                height: "{graph_layout.height}",
-                                view_box: "0 0 {graph_layout.width} {graph_layout.height}",
+                                width: "{render_width}",
+                                height: "{render_height}",
+                                view_box: "0 0 {render_width} {render_height}",
                                 style: "position:absolute; inset:0; overflow:visible;",
                                 for link in graph_links.iter() {
-                                    {render_link(link, &snapshot.nodes, &graph_layout.placements, flow_animation_enabled)}
+                                    {render_link(link, &snapshot.nodes, &render_placements, flow_animation_enabled)}
                                 }
                             }
 
@@ -244,8 +316,8 @@ pub fn NetworkTopologyTab(
                                     node,
                                     &graph_links,
                                     &snapshot.nodes,
-                                    &graph_layout.placements,
-                                    graph_layout.width,
+                                    &render_placements,
+                                    render_width,
                                     expanded_node_id,
                                 )}
                             }
@@ -299,17 +371,17 @@ pub fn NetworkTopologyTab(
                     style: "padding:8px; {graph_viewport_style(EMBEDDED_GRAPH_MIN_HEIGHT, Some(\"calc(var(--gs26-app-height) - 260px)\"), false)}",
                     div {
                         id: "{surface_id}",
-                        style: "position:relative; width:{graph_layout.width}px; height:{graph_layout.height}px; min-width:{graph_layout.width}px; min-height:{graph_layout.height}px;",
+                        style: "position:relative; width:{render_width}px; height:{render_height}px; min-width:{render_width}px; min-height:{render_height}px;",
                         div {
                             id: "{canvas_id}",
-                            style: "position:absolute; inset:0 auto auto 0; width:{graph_layout.width}px; height:{graph_layout.height}px; transform:scale(1); transform-origin:top left;",
+                            style: "position:absolute; inset:0 auto auto 0; width:{render_width}px; height:{render_height}px; transform:scale(1); transform-origin:top left;",
                             svg {
-                                width: "{graph_layout.width}",
-                                height: "{graph_layout.height}",
-                                view_box: "0 0 {graph_layout.width} {graph_layout.height}",
+                                width: "{render_width}",
+                                height: "{render_height}",
+                                view_box: "0 0 {render_width} {render_height}",
                                 style: "position:absolute; inset:0; overflow:visible;",
                                 for link in graph_links.iter() {
-                                    {render_link(link, &snapshot.nodes, &graph_layout.placements, flow_animation_enabled)}
+                                    {render_link(link, &snapshot.nodes, &render_placements, flow_animation_enabled)}
                                 }
                             }
 
@@ -318,8 +390,8 @@ pub fn NetworkTopologyTab(
                                     node,
                                     &graph_links,
                                     &snapshot.nodes,
-                                    &graph_layout.placements,
-                                    graph_layout.width,
+                                    &render_placements,
+                                    render_width,
                                     expanded_node_id,
                                 )}
                             }
@@ -396,6 +468,7 @@ fn install_drag_handlers(
     canvas_id: &str,
     graph_width: i32,
     graph_height: i32,
+    viewport_focus: Option<GraphViewportFocus>,
 ) {
     js_eval(&format!(
         r#"
@@ -411,8 +484,12 @@ fn install_drag_handlers(
             pointers: new Map(),
             pinchDistance: null,
             pinchScale: 1.0,
-            padX: 0,
-            padY: 0,
+            canvasLeft: 0,
+            canvasTop: 0,
+            padLeft: 0,
+            padRight: 0,
+            padTop: 0,
+            padBottom: 0,
             autoFitted: false,
             listenersInstalled: false,
           }};
@@ -431,41 +508,87 @@ fn install_drag_handlers(
 
           const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
           const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+          const focus = {viewport_focus};
           const fitScale = () => {{
-            const availW = Math.max(state.viewport.clientWidth - 120, 240);
-            const availH = Math.max(state.viewport.clientHeight - 120, 240);
-            return clamp(Math.min(availW / {graph_width}, availH / {graph_height}), {zoom_min}, {zoom_max});
+            const marginX = Math.min(64, Math.max(24, state.viewport.clientWidth * 0.06));
+            const marginY = Math.min(64, Math.max(24, state.viewport.clientHeight * 0.06));
+            const availW = Math.max(state.viewport.clientWidth - marginX * 2, 240);
+            const availH = Math.max(state.viewport.clientHeight - marginY * 2, 240);
+            if (!focus) {{
+              return clamp(Math.min(availW / {graph_width}, availH / {graph_height}) * 0.92, {zoom_min}, {zoom_max});
+            }}
+            const fitFromCenter = Math.min(
+              (availW / 2) / Math.max(focus.left_extent, focus.right_extent, 1),
+              (availH / 2) / Math.max(focus.top_extent, focus.bottom_extent, 1),
+            );
+            return clamp(fitFromCenter * 0.95, {zoom_min}, {zoom_max});
           }};
           const refreshSurfaceFrame = () => {{
-            const scaledWidth = Math.round({graph_width} * state.scale);
-            const scaledHeight = Math.round({graph_height} * state.scale);
-            state.padX = Math.max(Math.round((state.viewport.clientWidth - scaledWidth) / 2), 90);
-            state.padY = Math.max(Math.round((state.viewport.clientHeight - scaledHeight) / 2), 60);
-            state.surface.style.width = `${{scaledWidth + state.padX * 2}}px`;
-            state.surface.style.height = `${{scaledHeight + state.padY * 2}}px`;
+            const minX = focus ? focus.min_x : 0;
+            const maxX = focus ? focus.max_x : {graph_width};
+            const minY = focus ? focus.min_y : 0;
+            const maxY = focus ? focus.max_y : {graph_height};
+            const scaledWidth = Math.round((maxX - minX) * state.scale);
+            const scaledHeight = Math.round((maxY - minY) * state.scale);
+            const basePadX = Math.max(Math.round((state.viewport.clientWidth - scaledWidth) / 2), 48);
+            const basePadY = Math.max(Math.round((state.viewport.clientHeight - scaledHeight) / 2), 36);
+            if (focus) {{
+              state.padLeft = Math.max(basePadX, Math.ceil(state.viewport.clientWidth / 2 - (focus.center_x - focus.min_x) * state.scale + 24));
+              state.padRight = Math.max(basePadX, Math.ceil(state.viewport.clientWidth / 2 - (focus.max_x - focus.center_x) * state.scale + 24));
+              state.padTop = Math.max(basePadY, Math.ceil(state.viewport.clientHeight / 2 - (focus.center_y - focus.min_y) * state.scale + 24));
+              state.padBottom = Math.max(basePadY, Math.ceil(state.viewport.clientHeight / 2 - (focus.max_y - focus.center_y) * state.scale + 24));
+            }} else {{
+              state.padLeft = basePadX;
+              state.padRight = basePadX;
+              state.padTop = basePadY;
+              state.padBottom = basePadY;
+            }}
+            state.surface.style.width = `${{scaledWidth + state.padLeft + state.padRight}}px`;
+            state.surface.style.height = `${{scaledHeight + state.padTop + state.padBottom}}px`;
             state.surface.style.minWidth = state.surface.style.width;
             state.surface.style.minHeight = state.surface.style.height;
-            state.canvas.style.left = `${{state.padX}}px`;
-            state.canvas.style.top = `${{state.padY}}px`;
+            state.canvasLeft = Math.round(state.padLeft - minX * state.scale);
+            state.canvasTop = Math.round(state.padTop - minY * state.scale);
+            state.canvas.style.left = `${{state.canvasLeft}}px`;
+            state.canvas.style.top = `${{state.canvasTop}}px`;
+          }};
+          const setViewportScroll = (left, top) => {{
+            const maxLeft = Math.max(0, state.viewport.scrollWidth - state.viewport.clientWidth);
+            const maxTop = Math.max(0, state.viewport.scrollHeight - state.viewport.clientHeight);
+            state.viewport.scrollLeft = clamp(left, 0, maxLeft);
+            state.viewport.scrollTop = clamp(top, 0, maxTop);
           }};
           const centerGraph = () => {{
+            if (focus) {{
+              const localX = state.viewport.clientWidth / 2;
+              const localY = state.viewport.clientHeight / 2;
+              setViewportScroll(
+                (focus.center_x - focus.min_x) * state.scale + state.padLeft - localX,
+                (focus.center_y - focus.min_y) * state.scale + state.padTop - localY,
+              );
+              return;
+            }}
             const scaledWidth = Math.round({graph_width} * state.scale);
             const scaledHeight = Math.round({graph_height} * state.scale);
-            state.viewport.scrollLeft = Math.max(0, state.padX + Math.round((scaledWidth - state.viewport.clientWidth) / 2));
-            state.viewport.scrollTop = Math.max(0, state.padY + Math.round((scaledHeight - state.viewport.clientHeight) / 2));
+            setViewportScroll(
+              state.padLeft + Math.round((scaledWidth - state.viewport.clientWidth) / 2),
+              state.padTop + Math.round((scaledHeight - state.viewport.clientHeight) / 2),
+            );
           }};
           const applyScale = (nextScale, clientX, clientY) => {{
             const scale = clamp(nextScale, {zoom_min}, {zoom_max});
             const rect = state.viewport.getBoundingClientRect();
             const localX = clientX - rect.left;
             const localY = clientY - rect.top;
-            const contentX = (state.viewport.scrollLeft + localX - state.padX) / state.scale;
-            const contentY = (state.viewport.scrollTop + localY - state.padY) / state.scale;
+            const contentX = (state.viewport.scrollLeft + localX - state.canvasLeft) / state.scale;
+            const contentY = (state.viewport.scrollTop + localY - state.canvasTop) / state.scale;
             state.scale = scale;
             state.canvas.style.transform = `scale(${{scale}})`;
             refreshSurfaceFrame();
-            state.viewport.scrollLeft = Math.max(0, contentX * scale + state.padX - localX);
-            state.viewport.scrollTop = Math.max(0, contentY * scale + state.padY - localY);
+            setViewportScroll(
+              contentX * scale + state.canvasLeft - localX,
+              contentY * scale + state.canvasTop - localY,
+            );
           }};
 
           const zoomFromWheel = (evt) => {{
@@ -492,11 +615,23 @@ fn install_drag_handlers(
             refreshSurfaceFrame();
             centerGraph();
           }};
+          const fitAndCenterGraph = () => {{
+            state.viewport.scrollLeft = 0;
+            state.viewport.scrollTop = 0;
+            state.scale = fitScale();
+            state.canvas.style.transform = `scale(${{state.scale}})`;
+            refreshSurfaceFrame();
+            window.requestAnimationFrame(() => {{
+              refreshSurfaceFrame();
+              centerGraph();
+              window.requestAnimationFrame(() => {{
+                refreshSurfaceFrame();
+                centerGraph();
+              }});
+            }});
+          }};
 
-          state.scale = fitScale();
-          state.canvas.style.transform = `scale(${{state.scale}})`;
-          refreshSurfaceFrame();
-          centerGraph();
+          fitAndCenterGraph();
           window.requestAnimationFrame(() => {{
             if (typeof window.__gs26NetworkGraphRefresh === "function") {{
               window.__gs26NetworkGraphRefresh();
@@ -507,14 +642,14 @@ fn install_drag_handlers(
               window.__gs26NetworkGraphRefresh();
             }}
           }}, 60);
+          window.setTimeout(() => {{
+            fitAndCenterGraph();
+          }}, 140);
           if (state.listenersInstalled) return;
           state.listenersInstalled = true;
 
           window.addEventListener("resize", () => {{
-            state.scale = fitScale();
-            state.canvas.style.transform = `scale(${{state.scale}})`;
-            refreshSurfaceFrame();
-            centerGraph();
+            fitAndCenterGraph();
           }});
 
           document.addEventListener("wheel", (evt) => {{
@@ -625,6 +760,21 @@ fn install_drag_handlers(
         zoom_max = ZOOM_MAX,
         graph_width = graph_width,
         graph_height = graph_height,
+        viewport_focus = viewport_focus
+            .map(|focus| format!(
+                "{{ center_x: {}, center_y: {}, min_x: {}, max_x: {}, min_y: {}, max_y: {}, left_extent: {}, right_extent: {}, top_extent: {}, bottom_extent: {} }}",
+                focus.center_x,
+                focus.center_y,
+                focus.min_x,
+                focus.max_x,
+                focus.min_y,
+                focus.max_y,
+                focus.left_extent,
+                focus.right_extent,
+                focus.top_extent,
+                focus.bottom_extent
+            ))
+            .unwrap_or_else(|| "null".to_string()),
     ));
 }
 
@@ -762,7 +912,7 @@ fn render_link(
     let len = (dx * dx + dy * dy).sqrt().max(1.0);
     let nx = -dy / len;
     let ny = dx / len;
-    let lane_offset = if len < 220.0 { 1.6 } else { 1.8 };
+    let lane_offset = if len < 220.0 { 2.2 } else { 2.4 };
     let lane1_x1 = source.x as f32 + nx * lane_offset;
     let lane1_y1 = source.y as f32 + ny * lane_offset;
     let lane1_x2 = target.x as f32 + nx * lane_offset;
@@ -781,16 +931,6 @@ fn render_link(
         NetworkTopologyStatus::Offline => "#f87171",
         NetworkTopologyStatus::Simulated => "#c084fc",
     };
-    let upload_glow = match link.status {
-        NetworkTopologyStatus::Online => "#7dd3fc",
-        NetworkTopologyStatus::Offline => "#fca5a5",
-        NetworkTopologyStatus::Simulated => "#ddd6fe",
-    };
-    let download_glow = match link.status {
-        NetworkTopologyStatus::Online => "#86efac",
-        NetworkTopologyStatus::Offline => "#fecaca",
-        NetworkTopologyStatus::Simulated => "#e9d5ff",
-    };
     let lane_dash = if matches!(link.status, NetworkTopologyStatus::Simulated) {
         "12 16"
     } else {
@@ -802,15 +942,17 @@ fn render_link(
 
     rsx! {
         g {
-            line {
-                x1: "{source.x}",
-                y1: "{source.y}",
-                x2: "{target.x}",
-                y2: "{target.y}",
-                stroke: "{glow}",
-                stroke_width: if animated { "8" } else { "10" },
-                stroke_opacity: if animated { "0.08" } else { "0.15" },
-                stroke_linecap: "round",
+            if !animated {
+                line {
+                    x1: "{source.x}",
+                    y1: "{source.y}",
+                    x2: "{target.x}",
+                    y2: "{target.y}",
+                    stroke: "{glow}",
+                    stroke_width: "10",
+                    stroke_opacity: "0.15",
+                    stroke_linecap: "round",
+                }
             }
             if !animated {
                 line {
@@ -827,13 +969,23 @@ fn render_link(
             if animated {
                 g {
                     line {
-                        x1: "{lane1_x1}",
-                        y1: "{lane1_y1}",
-                        x2: "{lane1_x2}",
-                        y2: "{lane1_y2}",
-                        stroke: "{upload_glow}",
-                        stroke_width: "7",
+                        x1: "{source.x}",
+                        y1: "{source.y}",
+                        x2: "{target.x}",
+                        y2: "{target.y}",
+                        stroke: "{glow}",
+                        stroke_width: "8.5",
                         stroke_opacity: "0.12",
+                        stroke_linecap: "round",
+                    }
+                    line {
+                        x1: "{source.x}",
+                        y1: "{source.y}",
+                        x2: "{target.x}",
+                        y2: "{target.y}",
+                        stroke: "{GRAPH_LINK_CHANNEL_COLOR}",
+                        stroke_width: "6",
+                        stroke_opacity: "1.0",
                         stroke_linecap: "round",
                     }
                     line {
@@ -842,7 +994,7 @@ fn render_link(
                         x2: "{lane1_x2}",
                         y2: "{lane1_y2}",
                         stroke: "{upload_color}",
-                        stroke_width: "3",
+                        stroke_width: "2.5",
                         stroke_dasharray: "{lane_dash}",
                         stroke_linecap: "round",
                         stroke_opacity: "0.92",
@@ -865,18 +1017,8 @@ fn render_link(
                         y1: "{lane2_y1}",
                         x2: "{lane2_x2}",
                         y2: "{lane2_y2}",
-                        stroke: "{download_glow}",
-                        stroke_width: "7",
-                        stroke_opacity: "0.12",
-                        stroke_linecap: "round",
-                    }
-                    line {
-                        x1: "{lane2_x1}",
-                        y1: "{lane2_y1}",
-                        x2: "{lane2_x2}",
-                        y2: "{lane2_y2}",
                         stroke: "{download_color}",
-                        stroke_width: "3",
+                        stroke_width: "2.5",
                         stroke_dasharray: "{lane_dash}",
                         stroke_linecap: "round",
                         stroke_opacity: "0.92",
