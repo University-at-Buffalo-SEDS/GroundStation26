@@ -24,10 +24,10 @@ object LocationShim : LocationListener, SensorEventListener {
     private const val LOCATION_PERMISSION_REQUEST_CODE = 2601
     private const val LOCATION_MIN_TIME_MS = 250L
     private const val LOCATION_MIN_DISTANCE_M = 0.25f
-    private const val HEADING_SMOOTHING_ALPHA_HIGH = 0.12f
-    private const val HEADING_SMOOTHING_ALPHA_LOW = 0.06f
-    private const val HEADING_JITTER_THRESHOLD_DEG = 1.2f
-    private const val HEADING_SAMPLE_WINDOW = 7
+    private const val HEADING_SMOOTHING_ALPHA_HIGH = 0.92f
+    private const val HEADING_SMOOTHING_ALPHA_LOW = 0.78f
+    private const val HEADING_JITTER_THRESHOLD_DEG = 0.12f
+    private const val HEADING_SAMPLE_WINDOW = 1
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -139,7 +139,7 @@ object LocationShim : LocationListener, SensorEventListener {
         }
 
         rotationVectorSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
 
         tryEmitLastKnownLocation(locationManager)
@@ -203,10 +203,11 @@ object LocationShim : LocationListener, SensorEventListener {
         }
 
         val rotationMatrix = FloatArray(9)
-        val orientation = FloatArray(3)
         SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-        SensorManager.getOrientation(rotationMatrix, orientation)
-        var headingDeg = Math.toDegrees(orientation[0].toDouble()).toFloat()
+        // Use absolute yaw from the raw world/device rotation matrix.
+        // This keeps north stable regardless of screen rotation, pitch, or roll,
+        // so only turning around the vertical axis changes the reported heading.
+        var headingDeg = Math.toDegrees(atan2(rotationMatrix[1].toDouble(), rotationMatrix[4].toDouble())).toFloat()
         if (headingDeg < 0f) {
             headingDeg += 360f
         }

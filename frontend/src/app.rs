@@ -158,16 +158,35 @@ fn shell_input_style(theme: &ThemeConfig, margin_bottom: bool) -> String {
 
 fn shell_notice_style(theme: &ThemeConfig) -> String {
     format!(
-        "margin-top:14px; padding:12px; border-radius:12px; border:1px solid {}; background:{}; color:{}; white-space:pre-wrap; line-height:1.4; max-width:72ch; align-self:flex-start;",
+        "margin-top:14px; padding:12px; border-radius:12px; border:1px solid {}; background:{}; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; line-height:1.4; max-width:72ch; align-self:flex-start;",
         theme.border, theme.app_background, theme.text_secondary
     )
 }
 
 fn shell_warning_style(theme: &ThemeConfig) -> String {
     format!(
-        "margin-bottom:14px; padding:12px; border-radius:12px; border:1px solid {}; background:{}; color:{};",
+        "margin-bottom:14px; padding:12px; border-radius:12px; border:1px solid {}; background:{}; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
         theme.warning_border, theme.warning_background, theme.warning_text
     )
+}
+
+fn format_session_load_error(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    let tls_like = lower.contains("ssl")
+        || lower.contains("tls")
+        || lower.contains("certificate")
+        || lower.contains("unknown issuer")
+        || lower.contains("self signed")
+        || lower.contains("invalid peer certificate");
+
+    if tls_like {
+        err.to_string()
+    } else {
+        format!(
+            "{}\n\nThe app could not load the backend session endpoint. Check that the backend URL is correct and that the proxy or server is healthy.",
+            err
+        )
+    }
 }
 
 #[derive(Clone, Routable, PartialEq)]
@@ -1103,7 +1122,7 @@ fn ConnectionFailedCard(message: String, on_retry: EventHandler<()>) -> Element 
             div {
                 style: shell_card_style(&theme, "min(560px, 92vw)"),
                 h1 { style: "margin:0 0 10px 0; font-size:22px;", "Failed to Connect" }
-                p { style: "margin:0 0 16px 0; color:{theme.text_muted}; white-space:pre-wrap;", "{message}" }
+                p { style: "margin:0 0 16px 0; color:{theme.text_muted}; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;", "{message}" }
                 div { style: "display:flex; gap:12px; justify-content:flex-end; flex-wrap:wrap;",
                     button {
                         style: shell_button_style(&theme),
@@ -1512,10 +1531,7 @@ pub fn Dashboard() -> Element {
         }
         Some(Err(err)) => rsx! {
             ConnectionFailedCard {
-                message: format!(
-                    "{}\n\nThe app could not load the backend session endpoint. Check that the backend URL is correct and that the proxy or server is healthy.",
-                    err
-                ),
+                message: format_session_load_error(err),
                 on_retry: move |_| {
                     let base = UrlConfig::base_http();
                     let skip_tls = UrlConfig::_skip_tls_verify();
