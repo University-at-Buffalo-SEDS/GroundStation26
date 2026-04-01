@@ -354,6 +354,33 @@ def _read_dioxus_build(frontend_dir: Path) -> str:
     raise ValueError(f"Failed to read [application].build from: {dioxus_toml}")
 
 
+def _android_version_code(frontend_dir: Path) -> int:
+    version_name = _read_frontend_version(frontend_dir)
+    build_raw = _read_dioxus_build(frontend_dir)
+    semver = _parse_semver_triplet(version_name)
+    if semver is None:
+        raise ValueError(f"Android versionName must be semver-compatible, got: {version_name}")
+
+    try:
+        build_num = int(build_raw)
+    except ValueError as exc:
+        raise ValueError(f"Android build number must be an integer, got: {build_raw}") from exc
+
+    if build_num < 0 or build_num > 999:
+        raise ValueError(
+            f"Android build number must be between 0 and 999 inclusive, got: {build_num}"
+        )
+
+    major, minor, patch = semver
+    if major > 99 or minor > 99 or patch > 99:
+        raise ValueError(
+            "Android semantic version components must be 99 or less to fit versionCode encoding: "
+            f"{version_name}"
+        )
+
+    return (major * 10_000_000) + (minor * 100_000) + (patch * 1_000) + build_num
+
+
 def dist_dir(frontend_dir: Path) -> Path:
     return frontend_dir / DIST_DIRNAME
 
@@ -1992,12 +2019,12 @@ def _configure_android_app_gradle(frontend_dir: Path, project_dir: Path) -> None
 
     min_sdk, target_sdk, compile_sdk = _android_sdk_levels()
     version_name = _read_frontend_version(frontend_dir)
-    version_code = _read_dioxus_build(frontend_dir)
+    version_code = _android_version_code(frontend_dir)
     raw = gradle_file.read_text(encoding="utf-8")
     raw = re.sub(r"compileSdk\s*=\s*\d+", f"compileSdk = {compile_sdk}", raw)
     raw = re.sub(r"minSdk\s*=\s*\d+", f"minSdk = {min_sdk}", raw)
     raw = re.sub(r"targetSdk\s*=\s*\d+", f"targetSdk = {target_sdk}", raw)
-    raw = re.sub(r'versionCode\s*=\s*\d+', f"versionCode = {int(version_code)}", raw)
+    raw = re.sub(r'versionCode\s*=\s*\d+', f"versionCode = {version_code}", raw)
     raw = re.sub(r'versionName\s*=\s*"[^"]+"', f'versionName = "{version_name}"', raw)
     maven_dir = _find_rustls_platform_verifier_maven(frontend_dir)
     if maven_dir is not None:
