@@ -122,8 +122,8 @@ pub fn NetworkTopologyTab(
         })
         .unwrap_or((0, graph_layout.width, 0, graph_layout.height));
     let (bound_min_x, bound_max_x, bound_min_y, bound_max_y) = graph_bounds;
-    let render_width = (bound_max_x - bound_min_x).max(GRAPH_MIN_WIDTH);
-    let render_height = (bound_max_y - bound_min_y).max(GRAPH_MIN_HEIGHT);
+    let render_width = (bound_max_x - bound_min_x).max(1);
+    let render_height = (bound_max_y - bound_min_y).max(1);
     let render_placements = graph_layout
         .placements
         .iter()
