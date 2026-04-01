@@ -404,14 +404,14 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::ReinitAfter26 => "ReinitAfter26",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitAfter44 => "ReinitAfter44",
-        #[cfg(feature = "hitl_mode")]
+        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
-        #[cfg(feature = "hitl_mode")]
+        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         TelemetryCommand::RewindFlightState => "RewindFlightState",
     }
 }
 
-#[cfg(not(feature = "hitl_mode"))]
+#[cfg(all(not(feature = "hitl_mode"), not(feature = "test_fire_mode")))]
 pub fn all_command_names() -> Vec<&'static str> {
     vec![
         "Launch",
@@ -464,6 +464,24 @@ pub fn all_command_names() -> Vec<&'static str> {
         "ReinitAfter12",
         "ReinitAfter26",
         "ReinitAfter44",
+        "AdvanceFlightState",
+        "RewindFlightState",
+    ]
+}
+
+#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+pub fn all_command_names() -> Vec<&'static str> {
+    vec![
+        "Launch",
+        "Dump",
+        "Abort",
+        "NormallyOpen",
+        "Pilot",
+        "Igniter",
+        "RetractPlumbing",
+        "Nitrogen",
+        "Nitrous",
+        "ContinueFillSequence",
         "AdvanceFlightState",
         "RewindFlightState",
     ]
@@ -869,7 +887,7 @@ fn maybe_drive_local_prelaunch_state(
         return current_state;
     }
 
-    if current_state == FlightState::Startup && state.all_boards_seen() {
+    if current_state == FlightState::Startup && state.all_required_boards_seen() {
         state.set_local_flight_state(FlightState::Idle);
         return FlightState::Idle;
     }
@@ -1091,7 +1109,7 @@ fn read_key_enabled(state: &AppState, cfg: &SequenceConfig) -> bool {
     if cfg!(feature = "testing") {
         return true;
     }
-    if cfg!(feature = "hitl_mode") {
+    if cfg!(feature = "hitl_mode") || cfg!(feature = "test_fire_mode") {
         return true;
     }
     if !cfg.key_required {
@@ -1110,7 +1128,7 @@ fn read_software_buttons_enabled(state: &AppState, cfg: &SequenceConfig) -> bool
     if cfg!(feature = "testing") {
         return true;
     }
-    if cfg!(feature = "hitl_mode") {
+    if cfg!(feature = "hitl_mode") || cfg!(feature = "test_fire_mode") {
         return true;
     }
     state
@@ -1146,6 +1164,7 @@ pub fn start_sequence_task(
 
     if cfg.key_required
         && !cfg!(feature = "hitl_mode")
+        && !cfg!(feature = "test_fire_mode")
         && let Err(err) = state.gpio.setup_input_pin(cfg.key_enable_pin)
     {
         eprintln!(
@@ -1156,6 +1175,7 @@ pub fn start_sequence_task(
 
     if !cfg!(feature = "testing")
         && !cfg!(feature = "hitl_mode")
+        && !cfg!(feature = "test_fire_mode")
         && let Err(err) = state.gpio.setup_input_pin(cfg.software_disable_pin)
     {
         eprintln!(

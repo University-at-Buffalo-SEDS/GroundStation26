@@ -113,6 +113,7 @@ def build_backend(
         force_no_pi: bool,
         testing_mode: bool,
         hitl_mode: bool,
+        test_fire_mode: bool,
         debug_mode: bool = False,
 ) -> None:
     cmd = ["cargo", "build", "-p", "groundstation_backend"]
@@ -147,6 +148,12 @@ def build_backend(
             cmd[cmd.index("--features") + 1] += ",hitl_mode"
         else:
             cmd.extend(["--features", "hitl_mode"])
+    if test_fire_mode:
+        print("Test-fire mode enabled → adding `test_fire_mode` feature.")
+        if "--features" in cmd:
+            cmd[cmd.index("--features") + 1] += ",test_fire_mode"
+        else:
+            cmd.extend(["--features", "test_fire_mode"])
 
     try:
         run(cmd, cwd=backend_dir)
@@ -162,18 +169,19 @@ def print_usage(exit_code: int = 1) -> None:
     print("Backend build script")
     print("")
     print("Usage:")
-    print("  ./backend/build.py [pi_build|no_pi] [testing|hitl-mode] [debug] [log=<path>]")
+    print("  ./backend/build.py [pi_build|no_pi] [testing|hitl-mode|test-fire-mode] [debug] [log=<path>]")
     print("")
     print("What this script owns:")
     print("  - backend cargo builds")
     print("  - Raspberry Pi feature selection")
-    print("  - testing and hitl_mode feature toggles")
+    print("  - testing, hitl_mode, and test_fire_mode feature toggles")
     print("")
     print("Options:")
     print("  pi_build                          # force raspberry_pi feature on")
     print("  no_pi                             # force raspberry_pi feature off")
     print("  testing                           # enable backend testing feature")
     print("  hitl-mode                         # enable backend hitl_mode feature")
+    print("  test-fire-mode                    # enable backend test_fire_mode feature")
     print("  debug                             # build without --release")
     print("  log=<path>                        # tee command output into a log file")
     sys.exit(exit_code)
@@ -188,6 +196,7 @@ def main() -> None:
     force_no_pi = False
     testing_mode = False
     hitl_mode = False
+    test_fire_mode = False
     debug_mode = False
     log_file_arg: Optional[str] = None
 
@@ -201,6 +210,8 @@ def main() -> None:
             testing_mode = True
         elif arg == "hitl-mode":
             hitl_mode = True
+        elif arg == "test-fire-mode":
+            test_fire_mode = True
         elif arg == "debug":
             debug_mode = True
         elif arg.startswith("log="):
@@ -216,14 +227,23 @@ def main() -> None:
     if force_pi and force_no_pi:
         print("Error: Cannot specify both 'pi_build' and 'no_pi'.", file=sys.stderr)
         sys.exit(1)
-    if testing_mode and hitl_mode:
-        print("Error: Cannot specify both 'testing' and 'hitl-mode'.", file=sys.stderr)
+    selected_modes = sum([testing_mode, hitl_mode, test_fire_mode])
+    if selected_modes > 1:
+        print("Error: testing, hitl-mode, and test-fire-mode are mutually exclusive.", file=sys.stderr)
         sys.exit(1)
 
     repo_root = Path(__file__).resolve().parents[1]
     backend_dir = repo_root / "backend"
     _configure_log_file(repo_root, log_file_arg)
-    build_backend(backend_dir, force_pi, force_no_pi, testing_mode, hitl_mode, debug_mode)
+    build_backend(
+        backend_dir,
+        force_pi,
+        force_no_pi,
+        testing_mode,
+        hitl_mode,
+        test_fire_mode,
+        debug_mode,
+    )
 
 
 if __name__ == "__main__":

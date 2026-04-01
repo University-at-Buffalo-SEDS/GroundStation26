@@ -303,6 +303,19 @@ impl FlightSimState {
         }
     }
 
+    fn queue_scalar_f32(&mut self, dtype: DataType, sender: Board, value: f32, now_ms: u64) {
+        let bytes = value.to_le_bytes();
+        if let Ok(pkt) = Packet::new(
+            dtype,
+            &[DataEndpoint::GroundStation],
+            sender.sender_id(),
+            now_ms,
+            Arc::from(bytes.as_slice()),
+        ) {
+            self.queued.push_back(pkt);
+        }
+    }
+
     fn queue_housekeeping(&mut self, now_ms: u64) {
         let valve_board_online = !valve_board_disconnected_for_state(self.flight_state);
         for board in Board::ALL {
@@ -334,6 +347,32 @@ impl FlightSimState {
         self.next_valve_emit_idx = (self.next_valve_emit_idx + 1) % keys.len();
         let on = self.valve_on(key);
         self.queue_umbilical_status(key, on, now_ms);
+
+        // Keep battery telemetry present even when other sensor traffic is sparse.
+        self.queue_scalar_f32(
+            DataType::BatteryVoltage,
+            Board::PowerBoard,
+            self.av_bay_battery_v,
+            now_ms,
+        );
+        self.queue_scalar_f32(
+            DataType::BatteryCurrent,
+            Board::PowerBoard,
+            self.battery_a,
+            now_ms,
+        );
+        self.queue_scalar_f32(
+            DataType::BatteryVoltage,
+            Board::GatewayBoard,
+            self.ground_station_battery_v,
+            now_ms,
+        );
+        self.queue_scalar_f32(
+            DataType::BatteryCurrent,
+            Board::GatewayBoard,
+            self.ground_station_battery_a,
+            now_ms,
+        );
     }
 
     fn apply_command(&mut self, cmd: &TelemetryCommand, now_ms: u64) {
@@ -586,8 +625,9 @@ impl FlightSimState {
             0.7
         };
 
-        let av_bay_drop_v_per_s = 0.00008 + self.battery_a * 0.00006;
-        let gs_drop_v_per_s = 0.00005 + self.ground_station_battery_a * 0.00003;
+        // Make simulated pack drain visible over test sessions instead of effectively flat.
+        let av_bay_drop_v_per_s = 0.00035 + self.battery_a * 0.00012;
+        let gs_drop_v_per_s = 0.00020 + self.ground_station_battery_a * 0.00008;
 
         self.av_bay_battery_v =
             (self.av_bay_battery_v - av_bay_drop_v_per_s * dt_s).max(AV_BAY_BATTERY_CUTOFF_V);

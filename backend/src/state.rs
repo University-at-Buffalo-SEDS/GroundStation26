@@ -135,6 +135,19 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn board_visible_in_ui(&self, _board: Board) -> bool {
+        #[cfg(any(feature = "testing", feature = "test_fire_mode"))]
+        {
+            if matches!(
+                _board,
+                Board::FlightComputer | Board::RFBoard | Board::PowerBoard | Board::DaqBoard
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Updates heartbeat tracking for a board after a packet arrives from that sender.
     pub fn mark_board_seen(&self, sender: &str, timestamp_ms: u64) {
         let Some(board) = Board::from_sender_id(sender) else {
@@ -158,9 +171,53 @@ impl AppState {
     }
 
     /// Returns whether every known board has been observed at least once.
+    #[allow(dead_code)]
     pub fn all_boards_seen(&self) -> bool {
         let map = self.board_status.lock().unwrap();
         map.values().all(|status| status.last_seen_ms.is_some())
+    }
+
+    /// Returns whether a board should be required for startup/state gating in the current mode.
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+    pub fn board_required_for_progression(&self, board: Board) -> bool {
+        let av_link_up = self.av_bay_comms_connected.load(Ordering::Relaxed);
+        let fill_link_up = self.fill_comms_connected.load(Ordering::Relaxed);
+        if !av_link_up
+            && matches!(
+                board,
+                Board::FlightComputer | Board::RFBoard | Board::PowerBoard | Board::DaqBoard
+            )
+        {
+            return false;
+        }
+        if !fill_link_up
+            && matches!(
+                board,
+                Board::ValveBoard | Board::ActuatorBoard | Board::GatewayBoard
+            )
+        {
+            return false;
+        }
+
+        true
+    }
+
+    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+    pub fn board_required_for_progression(&self, _board: Board) -> bool {
+        true
+    }
+
+    /// Returns whether every board required for the current operating mode has been observed.
+    pub fn all_required_boards_seen(&self) -> bool {
+        let map = self.board_status.lock().unwrap();
+        Board::ALL.iter().all(|board| {
+            if !self.board_required_for_progression(*board) {
+                return true;
+            }
+            map.get(board)
+                .and_then(|status| status.last_seen_ms)
+                .is_some()
+        })
     }
 
     /// Builds the board-health payload sent to the dashboard.
@@ -169,6 +226,9 @@ impl AppState {
         let mut boards = Vec::with_capacity(Board::ALL.len());
 
         for board in Board::ALL {
+            if !self.board_visible_in_ui(*board) {
+                continue;
+            }
             let status = map.get(board);
             let last_seen_ms = status.and_then(|s| s.last_seen_ms);
             let age_ms = last_seen_ms.map(|ts| now_ms.saturating_sub(ts));
@@ -190,10 +250,17 @@ impl AppState {
     /// Projects the current router and board state into the UI-friendly topology graph.
     pub fn network_topology_snapshot(&self, now_ms: u64) -> NetworkTopologyMsg {
         let simulated = cfg!(feature = "testing");
-        let exported = self
-            .topology_router
-            .get()
-            .map(|router| router.export_topology());
+        let exported = if cfg!(feature = "test_fire_mode") {
+            // In test-fire mode the AV-bay side is intentionally absent and both comms links may
+            // be dummy placeholders. Avoid router topology export here; that path has proven
+            // fragile with disconnected-link operator setups, while the dashboard can still render
+            // a useful topology from board visibility and known side mappings alone.
+            None
+        } else {
+            self.topology_router
+                .get()
+                .map(|router| router.export_topology())
+        };
         let board_snapshot = self.board_status_snapshot(now_ms);
         let route_snapshot = exported.as_ref();
         let local_endpoint_list = route_snapshot

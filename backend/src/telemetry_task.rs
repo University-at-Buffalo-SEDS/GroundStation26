@@ -5,9 +5,9 @@ use crate::layout;
 use crate::loadcell;
 #[cfg(feature = "hitl_mode")]
 use crate::rocket_commands::FlightComputerCommands;
-use crate::rocket_commands::{ActuatorBoardCommands, FlightCommands, ValveBoardCommands};
+use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 use crate::state::AppState;
-#[cfg(feature = "hitl_mode")]
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 use crate::types::FlightState;
 use crate::types::{u8_to_flight_state, Board, TelemetryCommand, TelemetryRow};
 use crate::web::{emit_warning, FlightStateMsg};
@@ -70,8 +70,8 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     })
 }
 
-#[cfg(feature = "hitl_mode")]
-const HITL_FLIGHT_STATE_ORDER: [FlightState; 16] = [
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Startup,
     FlightState::Idle,
     FlightState::PreFill,
@@ -90,18 +90,19 @@ const HITL_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Aborted,
 ];
 
-#[cfg(feature = "hitl_mode")]
-fn hitl_adjacent_flight_state(current: FlightState, delta: i32) -> FlightState {
-    let idx = HITL_FLIGHT_STATE_ORDER
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> FlightState {
+    let idx = OPERATOR_MODE_FLIGHT_STATE_ORDER
         .iter()
         .position(|s| *s == current)
         .unwrap_or(0) as i32;
-    let next_idx = (idx + delta).clamp(0, (HITL_FLIGHT_STATE_ORDER.len() - 1) as i32) as usize;
-    HITL_FLIGHT_STATE_ORDER[next_idx]
+    let next_idx =
+        (idx + delta).clamp(0, (OPERATOR_MODE_FLIGHT_STATE_ORDER.len() - 1) as i32) as usize;
+    OPERATOR_MODE_FLIGHT_STATE_ORDER[next_idx]
 }
 
-#[cfg(feature = "hitl_mode")]
-async fn set_local_flight_state_for_hitl(state: &Arc<AppState>, next_state: FlightState) {
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_state: FlightState) {
     {
         let mut fs = state.state.lock().unwrap();
         *fs = next_state;
@@ -1044,16 +1045,29 @@ pub async fn telemetry_task(
                     }
                     match cmd {
                         TelemetryCommand::Launch => {
-                                if let Err(e) = router.log_queue(
-                                    DataType::FlightCommand,
-                                    &[FlightCommands::Launch as u8],
-                                ) {
+                                #[cfg(feature = "test_fire_mode")]
+                                {
+                                    if let Err(e) = router.log_queue(
+                                        DataType::ActuatorCommand,
+                                        &[ActuatorBoardCommands::IgniterSequence as u8],
+                                    ) {
+                                        log_telemetry_error("failed to log test-fire Launch command", e);
+                                    }
+                                    println!("Test-fire launch command sent to actuator board");
+                                    continue;
+                                }
+                                #[cfg(not(feature = "test_fire_mode"))]
+                                {
+                                    if let Err(e) = router.log_queue(
+                                        DataType::FlightCommand,
+                                        &[crate::rocket_commands::FlightCommands::Launch as u8],
+                                    ) {
                                     log_telemetry_error("failed to log Launch command", e);
                                 }
                                 let gpio = &state.gpio;
                                 gpio.write_output_pin(IGNITION_PIN, true).expect("failed to set gpio output");
                                 println!("Launch command sent");
-
+                                }
                             }
                         TelemetryCommand::Dump => {
                                 let key = ValveBoardCommands::DumpOpen as u8;
@@ -1195,19 +1209,19 @@ pub async fn telemetry_task(
                                 state.request_fill_sequence_continue();
                                 println!("ContinueFillSequence command accepted");
                         }
-                        #[cfg(feature = "hitl_mode")]
+                        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
                         TelemetryCommand::AdvanceFlightState => {
                                 let current = *state.state.lock().unwrap();
-                                let next = hitl_adjacent_flight_state(current, 1);
-                                set_local_flight_state_for_hitl(&state, next).await;
-                                println!("HITL flight state advanced: {:?} -> {:?}", current, next);
+                                let next = operator_mode_adjacent_flight_state(current, 1);
+                                set_local_flight_state_for_operator_mode(&state, next).await;
+                                println!("Operator-mode flight state advanced: {:?} -> {:?}", current, next);
                         }
-                        #[cfg(feature = "hitl_mode")]
+                        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
                         TelemetryCommand::RewindFlightState => {
                                 let current = *state.state.lock().unwrap();
-                                let next = hitl_adjacent_flight_state(current, -1);
-                                set_local_flight_state_for_hitl(&state, next).await;
-                                println!("HITL flight state rewound: {:?} -> {:?}", current, next);
+                                let next = operator_mode_adjacent_flight_state(current, -1);
+                                set_local_flight_state_for_operator_mode(&state, next).await;
+                                println!("Operator-mode flight state rewound: {:?} -> {:?}", current, next);
                         }
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::DeployParachute
@@ -1550,7 +1564,7 @@ async fn handle_packet(
     }
 
     if pkt.data_type() == DataType::FlightState {
-        if !cfg!(feature = "testing") && !state.all_boards_seen() {
+        if !cfg!(feature = "testing") && !state.all_required_boards_seen() {
             return None;
         }
         let pkt_data = match pkt.data_as_u8() {

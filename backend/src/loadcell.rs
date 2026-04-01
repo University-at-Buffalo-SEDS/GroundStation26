@@ -12,7 +12,9 @@ pub const DERIVED_FILL_PERCENT_DATA_TYPE: &str = "LOADCELL_FILL_PERCENT";
 pub const DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE: &str = "PRESSURE_TRANSDUCER_CALIBRATED";
 #[cfg(feature = "testing")]
 const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration_testing.json";
-#[cfg(not(feature = "testing"))]
+#[cfg(all(not(feature = "testing"), feature = "test_fire_mode"))]
+const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration_test_fire.json";
+#[cfg(all(not(feature = "testing"), not(feature = "test_fire_mode")))]
 const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration.json";
 
 const ALL_CALIBRATION_FIT_MODES: [&str; 7] = [

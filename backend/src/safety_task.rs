@@ -6,8 +6,6 @@ use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "hitl_mode")]
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio::time::{sleep, Duration};
@@ -125,29 +123,6 @@ fn battery_voltage_bounds_by_sender() -> &'static HashMap<String, (f32, f32)> {
     })
 }
 
-#[cfg(feature = "hitl_mode")]
-fn ignore_missing_board_in_hitl(state: &AppState, board: Board) -> bool {
-    let av_link_up = state.av_bay_radio_connected.load(Ordering::Relaxed);
-    let fill_link_up = state.fill_radio_connected.load(Ordering::Relaxed);
-    if !av_link_up
-        && matches!(
-            board,
-            Board::FlightComputer | Board::RFBoard | Board::PowerBoard | Board::DaqBoard
-        )
-    {
-        return true;
-    }
-    if !fill_link_up
-        && matches!(
-            board,
-            Board::ValveBoard | Board::ActuatorBoard | Board::GatewayBoard
-        )
-    {
-        return true;
-    }
-    false
-}
-
 async fn insert_flight_state_with_retry(
     db: &SqlitePool,
     timestamp_ms: i64,
@@ -232,8 +207,7 @@ pub async fn safety_task(
         let all_boards_seen = {
             let mut board_status = state.board_status.lock().unwrap();
             for (board, status) in board_status.iter_mut() {
-                #[cfg(feature = "hitl_mode")]
-                if ignore_missing_board_in_hitl(&state, *board) {
+                if !state.board_required_for_progression(*board) {
                     status.warned = false;
                     continue;
                 }
@@ -286,8 +260,7 @@ pub async fn safety_task(
                 }
             }
             Board::ALL.iter().all(|board| {
-                #[cfg(feature = "hitl_mode")]
-                if ignore_missing_board_in_hitl(&state, *board) {
+                if !state.board_required_for_progression(*board) {
                     return true;
                 }
                 board_status
@@ -308,7 +281,10 @@ pub async fn safety_task(
             .board_status_tx
             .send(state.board_status_snapshot(now_ms));
 
-        if current_state == FlightState::Startup && all_boards_seen && !cfg!(feature = "hitl_mode")
+        if current_state == FlightState::Startup
+            && all_boards_seen
+            && !cfg!(feature = "hitl_mode")
+            && !cfg!(feature = "test_fire_mode")
         {
             let should_advance = {
                 let mut fs = state.state.lock().unwrap();

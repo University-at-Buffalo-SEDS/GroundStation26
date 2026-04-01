@@ -15,6 +15,10 @@ pub enum TelemetryCommand {
     Nitrous,
     NitrousClose,
     ContinueFillSequence,
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+    AdvanceFlightState,
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+    RewindFlightState,
     #[cfg(feature = "hitl_mode")]
     DeployParachute,
     #[cfg(feature = "hitl_mode")]
@@ -63,10 +67,6 @@ pub enum TelemetryCommand {
     ReinitAfter26,
     #[cfg(feature = "hitl_mode")]
     ReinitAfter44,
-    #[cfg(feature = "hitl_mode")]
-    AdvanceFlightState,
-    #[cfg(feature = "hitl_mode")]
-    RewindFlightState,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]

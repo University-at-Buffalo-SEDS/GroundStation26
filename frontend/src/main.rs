@@ -4,11 +4,11 @@ mod telemetry_dashboard;
 
 use dioxus::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
+use dioxus_desktop::tao::window::WindowBuilder;
+#[cfg(not(target_arch = "wasm32"))]
 use dioxus_desktop::wry::http::{Request as HttpRequest, Response as HttpResponse};
 #[cfg(not(target_arch = "wasm32"))]
 use dioxus_desktop::RequestAsyncResponder;
-#[cfg(not(target_arch = "wasm32"))]
-use dioxus_desktop::tao::window::WindowBuilder;
 #[cfg(not(target_arch = "wasm32"))]
 use image::ImageFormat;
 #[cfg(not(target_arch = "wasm32"))]

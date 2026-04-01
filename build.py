@@ -205,6 +205,7 @@ def _backend_args(
         force_no_pi: bool,
         testing_mode: bool,
         hitl_mode: bool,
+        test_fire_mode: bool,
         debug_mode: bool,
         log_file_arg: Optional[str] = None,
 ) -> list[str]:
@@ -217,6 +218,8 @@ def _backend_args(
         args.append("testing")
     if hitl_mode:
         args.append("hitl-mode")
+    if test_fire_mode:
+        args.append("test-fire-mode")
     if debug_mode:
         args.append("debug")
     if log_file_arg:
@@ -231,6 +234,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py no_pi                   # local: backend w/o raspberry_pi feature")
     print("  ./build.py testing                 # local: backend w/ testing feature")
     print("  ./build.py hitl-mode               # local: backend w/ hitl_mode feature")
+    print("  ./build.py test-fire-mode          # local: backend w/ test_fire_mode feature")
     print("  ./build.py debug                   # local: build frontend+backend in debug mode")
     print("  ./build.py max_size                # web wasm: add wasm-opt --converge (slower, smaller)")
     print("  ./build.py plain                   # docker only: pass --progress plain")
@@ -272,6 +276,7 @@ def main() -> None:
     docker_mode = False
     testing_mode = False
     hitl_mode = False
+    test_fire_mode = False
     debug_mode = False
     max_size_mode = False
     plain_mode = False
@@ -319,6 +324,8 @@ def main() -> None:
             testing_mode = True
         elif arg == "hitl-mode":
             hitl_mode = True
+        elif arg == "test-fire-mode":
+            test_fire_mode = True
         elif arg == "debug":
             debug_mode = True
         elif arg in {"apk", "aab"}:
@@ -388,16 +395,17 @@ def main() -> None:
     if force_pi and force_no_pi:
         print("Error: Cannot specify both 'pi_build' and 'no_pi'.", file=sys.stderr)
         sys.exit(1)
-    if testing_mode and hitl_mode:
-        print("Error: Cannot specify both 'testing' and 'hitl-mode'.", file=sys.stderr)
+    selected_modes = sum([testing_mode, hitl_mode, test_fire_mode])
+    if selected_modes > 1:
+        print("Error: Cannot specify more than one of 'testing', 'hitl-mode', and 'test-fire-mode'.", file=sys.stderr)
         sys.exit(1)
 
     repo_root = Path(__file__).resolve().parent
     _configure_log_file(repo_root, log_file_arg)
 
     if action:
-        if docker_mode or force_pi or force_no_pi or testing_mode or hitl_mode:
-            print("Error: Frontend actions cannot be combined with docker/pi_build/no_pi/testing/hitl-mode.",
+        if docker_mode or force_pi or force_no_pi or testing_mode or hitl_mode or test_fire_mode:
+            print("Error: Frontend actions cannot be combined with docker/pi_build/no_pi/testing/hitl-mode/test-fire-mode.",
                   file=sys.stderr)
             print_usage()
         _run_script(
@@ -422,8 +430,8 @@ def main() -> None:
         return
 
     if frontend_only_platform is not None:
-        if docker_mode or force_pi or force_no_pi or testing_mode or hitl_mode:
-            print("Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing/hitl-mode.",
+        if docker_mode or force_pi or force_no_pi or testing_mode or hitl_mode or test_fire_mode:
+            print("Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing/hitl-mode/test-fire-mode.",
                   file=sys.stderr)
             print_usage()
         _run_script(
@@ -458,6 +466,7 @@ def main() -> None:
                 force_no_pi=force_no_pi,
                 testing_mode=testing_mode,
                 hitl_mode=hitl_mode,
+                test_fire_mode=test_fire_mode,
                 debug_mode=debug_mode,
                 log_file_arg=log_file_arg,
             ),
@@ -465,8 +474,8 @@ def main() -> None:
         return
 
     if docker_mode:
-        if hitl_mode:
-            print("Error: docker mode currently does not support 'hitl-mode'.", file=sys.stderr)
+        if hitl_mode or test_fire_mode:
+            print("Error: docker mode currently does not support 'hitl-mode' or 'test-fire-mode'.", file=sys.stderr)
             sys.exit(1)
         pi_build_flag = False if force_no_pi else (force_pi or is_raspberry_pi())
         use_plain = plain_mode or (LOG_FILE is not None)
@@ -500,6 +509,7 @@ def main() -> None:
         force_no_pi=force_no_pi,
         testing_mode=testing_mode,
         hitl_mode=hitl_mode,
+        test_fire_mode=test_fire_mode,
         debug_mode=debug_mode,
         log_file_arg=log_file_arg,
     )

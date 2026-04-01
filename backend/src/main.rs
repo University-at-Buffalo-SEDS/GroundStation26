@@ -30,7 +30,7 @@ use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
 use crate::telemetry_task::{get_current_timestamp_ms, set_network_time_router, telemetry_task};
 
-#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+#[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 use crate::comms::DummyComms;
 use crate::comms::{link_description, open_link, startup_failure_hint, CommsDevice};
 use crate::types::{Board, FlightState as FlightStateMode};
@@ -559,7 +559,10 @@ async fn main() -> anyhow::Result<()> {
                         false,
                     )
                 }
-                #[cfg(all(not(feature = "testing"), feature = "hitl_mode"))]
+                #[cfg(all(
+                    not(feature = "testing"),
+                    any(feature = "hitl_mode", feature = "test_fire_mode")
+                ))]
                 {
                     (
                         Arc::new(Mutex::new(Box::new(DummyComms::new("Rocket Comms")))),
@@ -568,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(not(feature = "testing"))]
                 #[cfg(not(feature = "hitl_mode"))]
+                #[cfg(not(feature = "test_fire_mode"))]
                 panic!("Rocket comms missing and testing mode not enabled")
             }
         };
@@ -591,7 +595,10 @@ async fn main() -> anyhow::Result<()> {
                         false,
                     )
                 }
-                #[cfg(all(not(feature = "testing"), feature = "hitl_mode"))]
+                #[cfg(all(
+                    not(feature = "testing"),
+                    any(feature = "hitl_mode", feature = "test_fire_mode")
+                ))]
                 {
                     (
                         Arc::new(Mutex::new(Box::new(DummyComms::new("Umbilical Comms")))),
@@ -600,6 +607,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(not(feature = "testing"))]
                 #[cfg(not(feature = "hitl_mode"))]
+                #[cfg(not(feature = "test_fire_mode"))]
                 panic!("Umbilical comms missing and testing mode not enabled")
             }
         };

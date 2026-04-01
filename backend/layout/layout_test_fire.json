@@ -147,110 +147,29 @@
         "border": "#eab308",
         "bg": "#1f2937",
         "fg": "#fef9c3"
+      },
+      {
+        "label": "Flight State +1",
+        "cmd": "AdvanceFlightState",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Flight State -1",
+        "cmd": "RewindFlightState",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
       }
     ],
     "disable_actions_by_default": true,
-    "show_flight_setup": true,
+    "show_flight_setup": false,
     "show_fill_targets": true,
     "fill_targets_require_actions_enabled": true
   },
   "data_tab": {
     "tabs": [
-      {
-        "id": "GYRO_DATA",
-        "label": "Gyro Data",
-        "channels": [
-          "Roll",
-          "Pitch",
-          "Yaw"
-        ],
-        "chart": {
-          "enabled": true
-        }
-      },
-      {
-        "id": "ACCEL_DATA",
-        "label": "Accel Data",
-        "channels": [
-          "X Accel",
-          "Y Accel",
-          "Z Accel"
-        ],
-        "chart": {
-          "enabled": true
-        }
-      },
-      {
-        "id": "BAROMETER_DATA",
-        "label": "Barometer Data",
-        "channels": [
-          "Pressure",
-          "Temp",
-          "Altitude"
-        ],
-        "chart_groups": [
-          {
-            "channels": [
-              0,
-              1,
-              2
-            ],
-            "scale_mode": "per_series"
-          }
-        ],
-        "chart": {
-          "enabled": true
-        }
-      },
-      {
-        "id": "KALMAN_FILTER_DATA",
-        "label": "Kalman Filter Data",
-        "channels": [
-          "X",
-          "Y",
-          "Z"
-        ],
-        "chart": {
-          "enabled": true
-        }
-      },
-      {
-        "id": "GPS_DATA",
-        "label": "GPS Data",
-        "channels": [
-          "Lat",
-          "Lon",
-          "Altitude",
-          "Satellites"
-        ],
-        "channel_formatters": [
-          {},
-          {},
-          {},
-          {
-            "kind": "integer"
-          }
-        ],
-        "chart": {
-          "enabled": true
-        }
-      },
-      {
-        "id": "VEHICLE_SPEED",
-        "label": "Vehicle Speed",
-        "channels": [
-          "Vertical Speed"
-        ],
-        "channel_formatters": [
-          {
-            "precision": 2,
-            "suffix": " m/s"
-          }
-        ],
-        "chart": {
-          "enabled": true
-        }
-      },
       {
         "id": "FUEL_TANK_PRESSURE",
         "label": "Fuel Tank Pressure",
@@ -268,18 +187,6 @@
           "Voltage"
         ],
         "subtabs": [
-          {
-            "id": "battery_voltage_pb",
-            "label": "AV Bay",
-            "data_type": "BATTERY_VOLTAGE",
-            "sender_id": "PB",
-            "channels": [
-              "Voltage"
-            ],
-            "chart": {
-              "enabled": true
-            }
-          },
           {
             "id": "battery_voltage_gw",
             "label": "Ground Station",
@@ -304,18 +211,6 @@
           "Current"
         ],
         "subtabs": [
-          {
-            "id": "battery_current_pb",
-            "label": "AV Bay",
-            "data_type": "BATTERY_CURRENT",
-            "sender_id": "PB",
-            "channels": [
-              "Current"
-            ],
-            "chart": {
-              "enabled": true
-            }
-          },
           {
             "id": "battery_current_gw",
             "label": "Ground Station",
@@ -345,30 +240,6 @@
           "Ground Station Runtime"
         ],
         "subtabs": [
-          {
-            "id": "battery_runtime_pb",
-            "label": "AV Bay",
-            "chart": {
-              "enabled": false
-            },
-            "summary_items": [
-              {
-                "label": "Battery %",
-                "data_type": "AV_BAY_BATTERY_PERCENT",
-                "index": 0
-              },
-              {
-                "label": "Drop Rate",
-                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
-                "index": 0
-              },
-              {
-                "label": "Runtime",
-                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-                "index": 0
-              }
-            ]
-          },
           {
             "id": "battery_runtime_gw",
             "label": "Ground Station",
@@ -663,60 +534,6 @@
             ]
           },
           {
-            "title": "AV Bay Battery (Power Board)",
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_PERCENT",
-                "items": [
-                  {
-                    "label": "Percent",
-                    "index": 0
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
-                "items": [
-                  {
-                    "label": "Drop Rate (V/min)",
-                    "index": 0
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-                "items": [
-                  {
-                    "label": "Remaining Minutes",
-                    "index": 0
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "title": "GPS",
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "GPS_DATA",
-                "items": [
-                  {
-                    "label": "Lat",
-                    "index": 0
-                  },
-                  {
-                    "label": "Lon",
-                    "index": 1
-                  }
-                ]
-              }
-            ]
-          },
-          {
             "title": "Ground Station Battery (Gateway Board)",
             "widgets": [
               {
@@ -746,36 +563,6 @@
                   {
                     "label": "Remaining Minutes",
                     "index": 0
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "title": "Satellites",
-            "style": {
-              "background": "#0b1220",
-              "border": "#475569",
-              "title_color": "#facc15"
-            },
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "GPS_DATA",
-                "summary_style": {
-                  "background": "#1f2937",
-                  "border": "#facc15",
-                  "label_color": "#fde68a",
-                  "value_color": "#fef3c7"
-                },
-                "items": [
-                  {
-                    "label": "Satellites",
-                    "index": 3,
-                    "formatter": {
-                      "kind": "integer",
-                      "prefix": "🛰 "
-                    }
                   }
                 ]
               }
@@ -935,42 +722,9 @@
                   "Nitrogen",
                   "Nitrous",
                   "Pilot",
-                  "RetractPlumbing"
-                ]
-              }
-            ]
-          },
-          {
-            "title": "AV Bay Battery (Power Board)",
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_PERCENT",
-                "items": [
-                  {
-                    "label": "Percent",
-                    "index": 0
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
-                "items": [
-                  {
-                    "label": "Drop Rate (V/min)",
-                    "index": 0
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-                "items": [
-                  {
-                    "label": "Remaining Minutes",
-                    "index": 0
-                  }
+                  "RetractPlumbing",
+                  "AdvanceFlightState",
+                  "RewindFlightState"
                 ]
               }
             ]
@@ -1009,36 +763,6 @@
                 ]
               }
             ]
-          },
-          {
-            "title": "Satellites",
-            "style": {
-              "background": "#0b1220",
-              "border": "#475569",
-              "title_color": "#facc15"
-            },
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "GPS_DATA",
-                "summary_style": {
-                  "background": "#1f2937",
-                  "border": "#facc15",
-                  "label_color": "#fde68a",
-                  "value_color": "#fef3c7"
-                },
-                "items": [
-                  {
-                    "label": "Satellites",
-                    "index": 3,
-                    "formatter": {
-                      "kind": "integer",
-                      "prefix": "🛰 "
-                    }
-                  }
-                ]
-              }
-            ]
           }
         ]
       },
@@ -1047,6 +771,64 @@
           "Armed"
         ],
         "sections": [
+          {
+            "title": "Armed Metrics",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "items": [
+                  {
+                    "label": "Tank Pressure",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_WEIGHT_KG",
+                "items": [
+                  {
+                    "label": "Mass (kg)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "items": [
+                  {
+                    "label": "Fill Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "chart",
+                "chart_title": "Pressure and Loadcell",
+                "chart_series": [
+                  {
+                    "data_type": "FUEL_TANK_PRESSURE",
+                    "index": 0,
+                    "label": "Tank Pressure"
+                  },
+                  {
+                    "data_type": "LOADCELL_WEIGHT_KG",
+                    "index": 0,
+                    "label": "Mass (kg)"
+                  },
+                  {
+                    "data_type": "LOADCELL_FILL_PERCENT",
+                    "index": 0,
+                    "label": "Fill Percent"
+                  }
+                ],
+                "width": 1200.0,
+                "height": 260.0
+              }
+            ]
+          },
           {
             "title": "Pressure",
             "widgets": [
@@ -1129,42 +911,9 @@
                 "actions": [
                   "Launch",
                   "Dump",
-                  "Pilot"
-                ]
-              }
-            ]
-          },
-          {
-            "title": "AV Bay Battery (Power Board)",
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_PERCENT",
-                "items": [
-                  {
-                    "label": "Percent",
-                    "index": 0
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
-                "items": [
-                  {
-                    "label": "Drop Rate (V/min)",
-                    "index": 0
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-                "items": [
-                  {
-                    "label": "Remaining Minutes",
-                    "index": 0
-                  }
+                  "Pilot",
+                  "AdvanceFlightState",
+                  "RewindFlightState"
                 ]
               }
             ]
@@ -1203,36 +952,6 @@
                 ]
               }
             ]
-          },
-          {
-            "title": "Satellites",
-            "style": {
-              "background": "#0b1220",
-              "border": "#475569",
-              "title_color": "#facc15"
-            },
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "GPS_DATA",
-                "summary_style": {
-                  "background": "#1f2937",
-                  "border": "#facc15",
-                  "label_color": "#fde68a",
-                  "value_color": "#fef3c7"
-                },
-                "items": [
-                  {
-                    "label": "Satellites",
-                    "index": 3,
-                    "formatter": {
-                      "kind": "integer",
-                      "prefix": "🛰 "
-                    }
-                  }
-                ]
-              }
-            ]
           }
         ]
       },
@@ -1247,148 +966,60 @@
         ],
         "sections": [
           {
-            "title": "Flight Overview",
+            "title": "Test Fire Metrics",
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "BAROMETER_DATA",
+                "data_type": "FUEL_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Altitude",
-                    "index": 2
-                  },
-                  {
-                    "label": "Pressure",
+                    "label": "Tank Pressure",
                     "index": 0
-                  },
-                  {
-                    "label": "Temp",
-                    "index": 1
                   }
                 ]
               },
               {
                 "kind": "summary",
-                "data_type": "VEHICLE_SPEED",
+                "data_type": "LOADCELL_WEIGHT_KG",
                 "items": [
                   {
-                    "label": "Vertical Speed",
-                    "index": 0,
-                    "formatter": {
-                      "precision": 2,
-                      "suffix": " m/s"
-                    }
+                    "label": "Mass (kg)",
+                    "index": 0
                   }
                 ]
               },
               {
                 "kind": "summary",
-                "data_type": "GPS_DATA",
-                "summary_style": {
-                  "background": "#1f2937",
-                  "border": "#facc15",
-                  "label_color": "#fde68a",
-                  "value_color": "#fef3c7"
-                },
+                "data_type": "LOADCELL_FILL_PERCENT",
                 "items": [
                   {
-                    "label": "Satellites",
-                    "index": 3,
-                    "formatter": {
-                      "kind": "integer",
-                      "prefix": "🛰 "
-                    }
+                    "label": "Fill Percent",
+                    "index": 0
                   }
                 ]
               },
               {
                 "kind": "chart",
-                "chart_title": "Altitude Estimates",
+                "chart_title": "Pressure and Loadcell",
                 "chart_series": [
                   {
-                    "data_type": "BAROMETER_DATA",
-                    "index": 2,
-                    "label": "Barometer"
-                  },
-                  {
-                    "data_type": "GPS_DATA",
-                    "index": 2,
-                    "label": "GPS"
-                  },
-                  {
-                    "data_type": "KALMAN_FILTER_DATA",
+                    "data_type": "FUEL_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Kalman"
+                    "label": "Tank Pressure"
+                  },
+                  {
+                    "data_type": "LOADCELL_WEIGHT_KG",
+                    "index": 0,
+                    "label": "Mass (kg)"
+                  },
+                  {
+                    "data_type": "LOADCELL_FILL_PERCENT",
+                    "index": 0,
+                    "label": "Fill Percent"
                   }
                 ],
                 "width": 1200.0,
                 "height": 260.0
-              }
-            ]
-          },
-          {
-            "title": "Dynamics",
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "ACCEL_DATA",
-                "items": [
-                  {
-                    "label": "Accel X",
-                    "index": 0
-                  },
-                  {
-                    "label": "Accel Y",
-                    "index": 1
-                  },
-                  {
-                    "label": "Accel Z",
-                    "index": 2
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "KALMAN_FILTER_DATA",
-                "items": [
-                  {
-                    "label": "Kalman X",
-                    "index": 0
-                  },
-                  {
-                    "label": "Kalman Y",
-                    "index": 1
-                  },
-                  {
-                    "label": "Kalman Z",
-                    "index": 2
-                  }
-                ]
-              },
-              {
-                "kind": "chart",
-                "chart_title": "Vertical Speed Comparison",
-                "chart_series": [
-                  {
-                    "data_type": "VEHICLE_SPEED",
-                    "index": 0,
-                    "label": "Fused"
-                  },
-                  {
-                    "data_type": "KALMAN_FILTER_DATA",
-                    "index": 1,
-                    "label": "Kalman"
-                  }
-                ],
-                "width": 1200.0,
-                "height": 240.0
-              },
-              {
-                "kind": "chart",
-                "data_type": "ACCEL_DATA",
-                "chart_title": "Acceleration",
-                "width": 1200.0,
-                "height": 240.0
               }
             ]
           }
@@ -1409,41 +1040,6 @@
             ]
           },
           {
-            "title": "AV Bay Battery (Power Board)",
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_PERCENT",
-                "items": [
-                  {
-                    "label": "Percent",
-                    "index": 0
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
-                "items": [
-                  {
-                    "label": "Drop Rate (V/min)",
-                    "index": 0
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-                "items": [
-                  {
-                    "label": "Remaining Minutes",
-                    "index": 0
-                  }
-                ]
-              }
-            ]
-          },
-          {
             "title": "Ground Station Battery (Gateway Board)",
             "widgets": [
               {
@@ -1473,36 +1069,6 @@
                   {
                     "label": "Remaining Minutes",
                     "index": 0
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "title": "Satellites",
-            "style": {
-              "background": "#0b1220",
-              "border": "#475569",
-              "title_color": "#facc15"
-            },
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "GPS_DATA",
-                "summary_style": {
-                  "background": "#1f2937",
-                  "border": "#facc15",
-                  "label_color": "#fde68a",
-                  "value_color": "#fef3c7"
-                },
-                "items": [
-                  {
-                    "label": "Satellites",
-                    "index": 3,
-                    "formatter": {
-                      "kind": "integer",
-                      "prefix": "🛰 "
-                    }
                   }
                 ]
               }
@@ -1542,42 +1108,9 @@
                   "Nitrogen",
                   "Nitrous",
                   "Pilot",
-                  "RetractPlumbing"
-                ]
-              }
-            ]
-          },
-          {
-            "title": "AV Bay Battery (Power Board)",
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_PERCENT",
-                "items": [
-                  {
-                    "label": "Percent",
-                    "index": 0
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
-                "items": [
-                  {
-                    "label": "Drop Rate (V/min)",
-                    "index": 0
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-                "items": [
-                  {
-                    "label": "Remaining Minutes",
-                    "index": 0
-                  }
+                  "RetractPlumbing",
+                  "AdvanceFlightState",
+                  "RewindFlightState"
                 ]
               }
             ]
@@ -1616,36 +1149,6 @@
                 ]
               }
             ]
-          },
-          {
-            "title": "Satellites",
-            "style": {
-              "background": "#0b1220",
-              "border": "#475569",
-              "title_color": "#facc15"
-            },
-            "widgets": [
-              {
-                "kind": "summary",
-                "data_type": "GPS_DATA",
-                "summary_style": {
-                  "background": "#1f2937",
-                  "border": "#facc15",
-                  "label_color": "#fde68a",
-                  "value_color": "#fef3c7"
-                },
-                "items": [
-                  {
-                    "label": "Satellites",
-                    "index": 3,
-                    "formatter": {
-                      "kind": "integer",
-                      "prefix": "🛰 "
-                    }
-                  }
-                ]
-              }
-            ]
           }
         ]
       }
@@ -1657,18 +1160,6 @@
       "min_drop_rate_v_per_min": 0.005
     },
     "sources": [
-      {
-        "id": "av_bay",
-        "label": "AV Bay Battery",
-        "sender_id": "PB",
-        "input_data_type": "BATTERY_VOLTAGE",
-        "percent_data_type": "AV_BAY_BATTERY_PERCENT",
-        "drop_rate_data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
-        "remaining_minutes_data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-        "empty_voltage": 6.3,
-        "full_voltage": 8.4,
-        "curve_exponent": 1.0
-      },
       {
         "id": "ground_station",
         "label": "Ground Station Battery",

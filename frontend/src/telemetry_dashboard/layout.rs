@@ -399,7 +399,25 @@ pub struct DataTabChart {
 pub struct ActionsTabLayout {
     #[serde(default)]
     pub disable_actions_by_default: bool,
+    #[serde(default = "default_show_flight_setup")]
+    pub show_flight_setup: bool,
+    #[serde(default = "default_show_fill_targets")]
+    pub show_fill_targets: bool,
+    #[serde(default = "default_fill_targets_require_actions_enabled")]
+    pub fill_targets_require_actions_enabled: bool,
     pub actions: Vec<ActionSpec>,
+}
+
+fn default_show_flight_setup() -> bool {
+    true
+}
+
+fn default_show_fill_targets() -> bool {
+    true
+}
+
+fn default_fill_targets_require_actions_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

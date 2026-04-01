@@ -1121,16 +1121,24 @@ def _write_windows_nsis_script(
         '  WriteUninstaller "$INSTDIR\\Uninstall.exe"',
         "",
         f'  CreateDirectory "$SMPROGRAMS\\{WINDOWS_APP_NAME}"',
-        f'  CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\{WINDOWS_APP_NAME}.lnk" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"',
-        f'  CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk" "$INSTDIR\\Uninstall.exe"',
+        f'  CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\{WINDOWS_APP_NAME}.lnk" "$INSTDIR\\'
+        f'{WINDOWS_APP_NAME}.exe"',
+        f'  CreateShortcut "$SMPROGRAMS\\{WINDOWS_APP_NAME}\\Uninstall {WINDOWS_APP_NAME}.lnk" '
+        f'"$INSTDIR\\Uninstall.exe"',
         "",
         f'  WriteRegStr HKCU "Software\\UBSEDS\\{WINDOWS_APP_NAME}" "InstallDir" "$INSTDIR"',
-        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayName" "{WINDOWS_APP_NAME}"',
-        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "DisplayIcon" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"',
-        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "UninstallString" "$INSTDIR\\Uninstall.exe"',
-        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "InstallLocation" "$INSTDIR"',
-        f'  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoModify" 1',
-        f'  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" "NoRepair" 1',
+        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" '
+        f'"DisplayName" "{WINDOWS_APP_NAME}"',
+        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" '
+        f'"DisplayIcon" "$INSTDIR\\{WINDOWS_APP_NAME}.exe"',
+        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" '
+        f'"UninstallString" "$INSTDIR\\Uninstall.exe"',
+        f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" '
+        f'"InstallLocation" "$INSTDIR"',
+        f'  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" '
+        f'"NoModify" 1',
+        f'  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{WINDOWS_APP_NAME}" '
+        f'"NoRepair" 1',
         "SectionEnd",
         "",
         'Section "Uninstall"',
@@ -1184,7 +1192,8 @@ def _write_windows_install_script(script_path: Path) -> None:
     script = "\n".join([
         '$ErrorActionPreference = "Stop"',
         '$logPath = Join-Path $env:TEMP "gs26-install.log"',
-        'function Write-InstallLog($message) { Add-Content -Path $logPath -Value ("[{0}] {1}" -f (Get-Date -Format "s"), $message) }',
+        'function Write-InstallLog($message) { Add-Content -Path $logPath -Value ("[{0}] {1}" -f (Get-Date -Format '
+        '"s"), $message) }',
         'Write-InstallLog "install.ps1 started"',
         "Add-Type -AssemblyName System.Windows.Forms",
         "",
@@ -1196,7 +1205,8 @@ def _write_windows_install_script(script_path: Path) -> None:
         "$folderDialog.SelectedPath = $defaultInstallDir",
         'Write-InstallLog ("showing folder picker with default path: " + $defaultInstallDir)',
         "$dialogResult = $folderDialog.ShowDialog()",
-        'if ($dialogResult -ne [System.Windows.Forms.DialogResult]::OK -or [string]::IsNullOrWhiteSpace($folderDialog.SelectedPath)) {',
+        'if ($dialogResult -ne [System.Windows.Forms.DialogResult]::OK -or [string]::IsNullOrWhiteSpace('
+        '$folderDialog.SelectedPath)) {',
         '    Write-InstallLog "installation cancelled from folder picker"',
         '    throw "Installation cancelled"',
         "}",
@@ -1229,12 +1239,18 @@ def _write_windows_install_script(script_path: Path) -> None:
         'Set-ItemProperty -Path "HKCU:\\Software\\UBSEDS\\$appName" -Name "InstallDir" -Value $installDir',
         "",
         'New-Item -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Force | Out-Null',
-        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayName" -Value $appName',
-        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "DisplayIcon" -Value $exePath',
-        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "InstallLocation" -Value $installDir',
-        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")',
-        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoModify" -Type DWord -Value 1',
-        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name "NoRepair" -Type DWord -Value 1',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name '
+        '"DisplayName" -Value $appName',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name '
+        '"DisplayIcon" -Value $exePath',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name '
+        '"InstallLocation" -Value $installDir',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name '
+        '"UninstallString" -Value ("powershell.exe -ExecutionPolicy Bypass -File `"" + $uninstallScript + "`"")',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name '
+        '"NoModify" -Type DWord -Value 1',
+        'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$appName" -Name '
+        '"NoRepair" -Type DWord -Value 1',
         'Write-InstallLog "install.ps1 completed successfully"',
     ])
     script_path.write_text(script, encoding="utf-8")

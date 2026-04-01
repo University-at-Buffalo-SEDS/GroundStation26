@@ -1,4 +1,5 @@
 #[repr(u8)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum FlightCommands {
     Launch = 3,

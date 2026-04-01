@@ -5,6 +5,8 @@ use std::path::PathBuf;
 const DEFAULT_LAYOUT_PATH: &str = "layout/layout.json";
 #[cfg(feature = "hitl_mode")]
 const DEFAULT_HITL_LAYOUT_PATH: &str = "layout/layout_hitl.json";
+#[cfg(feature = "test_fire_mode")]
+const DEFAULT_TEST_FIRE_LAYOUT_PATH: &str = "layout/layout_test_fire.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
@@ -404,7 +406,25 @@ pub struct DataTabChart {
 pub struct ActionsTabLayout {
     #[serde(default)]
     pub disable_actions_by_default: bool,
+    #[serde(default = "default_show_flight_setup")]
+    pub show_flight_setup: bool,
+    #[serde(default = "default_show_fill_targets")]
+    pub show_fill_targets: bool,
+    #[serde(default = "default_fill_targets_require_actions_enabled")]
+    pub fill_targets_require_actions_enabled: bool,
     pub actions: Vec<ActionSpec>,
+}
+
+fn default_show_flight_setup() -> bool {
+    true
+}
+
+fn default_show_fill_targets() -> bool {
+    true
+}
+
+fn default_fill_targets_require_actions_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +551,15 @@ pub enum StateWidgetKind {
 pub fn layout_path() -> PathBuf {
     if let Ok(path) = std::env::var("GS_LAYOUT_PATH") {
         return PathBuf::from(path);
+    }
+
+    #[cfg(feature = "test_fire_mode")]
+    {
+        let test_fire =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_TEST_FIRE_LAYOUT_PATH);
+        if test_fire.exists() {
+            return test_fire;
+        }
     }
 
     #[cfg(feature = "hitl_mode")]

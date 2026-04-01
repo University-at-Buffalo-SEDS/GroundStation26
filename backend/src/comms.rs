@@ -54,9 +54,9 @@ const I2C_FLAG_START: u8 = 0x01;
 #[cfg(target_os = "linux")]
 const I2C_FLAG_END: u8 = 0x02;
 
-#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+#[cfg(feature = "testing")]
 const DUMMY_ROCKET_TIMESYNC_SOURCES: &[&str] = &["RF", "FC", "PB"];
-#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+#[cfg(feature = "testing")]
 const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GW", "VB", "AB", "DAQ"];
 
 // ======================================================================
@@ -1211,27 +1211,32 @@ impl CommsDevice for CanComms {
 // ======================================================================
 //  Dummy Comms (fallback when hardware missing)
 // ======================================================================
-#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+#[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 #[derive(Debug)]
 pub struct DummyComms {
     name: &'static str,
     side_id: Option<RouterSideId>,
+    #[cfg(feature = "testing")]
     discovery_next_announce_ms: u64,
+    #[cfg(feature = "testing")]
     pending_rx: std::collections::VecDeque<sedsprintf_rs_2026::packet::Packet>,
 }
 
-#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+#[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 
 impl DummyComms {
     pub fn new(name: &'static str) -> Self {
         DummyComms {
             name,
             side_id: None,
+            #[cfg(feature = "testing")]
             discovery_next_announce_ms: 0,
+            #[cfg(feature = "testing")]
             pending_rx: std::collections::VecDeque::new(),
         }
     }
 
+    #[cfg(feature = "testing")]
     fn simulated_discovery_sender(&self) -> &'static str {
         match self.name {
             "Rocket Comms" => crate::types::Board::RFBoard.sender_id(),
@@ -1240,6 +1245,7 @@ impl DummyComms {
         }
     }
 
+    #[cfg(feature = "testing")]
     fn simulated_discovery_endpoints(&self) -> &'static [sedsprintf_rs_2026::config::DataEndpoint] {
         use sedsprintf_rs_2026::config::DataEndpoint;
 
@@ -1258,6 +1264,7 @@ impl DummyComms {
         }
     }
 
+    #[cfg(feature = "testing")]
     fn simulated_timesync_sources(&self) -> &'static [&'static str] {
         match self.name {
             "Rocket Comms" => DUMMY_ROCKET_TIMESYNC_SOURCES,
@@ -1266,6 +1273,7 @@ impl DummyComms {
         }
     }
 
+    #[cfg(feature = "testing")]
     fn maybe_queue_discovery(&mut self) -> TelemetryResult<()> {
         let now_ms = crate::telemetry_task::get_current_timestamp_ms();
         if now_ms < self.discovery_next_announce_ms {
@@ -1297,7 +1305,7 @@ impl DummyComms {
     }
 }
 
-#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+#[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 impl CommsDevice for DummyComms {
     fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
         #[cfg(feature = "testing")]

@@ -10,6 +10,7 @@ repository.workspace = true
 raspberry_pi = ["rppal"]
 testing = []
 hitl_mode = []
+test_fire_mode = []
 
 [dependencies]
 axum = { workspace = true, features = ["ws"] }
