@@ -1484,7 +1484,9 @@ pub fn ChartCanvas(
                     const rect = el.getBoundingClientRect();
                     const cssW = Math.max(1, Math.round(rect.width || data.view_w || 1));
                     const cssH = Math.max(1, Math.round(rect.height || data.view_h || 1));
-                    const dpr = Math.max(1, Math.min(5, (window.devicePixelRatio || 1)));
+                    const mobilePlatform = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || navigator.platform || "");
+                    const maxDpr = mobilePlatform ? 3 : 5;
+                    const dpr = Math.max(1, Math.min(maxDpr, (window.devicePixelRatio || 1)));
                     const qualityBoost = 1.0;
                     const maxCanvasEdge = 16384;
                     let renderScale = dpr * qualityBoost;

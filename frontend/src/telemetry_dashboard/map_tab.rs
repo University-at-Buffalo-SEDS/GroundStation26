@@ -257,7 +257,7 @@ pub fn MapTab(
                     js_set_user_heading(deg);
                 }
 
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         });
     }

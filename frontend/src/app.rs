@@ -699,11 +699,11 @@ fn insecure_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
     }
 }
 
-#[cfg(target_os = "android")]
-fn android_platform_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
+fn platform_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
     use rustls_platform_verifier::ConfigVerifierExt;
     let tls_config = rustls::ClientConfig::with_platform_verifier()
-        .map_err(|e| format!("android TLS verifier setup failed: {e}"))?;
+        .map_err(|e| format!("platform TLS verifier setup failed: {e}"))?;
     Ok(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
         tls_config,
     )))
@@ -726,10 +726,10 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl, skip_tls_verify: bool) -> Resu
                 .await
                 .map_err(|e| format!("{e}"))
         } else if ws_url.starts_with("wss://") {
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
             {
-                let tls = android_platform_rustls_connector()
-                    .map_err(|e| format!("android rustls connector build failed: {e}"))?;
+                let tls = platform_rustls_connector()
+                    .map_err(|e| format!("platform rustls connector build failed: {e}"))?;
                 tokio_tungstenite::connect_async_tls_with_config(
                     ws_url.clone(),
                     None,
@@ -739,7 +739,7 @@ async fn ws_connect_probe(parsed: &ParsedBaseUrl, skip_tls_verify: bool) -> Resu
                 .await
                 .map_err(|e| format!("{e}"))
             }
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
             {
                 tokio_tungstenite::connect_async(ws_url.clone())
                     .await

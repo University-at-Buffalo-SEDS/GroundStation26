@@ -185,7 +185,7 @@ pub(crate) fn build_native_http_client(
             .http1_only()
     };
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
     if !skip_tls_verify {
         use rustls_platform_verifier::ConfigVerifierExt;
         if let Ok(tls_config) = rustls::ClientConfig::with_platform_verifier() {
@@ -196,7 +196,7 @@ pub(crate) fn build_native_http_client(
                 Ok(client) => return Ok(client),
                 Err(err) => {
                     eprintln!(
-                        "Android platform-verifier TLS client build failed, falling back to default rustls: {err}"
+                        "Platform-verifier TLS client build failed, falling back to default rustls: {err}"
                     );
                 }
             }

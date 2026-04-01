@@ -76,6 +76,7 @@ static TELEMETRY_QUEUE: Lazy<Mutex<VecDeque<TelemetryRow>>> =
 static RESEED_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static RESEED_LIVE_BUFFER: Lazy<Mutex<Vec<TelemetryRow>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static DASHBOARD_HAS_CONNECTED: AtomicBool = AtomicBool::new(false);
+static LAST_WS_CONNECT_WARNING: Lazy<Mutex<Option<(String, i64)>>> = Lazy::new(|| Mutex::new(None));
 static FRONTEND_NETWORK_METRICS_STATE: Lazy<Mutex<FrontendNetworkMetrics>> =
     Lazy::new(|| Mutex::new(FrontendNetworkMetrics::default()));
 static TRANSLATION_MISS_QUEUE: Lazy<Mutex<HashSet<String>>> =
@@ -629,6 +630,9 @@ fn redact_ws_url_for_display(ws_url: &str) -> String {
 fn note_ws_connection_state(connected: bool, ws_url: String, reason: Option<String>, epoch: u64) {
     if connected {
         DASHBOARD_HAS_CONNECTED.store(true, Ordering::Relaxed);
+        if let Ok(mut slot) = LAST_WS_CONNECT_WARNING.lock() {
+            *slot = None;
+        }
     }
     if let Ok(mut next) = FRONTEND_NETWORK_METRICS_STATE.lock() {
         let was_connected = next.ws_connected;
@@ -645,6 +649,44 @@ fn note_ws_connection_state(connected: bool, ws_url: String, reason: Option<Stri
             next.last_disconnect_reason = Some(reason);
         }
     }
+}
+
+fn note_ws_connect_failure_warning(
+    warnings: &mut Signal<Vec<AlertMsg>>,
+    warning_event_counter: &mut Signal<u64>,
+    ws_url: &str,
+    reason: &str,
+) {
+    let now_ms = current_wallclock_ms();
+    let fingerprint = format!("{}|{}", redact_ws_url_for_display(ws_url), reason.trim());
+    if let Ok(mut slot) = LAST_WS_CONNECT_WARNING.lock() {
+        if let Some((last_fingerprint, last_ts)) = slot.as_ref()
+            && last_fingerprint == &fingerprint
+            && now_ms.saturating_sub(*last_ts) < 15_000
+        {
+            return;
+        }
+        *slot = Some((fingerprint, now_ms));
+    }
+
+    let mut list = warnings.read().clone();
+    list.insert(
+        0,
+        AlertMsg {
+            timestamp_ms: now_ms,
+            message: format!(
+                "WebSocket connection failed.\nURL: {}\nReason: {}",
+                redact_ws_url_for_display(ws_url),
+                reason.trim()
+            ),
+        },
+    );
+    if list.len() > 500 {
+        list.truncate(500);
+    }
+    warnings.set(list);
+    let next = warning_event_counter.read().saturating_add(1);
+    warning_event_counter.set(next);
 }
 
 /// Tracks incoming WebSocket message volume and updates rate calculations.
@@ -4608,6 +4650,9 @@ async fn connect_ws_supervisor(
     user_gps: Signal<Option<(f64, f64)>>,
     alive: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    let mut warnings = warnings;
+    let mut warning_event_counter = warning_event_counter;
+
     if *WS_EPOCH.read() != epoch {
         return Ok(());
     }
@@ -4682,6 +4727,12 @@ async fn connect_ws_supervisor(
         if let Err(e) = res
             && alive.load(Ordering::Relaxed)
         {
+            note_ws_connect_failure_warning(
+                &mut warnings,
+                &mut warning_event_counter,
+                &auth_ws_url(&UrlConfig::base_ws()),
+                &e,
+            );
             log!("[WS] connect error: {e}");
         }
 
@@ -4933,11 +4984,11 @@ fn insecure_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
     }
 }
 
-#[cfg(target_os = "android")]
-fn android_platform_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
+fn platform_rustls_connector() -> Result<tokio_tungstenite::Connector, String> {
     use rustls_platform_verifier::ConfigVerifierExt;
     let tls_config = rustls::ClientConfig::with_platform_verifier()
-        .map_err(|e| format!("android TLS verifier setup failed: {e}"))?;
+        .map_err(|e| format!("platform TLS verifier setup failed: {e}"))?;
     Ok(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
         tls_config,
     )))
@@ -4990,10 +5041,10 @@ async fn connect_ws_once_native(
             .map_err(|e| format!("[WS] connect failed: {e}"))?
             .0
     } else if ws_url.starts_with("wss://") {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
         {
-            let tls = android_platform_rustls_connector()
-                .map_err(|e| format!("[WS] android rustls connector build failed: {e}"))?;
+            let tls = platform_rustls_connector()
+                .map_err(|e| format!("[WS] platform rustls connector build failed: {e}"))?;
             tokio_tungstenite::connect_async_tls_with_config(
                 ws_url.as_str(),
                 None,
@@ -5004,7 +5055,7 @@ async fn connect_ws_once_native(
             .map_err(|e| format!("[WS] connect failed: {e}"))?
             .0
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
         {
             tokio_tungstenite::connect_async(ws_url.as_str())
                 .await
