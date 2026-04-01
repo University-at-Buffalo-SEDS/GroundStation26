@@ -91,10 +91,9 @@ function circularMeanDeg(a, b, wa, wb) {
 function fusedHeadingTarget() {
     const hasNative = Number.isFinite(nativeHeadingDeg);
     const hasDevice = Number.isFinite(deviceHeadingDeg);
-    if (hasNative && hasDevice) {
-        // Bias to native compass (north-referenced), blend in device orientation for smoothness.
-        return circularMeanDeg(nativeHeadingDeg, deviceHeadingDeg, 0.7, 0.3);
-    }
+    // Native mobile heading is already north-referenced and posture-independent.
+    // Do not blend it with browser/deviceorientation data, which can vary with
+    // screen posture and reintroduce orientation-dependent drift.
     if (hasNative) return normalizeAngle(nativeHeadingDeg);
     if (hasDevice) return normalizeAngle(deviceHeadingDeg);
     return null;
@@ -110,9 +109,9 @@ function applyFusedHeading() {
         userHeadingDeg = target;
     } else {
         const diff = shortestAngleDiff(userHeadingDeg, target);
-        // Wrap-safe adaptive smoothing:
-        // small deltas are damped; large deltas catch up quickly without snap.
-        const gain = Math.min(0.55, Math.max(0.16, Math.abs(diff) / 90.0));
+        const gain = Number.isFinite(nativeHeadingDeg)
+            ? Math.min(0.92, Math.max(0.72, Math.abs(diff) / 45.0))
+            : Math.min(0.55, Math.max(0.16, Math.abs(diff) / 90.0));
         userHeadingDeg = normalizeAngle(userHeadingDeg + diff * gain);
     }
 
