@@ -37,10 +37,26 @@ const ZOOM_MIN: f32 = 0.12;
 const ZOOM_MAX: f32 = 2.2;
 const ZOOM_STEP: f32 = 0.2;
 
+fn graph_viewport_style(min_height_px: i32, max_height: Option<&str>, fullscreen: bool) -> String {
+    let size_constraints = if fullscreen {
+        "flex:1; min-height:0;".to_string()
+    } else {
+        let mut style = format!("min-height:{min_height_px}px;");
+        if let Some(max_height) = max_height {
+            style.push_str(&format!(" max-height:{max_height};"));
+        }
+        style
+    };
+    format!(
+        "{size_constraints} border:1px solid #334155; border-radius:20px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain; scrollbar-width:none; -ms-overflow-style:none; box-shadow:0 24px 60px rgba(0,0,0,0.45);"
+    )
+}
+
 #[component]
 pub fn NetworkTopologyTab(
     topology: Signal<NetworkTopologyMsg>,
     layout: NetworkTabLayout,
+    flow_animation_enabled: bool,
 ) -> Element {
     let snapshot = topology.read().clone();
     let expanded_node_id = use_signal(|| None::<String>);
@@ -155,6 +171,16 @@ pub fn NetworkTopologyTab(
     };
 
     rsx! {
+        style {
+            {r#"
+            #network-topology-viewport::-webkit-scrollbar,
+            #network-topology-viewport-fullscreen::-webkit-scrollbar {
+                display: none;
+                width: 0;
+                height: 0;
+            }
+            "#}
+        }
         if *is_fullscreen.read() {
             div {
                 key: "network-fullscreen-{fullscreen_state}",
@@ -195,7 +221,7 @@ pub fn NetworkTopologyTab(
                     }
                 }
                 div {
-                    style: "flex:1; min-height:0; border:1px solid #334155; border-radius:20px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain; box-shadow:0 24px 60px rgba(0,0,0,0.45);",
+                    style: "{graph_viewport_style(EMBEDDED_GRAPH_MIN_HEIGHT, None, true)}",
                     id: "{viewport_id}",
                     div {
                         id: "{surface_id}",
@@ -209,7 +235,7 @@ pub fn NetworkTopologyTab(
                                 view_box: "0 0 {graph_layout.width} {graph_layout.height}",
                                 style: "position:absolute; inset:0; overflow:visible;",
                                 for link in graph_links.iter() {
-                                    {render_link(link, &snapshot.nodes, &graph_layout.placements)}
+                                    {render_link(link, &snapshot.nodes, &graph_layout.placements, flow_animation_enabled)}
                                 }
                             }
 
@@ -270,7 +296,7 @@ pub fn NetworkTopologyTab(
 
                 div {
                     id: "{viewport_id}",
-                    style: "padding:8px; border:1px solid #334155; border-radius:18px; background:radial-gradient(circle at top, #122033 0%, #0b1220 45%, #020617 100%); overflow:auto; min-height:{EMBEDDED_GRAPH_MIN_HEIGHT}px; max-height:calc(var(--gs26-app-height) - 260px); cursor:grab; user-select:none; touch-action:none; overscroll-behavior:contain;",
+                    style: "padding:8px; {graph_viewport_style(EMBEDDED_GRAPH_MIN_HEIGHT, Some(\"calc(var(--gs26-app-height) - 260px)\"), false)}",
                     div {
                         id: "{surface_id}",
                         style: "position:relative; width:{graph_layout.width}px; height:{graph_layout.height}px; min-width:{graph_layout.width}px; min-height:{graph_layout.height}px;",
@@ -283,7 +309,7 @@ pub fn NetworkTopologyTab(
                                 view_box: "0 0 {graph_layout.width} {graph_layout.height}",
                                 style: "position:absolute; inset:0; overflow:visible;",
                                 for link in graph_links.iter() {
-                                    {render_link(link, &snapshot.nodes, &graph_layout.placements)}
+                                    {render_link(link, &snapshot.nodes, &graph_layout.placements, flow_animation_enabled)}
                                 }
                             }
 
@@ -399,6 +425,10 @@ fn install_drag_handlers(
             state.viewport.style.cursor = value;
           }};
 
+          const withinSurface = (target) => {{
+            return target === state.surface || state.surface.contains(target);
+          }};
+
           const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
           const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
           const fitScale = () => {{
@@ -436,6 +466,14 @@ fn install_drag_handlers(
             refreshSurfaceFrame();
             state.viewport.scrollLeft = Math.max(0, contentX * scale + state.padX - localX);
             state.viewport.scrollTop = Math.max(0, contentY * scale + state.padY - localY);
+          }};
+
+          const zoomFromWheel = (evt) => {{
+            const delta = Number(evt.deltaY || 0);
+            if (!Number.isFinite(delta) || Math.abs(delta) < 0.01) return;
+            const intensity = evt.ctrlKey ? 0.0035 : 0.0018;
+            const nextScale = state.scale * Math.exp(-delta * intensity);
+            applyScale(nextScale, evt.clientX, evt.clientY);
           }};
 
           window.__gs26NetworkGraphZoomDelta = (delta) => {{
@@ -479,8 +517,18 @@ fn install_drag_handlers(
             centerGraph();
           }});
 
+          document.addEventListener("wheel", (evt) => {{
+            if (!withinSurface(evt.target)) return;
+            const target = evt.target;
+            if (target && typeof target.closest === "function" && target.closest("button")) {{
+              return;
+            }}
+            zoomFromWheel(evt);
+            evt.preventDefault();
+          }}, {{ passive: false }});
+
           document.addEventListener("pointerdown", (evt) => {{
-            if (evt.target !== state.surface && !state.surface.contains(evt.target)) return;
+            if (!withinSurface(evt.target)) return;
             const target = evt.target;
             if (target && typeof target.closest === "function" && target.closest("button")) {{
               return;
@@ -562,7 +610,7 @@ fn install_drag_handlers(
           }});
 
           document.addEventListener("click", (evt) => {{
-            if (evt.target !== state.surface && !state.surface.contains(evt.target)) return;
+            if (!withinSurface(evt.target)) return;
             if (!state.suppressNextClick) return;
             state.suppressNextClick = false;
             evt.preventDefault();
@@ -695,6 +743,7 @@ fn render_link(
     link: &NetworkTopologyLink,
     nodes: &[NetworkTopologyNode],
     placements: &HashMap<String, NodePlacement>,
+    flow_animation_enabled: bool,
 ) -> Element {
     let Some(source) = placement_for(&link.source, placements) else {
         return rsx! { g {} };
@@ -707,6 +756,49 @@ fn render_link(
     let glow = link_color(link, glow);
     let source_label = node_label(&link.source, nodes);
     let target_label = node_label(&link.target, nodes);
+    let animated = flow_animation_enabled && !matches!(link.status, NetworkTopologyStatus::Offline);
+    let dx = (target.x - source.x) as f32;
+    let dy = (target.y - source.y) as f32;
+    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+    let nx = -dy / len;
+    let ny = dx / len;
+    let lane_offset = if len < 220.0 { 1.6 } else { 1.8 };
+    let lane1_x1 = source.x as f32 + nx * lane_offset;
+    let lane1_y1 = source.y as f32 + ny * lane_offset;
+    let lane1_x2 = target.x as f32 + nx * lane_offset;
+    let lane1_y2 = target.y as f32 + ny * lane_offset;
+    let lane2_x1 = source.x as f32 - nx * lane_offset;
+    let lane2_y1 = source.y as f32 - ny * lane_offset;
+    let lane2_x2 = target.x as f32 - nx * lane_offset;
+    let lane2_y2 = target.y as f32 - ny * lane_offset;
+    let upload_color = match link.status {
+        NetworkTopologyStatus::Online => "#38bdf8",
+        NetworkTopologyStatus::Offline => "#ef4444",
+        NetworkTopologyStatus::Simulated => "#8b5cf6",
+    };
+    let download_color = match link.status {
+        NetworkTopologyStatus::Online => "#22c55e",
+        NetworkTopologyStatus::Offline => "#f87171",
+        NetworkTopologyStatus::Simulated => "#c084fc",
+    };
+    let upload_glow = match link.status {
+        NetworkTopologyStatus::Online => "#7dd3fc",
+        NetworkTopologyStatus::Offline => "#fca5a5",
+        NetworkTopologyStatus::Simulated => "#ddd6fe",
+    };
+    let download_glow = match link.status {
+        NetworkTopologyStatus::Online => "#86efac",
+        NetworkTopologyStatus::Offline => "#fecaca",
+        NetworkTopologyStatus::Simulated => "#e9d5ff",
+    };
+    let lane_dash = if matches!(link.status, NetworkTopologyStatus::Simulated) {
+        "12 16"
+    } else {
+        "10 18"
+    };
+    let tooltip = format!(
+        "{source_label} -> {target_label}: upload lane\n{target_label} -> {source_label}: download lane"
+    );
 
     rsx! {
         g {
@@ -716,21 +808,95 @@ fn render_link(
                 x2: "{target.x}",
                 y2: "{target.y}",
                 stroke: "{glow}",
-                stroke_width: "10",
-                stroke_opacity: "0.15",
+                stroke_width: if animated { "8" } else { "10" },
+                stroke_opacity: if animated { "0.08" } else { "0.15" },
                 stroke_linecap: "round",
             }
-            line {
-                x1: "{source.x}",
-                y1: "{source.y}",
-                x2: "{target.x}",
-                y2: "{target.y}",
-                stroke: "{stroke}",
-                stroke_width: "3",
-                stroke_dasharray: "{dash}",
-                stroke_linecap: "round",
+            if !animated {
+                line {
+                    x1: "{source.x}",
+                    y1: "{source.y}",
+                    x2: "{target.x}",
+                    y2: "{target.y}",
+                    stroke: "{stroke}",
+                    stroke_width: "3",
+                    stroke_dasharray: "{dash}",
+                    stroke_linecap: "round",
+                }
             }
-            title { "{source_label} -> {target_label}" }
+            if animated {
+                g {
+                    line {
+                        x1: "{lane1_x1}",
+                        y1: "{lane1_y1}",
+                        x2: "{lane1_x2}",
+                        y2: "{lane1_y2}",
+                        stroke: "{upload_glow}",
+                        stroke_width: "7",
+                        stroke_opacity: "0.12",
+                        stroke_linecap: "round",
+                    }
+                    line {
+                        x1: "{lane1_x1}",
+                        y1: "{lane1_y1}",
+                        x2: "{lane1_x2}",
+                        y2: "{lane1_y2}",
+                        stroke: "{upload_color}",
+                        stroke_width: "3",
+                        stroke_dasharray: "{lane_dash}",
+                        stroke_linecap: "round",
+                        stroke_opacity: "0.92",
+                        animate {
+                            attribute_name: "stroke-dashoffset",
+                            from: "0",
+                            to: "-28",
+                            dur: if matches!(link.status, NetworkTopologyStatus::Simulated) { "1.6s" } else { "1.1s" },
+                            repeat_count: "indefinite",
+                        }
+                        animate {
+                            attribute_name: "stroke-opacity",
+                            values: "0.35;0.95;0.35",
+                            dur: if matches!(link.status, NetworkTopologyStatus::Simulated) { "1.8s" } else { "1.2s" },
+                            repeat_count: "indefinite",
+                        }
+                    }
+                    line {
+                        x1: "{lane2_x1}",
+                        y1: "{lane2_y1}",
+                        x2: "{lane2_x2}",
+                        y2: "{lane2_y2}",
+                        stroke: "{download_glow}",
+                        stroke_width: "7",
+                        stroke_opacity: "0.12",
+                        stroke_linecap: "round",
+                    }
+                    line {
+                        x1: "{lane2_x1}",
+                        y1: "{lane2_y1}",
+                        x2: "{lane2_x2}",
+                        y2: "{lane2_y2}",
+                        stroke: "{download_color}",
+                        stroke_width: "3",
+                        stroke_dasharray: "{lane_dash}",
+                        stroke_linecap: "round",
+                        stroke_opacity: "0.92",
+                        animate {
+                            attribute_name: "stroke-dashoffset",
+                            from: "-28",
+                            to: "0",
+                            dur: if matches!(link.status, NetworkTopologyStatus::Simulated) { "1.8s" } else { "1.25s" },
+                            repeat_count: "indefinite",
+                        }
+                        animate {
+                            attribute_name: "stroke-opacity",
+                            values: "0.35;0.95;0.35",
+                            dur: if matches!(link.status, NetworkTopologyStatus::Simulated) { "2.0s" } else { "1.35s" },
+                            repeat_count: "indefinite",
+                        }
+                    }
+                }
+            }
+            title { "{tooltip}" }
         }
     }
 }
@@ -1168,13 +1334,8 @@ fn compute_graph_layout(
     }
 
     let mut adjacency = HashMap::<String, Vec<String>>::new();
-    let mut indegree = HashMap::<String, usize>::new();
-    let mut kind_by_id = HashMap::<String, NetworkTopologyNodeKind>::new();
-
     for node in nodes {
         adjacency.entry(node.id.clone()).or_default();
-        indegree.entry(node.id.clone()).or_insert(0);
-        kind_by_id.insert(node.id.clone(), node.kind);
     }
     for link in links {
         adjacency
@@ -1185,133 +1346,89 @@ fn compute_graph_layout(
             .entry(link.target.clone())
             .or_default()
             .push(link.source.clone());
-        *indegree.entry(link.target.clone()).or_insert(0) += 1;
     }
 
-    let mut roots = nodes
+    let root_id = nodes
         .iter()
-        .filter(|node| indegree.get(&node.id).copied().unwrap_or(0) == 0)
+        .find(|node| node.kind == NetworkTopologyNodeKind::Router)
         .map(|node| node.id.clone())
-        .collect::<Vec<_>>();
-    if roots.is_empty() {
-        roots = nodes
-            .iter()
-            .filter(|node| node.kind == NetworkTopologyNodeKind::Router)
-            .map(|node| node.id.clone())
-            .collect();
-    }
-    if roots.is_empty() {
-        roots.push(nodes[0].id.clone());
-    }
+        .unwrap_or_else(|| nodes[0].id.clone());
 
     let mut layer_map = HashMap::<String, usize>::new();
+    let mut first_hop_by_node = HashMap::<String, Option<String>>::new();
     let mut queue = std::collections::VecDeque::<String>::new();
-    for root in roots {
-        if layer_map.insert(root.clone(), 0).is_none() {
-            queue.push_back(root);
-        }
-    }
+    layer_map.insert(root_id.clone(), 0);
+    first_hop_by_node.insert(root_id.clone(), None);
+    queue.push_back(root_id.clone());
+
     while let Some(node_id) = queue.pop_front() {
         let current_layer = layer_map.get(&node_id).copied().unwrap_or(0);
+        let current_first_hop = first_hop_by_node.get(&node_id).cloned().unwrap_or(None);
         if let Some(neighbors) = adjacency.get(&node_id) {
             for neighbor in neighbors {
-                let next_layer = current_layer + 1;
-                let update = match layer_map.get(neighbor) {
-                    Some(existing) => next_layer < *existing,
-                    None => true,
-                };
-                if update {
-                    layer_map.insert(neighbor.clone(), next_layer);
-                    queue.push_back(neighbor.clone());
+                if layer_map.contains_key(neighbor) {
+                    continue;
                 }
+                let next_layer = current_layer + 1;
+                let next_first_hop = if node_id == root_id {
+                    Some(neighbor.clone())
+                } else {
+                    current_first_hop.clone()
+                };
+                layer_map.insert(neighbor.clone(), next_layer);
+                first_hop_by_node.insert(neighbor.clone(), next_first_hop);
+                queue.push_back(neighbor.clone());
             }
         }
     }
 
-    let mut unplaced = nodes
+    let mut extra_roots = nodes
         .iter()
         .filter(|node| !layer_map.contains_key(&node.id))
         .map(|node| node.id.clone())
         .collect::<Vec<_>>();
-    while let Some(id) = unplaced.pop() {
-        let start_layer = layer_map.values().copied().max().unwrap_or(0) + 1;
+
+    for (branch_idx, id) in extra_roots.drain(..).enumerate() {
+        let synthetic_root = format!("__detached_{branch_idx}_{}", id);
+        let start_layer = 1;
         layer_map.insert(id.clone(), start_layer);
+        first_hop_by_node.insert(id.clone(), Some(synthetic_root.clone()));
         queue.push_back(id.clone());
         while let Some(node_id) = queue.pop_front() {
             let current_layer = layer_map.get(&node_id).copied().unwrap_or(start_layer);
+            let current_first_hop = first_hop_by_node
+                .get(&node_id)
+                .cloned()
+                .unwrap_or(Some(synthetic_root.clone()));
             if let Some(neighbors) = adjacency.get(&node_id) {
                 for neighbor in neighbors {
                     if layer_map.contains_key(neighbor) {
                         continue;
                     }
                     layer_map.insert(neighbor.clone(), current_layer + 1);
+                    first_hop_by_node.insert(neighbor.clone(), current_first_hop.clone());
                     queue.push_back(neighbor.clone());
                 }
             }
         }
-        unplaced.retain(|node_id| !layer_map.contains_key(node_id));
     }
 
-    let root_router_ids = nodes
-        .iter()
-        .filter(|node| node.kind == NetworkTopologyNodeKind::Router)
-        .map(|node| node.id.clone())
+    let mut branch_roots = first_hop_by_node
+        .values()
+        .filter_map(|value| value.clone())
         .collect::<Vec<_>>();
-
-    let mut branch_roots = nodes
-        .iter()
-        .filter(|node| node.kind == NetworkTopologyNodeKind::Side)
-        .map(|node| node.id.clone())
-        .collect::<Vec<_>>();
-
-    if branch_roots.is_empty() {
-        branch_roots = root_router_ids
-            .iter()
-            .flat_map(|router_id| {
-                adjacency
-                    .get(router_id)
-                    .into_iter()
-                    .flat_map(|neighbors| neighbors.iter())
-                    .filter(|neighbor| *neighbor != router_id)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        branch_roots.sort();
-        branch_roots.dedup();
-    }
-
-    let branch_root_set = branch_roots
-        .iter()
-        .cloned()
-        .collect::<std::collections::HashSet<_>>();
-    let root_router_set = root_router_ids
-        .iter()
-        .cloned()
-        .collect::<std::collections::HashSet<_>>();
+    branch_roots.sort();
+    branch_roots.dedup();
     let mut branch_index_by_node = HashMap::<String, usize>::new();
 
     for (branch_idx, branch_root) in branch_roots.iter().enumerate() {
-        let mut queue = std::collections::VecDeque::<String>::new();
-        queue.push_back(branch_root.clone());
-        branch_index_by_node
-            .entry(branch_root.clone())
-            .or_insert(branch_idx);
-        while let Some(node_id) = queue.pop_front() {
-            if let Some(neighbors) = adjacency.get(&node_id) {
-                for neighbor in neighbors {
-                    if root_router_set.contains(neighbor) {
-                        continue;
-                    }
-                    if branch_root_set.contains(neighbor) && neighbor != branch_root {
-                        continue;
-                    }
-                    if branch_index_by_node.contains_key(neighbor) {
-                        continue;
-                    }
-                    branch_index_by_node.insert(neighbor.clone(), branch_idx);
-                    queue.push_back(neighbor.clone());
-                }
+        for node in nodes {
+            if first_hop_by_node
+                .get(&node.id)
+                .and_then(|value| value.as_ref())
+                == Some(branch_root)
+            {
+                branch_index_by_node.insert(node.id.clone(), branch_idx);
             }
         }
     }
@@ -1369,7 +1486,11 @@ fn compute_graph_layout(
 
         let mut by_branch = HashMap::<Option<usize>, Vec<&NetworkTopologyNode>>::new();
         for node in layer_nodes {
-            let branch = branch_index_by_node.get(&node.id).copied();
+            let branch = if node.id == root_id {
+                None
+            } else {
+                branch_index_by_node.get(&node.id).copied()
+            };
             by_branch.entry(branch).or_default().push(*node);
         }
 

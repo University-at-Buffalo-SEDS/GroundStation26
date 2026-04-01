@@ -88,7 +88,12 @@
   },
   "network_tab": {
     "enabled": true,
-    "title": "Network Topology"
+    "title": "Network Topology",
+    "expected_boards": [
+      "VB",
+      "GW",
+      "AB"
+    ]
   },
   "actions_tab": {
     "actions": [

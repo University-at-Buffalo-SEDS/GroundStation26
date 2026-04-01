@@ -264,6 +264,8 @@ pub struct NetworkTabLayout {
     #[serde(default)]
     pub enabled: bool,
     pub title: Option<String>,
+    #[serde(default)]
+    pub expected_boards: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -614,6 +616,21 @@ impl LayoutConfig {
                         ));
                     }
                 }
+            }
+        }
+
+        for board_id in &self.network_tab.expected_boards {
+            let trimmed = board_id.trim();
+            if trimmed.is_empty() {
+                return Err("layout contains an empty expected board id".to_string());
+            }
+            if !matches!(
+                trimmed,
+                "FC" | "RF" | "PB" | "VB" | "GW" | "AB" | "DAQ" | "GS"
+            ) {
+                return Err(format!(
+                    "layout contains unknown expected board id '{trimmed}'"
+                ));
             }
         }
 

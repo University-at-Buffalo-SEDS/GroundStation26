@@ -15,6 +15,7 @@ const LATENCY_FULLSCREEN_CHART_HEIGHT_PX: u32 = 240;
 #[component]
 pub fn ConnectionStatusTab(
     boards: Signal<Vec<BoardStatusEntry>>,
+    expected_boards: Vec<String>,
     layout: ConnectionTabLayout,
     title: String,
     theme: ThemeConfig,
@@ -24,13 +25,16 @@ pub fn ConnectionStatusTab(
     let mut show_latency = use_signal(|| true);
     let mut latency_fullscreen = use_signal(|| false);
     let history = use_signal(HashMap::<String, Vec<(i64, f64)>>::new);
+    let merged_boards = merged_connection_boards(&boards.read(), &expected_boards);
 
     {
         let boards = boards;
+        let expected_boards = expected_boards.clone();
         let mut history = history;
         let show_latency = show_latency;
         let latency_fullscreen = latency_fullscreen;
         use_effect(move || {
+            let expected_boards = expected_boards.clone();
             spawn(async move {
                 loop {
                     if !*show_latency.read() && !*latency_fullscreen.read() {
@@ -44,8 +48,9 @@ pub fn ConnectionStatusTab(
 
                     let now_ms = js_now_ms();
                     let mut map = history.read().clone();
+                    let merged = merged_connection_boards(&boards.read(), &expected_boards);
 
-                    for entry in boards.read().iter() {
+                    for entry in merged.iter() {
                         let Some(age_ms) = entry.age_ms else {
                             continue;
                         };
@@ -125,7 +130,7 @@ pub fn ConnectionStatusTab(
                                 }
                             }
                             if *show_board.read() {
-                                {render_board_table(&boards.read())}
+                                {render_board_table(&merged_boards)}
                             }
                         }
                     },
@@ -157,7 +162,7 @@ pub fn ConnectionStatusTab(
 
                             if *show_latency.read() {
                                 div { style: latency_list_style(),
-                                    for entry in boards.read().iter() {
+                                    for entry in merged_boards.iter() {
                                         div { style: latency_card_style(),
                                             div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
                                                 "{entry.display_name()} ({entry.sender_id})"
@@ -186,7 +191,7 @@ pub fn ConnectionStatusTab(
                         "Exit Fullscreen"
                     }
                 }
-                {render_board_table(&boards.read())}
+                {render_board_table(&merged_boards)}
             }
         }
 
@@ -201,7 +206,7 @@ pub fn ConnectionStatusTab(
                     }
                 }
                 div { style: latency_list_style(),
-                    for entry in boards.read().iter() {
+                    for entry in merged_boards.iter() {
                         div { style: latency_card_style(),
                             div { style: "font-size:12px; color:#94a3b8; margin-bottom:6px;",
                                 "{entry.display_name()} ({entry.sender_id})"
@@ -216,6 +221,31 @@ pub fn ConnectionStatusTab(
             }
         }
     }
+}
+
+fn merged_connection_boards(
+    live_boards: &[BoardStatusEntry],
+    expected_boards: &[String],
+) -> Vec<BoardStatusEntry> {
+    let mut by_sender = live_boards
+        .iter()
+        .cloned()
+        .map(|entry| (entry.sender_id.clone(), entry))
+        .collect::<HashMap<_, _>>();
+
+    for sender_id in expected_boards {
+        let sender_id = sender_id.trim();
+        if sender_id.is_empty() || by_sender.contains_key(sender_id) {
+            continue;
+        }
+        if let Some(entry) = BoardStatusEntry::from_sender_id(sender_id) {
+            by_sender.insert(sender_id.to_string(), entry);
+        }
+    }
+
+    let mut rows = by_sender.into_values().collect::<Vec<_>>();
+    rows.sort_by(|a, b| a.display_name().cmp(b.display_name()));
+    rows
 }
 
 fn js_now_ms() -> i64 {

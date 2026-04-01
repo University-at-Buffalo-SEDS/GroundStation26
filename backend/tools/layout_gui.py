@@ -15,6 +15,16 @@ except ImportError:
     )
     sys.exit(1)
 
+EXPECTED_BOARD_OPTIONS = [
+    ("Flight Computer (FC)", "FC"),
+    ("RF Board (RF)", "RF"),
+    ("Power Board (PB)", "PB"),
+    ("Valve Board (VB)", "VB"),
+    ("Gateway Board (GW)", "GW"),
+    ("Actuator Board (AB)", "AB"),
+    ("DAQ Board (DAQ)", "DAQ"),
+]
+
 
 def default_layout_path() -> Path:
     backend_dir = Path(__file__).resolve().parents[1]
@@ -87,7 +97,11 @@ def default_layout() -> dict:
             "network-topology",
         ],
         "connection_tab": {"sections": []},
-        "network_tab": {"enabled": False, "title": "SEDSprintf Network"},
+        "network_tab": {
+            "enabled": False,
+            "title": "SEDSprintf Network",
+            "expected_boards": ["FC", "RF", "PB", "VB", "GW", "AB", "DAQ"],
+        },
         "actions_tab": {"disable_actions_by_default": False, "actions": []},
         "data_tab": {"tabs": []},
         "state_tab": {"states": []},
@@ -122,6 +136,8 @@ def validate_layout(data: dict) -> list[str]:
     network = data.get("network_tab", {})
     if not isinstance(network, dict):
         errors.append("network_tab must be an object.")
+    elif not isinstance(network.get("expected_boards", []), list):
+        errors.append("network_tab.expected_boards must be a list.")
 
     connection = data.get("connection_tab", {})
     if not isinstance(connection, dict) or not isinstance(connection.get("sections", []), list):
@@ -573,6 +589,16 @@ class LayoutEditor(tk.Tk):
             row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(8, 6)
         )
         self.network_title = self._entry(frame, "Title", 1)
+        ttk.Label(frame, text="Expected boards").grid(row=2, column=0, sticky="nw", padx=6, pady=(8, 4))
+        expected_frame = ttk.Frame(frame)
+        expected_frame.grid(row=2, column=1, sticky="w", padx=6, pady=(8, 4))
+        self.network_expected_board_vars: dict[str, tk.BooleanVar] = {}
+        for idx, (label, sender_id) in enumerate(EXPECTED_BOARD_OPTIONS):
+            var = tk.BooleanVar(value=False)
+            self.network_expected_board_vars[sender_id] = var
+            ttk.Checkbutton(expected_frame, text=label, variable=var).grid(
+                row=idx // 2, column=idx % 2, sticky="w", padx=(0, 16), pady=2
+            )
 
     # ------------------------
     # Actions tab editor
@@ -1715,6 +1741,7 @@ class LayoutEditor(tk.Tk):
         network = self.data.setdefault("network_tab", {})
         network.setdefault("enabled", False)
         network.setdefault("title", "SEDSprintf Network")
+        network.setdefault("expected_boards", ["FC", "RF", "PB", "VB", "GW", "AB", "DAQ"])
         actions_tab = self.data.setdefault("actions_tab", {})
         actions_tab.setdefault("disable_actions_by_default", False)
         actions_tab.setdefault("actions", [])
@@ -1732,6 +1759,9 @@ class LayoutEditor(tk.Tk):
         self.network_enabled.set(bool(network.get("enabled", False)))
         self.network_title.delete(0, tk.END)
         self.network_title.insert(0, network.get("title", "") or "")
+        expected = set(network.get("expected_boards", []) or [])
+        for sender_id, var in self.network_expected_board_vars.items():
+            var.set(sender_id in expected)
 
     def _load_main_tabs_form(self) -> None:
         if not hasattr(self, "layout_version"):
@@ -3126,6 +3156,11 @@ class LayoutEditor(tk.Tk):
         self.data["network_tab"] = {
             "enabled": bool(self.network_enabled.get()),
             "title": self.network_title.get().strip() or None,
+            "expected_boards": [
+                sender_id
+                for _label, sender_id in EXPECTED_BOARD_OPTIONS
+                if self.network_expected_board_vars[sender_id].get()
+            ],
         }
 
     def _on_tab_changed(self, _event=None) -> None:

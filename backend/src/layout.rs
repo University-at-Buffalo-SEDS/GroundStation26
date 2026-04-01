@@ -271,6 +271,8 @@ pub struct NetworkTabLayout {
     #[serde(default)]
     pub enabled: bool,
     pub title: Option<String>,
+    #[serde(default)]
+    pub expected_boards: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

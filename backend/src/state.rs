@@ -135,17 +135,27 @@ pub struct AppState {
 }
 
 impl AppState {
-    fn board_visible_in_ui(&self, _board: Board) -> bool {
-        #[cfg(any(feature = "testing", feature = "test_fire_mode"))]
-        {
-            if matches!(
-                _board,
-                Board::FlightComputer | Board::RFBoard | Board::PowerBoard | Board::DaqBoard
-            ) {
-                return false;
-            }
+    fn layout_expected_boards(&self) -> std::collections::HashSet<Board> {
+        let configured = crate::layout::load_layout()
+            .ok()
+            .map(|layout| {
+                layout
+                    .network_tab
+                    .expected_boards
+                    .into_iter()
+                    .filter_map(|sender_id| Board::from_sender_id(sender_id.trim()))
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+        if configured.is_empty() {
+            Board::ALL
+                .iter()
+                .copied()
+                .filter(|board| *board != Board::GroundStation)
+                .collect()
+        } else {
+            configured
         }
-        true
     }
 
     /// Updates heartbeat tracking for a board after a packet arrives from that sender.
@@ -180,6 +190,9 @@ impl AppState {
     /// Returns whether a board should be required for startup/state gating in the current mode.
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     pub fn board_required_for_progression(&self, board: Board) -> bool {
+        if !self.layout_expected_boards().contains(&board) {
+            return false;
+        }
         let av_link_up = self.av_bay_comms_connected.load(Ordering::Relaxed);
         let fill_link_up = self.fill_comms_connected.load(Ordering::Relaxed);
         if !av_link_up
@@ -203,8 +216,8 @@ impl AppState {
     }
 
     #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-    pub fn board_required_for_progression(&self, _board: Board) -> bool {
-        true
+    pub fn board_required_for_progression(&self, board: Board) -> bool {
+        self.layout_expected_boards().contains(&board)
     }
 
     /// Returns whether every board required for the current operating mode has been observed.
@@ -226,13 +239,13 @@ impl AppState {
         let mut boards = Vec::with_capacity(Board::ALL.len());
 
         for board in Board::ALL {
-            if !self.board_visible_in_ui(*board) {
-                continue;
-            }
             let status = map.get(board);
             let last_seen_ms = status.and_then(|s| s.last_seen_ms);
-            let age_ms = last_seen_ms.map(|ts| now_ms.saturating_sub(ts));
             let seen = last_seen_ms.is_some();
+            if !seen {
+                continue;
+            }
+            let age_ms = last_seen_ms.map(|ts| now_ms.saturating_sub(ts));
 
             boards.push(BoardStatusEntry {
                 board: *board,

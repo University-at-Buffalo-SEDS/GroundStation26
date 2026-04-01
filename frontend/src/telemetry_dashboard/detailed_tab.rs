@@ -47,6 +47,11 @@ pub fn DetailedTab(
     let _tick_snapshot = *tick.read();
     let metrics_snapshot = metrics.read().clone();
     let boards = board_status.read().clone();
+    let seen_boards = boards
+        .iter()
+        .filter(|board| board.seen)
+        .cloned()
+        .collect::<Vec<_>>();
     let topology = network_topology.read().clone();
     let network_time_snapshot = *network_time.read();
     let visible_topology_nodes = visible_topology_nodes(&topology.nodes);
@@ -56,8 +61,7 @@ pub fn DetailedTab(
     let notifications_count = notifications.read().len();
     let now_ms = current_wallclock_ms();
 
-    let board_seen = boards.iter().filter(|board| board.seen).count();
-    let board_total = boards.len();
+    let board_seen = seen_boards.len();
     let online_nodes = visible_topology_nodes
         .iter()
         .filter(|node| node.status == NetworkTopologyStatus::Online)
@@ -86,8 +90,8 @@ pub fn DetailedTab(
         .iter()
         .filter(|node| node.kind == NetworkTopologyNodeKind::Board)
         .count();
-    let max_board_age_ms = boards.iter().filter_map(|board| board.age_ms).max();
-    let min_board_age_ms = boards.iter().filter_map(|board| board.age_ms).min();
+    let max_board_age_ms = seen_boards.iter().filter_map(|board| board.age_ms).max();
+    let min_board_age_ms = seen_boards.iter().filter_map(|board| board.age_ms).min();
     let avg_bytes_per_msg = if metrics_snapshot.ws_messages_total > 0 {
         Some(metrics_snapshot.ws_bytes_total as f64 / metrics_snapshot.ws_messages_total as f64)
     } else {
@@ -190,7 +194,7 @@ pub fn DetailedTab(
                 {metric_card(
                     "Topology",
                     vec![
-                        ("Boards seen", format!("{board_seen}/{board_total}")),
+                        ("Boards seen", board_seen.to_string()),
                         ("Visible nodes", visible_topology_nodes.len().to_string()),
                         ("Visible links", visible_topology_links.len().to_string()),
                         ("Routers", router_nodes.to_string()),
@@ -229,13 +233,18 @@ pub fn DetailedTab(
                             }
                         }
                         tbody {
-                            for board in boards.iter() {
+                            for board in seen_boards.iter() {
                                 tr {
                                     td { style: td_style(), "{board.display_name()}" }
                                     td { style: td_style_mono(), "{board.sender_id}" }
-                                    td { style: td_style(), if board.seen { "yes" } else { "no" } }
+                                    td { style: td_style(), "yes" }
                                     td { style: td_style_mono(), "{opt_i64_ms(board.age_ms.map(|v| v as i64))}" }
                                     td { style: td_style_mono(), "{board.last_seen_ms.map(|ts| format_timestamp_ms_clock(ts as i64)).unwrap_or_else(|| \"--\".to_string())}" }
+                                }
+                            }
+                            if seen_boards.is_empty() {
+                                tr {
+                                    td { style: td_style(), colspan: "5", "No boards have been observed yet." }
                                 }
                             }
                         }

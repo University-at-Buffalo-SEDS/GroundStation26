@@ -7,6 +7,7 @@ pub fn SettingsPage(
     distance_units_metric: Signal<bool>,
     theme_preset: Signal<String>,
     language_code: Signal<String>,
+    network_flow_animation_enabled: Signal<bool>,
     theme: ThemeConfig,
     #[props(default)] title: Option<String>,
 ) -> Element {
@@ -17,6 +18,7 @@ pub fn SettingsPage(
     let metric_enabled = *distance_units_metric.read();
     let selected_theme = theme_preset.read().clone();
     let selected_language = language_code.read().clone();
+    let flow_animation_enabled = *network_flow_animation_enabled.read();
 
     let card_style = format!(
         "padding:16px; border-radius:14px; border:1px solid {}; background:{}; display:flex; flex-direction:column; gap:12px;",
@@ -34,6 +36,7 @@ pub fn SettingsPage(
     let section_general = localized_copy(&language, "General", "General", "General");
     let section_appearance = localized_copy(&language, "Appearance", "Apariencia", "Apparence");
     let section_map = localized_copy(&language, "Map", "Mapa", "Carte");
+    let section_network = localized_copy(&language, "Network", "Red", "Reseau");
     let language_title = localized_copy(&language, "Language", "Idioma", "Langue");
     let language_desc = localized_copy(
         &language,
@@ -74,6 +77,20 @@ pub fn SettingsPage(
         "Pies hasta 1000 ft y luego millas.",
         "Pieds jusqu'a 1000 ft puis miles.",
     );
+    let network_anim_title = localized_copy(
+        &language,
+        "Flow Animations",
+        "Animaciones de flujo",
+        "Animations de flux",
+    );
+    let network_anim_desc = localized_copy(
+        &language,
+        "Controls animated directional lanes on the network graph.",
+        "Controla los carriles animados direccionales en el grafo de red.",
+        "Controle les voies directionnelles animees sur le graphe reseau.",
+    );
+    let flow_on_label = localized_copy(&language, "On", "Activado", "Active");
+    let flow_off_label = localized_copy(&language, "Off", "Desactivado", "Desactive");
     let english_label = "English".to_string();
     let spanish_label = "Español".to_string();
     let french_label = "Français".to_string();
@@ -189,6 +206,24 @@ pub fn SettingsPage(
                     }
                     div { style: "font-size:13px; color:{theme.text_secondary};",
                         if metric_enabled { "{metric_hint}" } else { "{imperial_hint}" }
+                    }
+                }
+            }
+
+            div { style: "margin-top:12px; {card_style}",
+                div { style: "font-size:15px; color:{theme.text_primary}; font-weight:700;", "{section_network}" }
+                div { style: "font-size:13px; color:{theme.text_muted};", "{network_anim_title}" }
+                div { style: "font-size:13px; color:{theme.text_soft};", "{network_anim_desc}" }
+                div { style: "display:flex; align-items:center; gap:12px; flex-wrap:wrap;",
+                    button {
+                        style: if flow_animation_enabled { chip_selected.clone() } else { chip_idle.clone() },
+                        onclick: move |_| network_flow_animation_enabled.set(true),
+                        "{flow_on_label}"
+                    }
+                    button {
+                        style: if !flow_animation_enabled { chip_selected.clone() } else { chip_idle.clone() },
+                        onclick: move |_| network_flow_animation_enabled.set(false),
+                        "{flow_off_label}"
                     }
                 }
             }

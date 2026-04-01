@@ -990,6 +990,7 @@ const BASE_URL_STORAGE_KEY: &str = "gs_base_url";
 const MAP_DISTANCE_UNITS_STORAGE_KEY: &str = "gs_map_distance_units";
 const THEME_PRESET_STORAGE_KEY: &str = "gs_theme_preset";
 const LANGUAGE_STORAGE_KEY: &str = "gs_language";
+const NETWORK_FLOW_ANIMATION_STORAGE_KEY: &str = "gs_network_flow_animation";
 const LAYOUT_CACHE_KEY: &str = "gs_layout_cache_v8";
 const NOTIFICATION_DISMISSED_STORAGE_KEY: &str = "gs_notification_dismissed_ids_v1";
 const _SKIP_TLS_VERIFY_KEY_PREFIX: &str = "gs_skip_tls_verify_";
@@ -1750,6 +1751,8 @@ fn TelemetryDashboardInner() -> Element {
         }
     });
     let language_code = use_signal(|| persist::get_or(LANGUAGE_STORAGE_KEY, "en"));
+    let network_flow_animation_enabled =
+        use_signal(|| persist::get_or(NETWORK_FLOW_ANIMATION_STORAGE_KEY, "on") != "off");
 
     let layout_config = use_signal(|| None::<LayoutConfig>);
     let layout_loading = use_signal(|| true);
@@ -2033,6 +2036,17 @@ fn TelemetryDashboardInner() -> Element {
             let value = language_code.read().clone();
             *PREFERRED_LANGUAGE.write() = value.clone();
             persist::set_string(LANGUAGE_STORAGE_KEY, &value);
+        });
+    }
+    {
+        let network_flow_animation_enabled = network_flow_animation_enabled;
+        use_effect(move || {
+            let value = if *network_flow_animation_enabled.read() {
+                "on"
+            } else {
+                "off"
+            };
+            persist::set_string(NETWORK_FLOW_ANIMATION_STORAGE_KEY, value);
         });
     }
     {
@@ -2961,6 +2975,7 @@ fn TelemetryDashboardInner() -> Element {
                             distance_units_metric: distance_units_metric,
                             theme_preset: theme_preset,
                             language_code: language_code,
+                            network_flow_animation_enabled: network_flow_animation_enabled,
                             theme: theme.clone(),
                             title: settings_title.clone(),
                         }
@@ -3749,6 +3764,7 @@ fn TelemetryDashboardInner() -> Element {
                             MainTab::ConnectionStatus => rsx! {
                                 ConnectionStatusTab {
                                     boards: board_status,
+                                    expected_boards: layout.network_tab.expected_boards.clone(),
                                     layout: layout.connection_tab.clone(),
                                     title: _main_tab_label(&layout, MainTab::ConnectionStatus),
                                     theme: theme.clone(),
@@ -3771,6 +3787,7 @@ fn TelemetryDashboardInner() -> Element {
                                     NetworkTopologyTab {
                                         topology: network_topology,
                                         layout: layout.network_tab.clone(),
+                                        flow_animation_enabled: *network_flow_animation_enabled.read(),
                                     }
                                 }
                             },
