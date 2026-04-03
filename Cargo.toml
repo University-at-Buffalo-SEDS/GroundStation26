@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend", "frontend", "map_downloader"]
+members = ["backend", "map_downloader"]
 resolver = "3"
 
 [workspace.package]
@@ -13,7 +13,7 @@ repository = "https://github.com/University-at-Buffalo-SEDS/GroundStation26"
 [workspace.dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-tokio = { version = "1.50.0", features = ["full"] }
+tokio = { version = "1.51.0", features = ["full"] }
 axum = "0.8.8"
 
 

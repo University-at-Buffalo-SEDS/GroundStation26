@@ -2,6 +2,7 @@
 import multiprocessing as mp
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Optional
 
 LOG_FILE: Optional[Path] = None
 INTERRUPTED_EXIT_CODE = 130
+FRONTEND_REPO_URL = "https://github.com/Rylan-Meilutis/Seds-Ground-Station-Frontend"
+FRONTEND_CHECKOUT_ENV = "GS26_FRONTEND_CHECKOUT_DIR"
 
 
 def _append_log(line: str) -> None:
@@ -54,6 +57,13 @@ def run(cmd: list[str], cwd: Path) -> None:
         raise
     if rc != 0:
         raise subprocess.CalledProcessError(rc, cmd)
+
+
+def run_capture(cmd: list[str], cwd: Path) -> str:
+    cmd = [str(part) for part in cmd]
+    print(f"Running: {' '.join(cmd)} (cwd={cwd})")
+    out = subprocess.check_output(cmd, cwd=cwd, text=True)
+    return out.strip()
 
 
 def _configure_log_file(repo_root: Path, log_file_arg: Optional[str]) -> None:
@@ -145,58 +155,144 @@ def _run_script(repo_root: Path, script: Path, args: list[str]) -> None:
     run([sys.executable, str(script), *args], cwd=repo_root)
 
 
-def _frontend_script(repo_root: Path) -> Path:
-    return repo_root / "frontend" / "build.py"
+def _normalize_git_url(url: str) -> str:
+    normalized = url.strip().rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return normalized.lower()
 
 
-def _backend_script(repo_root: Path) -> Path:
-    return repo_root / "backend" / "build.py"
+def _default_frontend_checkout_dir() -> Path:
+    override = os.environ.get(FRONTEND_CHECKOUT_ENV, "").strip()
+    if override:
+        path = Path(override).expanduser()
+        return path if path.is_absolute() else Path.cwd() / path
+    if platform.system() == "Darwin":
+        return Path.home() / "Library" / "Caches" / "GroundStation26" / "frontend-source"
+    if platform.system() == "Windows":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return Path(local_app_data) / "GroundStation26" / "frontend-source"
+    return Path.home() / ".cache" / "groundstation26" / "frontend-source"
 
 
-def _frontend_args(
-        *,
-        platform_name: Optional[str],
+def _frontend_checkout_dir() -> Path:
+    return _default_frontend_checkout_dir()
+
+
+def _frontend_sync_dir(repo_root: Path) -> Path:
+    return repo_root / "frontend"
+
+
+def _frontend_sync_public_dir(repo_root: Path) -> Path:
+    return _frontend_sync_dir(repo_root) / "dist" / "public"
+
+
+def _resolve_external_frontend_script(checkout_dir: Path) -> Path:
+    candidates = [
+        checkout_dir / "build.py",
+        checkout_dir / "frontend" / "build.py",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"Failed to find a frontend build script in {checkout_dir}. "
+        "Expected build.py or frontend/build.py."
+    )
+
+
+def _resolve_external_public_dir(checkout_dir: Path) -> Path:
+    candidates = [
+        checkout_dir / "dist" / "public",
+        checkout_dir / "frontend" / "dist" / "public",
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        f"Failed to find built frontend assets in {checkout_dir}. "
+        "Expected dist/public or frontend/dist/public."
+    )
+
+
+def _ensure_frontend_checkout(checkout_dir: Path) -> None:
+    if not checkout_dir.exists():
+        checkout_dir.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "clone", "--depth", "1", FRONTEND_REPO_URL, str(checkout_dir)], cwd=checkout_dir.parent)
+        return
+
+    if not checkout_dir.is_dir():
+        raise RuntimeError(f"Frontend checkout path exists but is not a directory: {checkout_dir}")
+
+    inside_work_tree = run_capture(
+        ["git", "-C", str(checkout_dir), "rev-parse", "--is-inside-work-tree"],
+        cwd=checkout_dir,
+    )
+    if inside_work_tree.strip().lower() != "true":
+        raise RuntimeError(f"Frontend checkout path is not a git worktree: {checkout_dir}")
+
+    origin_url = run_capture(
+        ["git", "-C", str(checkout_dir), "remote", "get-url", "origin"],
+        cwd=checkout_dir,
+    )
+    if _normalize_git_url(origin_url) != _normalize_git_url(FRONTEND_REPO_URL):
+        raise RuntimeError(
+            f"Frontend checkout remote does not match {FRONTEND_REPO_URL}: {origin_url}"
+        )
+
+    status = run_capture(
+        ["git", "-C", str(checkout_dir), "status", "--porcelain"],
+        cwd=checkout_dir,
+    )
+    if status:
+        raise RuntimeError(
+            f"Frontend checkout has local changes; refusing to pull latest from origin: {checkout_dir}"
+        )
+
+    run(["git", "-C", str(checkout_dir), "pull", "--ff-only"], cwd=checkout_dir)
+
+
+def _sync_frontend_public_assets(repo_root: Path, checkout_dir: Path) -> None:
+    src_public_dir = _resolve_external_public_dir(checkout_dir)
+    dst_public_dir = _frontend_sync_public_dir(repo_root)
+    dst_public_dir.parent.mkdir(parents=True, exist_ok=True)
+    if dst_public_dir.exists():
+        shutil.rmtree(dst_public_dir)
+    print(f"Syncing frontend web assets: {src_public_dir} -> {dst_public_dir}")
+    shutil.copytree(src_public_dir, dst_public_dir)
+
+
+def _run_frontend_build(
+        repo_root: Path,
         debug_mode: bool,
         max_size_mode: bool,
-        android_package_type: Optional[str],
         use_existing: bool,
-        action: Optional[str] = None,
-        log_file_arg: Optional[str] = None,
-        screenshot_delay_arg: Optional[str] = None,
-        screenshot_out_arg: Optional[str] = None,
-        screenshot_name_arg: Optional[str] = None,
-        desktop_window_arg: Optional[str] = None,
-        ios_window_arg: Optional[str] = None,
-        android_window_arg: Optional[str] = None,
-) -> list[str]:
-    args: list[str] = []
-    if action is not None:
-        args.append(action)
-    elif platform_name is not None:
-        args.append("frontend_web" if platform_name == "web" else platform_name)
+        log_file_arg: Optional[str],
+) -> None:
+    checkout_dir = _frontend_checkout_dir()
+    _ensure_frontend_checkout(checkout_dir)
+
+    script = _resolve_external_frontend_script(checkout_dir)
+    args = ["frontend_web"]
     if debug_mode:
         args.append("debug")
     if max_size_mode:
         args.append("max_size")
-    if android_package_type:
-        args.append(android_package_type)
     if use_existing:
         args.append("existing")
     if log_file_arg:
-        args.append(f"log={log_file_arg}")
-    if screenshot_delay_arg:
-        args.append(f"screenshot_delay={screenshot_delay_arg}")
-    if screenshot_out_arg:
-        args.append(f"screenshot_out={screenshot_out_arg}")
-    if screenshot_name_arg:
-        args.append(f"screenshot_name={screenshot_name_arg}")
-    if desktop_window_arg:
-        args.append(f"desktop_window={desktop_window_arg}")
-    if ios_window_arg:
-        args.append(f"ios_window={ios_window_arg}")
-    if android_window_arg:
-        args.append(f"android_window={android_window_arg}")
-    return args
+        log_path = Path(log_file_arg)
+        if not log_path.is_absolute():
+            log_path = repo_root / log_path
+        args.append(f"log={log_path}")
+
+    _run_script(checkout_dir, script, args)
+    _sync_frontend_public_assets(repo_root, checkout_dir)
+
+
+def _backend_script(repo_root: Path) -> Path:
+    return repo_root / "backend" / "build.py"
 
 
 def _backend_args(
@@ -242,31 +338,13 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py docker [pi_build|no_pi] [testing]")
     print("  ./build.py backend_only            # local: build backend only")
     print("  ./build.py frontend_web            # local: build frontend web only")
-    print("  ./frontend/build.py ...            # frontend-only entry point")
+    print("  ./build.py web                     # alias for frontend_web")
     print("  ./backend/build.py ...             # backend-only entry point")
     print("")
-    print("Frontend-only builds:")
-    print("  ./build.py ios")
-    print("  ./build.py ios_sim")
-    print("  ./build.py macos")
-    print("  ./build.py windows")
-    print("  ./build.py android [apk|aab]")
-    print("  ./build.py linux")
-    print("  Linux frontend builds emit AppImage/deb/rpm/Arch/Flatpak when supporting tools are installed")
-    print("  (add `debug` to frontend/local builds to skip --release)")
-    print("")
-    print("Frontend actions:")
-    print("  ./build.py ios_deploy")
-    print("  ./build.py ios_sim_deploy")
-    print("  ./build.py ios_sign")
-    print("  ./build.py ios_dist_sign")
-    print("  ./build.py android_install        # build APK if needed, install it to a connected emulator/device")
-    print("  ./build.py publisher_screenshots")
-    print("  ./build.py macos_deploy")
-    print("  ./build.py macos_sign")
-    print("  ./build.py macos_notarize")
-    print("  ./build.py publisher_screenshots screenshot_out=artifacts/screenshots")
-    print("  ./build.py publisher_screenshots desktop_window=1440x900 ios_window=1290x2796 android_window=1080x1920")
+    print("Frontend checkout:")
+    print(f"  default checkout path is {FRONTEND_CHECKOUT_ENV} or {_frontend_checkout_dir()}")
+    print("  the checkout is cloned only when absent and otherwise updated with `git pull --ff-only`")
+    print("  local changes in the external checkout abort the update instead of being modified")
     sys.exit(exit_code)
 
 
@@ -283,32 +361,13 @@ def main() -> None:
     use_existing = False
     backend_only = False
     log_file_arg: Optional[str] = None
-    android_package_type: Optional[str] = None
-    screenshot_delay_arg: Optional[str] = None
-    screenshot_out_arg: Optional[str] = None
-    screenshot_name_arg: Optional[str] = None
-    desktop_window_arg: Optional[str] = None
-    ios_window_arg: Optional[str] = None
-    android_window_arg: Optional[str] = None
     frontend_only_platform: Optional[str] = None
-    action: Optional[str] = None
 
     raw_args = [a.strip() for a in sys.argv[1:]]
     if any(a in {"-h", "--help", "help"} for a in raw_args):
         print_usage(0)
 
-    frontend_platforms = {"ios", "ios_sim", "macos", "windows", "android", "linux", "web", "frontend_web"}
-    frontend_actions = {
-        "android_install",
-        "ios_deploy",
-        "ios_sim_deploy",
-        "ios_sign",
-        "ios_dist_sign",
-        "macos_deploy",
-        "macos_sign",
-        "macos_notarize",
-        "publisher_screenshots",
-    }
+    frontend_platforms = {"web", "frontend_web"}
 
     for raw_arg in raw_args:
         arg = raw_arg.lower()
@@ -328,8 +387,6 @@ def main() -> None:
             test_fire_mode = True
         elif arg == "debug":
             debug_mode = True
-        elif arg in {"apk", "aab"}:
-            android_package_type = arg
         elif arg == "max_size":
             max_size_mode = True
         elif arg in {"backend_only", "backend"}:
@@ -342,49 +399,8 @@ def main() -> None:
                 print("Error: log= requires a filepath.", file=sys.stderr)
                 print_usage()
             log_file_arg = value
-        elif arg.startswith("screenshot_delay="):
-            value = raw_arg.split("=", 1)[1].strip()
-            if not value:
-                print("Error: screenshot_delay= requires a number of seconds.", file=sys.stderr)
-                print_usage()
-            screenshot_delay_arg = value
-        elif arg.startswith("screenshot_out="):
-            value = raw_arg.split("=", 1)[1].strip()
-            if not value:
-                print("Error: screenshot_out= requires a directory path.", file=sys.stderr)
-                print_usage()
-            screenshot_out_arg = value
-        elif arg.startswith("screenshot_name="):
-            value = raw_arg.split("=", 1)[1].strip()
-            if not value:
-                print("Error: screenshot_name= requires a filename stem.", file=sys.stderr)
-                print_usage()
-            screenshot_name_arg = value
-        elif arg.startswith("desktop_window="):
-            value = raw_arg.split("=", 1)[1].strip()
-            if not value:
-                print("Error: desktop_window= requires WIDTHxHEIGHT.", file=sys.stderr)
-                print_usage()
-            desktop_window_arg = value
-        elif arg.startswith("ios_window="):
-            value = raw_arg.split("=", 1)[1].strip()
-            if not value:
-                print("Error: ios_window= requires WIDTHxHEIGHT.", file=sys.stderr)
-                print_usage()
-            ios_window_arg = value
-        elif arg.startswith("android_window=") or arg.startswith("android_screen="):
-            value = raw_arg.split("=", 1)[1].strip()
-            if not value:
-                print("Error: android_window= requires WIDTHxHEIGHT.", file=sys.stderr)
-                print_usage()
-            android_window_arg = value
-        elif arg in frontend_actions:
-            if action or frontend_only_platform or backend_only:
-                print("Error: Only one frontend action/build may be specified.", file=sys.stderr)
-                print_usage()
-            action = arg
         elif arg in frontend_platforms:
-            if action or frontend_only_platform or backend_only:
+            if frontend_only_platform or backend_only:
                 print("Error: Only one frontend action/build may be specified.", file=sys.stderr)
                 print_usage()
             frontend_only_platform = "web" if arg in {"web", "frontend_web"} else arg
@@ -403,54 +419,17 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parent
     _configure_log_file(repo_root, log_file_arg)
 
-    if action:
-        if docker_mode or force_pi or force_no_pi or testing_mode or hitl_mode or test_fire_mode:
-            print("Error: Frontend actions cannot be combined with docker/pi_build/no_pi/testing/hitl-mode/test-fire-mode.",
-                  file=sys.stderr)
-            print_usage()
-        _run_script(
-            repo_root,
-            _frontend_script(repo_root),
-            _frontend_args(
-                platform_name=None,
-                debug_mode=debug_mode,
-                max_size_mode=max_size_mode,
-                android_package_type=android_package_type,
-                use_existing=use_existing,
-                action=action,
-                log_file_arg=log_file_arg,
-                screenshot_delay_arg=screenshot_delay_arg,
-                screenshot_out_arg=screenshot_out_arg,
-                screenshot_name_arg=screenshot_name_arg,
-                desktop_window_arg=desktop_window_arg,
-                ios_window_arg=ios_window_arg,
-                android_window_arg=android_window_arg,
-            ),
-        )
-        return
-
     if frontend_only_platform is not None:
         if docker_mode or force_pi or force_no_pi or testing_mode or hitl_mode or test_fire_mode:
             print("Error: Frontend-only builds cannot be combined with docker/pi_build/no_pi/testing/hitl-mode/test-fire-mode.",
                   file=sys.stderr)
             print_usage()
-        _run_script(
-            repo_root,
-            _frontend_script(repo_root),
-            _frontend_args(
-                platform_name=frontend_only_platform,
-                debug_mode=debug_mode,
-                max_size_mode=max_size_mode,
-                android_package_type=android_package_type,
-                use_existing=use_existing,
-                log_file_arg=log_file_arg,
-                screenshot_delay_arg=screenshot_delay_arg,
-                screenshot_out_arg=screenshot_out_arg,
-                screenshot_name_arg=screenshot_name_arg,
-                desktop_window_arg=desktop_window_arg,
-                ios_window_arg=ios_window_arg,
-                android_window_arg=android_window_arg,
-            ),
+        _run_frontend_build(
+            repo_root=repo_root,
+            debug_mode=debug_mode,
+            max_size_mode=max_size_mode,
+            use_existing=use_existing,
+            log_file_arg=log_file_arg,
         )
         return
 
@@ -490,20 +469,6 @@ def main() -> None:
         )
         return
 
-    frontend_args = _frontend_args(
-        platform_name="web",
-        debug_mode=debug_mode,
-        max_size_mode=max_size_mode,
-        android_package_type=android_package_type,
-        use_existing=use_existing,
-        log_file_arg=log_file_arg,
-        screenshot_delay_arg=screenshot_delay_arg,
-        screenshot_out_arg=screenshot_out_arg,
-        screenshot_name_arg=screenshot_name_arg,
-        desktop_window_arg=desktop_window_arg,
-        ios_window_arg=ios_window_arg,
-        android_window_arg=android_window_arg,
-    )
     backend_args = _backend_args(
         force_pi=force_pi,
         force_no_pi=force_no_pi,
@@ -516,13 +481,19 @@ def main() -> None:
 
     if in_docker_build():
         print("Sequential build")
-        _run_script(repo_root, _frontend_script(repo_root), frontend_args)
+        _run_frontend_build(
+            repo_root=repo_root,
+            debug_mode=debug_mode,
+            max_size_mode=max_size_mode,
+            use_existing=use_existing,
+            log_file_arg=log_file_arg,
+        )
         _run_script(repo_root, _backend_script(repo_root), backend_args)
         return
 
     frontend_proc = mp.Process(
-        target=_run_script,
-        args=(repo_root, _frontend_script(repo_root), frontend_args),
+        target=_run_frontend_build,
+        args=(repo_root, debug_mode, max_size_mode, use_existing, log_file_arg),
     )
     backend_proc = mp.Process(
         target=_run_script,

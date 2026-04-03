@@ -918,11 +918,19 @@ async fn get_favicon() -> impl IntoResponse {
     // Load the favicon into memory on first request, reuse later
     let bytes = FAVICON_DATA
         .get_or_init(|| async {
-            // Adjust this path if needed
-            let path: PathBuf = "./frontend/assets/icon.png".into();
-            tokio::fs::read(&path)
-                .await
-                .unwrap_or_else(|e| panic!("failed to read favicon at {:?}: {e}", path))
+            let candidates: [PathBuf; 3] = [
+                "./frontend/dist/public/icon.png".into(),
+                "./frontend/dist/public/assets/icon.png".into(),
+                "./frontend/dist/public/favicon.png".into(),
+            ];
+            for path in candidates {
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => return bytes,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => panic!("failed to read favicon at {:?}: {err}", path),
+                }
+            }
+            panic!("failed to find favicon in built frontend output")
         })
         .await
         .clone();

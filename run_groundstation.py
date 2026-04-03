@@ -141,7 +141,7 @@ def main() -> None:
         cmd.extend(["--features", ",".join(features)])
     repo_root = Path(__file__).resolve().parent
     if not args.backend_only_build:
-        frontend_cmd = [sys.executable, str(repo_root / "frontend" / "build.py"), "frontend_web"]
+        frontend_cmd = [sys.executable, str(repo_root / "build.py"), "frontend_web"]
         if debug_mode:
             frontend_cmd.append("debug")
         print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")
