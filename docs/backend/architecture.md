@@ -84,6 +84,7 @@ Responsibilities:
 
 - define the HTTP router
 - expose bootstrap endpoints such as `/api/recent`, `/api/layout`, `/api/boards`, `/flightstate`
+- support `/api/recent` as either the legacy JSON array response or an opt-in NDJSON stream for faster reseed startup
 - expose calibration and diagnostics endpoints
 - expose `/ws` for live websocket updates
 - serve tiles, favicon, and static frontend assets

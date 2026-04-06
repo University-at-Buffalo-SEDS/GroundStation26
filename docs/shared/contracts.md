@@ -74,7 +74,8 @@ Used for:
 
 Used for:
 
-- `/api/recent`
+- `/api/recent` array responses
+- `/api/recent` NDJSON line payloads
 - websocket telemetry batches
 - chart ingest
 - latest-value caching
@@ -89,6 +90,7 @@ Important fields:
 Implication:
 
 - this is the core data-plane record shared between backend and frontend
+- `/api/recent` may transport this schema either as a JSON array or as newline-delimited JSON objects; the row schema itself must not change between modes
 
 ## Contract Stability Notes
 

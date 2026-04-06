@@ -10,15 +10,16 @@ use crate::state::AppState;
 use crate::types::{
     BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryCommand, TelemetryRow,
 };
+use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::{
     Json, Router,
     extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
     extract::{Path, Query, State},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, get_service, post},
 };
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, TryStreamExt, stream};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -112,6 +114,19 @@ fn compact_recent_rows(rows: Vec<TelemetryRow>, cutoff: i64) -> Vec<TelemetryRow
             .then_with(|| a.data_type.cmp(&b.data_type))
     });
     rows
+}
+
+fn wants_ndjson(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|mime| mime.starts_with("application/x-ndjson"))
+        })
+        .unwrap_or(false)
 }
 
 /// Public router constructor
@@ -824,10 +839,14 @@ fn synthesize_zoom_tile_from_ancestor(
 }
 
 /// Returns the recent telemetry window, preferring the in-memory cache to cover DB write lag.
-async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
+    if wants_ndjson(&headers) {
+        return stream_recent_rows_response(state).await;
+    }
+
     let cache_snapshot = state.recent_telemetry_snapshot();
     let latest_cache_ts = cache_snapshot.last().map(|r| r.timestamp_ms);
     let oldest_cache_ts = cache_snapshot.first().map(|r| r.timestamp_ms);
@@ -870,6 +889,106 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
         cutoff,
     ))
     .into_response()
+}
+
+async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
+    let cache_snapshot = state.recent_telemetry_snapshot();
+    let latest_cache_ts = cache_snapshot.last().map(|r| r.timestamp_ms);
+    let oldest_cache_ts = cache_snapshot.first().map(|r| r.timestamp_ms);
+
+    let now_ms = if let Some(now_ms) = latest_cache_ts {
+        now_ms
+    } else if let Some(now_ms) =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(timestamp_ms) FROM telemetry")
+            .fetch_one(&state.db)
+            .await
+            .ok()
+            .flatten()
+    {
+        now_ms
+    } else {
+        return (
+            [(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
+            Body::empty(),
+        )
+            .into_response();
+    };
+
+    let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
+    let cache_covers_window = latest_cache_ts.is_some()
+        && oldest_cache_ts.is_some_and(|oldest| oldest <= cutoff + RECENT_BUCKET_MS);
+    let db_end_ms = if cache_covers_window {
+        None
+    } else {
+        oldest_cache_ts
+            .unwrap_or(now_ms)
+            .checked_sub(1)
+            .filter(|end_ms| *end_ms >= cutoff)
+    };
+
+    let state_for_task = Arc::clone(&state);
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+    tokio::spawn(async move {
+        if let Some(end_ms) = db_end_ms {
+            let mut rows = sqlx::query(
+                r#"
+                SELECT
+                    timestamp_ms,
+                    data_type,
+                    sender_id,
+                    values_json,
+                    payload_json
+                FROM telemetry
+                WHERE timestamp_ms BETWEEN ? AND ?
+                ORDER BY timestamp_ms ASC
+                "#,
+            )
+            .bind(cutoff)
+            .bind(end_ms)
+            .fetch(&state_for_task.db);
+
+            while let Ok(Some(row)) = rows.try_next().await {
+                let telemetry_row = TelemetryRow {
+                    timestamp_ms: row.get::<i64, _>("timestamp_ms"),
+                    data_type: row.get::<String, _>("data_type"),
+                    sender_id: row.get::<String, _>("sender_id"),
+                    values: values_from_row(&row),
+                };
+                if send_ndjson_row(&tx, &telemetry_row).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        for row in cache_snapshot {
+            if row.timestamp_ms < cutoff || row.timestamp_ms > now_ms {
+                continue;
+            }
+            if send_ndjson_row(&tx, &row).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let body_stream = stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|chunk| (Ok::<Vec<u8>, Infallible>(chunk), rx))
+    });
+
+    (
+        [(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
+        Body::from_stream(body_stream),
+    )
+        .into_response()
+}
+
+async fn send_ndjson_row(tx: &mpsc::Sender<Vec<u8>>, row: &TelemetryRow) -> Result<(), ()> {
+    let Ok(mut bytes) = serde_json::to_vec(row) else {
+        return Ok(());
+    };
+    bytes.push(b'\n');
+    tx.send(bytes).await.map_err(|_| ())
 }
 
 /// Loads telemetry rows for a bounded time range directly from SQLite.

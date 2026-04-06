@@ -48,7 +48,8 @@ Purpose:
 
 Expected response:
 
-- JSON array of `TelemetryRow`.
+- Default/fallback: JSON array of `TelemetryRow`.
+- Preferred when the client sends `Accept: application/x-ndjson`: NDJSON stream with one `TelemetryRow` JSON object per line.
 
 Shape:
 
@@ -63,12 +64,23 @@ Shape:
 ]
 ```
 
+NDJSON shape:
+
+```text
+{"timestamp_ms":1742400000000,"data_type":"VALVE_STATE","sender_id":"VB","values":[1.0,0.0,0.0]}
+{"timestamp_ms":1742400000020,"data_type":"PT","sender_id":"FC","values":[512.4]}
+```
+
 Frontend expectations:
 
 - `timestamp_ms` is milliseconds since Unix epoch.
 - `data_type` is the primary routing key for widgets and charts.
 - `sender_id` must stay stable across frontend/backend/device builds.
 - `values` ordering must remain stable for a given `data_type`.
+- NDJSON mode uses `Content-Type: application/x-ndjson; charset=utf-8`.
+- Each NDJSON line is one complete `TelemetryRow` object followed by `\n`.
+- Streamed rows are not wrapped in `[` or `]`.
+- Empty history is either an empty NDJSON body or `[]` in array mode.
 
 Failure impact:
 
