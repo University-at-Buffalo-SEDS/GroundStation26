@@ -342,6 +342,14 @@ async fn main() -> anyhow::Result<()> {
     .execute(&db)
     .await?;
 
+    // `/api/recent` repeatedly queries telemetry by timestamp range and ascending order.
+    // Without an index here, large field databases degrade into full scans and sorts.
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp_ms ON telemetry (timestamp_ms);",
+    )
+    .execute(&db)
+    .await?;
+
     // Add values_json column for older DBs.
     let cols = sqlx::query("PRAGMA table_info(telemetry)")
         .fetch_all(&db)
