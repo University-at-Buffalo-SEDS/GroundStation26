@@ -33,17 +33,6 @@ COPY backend/build.py backend/
 COPY map_downloader/Cargo.toml map_downloader/
 COPY map_downloader/src map_downloader/src
 
-# Frontend
-COPY frontend/src frontend/src
-COPY frontend/build.py frontend/
-COPY frontend/build.rs frontend/
-COPY frontend/Cargo.toml frontend/
-COPY frontend/assets frontend/assets
-COPY frontend/platform frontend/platform
-COPY frontend/scripts frontend/scripts
-COPY frontend/static frontend/static
-COPY frontend/Dioxus.toml frontend/
-
 # Top-level workspace manifest and main build script
 COPY Cargo.toml ./
 COPY build.py ./
