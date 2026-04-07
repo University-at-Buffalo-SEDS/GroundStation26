@@ -350,6 +350,12 @@ async fn main() -> anyhow::Result<()> {
     .execute(&db)
     .await?;
 
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_telemetry_data_type_timestamp_ms ON telemetry (data_type, timestamp_ms DESC);",
+    )
+    .execute(&db)
+    .await?;
+
     // Add values_json column for older DBs.
     let cols = sqlx::query("PRAGMA table_info(telemetry)")
         .fetch_all(&db)

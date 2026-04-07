@@ -401,12 +401,12 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-    // Latest GPS row: assumes `data_type = 'GPS'`
+    // Prefer the normalized GPS stream, but keep compatibility with older row tags.
     let row = sqlx::query(
         r#"
         SELECT values_json, payload_json
         FROM telemetry
-        WHERE data_type = 'GPS'
+        WHERE data_type IN ('GPS_DATA', 'GPS', 'ROCKET_GPS')
         ORDER BY timestamp_ms DESC
         LIMIT 1
         "#,
