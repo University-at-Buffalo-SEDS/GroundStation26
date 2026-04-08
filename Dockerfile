@@ -18,7 +18,7 @@ RUN mkdir -p backend/data
 RUN mkdir -p backend/comms
 RUN mkdir -p backend/users
 RUN mkdir -p map_downloader/src
-RUN mkdir -p frontend/dist
+RUN mkdir -p frontend/dist/public
 
 # Backend crate (no data/)
 COPY backend/Cargo.toml backend/
@@ -87,7 +87,7 @@ RUN mkdir -p /app/backend/data \
     /app/backend/calibration \
     /app/backend/comms \
     /app/backend/users \
-    /app/frontend/dist \
+    /app/frontend/dist/public \
     /app/map_downloader
 
 COPY --from=builder /app/backend/calibration /app/backend/calibration/
@@ -96,9 +96,7 @@ COPY --from=builder /app/backend/layout /app/backend/layout/
 COPY --from=builder /app/backend/users /app/backend/users/
 COPY --from=builder /app/target/release/groundstation_backend /app/
 COPY --from=builder /app/target/release/map_downloader /app/map_downloader/
-COPY --from=builder /app/frontend/dist /app/frontend/dist/
-COPY --from=builder /app/frontend/static /app/frontend/static/
-COPY --from=builder /app/frontend/assets /app/frontend/assets/
+COPY --from=builder /app/frontend/dist/public /app/frontend/dist/public/
 COPY --from=builder /app/entrypoint.sh /app/
 
 EXPOSE 3000
