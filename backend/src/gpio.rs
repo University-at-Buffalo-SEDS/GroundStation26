@@ -23,6 +23,8 @@ mod real {
 
     #[allow(dead_code)]
     impl GpioPins {
+        const LED_PWM_FREQUENCY_HZ: f64 = 120.0;
+
         /// Global singleton instance.
         pub fn new() -> Arc<GpioPins> {
             static INSTANCE: OnceLock<Arc<GpioPins>> = OnceLock::new();
@@ -55,6 +57,10 @@ mod real {
             Ok(())
         }
 
+        pub fn setup_led_pin(&self, pin_number: u8) -> Result<(), Box<dyn std::error::Error>> {
+            self.setup_output_pin(pin_number)
+        }
+
         pub fn read_input_pin(&self, pin_number: u8) -> Result<bool, Box<dyn std::error::Error>> {
             let input_pins = self.input_pins.lock().expect("failed to get lock");
             if let Some(pin) = input_pins.get(&pin_number) {
@@ -71,6 +77,7 @@ mod real {
         ) -> Result<(), Box<dyn std::error::Error>> {
             let mut output_pins = self.output_pins.lock().expect("failed to get lock");
             if let Some(pin) = output_pins.get_mut(&pin_number) {
+                pin.clear_pwm()?;
                 if value {
                     pin.set_high();
                 } else {
@@ -79,6 +86,29 @@ mod real {
                 Ok(())
             } else {
                 Err(format!("Output pin {} not configured", pin_number).into())
+            }
+        }
+
+        pub fn write_led_brightness(
+            &self,
+            pin_number: u8,
+            brightness: f64,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let mut output_pins = self.output_pins.lock().expect("failed to get lock");
+            if let Some(pin) = output_pins.get_mut(&pin_number) {
+                let duty_cycle = brightness.clamp(0.0, 1.0);
+                if duty_cycle <= 0.0 {
+                    pin.clear_pwm()?;
+                    pin.set_low();
+                } else if duty_cycle >= 1.0 {
+                    pin.clear_pwm()?;
+                    pin.set_high();
+                } else {
+                    pin.set_pwm_frequency(Self::LED_PWM_FREQUENCY_HZ, duty_cycle)?;
+                }
+                Ok(())
+            } else {
+                Err(format!("LED pin {} not configured", pin_number).into())
             }
         }
 
@@ -178,6 +208,10 @@ mod dummy {
             Ok(())
         }
 
+        pub fn setup_led_pin(&self, pin_number: u8) -> Result<(), Box<dyn std::error::Error>> {
+            self.setup_output_pin(pin_number)
+        }
+
         pub fn read_input_pin(&self, pin_number: u8) -> Result<bool, Box<dyn std::error::Error>> {
             let input_pins = self.input_pins.lock().expect("failed to get lock");
             if let Some(pin) = input_pins.get(&pin_number) {
@@ -191,15 +225,23 @@ mod dummy {
         pub fn write_output_pin(
             &self,
             pin_number: u8,
-            _value: bool,
+            value: bool,
         ) -> Result<(), Box<dyn std::error::Error>> {
             let mut output_pins = self.output_pins.lock().expect("failed to get lock");
-            if let Some(_pin) = output_pins.get_mut(&pin_number) {
-                // println!("Writing output pin {} (dummy, no actual effect)", pin_number);
+            if let Some(pin) = output_pins.get_mut(&pin_number) {
+                *pin = value;
                 Ok(())
             } else {
                 Err(format!("Output pin {} not configured", pin_number).into())
             }
+        }
+
+        pub fn write_led_brightness(
+            &self,
+            pin_number: u8,
+            brightness: f64,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            self.write_output_pin(pin_number, brightness > 0.0)
         }
 
         pub fn setup_callback_input_pin<F>(
