@@ -161,6 +161,7 @@ impl AppState {
     /// Updates heartbeat tracking for a board after a packet arrives from that sender.
     pub fn mark_board_seen(&self, sender: &str, timestamp_ms: u64) {
         let Some(board) = Board::from_sender_id(sender) else {
+            eprintln!("mark_board_seen ignored unknown sender={sender}");
             return;
         };
         let mut map = self.board_status.lock().unwrap();
@@ -177,6 +178,11 @@ impl AppState {
             }
             status.last_seen_ms = Some(timestamp_ms);
             status.warned = false;
+            eprintln!(
+                "mark_board_seen updated board={} sender={} last_seen_ms={timestamp_ms}",
+                board.as_str(),
+                sender
+            );
         }
     }
 

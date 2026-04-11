@@ -944,6 +944,32 @@ impl CommsDevice for I2cComms {
                                 match router.rx_serialized_queue_from_side(&packet, side_id) {
                                     Ok(()) => {
                                         log_i2c_router_accept(&packet, side_id);
+                                        if let Ok(frame) = serialize::peek_frame_info(&packet)
+                                            && matches!(frame.envelope.ty, DataType::DiscoveryAnnounce)
+                                        {
+                                            let snapshot = router.export_topology();
+                                            let advertised = snapshot
+                                                .advertised_endpoints
+                                                .iter()
+                                                .map(|ep| ep.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(", ");
+                                            eprintln!(
+                                                "i2c discovery accepted: advertised_endpoints=[{advertised}]"
+                                            );
+                                            for route in snapshot.routes {
+                                                let reachable = route
+                                                    .reachable_endpoints
+                                                    .iter()
+                                                    .map(|ep| ep.as_str())
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ");
+                                                eprintln!(
+                                                    "i2c discovery accepted: side={} reachable=[{}]",
+                                                    route.side_name, reachable
+                                                );
+                                            }
+                                        }
                                     }
                                     Err(err) => {
                                         log_i2c_router_decode_error(
