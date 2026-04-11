@@ -3,6 +3,7 @@ use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
 use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
+use crate::telemetry_task;
 use crate::types::{
     Board, BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyLink, NetworkTopologyMsg,
     NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus, TelemetryCommand,
@@ -276,20 +277,17 @@ impl AppState {
         };
         let board_snapshot = self.board_status_snapshot(now_ms);
         let route_snapshot = exported.as_ref();
-        let local_endpoint_list = route_snapshot
-            .map(|snapshot| {
-                let mut endpoints = snapshot
-                    .advertised_endpoints
-                    .iter()
-                    .copied()
-                    .map(|ep| ep.as_str())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                endpoints.sort();
-                endpoints.dedup();
-                endpoints
-            })
-            .unwrap_or_default();
+        let mut local_endpoint_list = vec![
+            DataEndpoint::GroundStation.as_str().to_string(),
+            DataEndpoint::Abort.as_str().to_string(),
+            DataEndpoint::FlightState.as_str().to_string(),
+            DataEndpoint::HeartBeat.as_str().to_string(),
+        ];
+        if telemetry_task::timesync_enabled() {
+            local_endpoint_list.push(DataEndpoint::TimeSync.as_str().to_string());
+        }
+        local_endpoint_list.sort();
+        local_endpoint_list.dedup();
         let local_visible_endpoint_list = local_endpoint_list
             .iter()
             .filter(|endpoint| endpoint.as_str() != DataEndpoint::GroundStation.as_str())
