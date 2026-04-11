@@ -42,6 +42,7 @@ EP = seds.DataEndpoint
 RM = seds.RouterMode
 
 SERIAL_DEFAULT_BAUD = 57_600
+SERIAL_OVERRIDE_DEFAULT_BAUD = 115_200
 I2C_DEFAULT_BUS = 1
 I2C_DEFAULT_ADDR = 0x55
 I2C_DEFAULT_CHUNK_DELAY_MS = 1
@@ -276,14 +277,17 @@ def resolve_fill_link_config(args: argparse.Namespace, backend_root: Path) -> di
 
     interface = args.interface
     if interface in {"serial", "raspberry_pi_gpio_uart", "custom_serial"}:
+        protocol = args.protocol or "raw_uart"
         return {
             "interface": interface,
-            "protocol": args.protocol or cfg.get("protocol", "raw_uart"),
-            "port": args.port or cfg.get("port", "/dev/ttyUSB2"),
+            "protocol": protocol,
+            "tx_protocol": args.tx_protocol or protocol,
+            "rx_protocol": args.rx_protocol or protocol,
+            "port": args.port or "/dev/ttyUSB2",
             "baud_rate": int(
                 args.baud_rate
                 if args.baud_rate is not None
-                else cfg.get("baud_rate", SERIAL_DEFAULT_BAUD)
+                else SERIAL_OVERRIDE_DEFAULT_BAUD
             ),
         }
 
@@ -336,6 +340,8 @@ class Transport:
 class SerialTransport(Transport):
     def __init__(self, cfg: dict) -> None:
         self.protocol = cfg["protocol"]
+        self.tx_protocol = cfg.get("tx_protocol", self.protocol)
+        self.rx_protocol = cfg.get("rx_protocol", self.protocol)
         self.rx_buf = bytearray()
         self.raw_reads = 0
         self.raw_bytes = 0
@@ -356,10 +362,15 @@ class SerialTransport(Transport):
         )
 
     def describe(self) -> str:
-        return f"serial {self.ser.port} {self.ser.baudrate} {self.protocol}"
+        if self.tx_protocol == self.rx_protocol:
+            return f"serial {self.ser.port} {self.ser.baudrate} {self.tx_protocol}"
+        return (
+            f"serial {self.ser.port} {self.ser.baudrate} "
+            f"tx={self.tx_protocol} rx={self.rx_protocol}"
+        )
 
     def send_serialized(self, payload: bytes) -> None:
-        if self.protocol == "packet_framed":
+        if self.tx_protocol == "packet_framed":
             self.ser.write(len(payload).to_bytes(2, "little"))
         self.ser.write(payload)
         self.ser.flush()
@@ -406,7 +417,7 @@ class SerialTransport(Transport):
     def read_serialized(self, timeout: float) -> bytes | None:
         packet = (
             self._take_packet_framed_packet()
-            if self.protocol == "packet_framed"
+            if self.rx_protocol == "packet_framed"
             else self._take_raw_uart_packet()
         )
         if packet is not None:
@@ -423,7 +434,7 @@ class SerialTransport(Transport):
             self.last_chunk_hex = hex_preview(chunk, limit=24)
         return (
             self._take_packet_framed_packet()
-            if self.protocol == "packet_framed"
+            if self.rx_protocol == "packet_framed"
             else self._take_raw_uart_packet()
         )
 
@@ -1051,7 +1062,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--protocol",
         choices=["raw_uart", "packet_framed"],
-        help="Override serial framing protocol.",
+        help="Override both serial TX and RX framing protocol.",
+    )
+    parser.add_argument(
+        "--tx-protocol",
+        choices=["raw_uart", "packet_framed"],
+        help="Override serial transmit framing only.",
+    )
+    parser.add_argument(
+        "--rx-protocol",
+        choices=["raw_uart", "packet_framed"],
+        help="Override serial receive framing only.",
     )
     parser.add_argument(
         "--bus",
