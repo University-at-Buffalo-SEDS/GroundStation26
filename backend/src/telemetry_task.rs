@@ -9,19 +9,19 @@ use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 use crate::state::AppState;
 #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 use crate::types::FlightState;
-use crate::types::{u8_to_flight_state, Board, TelemetryCommand, TelemetryRow};
-use crate::web::{emit_warning, FlightStateMsg};
+use crate::types::{Board, TelemetryCommand, TelemetryRow, u8_to_flight_state};
+use crate::web::{FlightStateMsg, emit_warning};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::Router;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
-use tokio::sync::{broadcast, mpsc, Notify};
-use tokio::time::{interval, Duration};
+use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::time::{Duration, interval};
 
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
@@ -1027,7 +1027,7 @@ pub async fn telemetry_task(
                     if let Err(e) = router.poll_discovery() {
                         log_telemetry_error("router discovery polling failed", e);
                     }
-                    if let Err(e) = router.process_all_queues_with_timeout(20) {
+                    if let Err(e) = router.process_all_queues_with_timeout(0) {
                         log_telemetry_error("router queue processing failed", e);
                     } else {
                         log_router_routes(&router, "router queue processed");
