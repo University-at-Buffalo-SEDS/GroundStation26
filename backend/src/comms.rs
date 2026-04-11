@@ -746,14 +746,12 @@ impl I2cComms {
             .rx_assembly
             .as_mut()
             .ok_or_else(|| std::io::Error::other("i2c slot arrived without an active transfer"));
-        let Ok(assembly) = assembly else {
-            return Ok(None);
-        };
+        let assembly = assembly?;
         let completed = match assembly.push(&slot) {
             Ok(completed) => completed,
-            Err(_) => {
+            Err(err) => {
                 self.rx_assembly = None;
-                return Ok(None);
+                return Err(err);
             }
         };
         if completed.is_some() {
@@ -860,7 +858,7 @@ impl CommsDevice for I2cComms {
                             }
                         }
                     }
-                    Ok(None) => return Ok(()),
+                    Ok(None) => continue,
                     Err(err) => {
                         eprintln!("i2c receive failed: {err}");
                         return Err(TelemetryError::HandlerError("i2c receive failed"));

@@ -730,7 +730,7 @@ class I2cTransport(Transport):
                     return packet
                 raw = self._transfer_read()
             if raw is None:
-                time.sleep(0.01)
+                time.sleep(self.chunk_delay if self.chunk_delay > 0 else 0.001)
                 continue
             try:
                 slot = self._decode_slot(raw)
@@ -738,10 +738,22 @@ class I2cTransport(Transport):
                 self.invalid_slots += 1
                 continue
             if slot is None:
-                return None
-            assembled = self._ingest_slot(slot)
-            if assembled is None:
+                time.sleep(self.chunk_delay if self.chunk_delay > 0 else 0.001)
                 continue
+            if slot.flags & I2C_FLAG_START:
+                assembled = self._ingest_slot(slot)
+                if slot.flags & I2C_FLAG_END:
+                    assert assembled is not None
+                else:
+                    time.sleep(self.chunk_delay if self.chunk_delay > 0 else 0.001)
+                    continue
+            else:
+                if self.rx_assembly is None:
+                    raise ValueError("slot arrived without an active transfer")
+                assembled = self._ingest_slot(slot)
+                if assembled is None:
+                    time.sleep(self.chunk_delay if self.chunk_delay > 0 else 0.001)
+                    continue
             kind, payload = assembled
             if kind == I2C_KIND_ERROR:
                 return None
