@@ -142,10 +142,17 @@ impl Board {
     }
 
     pub fn from_sender_id(sender: &str) -> Option<Board> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|board| board.sender_id() == sender)
+        match sender {
+            "GS" => Some(Board::GroundStation),
+            "FC" => Some(Board::FlightComputer),
+            "RF" => Some(Board::RFBoard),
+            "PB" => Some(Board::PowerBoard),
+            "VB" => Some(Board::ValveBoard),
+            "GW" | "GB" => Some(Board::GatewayBoard),
+            "AB" => Some(Board::ActuatorBoard),
+            "DAQ" | "DAQB" => Some(Board::DaqBoard),
+            _ => None,
+        }
     }
 }
 

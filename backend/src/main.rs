@@ -35,7 +35,7 @@ use crate::comms::DummyComms;
 use crate::comms::{link_description, open_link, startup_failure_hint, CommsDevice};
 use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
-use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation};
+use sedsprintf_rs_2026::config::DataEndpoint::{Abort, Discovery, FlightState, GroundStation};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode, RouterSideOptions};
@@ -576,6 +576,7 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler_state_clone = state.clone();
     let abort_handler_state_clone = state.clone();
     let flight_state_handler_state_clone = state.clone();
+    let discovery_handler_state_clone = state.clone();
 
     let ground_station_handler =
         EndpointHandler::new_packet_handler(GroundStation, move |pkt: &Packet| {
@@ -610,10 +611,19 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     });
 
+    let discovery_handler = EndpointHandler::new_packet_handler(Discovery, move |pkt: &Packet| {
+        discovery_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+        discovery_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
+        let mut rb = discovery_handler_state_clone.ring_buffer.lock().unwrap();
+        rb.push(pkt.clone());
+        Ok(())
+    });
+
     let mut cfg = sedsprintf_rs_2026::router::RouterConfig::new([
         ground_station_handler,
         abort_handler,
         flight_state_handler,
+        discovery_handler,
     ]);
     if telemetry_task::timesync_enabled() {
         cfg = cfg.with_timesync(TimeSyncConfig {
