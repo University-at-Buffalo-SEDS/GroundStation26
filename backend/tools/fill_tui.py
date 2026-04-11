@@ -347,6 +347,10 @@ class SerialTransport(Transport):
         self.raw_bytes = 0
         self.last_raw_ms: int | None = None
         self.last_chunk_hex = ""
+        self.tx_writes = 0
+        self.tx_bytes = 0
+        self.last_tx_ms: int | None = None
+        self.last_tx_hex = ""
         self.ser = serial.Serial(
             port=cfg["port"],
             baudrate=cfg["baud_rate"],
@@ -370,10 +374,15 @@ class SerialTransport(Transport):
         )
 
     def send_serialized(self, payload: bytes) -> None:
+        wire = payload
         if self.tx_protocol == "packet_framed":
-            self.ser.write(len(payload).to_bytes(2, "little"))
-        self.ser.write(payload)
+            wire = len(payload).to_bytes(2, "little") + payload
+        self.ser.write(wire)
         self.ser.flush()
+        self.tx_writes += 1
+        self.tx_bytes += len(wire)
+        self.last_tx_ms = now_ms()
+        self.last_tx_hex = hex_preview(wire, limit=24)
 
     def _take_raw_uart_packet(self) -> bytes | None:
         if self.rx_buf and is_valid_serialized_frame(bytes(self.rx_buf)):
@@ -449,6 +458,10 @@ class SerialTransport(Transport):
             "last_raw_ms": self.last_raw_ms,
             "last_chunk_hex": self.last_chunk_hex,
             "buffered_bytes": len(self.rx_buf),
+            "tx_writes": self.tx_writes,
+            "tx_bytes": self.tx_bytes,
+            "last_tx_ms": self.last_tx_ms,
+            "last_tx_hex": self.last_tx_hex,
         }
 
 
@@ -497,6 +510,15 @@ class I2cTransport(Transport):
         self.invalid_slots = 0
         self.last_raw_ms: int | None = None
         self.last_slot_hex = ""
+        self.transfer_starts = 0
+        self.transfer_completes = 0
+        self.transfer_resets = 0
+        self.last_transfer_len = 0
+        self.last_transfer_hex = ""
+        self.tx_writes = 0
+        self.tx_bytes = 0
+        self.last_tx_ms: int | None = None
+        self.last_tx_hex = ""
 
     def describe(self) -> str:
         return f"i2c {self.path} addr=0x{self.addr:02x}"
@@ -512,6 +534,10 @@ class I2cTransport(Transport):
         buf = ctypes.create_string_buffer(payload, len(payload))
         msg = I2cMsg(addr=self.addr, flags=0, len=len(payload), buf=ctypes.addressof(buf))
         self._ioctl(msg)
+        self.tx_writes += 1
+        self.tx_bytes += len(payload)
+        self.last_tx_ms = now_ms()
+        self.last_tx_hex = hex_preview(payload, limit=16)
 
     def _tx_backoff_active(self) -> bool:
         return time.monotonic() < self.tx_backoff_until
@@ -586,6 +612,7 @@ class I2cTransport(Transport):
 
     def _ingest_slot(self, slot: I2cSlot) -> tuple[int, bytes] | None:
         if slot.flags & I2C_FLAG_START:
+            self.transfer_starts += 1
             self.rx_assembly = {
                 "kind": slot.kind,
                 "transfer_id": slot.transfer_id,
@@ -601,15 +628,20 @@ class I2cTransport(Transport):
         if self.rx_assembly is None:
             return None
         if slot.transfer_id != self.rx_assembly["transfer_id"]:
+            self.transfer_resets += 1
             self.rx_assembly = None
             return None
         if slot.offset != self.rx_assembly["next_offset"]:
+            self.transfer_resets += 1
             self.rx_assembly = None
             return None
         self.rx_assembly["payload"].extend(slot.data)
         self.rx_assembly["next_offset"] += len(slot.data)
         if slot.flags & I2C_FLAG_END:
             payload = bytes(self.rx_assembly["payload"])
+            self.transfer_completes += 1
+            self.last_transfer_len = len(payload)
+            self.last_transfer_hex = hex_preview(payload, limit=24)
             self.rx_assembly = None
             return slot.kind, payload
         return None
@@ -692,6 +724,8 @@ class I2cTransport(Transport):
                 return None
             if kind != I2C_KIND_DATA:
                 continue
+            if is_valid_serialized_frame(payload):
+                return payload
             self.rx_payload_buf.extend(payload)
             packet = self._take_buffered_packet()
             if packet is not None:
@@ -709,7 +743,16 @@ class I2cTransport(Transport):
             "invalid_slots": self.invalid_slots,
             "last_raw_ms": self.last_raw_ms,
             "last_slot_hex": self.last_slot_hex,
+            "transfer_starts": self.transfer_starts,
+            "transfer_completes": self.transfer_completes,
+            "transfer_resets": self.transfer_resets,
+            "last_transfer_len": self.last_transfer_len,
+            "last_transfer_hex": self.last_transfer_hex,
             "buffered_bytes": len(self.rx_payload_buf),
+            "tx_writes": self.tx_writes,
+            "tx_bytes": self.tx_bytes,
+            "last_tx_ms": self.last_tx_ms,
+            "last_tx_hex": self.last_tx_hex,
         }
 
 
@@ -973,6 +1016,19 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
         else:
             transport_line += "n/a"
         status_lines.append(transport_line)
+        if transport_activity.get("kind") == "i2c":
+            status_lines.append(
+                "Transfers: "
+                f"starts={transport_activity.get('transfer_starts', 0)} "
+                f"done={transport_activity.get('transfer_completes', 0)} "
+                f"resets={transport_activity.get('transfer_resets', 0)} "
+                f"last_len={transport_activity.get('last_transfer_len', 0)}"
+            )
+        tx_line = (
+            f"Transport TX: writes={transport_activity.get('tx_writes', 0)} "
+            f"bytes={transport_activity.get('tx_bytes', 0)}"
+        )
+        status_lines.append(tx_line)
         status_lines.append(
             "Counts: " + ", ".join(f"{sender}:{dtype}={count}" for (sender, dtype), count in counts.most_common(4))
         )
@@ -980,6 +1036,12 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
         raw_preview = str(transport_activity.get("last_slot_hex", "") or transport_activity.get("last_chunk_hex", ""))
         if raw_preview:
             status_lines.append(f"Last RX raw: {raw_preview}")
+        transfer_preview = str(transport_activity.get("last_transfer_hex", ""))
+        if transfer_preview:
+            status_lines.append(f"Last transfer: {transfer_preview}")
+        tx_preview = str(transport_activity.get("last_tx_hex", ""))
+        if tx_preview:
+            status_lines.append(f"Last TX raw: {tx_preview}")
         for line in sent_log[:2]:
             status_lines.append(f"Sent: {line}")
 
