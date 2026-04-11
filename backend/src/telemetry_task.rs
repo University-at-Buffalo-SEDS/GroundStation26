@@ -1029,8 +1029,6 @@ pub async fn telemetry_task(
                     }
                     if let Err(e) = router.process_all_queues_with_timeout(0) {
                         log_telemetry_error("router queue processing failed", e);
-                    } else {
-                        log_router_routes(&router, "router queue processed");
                     }
                 }
                 Some(cmd) = rx.recv() => {
@@ -1071,7 +1069,6 @@ pub async fn telemetry_task(
                                         DataType::FlightCommand,
                                         &[crate::rocket_commands::FlightCommands::Launch as u8],
                                     );
-                                    log_router_routes(&router, "Launch command queued");
                                 }
                                 let gpio = &state.gpio;
                                 gpio.write_output_pin(IGNITION_PIN, true).expect("failed to set gpio output");
@@ -1093,7 +1090,6 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Dump command", e);
                                 } else {
                                     log_command_queue_success("Dump command", DataType::ValveCommand, &[cmd as u8]);
-                                    log_router_routes(&router, "Dump command queued");
                                 }
                                 {
                                     let gpio = &state.gpio;
@@ -1125,7 +1121,6 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Igniter command", e);
                                 } else {
                                     log_command_queue_success("Igniter command", DataType::ActuatorCommand, &[cmd as u8]);
-                                    log_router_routes(&router, "Igniter command queued");
                                 }
                                 println!("Igniter command sent {:?}", cmd);
                             }
@@ -1144,7 +1139,6 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Pilot command", e);
                                 } else {
                                     log_command_queue_success("Pilot command", DataType::ValveCommand, &[cmd as u8]);
-                                    log_router_routes(&router, "Pilot command queued");
                                 }
                                 println!("Pilot command sent {:?}", cmd);
                             }
@@ -1163,7 +1157,6 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log NormallyOpen command", e);
                                 } else {
                                     log_command_queue_success("NormallyOpen command", DataType::ValveCommand, &[cmd as u8]);
-                                    log_router_routes(&router, "NormallyOpen command queued");
                                 }
                                 println!("Tanks command sent {:?}", cmd);
                             }
@@ -1182,7 +1175,6 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Nitrogen command", e);
                                 } else {
                                     log_command_queue_success("Nitrogen command", DataType::ActuatorCommand, &[cmd as u8]);
-                                    log_router_routes(&router, "Nitrogen command queued");
                                 }
                                 println!("Nitrogen command sent {:?}", cmd);
                             }
@@ -1198,7 +1190,6 @@ pub async fn telemetry_task(
                                         DataType::ActuatorCommand,
                                         &[ActuatorBoardCommands::NitrogenClose as u8],
                                     );
-                                    log_router_routes(&router, "NitrogenClose command queued");
                                 }
                                 println!("Nitrogen explicit close command sent");
                             }
@@ -1214,7 +1205,6 @@ pub async fn telemetry_task(
                                         DataType::ActuatorCommand,
                                         &[ActuatorBoardCommands::RetractPlumbing as u8],
                                     );
-                                    log_router_routes(&router, "RetractPlumbing command queued");
                                 }
                                 println!("RetractPlumbing command sent");
                         }
@@ -1233,7 +1223,6 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Nitrous command", e);
                                 } else {
                                     log_command_queue_success("Nitrous command", DataType::ActuatorCommand, &[cmd as u8]);
-                                    log_router_routes(&router, "Nitrous command queued");
                                 }
                                 println!("Nitrous command sent: {:?}", cmd);
                         }
@@ -1249,7 +1238,6 @@ pub async fn telemetry_task(
                                         DataType::ActuatorCommand,
                                         &[ActuatorBoardCommands::NitrousClose as u8],
                                     );
-                                    log_router_routes(&router, "NitrousClose command queued");
                                 }
                                 println!("Nitrous explicit close command sent");
                         }
@@ -1837,29 +1825,6 @@ fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
             .collect::<Vec<_>>()
             .join(" ")
     );
-}
-
-fn log_router_routes(router: &Router, context: &str) {
-    let snapshot = router.export_topology();
-    let advertised = snapshot
-        .advertised_endpoints
-        .iter()
-        .map(|ep| ep.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    eprintln!("{context}: advertised_endpoints=[{advertised}]");
-    for route in snapshot.routes {
-        let reachable = route
-            .reachable_endpoints
-            .iter()
-            .map(|ep| ep.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!(
-            "{context}: side={} reachable=[{}]",
-            route.side_name, reachable
-        );
-    }
 }
 
 fn payload_json_from_pkt(pkt: &Packet) -> String {

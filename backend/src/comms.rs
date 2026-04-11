@@ -371,58 +371,6 @@ fn maybe_log_i2c_decoded(payload: &[u8]) {
 }
 
 #[cfg(target_os = "linux")]
-fn log_i2c_rx_payload(kind: u8, payload: &[u8]) {
-    match serialize::peek_frame_info(payload) {
-        Ok(frame) => {
-            eprintln!(
-                "i2c rx payload: kind={kind} bytes={} sender={} ty={:?} endpoints={:?} ts={} data={}",
-                payload.len(),
-                frame.envelope.sender,
-                frame.envelope.ty,
-                frame.envelope.endpoints,
-                frame.envelope.timestamp_ms,
-                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-            );
-        }
-        Err(err) => {
-            if payload.is_empty() {
-                eprintln!("i2c rx payload: kind={kind} bytes=0 empty-ack");
-            } else {
-                eprintln!(
-                    "i2c rx payload: kind={kind} bytes={} undecoded err={err} data={}",
-                    payload.len(),
-                    hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-                );
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn log_i2c_tx_payload(kind: u8, payload: &[u8]) {
-    match serialize::peek_frame_info(payload) {
-        Ok(frame) => {
-            eprintln!(
-                "i2c tx payload: kind={kind} bytes={} sender={} ty={:?} endpoints={:?} ts={} data={}",
-                payload.len(),
-                frame.envelope.sender,
-                frame.envelope.ty,
-                frame.envelope.endpoints,
-                frame.envelope.timestamp_ms,
-                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "i2c tx payload: kind={kind} bytes={} undecoded err={err} data={}",
-                payload.len(),
-                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-            );
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn log_i2c_tx_command_payload(kind: u8, payload: &[u8]) {
     let Ok(frame) = serialize::peek_frame_info(payload) else {
         return;
@@ -442,30 +390,6 @@ fn log_i2c_tx_command_payload(kind: u8, payload: &[u8]) {
         frame.envelope.timestamp_ms,
         hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
     );
-}
-
-#[cfg(target_os = "linux")]
-fn log_i2c_router_accept(payload: &[u8], side_id: RouterSideId) {
-    match serialize::peek_envelope(payload) {
-        Ok(envelope) => {
-            eprintln!(
-                "i2c router accept: side={side_id:?} sender={} ty={:?} endpoints={:?} ts={} bytes={} data={}",
-                envelope.sender,
-                envelope.ty,
-                envelope.endpoints,
-                envelope.timestamp_ms,
-                payload.len(),
-                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "i2c router accept but peek_envelope failed: side={side_id:?} bytes={} err={err} data={}",
-                payload.len(),
-                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-            );
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -926,7 +850,6 @@ impl CommsDevice for I2cComms {
                             eprintln!("i2c receive failed: {err}");
                             TelemetryError::HandlerError("i2c receive failed")
                         })? {
-                            log_i2c_rx_payload(kind, &payload);
                             maybe_log_i2c_decoded(&payload);
                             if kind != I2C_KIND_DATA {
                                 if kind == I2C_KIND_ERROR {
@@ -943,33 +866,7 @@ impl CommsDevice for I2cComms {
                             while let Some(packet) = self.try_take_buffered_packet()? {
                                 match router.rx_serialized_queue_from_side(&packet, side_id) {
                                     Ok(()) => {
-                                        log_i2c_router_accept(&packet, side_id);
-                                        if let Ok(frame) = serialize::peek_frame_info(&packet)
-                                            && matches!(frame.envelope.ty, DataType::DiscoveryAnnounce)
-                                        {
-                                            let snapshot = router.export_topology();
-                                            let advertised = snapshot
-                                                .advertised_endpoints
-                                                .iter()
-                                                .map(|ep| ep.as_str())
-                                                .collect::<Vec<_>>()
-                                                .join(", ");
-                                            eprintln!(
-                                                "i2c discovery accepted: advertised_endpoints=[{advertised}]"
-                                            );
-                                            for route in snapshot.routes {
-                                                let reachable = route
-                                                    .reachable_endpoints
-                                                    .iter()
-                                                    .map(|ep| ep.as_str())
-                                                    .collect::<Vec<_>>()
-                                                    .join(", ");
-                                                eprintln!(
-                                                    "i2c discovery accepted: side={} reachable=[{}]",
-                                                    route.side_name, reachable
-                                                );
-                                            }
-                                        }
+                                        let _ = side_id;
                                     }
                                     Err(err) => {
                                         log_i2c_router_decode_error(
@@ -995,12 +892,6 @@ impl CommsDevice for I2cComms {
                                     }
                                 }
                             }
-                            if payload.is_empty() {
-                                eprintln!("i2c rx payload was empty after reassembly");
-                            }
-                            if kind == I2C_KIND_DATA && !payload.is_empty() && self.rx_payload_buf.is_empty() {
-                                eprintln!("i2c rx payload consumed with no buffered remainder");
-                            }
                         }
                     }
                     Ok(None) => continue,
@@ -1025,18 +916,37 @@ impl CommsDevice for I2cComms {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(target_os = "linux")]
         {
-            log_i2c_tx_payload(I2C_KIND_DATA, payload);
             log_i2c_tx_command_payload(I2C_KIND_DATA, payload);
             match self.write_payload(I2C_KIND_DATA, payload) {
                 Ok(()) => {
-                    eprintln!("i2c tx accepted by transport: bytes={}", payload.len());
+                    if let Ok(frame) = serialize::peek_frame_info(payload)
+                        && matches!(
+                            frame.envelope.ty,
+                            DataType::FlightCommand
+                                | DataType::ValveCommand
+                                | DataType::ActuatorCommand
+                                | DataType::Abort
+                        )
+                    {
+                        eprintln!("i2c tx accepted by transport: bytes={}", payload.len());
+                    }
                     Ok(())
                 }
                 Err(err) => {
-                    eprintln!(
-                        "i2c tx rejected by transport: bytes={} err={err}",
-                        payload.len()
-                    );
+                    if let Ok(frame) = serialize::peek_frame_info(payload)
+                        && matches!(
+                            frame.envelope.ty,
+                            DataType::FlightCommand
+                                | DataType::ValveCommand
+                                | DataType::ActuatorCommand
+                                | DataType::Abort
+                        )
+                    {
+                        eprintln!(
+                            "i2c tx rejected by transport: bytes={} err={err}",
+                            payload.len()
+                        );
+                    }
                     Err(err)
                 }
             }
