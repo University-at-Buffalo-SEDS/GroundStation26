@@ -16,8 +16,8 @@ serde_json = "1.0.149"
 tokio = { version = "1.51.0", features = ["full"] }
 axum = "0.8.8"
 
-[patch."https://github.com/University-at-Buffalo-SEDS/sedsprintf_2026.git"]
-sedsprintf_rs_2026 = { path = "third_party/sedsprintf_2026" }
+#[patch."https://github.com/University-at-Buffalo-SEDS/sedsprintf_2026.git"]
+#sedsprintf_rs_2026 = { path = "third_party/sedsprintf_2026" }
 
 [profile.release]
 opt-level = 3
