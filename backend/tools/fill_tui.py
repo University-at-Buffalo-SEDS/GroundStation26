@@ -583,6 +583,8 @@ class FillLinkApp:
         self.sent_log: deque[str] = deque(maxlen=16)
         self.status = "Connected"
         self.error: str | None = None
+        self.raw_rx_count = 0
+        self.last_rx_ms: int | None = None
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.router = seds.Router(
@@ -635,11 +637,11 @@ class FillLinkApp:
 
     def _on_packet(self, pkt: object) -> None:
         event = self._extract_event(pkt)
-        if event.sender not in {"GW", "VB", "AB", "DAQ", "GS"} and event.sender:
-            return
         with self.lock:
             self.packet_events.appendleft(event)
             self.packet_counts[(event.sender, event.data_type)] += 1
+            self.last_rx_ms = now_ms()
+            self.status = f"RX packet {event.sender}:{event.data_type}"
 
     def _rx_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -647,6 +649,10 @@ class FillLinkApp:
                 packet = self.transport.read_serialized(timeout=0.1)
                 if packet is None:
                     continue
+                with self.lock:
+                    self.raw_rx_count += 1
+                    self.last_rx_ms = now_ms()
+                    self.status = f"RX bytes {len(packet)}"
                 self.router.receive_serialized_queue_from_side(self.side_id, packet)
                 self.router.process_all_queues()
             except Exception as err:
@@ -747,9 +753,11 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
             sent_log = list(app.sent_log)
             status = app.status
             error = app.error
+            raw_rx_count = app.raw_rx_count
+            last_rx_ms = app.last_rx_ms
 
         stdscr.addstr(1, 2, f"Link: {app.transport.describe()}")
-        stdscr.addstr(2, 2, "Recent fill-side packets (GW/VB/AB/DAQ/GS)")
+        stdscr.addstr(2, 2, "Recent received packets")
         max_packets = top_h - 5
         for idx, event in enumerate(packet_events[:max_packets]):
             line = (
@@ -774,11 +782,15 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
         if error:
             stdscr.addnstr(base_y + 1, 2, f"Error: {error}", w - 4, curses.A_BOLD)
         stdscr.addnstr(base_y + 2, 2, f"Selected: {app.selected().label} ({app.selected().detail})", w - 4)
-        stdscr.addnstr(base_y + 3, 2, "Counts: " + ", ".join(
+        rx_line = f"RX seen={raw_rx_count}"
+        if last_rx_ms is not None:
+            rx_line += f" last_ms={last_rx_ms}"
+        stdscr.addnstr(base_y + 3, 2, rx_line, w - 4)
+        stdscr.addnstr(base_y + 4, 2, "Counts: " + ", ".join(
             f"{sender}:{dtype}={count}" for (sender, dtype), count in counts.most_common(4)
         ), w - 4)
         for idx, line in enumerate(sent_log[:2]):
-            stdscr.addnstr(base_y + 4 + idx, 2, f"Sent: {line}", w - 4)
+            stdscr.addnstr(base_y + 5 + idx, 2, f"Sent: {line}", w - 4)
         stdscr.addnstr(h - 1, 2, "q quit | c clear | Enter send", w - 4)
         stdscr.refresh()
 
