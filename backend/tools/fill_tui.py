@@ -534,35 +534,38 @@ class I2cTransport(Transport):
                 raise
 
     def read_serialized(self, timeout: float) -> bytes | None:
-        with self.io_lock:
-            packet = self._take_buffered_packet()
-            if packet is not None:
-                return packet
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                raw = self._transfer_read()
-                if raw is None:
-                    time.sleep(0.01)
-                    continue
-                try:
-                    slot = self._decode_slot(raw)
-                except ValueError:
-                    continue
-                if slot is None:
-                    return None
-                assembled = self._ingest_slot(slot)
-                if assembled is None:
-                    continue
-                kind, payload = assembled
-                if kind == I2C_KIND_ERROR:
-                    return None
-                if kind != I2C_KIND_DATA:
-                    continue
-                self.rx_payload_buf.extend(payload)
+        packet = self._take_buffered_packet()
+        if packet is not None:
+            return packet
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.io_lock:
                 packet = self._take_buffered_packet()
                 if packet is not None:
                     return packet
-            return None
+                raw = self._transfer_read()
+            if raw is None:
+                time.sleep(0.01)
+                continue
+            try:
+                slot = self._decode_slot(raw)
+            except ValueError:
+                continue
+            if slot is None:
+                return None
+            assembled = self._ingest_slot(slot)
+            if assembled is None:
+                continue
+            kind, payload = assembled
+            if kind == I2C_KIND_ERROR:
+                return None
+            if kind != I2C_KIND_DATA:
+                continue
+            self.rx_payload_buf.extend(payload)
+            packet = self._take_buffered_packet()
+            if packet is not None:
+                return packet
+        return None
 
     def close(self) -> None:
         os.close(self.fd)
