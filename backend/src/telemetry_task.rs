@@ -1063,6 +1063,12 @@ pub async fn telemetry_task(
                                         &[crate::rocket_commands::FlightCommands::Launch as u8],
                                     ) {
                                     log_telemetry_error("failed to log Launch command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "Launch command",
+                                        DataType::FlightCommand,
+                                        &[crate::rocket_commands::FlightCommands::Launch as u8],
+                                    );
                                 }
                                 let gpio = &state.gpio;
                                 gpio.write_output_pin(IGNITION_PIN, true).expect("failed to set gpio output");
@@ -1082,6 +1088,8 @@ pub async fn telemetry_task(
                                     &[cmd as u8],
                                 ) {
                                     log_telemetry_error("failed to log Dump command", e);
+                                } else {
+                                    log_command_queue_success("Dump command", DataType::ValveCommand, &[cmd as u8]);
                                 }
                                 {
                                     let gpio = &state.gpio;
@@ -1111,6 +1119,8 @@ pub async fn telemetry_task(
                                     &[cmd as u8],
                                 ) {
                                     log_telemetry_error("failed to log Igniter command", e);
+                                } else {
+                                    log_command_queue_success("Igniter command", DataType::ActuatorCommand, &[cmd as u8]);
                                 }
                                 println!("Igniter command sent {:?}", cmd);
                             }
@@ -1127,6 +1137,8 @@ pub async fn telemetry_task(
                                     &[cmd as u8],
                                 ) {
                                     log_telemetry_error("failed to log Pilot command", e);
+                                } else {
+                                    log_command_queue_success("Pilot command", DataType::ValveCommand, &[cmd as u8]);
                                 }
                                 println!("Pilot command sent {:?}", cmd);
                             }
@@ -1143,6 +1155,8 @@ pub async fn telemetry_task(
                                     &[cmd as u8],
                                 ) {
                                     log_telemetry_error("failed to log NormallyOpen command", e);
+                                } else {
+                                    log_command_queue_success("NormallyOpen command", DataType::ValveCommand, &[cmd as u8]);
                                 }
                                 println!("Tanks command sent {:?}", cmd);
                             }
@@ -1159,6 +1173,8 @@ pub async fn telemetry_task(
                                     &[cmd as u8],
                                 ) {
                                     log_telemetry_error("failed to log Nitrogen command", e);
+                                } else {
+                                    log_command_queue_success("Nitrogen command", DataType::ActuatorCommand, &[cmd as u8]);
                                 }
                                 println!("Nitrogen command sent {:?}", cmd);
                             }
@@ -1168,6 +1184,12 @@ pub async fn telemetry_task(
                                     &[ActuatorBoardCommands::NitrogenClose as u8],
                                 ) {
                                     log_telemetry_error("failed to log NitrogenClose command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "NitrogenClose command",
+                                        DataType::ActuatorCommand,
+                                        &[ActuatorBoardCommands::NitrogenClose as u8],
+                                    );
                                 }
                                 println!("Nitrogen explicit close command sent");
                             }
@@ -1177,6 +1199,12 @@ pub async fn telemetry_task(
                                     &[ActuatorBoardCommands::RetractPlumbing as u8],
                                 ) {
                                     log_telemetry_error("failed to log RetractPlumbing command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "RetractPlumbing command",
+                                        DataType::ActuatorCommand,
+                                        &[ActuatorBoardCommands::RetractPlumbing as u8],
+                                    );
                                 }
                                 println!("RetractPlumbing command sent");
                         }
@@ -1193,6 +1221,8 @@ pub async fn telemetry_task(
                                     &[cmd as u8],
                                 ) {
                                     log_telemetry_error("failed to log Nitrous command", e);
+                                } else {
+                                    log_command_queue_success("Nitrous command", DataType::ActuatorCommand, &[cmd as u8]);
                                 }
                                 println!("Nitrous command sent: {:?}", cmd);
                         }
@@ -1202,6 +1232,12 @@ pub async fn telemetry_task(
                                     &[ActuatorBoardCommands::NitrousClose as u8],
                                 ) {
                                     log_telemetry_error("failed to log NitrousClose command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "NitrousClose command",
+                                        DataType::ActuatorCommand,
+                                        &[ActuatorBoardCommands::NitrousClose as u8],
+                                    );
                                 }
                                 println!("Nitrous explicit close command sent");
                         }
@@ -1778,6 +1814,17 @@ fn get_system_timestamp_ms() -> u64 {
 
 fn log_telemetry_error(context: &str, err: sedsprintf_rs_2026::TelemetryError) {
     eprintln!("{context}: {:?}", err);
+}
+
+fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
+    eprintln!(
+        "{context}: queued ty={ty:?} payload={}",
+        payload
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 }
 
 fn payload_json_from_pkt(pkt: &Packet) -> String {

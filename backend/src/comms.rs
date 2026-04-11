@@ -385,11 +385,15 @@ fn log_i2c_rx_payload(kind: u8, payload: &[u8]) {
             );
         }
         Err(err) => {
-            eprintln!(
-                "i2c rx payload: kind={kind} bytes={} undecoded err={err} data={}",
-                payload.len(),
-                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-            );
+            if payload.is_empty() {
+                eprintln!("i2c rx payload: kind={kind} bytes=0 empty-ack");
+            } else {
+                eprintln!(
+                    "i2c rx payload: kind={kind} bytes={} undecoded err={err} data={}",
+                    payload.len(),
+                    hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+                );
+            }
         }
     }
 }
