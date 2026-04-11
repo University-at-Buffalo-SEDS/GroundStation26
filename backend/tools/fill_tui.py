@@ -117,6 +117,30 @@ def safe_decode_ascii(data: bytes, limit: int = 48) -> str:
     return text
 
 
+def is_valid_serialized_frame(data: bytes) -> bool:
+    serialize_mod = getattr(seds, "serialize", None)
+    peek = None
+    if serialize_mod is not None and hasattr(serialize_mod, "peek_frame_info"):
+        peek = getattr(serialize_mod, "peek_frame_info")
+    elif hasattr(seds, "peek_frame_info"):
+        peek = getattr(seds, "peek_frame_info")
+    elif hasattr(seds, "peek_frame_info_py"):
+        peek = getattr(seds, "peek_frame_info_py")
+
+    if peek is not None:
+        try:
+            peek(data)
+            return True
+        except Exception:
+            return False
+
+    try:
+        pkt = seds.deserialize_packet_py(data)
+    except Exception:
+        return False
+    return int(pkt.wire_size()) == len(data)
+
+
 @dataclass(frozen=True)
 class CommandSpec:
     label: str
@@ -242,6 +266,56 @@ def load_fill_link_config(backend_root: Path) -> dict:
     raise SystemExit(f"Unsupported fill_box interface in comms config: {interface}")
 
 
+def resolve_fill_link_config(args: argparse.Namespace, backend_root: Path) -> dict:
+    if args.config:
+        os.environ["GS_COMMS_LINK_CONFIG"] = args.config
+    cfg = load_fill_link_config(backend_root)
+
+    if args.interface is None:
+        return cfg
+
+    interface = args.interface
+    if interface in {"serial", "raspberry_pi_gpio_uart", "custom_serial"}:
+        return {
+            "interface": interface,
+            "protocol": args.protocol or cfg.get("protocol", "raw_uart"),
+            "port": args.port or cfg.get("port", "/dev/ttyUSB2"),
+            "baud_rate": int(
+                args.baud_rate
+                if args.baud_rate is not None
+                else cfg.get("baud_rate", SERIAL_DEFAULT_BAUD)
+            ),
+        }
+
+    if interface == "i2c":
+        bus = args.bus if args.bus is not None else cfg.get("bus", I2C_DEFAULT_BUS)
+        if args.port:
+            port = args.port.strip()
+            if not port.startswith("/dev/i2c-"):
+                raise SystemExit(f"--port must look like /dev/i2c-N for --interface i2c, got: {port}")
+            try:
+                bus = int(port.rsplit("-", 1)[1], 10)
+            except (IndexError, ValueError):
+                raise SystemExit(f"Invalid I2C port: {port}") from None
+        return {
+            "interface": interface,
+            "bus": int(bus),
+            "addr": int(args.addr if args.addr is not None else cfg.get("addr", I2C_DEFAULT_ADDR)),
+            "chunk_delay_ms": int(
+                args.chunk_delay_ms
+                if args.chunk_delay_ms is not None
+                else cfg.get("chunk_delay_ms", I2C_DEFAULT_CHUNK_DELAY_MS)
+            ),
+            "initial_wait_ms": int(
+                args.initial_wait_ms
+                if args.initial_wait_ms is not None
+                else cfg.get("initial_wait_ms", I2C_DEFAULT_INITIAL_WAIT_MS)
+            ),
+        }
+
+    raise SystemExit(f"Unsupported interface override: {interface}")
+
+
 class Transport:
     def describe(self) -> str:
         raise NotImplementedError
@@ -255,17 +329,30 @@ class Transport:
     def close(self) -> None:
         raise NotImplementedError
 
+    def activity_snapshot(self) -> dict[str, object]:
+        return {}
+
 
 class SerialTransport(Transport):
     def __init__(self, cfg: dict) -> None:
         self.protocol = cfg["protocol"]
         self.rx_buf = bytearray()
+        self.raw_reads = 0
+        self.raw_bytes = 0
+        self.last_raw_ms: int | None = None
+        self.last_chunk_hex = ""
         self.ser = serial.Serial(
             port=cfg["port"],
             baudrate=cfg["baud_rate"],
             timeout=0.05,
             inter_byte_timeout=0.02,
             write_timeout=1.0,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
         )
 
     def describe(self) -> str:
@@ -278,21 +365,33 @@ class SerialTransport(Transport):
         self.ser.flush()
 
     def _take_raw_uart_packet(self) -> bytes | None:
+        if self.rx_buf and is_valid_serialized_frame(bytes(self.rx_buf)):
+            payload = bytes(self.rx_buf)
+            self.rx_buf.clear()
+            return payload
         scan_len = min(len(self.rx_buf), RAW_UART_MAX_FRAME_BYTES)
         for start in range(scan_len):
             for end in range(start + 1, scan_len + 1):
                 candidate = bytes(self.rx_buf[start:end])
-                try:
-                    pkt = seds.deserialize_packet_py(candidate)
-                except Exception:
-                    continue
-                if int(pkt.wire_size()) != len(candidate):
+                if not is_valid_serialized_frame(candidate):
                     continue
                 del self.rx_buf[:end]
                 return candidate
         if len(self.rx_buf) > RAW_UART_MAX_FRAME_BYTES:
             del self.rx_buf[: len(self.rx_buf) - RAW_UART_MAX_FRAME_BYTES]
         return None
+
+    def _read_burst(self, timeout: float) -> bytes:
+        deadline = time.monotonic() + timeout
+        buf = bytearray()
+        while time.monotonic() < deadline:
+            chunk = self.ser.read(4096)
+            if chunk:
+                buf.extend(chunk)
+                continue
+            if buf:
+                break
+        return bytes(buf)
 
     def _take_packet_framed_packet(self) -> bytes | None:
         if len(self.rx_buf) < 2:
@@ -315,9 +414,13 @@ class SerialTransport(Transport):
         ready, _, _ = select.select([self.ser.fileno()], [], [], timeout)
         if not ready:
             return None
-        chunk = self.ser.read(4096)
+        chunk = self._read_burst(timeout)
         if chunk:
             self.rx_buf.extend(chunk)
+            self.raw_reads += 1
+            self.raw_bytes += len(chunk)
+            self.last_raw_ms = now_ms()
+            self.last_chunk_hex = hex_preview(chunk, limit=24)
         return (
             self._take_packet_framed_packet()
             if self.protocol == "packet_framed"
@@ -326,6 +429,16 @@ class SerialTransport(Transport):
 
     def close(self) -> None:
         self.ser.close()
+
+    def activity_snapshot(self) -> dict[str, object]:
+        return {
+            "kind": "serial",
+            "raw_reads": self.raw_reads,
+            "raw_bytes": self.raw_bytes,
+            "last_raw_ms": self.last_raw_ms,
+            "last_chunk_hex": self.last_chunk_hex,
+            "buffered_bytes": len(self.rx_buf),
+        }
 
 
 class I2cMsg(ctypes.Structure):
@@ -368,6 +481,11 @@ class I2cTransport(Transport):
         self.rx_assembly: dict | None = None
         self.tx_transfer_id = 1
         self.tx_backoff_until = 0.0
+        self.raw_reads = 0
+        self.raw_slots = 0
+        self.invalid_slots = 0
+        self.last_raw_ms: int | None = None
+        self.last_slot_hex = ""
 
     def describe(self) -> str:
         return f"i2c {self.path} addr=0x{self.addr:02x}"
@@ -404,7 +522,12 @@ class I2cTransport(Transport):
             if err.errno in {errno.EREMOTEIO, errno.ENXIO, errno.EIO, errno.ETIMEDOUT}:
                 return None
             raise
-        return raw.raw
+        payload = raw.raw
+        self.raw_reads += 1
+        self.raw_slots += 1
+        self.last_raw_ms = now_ms()
+        self.last_slot_hex = hex_preview(payload, limit=16)
+        return payload
 
     def _encode_slot(
         self, kind: int, flags: int, transfer_id: int, offset: int, total_len: int, data: bytes
@@ -485,11 +608,7 @@ class I2cTransport(Transport):
         for start in range(scan_len):
             for end in range(start + 1, scan_len + 1):
                 candidate = bytes(self.rx_payload_buf[start:end])
-                try:
-                    pkt = seds.deserialize_packet_py(candidate)
-                except Exception:
-                    continue
-                if int(pkt.wire_size()) != len(candidate):
+                if not is_valid_serialized_frame(candidate):
                     continue
                 del self.rx_payload_buf[:end]
                 return candidate
@@ -550,6 +669,7 @@ class I2cTransport(Transport):
             try:
                 slot = self._decode_slot(raw)
             except ValueError:
+                self.invalid_slots += 1
                 continue
             if slot is None:
                 return None
@@ -569,6 +689,17 @@ class I2cTransport(Transport):
 
     def close(self) -> None:
         os.close(self.fd)
+
+    def activity_snapshot(self) -> dict[str, object]:
+        return {
+            "kind": "i2c",
+            "raw_reads": self.raw_reads,
+            "raw_slots": self.raw_slots,
+            "invalid_slots": self.invalid_slots,
+            "last_raw_ms": self.last_raw_ms,
+            "last_slot_hex": self.last_slot_hex,
+            "buffered_bytes": len(self.rx_payload_buf),
+        }
 
 
 class FillLinkApp:
@@ -755,17 +886,43 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
             error = app.error
             raw_rx_count = app.raw_rx_count
             last_rx_ms = app.last_rx_ms
+        transport_activity = app.transport.activity_snapshot()
 
         stdscr.addstr(1, 2, f"Link: {app.transport.describe()}")
         stdscr.addstr(2, 2, "Recent received packets")
         max_packets = top_h - 5
-        for idx, event in enumerate(packet_events[:max_packets]):
-            line = (
-                f"{event.sender:<3} {event.data_type:<18} len={event.payload_len:<3} "
-                f"ep={','.join(event.endpoints[:2]) or '-':<18} "
-                f"{event.payload_hex:<30} {event.payload_text}"
-            )
-            stdscr.addnstr(3 + idx, 2, line, left_w - 4)
+        if packet_events:
+            for idx, event in enumerate(packet_events[:max_packets]):
+                line = (
+                    f"{event.sender:<3} {event.data_type:<18} len={event.payload_len:<3} "
+                    f"ep={','.join(event.endpoints[:2]) or '-':<18} "
+                    f"{event.payload_hex:<30} {event.payload_text}"
+                )
+                stdscr.addnstr(3 + idx, 2, line, left_w - 4)
+        else:
+            raw_lines = ["No decoded packets yet."]
+            if transport_activity.get("kind") == "serial":
+                raw_lines.append(
+                    "Serial RX "
+                    f"reads={transport_activity.get('raw_reads', 0)} "
+                    f"bytes={transport_activity.get('raw_bytes', 0)} "
+                    f"buffered={transport_activity.get('buffered_bytes', 0)}"
+                )
+                chunk_hex = str(transport_activity.get("last_chunk_hex", ""))
+                if chunk_hex:
+                    raw_lines.append(f"Last serial chunk: {chunk_hex}")
+            elif transport_activity.get("kind") == "i2c":
+                raw_lines.append(
+                    "I2C RX "
+                    f"slots={transport_activity.get('raw_slots', 0)} "
+                    f"invalid={transport_activity.get('invalid_slots', 0)} "
+                    f"buffered={transport_activity.get('buffered_bytes', 0)}"
+                )
+                slot_hex = str(transport_activity.get("last_slot_hex", ""))
+                if slot_hex:
+                    raw_lines.append(f"Last I2C slot: {slot_hex}")
+            for idx, line in enumerate(raw_lines[:max_packets]):
+                stdscr.addnstr(3 + idx, 2, line, left_w - 4)
 
         group_name, group_commands = app.group()
         stdscr.addstr(1, left_w + 2, f"Group: {group_name} ({app.group_index + 1}/{len(app.command_groups)})", curses.A_BOLD)
@@ -786,11 +943,30 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
         if last_rx_ms is not None:
             rx_line += f" last_ms={last_rx_ms}"
         stdscr.addnstr(base_y + 3, 2, rx_line, w - 4)
-        stdscr.addnstr(base_y + 4, 2, "Counts: " + ", ".join(
+        transport_line = "Transport RX: "
+        if transport_activity.get("kind") == "i2c":
+            transport_line += (
+                f"slots={transport_activity.get('raw_slots', 0)} "
+                f"invalid={transport_activity.get('invalid_slots', 0)} "
+                f"buffered={transport_activity.get('buffered_bytes', 0)}"
+            )
+        elif transport_activity.get("kind") == "serial":
+            transport_line += (
+                f"reads={transport_activity.get('raw_reads', 0)} "
+                f"bytes={transport_activity.get('raw_bytes', 0)} "
+                f"buffered={transport_activity.get('buffered_bytes', 0)}"
+            )
+        else:
+            transport_line += "n/a"
+        stdscr.addnstr(base_y + 4, 2, transport_line, w - 4)
+        stdscr.addnstr(base_y + 5, 2, "Counts: " + ", ".join(
             f"{sender}:{dtype}={count}" for (sender, dtype), count in counts.most_common(4)
         ), w - 4)
+        slot_preview = str(transport_activity.get("last_slot_hex", ""))
+        if slot_preview:
+            stdscr.addnstr(base_y + 6, 2, f"Last RX raw: {slot_preview}", w - 4)
         for idx, line in enumerate(sent_log[:2]):
-            stdscr.addnstr(base_y + 5 + idx, 2, f"Sent: {line}", w - 4)
+            stdscr.addnstr(base_y + 7 + idx, 2, f"Sent: {line}", w - 4)
         stdscr.addnstr(h - 1, 2, "q quit | c clear | Enter send", w - 4)
         stdscr.refresh()
 
@@ -846,15 +1022,52 @@ def parse_args() -> argparse.Namespace:
         "--config",
         help="Override comms config path. Defaults to backend behavior.",
     )
+    parser.add_argument(
+        "--interface",
+        choices=["serial", "raspberry_pi_gpio_uart", "custom_serial", "i2c"],
+        help="Override transport interface instead of using fill_box.interface from config.",
+    )
+    parser.add_argument(
+        "--port",
+        help="Override serial port, or use /dev/i2c-N with --interface i2c.",
+    )
+    parser.add_argument(
+        "--baud-rate",
+        type=int,
+        help="Override serial baud rate.",
+    )
+    parser.add_argument(
+        "--protocol",
+        choices=["raw_uart", "packet_framed"],
+        help="Override serial framing protocol.",
+    )
+    parser.add_argument(
+        "--bus",
+        type=int,
+        help="Override I2C bus number.",
+    )
+    parser.add_argument(
+        "--addr",
+        type=lambda value: int(value, 0),
+        help="Override I2C address, e.g. 0x55.",
+    )
+    parser.add_argument(
+        "--chunk-delay-ms",
+        type=int,
+        help="Override I2C inter-slot delay in milliseconds.",
+    )
+    parser.add_argument(
+        "--initial-wait-ms",
+        type=int,
+        help="Override I2C post-send wait in milliseconds.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     backend_root = backend_root_from_script(Path(__file__))
-    if args.config:
-        os.environ["GS_COMMS_LINK_CONFIG"] = args.config
-    cfg = load_fill_link_config(backend_root)
+    cfg = resolve_fill_link_config(args, backend_root)
     transport = build_transport(cfg)
     app = FillLinkApp(transport, sender=args.sender, commands=build_command_groups(args.include_hitl))
     app.start()
