@@ -363,6 +363,7 @@ class I2cTransport(Transport):
         self.chunk_delay = cfg["chunk_delay_ms"] / 1000.0
         self.initial_wait = cfg["initial_wait_ms"] / 1000.0
         self.fd = os.open(self.path, os.O_RDWR)
+        self.io_lock = threading.Lock()
         self.rx_payload_buf = bytearray()
         self.rx_assembly: dict | None = None
         self.tx_transfer_id = 1
@@ -497,69 +498,71 @@ class I2cTransport(Transport):
         return None
 
     def send_serialized(self, payload: bytes) -> None:
-        if self._tx_backoff_active():
-            return
-        transfer_id = self._next_transfer_id()
-        try:
-            if not payload:
-                self._transfer_write(
-                    self._encode_slot(I2C_KIND_DATA, I2C_FLAG_START | I2C_FLAG_END, transfer_id, 0, 0, b"")
-                )
-            else:
-                offset = 0
-                while offset < len(payload):
-                    end = min(offset + I2C_SLOT_PAYLOAD_SIZE, len(payload))
-                    flags = 0
-                    if offset == 0:
-                        flags |= I2C_FLAG_START
-                    if end >= len(payload):
-                        flags |= I2C_FLAG_END
-                    self._transfer_write(
-                        self._encode_slot(
-                            I2C_KIND_DATA, flags, transfer_id, offset, len(payload), payload[offset:end]
-                        )
-                    )
-                    offset = end
-                    if offset < len(payload) and self.chunk_delay > 0:
-                        time.sleep(self.chunk_delay)
-            if self.initial_wait > 0:
-                time.sleep(self.initial_wait)
-            self.tx_backoff_until = 0.0
-        except OSError as err:
-            if err.errno in {errno.EREMOTEIO, errno.ENXIO, errno.ETIMEDOUT}:
-                self._arm_tx_backoff()
+        with self.io_lock:
+            if self._tx_backoff_active():
                 return
-            raise
+            transfer_id = self._next_transfer_id()
+            try:
+                if not payload:
+                    self._transfer_write(
+                        self._encode_slot(I2C_KIND_DATA, I2C_FLAG_START | I2C_FLAG_END, transfer_id, 0, 0, b"")
+                    )
+                else:
+                    offset = 0
+                    while offset < len(payload):
+                        end = min(offset + I2C_SLOT_PAYLOAD_SIZE, len(payload))
+                        flags = 0
+                        if offset == 0:
+                            flags |= I2C_FLAG_START
+                        if end >= len(payload):
+                            flags |= I2C_FLAG_END
+                        self._transfer_write(
+                            self._encode_slot(
+                                I2C_KIND_DATA, flags, transfer_id, offset, len(payload), payload[offset:end]
+                            )
+                        )
+                        offset = end
+                        if offset < len(payload) and self.chunk_delay > 0:
+                            time.sleep(self.chunk_delay)
+                if self.initial_wait > 0:
+                    time.sleep(self.initial_wait)
+                self.tx_backoff_until = 0.0
+            except OSError as err:
+                if err.errno in {errno.EREMOTEIO, errno.ENXIO, errno.ETIMEDOUT}:
+                    self._arm_tx_backoff()
+                    return
+                raise
 
     def read_serialized(self, timeout: float) -> bytes | None:
-        packet = self._take_buffered_packet()
-        if packet is not None:
-            return packet
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            raw = self._transfer_read()
-            if raw is None:
-                time.sleep(0.01)
-                continue
-            try:
-                slot = self._decode_slot(raw)
-            except ValueError:
-                continue
-            if slot is None:
-                return None
-            assembled = self._ingest_slot(slot)
-            if assembled is None:
-                continue
-            kind, payload = assembled
-            if kind == I2C_KIND_ERROR:
-                return None
-            if kind != I2C_KIND_DATA:
-                continue
-            self.rx_payload_buf.extend(payload)
+        with self.io_lock:
             packet = self._take_buffered_packet()
             if packet is not None:
                 return packet
-        return None
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                raw = self._transfer_read()
+                if raw is None:
+                    time.sleep(0.01)
+                    continue
+                try:
+                    slot = self._decode_slot(raw)
+                except ValueError:
+                    continue
+                if slot is None:
+                    return None
+                assembled = self._ingest_slot(slot)
+                if assembled is None:
+                    continue
+                kind, payload = assembled
+                if kind == I2C_KIND_ERROR:
+                    return None
+                if kind != I2C_KIND_DATA:
+                    continue
+                self.rx_payload_buf.extend(payload)
+                packet = self._take_buffered_packet()
+                if packet is not None:
+                    return packet
+            return None
 
     def close(self) -> None:
         os.close(self.fd)
