@@ -262,7 +262,7 @@ impl AppState {
 
     /// Projects the current router and board state into the UI-friendly topology graph.
     pub fn network_topology_snapshot(&self, now_ms: u64) -> NetworkTopologyMsg {
-        let simulated = cfg!(feature = "testing");
+        let simulated = crate::flight_sim::sim_mode_enabled();
         let exported = if cfg!(feature = "test_fire_mode") {
             // In test-fire mode the AV-bay side is intentionally absent and both comms links may
             // be dummy placeholders. Avoid router topology export here; that path has proven
@@ -319,6 +319,11 @@ impl AppState {
         let rocket_side_endpoints = side_endpoints("rocket_comms");
         let fill_side_endpoints = side_endpoints("umbilical_comms");
 
+        let router_endpoints = if simulated {
+            vec![DataEndpoint::GroundStation.as_str().to_string()]
+        } else {
+            local_visible_endpoint_list.clone()
+        };
         let mut nodes = vec![NetworkTopologyNode {
             id: "router".to_string(),
             label: "Ground Station Router".to_string(),
@@ -326,7 +331,7 @@ impl AppState {
             status: NetworkTopologyStatus::Online,
             group: "local".to_string(),
             sender_id: Some(Board::GroundStation.sender_id().to_string()),
-            endpoints: local_visible_endpoint_list.clone(),
+            endpoints: router_endpoints,
             show_in_details: true,
             detail: Some("SEDSprintf relay router".to_string()),
         }];
@@ -398,6 +403,9 @@ impl AppState {
         }
 
         for endpoint in &local_visible_endpoint_list {
+            if simulated {
+                continue;
+            }
             let endpoint_id = format!("endpoint_{}", endpoint.to_ascii_lowercase());
             if endpoint_ids.insert(endpoint_id.clone()) {
                 nodes.push(NetworkTopologyNode {
