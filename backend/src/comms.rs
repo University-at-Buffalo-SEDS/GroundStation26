@@ -663,17 +663,6 @@ impl I2cComms {
     }
 
     #[cfg(target_os = "linux")]
-    fn tx_backoff_active(&self) -> bool {
-        self.tx_backoff_until
-            .is_some_and(|deadline| std::time::Instant::now() < deadline)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn arm_tx_backoff(&mut self) {
-        self.tx_backoff_until = Some(std::time::Instant::now() + Duration::from_secs(1));
-    }
-
-    #[cfg(target_os = "linux")]
     fn next_transfer_id(&mut self) -> u16 {
         let current = self.tx_transfer_id;
         self.tx_transfer_id = self.tx_transfer_id.wrapping_add(1).max(1);
@@ -880,22 +869,7 @@ impl CommsDevice for I2cComms {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(target_os = "linux")]
         {
-            if self.tx_backoff_active() {
-                return Ok(());
-            }
-
-            if let Err(err) = self.write_payload(I2C_KIND_DATA, payload) {
-                if is_i2c_retryable_write_error(err.as_ref()) {
-                    self.arm_tx_backoff();
-                    return Ok(());
-                }
-                return Err(err);
-            }
-            if !self.initial_wait.is_zero() {
-                std::thread::sleep(self.initial_wait);
-            }
-            self.tx_backoff_until = None;
-            Ok(())
+            self.write_payload(I2C_KIND_DATA, payload)
         }
         #[cfg(not(target_os = "linux"))]
         {
