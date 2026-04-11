@@ -148,6 +148,29 @@ fn log_outbound_command_attempt(side_name: &str, pkt: &[u8]) {
     );
 }
 
+fn log_i2c_side_tx_attempt(side_name: &str, pkt: &[u8]) {
+    match peek_envelope(pkt) {
+        Ok(envelope) => {
+            eprintln!(
+                "{side_name} i2c side tx: sender={} ty={:?} endpoints={:?} ts={} bytes={} payload={}",
+                envelope.sender,
+                envelope.ty,
+                envelope.endpoints,
+                envelope.timestamp_ms,
+                pkt.len(),
+                hex_preview(pkt, 24)
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "{side_name} i2c side tx: undecoded bytes={} payload={} err={err}",
+                pkt.len(),
+                hex_preview(pkt, 24)
+            );
+        }
+    }
+}
+
 /// Creates the SQLite file on disk when it does not exist and returns a stable path string.
 fn ensure_sqlite_db_file(path: &Path) -> anyhow::Result<String> {
     if !path.exists() {
@@ -751,6 +774,10 @@ async fn main() -> anyhow::Result<()> {
 
     let umbilical_side = {
         let umbilical_comms = Arc::clone(&umbilical_comms);
+        let umbilical_is_i2c = matches!(
+            comms_links.fill_box,
+            crate::comms_config::CommsLinkConfig::I2c { .. }
+        );
         let opts = RouterSideOptions {
             reliable_enabled: !matches!(
                 comms_links.fill_box,
@@ -767,6 +794,9 @@ async fn main() -> anyhow::Result<()> {
                 let mut guard = umbilical_comms
                     .lock()
                     .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
+                if umbilical_is_i2c {
+                    log_i2c_side_tx_attempt("umbilical_comms", pkt);
+                }
                 log_outbound_command_attempt("umbilical_comms", pkt);
                 match guard.send_data(pkt) {
                     Ok(()) => {
