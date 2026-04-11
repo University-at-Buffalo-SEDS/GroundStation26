@@ -896,6 +896,10 @@ pub async fn telemetry_task(
     let mut router_interval = interval(Duration::from_millis(10));
     let mut heartbeat_interval = interval(Duration::from_millis(500));
     let mut timesync_interval = interval(Duration::from_millis(100));
+    handle_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    router_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    timesync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_failed = false;
     let mut last_backpressure_log_ms: u64 = 0;
     let packet_work_queue_size = env_usize(
@@ -1026,14 +1030,8 @@ pub async fn telemetry_task(
 
     loop {
         tokio::select! {
-            _= router_interval.tick() => {
-                    if let Err(e) = router.poll_discovery() {
-                        log_telemetry_error("router discovery polling failed", e);
-                    }
-                    if let Err(e) = process_router_queues(&router) {
-                        log_telemetry_error("router queue processing failed", e);
-                    }
-                }
+            biased;
+
                 Some(cmd) = rx.recv() => {
                     if !state.is_command_allowed(&cmd) {
                         emit_warning(
@@ -1304,6 +1302,14 @@ pub async fn telemetry_task(
                                     println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
                                 }
                         }
+                    }
+                }
+            _= router_interval.tick() => {
+                    if let Err(e) = router.poll_discovery() {
+                        log_telemetry_error("router discovery polling failed", e);
+                    }
+                    if let Err(e) = process_router_queues(&router) {
+                        log_telemetry_error("router queue processing failed", e);
                     }
                 }
                 _ = heartbeat_interval.tick() => {
