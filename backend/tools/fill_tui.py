@@ -938,11 +938,14 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
         stdscr.addstr(base_y, 2, f"Status: {status}")
         if error:
             stdscr.addnstr(base_y + 1, 2, f"Error: {error}", w - 4, curses.A_BOLD)
-        stdscr.addnstr(base_y + 2, 2, f"Selected: {app.selected().label} ({app.selected().detail})", w - 4)
+        status_lines = [
+            f"Selected: {app.selected().label} ({app.selected().detail})",
+        ]
         rx_line = f"RX seen={raw_rx_count}"
         if last_rx_ms is not None:
             rx_line += f" last_ms={last_rx_ms}"
-        stdscr.addnstr(base_y + 3, 2, rx_line, w - 4)
+        status_lines.append(rx_line)
+
         transport_line = "Transport RX: "
         if transport_activity.get("kind") == "i2c":
             transport_line += (
@@ -958,15 +961,24 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
             )
         else:
             transport_line += "n/a"
-        stdscr.addnstr(base_y + 4, 2, transport_line, w - 4)
-        stdscr.addnstr(base_y + 5, 2, "Counts: " + ", ".join(
-            f"{sender}:{dtype}={count}" for (sender, dtype), count in counts.most_common(4)
-        ), w - 4)
-        slot_preview = str(transport_activity.get("last_slot_hex", ""))
-        if slot_preview:
-            stdscr.addnstr(base_y + 6, 2, f"Last RX raw: {slot_preview}", w - 4)
-        for idx, line in enumerate(sent_log[:2]):
-            stdscr.addnstr(base_y + 7 + idx, 2, f"Sent: {line}", w - 4)
+        status_lines.append(transport_line)
+        status_lines.append(
+            "Counts: " + ", ".join(f"{sender}:{dtype}={count}" for (sender, dtype), count in counts.most_common(4))
+        )
+
+        raw_preview = str(transport_activity.get("last_slot_hex", "") or transport_activity.get("last_chunk_hex", ""))
+        if raw_preview:
+            status_lines.append(f"Last RX raw: {raw_preview}")
+        for line in sent_log[:2]:
+            status_lines.append(f"Sent: {line}")
+
+        status_row = base_y + 2
+        max_status_row = h - 2
+        for line in status_lines:
+            if status_row > max_status_row:
+                break
+            stdscr.addnstr(status_row, 2, line, w - 4)
+            status_row += 1
         stdscr.addnstr(h - 1, 2, "q quit | c clear | Enter send", w - 4)
         stdscr.refresh()
 
