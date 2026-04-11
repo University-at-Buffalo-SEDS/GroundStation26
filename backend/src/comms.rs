@@ -613,10 +613,6 @@ pub struct I2cComms {
     #[cfg(target_os = "linux")]
     chunk_delay: Duration,
     #[cfg(target_os = "linux")]
-    initial_wait: Duration,
-    #[cfg(target_os = "linux")]
-    tx_backoff_until: Option<std::time::Instant>,
-    #[cfg(target_os = "linux")]
     tx_transfer_id: u16,
     #[cfg(target_os = "linux")]
     rx_assembly: Option<I2cRxAssembly>,
@@ -635,8 +631,6 @@ impl I2cComms {
                 side_id: None,
                 addr: cfg.addr,
                 chunk_delay: Duration::from_millis(cfg.chunk_delay_ms),
-                initial_wait: Duration::from_millis(cfg.initial_wait_ms),
-                tx_backoff_until: None,
                 tx_transfer_id: 1,
                 rx_assembly: None,
                 rx_payload_buf: Vec::with_capacity(MAX_PACKET_SIZE * 4),
@@ -1436,14 +1430,6 @@ fn is_i2c_idle_read_error(err: &(dyn Error + 'static)) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn is_i2c_retryable_write_error(err: &(dyn Error + 'static)) -> bool {
-    err.downcast_ref::<std::io::Error>()
-        .and_then(std::io::Error::raw_os_error)
-        .is_some_and(|code| {
-            code == libc::ETIMEDOUT || code == libc::EREMOTEIO || code == libc::ENXIO
-        })
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
