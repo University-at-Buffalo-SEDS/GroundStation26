@@ -365,6 +365,8 @@ class I2cTransport(Transport):
         self.fd = os.open(self.path, os.O_RDWR)
         self.rx_payload_buf = bytearray()
         self.rx_assembly: dict | None = None
+        self.tx_transfer_id = 1
+        self.tx_backoff_until = 0.0
 
     def describe(self) -> str:
         return f"i2c {self.path} addr=0x{self.addr:02x}"
@@ -380,6 +382,17 @@ class I2cTransport(Transport):
         buf = ctypes.create_string_buffer(payload, len(payload))
         msg = I2cMsg(addr=self.addr, flags=0, len=len(payload), buf=ctypes.addressof(buf))
         self._ioctl(msg)
+
+    def _tx_backoff_active(self) -> bool:
+        return time.monotonic() < self.tx_backoff_until
+
+    def _arm_tx_backoff(self) -> None:
+        self.tx_backoff_until = time.monotonic() + 1.0
+
+    def _next_transfer_id(self) -> int:
+        current = self.tx_transfer_id
+        self.tx_transfer_id = ((self.tx_transfer_id + 1) & 0xFFFF) or 1
+        return current
 
     def _transfer_read(self) -> bytes | None:
         raw = ctypes.create_string_buffer(I2C_SLOT_SIZE)
@@ -413,6 +426,10 @@ class I2cTransport(Transport):
     def _decode_slot(self, raw: bytes) -> I2cSlot | None:
         if len(raw) != I2C_SLOT_SIZE:
             raise ValueError("invalid i2c slot size")
+        if all(byte == 0x00 for byte in raw) or all(byte == 0xFF for byte in raw):
+            return None
+        if raw[0] == 0x00 and raw[1] == 0x00:
+            return None
         if raw[0] != I2C_SLOT_MAGIC_0 or raw[1] != I2C_SLOT_MAGIC_1:
             raise ValueError("invalid i2c slot magic")
         if raw[2] != I2C_SLOT_VERSION:
@@ -480,28 +497,39 @@ class I2cTransport(Transport):
         return None
 
     def send_serialized(self, payload: bytes) -> None:
-        transfer_id = (now_ms() & 0xFFFF) or 1
-        if not payload:
-            self._transfer_write(
-                self._encode_slot(I2C_KIND_DATA, I2C_FLAG_START | I2C_FLAG_END, transfer_id, 0, 0, b"")
-            )
+        if self._tx_backoff_active():
             return
-        offset = 0
-        while offset < len(payload):
-            end = min(offset + I2C_SLOT_PAYLOAD_SIZE, len(payload))
-            flags = 0
-            if offset == 0:
-                flags |= I2C_FLAG_START
-            if end >= len(payload):
-                flags |= I2C_FLAG_END
-            self._transfer_write(
-                self._encode_slot(I2C_KIND_DATA, flags, transfer_id, offset, len(payload), payload[offset:end])
-            )
-            offset = end
-            if offset < len(payload) and self.chunk_delay > 0:
-                time.sleep(self.chunk_delay)
-        if self.initial_wait > 0:
-            time.sleep(self.initial_wait)
+        transfer_id = self._next_transfer_id()
+        try:
+            if not payload:
+                self._transfer_write(
+                    self._encode_slot(I2C_KIND_DATA, I2C_FLAG_START | I2C_FLAG_END, transfer_id, 0, 0, b"")
+                )
+            else:
+                offset = 0
+                while offset < len(payload):
+                    end = min(offset + I2C_SLOT_PAYLOAD_SIZE, len(payload))
+                    flags = 0
+                    if offset == 0:
+                        flags |= I2C_FLAG_START
+                    if end >= len(payload):
+                        flags |= I2C_FLAG_END
+                    self._transfer_write(
+                        self._encode_slot(
+                            I2C_KIND_DATA, flags, transfer_id, offset, len(payload), payload[offset:end]
+                        )
+                    )
+                    offset = end
+                    if offset < len(payload) and self.chunk_delay > 0:
+                        time.sleep(self.chunk_delay)
+            if self.initial_wait > 0:
+                time.sleep(self.initial_wait)
+            self.tx_backoff_until = 0.0
+        except OSError as err:
+            if err.errno in {errno.EREMOTEIO, errno.ENXIO, errno.ETIMEDOUT}:
+                self._arm_tx_backoff()
+                return
+            raise
 
     def read_serialized(self, timeout: float) -> bytes | None:
         packet = self._take_buffered_packet()
