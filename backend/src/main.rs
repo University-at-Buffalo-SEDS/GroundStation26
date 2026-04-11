@@ -28,7 +28,9 @@ use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
-use crate::telemetry_task::{get_current_timestamp_ms, set_network_time_router, telemetry_task};
+use crate::telemetry_task::{
+    CommsWorkerHandle, get_current_timestamp_ms, set_network_time_router, telemetry_task,
+};
 
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 use crate::comms::DummyComms;
@@ -748,8 +750,11 @@ async fn main() -> anyhow::Result<()> {
     set_network_time_router(router.clone());
     let _ = state.topology_router.set(router.clone());
 
+    let (rocket_tx, rocket_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
     let rocket_side = {
-        let rocket_comms = Arc::clone(&rocket_comms);
+        let rocket_tx = rocket_tx.clone();
         let opts = RouterSideOptions {
             reliable_enabled: !matches!(
                 comms_links.av_bay,
@@ -760,12 +765,9 @@ async fn main() -> anyhow::Result<()> {
         router.add_side_serialized_with_options(
             "rocket_comms",
             move |pkt| {
-                let mut guard = rocket_comms
-                    .lock()
-                    .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
-                if let Err(err) = guard.send_data(pkt) {
-                    eprintln!("rocket_comms send failed: {err}");
-                }
+                rocket_tx
+                    .send(pkt.to_vec())
+                    .map_err(|_| TelemetryError::HandlerError("rocket_comms tx queue closed"))?;
                 Ok(())
             },
             opts,
@@ -773,7 +775,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let umbilical_side = {
-        let umbilical_comms = Arc::clone(&umbilical_comms);
+        let umbilical_tx = umbilical_tx.clone();
         let umbilical_is_i2c = matches!(
             comms_links.fill_box,
             crate::comms_config::CommsLinkConfig::I2c { .. }
@@ -791,22 +793,13 @@ async fn main() -> anyhow::Result<()> {
         router.add_side_serialized_with_options(
             "umbilical_comms",
             move |pkt| {
-                let mut guard = umbilical_comms
-                    .lock()
-                    .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
                 if umbilical_is_i2c {
                     log_i2c_side_tx_attempt("umbilical_comms", pkt);
                 }
                 log_outbound_command_attempt("umbilical_comms", pkt);
-                match guard.send_data(pkt) {
-                    Ok(()) => {
-                        log_outbound_command_packet("umbilical_comms", pkt, Ok(()));
-                    }
-                    Err(err) => {
-                        log_outbound_command_packet("umbilical_comms", pkt, Err(err.as_ref()));
-                        eprintln!("umbilical_comms send failed: {err}");
-                    }
-                }
+                umbilical_tx
+                    .send(pkt.to_vec())
+                    .map_err(|_| TelemetryError::HandlerError("umbilical_comms tx queue closed"))?;
                 Ok(())
             },
             opts,
@@ -835,7 +828,18 @@ async fn main() -> anyhow::Result<()> {
     let mut tt = tokio::spawn(telemetry_task(
         state.clone(),
         router.clone(),
-        vec![rocket_comms, umbilical_comms],
+        vec![
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms: rocket_comms,
+                tx_rx: rocket_rx,
+            },
+            CommsWorkerHandle {
+                name: "umbilical_comms",
+                comms: umbilical_comms,
+                tx_rx: umbilical_rx,
+            },
+        ],
         cmd_rx,
         telemetry_shutdown_rx,
     ));

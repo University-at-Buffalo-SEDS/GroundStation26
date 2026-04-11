@@ -23,6 +23,12 @@ use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, interval};
 
+pub struct CommsWorkerHandle {
+    pub name: &'static str,
+    pub comms: Arc<Mutex<Box<dyn CommsDevice>>>,
+    pub tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
 const DB_WORK_QUEUE_SIZE: usize = 8_192;
@@ -888,7 +894,7 @@ pub fn set_network_time_router(router: Arc<Router>) {
 pub async fn telemetry_task(
     state: Arc<AppState>,
     router: Arc<sedsprintf_rs_2026::router::Router>,
-    comms: Vec<Arc<Mutex<Box<dyn CommsDevice>>>>,
+    comms: Vec<CommsWorkerHandle>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
@@ -997,9 +1003,8 @@ pub async fn telemetry_task(
     };
 
     let comms_workers: Vec<_> = comms
-        .iter()
-        .cloned()
-        .map(|comms| {
+        .into_iter()
+        .map(|mut comms_handle| {
             let router = router.clone();
             let mut comms_shutdown_rx = state.shutdown_subscribe();
             tokio::spawn(async move {
@@ -1007,11 +1012,37 @@ pub async fn telemetry_task(
                 comms_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
+                        biased;
+
+                        maybe_payload = comms_handle.tx_rx.recv() => {
+                            let Some(payload) = maybe_payload else {
+                                break;
+                            };
+                            match comms_handle
+                                .comms
+                                .lock()
+                                .expect("failed to get lock")
+                                .send_data(&payload)
+                            {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    eprintln!("{} worker send_data failed: {e}", comms_handle.name);
+                                }
+                            }
+                        }
                         _ = comms_interval.tick() => {
-                            match comms.lock().expect("failed to get lock").recv_packet(&router) {
+                            match comms_handle
+                                .comms
+                                .lock()
+                                .expect("failed to get lock")
+                                .recv_packet(&router)
+                            {
                                 Ok(_) => {}
                                 Err(e) => {
-                                    log_telemetry_error("comms_task recv_packet failed", e);
+                                    log_telemetry_error(
+                                        &format!("{} worker recv_packet failed", comms_handle.name),
+                                        e,
+                                    );
                                 }
                             }
                         }
