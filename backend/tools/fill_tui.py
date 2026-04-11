@@ -612,6 +612,14 @@ class I2cTransport(Transport):
 
     def _ingest_slot(self, slot: I2cSlot) -> tuple[int, bytes] | None:
         if slot.flags & I2C_FLAG_START:
+            if slot.offset != 0:
+                self.transfer_resets += 1
+                self.rx_assembly = None
+                return None
+            if slot.total_len < len(slot.data):
+                self.transfer_resets += 1
+                self.rx_assembly = None
+                return None
             self.transfer_starts += 1
             self.rx_assembly = {
                 "kind": slot.kind,
@@ -622,10 +630,17 @@ class I2cTransport(Transport):
             }
             if slot.flags & I2C_FLAG_END:
                 payload = bytes(self.rx_assembly["payload"])
+                self.transfer_completes += 1
+                self.last_transfer_len = len(payload)
+                self.last_transfer_hex = hex_preview(payload, limit=24)
                 self.rx_assembly = None
                 return slot.kind, payload
             return None
         if self.rx_assembly is None:
+            return None
+        if slot.kind != self.rx_assembly["kind"]:
+            self.transfer_resets += 1
+            self.rx_assembly = None
             return None
         if slot.transfer_id != self.rx_assembly["transfer_id"]:
             self.transfer_resets += 1
@@ -635,9 +650,17 @@ class I2cTransport(Transport):
             self.transfer_resets += 1
             self.rx_assembly = None
             return None
+        if len(self.rx_assembly["payload"]) + len(slot.data) > self.rx_assembly["total_len"]:
+            self.transfer_resets += 1
+            self.rx_assembly = None
+            return None
         self.rx_assembly["payload"].extend(slot.data)
         self.rx_assembly["next_offset"] += len(slot.data)
         if slot.flags & I2C_FLAG_END:
+            if len(self.rx_assembly["payload"]) != self.rx_assembly["total_len"]:
+                self.transfer_resets += 1
+                self.rx_assembly = None
+                return None
             payload = bytes(self.rx_assembly["payload"])
             self.transfer_completes += 1
             self.last_transfer_len = len(payload)
