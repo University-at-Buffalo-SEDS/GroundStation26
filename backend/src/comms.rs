@@ -369,6 +369,57 @@ fn maybe_log_i2c_decoded(payload: &[u8]) {
 }
 
 #[cfg(target_os = "linux")]
+fn log_i2c_rx_payload(kind: u8, payload: &[u8]) {
+    eprintln!(
+        "i2c rx payload: kind={kind} bytes={} data={}",
+        payload.len(),
+        hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn log_i2c_tx_payload(kind: u8, payload: &[u8]) {
+    eprintln!(
+        "i2c tx payload: kind={kind} bytes={} data={}",
+        payload.len(),
+        hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn log_i2c_router_accept(payload: &[u8], side_id: RouterSideId) {
+    match serialize::peek_envelope(payload) {
+        Ok(envelope) => {
+            eprintln!(
+                "i2c router accept: side={side_id:?} sender={} ty={:?} endpoints={:?} ts={} bytes={} data={}",
+                envelope.sender,
+                envelope.ty,
+                envelope.endpoints,
+                envelope.timestamp_ms,
+                payload.len(),
+                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "i2c router accept but peek_envelope failed: side={side_id:?} bytes={} err={err} data={}",
+                payload.len(),
+                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn log_i2c_router_decode_error(context: &str, payload: &[u8], err: &dyn Error) {
+    eprintln!(
+        "i2c router decode error ({context}): bytes={} err={err} data={}",
+        payload.len(),
+        hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 struct I2cMailboxSlot {
     kind: u8,
@@ -817,6 +868,7 @@ impl CommsDevice for I2cComms {
                             eprintln!("i2c receive failed: {err}");
                             TelemetryError::HandlerError("i2c receive failed")
                         })? {
+                            log_i2c_rx_payload(kind, &payload);
                             maybe_log_i2c_decoded(&payload);
                             if kind != I2C_KIND_DATA {
                                 if kind == I2C_KIND_ERROR {
@@ -831,13 +883,39 @@ impl CommsDevice for I2cComms {
                             }
                             self.rx_payload_buf.extend_from_slice(&payload);
                             while let Some(packet) = self.try_take_buffered_packet()? {
-                                if let Err(err) =
-                                    router.rx_serialized_queue_from_side(&packet, side_id)
-                                {
-                                    eprintln!("i2c router reject: {err}");
-                                    return Err(err);
+                                match router.rx_serialized_queue_from_side(&packet, side_id) {
+                                    Ok(()) => {
+                                        log_i2c_router_accept(&packet, side_id);
+                                    }
+                                    Err(err) => {
+                                        log_i2c_router_decode_error(
+                                            "router rejected serialized packet",
+                                            &packet,
+                                            &err,
+                                        );
+                                        eprintln!("i2c router reject: {err}");
+                                        return Err(err);
+                                    }
                                 }
                                 return Ok(());
+                            }
+                            if !self.rx_payload_buf.is_empty() {
+                                match serialize::peek_frame_info(&self.rx_payload_buf) {
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        log_i2c_router_decode_error(
+                                            "buffered payload did not form a serialized packet",
+                                            &self.rx_payload_buf,
+                                            &err,
+                                        );
+                                    }
+                                }
+                            }
+                            if payload.is_empty() {
+                                eprintln!("i2c rx payload was empty after reassembly");
+                            }
+                            if kind == I2C_KIND_DATA && !payload.is_empty() && self.rx_payload_buf.is_empty() {
+                                eprintln!("i2c rx payload consumed with no buffered remainder");
                             }
                         }
                     }
@@ -863,7 +941,20 @@ impl CommsDevice for I2cComms {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(target_os = "linux")]
         {
-            self.write_payload(I2C_KIND_DATA, payload)
+            log_i2c_tx_payload(I2C_KIND_DATA, payload);
+            match self.write_payload(I2C_KIND_DATA, payload) {
+                Ok(()) => {
+                    eprintln!("i2c tx accepted by transport: bytes={}", payload.len());
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!(
+                        "i2c tx rejected by transport: bytes={} err={err}",
+                        payload.len()
+                    );
+                    Err(err)
+                }
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
