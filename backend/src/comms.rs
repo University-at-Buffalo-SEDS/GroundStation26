@@ -370,18 +370,70 @@ fn maybe_log_i2c_decoded(payload: &[u8]) {
 
 #[cfg(target_os = "linux")]
 fn log_i2c_rx_payload(kind: u8, payload: &[u8]) {
-    eprintln!(
-        "i2c rx payload: kind={kind} bytes={} data={}",
-        payload.len(),
-        hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-    );
+    match serialize::peek_frame_info(payload) {
+        Ok(frame) => {
+            eprintln!(
+                "i2c rx payload: kind={kind} bytes={} sender={} ty={:?} endpoints={:?} ts={} data={}",
+                payload.len(),
+                frame.envelope.sender,
+                frame.envelope.ty,
+                frame.envelope.endpoints,
+                frame.envelope.timestamp_ms,
+                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "i2c rx payload: kind={kind} bytes={} undecoded err={err} data={}",
+                payload.len(),
+                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn log_i2c_tx_payload(kind: u8, payload: &[u8]) {
+    match serialize::peek_frame_info(payload) {
+        Ok(frame) => {
+            eprintln!(
+                "i2c tx payload: kind={kind} bytes={} sender={} ty={:?} endpoints={:?} ts={} data={}",
+                payload.len(),
+                frame.envelope.sender,
+                frame.envelope.ty,
+                frame.envelope.endpoints,
+                frame.envelope.timestamp_ms,
+                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "i2c tx payload: kind={kind} bytes={} undecoded err={err} data={}",
+                payload.len(),
+                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn log_i2c_tx_command_payload(kind: u8, payload: &[u8]) {
+    let Ok(frame) = serialize::peek_frame_info(payload) else {
+        return;
+    };
+    if !matches!(
+        frame.envelope.ty,
+        DataType::FlightCommand | DataType::ValveCommand | DataType::ActuatorCommand | DataType::Abort
+    ) {
+        return;
+    }
     eprintln!(
-        "i2c tx payload: kind={kind} bytes={} data={}",
+        "i2c tx command: kind={kind} bytes={} sender={} ty={:?} endpoints={:?} ts={} data={}",
         payload.len(),
+        frame.envelope.sender,
+        frame.envelope.ty,
+        frame.envelope.endpoints,
+        frame.envelope.timestamp_ms,
         hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
     );
 }
@@ -942,6 +994,7 @@ impl CommsDevice for I2cComms {
         #[cfg(target_os = "linux")]
         {
             log_i2c_tx_payload(I2C_KIND_DATA, payload);
+            log_i2c_tx_command_payload(I2C_KIND_DATA, payload);
             match self.write_payload(I2C_KIND_DATA, payload) {
                 Ok(()) => {
                     eprintln!("i2c tx accepted by transport: bytes={}", payload.len());

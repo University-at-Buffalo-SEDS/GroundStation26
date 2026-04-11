@@ -129,6 +129,25 @@ fn log_outbound_command_packet(side_name: &str, pkt: &[u8], result: Result<(), &
     }
 }
 
+fn log_outbound_command_attempt(side_name: &str, pkt: &[u8]) {
+    let Ok(envelope) = peek_envelope(pkt) else {
+        return;
+    };
+    if !is_command_like(envelope.ty) {
+        return;
+    }
+
+    eprintln!(
+        "{side_name} send attempt: sender={} ty={:?} endpoints={:?} ts={} bytes={} payload={}",
+        envelope.sender,
+        envelope.ty,
+        envelope.endpoints,
+        envelope.timestamp_ms,
+        pkt.len(),
+        hex_preview(pkt, 24)
+    );
+}
+
 /// Creates the SQLite file on disk when it does not exist and returns a stable path string.
 fn ensure_sqlite_db_file(path: &Path) -> anyhow::Result<String> {
     if !path.exists() {
@@ -738,6 +757,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut guard = umbilical_comms
                     .lock()
                     .map_err(|_| TelemetryError::HandlerError("Comms mutex poisoned"))?;
+                log_outbound_command_attempt("umbilical_comms", pkt);
                 match guard.send_data(pkt) {
                     Ok(()) => {
                         log_outbound_command_packet("umbilical_comms", pkt, Ok(()));
