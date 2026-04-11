@@ -657,15 +657,34 @@ class FillLinkApp:
 
 
 def draw_box(stdscr: curses.window, y: int, x: int, h: int, w: int, title: str) -> None:
-    stdscr.addstr(y, x + 2, f" {title} ", curses.A_BOLD)
-    stdscr.hline(y, x + 1, curses.ACS_HLINE, max(0, w - 2))
-    stdscr.hline(y + h - 1, x + 1, curses.ACS_HLINE, max(0, w - 2))
-    stdscr.vline(y + 1, x, curses.ACS_VLINE, max(0, h - 2))
-    stdscr.vline(y + 1, x + w - 1, curses.ACS_VLINE, max(0, h - 2))
-    stdscr.addch(y, x, curses.ACS_ULCORNER)
-    stdscr.addch(y, x + w - 1, curses.ACS_URCORNER)
-    stdscr.addch(y + h - 1, x, curses.ACS_LLCORNER)
-    stdscr.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
+    max_y, max_x = stdscr.getmaxyx()
+    if h < 2 or w < 2 or y < 0 or x < 0 or y >= max_y or x >= max_x:
+        return
+
+    right = min(x + w - 1, max_x - 1)
+    bottom = min(y + h - 1, max_y - 1)
+    inner_w = max(0, right - x - 1)
+    inner_h = max(0, bottom - y - 1)
+
+    try:
+        if x + 2 <= right:
+            stdscr.addnstr(y, x + 2, f" {title} ", max(0, right - (x + 2)), curses.A_BOLD)
+        stdscr.hline(y, x + 1, curses.ACS_HLINE, inner_w)
+        if bottom > y:
+            stdscr.hline(bottom, x + 1, curses.ACS_HLINE, inner_w)
+        stdscr.vline(y + 1, x, curses.ACS_VLINE, inner_h)
+        if right > x:
+            stdscr.vline(y + 1, right, curses.ACS_VLINE, inner_h)
+        stdscr.addch(y, x, curses.ACS_ULCORNER)
+        if right > x:
+            stdscr.addch(y, right, curses.ACS_URCORNER)
+        if bottom > y:
+            stdscr.addch(bottom, x, curses.ACS_LLCORNER)
+        # Avoid writing the terminal's lower-right cell; curses often rejects it.
+        if bottom > y and right > x and not (bottom == max_y - 1 and right == max_x - 1):
+            stdscr.addch(bottom, right, curses.ACS_LRCORNER)
+    except curses.error:
+        return
 
 
 def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
