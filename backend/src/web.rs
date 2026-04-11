@@ -37,7 +37,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 // NEW
 
-static FAVICON_DATA: OnceCell<Vec<u8>> = OnceCell::const_new();
+static FAVICON_DATA: OnceCell<Option<Vec<u8>>> = OnceCell::const_new();
 static TILE_DB_POOL: OnceCell<Option<sqlx::SqlitePool>> = OnceCell::const_new();
 static TILE_DB_MODE: OnceCell<TileDbMode> = OnceCell::const_new();
 const RECENT_HISTORY_MS: i64 = 20 * 60 * 1000;
@@ -1034,7 +1034,6 @@ async fn load_recent_rows_from_db(
 
 /// Serves the app icon and caches it after the first disk read.
 async fn get_favicon() -> impl IntoResponse {
-    // Load the favicon into memory on first request, reuse later
     let bytes = FAVICON_DATA
         .get_or_init(|| async {
             let candidates: [PathBuf; 3] = [
@@ -1044,18 +1043,23 @@ async fn get_favicon() -> impl IntoResponse {
             ];
             for path in candidates {
                 match tokio::fs::read(&path).await {
-                    Ok(bytes) => return bytes,
+                    Ok(bytes) => return Some(bytes),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => panic!("failed to read favicon at {:?}: {err}", path),
+                    Err(err) => {
+                        eprintln!("failed to read favicon at {:?}: {err}", path);
+                        return None;
+                    }
                 }
             }
-            panic!("failed to find favicon in built frontend output")
+            None
         })
         .await
         .clone();
 
-    // Return as an image/png response
-    ([(header::CONTENT_TYPE, "image/png")], bytes)
+    match bytes {
+        Some(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, "image/png")], bytes).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 /// Returns the latest persisted flight-state enum value.
 async fn get_flight_state(

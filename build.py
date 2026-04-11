@@ -216,6 +216,30 @@ def _resolve_external_public_dir(checkout_dir: Path) -> Path:
     )
 
 
+def _resolve_external_favicon(checkout_dir: Path) -> Optional[Path]:
+    candidate_names = ("icon.png", "favicon.png", "favicon.ico")
+    candidate_dirs = (
+        checkout_dir,
+        checkout_dir / "frontend",
+        checkout_dir / "assets",
+        checkout_dir / "public",
+        checkout_dir / "static",
+        checkout_dir / "dist",
+        checkout_dir / "dist" / "public",
+        checkout_dir / "frontend" / "assets",
+        checkout_dir / "frontend" / "public",
+        checkout_dir / "frontend" / "static",
+        checkout_dir / "frontend" / "dist",
+        checkout_dir / "frontend" / "dist" / "public",
+    )
+    for directory in candidate_dirs:
+        for name in candidate_names:
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def _ensure_frontend_checkout(checkout_dir: Path) -> None:
     if not checkout_dir.exists():
         checkout_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -261,6 +285,12 @@ def _sync_frontend_public_assets(repo_root: Path, checkout_dir: Path) -> None:
         shutil.rmtree(dst_public_dir)
     print(f"Syncing frontend web assets: {src_public_dir} -> {dst_public_dir}")
     shutil.copytree(src_public_dir, dst_public_dir)
+    favicon = _resolve_external_favicon(checkout_dir)
+    if favicon is not None:
+        dst_favicon = dst_public_dir / favicon.name
+        if favicon.resolve() != dst_favicon.resolve():
+            print(f"Syncing frontend favicon: {favicon} -> {dst_favicon}")
+            shutil.copy2(favicon, dst_favicon)
 
 
 def _run_frontend_build(
