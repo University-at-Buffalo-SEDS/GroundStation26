@@ -206,14 +206,15 @@ def comms_config_path(backend_root: Path) -> Path:
 
 def load_fill_link_config(backend_root: Path) -> dict:
     path = comms_config_path(backend_root)
-    if path.exists():
-        with path.open("r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-    else:
-        raw = {}
+    if not path.exists():
+        raise SystemExit(f"Comms config not found: {path}")
+    with path.open("r", encoding="utf-8") as fh:
+        raw = json.load(fh)
 
     fill = raw.get("fill_box") or {}
-    interface = fill.get("interface", "serial")
+    interface = fill.get("interface")
+    if not interface:
+        raise SystemExit(f"fill_box.interface missing in comms config: {path}")
     if interface in {"serial", "raspberry_pi_gpio_uart", "custom_serial"}:
         protocol = fill.get("protocol", "raw_uart")
         return {
@@ -223,9 +224,17 @@ def load_fill_link_config(backend_root: Path) -> dict:
             "baud_rate": int(fill.get("baud_rate", SERIAL_DEFAULT_BAUD)),
         }
     if interface == "i2c":
+        bus = fill.get("bus")
+        if bus is None:
+            port = str(fill.get("port", "")).strip()
+            if port.startswith("/dev/i2c-"):
+                try:
+                    bus = int(port.rsplit("-", 1)[1], 10)
+                except (IndexError, ValueError):
+                    raise SystemExit(f"Invalid fill_box I2C port in comms config: {port}") from None
         return {
             "interface": interface,
-            "bus": int(fill.get("bus", I2C_DEFAULT_BUS)),
+            "bus": int(bus if bus is not None else I2C_DEFAULT_BUS),
             "addr": int(fill.get("addr", I2C_DEFAULT_ADDR)),
             "chunk_delay_ms": int(fill.get("chunk_delay_ms", I2C_DEFAULT_CHUNK_DELAY_MS)),
             "initial_wait_ms": int(fill.get("initial_wait_ms", I2C_DEFAULT_INITIAL_WAIT_MS)),
