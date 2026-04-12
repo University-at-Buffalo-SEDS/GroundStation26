@@ -41,7 +41,6 @@ use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode, RouterSideOptions};
-use sedsprintf_rs_2026::serialize::peek_envelope;
 use sedsprintf_rs_2026::timesync::{TimeSyncConfig, TimeSyncRole};
 use sedsprintf_rs_2026::TelemetryError;
 use sqlx::sqlite::SqliteConnection;
@@ -73,104 +72,6 @@ fn env_i64(name: &str, default: i64, min: i64, max: i64) -> i64 {
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(default)
         .clamp(min, max)
-}
-
-fn hex_preview(bytes: &[u8], limit: usize) -> String {
-    let preview = bytes
-        .iter()
-        .take(limit)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if bytes.len() > limit {
-        format!("{preview} ...")
-    } else {
-        preview
-    }
-}
-
-fn is_command_like(ty: DataType) -> bool {
-    matches!(
-        ty,
-        DataType::FlightCommand | DataType::ValveCommand | DataType::ActuatorCommand | DataType::Abort
-    )
-}
-
-fn log_outbound_command_packet(side_name: &str, pkt: &[u8], result: Result<(), &dyn std::error::Error>) {
-    let Ok(envelope) = peek_envelope(pkt) else {
-        return;
-    };
-    if !is_command_like(envelope.ty) {
-        return;
-    }
-
-    let preview = hex_preview(pkt, 24);
-    match result {
-        Ok(()) => {
-            eprintln!(
-                "{side_name} send ok: sender={} ty={:?} endpoints={:?} ts={} bytes={} payload={}",
-                envelope.sender,
-                envelope.ty,
-                envelope.endpoints,
-                envelope.timestamp_ms,
-                pkt.len(),
-                preview
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "{side_name} send failed: sender={} ty={:?} endpoints={:?} ts={} bytes={} payload={} err={err}",
-                envelope.sender,
-                envelope.ty,
-                envelope.endpoints,
-                envelope.timestamp_ms,
-                pkt.len(),
-                preview
-            );
-        }
-    }
-}
-
-fn log_outbound_command_attempt(side_name: &str, pkt: &[u8]) {
-    let Ok(envelope) = peek_envelope(pkt) else {
-        return;
-    };
-    if !is_command_like(envelope.ty) {
-        return;
-    }
-
-    eprintln!(
-        "{side_name} send attempt: sender={} ty={:?} endpoints={:?} ts={} bytes={} payload={}",
-        envelope.sender,
-        envelope.ty,
-        envelope.endpoints,
-        envelope.timestamp_ms,
-        pkt.len(),
-        hex_preview(pkt, 24)
-    );
-}
-
-fn log_i2c_side_tx_attempt(side_name: &str, pkt: &[u8]) {
-    match peek_envelope(pkt) {
-        Ok(envelope) => {
-            eprintln!(
-                "{side_name} i2c side tx: sender={} ty={:?} endpoints={:?} ts={} bytes={} payload={}",
-                envelope.sender,
-                envelope.ty,
-                envelope.endpoints,
-                envelope.timestamp_ms,
-                pkt.len(),
-                hex_preview(pkt, 24)
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "{side_name} i2c side tx: undecoded bytes={} payload={} err={err}",
-                pkt.len(),
-                hex_preview(pkt, 24)
-            );
-        }
-    }
 }
 
 /// Creates the SQLite file on disk when it does not exist and returns a stable path string.
@@ -776,10 +677,6 @@ async fn main() -> anyhow::Result<()> {
 
     let umbilical_side = {
         let umbilical_tx = umbilical_tx.clone();
-        let umbilical_is_i2c = matches!(
-            comms_links.fill_box,
-            crate::comms_config::CommsLinkConfig::I2c { .. }
-        );
         let opts = RouterSideOptions {
             reliable_enabled: !matches!(
                 comms_links.fill_box,
@@ -793,10 +690,6 @@ async fn main() -> anyhow::Result<()> {
         router.add_side_serialized_with_options(
             "umbilical_comms",
             move |pkt| {
-                if umbilical_is_i2c {
-                    log_i2c_side_tx_attempt("umbilical_comms", pkt);
-                }
-                log_outbound_command_attempt("umbilical_comms", pkt);
                 umbilical_tx
                     .send(pkt.to_vec())
                     .map_err(|_| TelemetryError::HandlerError("umbilical_comms tx queue closed"))?;

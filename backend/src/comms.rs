@@ -371,28 +371,6 @@ fn maybe_log_i2c_decoded(payload: &[u8]) {
 }
 
 #[cfg(target_os = "linux")]
-fn log_i2c_tx_command_payload(kind: u8, payload: &[u8]) {
-    let Ok(frame) = serialize::peek_frame_info(payload) else {
-        return;
-    };
-    if !matches!(
-        frame.envelope.ty,
-        DataType::FlightCommand | DataType::ValveCommand | DataType::ActuatorCommand | DataType::Abort
-    ) {
-        return;
-    }
-    eprintln!(
-        "i2c tx command: kind={kind} bytes={} sender={} ty={:?} endpoints={:?} ts={} data={}",
-        payload.len(),
-        frame.envelope.sender,
-        frame.envelope.ty,
-        frame.envelope.endpoints,
-        frame.envelope.timestamp_ms,
-        hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-    );
-}
-
-#[cfg(target_os = "linux")]
 fn log_i2c_router_decode_error(context: &str, payload: &[u8], err: &dyn Error) {
     eprintln!(
         "i2c router decode error ({context}): bytes={} err={err} data={}",
@@ -916,40 +894,7 @@ impl CommsDevice for I2cComms {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(target_os = "linux")]
         {
-            log_i2c_tx_command_payload(I2C_KIND_DATA, payload);
-            match self.write_payload(I2C_KIND_DATA, payload) {
-                Ok(()) => {
-                    if let Ok(frame) = serialize::peek_frame_info(payload)
-                        && matches!(
-                            frame.envelope.ty,
-                            DataType::FlightCommand
-                                | DataType::ValveCommand
-                                | DataType::ActuatorCommand
-                                | DataType::Abort
-                        )
-                    {
-                        eprintln!("i2c tx accepted by transport: bytes={}", payload.len());
-                    }
-                    Ok(())
-                }
-                Err(err) => {
-                    if let Ok(frame) = serialize::peek_frame_info(payload)
-                        && matches!(
-                            frame.envelope.ty,
-                            DataType::FlightCommand
-                                | DataType::ValveCommand
-                                | DataType::ActuatorCommand
-                                | DataType::Abort
-                        )
-                    {
-                        eprintln!(
-                            "i2c tx rejected by transport: bytes={} err={err}",
-                            payload.len()
-                        );
-                    }
-                    Err(err)
-                }
-            }
+            self.write_payload(I2C_KIND_DATA, payload)
         }
         #[cfg(not(target_os = "linux"))]
         {
