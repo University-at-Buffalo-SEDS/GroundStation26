@@ -13,6 +13,13 @@ LOG_FILE: Optional[Path] = None
 INTERRUPTED_EXIT_CODE = 130
 FRONTEND_REPO_URL = "https://github.com/Rylan-Meilutis/Seds-Ground-Station-Frontend"
 FRONTEND_CHECKOUT_ENV = "GS26_FRONTEND_CHECKOUT_DIR"
+WASM_OPT_FAILURE_HINTS = (
+    "wasm-opt failed",
+    "error parsing wasm",
+    "unsupported version of dwarf",
+    "compile unit size was incorrect",
+    "invalid code after misc prefix",
+)
 
 
 def _append_log(line: str) -> None:
@@ -153,6 +160,55 @@ def build_docker(repo_root: Path, pi_build: bool, testing: bool, plain_progress:
 
 def _run_script(repo_root: Path, script: Path, args: list[str]) -> None:
     run([sys.executable, str(script), *args], cwd=repo_root)
+
+
+def _run_frontend_script_with_wasm_opt_fallback(script: Path, checkout_dir: Path, args: list[str]) -> None:
+    cmd = [sys.executable, str(script), *args]
+    cmd_line = f"Running: {' '.join(str(part) for part in cmd)} (cwd={checkout_dir})"
+    print(cmd_line)
+    _append_log(cmd_line + "\n")
+
+    proc = subprocess.Popen(
+        [str(part) for part in cmd],
+        cwd=checkout_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+
+    lines: list[str] = []
+    try:
+        for line in proc.stdout:
+            print(line, end="")
+            _append_log(line)
+            lines.append(line)
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
+
+    if rc == 0:
+        return
+
+    combined_output = "".join(lines).lower()
+    public_dir = _resolve_external_public_dir(checkout_dir)
+    if public_dir.is_dir() and any(hint in combined_output for hint in WASM_OPT_FAILURE_HINTS):
+        warning = (
+            "Warning: frontend build completed but wasm-opt post-processing failed. "
+            "Continuing with the unoptimized wasm bundle because dist/public was produced."
+        )
+        print(warning)
+        _append_log(warning + "\n")
+        return
+
+    raise subprocess.CalledProcessError(rc, [str(part) for part in cmd])
 
 
 def _normalize_git_url(url: str) -> str:
@@ -317,7 +373,7 @@ def _run_frontend_build(
             log_path = repo_root / log_path
         args.append(f"log={log_path}")
 
-    _run_script(checkout_dir, script, args)
+    _run_frontend_script_with_wasm_opt_fallback(script, checkout_dir, args)
     _sync_frontend_public_assets(repo_root, checkout_dir)
 
 
