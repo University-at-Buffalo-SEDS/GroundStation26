@@ -1313,18 +1313,15 @@ impl CommsDevice for DummyComms {
                 return _router.rx_queue_from_side(pkt, side_id);
             }
             let pkt = get_dummy_packet()?;
-            return _router.rx_queue_from_side(pkt, side_id);
+            _router.rx_queue_from_side(pkt, side_id)
         }
 
         #[cfg(not(feature = "testing"))]
         {
             let _ = _router;
             // In hitl_mode, dummy comms links are used only as disconnected-link placeholders.
-            return Ok(());
+            Ok(())
         }
-
-        #[allow(unreachable_code)]
-        Ok(())
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {

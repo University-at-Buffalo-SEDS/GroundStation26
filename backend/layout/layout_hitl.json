@@ -469,6 +469,18 @@
             }
           },
           {
+            "id": "battery_voltage_vb",
+            "label": "Valve Board",
+            "data_type": "BATTERY_VOLTAGE",
+            "sender_id": "VB",
+            "channels": [
+              "Voltage"
+            ],
+            "chart": {
+              "enabled": true
+            }
+          },
+          {
             "id": "battery_voltage_gw",
             "label": "Ground Station",
             "data_type": "BATTERY_VOLTAGE",
@@ -505,6 +517,18 @@
             }
           },
           {
+            "id": "battery_current_vb",
+            "label": "Valve Board",
+            "data_type": "BATTERY_CURRENT",
+            "sender_id": "VB",
+            "channels": [
+              "Current"
+            ],
+            "chart": {
+              "enabled": true
+            }
+          },
+          {
             "id": "battery_current_gw",
             "label": "Ground Station",
             "data_type": "BATTERY_CURRENT",
@@ -528,6 +552,9 @@
           "AV Bay %",
           "AV Bay Drop",
           "AV Bay Runtime",
+          "Valve Board %",
+          "Valve Board Drop",
+          "Valve Board Runtime",
           "Ground Station %",
           "Ground Station Drop",
           "Ground Station Runtime"
@@ -553,6 +580,30 @@
               {
                 "label": "Runtime",
                 "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
+                "index": 0
+              }
+            ]
+          },
+          {
+            "id": "battery_runtime_vb",
+            "label": "Valve Board",
+            "chart": {
+              "enabled": false
+            },
+            "summary_items": [
+              {
+                "label": "Battery %",
+                "data_type": "VALVE_BOARD_BATTERY_PERCENT",
+                "index": 0
+              },
+              {
+                "label": "Drop Rate",
+                "data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
+                "index": 0
+              },
+              {
+                "label": "Runtime",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
                 "index": 0
               }
             ]
@@ -979,6 +1030,18 @@
         "percent_data_type": "AV_BAY_BATTERY_PERCENT",
         "drop_rate_data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
+        "empty_voltage": 6.3,
+        "full_voltage": 8.4,
+        "curve_exponent": 1.0
+      },
+      {
+        "id": "valve_board",
+        "label": "Valve Board Battery",
+        "sender_id": "VB",
+        "input_data_type": "BATTERY_VOLTAGE",
+        "percent_data_type": "VALVE_BOARD_BATTERY_PERCENT",
+        "drop_rate_data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
+        "remaining_minutes_data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
         "empty_voltage": 6.3,
         "full_voltage": 8.4,
         "curve_exponent": 1.0

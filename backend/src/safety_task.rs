@@ -8,7 +8,7 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 // Acceleration thresholds (m/s²)
 const ACCELERATION_X_MIN_THRESHOLD: f32 = -2.0; // m/s²
@@ -44,6 +44,8 @@ const GPS_LONGITUDE_MAX_THRESHOLD: f32 = -93.5; // degrees
 // Default battery voltage thresholds (V), used as fallback sender ranges.
 const BATTERY_VOLTAGE_AV_BAY_MIN_THRESHOLD: f32 = 6.3; // V
 const BATTERY_VOLTAGE_AV_BAY_MAX_THRESHOLD: f32 = 8.4; // V
+const BATTERY_VOLTAGE_VALVE_BOARD_MIN_THRESHOLD: f32 = 6.3; // V
+const BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD: f32 = 8.4; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD: f32 = 13.3; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 15.5; // V
 
@@ -97,6 +99,13 @@ fn battery_voltage_bounds_by_sender() -> &'static HashMap<String, (f32, f32)> {
                 (
                     BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD,
                     BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD,
+                ),
+            ),
+            (
+                Board::ValveBoard.sender_id().to_string(),
+                (
+                    BATTERY_VOLTAGE_VALVE_BOARD_MIN_THRESHOLD,
+                    BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD,
                 ),
             ),
         ]);

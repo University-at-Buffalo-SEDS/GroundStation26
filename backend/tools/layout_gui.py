@@ -966,6 +966,9 @@ class LayoutEditor(tk.Tk):
         ttk.Button(btns, text="Add AV Bay Preset", command=self._add_av_bay_battery_preset).pack(
             side=tk.LEFT, padx=4
         )
+        ttk.Button(btns, text="Add Valve Board Preset", command=self._add_valve_board_battery_preset).pack(
+            side=tk.LEFT, padx=4
+        )
         ttk.Button(
             btns,
             text="Add Fill Box Preset",
@@ -1883,6 +1886,24 @@ class LayoutEditor(tk.Tk):
                 "empty_voltage": 13.3,
                 "nominal_voltage": 14.0,
                 "full_voltage": 15.5,
+                "curve_exponent": 1.0,
+            }
+        )
+        self._refresh_lists()
+
+    def _add_valve_board_battery_preset(self) -> None:
+        self.data["battery"]["sources"].append(
+            {
+                "id": "valve_board",
+                "label": "Valve Board Battery",
+                "sender_id": "VB",
+                "input_data_type": "BATTERY_VOLTAGE",
+                "percent_data_type": "VALVE_BOARD_BATTERY_PERCENT",
+                "drop_rate_data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
+                "remaining_minutes_data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
+                "empty_voltage": 6.3,
+                "nominal_voltage": 7.4,
+                "full_voltage": 8.4,
                 "curve_exponent": 1.0,
             }
         )

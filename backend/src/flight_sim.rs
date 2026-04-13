@@ -37,6 +37,10 @@ const AV_BAY_BATTERY_CUTOFF_V: f32 = 6.3;
 #[cfg(feature = "testing")]
 const AV_BAY_BATTERY_MAX_V: f32 = 8.4;
 #[cfg(feature = "testing")]
+const VALVE_BOARD_BATTERY_CUTOFF_V: f32 = 6.3;
+#[cfg(feature = "testing")]
+const VALVE_BOARD_BATTERY_MAX_V: f32 = 8.4;
+#[cfg(feature = "testing")]
 const GROUND_STATION_BATTERY_CUTOFF_V: f32 = 13.3;
 #[cfg(feature = "testing")]
 const GROUND_STATION_BATTERY_MAX_V: f32 = 15.5;
@@ -161,10 +165,12 @@ struct FlightSimState {
     yaw_dps: f32,
     last_physics_ms: u64,
     av_bay_battery_v: f32,
+    valve_board_battery_v: f32,
+    valve_board_battery_a: f32,
     ground_station_battery_v: f32,
     ground_station_battery_a: f32,
-    next_battery_sender_gateway: bool,
-    last_battery_sender_gateway: bool,
+    next_battery_sender_idx: usize,
+    last_battery_sender: Board,
     loadcell_mass_kg: f32,
     valves: HashMap<u8, bool>,
     saw_dump_open_after_n2: bool,
@@ -218,10 +224,12 @@ impl FlightSimState {
             yaw_dps: 0.0,
             last_physics_ms: 0,
             av_bay_battery_v: AV_BAY_BATTERY_MAX_V,
+            valve_board_battery_v: VALVE_BOARD_BATTERY_MAX_V,
+            valve_board_battery_a: 0.55,
             ground_station_battery_v: GROUND_STATION_BATTERY_MAX_V,
             ground_station_battery_a: 0.7,
-            next_battery_sender_gateway: false,
-            last_battery_sender_gateway: false,
+            next_battery_sender_idx: 0,
+            last_battery_sender: Board::PowerBoard,
             loadcell_mass_kg: 0.0,
             valves,
             saw_dump_open_after_n2: false,
@@ -361,6 +369,20 @@ impl FlightSimState {
             self.battery_a,
             now_ms,
         );
+        if valve_board_online {
+            self.queue_scalar_f32(
+                DataType::BatteryVoltage,
+                Board::ValveBoard,
+                self.valve_board_battery_v,
+                now_ms,
+            );
+            self.queue_scalar_f32(
+                DataType::BatteryCurrent,
+                Board::ValveBoard,
+                self.valve_board_battery_a,
+                now_ms,
+            );
+        }
         self.queue_scalar_f32(
             DataType::BatteryVoltage,
             Board::GatewayBoard,
@@ -619,6 +641,16 @@ impl FlightSimState {
         }
 
         self.battery_a = (1.0 + self.fuel_flow_lpm * 0.12).min(35.0);
+        let valve_board_online = !valve_board_disconnected_for_state(self.flight_state);
+        self.valve_board_battery_a = if valve_board_online {
+            if self.launch_time_ms.is_some() {
+                0.85
+            } else {
+                0.55
+            }
+        } else {
+            0.0
+        };
         self.ground_station_battery_a = if self.launch_time_ms.is_some() {
             0.95
         } else {
@@ -627,10 +659,13 @@ impl FlightSimState {
 
         // Make simulated pack drain visible over test sessions instead of effectively flat.
         let av_bay_drop_v_per_s = 0.00035 + self.battery_a * 0.00012;
+        let valve_board_drop_v_per_s = 0.00024 + self.valve_board_battery_a * 0.00010;
         let gs_drop_v_per_s = 0.00020 + self.ground_station_battery_a * 0.00008;
 
         self.av_bay_battery_v =
             (self.av_bay_battery_v - av_bay_drop_v_per_s * dt_s).max(AV_BAY_BATTERY_CUTOFF_V);
+        self.valve_board_battery_v = (self.valve_board_battery_v - valve_board_drop_v_per_s * dt_s)
+            .max(VALVE_BOARD_BATTERY_CUTOFF_V);
         self.ground_station_battery_v = (self.ground_station_battery_v - gs_drop_v_per_s * dt_s)
             .max(GROUND_STATION_BATTERY_CUTOFF_V);
         self.battery_v = self.av_bay_battery_v;
@@ -771,26 +806,47 @@ impl FlightSimState {
                 .into_iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect(),
-            DataType::BatteryVoltage => if self.next_battery_sender_gateway {
-                self.next_battery_sender_gateway = false;
-                self.last_battery_sender_gateway = true;
-                sender = Board::GatewayBoard.sender_id();
-                vec![self.ground_station_battery_v]
-            } else {
-                self.next_battery_sender_gateway = true;
-                self.last_battery_sender_gateway = false;
-                sender = Board::PowerBoard.sender_id();
-                vec![self.av_bay_battery_v]
+            DataType::BatteryVoltage => {
+                let valve_board_online = !valve_board_disconnected_for_state(self.flight_state);
+                let battery_sources: &[(Board, f32)] = if valve_board_online {
+                    &[
+                        (Board::PowerBoard, self.av_bay_battery_v),
+                        (Board::ValveBoard, self.valve_board_battery_v),
+                        (Board::GatewayBoard, self.ground_station_battery_v),
+                    ]
+                } else {
+                    &[
+                        (Board::PowerBoard, self.av_bay_battery_v),
+                        (Board::GatewayBoard, self.ground_station_battery_v),
+                    ]
+                };
+                let (board, voltage) =
+                    battery_sources[self.next_battery_sender_idx % battery_sources.len()];
+                self.next_battery_sender_idx =
+                    (self.next_battery_sender_idx + 1) % battery_sources.len();
+                self.last_battery_sender = board;
+                sender = board.sender_id();
+                vec![voltage]
             }
             .into_iter()
             .flat_map(|v| v.to_le_bytes())
             .collect(),
-            DataType::BatteryCurrent => if self.last_battery_sender_gateway {
-                sender = Board::GatewayBoard.sender_id();
-                vec![self.ground_station_battery_a]
-            } else {
-                sender = Board::PowerBoard.sender_id();
-                vec![self.battery_a]
+            DataType::BatteryCurrent => {
+                let current = match self.last_battery_sender {
+                    Board::GatewayBoard => {
+                        sender = Board::GatewayBoard.sender_id();
+                        self.ground_station_battery_a
+                    }
+                    Board::ValveBoard => {
+                        sender = Board::ValveBoard.sender_id();
+                        self.valve_board_battery_a
+                    }
+                    _ => {
+                        sender = Board::PowerBoard.sender_id();
+                        self.battery_a
+                    }
+                };
+                vec![current]
             }
             .into_iter()
             .flat_map(|v| v.to_le_bytes())

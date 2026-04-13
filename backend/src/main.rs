@@ -23,7 +23,7 @@ mod telemetry_task;
 mod types;
 mod web;
 
-use crate::map::{ensure_map_data, DEFAULT_MAP_REGION};
+use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
@@ -34,15 +34,15 @@ use crate::telemetry_task::{
 
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 use crate::comms::DummyComms;
-use crate::comms::{link_description, open_link, startup_failure_hint, CommsDevice};
+use crate::comms::{CommsDevice, link_description, open_link, startup_failure_hint};
 use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
+use sedsprintf_rs_2026::TelemetryError;
 use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation, HeartBeat};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode, RouterSideOptions};
 use sedsprintf_rs_2026::timesync::{TimeSyncConfig, TimeSyncRole};
-use sedsprintf_rs_2026::TelemetryError;
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Connection, Row};
 use std::collections::HashMap;

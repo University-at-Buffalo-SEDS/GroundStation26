@@ -1057,7 +1057,9 @@ async fn get_favicon() -> impl IntoResponse {
         .clone();
 
     match bytes {
-        Some(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, "image/png")], bytes).into_response(),
+        Some(bytes) => {
+            (StatusCode::OK, [(header::CONTENT_TYPE, "image/png")], bytes).into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
