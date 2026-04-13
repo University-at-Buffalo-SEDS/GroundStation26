@@ -4,8 +4,6 @@ use crate::comms_config::{
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
-#[cfg(target_os = "linux")]
-use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::{
     TelemetryError, TelemetryResult,
     router::{Router, RouterSideId},
