@@ -1202,6 +1202,10 @@ pub async fn telemetry_task(
                     }
                     match cmd {
                         TelemetryCommand::Launch => {
+                                if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
+                                    let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartNow)).await;
+                                    println!("Launch auto-started DB recording");
+                                }
                                 #[cfg(feature = "test_fire_mode")]
                                 {
                                     if let Err(e) = router.log_queue(

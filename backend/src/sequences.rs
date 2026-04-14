@@ -19,6 +19,7 @@ enum NitrogenAutocloseMode {
     Pressure,
     Weight,
     Both,
+    Either,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,10 +66,20 @@ fn backend_blink_for(cmd: &str, enabled: bool, recommended: Option<&BlinkMode>) 
     if let Some(blink) = recommended {
         return blink.clone();
     }
+    if is_recording_command(cmd) {
+        return BlinkMode::None;
+    }
     if backend_illuminated_commands().contains(cmd) {
         return BlinkMode::Slow;
     }
     BlinkMode::None
+}
+
+fn is_recording_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "StartWritingNow" | "StartWritingLastTwoMinutes" | "PauseWritingDb" | "StopWritingDb"
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,11 +175,12 @@ impl SequenceConfig {
                 "pressure" => Some(NitrogenAutocloseMode::Pressure),
                 "weight" => Some(NitrogenAutocloseMode::Weight),
                 "both" => Some(NitrogenAutocloseMode::Both),
+                "either" | "any" => Some(NitrogenAutocloseMode::Either),
                 _ => None,
             })
             .unwrap_or_else(|| {
                 if nitrogen_target_mass_kg.is_some() {
-                    NitrogenAutocloseMode::Weight
+                    NitrogenAutocloseMode::Either
                 } else {
                     NitrogenAutocloseMode::Pressure
                 }
@@ -547,7 +559,11 @@ pub fn default_action_policy() -> ActionPolicyMsg {
                 cmd: cmd.to_string(),
                 enabled,
                 blink: backend_blink_for(cmd, enabled, None),
-                actuated: None,
+                actuated: if is_recording_command(cmd) {
+                    Some(true)
+                } else {
+                    None
+                },
             }
         })
         .collect();
@@ -589,14 +605,8 @@ fn policy_with_overrides(
                 cmd: cmd.to_string(),
                 enabled,
                 blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
-                actuated: if matches!(
-                    cmd,
-                    "StartWritingNow"
-                        | "StartWritingLastTwoMinutes"
-                        | "PauseWritingDb"
-                        | "StopWritingDb"
-                ) {
-                    None
+                actuated: if is_recording_command(cmd) {
+                    Some(true)
                 } else {
                     valves.actuated_for_cmd(cmd)
                 },
@@ -675,6 +685,7 @@ fn update_sequence_runtime(
                 NitrogenAutocloseMode::Pressure => pressure_ready,
                 NitrogenAutocloseMode::Weight => weight_ready,
                 NitrogenAutocloseMode::Both => pressure_ready && weight_ready,
+                NitrogenAutocloseMode::Either => pressure_ready || weight_ready,
             };
 
             if should_close && !runtime.auto_close_nitrogen_sent {
@@ -700,6 +711,14 @@ fn update_sequence_runtime(
                                     cfg.nitrogen_target_mass_kg.unwrap_or_default();
                                 state.add_notification(format!(
                                     "Nitrogen targets reached ({target_mass_kg:.2} kg, {:.1} psi). Closing nitrogen valve.",
+                                    cfg.nitrogen_pressure_target_psi
+                                ));
+                            }
+                            NitrogenAutocloseMode::Either => {
+                                let target_mass_kg =
+                                    cfg.nitrogen_target_mass_kg.unwrap_or_default();
+                                state.add_notification(format!(
+                                    "Nitrogen fill target reached by weight or pressure ({target_mass_kg:.2} kg / {:.1} psi). Closing nitrogen valve.",
                                     cfg.nitrogen_pressure_target_psi
                                 ));
                             }
