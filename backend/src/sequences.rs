@@ -925,14 +925,14 @@ fn maybe_drive_local_prelaunch_state(
     current_state
 }
 
-fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
+fn hitl_action_policy(_valves: ValveSnapshot) -> ActionPolicyMsg {
     let controls = all_command_names()
         .into_iter()
         .map(|cmd| ActionControl {
             cmd: cmd.to_string(),
             enabled: true,
             blink: BlinkMode::None,
-            actuated: valves.actuated_for_cmd(cmd),
+            actuated: None,
         })
         .collect();
 
