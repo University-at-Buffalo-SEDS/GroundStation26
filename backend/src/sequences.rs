@@ -6,7 +6,7 @@ use crate::web::emit_warning;
 use crate::{fill_targets, loadcell};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
@@ -44,21 +44,18 @@ pub struct ActionPolicyMsg {
     pub controls: Vec<ActionControl>,
 }
 
-fn backend_illuminated_commands() -> &'static HashSet<String> {
-    static ILLUMINATED: OnceLock<HashSet<String>> = OnceLock::new();
-    ILLUMINATED.get_or_init(|| {
-        layout::load_layout()
-            .map(|layout| {
-                layout
-                    .actions_tab
-                    .actions
-                    .into_iter()
-                    .filter(|action| action.illuminated)
-                    .map(|action| action.cmd)
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
+fn backend_illuminated_commands() -> HashSet<String> {
+    layout::load_layout()
+        .map(|layout| {
+            layout
+                .actions_tab
+                .actions
+                .into_iter()
+                .filter(|action| action.illuminated)
+                .map(|action| action.cmd)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn backend_blink_for(cmd: &str, enabled: bool, recommended: Option<&BlinkMode>) -> BlinkMode {
