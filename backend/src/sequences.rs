@@ -930,7 +930,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
         .into_iter()
         .map(|cmd| ActionControl {
             cmd: cmd.to_string(),
-            enabled: !(cmd == "RetractPlumbing" && valves.retract == Some(true)),
+            enabled: true,
             blink: BlinkMode::None,
             actuated: valves.actuated_for_cmd(cmd),
         })
