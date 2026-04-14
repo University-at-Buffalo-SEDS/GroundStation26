@@ -1008,10 +1008,6 @@
               {
                 "kind": "actions",
                 "actions": [
-                  "StartWritingNow",
-                  "StartWritingLastTwoMinutes",
-                  "PauseWritingDb",
-                  "StopWritingDb",
                   "Launch",
                   "Dump",
                   "Igniter",

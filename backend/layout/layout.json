@@ -1059,10 +1059,6 @@
               {
                 "kind": "actions",
                 "actions": [
-                  "StartWritingNow",
-                  "StartWritingLastTwoMinutes",
-                  "PauseWritingDb",
-                  "StopWritingDb",
                   "Dump",
                   "NormallyOpen",
                   "Nitrogen",
@@ -1295,10 +1291,6 @@
                   }
                 ],
                 "actions": [
-                  "StartWritingNow",
-                  "StartWritingLastTwoMinutes",
-                  "PauseWritingDb",
-                  "StopWritingDb",
                   "Launch",
                   "Dump",
                   "Pilot"
@@ -1779,10 +1771,6 @@
               {
                 "kind": "actions",
                 "actions": [
-                  "StartWritingNow",
-                  "StartWritingLastTwoMinutes",
-                  "PauseWritingDb",
-                  "StopWritingDb",
                   "Dump",
                   "NormallyOpen",
                   "Nitrogen",
