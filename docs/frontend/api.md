@@ -174,6 +174,9 @@ Critical expectations:
 - Action layout entries may include:
   - `illuminated: bool` to request backend-driven default illumination for that action.
   - `spacer_before: bool` and `spacer_after: bool` to request a visual separator around that action.
+- Action layout entries may also include row-flow hints:
+  - `new_row_before: bool` and `new_row_after: bool` to force the next action(s) onto a new row.
+  - `spacer_row_before: bool` and `spacer_row_after: bool` to insert a blank spacer row before or after an action group.
 - Frontend-specific action highlighting should not be hardcoded for particular commands; it should follow backend layout plus live `ActionPolicyMsg` updates.
 - Data tab channel labels and boolean label sets must line up with actual telemetry value ordering.
 - State widgets must reference valid data types and valid per-value indexes.

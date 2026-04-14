@@ -132,7 +132,8 @@
         "bg": "#3f0b13",
         "fg": "#fee2e2",
         "illuminated": true,
-        "spacer_after": true
+        "new_row_after": true,
+        "spacer_row_after": true
       },
       {
         "label": "Launch",

@@ -442,6 +442,14 @@ pub struct ActionSpec {
     pub spacer_before: bool,
     #[serde(default)]
     pub spacer_after: bool,
+    #[serde(default)]
+    pub new_row_before: bool,
+    #[serde(default)]
+    pub new_row_after: bool,
+    #[serde(default)]
+    pub spacer_row_before: bool,
+    #[serde(default)]
+    pub spacer_row_after: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

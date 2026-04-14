@@ -102,7 +102,13 @@ def default_layout() -> dict:
             "title": "SEDSprintf Network",
             "expected_boards": ["FC", "RF", "PB", "VB", "GW", "AB", "DAQ"],
         },
-        "actions_tab": {"disable_actions_by_default": False, "actions": []},
+        "actions_tab": {
+            "disable_actions_by_default": False,
+            "show_flight_setup": True,
+            "show_fill_targets": True,
+            "fill_targets_require_actions_enabled": True,
+            "actions": [],
+        },
         "data_tab": {"tabs": []},
         "state_tab": {"states": []},
         "battery": {
@@ -449,8 +455,81 @@ class LayoutEditor(tk.Tk):
         ttk.Checkbutton(self.data_subtabs_frame, text="Chart enabled", variable=self.data_subtab_chart).grid(
             row=5, column=1, sticky="w", padx=6, pady=3
         )
+        self.data_subtab_has_labels = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self.data_subtabs_frame,
+            text="Has labels",
+            variable=self.data_subtab_has_labels,
+            command=self._sync_data_subtab_bool_fields,
+        ).grid(row=5, column=2, sticky="w", padx=6, pady=3)
+        self.data_subtab_bool_true_label = ttk.Label(self.data_subtabs_frame, text="True label")
+        self.data_subtab_bool_true_label.grid(row=6, column=1, sticky="w")
+        self.data_subtab_bool_true = ttk.Entry(self.data_subtabs_frame)
+        self.data_subtab_bool_true.grid(row=6, column=2, sticky="ew", padx=6, pady=3)
+        self.data_subtab_bool_false_label = ttk.Label(self.data_subtabs_frame, text="False label")
+        self.data_subtab_bool_false_label.grid(row=7, column=1, sticky="w")
+        self.data_subtab_bool_false = ttk.Entry(self.data_subtabs_frame)
+        self.data_subtab_bool_false.grid(row=7, column=2, sticky="ew", padx=6, pady=3)
+        self.data_subtab_bool_unknown_label = ttk.Label(self.data_subtabs_frame, text="Unknown label")
+        self.data_subtab_bool_unknown_label.grid(row=8, column=1, sticky="w")
+        self.data_subtab_bool_unknown = ttk.Entry(self.data_subtabs_frame)
+        self.data_subtab_bool_unknown.grid(row=8, column=2, sticky="ew", padx=6, pady=3)
+        self.data_subtab_bool_per_channel_label = ttk.Label(
+            self.data_subtabs_frame, text="Per-channel labels (true,false,unknown | ...)"
+        )
+        self.data_subtab_bool_per_channel_label.grid(row=9, column=1, sticky="w")
+        self.data_subtab_bool_per_channel = ttk.Entry(self.data_subtabs_frame)
+        self.data_subtab_bool_per_channel.grid(row=9, column=2, sticky="ew", padx=6, pady=3)
+        self.data_subtab_bool_per_channel_hint = ttk.Label(
+            self.data_subtabs_frame,
+            text="Example: Open,Closed,Unknown | Installed,Removed,Unknown",
+            foreground="#94a3b8",
+        )
+        self.data_subtab_bool_per_channel_hint.grid(row=10, column=2, sticky="w", padx=6)
+
+        self.data_subtab_channel_formatters_frame = ttk.LabelFrame(self.data_subtabs_frame, text="Channel formatters")
+        self.data_subtab_channel_formatters_frame.grid(row=11, column=1, columnspan=3, sticky="ew", padx=6, pady=6)
+        for col in range(4):
+            self.data_subtab_channel_formatters_frame.columnconfigure(col, weight=1)
+        self.data_subtab_formatter_channels = tk.Listbox(self.data_subtab_channel_formatters_frame, height=4)
+        self.data_subtab_formatter_channels.grid(row=0, column=0, rowspan=5, sticky="nsew", padx=6, pady=3)
+        self.data_subtab_formatter_channels.bind(
+            "<<ListboxSelect>>", lambda _: self._on_data_subtab_formatter_select()
+        )
+        ttk.Label(self.data_subtab_channel_formatters_frame, text="Format kind").grid(row=0, column=1, sticky="w")
+        self.data_subtab_formatter_kind = tk.StringVar(value="")
+        ttk.OptionMenu(
+            self.data_subtab_channel_formatters_frame,
+            self.data_subtab_formatter_kind,
+            "",
+            "",
+            "number",
+            "integer",
+        ).grid(row=0, column=2, sticky="w", padx=6, pady=3)
+        self.data_subtab_formatter_precision = self._entry(
+            self.data_subtab_channel_formatters_frame, "Precision", 1, col=1
+        )
+        self.data_subtab_formatter_prefix = self._entry(
+            self.data_subtab_channel_formatters_frame, "Prefix", 2, col=1
+        )
+        self.data_subtab_formatter_suffix = self._entry(
+            self.data_subtab_channel_formatters_frame, "Suffix", 3, col=1
+        )
+        data_subtab_formatter_btns = ttk.Frame(self.data_subtab_channel_formatters_frame)
+        data_subtab_formatter_btns.grid(row=4, column=1, columnspan=3, sticky="w", pady=4)
+        ttk.Button(
+            data_subtab_formatter_btns, text="Apply", command=self._apply_data_subtab_formatter
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            data_subtab_formatter_btns, text="Clear", command=self._clear_data_subtab_formatter
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            data_subtab_formatter_btns, text="Sync Channels", command=self._sync_data_subtab_formatter_channels
+        ).pack(side=tk.LEFT, padx=4)
+        self._data_subtab_channel_formatters: list[dict | None] = []
+        self._data_subtab_formatter_selected_idx: int | None = None
         subtab_btns = ttk.Frame(self.data_subtabs_frame)
-        subtab_btns.grid(row=6, column=1, columnspan=3, sticky="w", pady=4)
+        subtab_btns.grid(row=12, column=1, columnspan=3, sticky="w", pady=4)
         ttk.Button(subtab_btns, text="Add", command=self._add_data_subtab).pack(side=tk.LEFT, padx=4)
         ttk.Button(subtab_btns, text="Update", command=self._update_data_subtab).pack(side=tk.LEFT, padx=4)
         ttk.Button(subtab_btns, text="Remove", command=self._remove_data_subtab).pack(side=tk.LEFT, padx=4)
@@ -539,6 +618,8 @@ class LayoutEditor(tk.Tk):
         ttk.Button(data_summary_btns, text="Clear Editor", command=self._clear_data_summary_item_editor).pack(
             side=tk.LEFT, padx=4)
         self._sync_data_bool_fields()
+        self._sync_data_subtab_bool_fields()
+        self._sync_data_subtab_formatter_channels()
 
     # ------------------------
     # Connection tab editor
@@ -627,15 +708,64 @@ class LayoutEditor(tk.Tk):
             variable=self.disable_actions_by_default,
             command=self._store_actions_defaults,
         ).grid(row=0, column=1, sticky="w", pady=(0, 8))
+        self.show_flight_setup = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            form,
+            text="Show flight setup controls",
+            variable=self.show_flight_setup,
+            command=self._store_actions_defaults,
+        ).grid(row=1, column=1, sticky="w", pady=(0, 4))
+        self.show_fill_targets = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            form,
+            text="Show fill targets controls",
+            variable=self.show_fill_targets,
+            command=self._store_actions_defaults,
+        ).grid(row=2, column=1, sticky="w", pady=(0, 4))
+        self.fill_targets_require_actions_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            form,
+            text="Require actions enabled for fill targets",
+            variable=self.fill_targets_require_actions_enabled,
+            command=self._store_actions_defaults,
+        ).grid(row=3, column=1, sticky="w", pady=(0, 8))
 
-        self.action_label = self._entry(form, "Label", 1)
-        self.action_cmd = self._entry(form, "Command", 2)
-        self.action_border = self._color_entry(form, "Border color", 3)
-        self.action_bg = self._color_entry(form, "Background color", 4)
-        self.action_fg = self._color_entry(form, "Text color", 5)
+        self.action_label = self._entry(form, "Label", 4)
+        self.action_cmd = self._entry(form, "Command", 5)
+        self.action_border = self._color_entry(form, "Border color", 6)
+        self.action_bg = self._color_entry(form, "Background color", 7)
+        self.action_fg = self._color_entry(form, "Text color", 8)
+        self.action_illuminated = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="Illuminated", variable=self.action_illuminated).grid(
+            row=9, column=1, sticky="w", pady=(0, 4)
+        )
+        self.action_spacer_before = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="Spacer before", variable=self.action_spacer_before).grid(
+            row=10, column=1, sticky="w", pady=(0, 4)
+        )
+        self.action_spacer_after = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="Spacer after", variable=self.action_spacer_after).grid(
+            row=10, column=2, sticky="w", pady=(0, 4)
+        )
+        self.action_new_row_before = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="New row before", variable=self.action_new_row_before).grid(
+            row=11, column=1, sticky="w", pady=(0, 4)
+        )
+        self.action_new_row_after = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="New row after", variable=self.action_new_row_after).grid(
+            row=11, column=2, sticky="w", pady=(0, 4)
+        )
+        self.action_spacer_row_before = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="Spacer row before", variable=self.action_spacer_row_before).grid(
+            row=12, column=1, sticky="w", pady=(0, 4)
+        )
+        self.action_spacer_row_after = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="Spacer row after", variable=self.action_spacer_row_after).grid(
+            row=12, column=2, sticky="w", pady=(0, 4)
+        )
 
         btns = ttk.Frame(form)
-        btns.grid(row=6, column=1, sticky="w", pady=8)
+        btns.grid(row=13, column=1, sticky="w", pady=8)
         ttk.Button(btns, text="Add", command=self._add_action_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove", command=self._remove_action_item).pack(
             side=tk.LEFT, padx=4
@@ -691,8 +821,14 @@ class LayoutEditor(tk.Tk):
         ttk.Button(form, text="Add State Entry", command=self._add_state_entry).grid(
             row=1, column=1, padx=6, pady=4, sticky="w"
         )
+        ttk.Button(form, text="Up", command=lambda: self._move_state_entry(-1)).grid(
+            row=1, column=2, padx=6, pady=4, sticky="w"
+        )
         ttk.Button(form, text="Remove State Entry", command=self._remove_state_entry).grid(
             row=1, column=3, padx=6, pady=4, sticky="w"
+        )
+        ttk.Button(form, text="Down", command=lambda: self._move_state_entry(1)).grid(
+            row=1, column=4, padx=6, pady=4, sticky="w"
         )
 
         # Section row
@@ -709,8 +845,14 @@ class LayoutEditor(tk.Tk):
         ttk.Button(form, text="Add Section", command=self._add_section).grid(
             row=3, column=1, padx=6, pady=4, sticky="w"
         )
+        ttk.Button(form, text="Up", command=lambda: self._move_section(-1)).grid(
+            row=3, column=2, padx=6, pady=4, sticky="w"
+        )
         ttk.Button(form, text="Remove Section", command=self._remove_section).grid(
             row=3, column=3, padx=6, pady=4, sticky="w"
+        )
+        ttk.Button(form, text="Down", command=lambda: self._move_section(1)).grid(
+            row=3, column=4, padx=6, pady=4, sticky="w"
         )
 
         # Widget row
@@ -916,8 +1058,14 @@ class LayoutEditor(tk.Tk):
         ttk.Button(form, text="Add Widget", command=self._add_widget).grid(
             row=21, column=1, padx=6, pady=4, sticky="w"
         )
+        ttk.Button(form, text="Up", command=lambda: self._move_widget(-1)).grid(
+            row=21, column=2, padx=6, pady=4, sticky="w"
+        )
         ttk.Button(form, text="Remove Widget", command=self._remove_widget).grid(
-            row=20, column=3, padx=6, pady=4, sticky="w"
+            row=21, column=3, padx=6, pady=4, sticky="w"
+        )
+        ttk.Button(form, text="Down", command=lambda: self._move_widget(1)).grid(
+            row=21, column=4, padx=6, pady=4, sticky="w"
         )
 
         self.widget_kind.trace_add("write", lambda *_: self._sync_widget_fields())
@@ -1036,12 +1184,16 @@ class LayoutEditor(tk.Tk):
         for a in self.data["actions_tab"]["actions"]:
             self.actions_list.insert(tk.END, a.get("label", "action"))
         if hasattr(self, "disable_actions_by_default"):
+            actions_tab = self.data.get("actions_tab", {})
             self.disable_actions_by_default.set(
                 bool(
-                    self.data.get("actions_tab", {}).get(
-                        "disable_actions_by_default", False
-                    )
+                    actions_tab.get("disable_actions_by_default", False)
                 )
+            )
+            self.show_flight_setup.set(bool(actions_tab.get("show_flight_setup", True)))
+            self.show_fill_targets.set(bool(actions_tab.get("show_fill_targets", True)))
+            self.fill_targets_require_actions_enabled.set(
+                bool(actions_tab.get("fill_targets_require_actions_enabled", True))
             )
 
         self.state_entry_list.delete(0, tk.END)
@@ -1286,7 +1438,18 @@ class LayoutEditor(tk.Tk):
         if channels:
             item["channels"] = channels
         existing = self._current_data_subtab() or {}
-        for key in ("chart_groups", "summary_items", "channel_formatters", "boolean_labels", "channel_boolean_labels"):
+        labels = self._data_subtab_boolean_labels_from_form()
+        if labels:
+            item["boolean_labels"] = labels
+        channel_labels = self._data_subtab_channel_labels_from_form()
+        if channel_labels:
+            item["channel_boolean_labels"] = channel_labels
+        self._sync_data_subtab_formatter_channels()
+        if any(self._data_subtab_channel_formatters):
+            item["channel_formatters"] = [
+                formatter or {} for formatter in self._data_subtab_channel_formatters
+            ]
+        for key in ("chart_groups", "summary_items"):
             if key in existing and key not in item:
                 item[key] = existing[key]
         return item
@@ -1303,6 +1466,23 @@ class LayoutEditor(tk.Tk):
         self.data_subtab_channels.delete(0, tk.END)
         self.data_subtab_channels.insert(0, ", ".join(self._clean_channels(item.get("channels", []) or [])))
         self.data_subtab_chart.set(bool((item.get("chart", {}) or {}).get("enabled", True)))
+        labels = item.get("boolean_labels", {}) or {}
+        channel_labels = item.get("channel_boolean_labels", []) or []
+        channel_formatters = item.get("channel_formatters", []) or []
+        self.data_subtab_has_labels.set(bool(labels) or bool(channel_labels))
+        self._sync_data_subtab_bool_fields()
+        self.data_subtab_bool_true.delete(0, tk.END)
+        self.data_subtab_bool_true.insert(0, labels.get("true_label", "") or "")
+        self.data_subtab_bool_false.delete(0, tk.END)
+        self.data_subtab_bool_false.insert(0, labels.get("false_label", "") or "")
+        self.data_subtab_bool_unknown.delete(0, tk.END)
+        self.data_subtab_bool_unknown.insert(0, labels.get("unknown_label", "") or "")
+        self.data_subtab_bool_per_channel.delete(0, tk.END)
+        self.data_subtab_bool_per_channel.insert(0, self._format_valve_labels(channel_labels))
+        self._data_subtab_channel_formatters = [
+            dict(fmt) if isinstance(fmt, dict) else None for fmt in channel_formatters
+        ]
+        self._sync_data_subtab_formatter_channels()
 
     def _clear_data_subtab_editor(self) -> None:
         self._data_subtab_selected_idx = None
@@ -1312,9 +1492,17 @@ class LayoutEditor(tk.Tk):
                 self.data_subtab_data_type,
                 self.data_subtab_sender_id,
                 self.data_subtab_channels,
+                self.data_subtab_bool_true,
+                self.data_subtab_bool_false,
+                self.data_subtab_bool_unknown,
+                self.data_subtab_bool_per_channel,
         ):
             entry.delete(0, tk.END)
         self.data_subtab_chart.set(True)
+        self.data_subtab_has_labels.set(False)
+        self._sync_data_subtab_bool_fields()
+        self._data_subtab_channel_formatters = []
+        self._sync_data_subtab_formatter_channels()
         self.data_subtabs_list.selection_clear(0, tk.END)
 
     def _commit_current_data_subtab(self) -> None:
@@ -1747,6 +1935,9 @@ class LayoutEditor(tk.Tk):
         network.setdefault("expected_boards", ["FC", "RF", "PB", "VB", "GW", "AB", "DAQ"])
         actions_tab = self.data.setdefault("actions_tab", {})
         actions_tab.setdefault("disable_actions_by_default", False)
+        actions_tab.setdefault("show_flight_setup", True)
+        actions_tab.setdefault("show_fill_targets", True)
+        actions_tab.setdefault("fill_targets_require_actions_enabled", True)
         actions_tab.setdefault("actions", [])
         self.data.setdefault("data_tab", {}).setdefault("tabs", [])
         self.data.setdefault("state_tab", {}).setdefault("states", [])
@@ -1967,6 +2158,13 @@ class LayoutEditor(tk.Tk):
         self.action_bg.insert(0, item.get("bg", ""))
         self.action_fg.delete(0, tk.END)
         self.action_fg.insert(0, item.get("fg", ""))
+        self.action_illuminated.set(bool(item.get("illuminated", False)))
+        self.action_spacer_before.set(bool(item.get("spacer_before", False)))
+        self.action_spacer_after.set(bool(item.get("spacer_after", False)))
+        self.action_new_row_before.set(bool(item.get("new_row_before", False)))
+        self.action_new_row_after.set(bool(item.get("new_row_after", False)))
+        self.action_spacer_row_before.set(bool(item.get("spacer_row_before", False)))
+        self.action_spacer_row_after.set(bool(item.get("spacer_row_after", False)))
 
     def _add_action_item(self) -> None:
         self.data["actions_tab"]["actions"].append(self._action_from_form())
@@ -1992,11 +2190,22 @@ class LayoutEditor(tk.Tk):
             "border": self.action_border.get().strip(),
             "bg": self.action_bg.get().strip(),
             "fg": self.action_fg.get().strip(),
+            "illuminated": bool(self.action_illuminated.get()),
+            "spacer_before": bool(self.action_spacer_before.get()),
+            "spacer_after": bool(self.action_spacer_after.get()),
+            "new_row_before": bool(self.action_new_row_before.get()),
+            "new_row_after": bool(self.action_new_row_after.get()),
+            "spacer_row_before": bool(self.action_spacer_row_before.get()),
+            "spacer_row_after": bool(self.action_spacer_row_after.get()),
         }
 
     def _store_actions_defaults(self) -> None:
-        self.data.setdefault("actions_tab", {})["disable_actions_by_default"] = bool(
-            self.disable_actions_by_default.get()
+        actions_tab = self.data.setdefault("actions_tab", {})
+        actions_tab["disable_actions_by_default"] = bool(self.disable_actions_by_default.get())
+        actions_tab["show_flight_setup"] = bool(self.show_flight_setup.get())
+        actions_tab["show_fill_targets"] = bool(self.show_fill_targets.get())
+        actions_tab["fill_targets_require_actions_enabled"] = bool(
+            self.fill_targets_require_actions_enabled.get()
         )
 
     # ------------------------
@@ -2136,6 +2345,9 @@ class LayoutEditor(tk.Tk):
         self.data["state_tab"]["states"].pop(idx)
         self._refresh_lists()
 
+    def _move_state_entry(self, delta: int) -> None:
+        self._move_list_item(self.data["state_tab"]["states"], self.state_entry_list, delta)
+
     def _add_section(self) -> None:
         e_idx = self._ensure_state_entry_selected()
         if e_idx is None:
@@ -2201,6 +2413,20 @@ class LayoutEditor(tk.Tk):
             self._clear_section_form()
             self._clear_widget_form()
 
+    def _move_section(self, delta: int) -> None:
+        e_idx = self._state_entry_selected_idx
+        s_idx = self._selected_index(self.section_list)
+        if e_idx is None or s_idx is None:
+            return
+        sections = self.data["state_tab"]["states"][e_idx]["sections"]
+        new_idx = s_idx + delta
+        if new_idx < 0 or new_idx >= len(sections):
+            return
+        sections[s_idx], sections[new_idx] = sections[new_idx], sections[s_idx]
+        self._load_state_entry()
+        self._with_suspended_events(lambda: self.section_list.selection_set(new_idx))
+        self._load_section_for(e_idx, new_idx)
+
     def _add_widget(self) -> None:
         e_idx = self._ensure_state_entry_selected()
         if e_idx is None:
@@ -2249,6 +2475,21 @@ class LayoutEditor(tk.Tk):
             return
         self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["widgets"].pop(w_idx)
         self._load_section_for(e_idx, s_idx)
+
+    def _move_widget(self, delta: int) -> None:
+        e_idx = self._state_entry_selected_idx
+        s_idx = self._state_section_selected_idx
+        w_idx = self._selected_index(self.widget_list)
+        if None in (e_idx, s_idx, w_idx):
+            return
+        widgets = self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["widgets"]
+        new_idx = w_idx + delta
+        if new_idx < 0 or new_idx >= len(widgets):
+            return
+        widgets[w_idx], widgets[new_idx] = widgets[new_idx], widgets[w_idx]
+        self._load_section_for(e_idx, s_idx)
+        self._with_suspended_events(lambda: self.widget_list.selection_set(new_idx))
+        self._load_widget_for(e_idx, s_idx, new_idx)
 
     # ------------------------
     # Utility
@@ -2765,6 +3006,29 @@ class LayoutEditor(tk.Tk):
         labels = self._parse_valve_labels(self.data_bool_per_channel.get())
         return labels or None
 
+    def _data_subtab_boolean_labels_from_form(self) -> dict | None:
+        if not self.data_subtab_has_labels.get():
+            return None
+        true_label = self.data_subtab_bool_true.get().strip()
+        false_label = self.data_subtab_bool_false.get().strip()
+        unknown_label = self.data_subtab_bool_unknown.get().strip()
+        if not true_label and not false_label and not unknown_label:
+            return None
+        if not true_label:
+            true_label = "True"
+        if not false_label:
+            false_label = "False"
+        result = {"true_label": true_label, "false_label": false_label}
+        if unknown_label:
+            result["unknown_label"] = unknown_label
+        return result
+
+    def _data_subtab_channel_labels_from_form(self) -> list[dict] | None:
+        if not self.data_subtab_has_labels.get():
+            return None
+        labels = self._parse_valve_labels(self.data_subtab_bool_per_channel.get())
+        return labels or None
+
     def _sync_data_formatter_channels(self) -> None:
         channels = self._clean_channels(self._split_list(self.data_channels.get()))
         existing = list(self._data_channel_formatters)
@@ -2847,6 +3111,88 @@ class LayoutEditor(tk.Tk):
         self._data_channel_formatters[idx] = None
         self._sync_data_formatter_channels()
 
+    def _sync_data_subtab_formatter_channels(self) -> None:
+        channels = self._clean_channels(self._split_list(self.data_subtab_channels.get()))
+        existing = list(self._data_subtab_channel_formatters)
+        self._data_subtab_channel_formatters = []
+        for idx, _channel in enumerate(channels):
+            self._data_subtab_channel_formatters.append(existing[idx] if idx < len(existing) else None)
+        self.data_subtab_formatter_channels.delete(0, tk.END)
+        for idx, channel in enumerate(channels):
+            formatter = self._data_subtab_channel_formatters[idx] or {}
+            kind = str(formatter.get("kind", "")).strip()
+            label = f"{channel} [{kind}]" if kind else channel
+            self.data_subtab_formatter_channels.insert(tk.END, label)
+        self._clear_data_subtab_formatter_editor()
+
+    def _load_data_subtab_formatter_editor(self, formatter: dict | None) -> None:
+        formatter = formatter or {}
+        self.data_subtab_formatter_kind.set(str(formatter.get("kind", "")).strip())
+        self.data_subtab_formatter_precision.delete(0, tk.END)
+        if formatter.get("precision") is not None:
+            self.data_subtab_formatter_precision.insert(0, str(formatter.get("precision")))
+        self.data_subtab_formatter_prefix.delete(0, tk.END)
+        self.data_subtab_formatter_prefix.insert(0, formatter.get("prefix", "") or "")
+        self.data_subtab_formatter_suffix.delete(0, tk.END)
+        self.data_subtab_formatter_suffix.insert(0, formatter.get("suffix", "") or "")
+
+    def _clear_data_subtab_formatter_editor(self) -> None:
+        self._data_subtab_formatter_selected_idx = None
+        self.data_subtab_formatter_kind.set("")
+        self.data_subtab_formatter_precision.delete(0, tk.END)
+        self.data_subtab_formatter_prefix.delete(0, tk.END)
+        self.data_subtab_formatter_suffix.delete(0, tk.END)
+        if hasattr(self, "data_subtab_formatter_channels"):
+            self.data_subtab_formatter_channels.selection_clear(0, tk.END)
+
+    def _data_subtab_formatter_from_form(self) -> dict | None:
+        formatter: dict[str, object] = {}
+        kind = self.data_subtab_formatter_kind.get().strip()
+        if kind:
+            formatter["kind"] = kind
+        precision_raw = self.data_subtab_formatter_precision.get().strip()
+        if precision_raw:
+            try:
+                formatter["precision"] = int(precision_raw)
+            except ValueError:
+                pass
+        prefix = self.data_subtab_formatter_prefix.get().strip()
+        if prefix:
+            formatter["prefix"] = prefix
+        suffix = self.data_subtab_formatter_suffix.get().strip()
+        if suffix:
+            formatter["suffix"] = suffix
+        return formatter or None
+
+    def _on_data_subtab_formatter_select(self) -> None:
+        if self._suspend_events:
+            return
+        idx = self._selected_index(self.data_subtab_formatter_channels)
+        if idx is None or idx >= len(self._data_subtab_channel_formatters):
+            self._clear_data_subtab_formatter_editor()
+            return
+        self._data_subtab_formatter_selected_idx = idx
+        self._load_data_subtab_formatter_editor(self._data_subtab_channel_formatters[idx])
+
+    def _apply_data_subtab_formatter(self) -> None:
+        idx = self._selected_index(self.data_subtab_formatter_channels)
+        if idx is None or idx >= len(self._data_subtab_channel_formatters):
+            messagebox.showwarning("Subtab channel formatter", "Select a channel first.")
+            return
+        self._data_subtab_channel_formatters[idx] = self._data_subtab_formatter_from_form()
+        self._sync_data_subtab_formatter_channels()
+        self._with_suspended_events(lambda: self.data_subtab_formatter_channels.selection_set(idx))
+        self._data_subtab_formatter_selected_idx = idx
+        self._load_data_subtab_formatter_editor(self._data_subtab_channel_formatters[idx])
+
+    def _clear_data_subtab_formatter(self) -> None:
+        idx = self._selected_index(self.data_subtab_formatter_channels)
+        if idx is None or idx >= len(self._data_subtab_channel_formatters):
+            self._clear_data_subtab_formatter_editor()
+            return
+        self._data_subtab_channel_formatters[idx] = None
+        self._sync_data_subtab_formatter_channels()
+
     def _sync_data_bool_fields(self) -> None:
         enabled = bool(self.data_is_valve.get())
         state = "normal" if enabled else "disabled"
@@ -2877,6 +3223,41 @@ class LayoutEditor(tk.Tk):
             self.data_bool_per_channel_label.grid()
             self.data_bool_per_channel.grid()
             self.data_bool_per_channel_hint.grid()
+
+    def _sync_data_subtab_bool_fields(self) -> None:
+        enabled = bool(self.data_subtab_has_labels.get())
+        state = "normal" if enabled else "disabled"
+        for entry in (
+                self.data_subtab_bool_true,
+                self.data_subtab_bool_false,
+                self.data_subtab_bool_unknown,
+        ):
+            entry.configure(state=state)
+        self.data_subtab_bool_per_channel.configure(state=state)
+        if not enabled:
+            self.data_subtab_bool_true.delete(0, tk.END)
+            self.data_subtab_bool_false.delete(0, tk.END)
+            self.data_subtab_bool_unknown.delete(0, tk.END)
+            self.data_subtab_bool_per_channel.delete(0, tk.END)
+            self.data_subtab_bool_true_label.grid_remove()
+            self.data_subtab_bool_false_label.grid_remove()
+            self.data_subtab_bool_unknown_label.grid_remove()
+            self.data_subtab_bool_true.grid_remove()
+            self.data_subtab_bool_false.grid_remove()
+            self.data_subtab_bool_unknown.grid_remove()
+            self.data_subtab_bool_per_channel_label.grid_remove()
+            self.data_subtab_bool_per_channel_hint.grid_remove()
+            self.data_subtab_bool_per_channel.grid_remove()
+        else:
+            self.data_subtab_bool_true_label.grid()
+            self.data_subtab_bool_false_label.grid()
+            self.data_subtab_bool_unknown_label.grid()
+            self.data_subtab_bool_true.grid()
+            self.data_subtab_bool_false.grid()
+            self.data_subtab_bool_unknown.grid()
+            self.data_subtab_bool_per_channel_label.grid()
+            self.data_subtab_bool_per_channel.grid()
+            self.data_subtab_bool_per_channel_hint.grid()
 
     def _parse_items(self, text: str) -> list[dict]:
         items: list[dict] = []
@@ -2959,7 +3340,7 @@ class LayoutEditor(tk.Tk):
         kind = self.widget_kind.get()
         enable_data_type = kind in ("summary", "chart")
         enable_chart = kind == "chart"
-        enable_actions = kind == "actions" and self._state_widget_selected_idx is not None
+        enable_actions = kind == "actions"
         show_valves = kind == "valve_state"
         show_summary = kind == "summary"
 
@@ -3229,6 +3610,7 @@ class LayoutEditor(tk.Tk):
         }
 
     def _commit_action_form(self) -> None:
+        self._store_actions_defaults()
         idx = self._actions_selected_idx
         if idx is None or idx >= len(self.data["actions_tab"]["actions"]):
             return

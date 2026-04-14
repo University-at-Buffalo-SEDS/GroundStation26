@@ -147,6 +147,7 @@ fn vented_pressure_target_psi(loadcell_mass_kg: f32, nitrous_loaded: bool) -> f3
 #[derive(Debug)]
 struct FlightSimState {
     flight_state: FlightState,
+    launch_sequence_started_ms: Option<u64>,
     launch_time_ms: Option<u64>,
     last_state_emit_ms: u64,
     last_sensor_emit_ms: u64,
@@ -206,6 +207,7 @@ impl FlightSimState {
 
         Self {
             flight_state: FlightState::Idle,
+            launch_sequence_started_ms: None,
             launch_time_ms: None,
             last_state_emit_ms: 0,
             last_sensor_emit_ms: 0,
@@ -400,7 +402,14 @@ impl FlightSimState {
     fn apply_command(&mut self, cmd: &TelemetryCommand, now_ms: u64) {
         match cmd {
             TelemetryCommand::Abort => {
+                self.launch_sequence_started_ms = None;
                 self.launch_time_ms = None;
+                self.valves
+                    .insert(ActuatorBoardCommands::IgniterOn as u8, false);
+                self.queue_umbilical_status(ActuatorBoardCommands::IgniterOn as u8, false, now_ms);
+                self.valves
+                    .insert(ValveBoardCommands::PilotOpen as u8, false);
+                self.queue_umbilical_status(ValveBoardCommands::PilotOpen as u8, false, now_ms);
                 self.queue_abort(Board::ValveBoard, "simulated valve board abort", now_ms);
                 self.queue_abort(
                     Board::ActuatorBoard,
@@ -410,8 +419,17 @@ impl FlightSimState {
                 self.set_flight_state(FlightState::Aborted, now_ms);
             }
             TelemetryCommand::Launch => {
-                if self.flight_state == FlightState::Armed {
-                    self.launch_time_ms = Some(now_ms);
+                if self.flight_state == FlightState::Armed
+                    && self.launch_sequence_started_ms.is_none()
+                {
+                    self.launch_sequence_started_ms = Some(now_ms);
+                    self.valves
+                        .insert(ActuatorBoardCommands::IgniterOn as u8, true);
+                    self.queue_umbilical_status(
+                        ActuatorBoardCommands::IgniterOn as u8,
+                        true,
+                        now_ms,
+                    );
                     self.set_flight_state(FlightState::Launch, now_ms);
                 }
             }
@@ -518,11 +536,43 @@ impl FlightSimState {
             }
         }
 
+        self.update_launch_sequence(now_ms);
         self.update_ground_sequence(now_ms);
     }
 
+    fn update_launch_sequence(&mut self, now_ms: u64) {
+        let Some(sequence_start_ms) = self.launch_sequence_started_ms else {
+            return;
+        };
+
+        if self.flight_state == FlightState::Aborted {
+            self.launch_sequence_started_ms = None;
+            self.launch_time_ms = None;
+            return;
+        }
+
+        if self.launch_time_ms.is_none() && now_ms.saturating_sub(sequence_start_ms) >= 5_000 {
+            let pilot_key = ValveBoardCommands::PilotOpen as u8;
+            if !self.valve_on(pilot_key) {
+                self.valves.insert(pilot_key, true);
+                self.queue_umbilical_status(pilot_key, true, now_ms);
+            }
+            self.launch_time_ms = Some(now_ms);
+            self.set_flight_state(FlightState::Ascent, now_ms);
+        }
+
+        if now_ms.saturating_sub(sequence_start_ms) >= 10_000 {
+            let igniter_key = ActuatorBoardCommands::IgniterOn as u8;
+            if self.valve_on(igniter_key) {
+                self.valves.insert(igniter_key, false);
+                self.queue_umbilical_status(igniter_key, false, now_ms);
+            }
+            self.launch_sequence_started_ms = None;
+        }
+    }
+
     fn update_ground_sequence(&mut self, now_ms: u64) {
-        if self.launch_time_ms.is_some() {
+        if self.launch_sequence_started_ms.is_some() || self.launch_time_ms.is_some() {
             return;
         }
 
@@ -572,6 +622,8 @@ impl FlightSimState {
     }
 
     fn update_physics(&mut self, now_ms: u64) {
+        self.update_launch_sequence(now_ms);
+
         let dt_s = if self.last_physics_ms == 0 {
             SENSOR_PERIOD_MS as f32 / 1000.0
         } else {
