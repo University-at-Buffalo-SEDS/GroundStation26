@@ -355,6 +355,10 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::RetractPlumbing => "RetractPlumbing",
         TelemetryCommand::Nitrogen | TelemetryCommand::NitrogenClose => "Nitrogen",
         TelemetryCommand::Nitrous | TelemetryCommand::NitrousClose => "Nitrous",
+        TelemetryCommand::StartWritingNow => "StartWritingNow",
+        TelemetryCommand::StartWritingLastTwoMinutes => "StartWritingLastTwoMinutes",
+        TelemetryCommand::PauseWritingDb => "PauseWritingDb",
+        TelemetryCommand::StopWritingDb => "StopWritingDb",
         TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
@@ -423,6 +427,10 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
+        "StartWritingNow",
+        "StartWritingLastTwoMinutes",
+        "PauseWritingDb",
+        "StopWritingDb",
         "ContinueFillSequence",
     ]
 }
@@ -439,6 +447,10 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
+        "StartWritingNow",
+        "StartWritingLastTwoMinutes",
+        "PauseWritingDb",
+        "StopWritingDb",
         "ContinueFillSequence",
         "DeployParachute",
         "ExpandParachute",
@@ -481,6 +493,10 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
+        "StartWritingNow",
+        "StartWritingLastTwoMinutes",
+        "PauseWritingDb",
+        "StopWritingDb",
         "ContinueFillSequence",
         "AdvanceFlightState",
         "RewindFlightState",
@@ -492,7 +508,14 @@ pub fn default_action_policy() -> ActionPolicyMsg {
         .into_iter()
         .map(|cmd| ActionControl {
             cmd: cmd.to_string(),
-            enabled: cmd == "Abort",
+            enabled: matches!(
+                cmd,
+                "Abort"
+                    | "StartWritingNow"
+                    | "StartWritingLastTwoMinutes"
+                    | "PauseWritingDb"
+                    | "StopWritingDb"
+            ),
             blink: BlinkMode::None,
             actuated: None,
         })
@@ -515,7 +538,14 @@ fn policy_with_overrides(
         .map(|cmd| ActionControl {
             cmd: cmd.to_string(),
             // Keep controls pressable while key is enabled; blink indicates recommendation.
-            enabled: if cmd == "Abort" {
+            enabled: if matches!(
+                cmd,
+                "Abort"
+                    | "StartWritingNow"
+                    | "StartWritingLastTwoMinutes"
+                    | "PauseWritingDb"
+                    | "StopWritingDb"
+            ) {
                 true
             } else if cmd == "ContinueFillSequence" {
                 false
@@ -526,7 +556,17 @@ fn policy_with_overrides(
                 key_enabled
             },
             blink: recommended.get(cmd).cloned().unwrap_or(BlinkMode::None),
-            actuated: valves.actuated_for_cmd(cmd),
+            actuated: if matches!(
+                cmd,
+                "StartWritingNow"
+                    | "StartWritingLastTwoMinutes"
+                    | "PauseWritingDb"
+                    | "StopWritingDb"
+            ) {
+                None
+            } else {
+                valves.actuated_for_cmd(cmd)
+            },
         })
         .collect();
 

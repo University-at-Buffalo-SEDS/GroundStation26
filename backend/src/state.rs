@@ -3,6 +3,7 @@ use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
 use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
+use crate::telemetry_db::{DbQueueItem, LaunchClockKind, LaunchClockMsg, RecordingStatusMsg};
 use crate::telemetry_task;
 use crate::types::{
     Board, BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyLink, NetworkTopologyMsg,
@@ -44,8 +45,17 @@ pub struct AppState {
     /// Error messages → frontend
     pub errors_tx: broadcast::Sender<ErrorMsg>,
 
-    /// Main telemetry/application SQLite database.
-    pub db: SqlitePool,
+    /// Current telemetry/application SQLite database used by HTTP seeds.
+    pub db: Arc<Mutex<SqlitePool>>,
+
+    /// Current telemetry DB path on disk.
+    pub db_path: Arc<Mutex<String>>,
+
+    /// Placeholder telemetry DB path used while not recording to a timestamped session DB.
+    pub placeholder_db_path: String,
+
+    /// Shared DB writer/control queue.
+    pub db_queue_tx: mpsc::Sender<DbQueueItem>,
 
     /// Separate SQLite database for auth sessions.
     pub auth_db: SqlitePool,
@@ -104,6 +114,18 @@ pub struct AppState {
     /// Broadcast whenever action policy changes.
     pub action_policy_tx: broadcast::Sender<ActionPolicyMsg>,
 
+    /// Current launch clock snapshot used by reconnect seeds and live UI updates.
+    pub launch_clock: Arc<Mutex<LaunchClockMsg>>,
+
+    /// Broadcast whenever the launch clock changes.
+    pub launch_clock_tx: broadcast::Sender<LaunchClockMsg>,
+
+    /// Current recording state snapshot.
+    pub recording_status: Arc<Mutex<RecordingStatusMsg>>,
+
+    /// Broadcast whenever recording state changes.
+    pub recording_status_tx: broadcast::Sender<RecordingStatusMsg>,
+
     /// Last accepted command timestamp by command name.
     pub last_command_ms: Arc<Mutex<HashMap<String, u64>>>,
 
@@ -136,6 +158,63 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn telemetry_db_pool(&self) -> SqlitePool {
+        self.db.lock().unwrap().clone()
+    }
+
+    pub fn telemetry_db_path(&self) -> String {
+        self.db_path.lock().unwrap().clone()
+    }
+
+    pub fn replace_telemetry_db(&self, db: SqlitePool, path: String) {
+        *self.db.lock().unwrap() = db;
+        *self.db_path.lock().unwrap() = path.clone();
+        let mut recording = self.recording_status.lock().unwrap();
+        recording.db_path = Some(path);
+    }
+
+    pub fn set_recording_status(&self, status: RecordingStatusMsg) {
+        *self.recording_status.lock().unwrap() = status.clone();
+        let _ = self.recording_status_tx.send(status);
+    }
+
+    pub fn recording_status_snapshot(&self) -> RecordingStatusMsg {
+        self.recording_status.lock().unwrap().clone()
+    }
+
+    pub fn launch_clock_snapshot(&self) -> LaunchClockMsg {
+        self.launch_clock.lock().unwrap().clone()
+    }
+
+    pub fn set_launch_clock(&self, launch_clock: LaunchClockMsg) {
+        *self.launch_clock.lock().unwrap() = launch_clock.clone();
+        let _ = self.launch_clock_tx.send(launch_clock);
+    }
+
+    pub fn update_launch_clock_for_state(&self, next_state: FlightState, timestamp_ms: i64) {
+        let next = match next_state {
+            FlightState::Launch => LaunchClockMsg {
+                kind: LaunchClockKind::TMinus,
+                anchor_timestamp_ms: Some(timestamp_ms),
+                duration_ms: Some(5_000),
+            },
+            FlightState::Ascent => LaunchClockMsg {
+                kind: LaunchClockKind::TPlus,
+                anchor_timestamp_ms: Some(timestamp_ms),
+                duration_ms: None,
+            },
+            FlightState::Startup
+            | FlightState::Idle
+            | FlightState::PreFill
+            | FlightState::FillTest
+            | FlightState::NitrogenFill
+            | FlightState::NitrousFill
+            | FlightState::Armed => LaunchClockMsg::idle(),
+            _ => return,
+        };
+        self.set_launch_clock(next);
+    }
+
     fn layout_expected_boards(&self) -> std::collections::HashSet<Board> {
         let configured = crate::layout::load_layout()
             .ok()
@@ -177,6 +256,38 @@ impl AppState {
                 status.ema_gap_ms = Some(ema.clamp(10, 60_000));
             }
             status.last_seen_ms = Some(timestamp_ms);
+            status.warned = false;
+        }
+    }
+
+    /// Marks side-relay boards as seen when the router has an active discovery route for that side.
+    pub fn mark_discovered_relays_seen(&self) {
+        if cfg!(feature = "test_fire_mode") {
+            return;
+        }
+        let Some(router) = self.topology_router.get() else {
+            return;
+        };
+        let snapshot = router.export_topology();
+        let mut map = self.board_status.lock().unwrap();
+        for route in snapshot.routes {
+            let relay_board = match route.side_name {
+                "rocket_comms" => Some(Board::RFBoard),
+                "umbilical_comms" => Some(Board::GatewayBoard),
+                _ => None,
+            };
+            let Some(board) = relay_board else {
+                continue;
+            };
+            let Some(status) = map.get_mut(&board) else {
+                continue;
+            };
+            status.last_seen_ms = Some(
+                status
+                    .last_seen_ms
+                    .map(|existing| existing.max(route.last_seen_ms))
+                    .unwrap_or(route.last_seen_ms),
+            );
             status.warned = false;
         }
     }
@@ -548,11 +659,6 @@ impl AppState {
         let _ = self.shutdown_tx.send(());
     }
 
-    /// Increments the count of in-flight async database writes.
-    pub fn begin_db_write(&self) {
-        self.pending_db_writes.fetch_add(1, Ordering::SeqCst);
-    }
-
     /// Updates local flight state, notifies subscribers, and persists the transition asynchronously.
     pub fn set_local_flight_state(&self, next_state: FlightState) {
         let mut slot = self.state.lock().unwrap();
@@ -565,26 +671,19 @@ impl AppState {
         crate::flight_sim::sync_local_flight_state(next_state);
 
         let _ = self.state_tx.send(FlightStateMsg { state: next_state });
-
-        self.begin_db_write();
-        let db = self.db.clone();
-        let state_for_task = self.clone();
         let ts_ms = crate::telemetry_task::get_current_timestamp_ms() as i64;
+        self.update_launch_clock_for_state(next_state, ts_ms);
+        let tx = self.db_queue_tx.clone();
         tokio::spawn(async move {
-            let _ = sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
-                .bind(ts_ms)
-                .bind(next_state as i64)
-                .execute(&db)
+            let _ = tx
+                .send(DbQueueItem::Write(
+                    crate::telemetry_db::DbWrite::FlightState {
+                        timestamp_ms: ts_ms,
+                        state_code: next_state as i64,
+                    },
+                ))
                 .await;
-            state_for_task.end_db_write();
         });
-    }
-
-    /// Decrements the in-flight DB write count and wakes any shutdown waiters when it reaches zero.
-    pub fn end_db_write(&self) {
-        if self.pending_db_writes.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.db_write_notify.notify_waiters();
-        }
     }
 
     /// Returns the number of async database writes still in progress.

@@ -481,6 +481,12 @@ impl FlightSimState {
                     self.set_flight_state(FlightState::NitrousFill, now_ms);
                 }
             }
+            TelemetryCommand::StartWritingNow
+            | TelemetryCommand::StartWritingLastTwoMinutes
+            | TelemetryCommand::PauseWritingDb
+            | TelemetryCommand::StopWritingDb => {
+                // Recording controls are backend-local and do not affect simulator state.
+            }
             #[cfg(feature = "hitl_mode")]
             TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute

@@ -7,6 +7,7 @@ use crate::loadcell;
 use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_bundle_path};
 use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::state::AppState;
+use crate::telemetry_db::{DbQueueItem, DbWrite, LaunchClockMsg, RecordingStatusMsg};
 use crate::types::{
     BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryCommand, TelemetryRow,
 };
@@ -182,7 +183,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/calibration/capture_span", post(capture_loadcell_span))
         .route("/api/calibration/refit", post(refit_loadcell_channel))
         .route("/api/network_time", get(get_network_time))
+        .route("/api/launch_clock", get(get_launch_clock))
         .route("/api/network_topology", get(get_network_topology))
+        .route("/api/recording_status", get(get_recording_status))
         .route("/api/notifications", get(get_notifications))
         .route(
             "/api/notifications/{id}/dismiss",
@@ -290,11 +293,13 @@ pub enum WsOutMsg {
     TelemetryBatch(Vec<TelemetryRow>),
     Warning(WarningMsg),
     FlightState(FlightStateMsg),
+    LaunchClock(LaunchClockMsg),
     Error(ErrorMsg),
     BoardStatus(BoardStatusMsg),
     NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
+    RecordingStatus(RecordingStatusMsg),
     NetworkTime(NetworkTimeMsg),
 }
 
@@ -363,6 +368,7 @@ async fn get_valve_state(
         return response;
     }
     // Latest valve state row: data_type = 'VALVE_STATE'
+    let db = state.telemetry_db_pool();
     let row = sqlx::query(
         r#"
         SELECT timestamp_ms, values_json, payload_json
@@ -372,7 +378,7 @@ async fn get_valve_state(
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
+    .fetch_optional(&db)
     .await
     .unwrap_or(None);
 
@@ -401,6 +407,7 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
+    let db = state.telemetry_db_pool();
     // Prefer the normalized GPS stream, but keep compatibility with older row tags.
     let row = sqlx::query(
         r#"
@@ -411,7 +418,7 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
+    .fetch_optional(&db)
     .await
     .unwrap_or(None);
 
@@ -874,9 +881,10 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         return Json(compact_recent_rows(merged_rows, cutoff)).into_response();
     }
 
+    let db = state.telemetry_db_pool();
     let Some(now_ms) =
         sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(timestamp_ms) FROM telemetry")
-            .fetch_one(&state.db)
+            .fetch_one(&db)
             .await
             .ok()
             .flatten()
@@ -898,20 +906,23 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
 
     let now_ms = if let Some(now_ms) = latest_cache_ts {
         now_ms
-    } else if let Some(now_ms) =
-        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(timestamp_ms) FROM telemetry")
-            .fetch_one(&state.db)
-            .await
-            .ok()
-            .flatten()
-    {
-        now_ms
     } else {
-        return (
-            [(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
-            Body::empty(),
-        )
-            .into_response();
+        let db = state.telemetry_db_pool();
+        if let Some(now_ms) =
+            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(timestamp_ms) FROM telemetry")
+                .fetch_one(&db)
+                .await
+                .ok()
+                .flatten()
+        {
+            now_ms
+        } else {
+            return (
+                [(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
+                Body::empty(),
+            )
+                .into_response();
+        }
     };
 
     let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
@@ -930,6 +941,7 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
     tokio::spawn(async move {
         if let Some(end_ms) = db_end_ms {
+            let db = state_for_task.telemetry_db_pool();
             let mut rows = sqlx::query(
                 r#"
                 SELECT
@@ -945,7 +957,7 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
             )
             .bind(cutoff)
             .bind(end_ms)
-            .fetch(&state_for_task.db);
+            .fetch(&db);
 
             while let Ok(Some(row)) = rows.try_next().await {
                 let telemetry_row = TelemetryRow {
@@ -1016,7 +1028,7 @@ async fn load_recent_rows_from_db(
     )
     .bind(start_ms)
     .bind(end_ms)
-    .fetch_all(&state.db)
+    .fetch_all(&state.telemetry_db_pool())
     .await
     .unwrap_or_default();
 
@@ -1074,7 +1086,7 @@ async fn get_flight_state(
     // get the state from the db
     let flight_state: i64 =
         match sqlx::query("SELECT f_state FROM flight_state ORDER BY timestamp_ms DESC LIMIT 1")
-            .fetch_one(&state.db)
+            .fetch_one(&state.telemetry_db_pool())
             .await
         {
             Ok(data) => data.get::<i64, _>("f_state"),
@@ -1097,6 +1109,26 @@ async fn get_network_time(
         timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
     })
     .into_response()
+}
+
+async fn get_launch_clock(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(state.launch_clock_snapshot()).into_response()
+}
+
+async fn get_recording_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(state.recording_status_snapshot()).into_response()
 }
 
 /// Returns the current list of operator notifications.
@@ -1340,9 +1372,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let mut warnings_rx = state.warnings_tx.subscribe();
     let mut errors_rx = state.errors_tx.subscribe();
     let mut state_rx = state.state_tx.subscribe();
+    let mut launch_clock_rx = state.launch_clock_tx.subscribe();
     let mut board_status_rx = state.board_status_tx.subscribe();
     let mut notifications_rx = state.notifications_tx.subscribe();
     let mut action_policy_rx = state.action_policy_tx.subscribe();
+    let mut recording_status_rx = state.recording_status_tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
     let state_for_send = state.clone();
@@ -1382,6 +1416,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_action_policy).await.is_err() {
+            return;
+        }
+        let initial_launch_clock = serde_json::to_string(&WsOutMsg::LaunchClock(
+            state_for_send.launch_clock_snapshot(),
+        ))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_launch_clock).await.is_err() {
+            return;
+        }
+        let initial_recording_status = serde_json::to_string(&WsOutMsg::RecordingStatus(
+            state_for_send.recording_status_snapshot(),
+        ))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_recording_status).await.is_err() {
             return;
         }
         let initial_network_topology = serde_json::to_string(&WsOutMsg::NetworkTopology(
@@ -1474,6 +1522,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     }
                 }
 
+                recv = launch_clock_rx.recv() => {
+                    match recv {
+                        Ok(clock) => {
+                            let msg = WsOutMsg::LaunchClock(clock);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
                 recv = board_status_rx.recv() => {
                     match recv {
                         Ok(status) => {
@@ -1515,6 +1577,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     match recv {
                         Ok(policy) => {
                             let msg = WsOutMsg::ActionPolicy(policy);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = recording_status_rx.recv() => {
+                    match recv {
+                        Ok(status) => {
+                            let msg = WsOutMsg::RecordingStatus(status);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;
@@ -1662,8 +1738,9 @@ async fn get_alerts(
         return response;
     }
     let minutes = params.minutes.unwrap_or(20);
+    let db = state.telemetry_db_pool();
     let latest_db_ts: Option<i64> = sqlx::query_scalar("SELECT MAX(timestamp_ms) FROM alerts")
-        .fetch_one(&state.db)
+        .fetch_one(&db)
         .await
         .ok()
         .flatten();
@@ -1688,7 +1765,7 @@ async fn get_alerts(
     )
     .bind(cutoff)
     .bind(now_ms)
-    .fetch_all(&state.db)
+    .fetch_all(&db)
     .await
     .unwrap_or_default();
 
@@ -1741,23 +1818,15 @@ fn spawn_alert_insert(
         severity: severity.to_string(),
         message: message.clone(),
     });
-    state.begin_db_write();
-    let db = state.db.clone();
-    let state_for_task = state.clone();
-
+    let tx = state.db_queue_tx.clone();
     tokio::spawn(async move {
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO alerts (timestamp_ms, severity, message)
-            VALUES (?, ?, ?)
-            "#,
-        )
-        .bind(timestamp_ms)
-        .bind(severity)
-        .bind(message)
-        .execute(&db)
-        .await;
-        state_for_task.end_db_write();
+        let _ = tx
+            .send(DbQueueItem::Write(DbWrite::Alert {
+                timestamp_ms,
+                severity: severity.to_string(),
+                message,
+            }))
+            .await;
     });
 }
 

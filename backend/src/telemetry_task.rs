@@ -7,6 +7,10 @@ use crate::loadcell;
 use crate::rocket_commands::FlightComputerCommands;
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 use crate::state::AppState;
+use crate::telemetry_db::{
+    DbQueueItem, DbWrite, RecordingCommand, RecordingMode, RecordingModeWire, RecordingStatusMsg,
+    close_and_finalize_sqlite, open_telemetry_db, prune_recent_writes, session_db_path,
+};
 #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 use crate::types::FlightState;
 use crate::types::{Board, TelemetryCommand, TelemetryRow, u8_to_flight_state};
@@ -31,7 +35,6 @@ pub struct CommsWorkerHandle {
 
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
-const DB_WORK_QUEUE_SIZE: usize = 8_192;
 const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
 const DB_BATCH_MAX_DEFAULT: usize = 256;
 const DB_BATCH_WAIT_MS_DEFAULT: u64 = 8;
@@ -117,18 +120,15 @@ async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_st
         *fs = next_state;
     }
     let _ = state.state_tx.send(FlightStateMsg { state: next_state });
-    state.begin_db_write();
-    let db = state.db.clone();
-    let state_for_task = state.clone();
     let ts_ms = get_current_timestamp_ms() as i64;
-    tokio::spawn(async move {
-        let _ = sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
-            .bind(ts_ms)
-            .bind(next_state as i64)
-            .execute(&db)
-            .await;
-        state_for_task.end_db_write();
-    });
+    state.update_launch_clock_for_state(next_state, ts_ms);
+    let _ = state
+        .db_queue_tx
+        .send(DbQueueItem::Write(DbWrite::FlightState {
+            timestamp_ms: ts_ms,
+            state_code: next_state as i64,
+        }))
+        .await;
 }
 
 static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
@@ -209,20 +209,6 @@ fn should_persist_telemetry_sample(data_type: &str, ts_ms: i64) -> bool {
             true
         }
     }
-}
-
-enum DbWrite {
-    FlightState {
-        timestamp_ms: i64,
-        state_code: i64,
-    },
-    Telemetry {
-        timestamp_ms: i64,
-        data_type: String,
-        sender_id: String,
-        values_json: Option<String>,
-        payload_json: String,
-    },
 }
 
 #[derive(Default)]
@@ -549,7 +535,7 @@ fn telemetry_values_json(values: &[Option<f32>]) -> Option<String> {
 #[allow(clippy::too_many_arguments)]
 async fn emit_derived_battery_rows(
     state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbWrite>,
+    db_tx: &mpsc::Sender<DbQueueItem>,
     db_overflow: &DbOverflow,
     ts_ms: i64,
     sender_id: &str,
@@ -621,7 +607,7 @@ async fn emit_derived_battery_rows(
 
 async fn emit_derived_loadcell_rows(
     state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbWrite>,
+    db_tx: &mpsc::Sender<DbQueueItem>,
     db_overflow: &DbOverflow,
     ts_ms: i64,
     sender_id: &str,
@@ -702,7 +688,7 @@ async fn emit_derived_loadcell_rows(
 
 async fn emit_derived_vehicle_speed_row(
     state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbWrite>,
+    db_tx: &mpsc::Sender<DbQueueItem>,
     db_overflow: &DbOverflow,
     ts_ms: i64,
     speed_mps: f32,
@@ -762,7 +748,7 @@ fn normalized_gps_values(
 
 async fn emit_normalized_gps_row(
     state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbWrite>,
+    db_tx: &mpsc::Sender<DbQueueItem>,
     db_overflow: &DbOverflow,
     ts_ms: i64,
     sender_id: &str,
@@ -797,7 +783,7 @@ async fn emit_normalized_gps_row(
 
 async fn handle_gps_satellite_count_packet(
     state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbWrite>,
+    db_tx: &mpsc::Sender<DbQueueItem>,
     db_overflow: &DbOverflow,
     pkt: &Packet,
     payload_json: &str,
@@ -896,6 +882,7 @@ pub async fn telemetry_task(
     router: Arc<sedsprintf_rs_2026::router::Router>,
     comms: Vec<CommsWorkerHandle>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
+    mut db_rx: mpsc::Receiver<DbQueueItem>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     let mut handle_interval = interval(Duration::from_millis(1));
@@ -914,10 +901,8 @@ pub async fn telemetry_task(
         1024,
         262_144,
     );
-    let db_work_queue_size = env_usize("GS_DB_WORK_QUEUE_SIZE", DB_WORK_QUEUE_SIZE, 1024, 262_144);
     let packet_enqueue_burst = env_usize("GS_PACKET_ENQUEUE_BURST", PACKET_ENQUEUE_BURST, 32, 4096);
     let (packet_tx, mut packet_rx) = mpsc::channel::<Packet>(packet_work_queue_size);
-    let (db_tx, mut db_rx) = mpsc::channel::<DbWrite>(db_work_queue_size);
     let db_overflow = DbOverflow {
         queue: Arc::new(Mutex::new(VecDeque::new())),
         notify: Arc::new(Notify::new()),
@@ -926,7 +911,7 @@ pub async fn telemetry_task(
     };
 
     let db_worker = {
-        let db = state.db.clone();
+        let state = state.clone();
         let db_batch_max = env_usize("GS_DB_BATCH_MAX", DB_BATCH_MAX_DEFAULT, 1, 4096);
         let db_batch_wait_ms = std::env::var("GS_DB_BATCH_WAIT_MS")
             .ok()
@@ -934,15 +919,75 @@ pub async fn telemetry_task(
             .unwrap_or(DB_BATCH_WAIT_MS_DEFAULT)
             .clamp(1, 250);
         tokio::spawn(async move {
-            while let Some(first) = db_rx.recv().await {
-                let mut batch: Vec<DbWrite> = Vec::with_capacity(db_batch_max);
-                batch.push(first);
+            let mut db_shutdown_rx = state.shutdown_subscribe();
+            struct ActiveRecording {
+                pool: sqlx::SqlitePool,
+                path: String,
+            }
+
+            let placeholder_path = state.placeholder_db_path.clone();
+            let recordings_dir = std::path::Path::new(&placeholder_path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            let mut recent_writes: VecDeque<DbWrite> = VecDeque::new();
+            let mut active_recording: Option<ActiveRecording> = None;
+            let mut mode = RecordingMode::Idle;
+            let mut last_recording_end_ms: Option<i64> = None;
+
+            let mut pending: Vec<DbWrite> = Vec::with_capacity(db_batch_max);
+            let mut shutting_down = false;
+            loop {
+                let first = if shutting_down {
+                    match db_rx.try_recv() {
+                        Ok(item) => item,
+                        Err(MpscTryRecvError::Empty | MpscTryRecvError::Disconnected) => break,
+                    }
+                } else {
+                    tokio::select! {
+                        recv = db_rx.recv() => {
+                            let Some(item) = recv else { break; };
+                            item
+                        }
+                        recv = db_shutdown_rx.recv() => {
+                            match recv {
+                                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
+                                    shutting_down = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                };
+
+                let mut deferred_control: Option<RecordingCommand> = None;
+                match first {
+                    DbQueueItem::Write(write) => {
+                        let newest_ts = write.timestamp_ms();
+                        recent_writes.push_back(write.clone());
+                        prune_recent_writes(&mut recent_writes, newest_ts);
+                        if matches!(mode, RecordingMode::Recording) {
+                            pending.push(write);
+                        }
+                    }
+                    DbQueueItem::Control(cmd) => deferred_control = Some(cmd),
+                }
+
                 let deadline =
                     tokio::time::Instant::now() + Duration::from_millis(db_batch_wait_ms);
-
-                while batch.len() < db_batch_max {
+                while pending.len() < db_batch_max && deferred_control.is_none() {
                     match db_rx.try_recv() {
-                        Ok(write) => batch.push(write),
+                        Ok(DbQueueItem::Write(write)) => {
+                            let newest_ts = write.timestamp_ms();
+                            recent_writes.push_back(write.clone());
+                            prune_recent_writes(&mut recent_writes, newest_ts);
+                            if matches!(mode, RecordingMode::Recording) {
+                                pending.push(write);
+                            }
+                        }
+                        Ok(DbQueueItem::Control(cmd)) => {
+                            deferred_control = Some(cmd);
+                        }
                         Err(MpscTryRecvError::Disconnected) => break,
                         Err(MpscTryRecvError::Empty) => {
                             let now = tokio::time::Instant::now();
@@ -951,7 +996,17 @@ pub async fn telemetry_task(
                             }
                             let remaining = deadline.saturating_duration_since(now);
                             match tokio::time::timeout(remaining, db_rx.recv()).await {
-                                Ok(Some(write)) => batch.push(write),
+                                Ok(Some(DbQueueItem::Write(write))) => {
+                                    let newest_ts = write.timestamp_ms();
+                                    recent_writes.push_back(write.clone());
+                                    prune_recent_writes(&mut recent_writes, newest_ts);
+                                    if matches!(mode, RecordingMode::Recording) {
+                                        pending.push(write);
+                                    }
+                                }
+                                Ok(Some(DbQueueItem::Control(cmd))) => {
+                                    deferred_control = Some(cmd);
+                                }
                                 Ok(None) => break,
                                 Err(_) => break,
                             }
@@ -959,15 +1014,85 @@ pub async fn telemetry_task(
                     }
                 }
 
-                if let Err(e) = insert_db_batch_with_retry(&db, &batch).await {
-                    eprintln!("DB insert failed after retry: {e}");
+                flush_recording_batch(active_recording.as_ref().map(|a| &a.pool), &mut pending)
+                    .await;
+
+                if let Some(cmd) = deferred_control {
+                    match cmd {
+                        RecordingCommand::StartNow | RecordingCommand::StartWithRecent => {
+                            if let Some(active) = active_recording.take() {
+                                close_and_finalize_sqlite(active.pool, &active.path).await;
+                                last_recording_end_ms = Some(get_current_timestamp_ms() as i64);
+                            }
+
+                            let started_at_ms = get_current_timestamp_ms() as i64;
+                            let target_path = session_db_path(&recordings_dir, started_at_ms);
+                            match open_telemetry_db(&target_path).await {
+                                Ok((pool, path)) => {
+                                    state.replace_telemetry_db(pool.clone(), path.clone());
+                                    state.set_recording_status(RecordingStatusMsg {
+                                        mode: RecordingModeWire::Recording,
+                                        db_path: Some(path.clone()),
+                                    });
+                                    active_recording = Some(ActiveRecording { pool, path });
+                                    mode = RecordingMode::Recording;
+
+                                    if matches!(cmd, RecordingCommand::StartWithRecent)
+                                        && let Some(active) = &active_recording
+                                    {
+                                        let cutoff = started_at_ms.saturating_sub(120_000);
+                                        let min_ts = last_recording_end_ms
+                                            .map(|prev| prev.max(cutoff))
+                                            .unwrap_or(cutoff);
+                                        let backfill: Vec<DbWrite> = recent_writes
+                                            .iter()
+                                            .filter(|write| write.timestamp_ms() > min_ts)
+                                            .cloned()
+                                            .collect();
+                                        if let Err(err) =
+                                            insert_db_batch_with_retry(&active.pool, &backfill)
+                                                .await
+                                        {
+                                            eprintln!("Failed to backfill recent writes: {err}");
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    emit_warning(
+                                        &state,
+                                        format!("Failed to open recording DB session: {err}"),
+                                    );
+                                }
+                            }
+                        }
+                        RecordingCommand::Pause | RecordingCommand::Stop => {
+                            if let Some(active) = active_recording.take() {
+                                close_and_finalize_sqlite(active.pool, &active.path).await;
+                                last_recording_end_ms = Some(get_current_timestamp_ms() as i64);
+                            }
+                            mode = if matches!(cmd, RecordingCommand::Pause) {
+                                RecordingMode::Paused
+                            } else {
+                                RecordingMode::Idle
+                            };
+                            rotate_placeholder_db(&state, &placeholder_path, mode).await;
+                            state.set_recording_status(RecordingStatusMsg {
+                                mode: RecordingModeWire::from(mode),
+                                db_path: Some(state.telemetry_db_path()),
+                            });
+                        }
+                    }
                 }
+            }
+
+            if let Some(active) = active_recording.take() {
+                close_and_finalize_sqlite(active.pool, &active.path).await;
             }
         })
     };
 
     let db_overflow_worker = {
-        let db_tx = db_tx.clone();
+        let db_tx = state.db_queue_tx.clone();
         let db_overflow = db_overflow.clone();
         tokio::spawn(async move {
             while db_overflow.running.load(Ordering::Relaxed) {
@@ -980,7 +1105,7 @@ pub async fn telemetry_task(
                     let Some(write) = next else {
                         break;
                     };
-                    if db_tx.send(write).await.is_err() {
+                    if db_tx.send(DbQueueItem::Write(write)).await.is_err() {
                         return;
                     }
                 }
@@ -990,7 +1115,7 @@ pub async fn telemetry_task(
 
     let packet_worker = {
         let state = state.clone();
-        let db_tx = db_tx.clone();
+        let db_tx = state.db_queue_tx.clone();
         let db_overflow = db_overflow.clone();
         tokio::spawn(async move {
             while let Some(pkt) = packet_rx.recv().await {
@@ -1283,6 +1408,22 @@ pub async fn telemetry_task(
                                 }
                                 println!("Nitrous explicit close command sent");
                         }
+                        TelemetryCommand::StartWritingNow => {
+                                let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartNow)).await;
+                                println!("DB recording started without backfill");
+                        }
+                        TelemetryCommand::StartWritingLastTwoMinutes => {
+                                let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartWithRecent)).await;
+                                println!("DB recording started with recent backfill");
+                        }
+                        TelemetryCommand::PauseWritingDb => {
+                                let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::Pause)).await;
+                                println!("DB recording paused");
+                        }
+                        TelemetryCommand::StopWritingDb => {
+                                let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::Stop)).await;
+                                println!("DB recording stopped");
+                        }
                         TelemetryCommand::ContinueFillSequence => {
                                 state.request_fill_sequence_continue();
                                 println!("ContinueFillSequence command accepted");
@@ -1335,13 +1476,14 @@ pub async fn telemetry_task(
                         }
                     }
                 }
-            _= router_interval.tick() => {
+                _= router_interval.tick() => {
                     if let Err(e) = router.poll_discovery() {
                         log_telemetry_error("router discovery polling failed", e);
                     }
                     if let Err(e) = process_router_queues(&router) {
                         log_telemetry_error("router queue processing failed", e);
                     }
+                    state.mark_discovered_relays_seen();
                 }
                 _ = heartbeat_interval.tick() => {
                     if router.log_queue::<u8>(DataType::Heartbeat, &[]).is_ok() {
@@ -1444,8 +1586,6 @@ pub async fn telemetry_task(
         ),
     }
 
-    // Packet worker is done producing DB writes; now drain DB queue.
-    drop(db_tx);
     match tokio::time::timeout(worker_shutdown_timeout, db_worker).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("DB worker ended with error: {e}"),
@@ -1538,6 +1678,20 @@ async fn insert_db_batch_once(
                     .execute(&mut *tx)
                     .await?;
             }
+            DbWrite::Alert {
+                timestamp_ms,
+                severity,
+                message,
+            } => {
+                sqlx::query(
+                    "INSERT INTO alerts (timestamp_ms, severity, message) VALUES (?, ?, ?)",
+                )
+                .bind(*timestamp_ms)
+                .bind(severity.as_str())
+                .bind(message.as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
         }
     }
     tx.commit().await
@@ -1565,14 +1719,50 @@ async fn insert_db_batch_with_retry(
     Err(last_err.unwrap())
 }
 
+async fn flush_recording_batch(active: Option<&sqlx::SqlitePool>, batch: &mut Vec<DbWrite>) {
+    if batch.is_empty() {
+        return;
+    }
+    if let Some(active) = active
+        && let Err(e) = insert_db_batch_with_retry(active, batch).await
+    {
+        eprintln!("DB insert failed after retry: {e}");
+    }
+    batch.clear();
+}
+
+async fn rotate_placeholder_db(state: &Arc<AppState>, placeholder_path: &str, mode: RecordingMode) {
+    let old_pool = state.telemetry_db_pool();
+    let old_path = state.telemetry_db_path();
+    if old_path != placeholder_path {
+        close_and_finalize_sqlite(old_pool, &old_path).await;
+    }
+    let _ = std::fs::remove_file(placeholder_path);
+    match open_telemetry_db(std::path::Path::new(placeholder_path)).await {
+        Ok((db, db_path)) => {
+            state.replace_telemetry_db(db, db_path.clone());
+            state.set_recording_status(RecordingStatusMsg {
+                mode: RecordingModeWire::from(mode),
+                db_path: Some(db_path),
+            });
+        }
+        Err(err) => {
+            emit_warning(
+                state,
+                format!("Failed to reopen placeholder telemetry DB: {err}"),
+            );
+        }
+    }
+}
+
 async fn queue_db_write(
     state: &AppState,
-    db_tx: &mpsc::Sender<DbWrite>,
+    db_tx: &mpsc::Sender<DbQueueItem>,
     db_overflow: &DbOverflow,
     write: DbWrite,
 ) {
     if drop_db_writes_on_backpressure() {
-        match db_tx.try_send(write) {
+        match db_tx.try_send(DbQueueItem::Write(write)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 DB_BACKPRESSURE_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1597,9 +1787,9 @@ async fn queue_db_write(
         return;
     }
 
-    match db_tx.try_send(write) {
+    match db_tx.try_send(DbQueueItem::Write(write)) {
         Ok(()) => {}
-        Err(TrySendError::Full(write)) => {
+        Err(TrySendError::Full(DbQueueItem::Write(write))) => {
             let mut write_opt = Some(write);
             let mut queued_len = 0usize;
             let mut pushed = false;
@@ -1622,9 +1812,19 @@ async fn queue_db_write(
                         queued_len
                     );
                 }
-            } else if db_tx.send(write_opt.take().unwrap()).await.is_err() {
+            } else if db_tx
+                .send(DbQueueItem::Write(write_opt.take().unwrap()))
+                .await
+                .is_err()
+            {
                 emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
             }
+        }
+        Err(TrySendError::Full(DbQueueItem::Control(_))) => {
+            emit_warning(
+                state,
+                "Warning: telemetry DB worker control queue backpressured",
+            );
         }
         Err(TrySendError::Closed(_)) => {
             emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
@@ -1634,7 +1834,7 @@ async fn queue_db_write(
 
 async fn handle_packet(
     state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbWrite>,
+    db_tx: &mpsc::Sender<DbQueueItem>,
     db_overflow: &DbOverflow,
     pkt: Packet,
 ) -> Option<TelemetryRow> {
@@ -1666,6 +1866,7 @@ async fn handle_packet(
             *fs = new_flight_state;
         }
         let ts_ms = get_current_timestamp_ms() as i64;
+        state.update_launch_clock_for_state(new_flight_state, ts_ms);
         queue_db_write(
             state,
             db_tx,

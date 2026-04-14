@@ -307,8 +307,13 @@ pub async fn safety_task(
 
             if should_advance {
                 let ts_ms = get_current_timestamp_ms() as i64;
-                if let Err(e) =
-                    insert_flight_state_with_retry(&state.db, ts_ms, FlightState::Idle as i64).await
+                state.update_launch_clock_for_state(FlightState::Idle, ts_ms);
+                if let Err(e) = insert_flight_state_with_retry(
+                    &state.telemetry_db_pool(),
+                    ts_ms,
+                    FlightState::Idle as i64,
+                )
+                .await
                 {
                     eprintln!("DB insert into flight_state failed after retry: {e}");
                 }

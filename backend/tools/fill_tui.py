@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 import argparse
-import curses
 import ctypes
+import curses
 import errno
 import json
 import os
@@ -35,7 +35,6 @@ except ModuleNotFoundError:
         raise SystemExit(
             "Missing dependency 'sedsprintf_rs_2026' or 'sedsprintf_rs'. Build/install the Python module first."
         ) from e
-
 
 DT = seds.DataType
 EP = seds.DataEndpoint
@@ -169,30 +168,52 @@ def build_command_groups(include_hitl: bool) -> list[tuple[str, list[CommandSpec
     if include_hitl:
         rocket.extend(
             [
-                CommandSpec("DeployParachute", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 0, "FlightComputerCommands"),
-                CommandSpec("ExpandParachute", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 1, "FlightComputerCommands"),
-                CommandSpec("ReinitSensors", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 2, "FlightComputerCommands"),
-                CommandSpec("LaunchSignal", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 3, "FlightComputerCommands"),
-                CommandSpec("EvaluationRelax", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 4, "FlightComputerCommands"),
-                CommandSpec("EvaluationFocus", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 5, "FlightComputerCommands"),
-                CommandSpec("EvaluationAbort", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 6, "FlightComputerCommands"),
-                CommandSpec("ReinitBarometer", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 7, "FlightComputerCommands"),
+                CommandSpec("DeployParachute", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 0,
+                            "FlightComputerCommands"),
+                CommandSpec("ExpandParachute", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 1,
+                            "FlightComputerCommands"),
+                CommandSpec("ReinitSensors", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 2,
+                            "FlightComputerCommands"),
+                CommandSpec("LaunchSignal", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 3,
+                            "FlightComputerCommands"),
+                CommandSpec("EvaluationRelax", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 4,
+                            "FlightComputerCommands"),
+                CommandSpec("EvaluationFocus", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 5,
+                            "FlightComputerCommands"),
+                CommandSpec("EvaluationAbort", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 6,
+                            "FlightComputerCommands"),
+                CommandSpec("ReinitBarometer", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 7,
+                            "FlightComputerCommands"),
                 CommandSpec("EnableIMU", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 8, "FlightComputerCommands"),
                 CommandSpec("DisableIMU", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 9, "FlightComputerCommands"),
-                CommandSpec("MonitorAltitude", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 10, "FlightComputerCommands"),
-                CommandSpec("RevokeMonitorAltitude", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 11, "FlightComputerCommands"),
-                CommandSpec("ConsecutiveSamples", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 12, "FlightComputerCommands"),
-                CommandSpec("RevokeConsecutiveSamples", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 13, "FlightComputerCommands"),
-                CommandSpec("ResetFailures", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 14, "FlightComputerCommands"),
-                CommandSpec("RevokeResetFailures", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 15, "FlightComputerCommands"),
-                CommandSpec("ValidateMeasms", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 16, "FlightComputerCommands"),
-                CommandSpec("RevokeValidateMeasms", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 17, "FlightComputerCommands"),
-                CommandSpec("AbortAfter15", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 18, "FlightComputerCommands"),
-                CommandSpec("AbortAfter40", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 19, "FlightComputerCommands"),
-                CommandSpec("AbortAfter70", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 20, "FlightComputerCommands"),
-                CommandSpec("ReinitAfter12", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 21, "FlightComputerCommands"),
-                CommandSpec("ReinitAfter26", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 22, "FlightComputerCommands"),
-                CommandSpec("ReinitAfter44", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 23, "FlightComputerCommands"),
+                CommandSpec("MonitorAltitude", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 10,
+                            "FlightComputerCommands"),
+                CommandSpec("RevokeMonitorAltitude", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 11,
+                            "FlightComputerCommands"),
+                CommandSpec("ConsecutiveSamples", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 12,
+                            "FlightComputerCommands"),
+                CommandSpec("RevokeConsecutiveSamples", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 13,
+                            "FlightComputerCommands"),
+                CommandSpec("ResetFailures", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 14,
+                            "FlightComputerCommands"),
+                CommandSpec("RevokeResetFailures", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 15,
+                            "FlightComputerCommands"),
+                CommandSpec("ValidateMeasms", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 16,
+                            "FlightComputerCommands"),
+                CommandSpec("RevokeValidateMeasms", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 17,
+                            "FlightComputerCommands"),
+                CommandSpec("AbortAfter15", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 18,
+                            "FlightComputerCommands"),
+                CommandSpec("AbortAfter40", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 19,
+                            "FlightComputerCommands"),
+                CommandSpec("AbortAfter70", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 20,
+                            "FlightComputerCommands"),
+                CommandSpec("ReinitAfter12", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 21,
+                            "FlightComputerCommands"),
+                CommandSpec("ReinitAfter26", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 22,
+                            "FlightComputerCommands"),
+                CommandSpec("ReinitAfter44", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 23,
+                            "FlightComputerCommands"),
             ]
         )
 
@@ -419,7 +440,7 @@ class SerialTransport(Transport):
         frame_len = int.from_bytes(self.rx_buf[:2], "little")
         if len(self.rx_buf) < 2 + frame_len:
             return None
-        payload = bytes(self.rx_buf[2 : 2 + frame_len])
+        payload = bytes(self.rx_buf[2: 2 + frame_len])
         del self.rx_buf[: 2 + frame_len]
         return payload
 
@@ -567,7 +588,7 @@ class I2cTransport(Transport):
         return payload
 
     def _encode_slot(
-        self, kind: int, flags: int, transfer_id: int, offset: int, total_len: int, data: bytes
+            self, kind: int, flags: int, transfer_id: int, offset: int, total_len: int, data: bytes
     ) -> bytes:
         data = data[:I2C_SLOT_PAYLOAD_SIZE]
         slot = bytearray(I2C_SLOT_SIZE)
@@ -581,7 +602,7 @@ class I2cTransport(Transport):
         slot[10:14] = int(total_len).to_bytes(4, "little")
         slot[14:16] = len(data).to_bytes(2, "little")
         slot[16:18] = int(transfer_id).to_bytes(2, "little")
-        slot[I2C_SLOT_HEADER_SIZE : I2C_SLOT_HEADER_SIZE + len(data)] = data
+        slot[I2C_SLOT_HEADER_SIZE: I2C_SLOT_HEADER_SIZE + len(data)] = data
         return bytes(slot)
 
     def _decode_slot(self, raw: bytes) -> I2cSlot | None:
@@ -607,7 +628,7 @@ class I2cTransport(Transport):
             transfer_id=int.from_bytes(raw[16:18], "little"),
             offset=int.from_bytes(raw[6:10], "little"),
             total_len=int.from_bytes(raw[10:14], "little"),
-            data=raw[I2C_SLOT_HEADER_SIZE : I2C_SLOT_HEADER_SIZE + data_len],
+            data=raw[I2C_SLOT_HEADER_SIZE: I2C_SLOT_HEADER_SIZE + data_len],
         )
 
     def _ingest_slot(self, slot: I2cSlot) -> tuple[int, bytes] | None:
@@ -1014,7 +1035,8 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
                 stdscr.addnstr(3 + idx, 2, line, left_w - 4)
 
         group_name, group_commands = app.group()
-        stdscr.addstr(1, left_w + 2, f"Group: {group_name} ({app.group_index + 1}/{len(app.command_groups)})", curses.A_BOLD)
+        stdscr.addstr(1, left_w + 2, f"Group: {group_name} ({app.group_index + 1}/{len(app.command_groups)})",
+                      curses.A_BOLD)
         stdscr.addstr(2, left_w + 2, "Tab/Shift-Tab switch group. Up/Down select. Enter sends.")
         cmd_rows = min(len(group_commands), top_h - 5)
         for idx in range(cmd_rows):

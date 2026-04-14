@@ -154,6 +154,34 @@
         "fg": "#fef9c3"
       },
       {
+        "label": "Start DB Now",
+        "cmd": "StartWritingNow",
+        "border": "#10b981",
+        "bg": "#06261d",
+        "fg": "#d1fae5"
+      },
+      {
+        "label": "Start DB Last 2 Min",
+        "cmd": "StartWritingLastTwoMinutes",
+        "border": "#14b8a6",
+        "bg": "#042f2e",
+        "fg": "#ccfbf1"
+      },
+      {
+        "label": "Pause DB",
+        "cmd": "PauseWritingDb",
+        "border": "#f59e0b",
+        "bg": "#3b2203",
+        "fg": "#fef3c7"
+      },
+      {
+        "label": "Stop DB",
+        "cmd": "StopWritingDb",
+        "border": "#ef4444",
+        "bg": "#3f0b13",
+        "fg": "#fee2e2"
+      },
+      {
         "label": "Flight State +1",
         "cmd": "AdvanceFlightState",
         "border": "#38bdf8",
@@ -805,6 +833,10 @@
               {
                 "kind": "actions",
                 "actions": [
+                  "StartWritingNow",
+                  "StartWritingLastTwoMinutes",
+                  "PauseWritingDb",
+                  "StopWritingDb",
                   "Dump",
                   "NormallyOpen",
                   "Nitrogen",
@@ -1032,6 +1064,10 @@
                   }
                 ],
                 "actions": [
+                  "StartWritingNow",
+                  "StartWritingLastTwoMinutes",
+                  "PauseWritingDb",
+                  "StopWritingDb",
                   "Launch",
                   "Dump",
                   "Pilot",
@@ -1296,6 +1332,10 @@
               {
                 "kind": "actions",
                 "actions": [
+                  "StartWritingNow",
+                  "StartWritingLastTwoMinutes",
+                  "PauseWritingDb",
+                  "StopWritingDb",
                   "Dump",
                   "NormallyOpen",
                   "Nitrogen",

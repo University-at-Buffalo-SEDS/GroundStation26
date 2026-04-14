@@ -19,6 +19,7 @@ mod rocket_commands;
 mod safety_task;
 mod sequences;
 mod state;
+mod telemetry_db;
 mod telemetry_task;
 mod types;
 mod web;
@@ -28,6 +29,11 @@ use crate::ring_buffer::RingBuffer;
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
+use crate::telemetry_db::{
+    DEFAULT_TELEMETRY_DB_FILENAME, DbQueueItem, LaunchClockMsg, RecordingModeWire,
+    RecordingStatusMsg, apply_sqlite_pragmas, close_and_finalize_sqlite, ensure_sqlite_db_file,
+    open_telemetry_db,
+};
 use crate::telemetry_task::{
     CommsWorkerHandle, get_current_timestamp_ms, set_network_time_router, telemetry_task,
 };
@@ -43,8 +49,7 @@ use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode, RouterSideOptions};
 use sedsprintf_rs_2026::timesync::{TimeSyncConfig, TimeSyncRole};
-use sqlx::sqlite::SqliteConnection;
-use sqlx::{Connection, Row};
+use sqlx::Row;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -56,35 +61,12 @@ use tokio::time::Duration;
 use crate::web::emit_error;
 use tokio::sync::{broadcast, mpsc};
 
-/// Reads a bounded `usize` environment variable and falls back to `default`.
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(default)
         .clamp(min, max)
-}
-
-/// Reads a bounded `i64` environment variable and falls back to `default`.
-fn env_i64(name: &str, default: i64, min: i64, max: i64) -> i64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(default)
-        .clamp(min, max)
-}
-
-/// Creates the SQLite file on disk when it does not exist and returns a stable path string.
-fn ensure_sqlite_db_file(path: &Path) -> anyhow::Result<String> {
-    if !path.exists() {
-        fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
-        fs::write(path, b"")?;
-        println!("Created empty DB file: {}", path.display());
-    }
-    Ok(fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .to_string())
 }
 
 /// Creates or upgrades the auth session table used by token-based login.
@@ -122,153 +104,6 @@ async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()>
     }
 
     Ok(())
-}
-
-/// Applies runtime SQLite pragmas that trade startup defaults for better write throughput.
-async fn apply_sqlite_pragmas(db: &sqlx::SqlitePool) {
-    let synchronous = std::env::var("GS_SQLITE_SYNCHRONOUS")
-        .unwrap_or_else(|_| "NORMAL".to_string())
-        .to_uppercase();
-    let synchronous = match synchronous.as_str() {
-        "OFF" | "NORMAL" | "FULL" | "EXTRA" => synchronous,
-        _ => "NORMAL".to_string(),
-    };
-
-    let busy_timeout_ms = env_i64("GS_SQLITE_BUSY_TIMEOUT_MS", 5_000, 100, 120_000);
-    let wal_autocheckpoint = env_i64("GS_SQLITE_WAL_AUTOCHECKPOINT", 1_000, 100, 100_000);
-    let cache_kib = env_i64("GS_SQLITE_CACHE_SIZE_KIB", 32 * 1024, 1024, 512 * 1024);
-    let cache_pages = -cache_kib; // negative => kibibytes
-
-    let pragmas = [
-        "PRAGMA journal_mode=WAL;".to_string(),
-        format!("PRAGMA synchronous={synchronous};"),
-        "PRAGMA temp_store=MEMORY;".to_string(),
-        format!("PRAGMA busy_timeout={busy_timeout_ms};"),
-        format!("PRAGMA wal_autocheckpoint={wal_autocheckpoint};"),
-        format!("PRAGMA cache_size={cache_pages};"),
-    ];
-
-    for stmt in pragmas {
-        if let Err(err) = sqlx::query(&stmt).execute(db).await {
-            eprintln!("SQLite pragma failed ({stmt}): {err}");
-        }
-    }
-}
-
-/// Runs the shutdown-time checkpoint and optimization pragmas against an open pool.
-async fn flush_sqlite_journals(db: &sqlx::SqlitePool) {
-    /// Retries shutdown pragmas because the pool can still be draining background writers.
-    async fn exec_pragma_with_retry(
-        db: &sqlx::SqlitePool,
-        stmt: &str,
-        retries: usize,
-        delay_ms: u64,
-    ) -> Result<(), sqlx::Error> {
-        for attempt in 0..retries {
-            match sqlx::query(stmt).execute(db).await {
-                Ok(_) => return Ok(()),
-                Err(err) => {
-                    if attempt + 1 >= retries {
-                        return Err(err);
-                    }
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    let retries = env_usize("GS_SQLITE_SHUTDOWN_PRAGMA_RETRIES", 8, 1, 60);
-    let delay_ms = env_i64("GS_SQLITE_SHUTDOWN_PRAGMA_RETRY_DELAY_MS", 120, 10, 5_000) as u64;
-
-    // If DB is in WAL mode, this checkpoints all frames and truncates WAL to 0 bytes.
-    if let Err(err) =
-        exec_pragma_with_retry(db, "PRAGMA wal_checkpoint(TRUNCATE);", retries, delay_ms).await
-    {
-        eprintln!("SQLite wal_checkpoint(TRUNCATE) failed after {retries} attempts: {err}");
-    }
-
-    // Optional lightweight cleanup/analysis pass.
-    if let Err(err) = exec_pragma_with_retry(db, "PRAGMA optimize;", retries, delay_ms).await {
-        eprintln!("SQLite PRAGMA optimize failed after {retries} attempts: {err}");
-    }
-}
-
-/// Removes leftover WAL and journal sidecar files after SQLite has been finalized.
-async fn remove_sqlite_sidecars(db_path: &str) {
-    let retries = env_usize("GS_SQLITE_SIDECAR_DELETE_RETRIES", 12, 1, 120);
-    let retry_delay_ms = env_i64("GS_SQLITE_SIDECAR_DELETE_DELAY_MS", 100, 10, 2_000) as u64;
-    for suffix in [".wal", ".shm", "-wal", "-shm", "-journal", ".journal"] {
-        let sidecar = format!("{db_path}{suffix}");
-        for attempt in 0..retries {
-            match fs::remove_file(&sidecar) {
-                Ok(()) => break,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
-                Err(err) => {
-                    if attempt + 1 >= retries {
-                        eprintln!("Failed removing SQLite sidecar {sidecar}: {err}");
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
-                }
-            }
-        }
-    }
-}
-
-/// Lists SQLite sidecar files that still exist beside the database.
-fn sqlite_sidecars_present(db_path: &str) -> Vec<String> {
-    [".wal", ".shm", "-wal", "-shm", "-journal", ".journal"]
-        .into_iter()
-        .map(|suffix| format!("{db_path}{suffix}"))
-        .filter(|p| Path::new(p).exists())
-        .collect()
-}
-
-/// Reopens the database once the pool is dropped to force a final checkpoint back to DELETE mode.
-async fn finalize_sqlite_after_pool_close(db_path: &str) {
-    let url = format!("sqlite://{db_path}");
-    let mut conn = match SqliteConnection::connect(&url).await {
-        Ok(conn) => conn,
-        Err(err) => {
-            eprintln!("Failed to reopen SQLite DB for finalization ({db_path}): {err}");
-            return;
-        }
-    };
-
-    for stmt in [
-        "PRAGMA busy_timeout=5000;",
-        "PRAGMA wal_checkpoint(TRUNCATE);",
-        "PRAGMA optimize;",
-    ] {
-        if let Err(err) = sqlx::query(stmt).execute(&mut conn).await {
-            eprintln!("SQLite finalization pragma failed ({stmt}): {err}");
-        }
-    }
-
-    let retries = env_usize("GS_SQLITE_SHUTDOWN_PRAGMA_RETRIES", 8, 1, 60);
-    let retry_delay_ms = env_i64("GS_SQLITE_SHUTDOWN_PRAGMA_RETRY_DELAY_MS", 120, 10, 5_000) as u64;
-    for attempt in 0..retries {
-        match sqlx::query("PRAGMA journal_mode=DELETE;")
-            .execute(&mut conn)
-            .await
-        {
-            Ok(_) => break,
-            Err(err) => {
-                if attempt + 1 >= retries {
-                    eprintln!(
-                        "SQLite finalization pragma failed (PRAGMA journal_mode=DELETE;): {err}"
-                    );
-                } else {
-                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
-                }
-            }
-        }
-    }
-
-    if let Err(err) = conn.close().await {
-        eprintln!("Failed closing SQLite finalization connection: {err}");
-    }
 }
 
 /// Waits for process termination signals and then fan-outs the app-wide shutdown request.
@@ -315,116 +150,36 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- DB path ---
-    let db_path = PathBuf::from("./data/groundstation.db");
-    let db_path_str = ensure_sqlite_db_file(&db_path)?;
+    let db_path = PathBuf::from("./data").join(DEFAULT_TELEMETRY_DB_FILENAME);
+    let (db, db_path_str) = open_telemetry_db(&db_path).await?;
     let auth_db_path = db_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("users.db");
     let auth_db_path_str = ensure_sqlite_db_file(&auth_db_path)?;
-
-    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path_str)).await?;
-    apply_sqlite_pragmas(&db).await;
     let auth_db = sqlx::SqlitePool::connect(&format!("sqlite://{}", auth_db_path_str)).await?;
     apply_sqlite_pragmas(&auth_db).await;
 
-    // --- Tables ---
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS telemetry (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp_ms INTEGER NOT NULL,
-            data_type    TEXT    NOT NULL,
-            sender_id    TEXT,
-            values_json  TEXT,
-            payload_json TEXT
-        );
-        "#,
-    )
-    .execute(&db)
-    .await?;
-
-    // `/api/recent` repeatedly queries telemetry by timestamp range and ascending order.
-    // Without an index here, large field databases degrade into full scans and sorts.
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp_ms ON telemetry (timestamp_ms);",
-    )
-    .execute(&db)
-    .await?;
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_telemetry_data_type_timestamp_ms ON telemetry (data_type, timestamp_ms DESC);",
-    )
-    .execute(&db)
-    .await?;
-
-    // Add values_json column for older DBs.
-    let cols = sqlx::query("PRAGMA table_info(telemetry)")
-        .fetch_all(&db)
-        .await?;
-    let has_values_json = cols
-        .iter()
-        .any(|row| row.get::<String, _>("name") == "values_json");
-    if !has_values_json {
-        sqlx::query("ALTER TABLE telemetry ADD COLUMN values_json TEXT")
-            .execute(&db)
-            .await?;
-    }
-    let has_payload_json = cols
-        .iter()
-        .any(|row| row.get::<String, _>("name") == "payload_json");
-    if !has_payload_json {
-        sqlx::query("ALTER TABLE telemetry ADD COLUMN payload_json TEXT")
-            .execute(&db)
-            .await?;
-    }
-    let has_sender_id = cols
-        .iter()
-        .any(|row| row.get::<String, _>("name") == "sender_id");
-    if !has_sender_id {
-        sqlx::query("ALTER TABLE telemetry ADD COLUMN sender_id TEXT")
-            .execute(&db)
-            .await?;
-    }
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS alerts (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp_ms INTEGER NOT NULL,
-            severity     TEXT    NOT NULL, -- 'warning' or 'error'
-            message      TEXT    NOT NULL
-        );
-        "#,
-    )
-    .execute(&db)
-    .await?;
-
     ensure_auth_sessions_table(&auth_db).await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS flight_state (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp_ms INTEGER NOT NULL,
-            f_state      INTEGER NOT NULL
-        );
-        "#,
-    )
-    .execute(&db)
-    .await?;
 
     // --- Channels ---
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
+    let db_work_queue_size = env_usize("GS_DB_WORK_QUEUE_SIZE", 8_192, 1024, 262_144);
+    let (db_queue_tx, db_queue_rx) = mpsc::channel::<DbQueueItem>(db_work_queue_size);
     let ws_broadcast_capacity = env_usize("GS_WS_BROADCAST_CAPACITY", 8192, 512, 262_144);
     let board_status_capacity = env_usize("GS_BOARD_STATUS_BROADCAST_CAPACITY", 256, 64, 4096);
     let alerts_capacity = env_usize("GS_ALERTS_BROADCAST_CAPACITY", 1024, 128, 8192);
     let notifications_capacity = env_usize("GS_NOTIFICATIONS_BROADCAST_CAPACITY", 64, 16, 2048);
     let actions_capacity = env_usize("GS_ACTION_POLICY_BROADCAST_CAPACITY", 64, 16, 2048);
+    let launch_clock_capacity = env_usize("GS_LAUNCH_CLOCK_BROADCAST_CAPACITY", 32, 8, 1024);
+    let recording_status_capacity =
+        env_usize("GS_RECORDING_STATUS_BROADCAST_CAPACITY", 32, 8, 1024);
     let (ws_tx, _ws_rx) = broadcast::channel(ws_broadcast_capacity);
     let (board_status_tx, _board_status_rx) = broadcast::channel(board_status_capacity);
     let (notifications_tx, _notifications_rx) = broadcast::channel(notifications_capacity);
     let (action_policy_tx, _action_policy_rx) = broadcast::channel(actions_capacity);
+    let (launch_clock_tx, _launch_clock_rx) = broadcast::channel(launch_clock_capacity);
+    let (recording_status_tx, _recording_status_rx) = broadcast::channel(recording_status_capacity);
     let (shutdown_tx, _shutdown_rx) = broadcast::channel(8);
 
     // --- Shared state ---
@@ -462,7 +217,10 @@ async fn main() -> anyhow::Result<()> {
         ws_tx,
         warnings_tx: broadcast::channel(alerts_capacity).0,
         errors_tx: broadcast::channel(alerts_capacity).0,
-        db,
+        db: Arc::new(Mutex::new(db)),
+        db_path: Arc::new(Mutex::new(db_path_str.clone())),
+        placeholder_db_path: db_path_str.clone(),
+        db_queue_tx,
         auth_db,
         state: Arc::new(Mutex::new(FlightStateMode::Startup)),
         state_tx: broadcast::channel(16).0,
@@ -482,6 +240,13 @@ async fn main() -> anyhow::Result<()> {
         next_notification_id: Arc::new(AtomicU64::new(0)),
         action_policy: Arc::new(Mutex::new(default_action_policy())),
         action_policy_tx,
+        launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
+        launch_clock_tx,
+        recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
+            mode: RecordingModeWire::Idle,
+            db_path: Some(db_path_str.clone()),
+        })),
+        recording_status_tx,
         last_command_ms: Arc::new(Mutex::new(HashMap::new())),
         fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
         recent_telemetry_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
@@ -734,6 +499,7 @@ async fn main() -> anyhow::Result<()> {
             },
         ],
         cmd_rx,
+        db_queue_rx,
         telemetry_shutdown_rx,
     ));
     let mut st = tokio::spawn(safety_task(
@@ -801,28 +567,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    flush_sqlite_journals(&state.db).await;
-    state.db.close().await;
-    finalize_sqlite_after_pool_close(&db_path_str).await;
-    remove_sqlite_sidecars(&db_path_str).await;
-    let lingering = sqlite_sidecars_present(&db_path_str);
-    if !lingering.is_empty() {
-        eprintln!(
-            "WARNING: SQLite sidecar files still present after shutdown cleanup: {}",
-            lingering.join(", ")
-        );
-    }
+    let telemetry_db = state.telemetry_db_pool();
+    let telemetry_db_path = state.telemetry_db_path();
+    close_and_finalize_sqlite(telemetry_db, &telemetry_db_path).await;
 
-    flush_sqlite_journals(&state.auth_db).await;
-    state.auth_db.close().await;
-    finalize_sqlite_after_pool_close(&auth_db_path_str).await;
-    remove_sqlite_sidecars(&auth_db_path_str).await;
-    let lingering = sqlite_sidecars_present(&auth_db_path_str);
-    if !lingering.is_empty() {
-        eprintln!(
-            "WARNING: Auth SQLite sidecar files still present after shutdown cleanup: {}",
-            lingering.join(", ")
-        );
-    }
+    close_and_finalize_sqlite(state.auth_db.clone(), &auth_db_path_str).await;
     Ok(())
 }

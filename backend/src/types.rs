@@ -14,6 +14,10 @@ pub enum TelemetryCommand {
     NitrogenClose,
     Nitrous,
     NitrousClose,
+    StartWritingNow,
+    StartWritingLastTwoMinutes,
+    PauseWritingDb,
+    StopWritingDb,
     ContinueFillSequence,
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     AdvanceFlightState,
