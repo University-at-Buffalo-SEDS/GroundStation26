@@ -1124,6 +1124,8 @@ pub async fn telemetry_task(
                                 } else {
                                     log_command_queue_success("Dump command", DataType::ValveCommand, &[cmd as u8]);
                                     flush_command_tx(&router, "failed to flush Dump command tx");
+                                    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                                    emit_local_valve_state_update(&state, &db_tx, &db_overflow, cmd as u8, true).await;
                                 }
                                 {
                                     let gpio = &state.gpio;
@@ -1156,6 +1158,8 @@ pub async fn telemetry_task(
                                 } else {
                                     log_command_queue_success("Igniter command", DataType::ActuatorCommand, &[cmd as u8]);
                                     flush_command_tx(&router, "failed to flush Igniter command tx");
+                                    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                                    emit_local_valve_state_update(&state, &db_tx, &db_overflow, cmd as u8, true).await;
                                 }
                                 println!("Igniter command sent {:?}", cmd);
                             }
@@ -1175,6 +1179,8 @@ pub async fn telemetry_task(
                                 } else {
                                     log_command_queue_success("Pilot command", DataType::ValveCommand, &[cmd as u8]);
                                     flush_command_tx(&router, "failed to flush Pilot command tx");
+                                    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                                    emit_local_valve_state_update(&state, &db_tx, &db_overflow, cmd as u8, true).await;
                                 }
                                 println!("Pilot command sent {:?}", cmd);
                             }
@@ -1194,6 +1200,8 @@ pub async fn telemetry_task(
                                 } else {
                                     log_command_queue_success("NormallyOpen command", DataType::ValveCommand, &[cmd as u8]);
                                     flush_command_tx(&router, "failed to flush NormallyOpen command tx");
+                                    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                                    emit_local_valve_state_update(&state, &db_tx, &db_overflow, cmd as u8, true).await;
                                 }
                                 println!("Tanks command sent {:?}", cmd);
                             }
@@ -1213,6 +1221,8 @@ pub async fn telemetry_task(
                                 } else {
                                     log_command_queue_success("Nitrogen command", DataType::ActuatorCommand, &[cmd as u8]);
                                     flush_command_tx(&router, "failed to flush Nitrogen command tx");
+                                    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                                    emit_local_valve_state_update(&state, &db_tx, &db_overflow, cmd as u8, true).await;
                                 }
                                 println!("Nitrogen command sent {:?}", cmd);
                             }
@@ -1229,6 +1239,14 @@ pub async fn telemetry_task(
                                         &[ActuatorBoardCommands::NitrogenClose as u8],
                                     );
                                     flush_command_tx(&router, "failed to flush NitrogenClose command tx");
+                                    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                                    emit_local_valve_state_update(
+                                        &state,
+                                        &db_tx,
+                                        &db_overflow,
+                                        ActuatorBoardCommands::NitrogenClose as u8,
+                                        true,
+                                    ).await;
                                 }
                                 println!("Nitrogen explicit close command sent");
                             }
@@ -1245,6 +1263,14 @@ pub async fn telemetry_task(
                                         &[ActuatorBoardCommands::RetractPlumbing as u8],
                                     );
                                     flush_command_tx(&router, "failed to flush RetractPlumbing command tx");
+                                    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                                    emit_local_valve_state_update(
+                                        &state,
+                                        &db_tx,
+                                        &db_overflow,
+                                        ActuatorBoardCommands::RetractPlumbing as u8,
+                                        true,
+                                    ).await;
                                 }
                                 println!("RetractPlumbing command sent");
                         }
@@ -1264,6 +1290,8 @@ pub async fn telemetry_task(
                                 } else {
                                     log_command_queue_success("Nitrous command", DataType::ActuatorCommand, &[cmd as u8]);
                                     flush_command_tx(&router, "failed to flush Nitrous command tx");
+                                    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                                    emit_local_valve_state_update(&state, &db_tx, &db_overflow, cmd as u8, true).await;
                                 }
                                 println!("Nitrous command sent: {:?}", cmd);
                         }
@@ -1280,6 +1308,14 @@ pub async fn telemetry_task(
                                         &[ActuatorBoardCommands::NitrousClose as u8],
                                     );
                                     flush_command_tx(&router, "failed to flush NitrousClose command tx");
+                                    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                                    emit_local_valve_state_update(
+                                        &state,
+                                        &db_tx,
+                                        &db_overflow,
+                                        ActuatorBoardCommands::NitrousClose as u8,
+                                        true,
+                                    ).await;
                                 }
                                 println!("Nitrous explicit close command sent");
                         }
@@ -1498,6 +1534,54 @@ fn valve_state_values(state: &AppState) -> [Option<f32>; 8] {
         bool_to_f32(state.get_umbilical_valve_state(A::RetractPlumbing as u8)),
         None,
     ]
+}
+
+async fn emit_local_valve_state_update(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbWrite>,
+    db_overflow: &DbOverflow,
+    cmd_id: u8,
+    on: bool,
+) {
+    let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) else {
+        return;
+    };
+
+    state.set_umbilical_valve_state(key_cmd_id, key_on);
+
+    let ts_ms = get_current_timestamp_ms() as i64;
+    let values = valve_state_values(state);
+    let values_vec: Vec<Option<f32>> = values.into_iter().collect();
+    let values_json = serde_json::to_string(
+        &values_vec
+            .iter()
+            .map(|v| v.map(|n| n as f64))
+            .collect::<Vec<_>>(),
+    )
+    .ok();
+
+    queue_db_write(
+        state,
+        db_tx,
+        db_overflow,
+        DbWrite::Telemetry {
+            timestamp_ms: ts_ms,
+            data_type: VALVE_STATE_DATA_TYPE.to_string(),
+            sender_id: Board::GroundStation.sender_id().to_string(),
+            values_json,
+            payload_json: "[]".to_string(),
+        },
+    )
+    .await;
+
+    let row = TelemetryRow {
+        timestamp_ms: ts_ms,
+        data_type: VALVE_STATE_DATA_TYPE.to_string(),
+        sender_id: Board::GroundStation.sender_id().to_string(),
+        values: values_vec,
+    };
+    state.cache_recent_telemetry(row.clone());
+    let _ = state.ws_tx.send(row);
 }
 
 const DB_RETRIES: usize = 5;
