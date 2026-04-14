@@ -149,6 +149,7 @@ Frontend expectations:
 Purpose:
 
 - Provide the top-level tab list and the layout for state/data/network/calibration views.
+- Provide the backend-defined action ordering and action presentation hints.
 
 Expected response:
 
@@ -169,6 +170,11 @@ Critical expectations:
     - `network-topology`
     - `detailed`
 - Tab IDs must be unique.
+- `actions_tab.actions` order is authoritative and must be rendered in-order by the frontend.
+- Action layout entries may include:
+  - `illuminated: bool` to request backend-driven default illumination for that action.
+  - `spacer_before: bool` and `spacer_after: bool` to request a visual separator around that action.
+- Frontend-specific action highlighting should not be hardcoded for particular commands; it should follow backend layout plus live `ActionPolicyMsg` updates.
 - Data tab channel labels and boolean label sets must line up with actual telemetry value ordering.
 - State widgets must reference valid data types and valid per-value indexes.
 

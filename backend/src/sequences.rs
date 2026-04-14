@@ -1,11 +1,12 @@
+use crate::layout;
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 use crate::state::AppState;
 use crate::types::{FlightState, TelemetryCommand};
 use crate::web::emit_warning;
 use crate::{fill_targets, loadcell};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
@@ -41,6 +42,36 @@ pub struct ActionPolicyMsg {
     pub key_enabled: bool,
     pub software_buttons_enabled: bool,
     pub controls: Vec<ActionControl>,
+}
+
+fn backend_illuminated_commands() -> &'static HashSet<String> {
+    static ILLUMINATED: OnceLock<HashSet<String>> = OnceLock::new();
+    ILLUMINATED.get_or_init(|| {
+        layout::load_layout()
+            .map(|layout| {
+                layout
+                    .actions_tab
+                    .actions
+                    .into_iter()
+                    .filter(|action| action.illuminated)
+                    .map(|action| action.cmd)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn backend_blink_for(cmd: &str, enabled: bool, recommended: Option<&BlinkMode>) -> BlinkMode {
+    if !enabled {
+        return BlinkMode::None;
+    }
+    if let Some(blink) = recommended {
+        return blink.clone();
+    }
+    if backend_illuminated_commands().contains(cmd) {
+        return BlinkMode::Slow;
+    }
+    BlinkMode::None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -506,18 +537,21 @@ pub fn all_command_names() -> Vec<&'static str> {
 pub fn default_action_policy() -> ActionPolicyMsg {
     let controls = all_command_names()
         .into_iter()
-        .map(|cmd| ActionControl {
-            cmd: cmd.to_string(),
-            enabled: matches!(
+        .map(|cmd| {
+            let enabled = matches!(
                 cmd,
                 "Abort"
                     | "StartWritingNow"
                     | "StartWritingLastTwoMinutes"
                     | "PauseWritingDb"
                     | "StopWritingDb"
-            ),
-            blink: BlinkMode::None,
-            actuated: None,
+            );
+            ActionControl {
+                cmd: cmd.to_string(),
+                enabled,
+                blink: backend_blink_for(cmd, enabled, None),
+                actuated: None,
+            }
         })
         .collect();
     ActionPolicyMsg {
@@ -535,10 +569,9 @@ fn policy_with_overrides(
 ) -> ActionPolicyMsg {
     let controls = all_command_names()
         .into_iter()
-        .map(|cmd| ActionControl {
-            cmd: cmd.to_string(),
+        .map(|cmd| {
             // Keep controls pressable while key is enabled; blink indicates recommendation.
-            enabled: if matches!(
+            let enabled = if matches!(
                 cmd,
                 "Abort"
                     | "StartWritingNow"
@@ -554,19 +587,23 @@ fn policy_with_overrides(
                 false
             } else {
                 key_enabled
-            },
-            blink: recommended.get(cmd).cloned().unwrap_or(BlinkMode::None),
-            actuated: if matches!(
-                cmd,
-                "StartWritingNow"
-                    | "StartWritingLastTwoMinutes"
-                    | "PauseWritingDb"
-                    | "StopWritingDb"
-            ) {
-                None
-            } else {
-                valves.actuated_for_cmd(cmd)
-            },
+            };
+            ActionControl {
+                cmd: cmd.to_string(),
+                enabled,
+                blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
+                actuated: if matches!(
+                    cmd,
+                    "StartWritingNow"
+                        | "StartWritingLastTwoMinutes"
+                        | "PauseWritingDb"
+                        | "StopWritingDb"
+                ) {
+                    None
+                } else {
+                    valves.actuated_for_cmd(cmd)
+                },
+            }
         })
         .collect();
 

@@ -436,6 +436,12 @@ pub struct ActionSpec {
     pub border: String,
     pub bg: String,
     pub fg: String,
+    #[serde(default)]
+    pub illuminated: bool,
+    #[serde(default)]
+    pub spacer_before: bool,
+    #[serde(default)]
+    pub spacer_after: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
