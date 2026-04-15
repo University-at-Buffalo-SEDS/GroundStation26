@@ -984,6 +984,7 @@ fn launch_clock_for_transition(
     Some(match next_state {
         FlightState::Launch if current.kind == LaunchClockKind::TMinus => current.clone(),
         FlightState::Launch => launch_countdown_clock(timestamp_ms),
+        FlightState::Ascent if current.kind == LaunchClockKind::TPlus => current.clone(),
         FlightState::Ascent => LaunchClockMsg {
             kind: LaunchClockKind::TPlus,
             anchor_timestamp_ms: Some(t_plus_anchor_timestamp(current, timestamp_ms)),
@@ -1060,6 +1061,22 @@ mod tests {
 
         assert_eq!(next.kind, LaunchClockKind::TPlus);
         assert_eq!(next.anchor_timestamp_ms, Some(15_800));
+        assert_eq!(next.duration_ms, None);
+    }
+
+    #[test]
+    fn ascent_keeps_existing_t_plus_anchor_on_repeated_packets() {
+        let current = LaunchClockMsg {
+            kind: LaunchClockKind::TPlus,
+            anchor_timestamp_ms: Some(20_000),
+            duration_ms: None,
+        };
+
+        let next = launch_clock_for_transition(&current, FlightState::Ascent, 20_850)
+            .expect("repeated ascent packet should preserve launch clock");
+
+        assert_eq!(next.kind, LaunchClockKind::TPlus);
+        assert_eq!(next.anchor_timestamp_ms, Some(20_000));
         assert_eq!(next.duration_ms, None);
     }
 
