@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 
+pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
+
 #[derive(Debug, Clone)]
 pub struct BoardStatus {
     pub last_seen_ms: Option<u64>,
@@ -980,11 +982,8 @@ fn launch_clock_for_transition(
     timestamp_ms: i64,
 ) -> Option<LaunchClockMsg> {
     Some(match next_state {
-        FlightState::Launch => LaunchClockMsg {
-            kind: LaunchClockKind::TMinus,
-            anchor_timestamp_ms: Some(timestamp_ms),
-            duration_ms: Some(5_000),
-        },
+        FlightState::Launch if current.kind == LaunchClockKind::TMinus => current.clone(),
+        FlightState::Launch => launch_countdown_clock(timestamp_ms),
         FlightState::Ascent => LaunchClockMsg {
             kind: LaunchClockKind::TPlus,
             anchor_timestamp_ms: Some(t_plus_anchor_timestamp(current, timestamp_ms)),
@@ -999,6 +998,14 @@ fn launch_clock_for_transition(
         | FlightState::Armed => LaunchClockMsg::idle(),
         _ => return None,
     })
+}
+
+pub fn launch_countdown_clock(timestamp_ms: i64) -> LaunchClockMsg {
+    LaunchClockMsg {
+        kind: LaunchClockKind::TMinus,
+        anchor_timestamp_ms: Some(timestamp_ms),
+        duration_ms: Some(LAUNCH_COUNTDOWN_DURATION_MS),
+    }
 }
 
 fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
@@ -1033,14 +1040,14 @@ mod tests {
         let current = LaunchClockMsg {
             kind: LaunchClockKind::TMinus,
             anchor_timestamp_ms: Some(10_000),
-            duration_ms: Some(5_000),
+            duration_ms: Some(LAUNCH_COUNTDOWN_DURATION_MS),
         };
 
-        let next = launch_clock_for_transition(&current, FlightState::Ascent, 15_800)
+        let next = launch_clock_for_transition(&current, FlightState::Ascent, 20_800)
             .expect("ascent transition should produce a launch clock");
 
         assert_eq!(next.kind, LaunchClockKind::TPlus);
-        assert_eq!(next.anchor_timestamp_ms, Some(15_000));
+        assert_eq!(next.anchor_timestamp_ms, Some(20_000));
         assert_eq!(next.duration_ms, None);
     }
 
@@ -1054,5 +1061,17 @@ mod tests {
         assert_eq!(next.kind, LaunchClockKind::TPlus);
         assert_eq!(next.anchor_timestamp_ms, Some(15_800));
         assert_eq!(next.duration_ms, None);
+    }
+
+    #[test]
+    fn launch_keeps_running_countdown_when_flight_state_packet_arrives_late() {
+        let current = launch_countdown_clock(10_000);
+
+        let next = launch_clock_for_transition(&current, FlightState::Launch, 15_000)
+            .expect("launch transition should produce a launch clock");
+
+        assert_eq!(next.kind, LaunchClockKind::TMinus);
+        assert_eq!(next.anchor_timestamp_ms, Some(10_000));
+        assert_eq!(next.duration_ms, Some(LAUNCH_COUNTDOWN_DURATION_MS));
     }
 }

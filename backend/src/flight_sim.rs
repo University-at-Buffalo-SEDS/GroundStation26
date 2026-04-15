@@ -31,6 +31,8 @@ const SENSOR_PERIOD_MS: u64 = 25;
 #[cfg(feature = "testing")]
 const FLIGHT_STATE_PERIOD_MS: u64 = 1_000;
 #[cfg(feature = "testing")]
+const LAUNCH_COUNTDOWN_DURATION_MS: u64 = 10_000;
+#[cfg(feature = "testing")]
 const HOUSEKEEPING_PERIOD_MS: u64 = 900;
 #[cfg(feature = "testing")]
 const AV_BAY_BATTERY_CUTOFF_V: f32 = 6.3;
@@ -551,7 +553,9 @@ impl FlightSimState {
             return;
         }
 
-        if self.launch_time_ms.is_none() && now_ms.saturating_sub(sequence_start_ms) >= 5_000 {
+        if self.launch_time_ms.is_none()
+            && now_ms.saturating_sub(sequence_start_ms) >= LAUNCH_COUNTDOWN_DURATION_MS
+        {
             let pilot_key = ValveBoardCommands::PilotOpen as u8;
             if !self.valve_on(pilot_key) {
                 self.valves.insert(pilot_key, true);
@@ -561,7 +565,7 @@ impl FlightSimState {
             self.set_flight_state(FlightState::Ascent, now_ms);
         }
 
-        if now_ms.saturating_sub(sequence_start_ms) >= 10_000 {
+        if now_ms.saturating_sub(sequence_start_ms) >= LAUNCH_COUNTDOWN_DURATION_MS {
             let igniter_key = ActuatorBoardCommands::IgniterOn as u8;
             if self.valve_on(igniter_key) {
                 self.valves.insert(igniter_key, false);

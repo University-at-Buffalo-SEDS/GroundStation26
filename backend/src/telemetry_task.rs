@@ -6,14 +6,13 @@ use crate::loadcell;
 #[cfg(feature = "hitl_mode")]
 use crate::rocket_commands::FlightComputerCommands;
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
-use crate::state::AppState;
+use crate::state::{AppState, launch_countdown_clock};
 use crate::telemetry_db::{
-    DbQueueItem, DbWrite, RecordingCommand, RecordingMode, RecordingModeWire, RecordingStatusMsg,
-    close_and_finalize_sqlite, open_telemetry_db, prune_recent_writes, session_db_path,
+    DbQueueItem, DbWrite, LaunchClockKind, RecordingCommand, RecordingMode, RecordingModeWire,
+    RecordingStatusMsg, close_and_finalize_sqlite, open_telemetry_db, prune_recent_writes,
+    session_db_path,
 };
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-use crate::types::FlightState;
-use crate::types::{Board, TelemetryCommand, TelemetryRow, u8_to_flight_state};
+use crate::types::{Board, FlightState, TelemetryCommand, TelemetryRow, u8_to_flight_state};
 use crate::web::{FlightStateMsg, emit_warning};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
@@ -41,6 +40,7 @@ const DB_BATCH_WAIT_MS_DEFAULT: u64 = 8;
 const ROUTER_QUEUE_BUDGET_MS: u32 = 6;
 const ROUTER_TX_BUDGET_MS: u32 = 3;
 const ROUTER_RX_BUDGET_MS: u32 = ROUTER_QUEUE_BUDGET_MS - ROUTER_TX_BUDGET_MS;
+const LAUNCH_COMMAND_DELAY_MS: u64 = 5_000;
 const GPS_SATELLITES_DATA_TYPE: &str = "GPS_SATELLITE_NUMBER";
 const VEHICLE_SPEED_DATA_TYPE: &str = "VEHICLE_SPEED";
 const GRAVITY_MPS2: f32 = 9.80665;
@@ -877,6 +877,76 @@ pub fn set_network_time_router(router: Arc<Router>) {
     let _ = NETWORK_TIME_ROUTER.set(router);
 }
 
+fn schedule_launch_command_after_delay(state: Arc<AppState>, router: Arc<Router>) {
+    tokio::spawn(async move {
+        let mut shutdown_rx = state.shutdown_subscribe();
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(LAUNCH_COMMAND_DELAY_MS)) => {}
+            recv = shutdown_rx.recv() => {
+                match recv {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {}
+                }
+                println!("Delayed launch command canceled by shutdown");
+                return;
+            }
+        }
+
+        let current_state = { *state.state.lock().unwrap() };
+        if current_state == FlightState::Aborted {
+            println!("Delayed launch command canceled because flight state is Aborted");
+            return;
+        }
+
+        send_launch_command(&state, &router);
+    });
+}
+
+fn send_launch_command(state: &AppState, router: &Router) {
+    #[cfg(feature = "test_fire_mode")]
+    {
+        let _ = state;
+        if let Err(e) = router.log_queue(
+            DataType::ActuatorCommand,
+            &[ActuatorBoardCommands::IgniterSequence as u8],
+        ) {
+            log_telemetry_error("failed to log delayed test-fire Launch command", e);
+        } else {
+            log_command_queue_success(
+                "Delayed test-fire Launch command",
+                DataType::ActuatorCommand,
+                &[ActuatorBoardCommands::IgniterSequence as u8],
+            );
+            flush_command_tx(
+                router,
+                "failed to flush delayed test-fire Launch command tx",
+            );
+        }
+        println!("Delayed test-fire launch command sent to actuator board");
+    }
+
+    #[cfg(not(feature = "test_fire_mode"))]
+    {
+        if let Err(e) = router.log_queue(
+            DataType::FlightCommand,
+            &[crate::rocket_commands::FlightCommands::Launch as u8],
+        ) {
+            log_telemetry_error("failed to log delayed Launch command", e);
+        } else {
+            log_command_queue_success(
+                "Delayed Launch command",
+                DataType::FlightCommand,
+                &[crate::rocket_commands::FlightCommands::Launch as u8],
+            );
+            flush_command_tx(router, "failed to flush delayed Launch command tx");
+        }
+        state
+            .gpio
+            .write_output_pin(IGNITION_PIN, true)
+            .expect("failed to set gpio output");
+        println!("Delayed launch command sent");
+    }
+}
+
 pub async fn telemetry_task(
     state: Arc<AppState>,
     router: Arc<sedsprintf_rs_2026::router::Router>,
@@ -1202,40 +1272,18 @@ pub async fn telemetry_task(
                     }
                     match cmd {
                         TelemetryCommand::Launch => {
+                                if state.launch_clock_snapshot().kind == LaunchClockKind::TMinus {
+                                    println!("Launch command ignored because launch countdown is already running");
+                                    continue;
+                                }
                                 if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
                                     let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartNow)).await;
                                     println!("Launch auto-started DB recording");
                                 }
-                                #[cfg(feature = "test_fire_mode")]
-                                {
-                                    if let Err(e) = router.log_queue(
-                                        DataType::ActuatorCommand,
-                                        &[ActuatorBoardCommands::IgniterSequence as u8],
-                                    ) {
-                                        log_telemetry_error("failed to log test-fire Launch command", e);
-                                    }
-                                    println!("Test-fire launch command sent to actuator board");
-                                    continue;
-                                }
-                                #[cfg(not(feature = "test_fire_mode"))]
-                                {
-                                    if let Err(e) = router.log_queue(
-                                        DataType::FlightCommand,
-                                        &[crate::rocket_commands::FlightCommands::Launch as u8],
-                                    ) {
-                                    log_telemetry_error("failed to log Launch command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "Launch command",
-                                        DataType::FlightCommand,
-                                        &[crate::rocket_commands::FlightCommands::Launch as u8],
-                                    );
-                                    flush_command_tx(&router, "failed to flush Launch command tx");
-                                }
-                                let gpio = &state.gpio;
-                                gpio.write_output_pin(IGNITION_PIN, true).expect("failed to set gpio output");
-                                println!("Launch command sent");
-                                }
+                                let now_ms = get_current_timestamp_ms() as i64;
+                                state.set_launch_clock(launch_countdown_clock(now_ms));
+                                schedule_launch_command_after_delay(state.clone(), router.clone());
+                                println!("Launch command scheduled after {LAUNCH_COMMAND_DELAY_MS} ms");
                             }
                         TelemetryCommand::Dump => {
                                 let key = ValveBoardCommands::DumpOpen as u8;
