@@ -192,25 +192,9 @@ impl AppState {
     }
 
     pub fn update_launch_clock_for_state(&self, next_state: FlightState, timestamp_ms: i64) {
-        let next = match next_state {
-            FlightState::Launch => LaunchClockMsg {
-                kind: LaunchClockKind::TMinus,
-                anchor_timestamp_ms: Some(timestamp_ms),
-                duration_ms: Some(5_000),
-            },
-            FlightState::Ascent => LaunchClockMsg {
-                kind: LaunchClockKind::TPlus,
-                anchor_timestamp_ms: Some(timestamp_ms),
-                duration_ms: None,
-            },
-            FlightState::Startup
-            | FlightState::Idle
-            | FlightState::PreFill
-            | FlightState::FillTest
-            | FlightState::NitrogenFill
-            | FlightState::NitrousFill
-            | FlightState::Armed => LaunchClockMsg::idle(),
-            _ => return,
+        let current = self.launch_clock_snapshot();
+        let Some(next) = launch_clock_for_transition(&current, next_state, timestamp_ms) else {
+            return;
         };
         self.set_launch_clock(next);
     }
@@ -967,6 +951,46 @@ fn modeled_board_endpoints(
     endpoints
 }
 
+fn launch_clock_for_transition(
+    current: &LaunchClockMsg,
+    next_state: FlightState,
+    timestamp_ms: i64,
+) -> Option<LaunchClockMsg> {
+    Some(match next_state {
+        FlightState::Launch => LaunchClockMsg {
+            kind: LaunchClockKind::TMinus,
+            anchor_timestamp_ms: Some(timestamp_ms),
+            duration_ms: Some(5_000),
+        },
+        FlightState::Ascent => LaunchClockMsg {
+            kind: LaunchClockKind::TPlus,
+            anchor_timestamp_ms: Some(t_plus_anchor_timestamp(current, timestamp_ms)),
+            duration_ms: None,
+        },
+        FlightState::Startup
+        | FlightState::Idle
+        | FlightState::PreFill
+        | FlightState::FillTest
+        | FlightState::NitrogenFill
+        | FlightState::NitrousFill
+        | FlightState::Armed => LaunchClockMsg::idle(),
+        _ => return None,
+    })
+}
+
+fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
+    match (
+        current.kind,
+        current.anchor_timestamp_ms,
+        current.duration_ms,
+    ) {
+        (LaunchClockKind::TMinus, Some(anchor_timestamp_ms), Some(duration_ms)) => {
+            (anchor_timestamp_ms + duration_ms).min(timestamp_ms)
+        }
+        _ => timestamp_ms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,5 +1003,33 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint == DataEndpoint::SdCard.as_str())
         );
+    }
+
+    #[test]
+    fn ascent_uses_prior_t0_when_following_launch_countdown() {
+        let current = LaunchClockMsg {
+            kind: LaunchClockKind::TMinus,
+            anchor_timestamp_ms: Some(10_000),
+            duration_ms: Some(5_000),
+        };
+
+        let next = launch_clock_for_transition(&current, FlightState::Ascent, 15_800)
+            .expect("ascent transition should produce a launch clock");
+
+        assert_eq!(next.kind, LaunchClockKind::TPlus);
+        assert_eq!(next.anchor_timestamp_ms, Some(15_000));
+        assert_eq!(next.duration_ms, None);
+    }
+
+    #[test]
+    fn ascent_falls_back_to_transition_time_without_prior_countdown() {
+        let current = LaunchClockMsg::idle();
+
+        let next = launch_clock_for_transition(&current, FlightState::Ascent, 15_800)
+            .expect("ascent transition should produce a launch clock");
+
+        assert_eq!(next.kind, LaunchClockKind::TPlus);
+        assert_eq!(next.anchor_timestamp_ms, Some(15_800));
+        assert_eq!(next.duration_ms, None);
     }
 }
