@@ -23,6 +23,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 
 pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
+const NETWORK_TOPOLOGY_BOARD_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 
 #[derive(Debug, Clone)]
 pub struct BoardStatus {
@@ -374,6 +375,7 @@ impl AppState {
     /// Projects the current router and board state into the UI-friendly topology graph.
     pub fn network_topology_snapshot(&self, now_ms: u64) -> NetworkTopologyMsg {
         let simulated = crate::flight_sim::sim_mode_enabled();
+        let topology_board_timeout_ms = network_topology_board_timeout_ms();
         let exported = if cfg!(feature = "test_fire_mode") {
             // In test-fire mode the AV-bay side is intentionally absent and both comms links may
             // be dummy placeholders. Avoid router topology export here; that path has proven
@@ -556,7 +558,7 @@ impl AppState {
         let seen_boards = board_snapshot
             .boards
             .iter()
-            .filter(|entry| entry.seen && entry.board != Board::GroundStation)
+            .filter(|entry| board_visible_in_topology(entry, topology_board_timeout_ms))
             .map(|entry| {
                 (
                     entry.board,
@@ -568,7 +570,7 @@ impl AppState {
         for entry in board_snapshot
             .boards
             .iter()
-            .filter(|entry| entry.seen && entry.board != Board::GroundStation)
+            .filter(|entry| board_visible_in_topology(entry, topology_board_timeout_ms))
         {
             let node_id = format!("board_{}", entry.sender_id.to_ascii_lowercase());
             let status = if simulated {
@@ -954,6 +956,19 @@ impl AppState {
             .cloned()
             .collect()
     }
+}
+
+fn network_topology_board_timeout_ms() -> u64 {
+    std::env::var("GS_NETWORK_TOPOLOGY_BOARD_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(NETWORK_TOPOLOGY_BOARD_TIMEOUT_MS_DEFAULT)
+}
+
+fn board_visible_in_topology(entry: &BoardStatusEntry, timeout_ms: u64) -> bool {
+    entry.board != Board::GroundStation
+        && entry.seen
+        && entry.age_ms.is_some_and(|age_ms| age_ms <= timeout_ms)
 }
 
 fn command_dedup_key(cmd: &TelemetryCommand) -> String {
