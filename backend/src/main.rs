@@ -178,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
     let (board_status_tx, _board_status_rx) = broadcast::channel(board_status_capacity);
     let (notifications_tx, _notifications_rx) = broadcast::channel(notifications_capacity);
     let (action_policy_tx, _action_policy_rx) = broadcast::channel(actions_capacity);
+    let (fill_targets_tx, _fill_targets_rx) = broadcast::channel(actions_capacity);
     let (launch_clock_tx, _launch_clock_rx) = broadcast::channel(launch_clock_capacity);
     let (recording_status_tx, _recording_status_rx) = broadcast::channel(recording_status_capacity);
     let (shutdown_tx, _shutdown_rx) = broadcast::channel(8);
@@ -240,6 +241,8 @@ async fn main() -> anyhow::Result<()> {
         next_notification_id: Arc::new(AtomicU64::new(0)),
         action_policy: Arc::new(Mutex::new(default_action_policy())),
         action_policy_tx,
+        fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
+        fill_targets_tx,
         launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
         launch_clock_tx,
         recording_status: Arc::new(Mutex::new(RecordingStatusMsg {

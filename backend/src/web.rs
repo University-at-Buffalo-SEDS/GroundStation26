@@ -299,6 +299,7 @@ pub enum WsOutMsg {
     NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
+    FillTargets(FillTargetsConfig),
     RecordingStatus(RecordingStatusMsg),
     NetworkTime(NetworkTimeMsg),
 }
@@ -1207,7 +1208,7 @@ async fn get_fill_targets(
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-    Json(fill_targets::load_or_default()).into_response()
+    Json(state.fill_targets_snapshot()).into_response()
 }
 
 /// Persists the local fill targets used by the Ground Station fill sequence.
@@ -1224,7 +1225,11 @@ async fn set_fill_targets(
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
     match fill_targets::save(&cfg) {
-        Ok(()) => Json(fill_targets::load_or_default()).into_response(),
+        Ok(()) => {
+            let saved = fill_targets::load_or_default();
+            state.set_fill_targets(saved.clone());
+            Json(saved).into_response()
+        }
         Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
     }
 }
@@ -1376,6 +1381,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let mut board_status_rx = state.board_status_tx.subscribe();
     let mut notifications_rx = state.notifications_tx.subscribe();
     let mut action_policy_rx = state.action_policy_tx.subscribe();
+    let mut fill_targets_rx = state.fill_targets_tx.subscribe();
     let mut recording_status_rx = state.recording_status_tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
@@ -1416,6 +1422,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_action_policy).await.is_err() {
+            return;
+        }
+        let initial_fill_targets = serde_json::to_string(&WsOutMsg::FillTargets(
+            state_for_send.fill_targets_snapshot(),
+        ))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_fill_targets).await.is_err() {
             return;
         }
         let initial_launch_clock = serde_json::to_string(&WsOutMsg::LaunchClock(
@@ -1577,6 +1590,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     match recv {
                         Ok(policy) => {
                             let msg = WsOutMsg::ActionPolicy(policy);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = fill_targets_rx.recv() => {
+                    match recv {
+                        Ok(targets) => {
+                            let msg = WsOutMsg::FillTargets(targets);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;

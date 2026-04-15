@@ -734,6 +734,55 @@
                 ]
               },
               {
+                "kind": "summary",
+                "items": [
+                  {
+                    "label": "N2 Pressure Setpoint",
+                    "index": 0,
+                    "fill_target_fluid": "nitrogen",
+                    "fill_target_kind": "pressure_psi",
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 1,
+                      "suffix": " psi"
+                    }
+                  },
+                  {
+                    "label": "N2 Weight Setpoint",
+                    "index": 0,
+                    "fill_target_fluid": "nitrogen",
+                    "fill_target_kind": "mass_kg",
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 2,
+                      "suffix": " kg"
+                    }
+                  },
+                  {
+                    "label": "N2O Pressure Setpoint",
+                    "index": 0,
+                    "fill_target_fluid": "nitrous",
+                    "fill_target_kind": "pressure_psi",
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 1,
+                      "suffix": " psi"
+                    }
+                  },
+                  {
+                    "label": "N2O Weight Setpoint",
+                    "index": 0,
+                    "fill_target_fluid": "nitrous",
+                    "fill_target_kind": "mass_kg",
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 2,
+                      "suffix": " kg"
+                    }
+                  }
+                ]
+              },
+              {
                 "kind": "chart",
                 "chart_title": "Pressure and Loadcell",
                 "chart_series": [

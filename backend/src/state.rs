@@ -1,4 +1,5 @@
 use crate::auth::AuthManager;
+use crate::fill_targets::FillTargetsConfig;
 use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
@@ -113,6 +114,12 @@ pub struct AppState {
 
     /// Broadcast whenever action policy changes.
     pub action_policy_tx: broadcast::Sender<ActionPolicyMsg>,
+
+    /// Current fill-target configuration used by state summaries and fill controls.
+    pub fill_targets: Arc<Mutex<FillTargetsConfig>>,
+
+    /// Broadcast whenever fill targets change.
+    pub fill_targets_tx: broadcast::Sender<FillTargetsConfig>,
 
     /// Current launch clock snapshot used by reconnect seeds and live UI updates.
     pub launch_clock: Arc<Mutex<LaunchClockMsg>>,
@@ -769,6 +776,11 @@ impl AppState {
         self.action_policy.lock().unwrap().clone()
     }
 
+    /// Returns the latest fill-target snapshot used by the dashboard.
+    pub fn fill_targets_snapshot(&self) -> FillTargetsConfig {
+        self.fill_targets.lock().unwrap().clone()
+    }
+
     /// Records an operator request to continue the fill sequence.
     pub fn request_fill_sequence_continue(&self) {
         self.fill_sequence_continue_requests
@@ -792,6 +804,17 @@ impl AppState {
         *slot = policy.clone();
         drop(slot);
         let _ = self.action_policy_tx.send(policy);
+    }
+
+    /// Replaces the current fill targets and broadcasts them if they changed.
+    pub fn set_fill_targets(&self, targets: FillTargetsConfig) {
+        let mut slot = self.fill_targets.lock().unwrap();
+        if *slot == targets {
+            return;
+        }
+        *slot = targets.clone();
+        drop(slot);
+        let _ = self.fill_targets_tx.send(targets);
     }
 
     /// Applies the current software-action policy to decide whether a command can run.
