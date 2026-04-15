@@ -774,7 +774,7 @@
                 "height": 260.0
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           },
           {
             "title": "Valve States",
@@ -851,7 +851,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           },
           {
             "title": "Actions",
@@ -906,7 +906,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -942,7 +942,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           }
         ]
       },
@@ -1008,7 +1008,7 @@
                 "height": 260.0
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           },
           {
             "title": "Pressure",
@@ -1031,7 +1031,7 @@
                 "height": 260.0
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           },
           {
             "title": "Valve States",
@@ -1108,7 +1108,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           },
           {
             "title": "Actions",
@@ -1167,7 +1167,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -1203,7 +1203,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           }
         ]
       },
@@ -1274,7 +1274,7 @@
                 "height": 260.0
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           }
         ]
       },
@@ -1291,7 +1291,7 @@
                 "kind": "map"
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           },
           {
             "title": "Valve Board Battery (Valve Board)",
@@ -1327,7 +1327,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -1363,7 +1363,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           }
         ]
       },
@@ -1387,7 +1387,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           },
           {
             "title": "Actions",
@@ -1442,7 +1442,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -1478,7 +1478,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           }
         ]
       }

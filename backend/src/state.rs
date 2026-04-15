@@ -1005,6 +1005,17 @@ fn launch_clock_for_transition(
         | FlightState::FillTest
         | FlightState::NitrogenFill
         | FlightState::NitrousFill
+        | FlightState::Armed
+            if current.kind == LaunchClockKind::TMinus =>
+        {
+            current.clone()
+        }
+        FlightState::Startup
+        | FlightState::Idle
+        | FlightState::PreFill
+        | FlightState::FillTest
+        | FlightState::NitrogenFill
+        | FlightState::NitrousFill
         | FlightState::Armed => LaunchClockMsg::idle(),
         _ => return None,
     })
@@ -1099,5 +1110,27 @@ mod tests {
         assert_eq!(next.kind, LaunchClockKind::TMinus);
         assert_eq!(next.anchor_timestamp_ms, Some(10_000));
         assert_eq!(next.duration_ms, Some(LAUNCH_COUNTDOWN_DURATION_MS));
+    }
+
+    #[test]
+    fn active_countdown_ignores_late_prelaunch_state_packets() {
+        let current = launch_countdown_clock(10_000);
+
+        for state in [
+            FlightState::Startup,
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::NitrousFill,
+            FlightState::Armed,
+        ] {
+            let next = launch_clock_for_transition(&current, state, 20_500)
+                .expect("prelaunch state should preserve active countdown");
+
+            assert_eq!(next.kind, LaunchClockKind::TMinus);
+            assert_eq!(next.anchor_timestamp_ms, Some(10_000));
+            assert_eq!(next.duration_ms, Some(LAUNCH_COUNTDOWN_DURATION_MS));
+        }
     }
 }

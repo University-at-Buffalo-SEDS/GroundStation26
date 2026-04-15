@@ -1124,7 +1124,7 @@
                 ]
               }
             ],
-            "value_layout": "auto"
+            "value_layout": "horizontal"
           }
         ]
       }
