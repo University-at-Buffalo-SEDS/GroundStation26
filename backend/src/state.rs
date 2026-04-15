@@ -196,8 +196,14 @@ impl AppState {
     }
 
     pub fn set_launch_clock(&self, launch_clock: LaunchClockMsg) {
-        *self.launch_clock.lock().unwrap() = launch_clock.clone();
-        let _ = self.launch_clock_tx.send(launch_clock);
+        let mut current = self.launch_clock.lock().unwrap();
+        let next = monotonic_launch_clock_update(&current, launch_clock);
+        if *current == next {
+            return;
+        }
+
+        *current = next.clone();
+        let _ = self.launch_clock_tx.send(next);
     }
 
     pub fn update_launch_clock_for_state(&self, next_state: FlightState, timestamp_ms: i64) {
@@ -858,6 +864,25 @@ impl AppState {
         map.insert(command_name(cmd).to_string(), ts_ms);
     }
 
+    /// Records a software command only if it is not an immediate duplicate.
+    pub fn record_software_command_if_fresh(
+        &self,
+        cmd: &TelemetryCommand,
+        ts_ms: u64,
+        duplicate_window_ms: u64,
+    ) -> bool {
+        let mut map = self.last_command_ms.lock().unwrap();
+        let key = command_dedup_key(cmd);
+        if map
+            .get(&key)
+            .is_some_and(|last_ms| ts_ms.saturating_sub(*last_ms) < duplicate_window_ms)
+        {
+            return false;
+        }
+        map.insert(key, ts_ms);
+        true
+    }
+
     /// Looks up the last accepted timestamp for a command name.
     pub fn last_command_timestamp_ms(&self, cmd_name: &str) -> Option<u64> {
         self.last_command_ms.lock().unwrap().get(cmd_name).copied()
@@ -931,6 +956,10 @@ impl AppState {
     }
 }
 
+fn command_dedup_key(cmd: &TelemetryCommand) -> String {
+    format!("dedup:{cmd:?}")
+}
+
 fn modeled_board_endpoints(
     board: Board,
     simulated: bool,
@@ -991,7 +1020,14 @@ fn launch_clock_for_transition(
     timestamp_ms: i64,
 ) -> Option<LaunchClockMsg> {
     Some(match next_state {
-        FlightState::Launch if current.kind == LaunchClockKind::TMinus => current.clone(),
+        FlightState::Launch
+            if matches!(
+                current.kind,
+                LaunchClockKind::TMinus | LaunchClockKind::TPlus
+            ) =>
+        {
+            current.clone()
+        }
         FlightState::Launch => launch_countdown_clock(timestamp_ms),
         FlightState::Ascent if current.kind == LaunchClockKind::TPlus => current.clone(),
         FlightState::Ascent => LaunchClockMsg {
@@ -1006,7 +1042,10 @@ fn launch_clock_for_transition(
         | FlightState::NitrogenFill
         | FlightState::NitrousFill
         | FlightState::Armed
-            if current.kind == LaunchClockKind::TMinus =>
+            if matches!(
+                current.kind,
+                LaunchClockKind::TMinus | LaunchClockKind::TPlus
+            ) =>
         {
             current.clone()
         }
@@ -1019,6 +1058,22 @@ fn launch_clock_for_transition(
         | FlightState::Armed => LaunchClockMsg::idle(),
         _ => return None,
     })
+}
+
+fn monotonic_launch_clock_update(
+    current: &LaunchClockMsg,
+    requested: LaunchClockMsg,
+) -> LaunchClockMsg {
+    match (current.kind, requested.kind) {
+        // T+ is final for a launch. Preserve the first anchor and reject stale state packets,
+        // repeated launch commands, or repeated ascent packets that would re-anchor elapsed time.
+        (LaunchClockKind::TPlus, _) => current.clone(),
+        // T- may advance to T+, but it may not be restarted or reset back to idle.
+        (LaunchClockKind::TMinus, LaunchClockKind::Idle | LaunchClockKind::TMinus) => {
+            current.clone()
+        }
+        (LaunchClockKind::TMinus, LaunchClockKind::TPlus) | (LaunchClockKind::Idle, _) => requested,
+    }
 }
 
 pub fn launch_countdown_clock(timestamp_ms: i64) -> LaunchClockMsg {
@@ -1131,6 +1186,78 @@ mod tests {
             assert_eq!(next.kind, LaunchClockKind::TMinus);
             assert_eq!(next.anchor_timestamp_ms, Some(10_000));
             assert_eq!(next.duration_ms, Some(LAUNCH_COUNTDOWN_DURATION_MS));
+        }
+    }
+
+    #[test]
+    fn t_plus_ignores_late_launch_and_prelaunch_state_packets() {
+        let current = LaunchClockMsg {
+            kind: LaunchClockKind::TPlus,
+            anchor_timestamp_ms: Some(20_000),
+            duration_ms: None,
+        };
+
+        for state in [
+            FlightState::Startup,
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::NitrousFill,
+            FlightState::Armed,
+            FlightState::Launch,
+            FlightState::Ascent,
+        ] {
+            let next = launch_clock_for_transition(&current, state, 30_000)
+                .expect("late state packet should preserve t-plus clock");
+
+            assert_eq!(next, current);
+        }
+    }
+
+    #[test]
+    fn monotonic_update_preserves_tminus_until_tplus() {
+        let current = launch_countdown_clock(10_000);
+
+        assert_eq!(
+            monotonic_launch_clock_update(&current, LaunchClockMsg::idle()),
+            current
+        );
+        assert_eq!(
+            monotonic_launch_clock_update(&current, launch_countdown_clock(15_000)),
+            current
+        );
+
+        let t_plus = LaunchClockMsg {
+            kind: LaunchClockKind::TPlus,
+            anchor_timestamp_ms: Some(20_000),
+            duration_ms: None,
+        };
+
+        assert_eq!(
+            monotonic_launch_clock_update(&current, t_plus.clone()),
+            t_plus
+        );
+    }
+
+    #[test]
+    fn monotonic_update_preserves_tplus_forever() {
+        let current = LaunchClockMsg {
+            kind: LaunchClockKind::TPlus,
+            anchor_timestamp_ms: Some(20_000),
+            duration_ms: None,
+        };
+
+        for requested in [
+            LaunchClockMsg::idle(),
+            launch_countdown_clock(30_000),
+            LaunchClockMsg {
+                kind: LaunchClockKind::TPlus,
+                anchor_timestamp_ms: Some(30_000),
+                duration_ms: None,
+            },
+        ] {
+            assert_eq!(monotonic_launch_clock_update(&current, requested), current);
         }
     }
 }

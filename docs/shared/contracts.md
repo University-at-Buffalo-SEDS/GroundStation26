@@ -19,6 +19,7 @@ The frontend and backend must agree on:
 - board identity
 - board-status DTOs
 - telemetry row shape
+- launch-clock DTO shape and monotonic countdown/T-plus semantics
 
 The shared crate keeps those contracts in one place so serde, command dispatch, and layout/state rendering stay aligned.
 
@@ -91,6 +92,25 @@ Implication:
 
 - this is the core data-plane record shared between backend and frontend
 - `/api/recent` may transport this schema either as a JSON array or as newline-delimited JSON objects; the row schema itself must not change between modes
+
+### `LaunchClockMsg`
+
+Used for:
+
+- `/api/launch_clock`
+- websocket `LaunchClock` messages
+- reconnect/reseed launch-clock recovery
+
+Important fields:
+
+- `kind`: `idle`, `t_minus`, or `t_plus`
+- `anchor_timestamp_ms`: backend network timestamp for countdown start or T0
+- `duration_ms`: countdown duration for `t_minus`, otherwise null
+
+Implication:
+
+- `t_minus` is monotonic once started; the first countdown anchor is preserved until a `t_plus` transition.
+- `t_plus` is final for a launch; the first T0 anchor is preserved and later stale packets must not reset or re-anchor it.
 
 ## Contract Stability Notes
 

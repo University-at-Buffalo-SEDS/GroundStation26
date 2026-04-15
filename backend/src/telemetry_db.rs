@@ -60,7 +60,7 @@ pub enum DbQueueItem {
     Control(RecordingCommand),
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct LaunchClockMsg {
     pub kind: LaunchClockKind,
     pub anchor_timestamp_ms: Option<i64>,

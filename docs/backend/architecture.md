@@ -49,11 +49,13 @@ Responsibilities:
 - hold recent telemetry cache
 - hold notifications and action policy
 - hold network topology snapshot state
+- hold the launch-clock snapshot and enforce monotonic T-minus/T-plus transitions
 - provide broadcast channels used by websocket and tasks
 
 Why it matters:
 
 - almost every backend subsystem touches `AppState`
+- launch-clock updates are normalized here so stale packets or repeated commands cannot reset an active countdown or T-plus anchor
 
 ### `backend/src/telemetry_task.rs`
 

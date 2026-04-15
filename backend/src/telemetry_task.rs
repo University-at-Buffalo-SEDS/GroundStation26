@@ -1273,8 +1273,11 @@ pub async fn telemetry_task(
                     }
                     match cmd {
                         TelemetryCommand::Launch => {
-                                if state.launch_clock_snapshot().kind == LaunchClockKind::TMinus {
-                                    println!("Launch command ignored because launch countdown is already running");
+                                if matches!(
+                                    state.launch_clock_snapshot().kind,
+                                    LaunchClockKind::TMinus | LaunchClockKind::TPlus
+                                ) {
+                                    println!("Launch command ignored because launch clock is already running");
                                     continue;
                                 }
                                 if state.recording_status_snapshot().mode != RecordingModeWire::Recording {

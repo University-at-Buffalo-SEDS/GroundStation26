@@ -256,6 +256,35 @@ Failure impact:
 
 - The state tab boots in a stale/default state until the backend pushes a live state update.
 
+### `GET /api/launch_clock`
+
+Purpose:
+
+- Seed the launch-clock state used by the top bar on connect and reconnect.
+
+Expected response:
+
+```json
+{
+  "kind": "t_minus",
+  "anchor_timestamp_ms": 1742400000000,
+  "duration_ms": 10000
+}
+```
+
+Clock kinds:
+
+- `idle`: no backend-started countdown is active.
+- `t_minus`: `anchor_timestamp_ms` is the backend network time when countdown started and `duration_ms` is the countdown length.
+- `t_plus`: `anchor_timestamp_ms` is T0 in backend network time and `duration_ms` is null.
+
+Frontend expectations:
+
+- Remaining T-minus time is `duration_ms - (network_now_ms - anchor_timestamp_ms)`, clamped at zero.
+- Once `t_minus` starts, the backend preserves the first countdown anchor and ignores repeated launch commands or stale prelaunch state packets that would reset it.
+- Once `t_plus` starts, the backend preserves the first T0 anchor and ignores all later attempts to reset it to idle, restart `t_minus`, or re-anchor `t_plus`.
+- Clients should keep displaying `T- 00:00.00` at countdown completion until the backend sends `t_plus`.
+
 ### `GET /api/gps`
 
 Purpose:
@@ -465,6 +494,7 @@ The backend sends tagged JSON objects:
 { "ty": "Warning", "data": { ... } }
 { "ty": "Error", "data": { ... } }
 { "ty": "FlightState", "data": { ... } }
+{ "ty": "LaunchClock", "data": { ... } }
 { "ty": "BoardStatus", "data": { ... } }
 { "ty": "NetworkTopology", "data": { ... } }
 { "ty": "Notifications", "data": [ ... ] }
@@ -488,6 +518,8 @@ Notes:
   Append to the respective alert lists.
 - `FlightState`
   Updates the current mission state signal.
+- `LaunchClock`
+  Replaces the current launch-clock snapshot. Semantics match `GET /api/launch_clock`.
 - `BoardStatus`
   Replaces the board-freshness view.
 - `NetworkTopology`

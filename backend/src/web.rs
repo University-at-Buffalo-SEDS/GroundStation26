@@ -43,6 +43,7 @@ static TILE_DB_POOL: OnceCell<Option<sqlx::SqlitePool>> = OnceCell::const_new();
 static TILE_DB_MODE: OnceCell<TileDbMode> = OnceCell::const_new();
 const RECENT_HISTORY_MS: i64 = 20 * 60 * 1000;
 const RECENT_BUCKET_MS: i64 = 20;
+const SOFTWARE_COMMAND_DEDUP_MS_DEFAULT: u64 = 500;
 
 #[derive(Clone, Copy)]
 enum TileDbMode {
@@ -58,6 +59,13 @@ struct TranslationCatalogQuery {
 
 fn default_translation_lang() -> String {
     "en".to_string()
+}
+
+fn software_command_dedup_ms() -> u64 {
+    std::env::var("GS_SOFTWARE_COMMAND_DEDUP_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(SOFTWARE_COMMAND_DEDUP_MS_DEFAULT)
 }
 
 /// Extracts the numeric telemetry payload from either the newer JSON column or the legacy blob.
@@ -1340,6 +1348,11 @@ async fn send_command(
         );
         return (StatusCode::FORBIDDEN, "command disabled");
     }
+    let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+    if !state.record_software_command_if_fresh(&cmd, now_ms, software_command_dedup_ms()) {
+        println!("Ignored duplicate software command {cmd:?}");
+        return (StatusCode::OK, "duplicate ignored");
+    }
     let _ = state.cmd_tx.send(cmd).await;
     (StatusCode::OK, "ok")
 }
@@ -1731,6 +1744,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                     cmd.cmd
                                 ),
                             );
+                            continue;
+                        }
+                        let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+                        if !state_for_recv.record_software_command_if_fresh(
+                            &cmd.cmd,
+                            now_ms,
+                            software_command_dedup_ms(),
+                        ) {
+                            println!("Ignored duplicate websocket command {:?}", cmd.cmd);
                             continue;
                         }
                         if let Err(e) = cmd_tx.send(cmd.cmd).await {
