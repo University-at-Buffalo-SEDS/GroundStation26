@@ -492,6 +492,8 @@ pub struct StateWidget {
     pub height: Option<f64>,
     #[serde(default)]
     pub full_width: bool,
+    #[serde(default)]
+    pub width_fraction: Option<f64>,
     pub actions: Option<Vec<String>>,
     pub valves: Option<Vec<SummaryItem>>,
     pub valve_colors: Option<ValveColorSet>,

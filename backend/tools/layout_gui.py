@@ -970,6 +970,10 @@ class LayoutEditor(tk.Tk):
         ttk.Checkbutton(form, text="Full row", variable=self.widget_full_width).grid(
             row=6, column=2, sticky="w", padx=6, pady=3
         )
+        ttk.Label(form, text="Width fraction").grid(row=6, column=3, sticky="w")
+        self.widget_width_fraction_label = form.grid_slaves(row=6, column=3)[0]
+        self.widget_width_fraction = ttk.Entry(form)
+        self.widget_width_fraction.grid(row=6, column=4, sticky="ew", padx=6, pady=3)
 
         self.chart_series_frame = ttk.LabelFrame(form, text="Chart series")
         self.chart_series_frame.grid(row=7, column=0, columnspan=6, sticky="ew", padx=6, pady=(6, 4))
@@ -2452,6 +2456,8 @@ class LayoutEditor(tk.Tk):
         self.widget_height.delete(0, tk.END)
         self.widget_height.insert(0, str(widget.get("height", "")))
         self.widget_full_width.set(bool(widget.get("full_width", False)))
+        self.widget_width_fraction.delete(0, tk.END)
+        self.widget_width_fraction.insert(0, str(widget.get("width_fraction", "")))
         self._chart_series = [dict(item) for item in widget.get("chart_series", []) or []]
         self._refresh_chart_series_list()
         self._clear_chart_series_editor()
@@ -3467,6 +3473,11 @@ class LayoutEditor(tk.Tk):
                 pass
         if self.widget_full_width.get():
             widget["full_width"] = True
+        if self.widget_width_fraction.get().strip():
+            try:
+                widget["width_fraction"] = float(self.widget_width_fraction.get().strip())
+            except ValueError:
+                pass
         if kind == "chart":
             if self._chart_series_selected_idx is not None and self._chart_series_selected_idx < len(
                     self._chart_series):
@@ -3522,6 +3533,7 @@ class LayoutEditor(tk.Tk):
         self._set_entry_state(self.widget_chart_title, enable_chart)
         self._set_entry_state(self.widget_width, enable_chart)
         self._set_entry_state(self.widget_height, enable_chart)
+        self._set_entry_state(self.widget_width_fraction, enable_chart)
         self._set_widget_field_visibility(kind)
         self._set_valve_widget_visibility(show_valves)
         self._set_summary_widget_visibility(show_summary)
@@ -3554,6 +3566,7 @@ class LayoutEditor(tk.Tk):
         self._set_widget_field_group(self.widget_chart_title_label, self.widget_chart_title, show_chart)
         self._set_widget_field_group(self.widget_width_label, self.widget_width, show_chart)
         self._set_widget_field_group(self.widget_height_label, self.widget_height, show_chart)
+        self._set_widget_field_group(self.widget_width_fraction_label, self.widget_width_fraction, show_chart)
 
     def _set_widget_field_group(self, label: ttk.Label, entry: ttk.Entry, show: bool) -> None:
         if show:
@@ -3606,6 +3619,7 @@ class LayoutEditor(tk.Tk):
         self.widget_width.delete(0, tk.END)
         self.widget_height.delete(0, tk.END)
         self.widget_full_width.set(False)
+        self.widget_width_fraction.delete(0, tk.END)
         self._chart_series = []
         self._refresh_chart_series_list()
         self._clear_chart_series_editor()

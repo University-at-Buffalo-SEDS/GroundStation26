@@ -1593,6 +1593,33 @@
                 "full_width": true
               },
               {
+                "kind": "chart",
+                "chart_title": "Vertical Speed Comparison",
+                "chart_series": [
+                  {
+                    "data_type": "VEHICLE_SPEED",
+                    "index": 0,
+                    "label": "Fused"
+                  },
+                  {
+                    "data_type": "KALMAN_FILTER_DATA",
+                    "index": 1,
+                    "label": "Kalman"
+                  }
+                ],
+                "width": 1200.0,
+                "height": 240.0,
+                "width_fraction": 0.5
+              },
+              {
+                "kind": "chart",
+                "data_type": "ACCEL_DATA",
+                "chart_title": "Acceleration",
+                "width": 1200.0,
+                "height": 240.0,
+                "width_fraction": 0.5
+              },
+              {
                 "kind": "summary",
                 "data_type": "ACCEL_DATA",
                 "items": [
@@ -1627,31 +1654,6 @@
                     "index": 2
                   }
                 ]
-              },
-              {
-                "kind": "chart",
-                "chart_title": "Vertical Speed Comparison",
-                "chart_series": [
-                  {
-                    "data_type": "VEHICLE_SPEED",
-                    "index": 0,
-                    "label": "Fused"
-                  },
-                  {
-                    "data_type": "KALMAN_FILTER_DATA",
-                    "index": 1,
-                    "label": "Kalman"
-                  }
-                ],
-                "width": 1200.0,
-                "height": 240.0
-              },
-              {
-                "kind": "chart",
-                "data_type": "ACCEL_DATA",
-                "chart_title": "Acceleration",
-                "width": 1200.0,
-                "height": 240.0
               }
             ],
             "value_layout": "horizontal"
