@@ -274,6 +274,16 @@ impl FlightSimState {
         }
     }
 
+    fn pop_next_queued(&mut self) -> Option<Packet> {
+        let flight_state_idx = self
+            .queued
+            .iter()
+            .position(|pkt| pkt.data_type() == DataType::FlightState);
+        flight_state_idx
+            .and_then(|idx| self.queued.remove(idx))
+            .or_else(|| self.queued.pop_front())
+    }
+
     fn queue_abort(&mut self, board: Board, reason: &str, now_ms: u64) {
         if let Ok(pkt) = Packet::new(
             DataType::Abort,
@@ -1056,6 +1066,23 @@ mod tests {
             endpoint == sedsprintf_rs_2026::config::DataEndpoint::SdCard.as_str()
         }));
     }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn queued_flight_state_is_prioritized_for_launch_clock_sync() {
+        let mut sim = super::FlightSimState::new();
+        sim.queue_umbilical_status(super::ActuatorBoardCommands::IgniterOn as u8, true, 1_000);
+        sim.queue_flight_state(1_000);
+
+        let pkt = sim
+            .pop_next_queued()
+            .expect("queued flight state packet should be returned");
+
+        assert_eq!(
+            pkt.data_type(),
+            sedsprintf_rs_2026::config::DataType::FlightState
+        );
+    }
 }
 
 #[cfg(feature = "testing")]
@@ -1087,14 +1114,14 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
     let now_ms = get_current_timestamp_ms();
     let mut s = sim().lock().expect("flight sim mutex poisoned");
 
-    if let Some(pkt) = s.queued.pop_front() {
+    if let Some(pkt) = s.pop_next_queued() {
         return Ok(pkt);
     }
 
     if now_ms.saturating_sub(s.last_housekeeping_emit_ms) >= HOUSEKEEPING_PERIOD_MS {
         s.last_housekeeping_emit_ms = now_ms;
         s.queue_housekeeping(now_ms);
-        if let Some(pkt) = s.queued.pop_front() {
+        if let Some(pkt) = s.pop_next_queued() {
             return Ok(pkt);
         }
     }
@@ -1102,18 +1129,20 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
     if now_ms.saturating_sub(s.last_state_emit_ms) >= FLIGHT_STATE_PERIOD_MS {
         s.last_state_emit_ms = now_ms;
         s.queue_flight_state(now_ms);
-        if let Some(pkt) = s.queued.pop_front() {
+        if let Some(pkt) = s.pop_next_queued() {
             return Ok(pkt);
         }
     }
 
     if now_ms.saturating_sub(s.last_sensor_emit_ms) < SENSOR_PERIOD_MS {
         // Keep packets flowing even under very fast poll cadence.
-        return s.next_sensor_packet(now_ms);
+        let pkt = s.next_sensor_packet(now_ms)?;
+        return Ok(s.pop_next_queued().unwrap_or(pkt));
     }
 
     s.last_sensor_emit_ms = now_ms;
-    s.next_sensor_packet(now_ms)
+    let pkt = s.next_sensor_packet(now_ms)?;
+    Ok(s.pop_next_queued().unwrap_or(pkt))
 }
 
 #[cfg(not(feature = "testing"))]

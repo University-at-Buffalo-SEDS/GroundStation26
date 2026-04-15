@@ -1917,7 +1917,7 @@ async fn handle_packet(
             let mut fs = state.state.lock().unwrap();
             *fs = new_flight_state;
         }
-        let ts_ms = get_current_timestamp_ms() as i64;
+        let ts_ms = pkt.timestamp() as i64;
         state.update_launch_clock_for_state(new_flight_state, ts_ms);
         queue_db_write(
             state,
