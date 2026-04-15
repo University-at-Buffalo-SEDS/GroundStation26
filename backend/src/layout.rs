@@ -468,6 +468,17 @@ pub struct StateSection {
     pub title: Option<String>,
     pub widgets: Vec<StateWidget>,
     pub style: Option<StateSectionStyle>,
+    #[serde(default)]
+    pub value_layout: StateSectionValueLayout,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StateSectionValueLayout {
+    #[default]
+    Auto,
+    Vertical,
+    Horizontal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,6 +490,8 @@ pub struct StateWidget {
     pub chart_title: Option<String>,
     pub width: Option<f64>,
     pub height: Option<f64>,
+    #[serde(default)]
+    pub full_width: bool,
     pub actions: Option<Vec<String>>,
     pub valves: Option<Vec<SummaryItem>>,
     pub valve_colors: Option<ValveColorSet>,

@@ -320,6 +320,7 @@ pub async fn safety_task(
                 let _ = state.state_tx.send(crate::web::FlightStateMsg {
                     state: FlightState::Idle,
                 });
+                state.broadcast_fill_targets_snapshot();
             }
         }
 

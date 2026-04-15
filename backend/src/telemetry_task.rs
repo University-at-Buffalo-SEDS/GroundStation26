@@ -120,6 +120,7 @@ async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_st
         *fs = next_state;
     }
     let _ = state.state_tx.send(FlightStateMsg { state: next_state });
+    state.broadcast_fill_targets_snapshot();
     let ts_ms = get_current_timestamp_ms() as i64;
     state.update_launch_clock_for_state(next_state, ts_ms);
     let _ = state
@@ -1933,6 +1934,7 @@ async fn handle_packet(
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,
         });
+        state.broadcast_fill_targets_snapshot();
         return None;
     }
 

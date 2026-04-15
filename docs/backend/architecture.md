@@ -193,6 +193,9 @@ Responsibilities:
 - load/save calibration files
 - implement capture-zero, capture-span, and refit logic
 - expose calibration tab layout config used by the frontend
+- load calibration UI sensor/channel metadata from `backend/config/calibration_config.json` or
+  `GS_CALIBRATION_CONFIG_PATH`
+- support backend-declared regression modes, including linear, parabolic, cubic, and quartic fits
 
 ### `backend/src/layout.rs`
 

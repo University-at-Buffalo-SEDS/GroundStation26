@@ -67,49 +67,103 @@ const GRAVITY_FPS2: f32 = 32.174;
 
 #[cfg(feature = "testing")]
 fn sim_full_mass_kg() -> f32 {
-    static FULL_MASS_KG: OnceLock<f32> = OnceLock::new();
-    *FULL_MASS_KG.get_or_init(|| {
-        fill_targets::load_or_default()
-            .nitrous
-            .target_mass_kg
-            .max(
-                loadcell::load_or_default()
-                    .full_mass_kg
-                    .unwrap_or(loadcell::DEFAULT_FULL_MASS_KG),
-            )
-            .max(0.1)
-    })
+    sim_full_mass_kg_from(
+        &fill_targets::load_or_default(),
+        &loadcell::load_or_default(),
+    )
+}
+
+#[cfg(feature = "testing")]
+fn sim_full_mass_kg_from(
+    fill_cfg: &fill_targets::FillTargetsConfig,
+    loadcell_cfg: &loadcell::LoadcellCalibrationFile,
+) -> f32 {
+    fill_cfg
+        .nitrous
+        .target_mass_kg
+        .max(
+            loadcell_cfg
+                .full_mass_kg
+                .unwrap_or(loadcell::DEFAULT_FULL_MASS_KG),
+        )
+        .max(0.1)
 }
 
 #[cfg(feature = "testing")]
 fn sim_nitrogen_target_mass_kg() -> f32 {
-    static NITROGEN_TARGET_KG: OnceLock<f32> = OnceLock::new();
-    *NITROGEN_TARGET_KG.get_or_init(|| {
-        std::env::var("GS_SEQUENCE_NITROGEN_TARGET_MASS_KG")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v > 0.0)
-            .unwrap_or_else(|| {
-                fill_targets::load_or_default()
-                    .nitrogen
-                    .target_mass_kg
-                    .max(0.1)
-            })
-    })
+    sim_nitrogen_target_mass_kg_from(&fill_targets::load_or_default())
+}
+
+#[cfg(feature = "testing")]
+fn sim_nitrogen_target_mass_kg_from(fill_cfg: &fill_targets::FillTargetsConfig) -> f32 {
+    std::env::var("GS_SEQUENCE_NITROGEN_TARGET_MASS_KG")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or_else(|| fill_cfg.nitrogen.target_mass_kg.max(0.1))
 }
 
 #[cfg(feature = "testing")]
 fn sim_nitrogen_pressure_ceiling_psi() -> f32 {
-    static NITROGEN_PRESSURE_CEILING_PSI: OnceLock<f32> = OnceLock::new();
-    *NITROGEN_PRESSURE_CEILING_PSI.get_or_init(|| {
-        std::env::var("GS_SEQUENCE_NITROGEN_PRESSURE_TARGET_PSI")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v > 0.0)
-            .map(|target| target + 5.0)
-            .unwrap_or(fill_targets::load_or_default().nitrogen.target_pressure_psi + 5.0)
-            .max(NITROGEN_PRESSURE_MAX_PSI)
-    })
+    sim_nitrogen_pressure_ceiling_psi_from(&fill_targets::load_or_default())
+}
+
+#[cfg(feature = "testing")]
+fn sim_nitrogen_pressure_ceiling_psi_from(fill_cfg: &fill_targets::FillTargetsConfig) -> f32 {
+    std::env::var("GS_SEQUENCE_NITROGEN_PRESSURE_TARGET_PSI")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .map(|target| target + 5.0)
+        .unwrap_or(fill_cfg.nitrogen.target_pressure_psi + 5.0)
+        .max(NITROGEN_PRESSURE_MAX_PSI)
+}
+
+#[cfg(feature = "testing")]
+fn sim_nitrogen_pressure_setpoint_psi_from(fill_cfg: &fill_targets::FillTargetsConfig) -> f32 {
+    std::env::var("GS_SEQUENCE_NITROGEN_PRESSURE_TARGET_PSI")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(fill_cfg.nitrogen.target_pressure_psi)
+        .max(0.0)
+}
+
+#[cfg(feature = "testing")]
+pub fn effective_fill_targets(
+    mut cfg: fill_targets::FillTargetsConfig,
+    loadcell_cfg: &loadcell::LoadcellCalibrationFile,
+    flight_state: FlightState,
+) -> fill_targets::FillTargetsConfig {
+    if !sim_mode_enabled() {
+        return cfg;
+    }
+
+    cfg.nitrogen.target_mass_kg = sim_nitrogen_target_mass_kg_from(&cfg);
+    cfg.nitrogen.target_pressure_psi = sim_nitrogen_pressure_setpoint_psi_from(&cfg);
+    cfg.nitrous.target_mass_kg = sim_full_mass_kg_from(&cfg, loadcell_cfg);
+    cfg.nitrous.target_pressure_psi = cfg
+        .nitrous
+        .target_pressure_psi
+        .max(NITROUS_ROOM_TEMP_SATURATION_PSI);
+
+    if matches!(
+        flight_state,
+        FlightState::PreFill | FlightState::FillTest | FlightState::NitrogenFill
+    ) {
+        cfg.nitrous = cfg.nitrogen.clone();
+    }
+
+    cfg
+}
+
+#[cfg(not(feature = "testing"))]
+pub fn effective_fill_targets(
+    cfg: crate::fill_targets::FillTargetsConfig,
+    _loadcell_cfg: &crate::loadcell::LoadcellCalibrationFile,
+    _flight_state: crate::types::FlightState,
+) -> crate::fill_targets::FillTargetsConfig {
+    cfg
 }
 
 #[cfg(feature = "testing")]

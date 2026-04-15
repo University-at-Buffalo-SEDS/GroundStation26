@@ -31,6 +31,25 @@ def default_layout_path() -> Path:
     return backend_dir / "layout" / "layout.json"
 
 
+def default_fill_targets_path() -> Path:
+    backend_dir = Path(__file__).resolve().parents[1]
+    return backend_dir / "config" / "fill_targets.json"
+
+
+def default_fill_targets() -> dict:
+    return {
+        "version": 1,
+        "nitrogen": {
+            "target_mass_kg": 10.0,
+            "target_pressure_psi": 120.0,
+        },
+        "nitrous": {
+            "target_mass_kg": 10.0,
+            "target_pressure_psi": 745.0,
+        },
+    }
+
+
 def default_layout() -> dict:
     return {
         "version": 1,
@@ -175,7 +194,9 @@ class LayoutEditor(tk.Tk):
         self.geometry("1100x720")
 
         self.path = initial_path or default_layout_path()
+        self.fill_targets_path = default_fill_targets_path()
         self.data = default_layout()
+        self.fill_targets_data = default_fill_targets()
 
         toolbar = tk.Frame(self)
         toolbar.pack(fill=tk.X, padx=8, pady=8)
@@ -196,6 +217,7 @@ class LayoutEditor(tk.Tk):
         self.connection_tab_frame = ttk.Frame(self.notebook)
         self.network_tab_frame = ttk.Frame(self.notebook)
         self.actions_tab_frame = ttk.Frame(self.notebook)
+        self.fill_targets_tab_frame = ttk.Frame(self.notebook)
         self.state_tab_frame = ttk.Frame(self.notebook)
         self.battery_tab_frame = ttk.Frame(self.notebook)
 
@@ -204,6 +226,7 @@ class LayoutEditor(tk.Tk):
         self.notebook.add(self.connection_tab_frame, text="Connection")
         self.notebook.add(self.network_tab_frame, text="Network")
         self.notebook.add(self.actions_tab_frame, text="Actions")
+        self.notebook.add(self.fill_targets_tab_frame, text="Fill Targets")
         self.notebook.add(self.state_tab_frame, text="State Layout")
         self.notebook.add(self.battery_tab_frame, text="Battery")
 
@@ -214,6 +237,7 @@ class LayoutEditor(tk.Tk):
         self._build_connection_tab()
         self._build_network_tab()
         self._build_actions_tab()
+        self._build_fill_targets_tab()
         self._build_state_tab()
         self._build_battery_tab()
 
@@ -778,6 +802,48 @@ class LayoutEditor(tk.Tk):
         )
 
     # ------------------------
+    # Fill targets editor
+    # ------------------------
+    def _build_fill_targets_tab(self) -> None:
+        frame = self.fill_targets_tab_frame
+        frame.columnconfigure(0, weight=1)
+
+        self.fill_targets_status = tk.StringVar(value=f"Fill target path: {self.fill_targets_path}")
+        ttk.Label(frame, textvariable=self.fill_targets_status, anchor="w").grid(
+            row=0, column=0, sticky="ew", padx=8, pady=(8, 12)
+        )
+
+        form = ttk.Frame(frame)
+        form.grid(row=1, column=0, sticky="nsew", padx=8)
+        for col in range(3):
+            form.columnconfigure(col, weight=1)
+
+        ttk.Label(form, text="Fluid").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        ttk.Label(form, text="Target mass (kg)").grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(form, text="Target pressure (psi)").grid(row=0, column=2, sticky="w", padx=6, pady=3)
+
+        ttk.Label(form, text="Nitrogen").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        self.nitrogen_target_mass = ttk.Entry(form)
+        self.nitrogen_target_mass.grid(row=1, column=1, sticky="ew", padx=6, pady=3)
+        self.nitrogen_target_pressure = ttk.Entry(form)
+        self.nitrogen_target_pressure.grid(row=1, column=2, sticky="ew", padx=6, pady=3)
+
+        ttk.Label(form, text="Nitrous").grid(row=2, column=0, sticky="w", padx=6, pady=3)
+        self.nitrous_target_mass = ttk.Entry(form)
+        self.nitrous_target_mass.grid(row=2, column=1, sticky="ew", padx=6, pady=3)
+        self.nitrous_target_pressure = ttk.Entry(form)
+        self.nitrous_target_pressure.grid(row=2, column=2, sticky="ew", padx=6, pady=3)
+
+        btns = ttk.Frame(form)
+        btns.grid(row=3, column=1, columnspan=2, sticky="w", pady=8)
+        ttk.Button(btns, text="Reload Fill Targets", command=self._load_fill_targets_file).pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Button(btns, text="Save Fill Targets", command=self._save_fill_targets_file).pack(
+            side=tk.LEFT, padx=4
+        )
+
+    # ------------------------
     # State tab editor
     # ------------------------
     def _build_state_tab(self) -> None:
@@ -836,8 +902,19 @@ class LayoutEditor(tk.Tk):
         self.section_title = ttk.Entry(form)
         self.section_title.grid(row=2, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
         self.section_title.bind("<KeyRelease>", lambda _: self._update_section_title_live())
+        ttk.Label(form, text="Value layout").grid(row=2, column=4, sticky="w")
+        self.section_value_layout = tk.StringVar(value="auto")
+        ttk.OptionMenu(
+            form,
+            self.section_value_layout,
+            "auto",
+            "auto",
+            "horizontal",
+            "vertical",
+            command=lambda _: self._update_section_title_live(),
+        ).grid(row=2, column=5, sticky="ew", padx=6, pady=3)
         self.section_style_frame = ttk.LabelFrame(form, text="Section style")
-        self.section_style_frame.grid(row=2, column=4, rowspan=2, columnspan=2, sticky="nsew", padx=6, pady=3)
+        self.section_style_frame.grid(row=3, column=4, rowspan=1, columnspan=2, sticky="nsew", padx=6, pady=3)
         self.section_style_frame.columnconfigure(1, weight=1)
         self.section_bg = self._color_entry(self.section_style_frame, "Background", 0)
         self.section_border = self._color_entry(self.section_style_frame, "Border", 1)
@@ -889,6 +966,10 @@ class LayoutEditor(tk.Tk):
         self.widget_height_label = form.grid_slaves(row=6, column=0)[0]
         self.widget_height = ttk.Entry(form)
         self.widget_height.grid(row=6, column=1, sticky="ew", padx=6, pady=3)
+        self.widget_full_width = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="Full row", variable=self.widget_full_width).grid(
+            row=6, column=2, sticky="w", padx=6, pady=3
+        )
 
         self.chart_series_frame = ttk.LabelFrame(form, text="Chart series")
         self.chart_series_frame.grid(row=7, column=0, columnspan=6, sticky="ew", padx=6, pady=(6, 4))
@@ -1210,6 +1291,77 @@ class LayoutEditor(tk.Tk):
         self.section_list.delete(0, tk.END)
         self.widget_list.delete(0, tk.END)
 
+        if hasattr(self, "nitrogen_target_mass"):
+            self._load_fill_targets_form()
+
+    def _load_fill_targets_file(self) -> None:
+        if self.fill_targets_path.exists():
+            raw = self.fill_targets_path.read_text(encoding="utf-8")
+            self.fill_targets_data = json.loads(raw)
+        else:
+            self.fill_targets_data = default_fill_targets()
+        if hasattr(self, "fill_targets_status"):
+            self.fill_targets_status.set(f"Fill target path: {self.fill_targets_path}")
+        self._load_fill_targets_form()
+
+    def _load_fill_targets_form(self) -> None:
+        targets = self.fill_targets_data or default_fill_targets()
+        nitrogen = targets.get("nitrogen", {})
+        nitrous = targets.get("nitrous", {})
+        for entry, value in (
+            (self.nitrogen_target_mass, nitrogen.get("target_mass_kg", 10.0)),
+            (self.nitrogen_target_pressure, nitrogen.get("target_pressure_psi", 120.0)),
+            (self.nitrous_target_mass, nitrous.get("target_mass_kg", 10.0)),
+            (self.nitrous_target_pressure, nitrous.get("target_pressure_psi", 745.0)),
+        ):
+            entry.delete(0, tk.END)
+            entry.insert(0, str(value))
+
+    def _commit_fill_targets_form(self) -> None:
+        def number(entry: ttk.Entry, label: str, minimum: float) -> float:
+            try:
+                value = float(entry.get().strip())
+            except ValueError as exc:
+                raise ValueError(f"{label} must be a number") from exc
+            if value < minimum:
+                raise ValueError(f"{label} must be at least {minimum:g}")
+            return value
+
+        self.fill_targets_data = {
+            "version": int(self.fill_targets_data.get("version", 1) or 1),
+            "nitrogen": {
+                "target_mass_kg": number(self.nitrogen_target_mass, "Nitrogen target mass", 0.01),
+                "target_pressure_psi": number(
+                    self.nitrogen_target_pressure,
+                    "Nitrogen target pressure",
+                    0.0,
+                ),
+            },
+            "nitrous": {
+                "target_mass_kg": number(self.nitrous_target_mass, "Nitrous target mass", 0.01),
+                "target_pressure_psi": number(
+                    self.nitrous_target_pressure,
+                    "Nitrous target pressure",
+                    0.0,
+                ),
+            },
+        }
+
+    def _save_fill_targets_file(self) -> bool:
+        try:
+            self._commit_fill_targets_form()
+        except ValueError as exc:
+            messagebox.showerror("Fill target error", str(exc))
+            return False
+        self.fill_targets_path.parent.mkdir(parents=True, exist_ok=True)
+        self.fill_targets_path.write_text(
+            json.dumps(self.fill_targets_data, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if hasattr(self, "fill_targets_status"):
+            self.fill_targets_status.set(f"Fill target path: {self.fill_targets_path}")
+        return True
+
     # ------------------------
     # Load/save
     # ------------------------
@@ -1219,6 +1371,7 @@ class LayoutEditor(tk.Tk):
             self.data = json.loads(raw)
         else:
             self.data = default_layout()
+        self._load_fill_targets_file()
         self._ensure_layout_shape()
 
         self.status.set(f"Layout path: {self.path}")
@@ -1228,6 +1381,8 @@ class LayoutEditor(tk.Tk):
 
     def save(self) -> None:
         self._commit_current_tab()
+        if not self._save_fill_targets_file():
+            return
         errors = validate_layout(self.data)
         if errors:
             messagebox.showerror("Validation errors", "\n".join(errors))
@@ -1941,6 +2096,9 @@ class LayoutEditor(tk.Tk):
         actions_tab.setdefault("actions", [])
         self.data.setdefault("data_tab", {}).setdefault("tabs", [])
         self.data.setdefault("state_tab", {}).setdefault("states", [])
+        for entry in self.data["state_tab"]["states"]:
+            for section in entry.get("sections", []) or []:
+                section.setdefault("value_layout", "auto")
         battery = self.data.setdefault("battery", {})
         battery.setdefault("estimator", {})
         battery.setdefault("sources", [])
@@ -2255,6 +2413,7 @@ class LayoutEditor(tk.Tk):
         self.section_title.delete(0, tk.END)
         self.section_title.insert(0, section.get("title", ""))
         self._section_title_loaded = section.get("title", "")
+        self.section_value_layout.set(section.get("value_layout", "auto") or "auto")
         section_style = section.get("style", {}) or {}
         self.section_bg.delete(0, tk.END)
         self.section_bg.insert(0, section_style.get("background", "") or "")
@@ -2292,6 +2451,7 @@ class LayoutEditor(tk.Tk):
         self.widget_width.insert(0, str(widget.get("width", "")))
         self.widget_height.delete(0, tk.END)
         self.widget_height.insert(0, str(widget.get("height", "")))
+        self.widget_full_width.set(bool(widget.get("full_width", False)))
         self._chart_series = [dict(item) for item in widget.get("chart_series", []) or []]
         self._refresh_chart_series_list()
         self._clear_chart_series_editor()
@@ -2364,7 +2524,11 @@ class LayoutEditor(tk.Tk):
                     self.section_list.selection_set(s_idx)
 
                 self._with_suspended_events(_restore_title)
-        section = {"title": self.section_title.get().strip(), "widgets": []}
+        section = {
+            "title": self.section_title.get().strip(),
+            "widgets": [],
+            "value_layout": self.section_value_layout.get() or "auto",
+        }
         style = self._style_dict(
             [
                 ("background", self.section_bg),
@@ -2435,7 +2599,11 @@ class LayoutEditor(tk.Tk):
         sections = self.data["state_tab"]["states"][e_idx]["sections"]
         s_idx = self._state_section_selected_idx
         if s_idx is None or s_idx >= len(sections):
-            section = {"title": self.section_title.get().strip() or "Section", "widgets": []}
+            section = {
+                "title": self.section_title.get().strip() or "Section",
+                "widgets": [],
+                "value_layout": self.section_value_layout.get() or "auto",
+            }
             style = self._style_dict(
                 [
                     ("background", self.section_bg),
@@ -2543,6 +2711,7 @@ class LayoutEditor(tk.Tk):
 
     def _clear_section_form(self) -> None:
         self.section_title.delete(0, tk.END)
+        self.section_value_layout.set("auto")
         self.section_bg.delete(0, tk.END)
         self.section_border.delete(0, tk.END)
         self.section_title_color.delete(0, tk.END)
@@ -2559,6 +2728,9 @@ class LayoutEditor(tk.Tk):
             return
         title = self.section_title.get().strip()
         self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["title"] = title
+        self.data["state_tab"]["states"][e_idx]["sections"][s_idx]["value_layout"] = (
+                self.section_value_layout.get() or "auto"
+        )
         if s_idx < self.section_list.size():
             def _update() -> None:
                 self.section_list.delete(s_idx)
@@ -3293,6 +3465,8 @@ class LayoutEditor(tk.Tk):
                 widget["height"] = float(self.widget_height.get().strip())
             except ValueError:
                 pass
+        if self.widget_full_width.get():
+            widget["full_width"] = True
         if kind == "chart":
             if self._chart_series_selected_idx is not None and self._chart_series_selected_idx < len(
                     self._chart_series):
@@ -3431,6 +3605,7 @@ class LayoutEditor(tk.Tk):
         self.widget_chart_title.delete(0, tk.END)
         self.widget_width.delete(0, tk.END)
         self.widget_height.delete(0, tk.END)
+        self.widget_full_width.set(False)
         self._chart_series = []
         self._refresh_chart_series_list()
         self._clear_chart_series_editor()
@@ -3526,8 +3701,13 @@ class LayoutEditor(tk.Tk):
         elif current == 4:
             self._commit_action_form()
         elif current == 5:
-            self._commit_state_form()
+            try:
+                self._commit_fill_targets_form()
+            except ValueError:
+                pass
         elif current == 6:
+            self._commit_state_form()
+        elif current == 7:
             self._commit_battery_form()
 
     def _commit_main_tabs_form(self) -> None:
@@ -3629,6 +3809,7 @@ class LayoutEditor(tk.Tk):
         s_idx = self._state_section_selected_idx
         if s_idx is not None and s_idx < len(sections):
             sections[s_idx]["title"] = self.section_title.get().strip()
+            sections[s_idx]["value_layout"] = self.section_value_layout.get() or "auto"
             style = self._style_dict(
                 [
                     ("background", self.section_bg),

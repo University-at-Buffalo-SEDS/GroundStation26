@@ -998,9 +998,11 @@
                 "data_type": "VEHICLE_SPEED",
                 "chart_title": "Vehicle Speed",
                 "width": 1200.0,
-                "height": 240.0
+                "height": 240.0,
+                "full_width": true
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "Actions",
@@ -1044,7 +1046,85 @@
                   "ReinitAfter44"
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Valve States",
+            "widgets": [
+              {
+                "kind": "valve_state",
+                "data_type": "VALVE_STATE",
+                "valves": [
+                  {
+                    "label": "Pilot",
+                    "index": 0
+                  },
+                  {
+                    "label": "NormallyOpen",
+                    "index": 1
+                  },
+                  {
+                    "label": "Dump",
+                    "index": 2
+                  },
+                  {
+                    "label": "Igniter",
+                    "index": 3
+                  },
+                  {
+                    "label": "Nitrogen",
+                    "index": 4
+                  },
+                  {
+                    "label": "Nitrous",
+                    "index": 5
+                  },
+                  {
+                    "label": "Fill Lines",
+                    "index": 6
+                  }
+                ],
+                "valve_labels": [
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Removed",
+                    "false_label": "Installed",
+                    "unknown_label": "Unknown"
+                  }
+                ]
+              }
+            ],
+            "value_layout": "auto"
           }
         ]
       }

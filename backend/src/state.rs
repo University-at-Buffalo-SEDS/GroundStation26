@@ -664,6 +664,7 @@ impl AppState {
         crate::flight_sim::sync_local_flight_state(next_state);
 
         let _ = self.state_tx.send(FlightStateMsg { state: next_state });
+        self.broadcast_fill_targets_snapshot();
         let ts_ms = crate::telemetry_task::get_current_timestamp_ms() as i64;
         self.update_launch_clock_for_state(next_state, ts_ms);
         let tx = self.db_queue_tx.clone();
@@ -780,7 +781,15 @@ impl AppState {
 
     /// Returns the latest fill-target snapshot used by the dashboard.
     pub fn fill_targets_snapshot(&self) -> FillTargetsConfig {
-        self.fill_targets.lock().unwrap().clone()
+        let targets = self.fill_targets.lock().unwrap().clone();
+        let loadcell_cfg = self.loadcell_calibration.lock().unwrap().clone();
+        let flight_state = *self.state.lock().unwrap();
+        crate::flight_sim::effective_fill_targets(targets, &loadcell_cfg, flight_state)
+    }
+
+    /// Broadcasts the current fill-target snapshot if runtime-derived values changed.
+    pub fn broadcast_fill_targets_snapshot(&self) {
+        let _ = self.fill_targets_tx.send(self.fill_targets_snapshot());
     }
 
     /// Records an operator request to continue the fill sequence.
@@ -814,9 +823,9 @@ impl AppState {
         if *slot == targets {
             return;
         }
-        *slot = targets.clone();
+        *slot = targets;
         drop(slot);
-        let _ = self.fill_targets_tx.send(targets);
+        self.broadcast_fill_targets_snapshot();
     }
 
     /// Applies the current software-action policy to decide whether a command can run.

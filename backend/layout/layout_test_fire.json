@@ -618,7 +618,8 @@
               {
                 "kind": "board_status"
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "Valve Board Battery (Valve Board)",
@@ -653,7 +654,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -688,7 +690,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           }
         ]
       },
@@ -770,13 +773,15 @@
                 "width": 1200.0,
                 "height": 260.0
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Valve States",
             "widgets": [
               {
                 "kind": "valve_state",
+                "data_type": "VALVE_STATE",
                 "valves": [
                   {
                     "label": "Pilot",
@@ -845,7 +850,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Actions",
@@ -863,7 +869,8 @@
                   "RewindFlightState"
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "Valve Board Battery (Valve Board)",
@@ -898,7 +905,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -933,7 +941,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           }
         ]
       },
@@ -998,7 +1007,8 @@
                 "width": 1200.0,
                 "height": 260.0
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Pressure",
@@ -1020,13 +1030,45 @@
                 "width": 1200.0,
                 "height": 260.0
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Valve States",
             "widgets": [
               {
                 "kind": "valve_state",
+                "data_type": "VALVE_STATE",
+                "valves": [
+                  {
+                    "label": "Pilot",
+                    "index": 0
+                  },
+                  {
+                    "label": "NormallyOpen",
+                    "index": 1
+                  },
+                  {
+                    "label": "Dump",
+                    "index": 2
+                  },
+                  {
+                    "label": "Igniter",
+                    "index": 3
+                  },
+                  {
+                    "label": "Nitrogen",
+                    "index": 4
+                  },
+                  {
+                    "label": "Nitrous",
+                    "index": 5
+                  },
+                  {
+                    "label": "Fill Lines",
+                    "index": 6
+                  }
+                ],
                 "valve_labels": [
                   {
                     "true_label": "Open",
@@ -1065,7 +1107,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Actions",
@@ -1087,7 +1130,8 @@
                   "RewindFlightState"
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "Valve Board Battery (Valve Board)",
@@ -1122,7 +1166,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -1157,7 +1202,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           }
         ]
       },
@@ -1227,7 +1273,8 @@
                 "width": 1200.0,
                 "height": 260.0
               }
-            ]
+            ],
+            "value_layout": "auto"
           }
         ]
       },
@@ -1243,7 +1290,8 @@
               {
                 "kind": "map"
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Valve Board Battery (Valve Board)",
@@ -1278,7 +1326,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -1313,7 +1362,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           }
         ]
       },
@@ -1336,7 +1386,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Actions",
@@ -1354,7 +1405,8 @@
                   "RewindFlightState"
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "Valve Board Battery (Valve Board)",
@@ -1389,7 +1441,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -1424,7 +1477,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           }
         ]
       }

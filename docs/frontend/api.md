@@ -194,7 +194,27 @@ Purpose:
 
 Expected response:
 
-- Calibration layout JSON produced by `backend/src/loadcell.rs`.
+- Calibration layout JSON loaded by the backend from `backend/config/calibration_config.json`, or
+  from `GS_CALIBRATION_CONFIG_PATH` when set.
+- The response includes `capture_target_samples`, top-level backend-supported `fit_modes`, and
+  `sensors`.
+- Each sensor provides `id`, `label`, `data_type`, `channel`, `fit_color`, `raw_label`,
+  `expected_label`, and optional per-sensor `fit_modes`.
+- The frontend must render calibration channels, labels, colors, and regression choices from this
+  response. These values are intentionally not hard-coded in the frontend so future sensors can be
+  added by backend config.
+
+Supported regression ids:
+
+- `best`
+- `linear`
+- `linear_zero`
+- `parabolic` / `poly2`
+- `parabolic_zero` / `poly2_zero`
+- `cubic` / `poly3`
+- `cubic_zero` / `poly3_zero`
+- `quartic` / `poly4`
+- `quartic_zero` / `poly4_zero`
 
 Failure impact:
 
@@ -351,6 +371,10 @@ Legacy aliases still exposed:
 - `POST /api/loadcell_calibration/refit`
 
 These are required for the calibration tab to be interactive.
+
+Calibration documents keep legacy fields for `ch0`, `ch1`, and `iadc`. Additional channels use
+`extra_channels[channel_id]` with generic `linear`, `zero_raw`, `points`, and `fit` fields. Generic
+points use `{ "expected": number, "raw": number }`.
 
 ### `POST /api/notifications/{id}/dismiss`
 

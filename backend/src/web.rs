@@ -565,6 +565,7 @@ async fn set_loadcell_calibration(
     if let Err(err) = loadcell::save(&cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
     }
+    state.broadcast_fill_targets_snapshot();
     Json(cfg).into_response()
 }
 
@@ -585,6 +586,7 @@ async fn capture_loadcell_zero(
     if let Err(err) = loadcell::save(&updated) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
     }
+    state.broadcast_fill_targets_snapshot();
     Json(updated).into_response()
 }
 
@@ -605,6 +607,7 @@ async fn capture_loadcell_span(
     if let Err(err) = loadcell::save(&updated) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
     }
+    state.broadcast_fill_targets_snapshot();
     Json(updated).into_response()
 }
 
@@ -617,9 +620,7 @@ async fn refit_loadcell_channel(
     if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
         return response;
     }
-    let Some(channel) = loadcell::CalibrationChannel::from_str(req.channel.trim()) else {
-        return (StatusCode::BAD_REQUEST, "invalid channel".to_string()).into_response();
-    };
+    let channel = loadcell::CalibrationChannel::from_str(req.channel.trim());
     let Some(mode) = loadcell::FitMode::from_str(req.mode.trim()) else {
         return (StatusCode::BAD_REQUEST, "invalid fit mode".to_string()).into_response();
     };
@@ -635,6 +636,7 @@ async fn refit_loadcell_channel(
     if let Err(err) = loadcell::save(&updated) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
     }
+    state.broadcast_fill_targets_snapshot();
     Json(updated).into_response()
 }
 

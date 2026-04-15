@@ -127,11 +127,6 @@ const KNOWN_TRANSLATIONS: &[(&str, &str, &str)] = &[
     ("Startup", "Inicio", "Démarrage"),
     ("Abort", "Abortar", "Abandon"),
     (
-        "Current Flight State",
-        "Estado actual de vuelo",
-        "État de vol actuel",
-    ),
-    (
         "Fuel Tank Pressure",
         "Presión del tanque de combustible",
         "Pression du réservoir carburant",

@@ -754,7 +754,8 @@
               {
                 "kind": "board_status"
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "AV Bay Battery (Power Board)",
@@ -789,7 +790,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "GPS",
@@ -808,7 +810,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "Valve Board Battery (Valve Board)",
@@ -843,7 +846,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -878,7 +882,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Satellites",
@@ -908,7 +913,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           }
         ]
       },
@@ -988,15 +994,18 @@
                   }
                 ],
                 "width": 1200.0,
-                "height": 260.0
+                "height": 260.0,
+                "full_width": true
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "Valve States",
             "widgets": [
               {
                 "kind": "valve_state",
+                "data_type": "VALVE_STATE",
                 "valves": [
                   {
                     "label": "Pilot",
@@ -1065,7 +1074,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Actions",
@@ -1081,7 +1091,8 @@
                   "RetractPlumbing"
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "AV Bay Battery (Power Board)",
@@ -1116,7 +1127,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Valve Board Battery (Valve Board)",
@@ -1151,7 +1163,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -1186,7 +1199,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Satellites",
@@ -1216,7 +1230,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           }
         ]
       },
@@ -1243,15 +1258,48 @@
                 "data_type": "FUEL_TANK_PRESSURE",
                 "chart_title": "Fuel Tank Pressure",
                 "width": 1200.0,
-                "height": 260.0
+                "height": 260.0,
+                "full_width": true
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "Valve States",
             "widgets": [
               {
                 "kind": "valve_state",
+                "data_type": "VALVE_STATE",
+                "valves": [
+                  {
+                    "label": "Pilot",
+                    "index": 0
+                  },
+                  {
+                    "label": "NormallyOpen",
+                    "index": 1
+                  },
+                  {
+                    "label": "Dump",
+                    "index": 2
+                  },
+                  {
+                    "label": "Igniter",
+                    "index": 3
+                  },
+                  {
+                    "label": "Nitrogen",
+                    "index": 4
+                  },
+                  {
+                    "label": "Nitrous",
+                    "index": 5
+                  },
+                  {
+                    "label": "Fill Lines",
+                    "index": 6
+                  }
+                ],
                 "valve_labels": [
                   {
                     "true_label": "Open",
@@ -1290,7 +1338,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Actions",
@@ -1310,7 +1359,8 @@
                   "Pilot"
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "AV Bay Battery (Power Board)",
@@ -1345,7 +1395,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Valve Board Battery (Valve Board)",
@@ -1380,7 +1431,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -1415,7 +1467,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Satellites",
@@ -1445,7 +1498,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           }
         ]
       },
@@ -1535,9 +1589,11 @@
                   }
                 ],
                 "width": 1200.0,
-                "height": 260.0
+                "height": 260.0,
+                "full_width": true
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "Dynamics",
@@ -1603,7 +1659,8 @@
                 "width": 1200.0,
                 "height": 240.0
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           }
         ]
       },
@@ -1619,7 +1676,8 @@
               {
                 "kind": "map"
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "AV Bay Battery (Power Board)",
@@ -1654,7 +1712,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Valve Board Battery (Valve Board)",
@@ -1689,7 +1748,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -1724,7 +1784,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Satellites",
@@ -1754,7 +1815,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           }
         ]
       },
@@ -1777,7 +1839,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Actions",
@@ -1793,7 +1856,8 @@
                   "RetractPlumbing"
                 ]
               }
-            ]
+            ],
+            "value_layout": "horizontal"
           },
           {
             "title": "AV Bay Battery (Power Board)",
@@ -1828,7 +1892,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Valve Board Battery (Valve Board)",
@@ -1863,7 +1928,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Ground Station Battery (Gateway Board)",
@@ -1898,7 +1964,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           },
           {
             "title": "Satellites",
@@ -1928,7 +1995,8 @@
                   }
                 ]
               }
-            ]
+            ],
+            "value_layout": "auto"
           }
         ]
       }
