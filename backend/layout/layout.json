@@ -903,7 +903,7 @@
                     "index": 3,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -929,7 +929,14 @@
                 "items": [
                   {
                     "label": "Tank Pressure",
-                    "index": 0
+                    "index": 0,
+                    "fill_target_fluid": "nitrous",
+                    "fill_target_kind": "pressure_psi",
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 1,
+                      "suffix": " psi"
+                    }
                   }
                 ]
               },
@@ -939,7 +946,14 @@
                 "items": [
                   {
                     "label": "Mass (kg)",
-                    "index": 0
+                    "index": 0,
+                    "fill_target_fluid": "nitrous",
+                    "fill_target_kind": "mass_kg",
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 2,
+                      "suffix": " kg"
+                    }
                   }
                 ]
               },
@@ -950,55 +964,6 @@
                   {
                     "label": "Fill Percent",
                     "index": 0
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "items": [
-                  {
-                    "label": "N2 Pressure Setpoint",
-                    "index": 0,
-                    "fill_target_fluid": "nitrogen",
-                    "fill_target_kind": "pressure_psi",
-                    "formatter": {
-                      "kind": "number",
-                      "precision": 1,
-                      "suffix": " psi"
-                    }
-                  },
-                  {
-                    "label": "N2 Weight Setpoint",
-                    "index": 0,
-                    "fill_target_fluid": "nitrogen",
-                    "fill_target_kind": "mass_kg",
-                    "formatter": {
-                      "kind": "number",
-                      "precision": 2,
-                      "suffix": " kg"
-                    }
-                  },
-                  {
-                    "label": "N2O Pressure Setpoint",
-                    "index": 0,
-                    "fill_target_fluid": "nitrous",
-                    "fill_target_kind": "pressure_psi",
-                    "formatter": {
-                      "kind": "number",
-                      "precision": 1,
-                      "suffix": " psi"
-                    }
-                  },
-                  {
-                    "label": "N2O Weight Setpoint",
-                    "index": 0,
-                    "fill_target_fluid": "nitrous",
-                    "fill_target_kind": "mass_kg",
-                    "formatter": {
-                      "kind": "number",
-                      "precision": 2,
-                      "suffix": " kg"
-                    }
                   }
                 ]
               },
@@ -1246,7 +1211,7 @@
                     "index": 3,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -1475,7 +1440,7 @@
                     "index": 3,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -1544,7 +1509,7 @@
                     "index": 3,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -1784,7 +1749,7 @@
                     "index": 3,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -1958,7 +1923,7 @@
                     "index": 3,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
