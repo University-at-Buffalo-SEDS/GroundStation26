@@ -316,9 +316,9 @@ fn calibration_path() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     #[cfg(feature = "testing")]
     {
-        return manifest_dir
+        manifest_dir
             .join("calibration")
-            .join(DEFAULT_LOADCELL_CALIBRATION_FILENAME);
+            .join(DEFAULT_LOADCELL_CALIBRATION_FILENAME)
     }
     #[cfg(not(feature = "testing"))]
     {
@@ -754,10 +754,10 @@ fn fit_poly_degree(xs: &[f64], ys: &[f64], degree: usize) -> Result<Vec<f64>, St
     let n = degree + 1;
     let mut a = vec![vec![0.0; n]; n];
     let mut b = vec![0.0; n];
-    for row in 0..n {
-        for col in 0..n {
+    for (row, row_values) in a.iter_mut().enumerate().take(n) {
+        for (col, slot) in row_values.iter_mut().enumerate().take(n) {
             let power = (2 * degree).saturating_sub(row + col) as i32;
-            a[row][col] = xs.iter().map(|x| x.powi(power)).sum();
+            *slot = xs.iter().map(|x| x.powi(power)).sum();
         }
         let power = degree.saturating_sub(row) as i32;
         b[row] = xs.iter().zip(ys).map(|(x, y)| x.powi(power) * y).sum();

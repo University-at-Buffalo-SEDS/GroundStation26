@@ -606,22 +606,27 @@ async fn emit_derived_battery_rows(
     }
 }
 
+struct DerivedLoadcellSample<'a> {
+    ts_ms: i64,
+    sender_id: &'a str,
+    sensor_id: &'a str,
+    raw_value: f32,
+    payload_json: &'a str,
+}
+
 async fn emit_derived_loadcell_rows(
     state: &Arc<AppState>,
     db_tx: &mpsc::Sender<DbQueueItem>,
     db_overflow: &DbOverflow,
-    ts_ms: i64,
-    sender_id: &str,
-    sensor_id: &str,
-    raw_value: f32,
-    payload_json: &str,
+    sample: DerivedLoadcellSample<'_>,
 ) {
     let cfg = state.loadcell_calibration.lock().unwrap().clone();
-    let Some(calibrated_value) = loadcell::calibrated_sensor_value(&cfg, sensor_id, raw_value)
+    let Some(calibrated_value) =
+        loadcell::calibrated_sensor_value(&cfg, sample.sensor_id, sample.raw_value)
     else {
         return;
     };
-    let rows: Vec<(&str, Vec<Option<f32>>)> = match sensor_id {
+    let rows: Vec<(&str, Vec<Option<f32>>)> = match sample.sensor_id {
         loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
             let percent = loadcell::fill_percent(&cfg, calibrated_value);
             {
@@ -660,26 +665,26 @@ async fn emit_derived_loadcell_rows(
     };
 
     for (data_type, values) in rows {
-        if should_persist_telemetry_sample(data_type, ts_ms) {
+        if should_persist_telemetry_sample(data_type, sample.ts_ms) {
             queue_db_write(
                 state,
                 db_tx,
                 db_overflow,
                 DbWrite::Telemetry {
-                    timestamp_ms: ts_ms,
+                    timestamp_ms: sample.ts_ms,
                     data_type: data_type.to_string(),
-                    sender_id: sender_id.to_string(),
+                    sender_id: sample.sender_id.to_string(),
                     values_json: telemetry_values_json(&values),
-                    payload_json: payload_json.to_string(),
+                    payload_json: sample.payload_json.to_string(),
                 },
             )
             .await;
         }
 
         let row = TelemetryRow {
-            timestamp_ms: ts_ms,
+            timestamp_ms: sample.ts_ms,
             data_type: data_type.to_string(),
-            sender_id: sender_id.to_string(),
+            sender_id: sample.sender_id.to_string(),
             values,
         };
         state.cache_recent_telemetry(row.clone());
@@ -2056,11 +2061,13 @@ async fn handle_packet(
                     state,
                     db_tx,
                     db_overflow,
-                    derived_ts_ms,
-                    pkt.sender(),
-                    &data_type_str,
-                    voltage,
-                    &payload_json,
+                    DerivedLoadcellSample {
+                        ts_ms: derived_ts_ms,
+                        sender_id: pkt.sender(),
+                        sensor_id: &data_type_str,
+                        raw_value: voltage,
+                        payload_json: &payload_json,
+                    },
                 )
                 .await;
             }

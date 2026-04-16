@@ -260,15 +260,15 @@ fn migrate_legacy_config(target_path: &PathBuf) {
             );
             return;
         }
-        if let Err(err) = fs::rename(&legacy_path, target_path) {
-            if let Err(copy_err) = fs::copy(&legacy_path, target_path) {
-                eprintln!(
-                    "WARNING: failed to migrate comms link config {} -> {}: {err}; copy fallback failed: {copy_err}",
-                    legacy_path.display(),
-                    target_path.display()
-                );
-                return;
-            }
+        if let Err(err) = fs::rename(&legacy_path, target_path)
+            && let Err(copy_err) = fs::copy(&legacy_path, target_path)
+        {
+            eprintln!(
+                "WARNING: failed to migrate comms link config {} -> {}: {err}; copy fallback failed: {copy_err}",
+                legacy_path.display(),
+                target_path.display()
+            );
+            return;
         }
         return;
     }

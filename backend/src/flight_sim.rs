@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "testing")]
 const BASE_LAT: f32 = 31.7619;
 #[cfg(feature = "testing")]
-const BASE_LON: f32 = -106.4850;
+const BASE_LON: f32 = -106.485;
 
 #[cfg(feature = "testing")]
 const SENSOR_PERIOD_MS: u64 = 25;
@@ -1110,35 +1110,6 @@ pub fn simulated_board_endpoints(_board: crate::types::Board) -> Vec<String> {
     Vec::new()
 }
 
-#[cfg(test)]
-mod tests {
-    #[cfg(feature = "testing")]
-    #[test]
-    fn flight_computer_simulated_endpoints_include_sd_card() {
-        let endpoints = super::simulated_board_endpoints(crate::types::Board::FlightComputer);
-        assert!(endpoints.iter().any(|endpoint| {
-            endpoint == sedsprintf_rs_2026::config::DataEndpoint::SdCard.as_str()
-        }));
-    }
-
-    #[cfg(feature = "testing")]
-    #[test]
-    fn queued_flight_state_is_prioritized_for_launch_clock_sync() {
-        let mut sim = super::FlightSimState::new();
-        sim.queue_umbilical_status(super::ActuatorBoardCommands::IgniterOn as u8, true, 1_000);
-        sim.queue_flight_state(1_000);
-
-        let pkt = sim
-            .pop_next_queued()
-            .expect("queued flight state packet should be returned");
-
-        assert_eq!(
-            pkt.data_type(),
-            sedsprintf_rs_2026::config::DataType::FlightState
-        );
-    }
-}
-
 #[cfg(feature = "testing")]
 pub fn handle_command(cmd: &TelemetryCommand) -> bool {
     if !sim_mode_enabled() {
@@ -1207,4 +1178,33 @@ pub fn handle_command(_cmd: &TelemetryCommand) -> bool {
 #[cfg(not(feature = "testing"))]
 pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
     unreachable!("flight sim only available with testing feature")
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "testing")]
+    #[test]
+    fn flight_computer_simulated_endpoints_include_sd_card() {
+        let endpoints = super::simulated_board_endpoints(crate::types::Board::FlightComputer);
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint == sedsprintf_rs_2026::config::DataEndpoint::SdCard.as_str()
+        }));
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn queued_flight_state_is_prioritized_for_launch_clock_sync() {
+        let mut sim = super::FlightSimState::new();
+        sim.queue_umbilical_status(super::ActuatorBoardCommands::IgniterOn as u8, true, 1_000);
+        sim.queue_flight_state(1_000);
+
+        let pkt = sim
+            .pop_next_queued()
+            .expect("queued flight state packet should be returned");
+
+        assert_eq!(
+            pkt.data_type(),
+            sedsprintf_rs_2026::config::DataType::FlightState
+        );
+    }
 }

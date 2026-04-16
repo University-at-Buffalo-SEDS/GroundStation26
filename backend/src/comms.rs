@@ -238,13 +238,13 @@ impl UartComms {
             self.rx_buf.drain(..drop_len);
         }
 
-        if !self.rx_buf.is_empty() {
-            if let Err(err) = serialize::peek_frame_info(&self.rx_buf) {
-                maybe_log_raw_uart_parse_issue(
-                    &format!("raw UART parse pending: {err}"),
-                    &self.rx_buf[..self.rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
-                );
-            }
+        if !self.rx_buf.is_empty()
+            && let Err(err) = serialize::peek_frame_info(&self.rx_buf)
+        {
+            maybe_log_raw_uart_parse_issue(
+                &format!("raw UART parse pending: {err}"),
+                &self.rx_buf[..self.rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+            );
         }
 
         Ok(None)
@@ -1218,7 +1218,6 @@ pub struct DummyComms {
 }
 
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
-
 impl DummyComms {
     pub fn new(name: &'static str) -> Self {
         DummyComms {

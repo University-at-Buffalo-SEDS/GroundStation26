@@ -666,7 +666,10 @@ async fn get_tile_jpg(Path((z, x, y_raw)): Path<(u32, u32, String)>) -> impl Int
         return (
             [
                 (header::CONTENT_TYPE, "image/jpeg"),
-                (header::HeaderName::from_static("x-gs26-tile-source"), source_value.as_str()),
+                (
+                    header::HeaderName::from_static("x-gs26-tile-source"),
+                    source_value.as_str(),
+                ),
             ],
             tile.bytes,
         )
@@ -804,7 +807,10 @@ struct TileResponse {
 /// Walks up the tile pyramid until it can synthesize a usable child tile.
 async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<TileResponse> {
     if let Some(bytes) = read_exact_tile(z, x, y).await {
-        return Some(TileResponse { bytes, source: TileResponseSource::Exact });
+        return Some(TileResponse {
+            bytes,
+            source: TileResponseSource::Exact,
+        });
     }
 
     let mut az = z;
@@ -818,10 +824,12 @@ async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<TileResponse>
             continue;
         };
         match synthesize_zoom_tile_from_ancestor(&parent_bytes, az, ax, ay, z, x, y) {
-            Ok(bytes) => return Some(TileResponse {
-                bytes,
-                source: TileResponseSource::Fallback { ancestor_z: az },
-            }),
+            Ok(bytes) => {
+                return Some(TileResponse {
+                    bytes,
+                    source: TileResponseSource::Fallback { ancestor_z: az },
+                });
+            }
             Err(err) => {
                 eprintln!(
                     "WARNING: failed synthesizing fallback tile z={z} x={x} y={y} from ancestor z={az} x={ax} y={ay}: {err}"
