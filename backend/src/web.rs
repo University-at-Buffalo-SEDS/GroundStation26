@@ -492,6 +492,7 @@ async fn get_calibration_config(
 #[derive(Serialize)]
 struct MapConfigDto {
     max_native_zoom: u32,
+    max_display_zoom: u32,
     default_center_lat: f64,
     default_center_lon: f64,
     default_zoom: f64,
@@ -518,6 +519,7 @@ async fn get_map_config(
 
     Json(MapConfigDto {
         max_native_zoom,
+        max_display_zoom: max_native_zoom.saturating_add(1),
         default_center_lat: 31.0,
         default_center_lon: -99.0,
         default_zoom: 7.0,
@@ -656,8 +658,19 @@ async fn get_tile_jpg(Path((z, x, y_raw)): Path<(u32, u32, String)>) -> impl Int
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    if let Some(bytes) = read_tile_with_fallback(z, x, y).await {
-        return ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response();
+    if let Some(tile) = read_tile_with_fallback(z, x, y).await {
+        let source_value = match tile.source {
+            TileResponseSource::Exact => "exact".to_string(),
+            TileResponseSource::Fallback { ancestor_z } => format!("fallback:{ancestor_z}"),
+        };
+        return (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::HeaderName::from_static("x-gs26-tile-source"), source_value.as_str()),
+            ],
+            tile.bytes,
+        )
+            .into_response();
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -776,10 +789,22 @@ async fn read_exact_tile(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
     }
 }
 
+#[derive(Clone, Debug)]
+enum TileResponseSource {
+    Exact,
+    Fallback { ancestor_z: u32 },
+}
+
+#[derive(Clone, Debug)]
+struct TileResponse {
+    bytes: Vec<u8>,
+    source: TileResponseSource,
+}
+
 /// Walks up the tile pyramid until it can synthesize a usable child tile.
-async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
+async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<TileResponse> {
     if let Some(bytes) = read_exact_tile(z, x, y).await {
-        return Some(bytes);
+        return Some(TileResponse { bytes, source: TileResponseSource::Exact });
     }
 
     let mut az = z;
@@ -793,7 +818,10 @@ async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
             continue;
         };
         match synthesize_zoom_tile_from_ancestor(&parent_bytes, az, ax, ay, z, x, y) {
-            Ok(bytes) => return Some(bytes),
+            Ok(bytes) => return Some(TileResponse {
+                bytes,
+                source: TileResponseSource::Fallback { ancestor_z: az },
+            }),
             Err(err) => {
                 eprintln!(
                     "WARNING: failed synthesizing fallback tile z={z} x={x} y={y} from ancestor z={az} x={ax} y={ay}: {err}"
