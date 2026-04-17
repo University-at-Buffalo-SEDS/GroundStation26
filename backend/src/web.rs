@@ -253,6 +253,18 @@ async fn authorize_headers(
         .map_err(auth_failure_response)
 }
 
+fn calibration_edit_forbidden_response() -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        "calibration editing is restricted to the rylan user",
+    )
+        .into_response()
+}
+
+fn principal_can_edit_calibration(principal: &crate::auth::AuthPrincipal) -> bool {
+    principal.calibration_access.edit
+}
+
 /// Creates a new authenticated session from username/password credentials.
 async fn login(
     State(state): State<Arc<AppState>>,
@@ -480,12 +492,9 @@ async fn post_translate_texts(
 
 /// Returns the UI layout metadata for the loadcell calibration tab.
 async fn get_calibration_config(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    State(_state): State<Arc<AppState>>,
+    _headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
-        return response;
-    }
     Json(loadcell::calibration_tab_layout()).into_response()
 }
 
@@ -551,11 +560,8 @@ struct RefitLoadcellReq {
 /// Returns the in-memory loadcell calibration file.
 async fn get_loadcell_calibration(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
-        return response;
-    }
     Json(state.loadcell_calibration.lock().unwrap().clone()).into_response()
 }
 
@@ -565,8 +571,12 @@ async fn set_loadcell_calibration(
     headers: HeaderMap,
     Json(cfg): Json<loadcell::LoadcellCalibrationFile>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
-        return response;
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal_can_edit_calibration(&principal) {
+        return calibration_edit_forbidden_response();
     }
     {
         let mut slot = state.loadcell_calibration.lock().unwrap();
@@ -585,8 +595,12 @@ async fn capture_loadcell_zero(
     headers: HeaderMap,
     Json(req): Json<CaptureLoadcellPointReq>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
-        return response;
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal_can_edit_calibration(&principal) {
+        return calibration_edit_forbidden_response();
     }
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
@@ -606,8 +620,12 @@ async fn capture_loadcell_span(
     headers: HeaderMap,
     Json(req): Json<CaptureLoadcellSpanReq>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
-        return response;
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal_can_edit_calibration(&principal) {
+        return calibration_edit_forbidden_response();
     }
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
@@ -627,8 +645,12 @@ async fn refit_loadcell_channel(
     headers: HeaderMap,
     Json(req): Json<RefitLoadcellReq>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
-        return response;
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal_can_edit_calibration(&principal) {
+        return calibration_edit_forbidden_response();
     }
     let channel = loadcell::CalibrationChannel::from_str(req.channel.trim());
     let Some(mode) = loadcell::FitMode::from_str(req.mode.trim()) else {

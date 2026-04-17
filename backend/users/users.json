@@ -8,6 +8,10 @@
   "anonymous_command_access": {
     "allowed_commands": []
   },
+  "anonymous_calibration_access": {
+    "view": true,
+    "edit": false
+  },
   "users": [
     {
       "username": "rylan",
@@ -63,6 +67,10 @@
           "StopWritingDb",
           "ValidateMeasms"
         ]
+      },
+      "calibration_access": {
+        "view": true,
+        "edit": true
       },
       "disabled": false
     }
