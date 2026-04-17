@@ -2162,8 +2162,37 @@ fn payload_json_from_pkt(pkt: &Packet) -> String {
 }
 
 pub fn timesync_enabled() -> bool {
-    if cfg!(feature = "testing") {
-        return std::env::var("GROUNDSTATION_TIMESYNC").ok().as_deref() == Some("1");
+    std::env::var("GROUNDSTATION_TIMESYNC").ok().as_deref() == Some("1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timesync_enabled;
+    use std::sync::{Mutex, OnceLock};
+
+    fn timesync_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
-    true
+
+    #[test]
+    fn timesync_defaults_off() {
+        let _guard = timesync_env_lock().lock().unwrap();
+        unsafe {
+            std::env::remove_var("GROUNDSTATION_TIMESYNC");
+        }
+        assert!(!timesync_enabled());
+    }
+
+    #[test]
+    fn timesync_can_be_enabled_via_env() {
+        let _guard = timesync_env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("GROUNDSTATION_TIMESYNC", "1");
+        }
+        assert!(timesync_enabled());
+        unsafe {
+            std::env::remove_var("GROUNDSTATION_TIMESYNC");
+        }
+    }
 }
