@@ -27,6 +27,9 @@ pub const ROCKET_COMMS_PORT: &str = "/dev/ttyUSB1";
 pub const UMBILICAL_COMMS_PORT: &str = "/dev/ttyUSB2";
 pub const COMMS_BAUD_RATE: usize = 57_600;
 pub const MAX_PACKET_SIZE: usize = 256;
+const RAW_UART_FRAME_SYNC_0: u8 = 0xA5;
+const RAW_UART_FRAME_SYNC_1: u8 = 0x5A;
+const RAW_UART_FRAME_HEADER_SIZE: usize = 4;
 const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
 #[cfg(target_os = "linux")]
@@ -217,37 +220,7 @@ impl UartComms {
     }
 
     fn try_take_raw_uart_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
-        let scan_len = self.rx_buf.len().min(RAW_UART_MAX_FRAME_BYTES);
-        for start in 0..scan_len {
-            for end in (start + 1)..=scan_len {
-                let candidate = &self.rx_buf[start..end];
-                if serialize::peek_frame_info(candidate).is_ok() {
-                    let payload = candidate.to_vec();
-                    self.rx_buf.drain(..end);
-                    return Ok(Some(payload));
-                }
-            }
-        }
-
-        if self.rx_buf.len() > RAW_UART_MAX_FRAME_BYTES {
-            let drop_len = self.rx_buf.len() - RAW_UART_MAX_FRAME_BYTES;
-            maybe_log_raw_uart_parse_issue(
-                "dropping oversized raw UART buffer",
-                &self.rx_buf[..self.rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
-            );
-            self.rx_buf.drain(..drop_len);
-        }
-
-        if !self.rx_buf.is_empty()
-            && let Err(err) = serialize::peek_frame_info(&self.rx_buf)
-        {
-            maybe_log_raw_uart_parse_issue(
-                &format!("raw UART parse pending: {err}"),
-                &self.rx_buf[..self.rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
-            );
-        }
-
-        Ok(None)
+        take_raw_uart_framed_payload(&mut self.rx_buf)
     }
 
     fn try_take_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
@@ -268,6 +241,82 @@ fn is_idle_serial_timeout(err: &std::io::Error) -> bool {
 fn raw_uart_debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("GS_RAW_UART_DEBUG").ok().as_deref() == Some("1"))
+}
+
+fn build_raw_uart_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    let len = payload.len();
+    if len == 0 || len > MAX_PACKET_SIZE {
+        return Err(format!("packet too large to send over raw UART: {len} bytes").into());
+    }
+
+    let mut framed = Vec::with_capacity(RAW_UART_FRAME_HEADER_SIZE + len);
+    framed.push(RAW_UART_FRAME_SYNC_0);
+    framed.push(RAW_UART_FRAME_SYNC_1);
+    framed.extend_from_slice(&(len as u16).to_le_bytes());
+    framed.extend_from_slice(payload);
+    Ok(framed)
+}
+
+fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<Vec<u8>>> {
+    if rx_buf.len() > RAW_UART_MAX_FRAME_BYTES {
+        let drop_len = rx_buf.len() - RAW_UART_MAX_FRAME_BYTES;
+        maybe_log_raw_uart_parse_issue(
+            "dropping oversized raw UART buffer",
+            &rx_buf[..rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+        );
+        rx_buf.drain(..drop_len);
+    }
+
+    let sync_pos = rx_buf
+        .windows(2)
+        .position(|pair| pair == [RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1]);
+    match sync_pos {
+        Some(0) => {}
+        Some(pos) => {
+            maybe_log_raw_uart_parse_issue(
+                "dropping bytes before raw UART frame sync",
+                &rx_buf[..pos.min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+            );
+            rx_buf.drain(..pos);
+        }
+        None => {
+            if !rx_buf.is_empty() {
+                maybe_log_raw_uart_parse_issue(
+                    "raw UART waiting for frame sync",
+                    &rx_buf[..rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+                );
+                let keep = usize::from(rx_buf.last().copied() == Some(RAW_UART_FRAME_SYNC_0));
+                let drop_len = rx_buf.len().saturating_sub(keep);
+                if drop_len > 0 {
+                    rx_buf.drain(..drop_len);
+                }
+            }
+            return Ok(None);
+        }
+    }
+
+    if rx_buf.len() < RAW_UART_FRAME_HEADER_SIZE {
+        return Ok(None);
+    }
+
+    let frame_len = u16::from_le_bytes([rx_buf[2], rx_buf[3]]) as usize;
+    if frame_len == 0 || frame_len > MAX_PACKET_SIZE {
+        maybe_log_raw_uart_parse_issue(
+            &format!("invalid raw UART frame length: {frame_len}"),
+            &rx_buf[..rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+        );
+        rx_buf.drain(..1);
+        return Ok(None);
+    }
+
+    let total_len = RAW_UART_FRAME_HEADER_SIZE + frame_len;
+    if rx_buf.len() < total_len {
+        return Ok(None);
+    }
+
+    let payload = rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len].to_vec();
+    rx_buf.drain(..total_len);
+    Ok(Some(payload))
 }
 
 #[cfg(target_os = "linux")]
@@ -597,7 +646,7 @@ impl CommsDevice for UartComms {
                 self.inner.write_all(payload)?;
             }
             SerialProtocol::RawUart => {
-                self.inner.write_all(payload)?;
+                self.inner.write_all(&build_raw_uart_frame(payload)?)?;
             }
         }
         self.inner.flush()?;
@@ -1503,6 +1552,30 @@ mod tests {
     fn timed_out_i2c_read_is_treated_as_idle() {
         let err = std::io::Error::from_raw_os_error(libc::ETIMEDOUT);
         assert!(is_i2c_idle_read_error(&err));
+    }
+}
+
+#[cfg(test)]
+mod raw_uart_tests {
+    use super::*;
+
+    #[test]
+    fn raw_uart_frame_roundtrip() {
+        let payload = vec![1, 2, 3, 4, 5];
+        let mut framed = build_raw_uart_frame(&payload).unwrap();
+        let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
+        assert_eq!(decoded, payload);
+        assert!(framed.is_empty());
+    }
+
+    #[test]
+    fn raw_uart_frame_resyncs_after_garbage() {
+        let payload = vec![9, 8, 7];
+        let mut framed = vec![0x00, 0x11, 0x22];
+        framed.extend_from_slice(&build_raw_uart_frame(&payload).unwrap());
+        let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
+        assert_eq!(decoded, payload);
+        assert!(framed.is_empty());
     }
 }
 
