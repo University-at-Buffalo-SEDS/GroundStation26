@@ -1,6 +1,6 @@
 # Backend I2C Transport
 
-This document describes the chunked I2C packet transport used by the Ground Station backend and the Python I2C host tooling.
+This document describes the chunked I2C packet transport used by the Ground Station backend and the Pico firmware currently deployed on the fill-system side.
 
 ## Scope
 
@@ -106,6 +106,11 @@ The total packet length field is `u32`, so the wire format can carry payloads up
 
 The Ground Station Rust backend now streams outgoing packets across as many I2C slots as needed and reassembles incoming packets from as many slots as required.
 
+Current Pico firmware error responses on this link are `KIND_ERROR` packets with short ASCII payloads such as:
+
+- `error invalid i2c slot`
+- `error invalid i2c kind`
+
 ## Compatibility
 
 This slot protocol is not wire-compatible with the old `258` byte `magic + len + payload` staging format.
@@ -120,5 +125,5 @@ If one side is still on the old fixed-frame transport, the link will not decode 
 
 ## References
 
-- Rust host transport: [comms.rs](/Users/rylan/Documents/GitKraken/GroundStation26/backend/src/comms.rs)
+- Ground Station Rust host transport: [comms.rs](/Users/rylan/Documents/GitKraken/GroundStation26/backend/src/comms.rs)
 - Python host tools: `/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py`

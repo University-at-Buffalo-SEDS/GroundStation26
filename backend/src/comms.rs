@@ -825,6 +825,10 @@ impl CommsDevice for UartComms {
 // I2C Comms Implementation
 // ======================================================================
 
+// This Linux backend speaks the Pico slot-based I2C protocol directly:
+// one self-describing 32-byte slot per transfer, not the legacy fake 258-byte
+// framing model used by older host experiments.
+
 pub struct I2cComms {
     #[cfg(target_os = "linux")]
     inner: File,
