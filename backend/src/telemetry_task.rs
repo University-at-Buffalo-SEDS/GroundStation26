@@ -1998,6 +1998,7 @@ async fn handle_packet(
     db_overflow: &DbOverflow,
     pkt: Packet,
 ) -> Option<TelemetryRow> {
+    log_inbound_packet("accepted", &pkt);
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
 
     if pkt.data_type() == DataType::Warning {
@@ -2051,6 +2052,12 @@ async fn handle_packet(
         {
             let cmd_id = data[0];
             let on = data[1] != 0;
+            eprintln!(
+                "inbound umbilical status: sender={} cmd_id={} on={}",
+                pkt.sender(),
+                cmd_id,
+                on
+            );
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
                 state.set_umbilical_valve_state(key_cmd_id, key_on);
 
@@ -2098,6 +2105,11 @@ async fn handle_packet(
     let payload_json = payload_json_from_pkt(&pkt);
 
     if pkt.data_type() == DataType::GpsSatelliteNumber {
+        eprintln!(
+            "inbound gps satellites: sender={} ts={}",
+            pkt.sender(),
+            pkt.timestamp()
+        );
         return handle_gps_satellite_count_packet(state, db_tx, db_overflow, &pkt, &payload_json)
             .await;
     }
@@ -2105,6 +2117,12 @@ async fn handle_packet(
     if let Ok(values) = pkt.data_as_f32() {
         let mut values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
         if pkt.data_type() == DataType::GpsData {
+            eprintln!(
+                "inbound gps fix: sender={} ts={} values={:?}",
+                pkt.sender(),
+                pkt.timestamp(),
+                values_vec
+            );
             values_vec = normalized_gps_values(state, pkt.sender(), &values_vec);
         }
         if pkt.data_type() == DataType::FuelTankPressure {
@@ -2247,6 +2265,32 @@ fn log_command_flush_start(context: &str) {
 
 fn log_command_flush_success(context: &str) {
     eprintln!("{context}: router tx queue flushed");
+}
+
+fn should_log_inbound_packet(pkt: &Packet) -> bool {
+    matches!(pkt.sender(), "AB" | "VB" | "GW")
+        || matches!(
+            pkt.data_type(),
+            DataType::UmbilicalStatus
+                | DataType::GpsData
+                | DataType::GpsSatelliteNumber
+                | DataType::ValveCommand
+                | DataType::ActuatorCommand
+        )
+}
+
+fn log_inbound_packet(stage: &str, pkt: &Packet) {
+    if !should_log_inbound_packet(pkt) {
+        return;
+    }
+
+    eprintln!(
+        "inbound {stage}: sender={} ty={} ts={} payload_len={}",
+        pkt.sender(),
+        pkt.data_type().as_str(),
+        pkt.timestamp(),
+        pkt.payload().len()
+    );
 }
 
 fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::TelemetryError> {
