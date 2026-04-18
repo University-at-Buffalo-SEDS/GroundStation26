@@ -4,12 +4,12 @@ use crate::comms_config::{
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
-use serialport::SerialPort;
 use sedsprintf_rs_2026::{
     TelemetryError, TelemetryResult,
     router::{Router, RouterSideId},
     serialize,
 };
+use serialport::SerialPort;
 use std::error::Error;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
@@ -21,15 +21,20 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::time::{Duration, Instant};
 use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 pub const ROCKET_COMMS_PORT: &str = "/dev/ttyUSB1";
 pub const UMBILICAL_COMMS_PORT: &str = "/dev/ttyUSB2";
 pub const COMMS_BAUD_RATE: usize = 57_600;
 pub const MAX_PACKET_SIZE: usize = 256;
+const STREAM_PACKET_MAX_SIZE: usize = 4_096;
 const RAW_UART_FRAME_SYNC_0: u8 = 0xA5;
 const RAW_UART_FRAME_SYNC_1: u8 = 0x5A;
+const RAW_UART_COMMAND_SYNC_0: u8 = 0xA6;
+const RAW_UART_COMMAND_SYNC_1: u8 = 0x5B;
+const RAW_UART_ASCII_SYNC_0: u8 = 0xA7;
+const RAW_UART_ASCII_SYNC_1: u8 = 0x7A;
 const RAW_UART_FRAME_HEADER_SIZE: usize = 4;
 const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
@@ -54,11 +59,15 @@ const I2C_KIND_IDLE: u8 = 0;
 #[cfg(target_os = "linux")]
 const I2C_KIND_DATA: u8 = 1;
 #[cfg(target_os = "linux")]
+const I2C_KIND_COMMAND: u8 = 2;
+#[cfg(target_os = "linux")]
 const I2C_KIND_ERROR: u8 = 127;
 #[cfg(target_os = "linux")]
 const I2C_FLAG_START: u8 = 0x01;
 #[cfg(target_os = "linux")]
 const I2C_FLAG_END: u8 = 0x02;
+#[cfg(target_os = "linux")]
+const I2C_PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[cfg(feature = "testing")]
 const DUMMY_ROCKET_TIMESYNC_SOURCES: &[&str] = &["RF", "FC", "PB"];
@@ -177,7 +186,7 @@ impl UartComms {
         Ok(Self {
             inner,
             side_id: None,
-            rx_buf: Vec::with_capacity(MAX_PACKET_SIZE * 2),
+            rx_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
             protocol: cfg.protocol.clone(),
             slow_start_deadline: Some(Instant::now() + UART_STARTUP_TIMEOUT),
         })
@@ -199,7 +208,12 @@ impl UartComms {
         let mut scratch = [0u8; 512];
         match self.inner.read(&mut scratch) {
             Ok(0) => {
-                maybe_log_raw_uart_read_outcome("read returned 0 bytes", self.rx_buf.len(), None, &self.protocol);
+                maybe_log_raw_uart_read_outcome(
+                    "read returned 0 bytes",
+                    self.rx_buf.len(),
+                    None,
+                    &self.protocol,
+                );
                 Ok(())
             }
             Ok(n) => {
@@ -275,7 +289,9 @@ impl UartComms {
             .windows(2)
             .enumerate()
             .skip(1)
-            .find_map(|(idx, pair)| (pair == [RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1]).then_some(idx))
+            .find_map(|(idx, pair)| {
+                (pair == [RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1]).then_some(idx)
+            })
             .map(|idx| payload[idx..].to_vec())
             .unwrap_or_default();
 
@@ -298,8 +314,9 @@ impl UartComms {
         let mut processed_any = false;
 
         loop {
-            let Some(payload) = self.try_take_packet()? else {
-                break;
+            let payload = match self.try_take_packet()? {
+                Some(payload) => payload,
+                None => break,
             };
             processed_any = true;
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
@@ -344,17 +361,48 @@ fn unix_now_ms() -> u64 {
 }
 
 fn build_raw_uart_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    build_link_frame(RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1, payload)
+}
+
+fn build_link_frame(
+    sync_0: u8,
+    sync_1: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
     let len = payload.len();
-    if len == 0 || len > MAX_PACKET_SIZE {
-        return Err(format!("packet too large to send over raw UART: {len} bytes").into());
+    if len == 0 || len > STREAM_PACKET_MAX_SIZE {
+        return Err(format!("packet too large to send over framed link: {len} bytes").into());
     }
 
     let mut framed = Vec::with_capacity(RAW_UART_FRAME_HEADER_SIZE + len);
-    framed.push(RAW_UART_FRAME_SYNC_0);
-    framed.push(RAW_UART_FRAME_SYNC_1);
+    framed.push(sync_0);
+    framed.push(sync_1);
     framed.extend_from_slice(&(len as u16).to_le_bytes());
     framed.extend_from_slice(payload);
     Ok(framed)
+}
+
+fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
+    if payload.len() < RAW_UART_FRAME_HEADER_SIZE {
+        return None;
+    }
+    let header = (payload[0], payload[1]);
+    if !matches!(
+        header,
+        (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1)
+            | (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1)
+            | (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1)
+    ) {
+        return None;
+    }
+    let len = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+    if payload.len() < RAW_UART_FRAME_HEADER_SIZE + len {
+        return None;
+    }
+    Some((
+        header,
+        &payload[RAW_UART_FRAME_HEADER_SIZE..RAW_UART_FRAME_HEADER_SIZE + len],
+    ))
 }
 
 fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<Vec<u8>>> {
@@ -367,9 +415,11 @@ fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<
         rx_buf.drain(..drop_len);
     }
 
-    let sync_pos = rx_buf
-        .windows(2)
-        .position(|pair| pair == [RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1]);
+    let sync_pos = rx_buf.windows(2).position(|pair| {
+        pair == [RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1]
+            || pair == [RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1]
+            || pair == [RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1]
+    });
     match sync_pos {
         Some(0) => {}
         Some(pos) => {
@@ -385,7 +435,10 @@ fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<
                     "raw UART waiting for frame sync",
                     &rx_buf[..rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
                 );
-                let keep = usize::from(rx_buf.last().copied() == Some(RAW_UART_FRAME_SYNC_0));
+                let keep = usize::from(matches!(
+                    rx_buf.last().copied(),
+                    Some(RAW_UART_FRAME_SYNC_0 | RAW_UART_COMMAND_SYNC_0 | RAW_UART_ASCII_SYNC_0)
+                ));
                 let drop_len = rx_buf.len().saturating_sub(keep);
                 if drop_len > 0 {
                     rx_buf.drain(..drop_len);
@@ -400,7 +453,16 @@ fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<
     }
 
     let frame_len = u16::from_le_bytes([rx_buf[2], rx_buf[3]]) as usize;
-    if frame_len == 0 || frame_len > MAX_PACKET_SIZE {
+    if frame_len == 0 {
+        maybe_log_raw_uart_parse_issue(
+            "ignoring empty raw UART frame",
+            &rx_buf[..RAW_UART_FRAME_HEADER_SIZE],
+        );
+        rx_buf.drain(..RAW_UART_FRAME_HEADER_SIZE);
+        return Ok(None);
+    }
+
+    if frame_len > STREAM_PACKET_MAX_SIZE {
         maybe_log_raw_uart_parse_issue(
             &format!("invalid raw UART frame length: {frame_len}"),
             &rx_buf[..rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
@@ -608,6 +670,7 @@ struct I2cRxAssembly {
     total_len: usize,
     next_offset: usize,
     payload: Vec<u8>,
+    started_at: Instant,
 }
 
 #[cfg(target_os = "linux")]
@@ -620,6 +683,9 @@ impl I2cRxAssembly {
             return Err(std::io::Error::other("i2c transfer start must have offset 0").into());
         }
         let total_len = slot.total_len as usize;
+        if total_len > STREAM_PACKET_MAX_SIZE {
+            return Err(std::io::Error::other("i2c transfer exceeds max packet size").into());
+        }
         if total_len < slot.data.len() {
             return Err(
                 std::io::Error::other("i2c transfer total length smaller than first slot").into(),
@@ -633,6 +699,7 @@ impl I2cRxAssembly {
             total_len,
             next_offset: slot.data.len(),
             payload,
+            started_at: Instant::now(),
         })
     }
 
@@ -709,9 +776,6 @@ fn decode_i2c_slot(
     let all_zero = raw.iter().all(|byte| *byte == 0x00);
     let all_ff = raw.iter().all(|byte| *byte == 0xFF);
     if all_zero || all_ff {
-        return Ok(None);
-    }
-    if raw[0] == 0x00 && raw[1] == 0x00 {
         return Ok(None);
     }
     if raw[0] != I2C_SLOT_MAGIC_0 || raw[1] != I2C_SLOT_MAGIC_1 {
@@ -861,7 +925,7 @@ impl I2cComms {
                 initial_wait: Duration::from_millis(cfg.initial_wait_ms),
                 tx_transfer_id: 1,
                 rx_assembly: None,
-                rx_payload_buf: Vec::with_capacity(MAX_PACKET_SIZE * 4),
+                rx_payload_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -898,6 +962,9 @@ impl I2cComms {
         payload: &[u8],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let total_len = payload.len();
+        if total_len > STREAM_PACKET_MAX_SIZE {
+            return Err(format!("packet too large to send over i2c: {total_len} bytes").into());
+        }
         let transfer_id = self.next_transfer_id();
         let mut offset = 0usize;
 
@@ -947,6 +1014,12 @@ impl I2cComms {
             return Ok(None);
         }
 
+        if self.rx_assembly.as_ref().is_some_and(|assembly| {
+            Instant::now().duration_since(assembly.started_at) >= I2C_PARTIAL_PACKET_TIMEOUT
+        }) {
+            self.rx_assembly = None;
+        }
+
         if slot.flags & I2C_FLAG_START != 0 {
             let assembly = I2cRxAssembly::new(&slot)?;
             if slot.flags & I2C_FLAG_END != 0 {
@@ -959,11 +1032,7 @@ impl I2cComms {
         let assembly = self
             .rx_assembly
             .as_mut()
-            .ok_or_else(|| std::io::Error::other("i2c slot arrived without an active transfer"));
-        let assembly = match assembly {
-            Ok(assembly) => assembly,
-            Err(_) => return Ok(None),
-        };
+            .ok_or_else(|| std::io::Error::other("i2c slot arrived without an active transfer"))?;
         let completed = match assembly.push(&slot) {
             Ok(completed) => completed,
             Err(err) => {
@@ -1062,12 +1131,37 @@ impl CommsDevice for I2cComms {
                                     if msg != "error invalid i2c slot" || i2c_debug_enabled() {
                                         eprintln!("i2c error packet: {msg}");
                                     }
+                                } else if kind == I2C_KIND_COMMAND {
+                                    eprintln!("i2c command packet ignored on telemetry path");
                                 } else {
                                     eprintln!("i2c non-data packet kind {kind} ignored");
                                 }
                                 continue;
                             }
-                            self.rx_payload_buf.extend_from_slice(&payload);
+                            let payload = match parse_link_frame(&payload) {
+                                Some(((RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1), body)) => {
+                                    body
+                                }
+                                Some((
+                                    (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1),
+                                    body,
+                                )) => {
+                                    eprintln!(
+                                        "i2c command response ignored on telemetry path: {}",
+                                        String::from_utf8_lossy(body)
+                                    );
+                                    continue;
+                                }
+                                Some(((RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1), body)) => {
+                                    eprintln!(
+                                        "i2c raw ascii response ignored on telemetry path: {}",
+                                        String::from_utf8_lossy(body)
+                                    );
+                                    continue;
+                                }
+                                _ => payload.as_slice(),
+                            };
+                            self.rx_payload_buf.extend_from_slice(payload);
                             while let Some(packet) = self.try_take_buffered_packet()? {
                                 match router.rx_serialized_queue_from_side(&packet, side_id) {
                                     Ok(()) => {}
@@ -1118,7 +1212,8 @@ impl CommsDevice for I2cComms {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(target_os = "linux")]
         {
-            self.write_payload(I2C_KIND_DATA, payload)
+            let framed = build_raw_uart_frame(payload)?;
+            self.write_payload(I2C_KIND_DATA, &framed)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1207,23 +1302,20 @@ impl CommsDevice for SpiComms {
 
         #[cfg(target_os = "linux")]
         {
-            let mut tx = vec![0u8; MAX_PACKET_SIZE + 2];
-            let mut rx = vec![0u8; MAX_PACKET_SIZE + 2];
+            let mut tx = vec![0u8; MAX_PACKET_SIZE + RAW_UART_FRAME_HEADER_SIZE];
+            let mut rx = vec![0u8; MAX_PACKET_SIZE + RAW_UART_FRAME_HEADER_SIZE];
             self.transfer(&tx, &mut rx)
                 .map_err(|_| TelemetryError::HandlerError("spi transfer failed"))?;
             tx.clear();
 
-            let frame_len = u16::from_le_bytes([rx[0], rx[1]]) as usize;
-            if frame_len == 0 {
+            let Some(((RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1), payload)) =
+                parse_link_frame(&rx)
+            else {
+                return Ok(());
+            };
+            if payload.is_empty() {
                 return Ok(());
             }
-            if frame_len > MAX_PACKET_SIZE {
-                return Err(TelemetryError::HandlerError(
-                    "invalid frame length from spi",
-                ));
-            }
-
-            let payload = &rx[2..2 + frame_len];
             return router.rx_serialized_queue_from_side(payload, side_id);
         }
         #[cfg(not(target_os = "linux"))]
@@ -1237,7 +1329,7 @@ impl CommsDevice for SpiComms {
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if payload.is_empty() || payload.len() > u16::MAX as usize {
+        if payload.is_empty() || payload.len() > MAX_PACKET_SIZE {
             return Err(
                 format!("packet too large to send over spi: {} bytes", payload.len()).into(),
             );
@@ -1245,9 +1337,7 @@ impl CommsDevice for SpiComms {
 
         #[cfg(target_os = "linux")]
         {
-            let mut tx = Vec::with_capacity(payload.len() + 2);
-            tx.extend_from_slice(&(payload.len() as u16).to_le_bytes());
-            tx.extend_from_slice(payload);
+            let tx = build_raw_uart_frame(payload)?;
             let mut rx = vec![0u8; tx.len()];
             self.transfer(&tx, &mut rx)?;
             Ok(())

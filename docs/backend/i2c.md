@@ -80,6 +80,9 @@ Receivers must reject a transfer if:
 - the received bytes exceed the declared total length
 - the transfer ends before the declared total length is reached
 
+Partial transfers are not kept forever. The Pico firmware drops any in-progress assembly that has not completed within
+`50 ms`, and the Ground Station host paths should match that timeout.
+
 ## Polling Model
 
 I2C slaves cannot push data. The master must read.
@@ -97,12 +100,13 @@ Idle reads are either:
 - all-`0xff` data
 
 Those must be treated as “no packet available yet”.
+Malformed non-idle headers are not idle and should be treated as protocol errors.
 
 ## Large Packet Support
 
 Packet size is no longer limited by the I2C transport itself.
 
-The total packet length field is `u32`, so the wire format can carry payloads up to `4 GiB - 1` bytes. In practice, the usable size depends on endpoint memory, queueing, and the application producing or consuming the packet.
+The total packet length field is `u32`, so the wire format can carry payloads up to `4 GiB - 1` bytes. In practice, the usable size depends on endpoint memory, queueing, and the application producing or consuming the packet. The current Pico firmware and Ground Station backend cap logical packets at `4096` bytes.
 
 The Ground Station Rust backend now streams outgoing packets across as many I2C slots as needed and reassembles incoming packets from as many slots as required.
 

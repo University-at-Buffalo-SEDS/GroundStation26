@@ -47,6 +47,10 @@ I2C_DEFAULT_ADDR = 0x55
 I2C_DEFAULT_CHUNK_DELAY_MS = 1
 I2C_DEFAULT_INITIAL_WAIT_MS = 10
 RAW_UART_MAX_FRAME_BYTES = 4096
+RAW_UART_DATA_HEADER = (0xA5, 0x5A)
+RAW_UART_COMMAND_HEADER = (0xA6, 0x5B)
+RAW_UART_ASCII_HEADER = (0xA7, 0x7A)
+RAW_UART_HEADER_SIZE = 4
 I2C_SLOT_SIZE = 32
 I2C_SLOT_HEADER_SIZE = 18
 I2C_SLOT_PAYLOAD_SIZE = I2C_SLOT_SIZE - I2C_SLOT_HEADER_SIZE
@@ -55,9 +59,11 @@ I2C_SLOT_MAGIC_1 = 0x32
 I2C_SLOT_VERSION = 1
 I2C_KIND_IDLE = 0
 I2C_KIND_DATA = 1
+I2C_KIND_COMMAND = 2
 I2C_KIND_ERROR = 127
 I2C_FLAG_START = 0x01
 I2C_FLAG_END = 0x02
+I2C_PARTIAL_PACKET_TIMEOUT_S = 0.050
 I2C_M_RD = 0x0001
 I2C_RDWR = 0x0707
 LIBC = ctypes.CDLL(None, use_errno=True)
@@ -139,6 +145,23 @@ def is_valid_serialized_frame(data: bytes) -> bool:
     except Exception:
         return False
     return int(pkt.wire_size()) == len(data)
+
+
+def build_link_frame(header: tuple[int, int], payload: bytes) -> bytes:
+    payload = payload[:RAW_UART_MAX_FRAME_BYTES]
+    return bytes([header[0], header[1]]) + len(payload).to_bytes(2, "little") + payload
+
+
+def parse_link_frame(data: bytes) -> tuple[tuple[int, int], bytes] | None:
+    if len(data) < RAW_UART_HEADER_SIZE:
+        return None
+    header = (data[0], data[1])
+    if header not in {RAW_UART_DATA_HEADER, RAW_UART_COMMAND_HEADER, RAW_UART_ASCII_HEADER}:
+        return None
+    frame_len = int.from_bytes(data[2:4], "little")
+    if len(data) < RAW_UART_HEADER_SIZE + frame_len:
+        return None
+    return header, data[RAW_UART_HEADER_SIZE: RAW_UART_HEADER_SIZE + frame_len]
 
 
 @dataclass(frozen=True)
@@ -351,6 +374,9 @@ class Transport:
     def read_serialized(self, timeout: float) -> bytes | None:
         raise NotImplementedError
 
+    def send_raw_ascii(self, text: str) -> None:
+        raise NotImplementedError
+
     def close(self) -> None:
         raise NotImplementedError
 
@@ -398,6 +424,8 @@ class SerialTransport(Transport):
         wire = payload
         if self.tx_protocol == "packet_framed":
             wire = len(payload).to_bytes(2, "little") + payload
+        elif self.tx_protocol == "raw_uart":
+            wire = build_link_frame(RAW_UART_DATA_HEADER, payload)
         self.ser.write(wire)
         self.ser.flush()
         self.tx_writes += 1
@@ -406,18 +434,29 @@ class SerialTransport(Transport):
         self.last_tx_hex = hex_preview(wire, limit=24)
 
     def _take_raw_uart_packet(self) -> bytes | None:
-        if self.rx_buf and is_valid_serialized_frame(bytes(self.rx_buf)):
-            payload = bytes(self.rx_buf)
-            self.rx_buf.clear()
+        scan_len = min(len(self.rx_buf), RAW_UART_MAX_FRAME_BYTES + RAW_UART_HEADER_SIZE)
+        sync_pos = None
+        for idx in range(max(0, scan_len - 1)):
+            if (self.rx_buf[idx], self.rx_buf[idx + 1]) in {
+                RAW_UART_DATA_HEADER,
+                RAW_UART_COMMAND_HEADER,
+                RAW_UART_ASCII_HEADER,
+            }:
+                sync_pos = idx
+                break
+        if sync_pos is None:
+            if len(self.rx_buf) > RAW_UART_MAX_FRAME_BYTES:
+                del self.rx_buf[: len(self.rx_buf) - RAW_UART_MAX_FRAME_BYTES]
+            return None
+        if sync_pos > 0:
+            del self.rx_buf[:sync_pos]
+        parsed = parse_link_frame(bytes(self.rx_buf))
+        if parsed is None:
+            return None
+        header, payload = parsed
+        del self.rx_buf[:RAW_UART_HEADER_SIZE + len(payload)]
+        if header == RAW_UART_DATA_HEADER:
             return payload
-        scan_len = min(len(self.rx_buf), RAW_UART_MAX_FRAME_BYTES)
-        for start in range(scan_len):
-            for end in range(start + 1, scan_len + 1):
-                candidate = bytes(self.rx_buf[start:end])
-                if not is_valid_serialized_frame(candidate):
-                    continue
-                del self.rx_buf[:end]
-                return candidate
         if len(self.rx_buf) > RAW_UART_MAX_FRAME_BYTES:
             del self.rx_buf[: len(self.rx_buf) - RAW_UART_MAX_FRAME_BYTES]
         return None
@@ -470,6 +509,16 @@ class SerialTransport(Transport):
 
     def close(self) -> None:
         self.ser.close()
+
+    def send_raw_ascii(self, text: str) -> None:
+        payload = text.encode("ascii", errors="replace")
+        wire = build_link_frame(RAW_UART_ASCII_HEADER, payload)
+        self.ser.write(wire)
+        self.ser.flush()
+        self.tx_writes += 1
+        self.tx_bytes += len(wire)
+        self.last_tx_ms = now_ms()
+        self.last_tx_hex = hex_preview(wire, limit=24)
 
     def activity_snapshot(self) -> dict[str, object]:
         return {
@@ -610,8 +659,6 @@ class I2cTransport(Transport):
             raise ValueError("invalid i2c slot size")
         if all(byte == 0x00 for byte in raw) or all(byte == 0xFF for byte in raw):
             return None
-        if raw[0] == 0x00 and raw[1] == 0x00:
-            return None
         if raw[0] != I2C_SLOT_MAGIC_0 or raw[1] != I2C_SLOT_MAGIC_1:
             raise ValueError("invalid i2c slot magic")
         if raw[2] != I2C_SLOT_VERSION:
@@ -632,6 +679,13 @@ class I2cTransport(Transport):
         )
 
     def _ingest_slot(self, slot: I2cSlot) -> tuple[int, bytes] | None:
+        if (
+                self.rx_assembly is not None
+                and (time.monotonic() - self.rx_assembly["started_at"]) >= I2C_PARTIAL_PACKET_TIMEOUT_S
+        ):
+            self.transfer_resets += 1
+            self.rx_assembly = None
+
         if slot.flags & I2C_FLAG_START:
             if slot.offset != 0:
                 self.transfer_resets += 1
@@ -648,6 +702,7 @@ class I2cTransport(Transport):
                 "total_len": slot.total_len,
                 "next_offset": len(slot.data),
                 "payload": bytearray(slot.data),
+                "started_at": time.monotonic(),
             }
             if slot.flags & I2C_FLAG_END:
                 payload = bytes(self.rx_assembly["payload"])
@@ -704,6 +759,7 @@ class I2cTransport(Transport):
         return None
 
     def send_serialized(self, payload: bytes) -> None:
+        payload = build_link_frame(RAW_UART_DATA_HEADER, payload)
         with self.io_lock:
             if self._tx_backoff_active():
                 return
@@ -778,8 +834,14 @@ class I2cTransport(Transport):
             kind, payload = assembled
             if kind == I2C_KIND_ERROR:
                 return None
-            if kind != I2C_KIND_DATA:
+            if kind not in {I2C_KIND_DATA, I2C_KIND_COMMAND}:
                 continue
+            parsed = parse_link_frame(payload)
+            if parsed is not None:
+                header, body = parsed
+                if header != RAW_UART_DATA_HEADER:
+                    continue
+                payload = body
             if is_valid_serialized_frame(payload):
                 return payload
             self.rx_payload_buf.extend(payload)
@@ -790,6 +852,9 @@ class I2cTransport(Transport):
 
     def close(self) -> None:
         os.close(self.fd)
+
+    def send_raw_ascii(self, text: str) -> None:
+        raise RuntimeError("raw ASCII bypass is only available on UART links")
 
     def activity_snapshot(self) -> dict[str, object]:
         return {
@@ -914,6 +979,12 @@ class FillLinkApp:
                 f"{spec.label} -> id={spec.command_id} ep={spec.endpoint} raw={hex_preview(wire, limit=32)}"
             )
             self.status = f"Sent {spec.label}"
+
+    def send_raw_ascii(self, text: str) -> None:
+        self.transport.send_raw_ascii(text)
+        with self.lock:
+            self.sent_log.appendleft(f"raw ascii -> {text[:48]}")
+            self.status = "Sent raw ASCII"
 
     def clear_packets(self) -> None:
         with self.lock:
@@ -1108,7 +1179,7 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
                 break
             stdscr.addnstr(status_row, 2, line, w - 4)
             status_row += 1
-        stdscr.addnstr(h - 1, 2, "q quit | c clear | Enter send", w - 4)
+        stdscr.addnstr(h - 1, 2, "q quit | c clear | a raw ASCII | Enter send", w - 4)
         stdscr.refresh()
 
         key = stdscr.getch()
@@ -1119,6 +1190,25 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
             return
         if key in {ord("c"), ord("C")}:
             app.clear_packets()
+            continue
+        if key in {ord("a"), ord("A")}:
+            curses.echo()
+            curses.curs_set(1)
+            prompt = "Raw ASCII: "
+            stdscr.addnstr(h - 1, 2, " " * (w - 4), w - 4)
+            stdscr.addnstr(h - 1, 2, prompt, w - 4)
+            try:
+                raw = stdscr.getstr(h - 1, 2 + len(prompt), max(1, w - 4 - len(prompt)))
+                text = raw.decode("ascii", errors="replace")
+                if text:
+                    app.send_raw_ascii(text)
+            except Exception as err:
+                with app.lock:
+                    app.error = str(err)
+                    app.status = "Raw ASCII TX error"
+            finally:
+                curses.noecho()
+                curses.curs_set(0)
             continue
         if key in {curses.KEY_UP, ord("k")}:
             app.move_command(-1)

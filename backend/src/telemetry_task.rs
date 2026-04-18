@@ -77,18 +77,19 @@ fn spawn_comms_worker_threads(
                             payload.len(),
                             tx_payload_preview(&payload)
                         );
-                        match tx_comms.lock().expect("failed to get lock").send_data(&payload) {
-                        Ok(()) => {
-                            eprintln!(
-                                "{} tx worker sent {} bytes",
-                                worker_name,
-                                payload.len()
-                            );
+                        match tx_comms
+                            .lock()
+                            .expect("failed to get lock")
+                            .send_data(&payload)
+                        {
+                            Ok(()) => {
+                                eprintln!("{} tx worker sent {} bytes", worker_name, payload.len());
+                            }
+                            Err(e) => {
+                                eprintln!("{worker_name} tx worker send_data failed: {e}");
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("{worker_name} tx worker send_data failed: {e}");
-                        }
-                    }},
+                    }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                         thread::sleep(Duration::from_millis(2));
                     }
@@ -110,7 +111,10 @@ fn spawn_comms_worker_threads(
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
                 }
 
-                match rx_comms.lock().expect("failed to get lock").recv_packet(&router)
+                match rx_comms
+                    .lock()
+                    .expect("failed to get lock")
+                    .recv_packet(&router)
                 {
                     Ok(_) => {}
                     Err(e) => {
