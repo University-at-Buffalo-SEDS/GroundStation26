@@ -909,7 +909,9 @@ class FillLinkApp:
         wire = bytes(packet.serialize())
         self.transport.send_serialized(wire)
         with self.lock:
-            self.sent_log.appendleft(f"{spec.label} -> id={spec.command_id} ep={spec.endpoint}")
+            self.sent_log.appendleft(
+                f"{spec.label} -> id={spec.command_id} ep={spec.endpoint} raw={hex_preview(wire, limit=32)}"
+            )
             self.status = f"Sent {spec.label}"
 
     def clear_packets(self) -> None:
