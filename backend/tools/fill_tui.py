@@ -907,6 +907,7 @@ class FillLinkApp:
             payload=bytes([spec.command_id]),
         )
         wire = bytes(packet.serialize())
+        print(f"[fill_tui tx] {spec.label}: {hex_preview(wire, limit=64)}", file=sys.stderr)
         self.transport.send_serialized(wire)
         with self.lock:
             self.sent_log.appendleft(
