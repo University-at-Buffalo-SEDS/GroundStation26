@@ -22,6 +22,7 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, interval};
@@ -30,6 +31,61 @@ pub struct CommsWorkerHandle {
     pub name: &'static str,
     pub comms: Arc<Mutex<Box<dyn CommsDevice>>>,
     pub tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+fn spawn_comms_worker_thread(
+    router: Arc<Router>,
+    state: Arc<AppState>,
+    mut comms_handle: CommsWorkerHandle,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name(format!("{}_worker", comms_handle.name))
+        .spawn(move || {
+            let mut comms_shutdown_rx = state.shutdown_subscribe();
+            loop {
+                match comms_shutdown_rx.try_recv() {
+                    Ok(_)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                }
+
+                loop {
+                    match comms_handle.tx_rx.try_recv() {
+                        Ok(payload) => match comms_handle
+                            .comms
+                            .lock()
+                            .expect("failed to get lock")
+                            .send_data(&payload)
+                        {
+                            Ok(()) => {}
+                            Err(e) => {
+                                eprintln!("{} worker send_data failed: {e}", comms_handle.name);
+                            }
+                        },
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+                    }
+                }
+
+                match comms_handle
+                    .comms
+                    .lock()
+                    .expect("failed to get lock")
+                    .recv_packet(&router)
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        log_telemetry_error(
+                            &format!("{} worker recv_packet failed", comms_handle.name),
+                            e,
+                        );
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(2));
+            }
+        })
 }
 
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
@@ -1205,58 +1261,16 @@ pub async fn telemetry_task(
 
     let comms_workers: Vec<_> = comms
         .into_iter()
-        .map(|mut comms_handle| {
+        .filter_map(|comms_handle| {
             let router = router.clone();
-            let mut comms_shutdown_rx = state.shutdown_subscribe();
-            tokio::spawn(async move {
-                let mut comms_interval = interval(Duration::from_millis(2));
-                comms_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        biased;
-
-                        maybe_payload = comms_handle.tx_rx.recv() => {
-                            let Some(payload) = maybe_payload else {
-                                break;
-                            };
-                            match comms_handle
-                                .comms
-                                .lock()
-                                .expect("failed to get lock")
-                                .send_data(&payload)
-                            {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    eprintln!("{} worker send_data failed: {e}", comms_handle.name);
-                                }
-                            }
-                        }
-                        _ = comms_interval.tick() => {
-                            match comms_handle
-                                .comms
-                                .lock()
-                                .expect("failed to get lock")
-                                .recv_packet(&router)
-                            {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    log_telemetry_error(
-                                        &format!("{} worker recv_packet failed", comms_handle.name),
-                                        e,
-                                    );
-                                }
-                            }
-                        }
-                        recv = comms_shutdown_rx.recv() => {
-                            match recv {
-                                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
-                                    break;
-                                }
-                            }
-                        }
-                    }
+            let state = state.clone();
+            match spawn_comms_worker_thread(router, state, comms_handle) {
+                Ok(handle) => Some(handle),
+                Err(err) => {
+                    eprintln!("Failed to spawn comms worker thread: {err}");
+                    None
                 }
-            })
+            }
         })
         .collect();
 
@@ -1615,9 +1629,15 @@ pub async fn telemetry_task(
     let worker_shutdown_timeout = Duration::from_secs(10);
 
     for worker in comms_workers {
-        match tokio::time::timeout(worker_shutdown_timeout, worker).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("Comms worker ended with error: {e}"),
+        match tokio::time::timeout(
+            worker_shutdown_timeout,
+            tokio::task::spawn_blocking(move || worker.join()),
+        )
+        .await
+        {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(_))) => eprintln!("Comms worker panicked during shutdown"),
+            Ok(Err(e)) => eprintln!("Comms worker join task failed: {e}"),
             Err(_) => eprintln!(
                 "Comms worker did not shut down within {:?}",
                 worker_shutdown_timeout
@@ -2162,7 +2182,10 @@ fn payload_json_from_pkt(pkt: &Packet) -> String {
 }
 
 pub fn timesync_enabled() -> bool {
-    std::env::var("GROUNDSTATION_TIMESYNC").ok().as_deref() == Some("1")
+    if cfg!(feature = "testing") {
+        return std::env::var("GROUNDSTATION_TIMESYNC").ok().as_deref() == Some("1");
+    }
+    true
 }
 
 #[cfg(test)]
@@ -2176,16 +2199,16 @@ mod tests {
     }
 
     #[test]
-    fn timesync_defaults_off() {
+    fn timesync_defaults_on_without_testing_feature() {
         let _guard = timesync_env_lock().lock().unwrap();
         unsafe {
             std::env::remove_var("GROUNDSTATION_TIMESYNC");
         }
-        assert!(!timesync_enabled());
+        assert!(timesync_enabled());
     }
 
     #[test]
-    fn timesync_can_be_enabled_via_env() {
+    fn timesync_env_can_still_enable_it() {
         let _guard = timesync_env_lock().lock().unwrap();
         unsafe {
             std::env::set_var("GROUNDSTATION_TIMESYNC", "1");

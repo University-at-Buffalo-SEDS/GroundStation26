@@ -3,7 +3,7 @@
   "av_bay": {
     "interface": "serial",
     "port": "/dev/ttyUSB0",
-    "baud_rate": 57600,
+    "baud_rate": 9600,
     "protocol": "raw_uart"
   },
   "fill_box": {
