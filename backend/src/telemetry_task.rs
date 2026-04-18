@@ -101,6 +101,38 @@ fn spawn_comms_worker_threads(
     Ok(vec![tx_worker, rx_worker])
 }
 
+fn spawn_router_worker_thread(
+    router: Arc<Router>,
+    state: Arc<AppState>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("router_worker".to_string())
+        .spawn(move || {
+            let mut shutdown_rx = state.shutdown_subscribe();
+            loop {
+                match shutdown_rx.try_recv() {
+                    Ok(_)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                }
+
+                if let Err(e) = router.poll_discovery() {
+                    log_telemetry_error("router discovery polling failed", e);
+                }
+                if timesync_enabled() {
+                    let _ = router.poll_timesync();
+                }
+                if let Err(e) = process_router_queues(&router) {
+                    log_telemetry_error("router queue processing failed", e);
+                }
+                state.mark_discovered_relays_seen();
+
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+}
+
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
 const BACKPRESSURE_LOG_INTERVAL_MS: u64 = 10_000;
@@ -1031,13 +1063,9 @@ pub async fn telemetry_task(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     let mut handle_interval = interval(Duration::from_millis(1));
-    let mut router_interval = interval(Duration::from_millis(10));
     let mut heartbeat_interval = interval(Duration::from_millis(500));
-    let mut timesync_interval = interval(Duration::from_millis(100));
     handle_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    router_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    timesync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_failed = false;
     let mut last_backpressure_log_ms: u64 = 0;
     let packet_work_queue_size = env_usize(
@@ -1270,6 +1298,14 @@ pub async fn telemetry_task(
                 }
             }
         })
+    };
+
+    let router_worker = match spawn_router_worker_thread(router.clone(), state.clone()) {
+        Ok(worker) => Some(worker),
+        Err(err) => {
+            eprintln!("Failed to spawn router worker thread: {err}");
+            None
+        }
     };
 
     let comms_workers: Vec<_> = comms
@@ -1564,15 +1600,6 @@ pub async fn telemetry_task(
                         }
                     }
                 }
-                _= router_interval.tick() => {
-                    if let Err(e) = router.poll_discovery() {
-                        log_telemetry_error("router discovery polling failed", e);
-                    }
-                    if let Err(e) = process_router_queues(&router) {
-                        log_telemetry_error("router queue processing failed", e);
-                    }
-                    state.mark_discovered_relays_seen();
-                }
                 _ = heartbeat_interval.tick() => {
                     if router.log_queue::<u8>(DataType::Heartbeat, &[]).is_ok() {
                         state.mark_board_seen(
@@ -1624,11 +1651,6 @@ pub async fn telemetry_task(
                         }
                     }
                 }
-                _ = timesync_interval.tick() => {
-                    if timesync_enabled() {
-                        let _ = router.poll_timesync();
-                    }
-                }
                 recv = shutdown_rx.recv() => {
                     match recv {
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
@@ -1653,6 +1675,23 @@ pub async fn telemetry_task(
             Ok(Err(e)) => eprintln!("Comms worker join task failed: {e}"),
             Err(_) => eprintln!(
                 "Comms worker did not shut down within {:?}",
+                worker_shutdown_timeout
+            ),
+        }
+    }
+
+    if let Some(worker) = router_worker {
+        match tokio::time::timeout(
+            worker_shutdown_timeout,
+            tokio::task::spawn_blocking(move || worker.join()),
+        )
+        .await
+        {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(_))) => eprintln!("Router worker panicked during shutdown"),
+            Ok(Err(e)) => eprintln!("Router worker join task failed: {e}"),
+            Err(_) => eprintln!(
+                "Router worker did not shut down within {:?}",
                 worker_shutdown_timeout
             ),
         }
