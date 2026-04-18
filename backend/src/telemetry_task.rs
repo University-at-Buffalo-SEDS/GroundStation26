@@ -39,7 +39,8 @@ fn spawn_comms_worker_threads(
     mut comms_handle: CommsWorkerHandle,
 ) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
     let worker_name = comms_handle.name;
-    let tx_comms = comms_handle.comms.clone();
+    let shared_comms = comms_handle.comms.clone();
+    let tx_comms = shared_comms.clone();
     let tx_state = state.clone();
     let tx_worker = thread::Builder::new()
         .name(format!("{}_tx_worker", worker_name))
@@ -69,7 +70,7 @@ fn spawn_comms_worker_threads(
             }
         })?;
 
-    let rx_comms = tx_comms.clone();
+    let rx_comms = shared_comms;
     let rx_worker = thread::Builder::new()
         .name(format!("{}_rx_worker", worker_name))
         .spawn(move || {
