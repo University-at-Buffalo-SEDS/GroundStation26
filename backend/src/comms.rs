@@ -492,9 +492,10 @@ fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<
         return Ok(None);
     }
 
+    let is_data_frame = rx_buf[0] == RAW_UART_FRAME_SYNC_0 && rx_buf[1] == RAW_UART_FRAME_SYNC_1;
     let payload = rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len].to_vec();
     rx_buf.drain(..total_len);
-    Ok(Some(payload))
+    Ok(is_data_frame.then_some(payload))
 }
 
 fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
