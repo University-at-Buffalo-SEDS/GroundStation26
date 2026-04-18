@@ -1813,7 +1813,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             println!("Ignored duplicate websocket command {:?}", cmd.cmd);
                             continue;
                         }
-                        if let Err(e) = cmd_tx.send(cmd.cmd).await {
+                        let received_cmd = cmd.cmd;
+                        println!(
+                            "\x1b[32mWebsocket command received: {:?}\x1b[0m",
+                            received_cmd
+                        );
+                        if let Err(e) = cmd_tx.send(received_cmd).await {
                             println!("Failed to forward WS command to cmd_tx: {e}");
                         }
                     }
