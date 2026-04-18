@@ -22,6 +22,7 @@ use std::mem::size_of;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::time::Duration;
+use std::time::SystemTime;
 
 pub const ROCKET_COMMS_PORT: &str = "/dev/ttyUSB1";
 pub const UMBILICAL_COMMS_PORT: &str = "/dev/ttyUSB2";
@@ -243,6 +244,13 @@ fn raw_uart_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("GS_RAW_UART_DEBUG").ok().as_deref() == Some("1"))
 }
 
+fn unix_now_ms() -> u64 {
+    match SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => 0,
+    }
+}
+
 fn build_raw_uart_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
     let len = payload.len();
     if len == 0 || len > MAX_PACKET_SIZE {
@@ -341,10 +349,7 @@ fn maybe_log_raw_uart_parse_issue(context: &str, bytes: &[u8]) {
         return;
     }
     static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_millis() as u64,
-        Err(_) => 0,
-    };
+    let now_ms = unix_now_ms();
     let last = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
     if now_ms.saturating_sub(last) < 500 {
         return;
@@ -354,6 +359,35 @@ fn maybe_log_raw_uart_parse_issue(context: &str, bytes: &[u8]) {
         "{context}; buffered {} bytes: {}",
         bytes.len(),
         hex_preview(bytes, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn maybe_log_raw_uart_router_error(payload: &[u8], err: &TelemetryError) {
+    if !raw_uart_debug_enabled() {
+        return;
+    }
+    eprintln!(
+        "raw_uart router rejected {} bytes: {err}; payload: {}",
+        payload.len(),
+        hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn maybe_log_raw_uart_buffer_state(rx_buf: &[u8], context: &str, protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = unix_now_ms();
+    let last = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 1_000 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "raw_uart {context}: buffered={} preview={}",
+        rx_buf.len(),
+        hex_preview(rx_buf, RAW_UART_DEBUG_PREVIEW_BYTES)
     );
 }
 
@@ -616,7 +650,13 @@ impl CommsDevice for UartComms {
         }
         if let Some(payload) = self.try_take_packet()? {
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
-            return router.rx_serialized_queue_from_side(&payload, side_id);
+            return match router.rx_serialized_queue_from_side(&payload, side_id) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    maybe_log_raw_uart_router_error(&payload, &err);
+                    Err(err)
+                }
+            };
         }
 
         if let Err(err) = self.fill_rx_buf() {
@@ -625,8 +665,16 @@ impl CommsDevice for UartComms {
 
         if let Some(payload) = self.try_take_packet()? {
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
-            return router.rx_serialized_queue_from_side(&payload, side_id);
+            return match router.rx_serialized_queue_from_side(&payload, side_id) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    maybe_log_raw_uart_router_error(&payload, &err);
+                    Err(err)
+                }
+            };
         }
+
+        maybe_log_raw_uart_buffer_state(&self.rx_buf, "waiting for complete frame", &self.protocol);
 
         Ok(())
     }

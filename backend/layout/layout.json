@@ -1578,11 +1578,6 @@
                     "label": "Barometer"
                   },
                   {
-                    "data_type": "GPS_DATA",
-                    "index": 2,
-                    "label": "GPS"
-                  },
-                  {
                     "data_type": "KALMAN_FILTER_DATA",
                     "index": 0,
                     "label": "Kalman"
