@@ -45,8 +45,6 @@ const I2C_FRAME_PAYLOAD_MAX_BYTES: usize = I2C_PACKET_MAX_BYTES - RAW_UART_FRAME
 const UART_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const UART_NORMAL_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
-const I2C_DEBUG_PREVIEW_BYTES: usize = 48;
-#[cfg(target_os = "linux")]
 const I2C_SLOT_SIZE: usize = 32;
 #[cfg(target_os = "linux")]
 const I2C_SLOT_HEADER_SIZE: usize = 18;
@@ -62,10 +60,6 @@ const I2C_SLOT_VERSION: u8 = 1;
 const I2C_KIND_IDLE: u8 = 0;
 #[cfg(target_os = "linux")]
 const I2C_KIND_DATA: u8 = 1;
-#[cfg(target_os = "linux")]
-const I2C_KIND_COMMAND: u8 = 2;
-#[cfg(target_os = "linux")]
-const I2C_KIND_ERROR: u8 = 127;
 #[cfg(target_os = "linux")]
 const I2C_FLAG_START: u8 = 0x01;
 #[cfg(target_os = "linux")]
@@ -498,15 +492,14 @@ fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<
         return Ok(None);
     }
 
+    if rx_buf[0] != RAW_UART_FRAME_SYNC_0 || rx_buf[1] != RAW_UART_FRAME_SYNC_1 {
+        rx_buf.drain(..total_len);
+        return Ok(None);
+    }
+
     let payload = rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len].to_vec();
     rx_buf.drain(..total_len);
     Ok(Some(payload))
-}
-
-#[cfg(target_os = "linux")]
-fn i2c_debug_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("GS_I2C_DEBUG").ok().as_deref() == Some("1"))
 }
 
 fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
@@ -627,50 +620,6 @@ fn maybe_log_raw_uart_router_queue_after(payload: &[u8], protocol: &SerialProtoc
         return;
     }
     eprintln!("raw_uart router accepted {} bytes", payload.len());
-}
-
-#[cfg(target_os = "linux")]
-fn maybe_log_i2c_frame(context: &str, bytes: &[u8]) {
-    if !i2c_debug_enabled() {
-        return;
-    }
-    eprintln!(
-        "{context}: {} bytes: {}",
-        bytes.len(),
-        hex_preview(bytes, I2C_DEBUG_PREVIEW_BYTES)
-    );
-}
-
-#[cfg(target_os = "linux")]
-fn maybe_log_i2c_decoded(payload: &[u8]) {
-    if !i2c_debug_enabled() {
-        return;
-    }
-    match serialize::peek_frame_info(payload) {
-        Ok(_) => {
-            eprintln!(
-                "i2c decoded {} bytes: {}",
-                payload.len(),
-                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-            );
-        }
-        Err(_) => {
-            eprintln!(
-                "i2c decoded {} bytes but payload is not a valid serialized packet: {}",
-                payload.len(),
-                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-            );
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn log_i2c_router_decode_error(context: &str, payload: &[u8], err: &dyn Error) {
-    eprintln!(
-        "i2c router decode error ({context}): bytes={} err={err} data={}",
-        payload.len(),
-        hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-    );
 }
 
 #[cfg(target_os = "linux")]
@@ -961,10 +910,7 @@ impl I2cComms {
     fn read_slot(&mut self) -> Result<Option<I2cMailboxSlot>, Box<dyn Error + Send + Sync>> {
         let mut raw = [0u8; I2C_SLOT_SIZE];
         match self.transfer_read(&mut raw) {
-            Ok(()) => {
-                maybe_log_i2c_frame("i2c rx slot", &raw);
-                decode_i2c_slot(&raw)
-            }
+            Ok(()) => decode_i2c_slot(&raw),
             Err(err) if is_i2c_idle_read_error(err.as_ref()) => Ok(None),
             Err(err) => Err(err),
         }
@@ -992,7 +938,6 @@ impl I2cComms {
 
         if total_len == 0 {
             let slot = encode_i2c_slot(kind, I2C_FLAG_START | I2C_FLAG_END, transfer_id, 0, 0, &[]);
-            maybe_log_i2c_frame("i2c tx slot", &slot);
             self.transfer_write(&slot)?;
             return Ok(());
         }
@@ -1014,7 +959,6 @@ impl I2cComms {
                 total_len as u32,
                 &payload[offset..end],
             );
-            maybe_log_i2c_frame("i2c tx slot", &slot);
             self.transfer_write(&slot)?;
             offset = end;
             if offset < total_len {
@@ -1141,45 +1085,18 @@ impl CommsDevice for I2cComms {
                         let assembled = match self.ingest_rx_slot(slot) {
                             Ok(assembled) => assembled,
                             Err(err) => {
-                                eprintln!("i2c receive failed: {err}");
+                                let _ = err;
                                 continue;
                             }
                         };
                         if let Some((kind, payload)) = assembled {
-                            maybe_log_i2c_decoded(&payload);
                             if kind != I2C_KIND_DATA {
-                                if kind == I2C_KIND_ERROR {
-                                    let msg = String::from_utf8_lossy(&payload);
-                                    if msg != "error invalid i2c slot" || i2c_debug_enabled() {
-                                        eprintln!("i2c error packet: {msg}");
-                                    }
-                                } else if kind == I2C_KIND_COMMAND {
-                                    eprintln!("i2c command packet ignored on telemetry path");
-                                } else {
-                                    eprintln!("i2c non-data packet kind {kind} ignored");
-                                }
                                 continue;
                             }
                             let Some((header, payload)) = parse_link_frame(&payload) else {
-                                log_i2c_router_decode_error(
-                                    "data packet missing Pico link frame header",
-                                    &payload,
-                                    &std::io::Error::other("missing link frame header"),
-                                );
                                 continue;
                             };
                             if header != (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1) {
-                                if header == (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1) {
-                                    eprintln!(
-                                        "i2c command response ignored on telemetry path: {}",
-                                        String::from_utf8_lossy(payload)
-                                    );
-                                } else if header == (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1) {
-                                    eprintln!(
-                                        "i2c raw ascii response ignored on telemetry path: {}",
-                                        String::from_utf8_lossy(payload)
-                                    );
-                                }
                                 continue;
                             }
                             self.rx_payload_buf.extend_from_slice(payload);
@@ -1187,12 +1104,7 @@ impl CommsDevice for I2cComms {
                                 match router.rx_serialized_queue_from_side(&packet, side_id) {
                                     Ok(()) => {}
                                     Err(err) => {
-                                        log_i2c_router_decode_error(
-                                            "router rejected serialized packet",
-                                            &packet,
-                                            &err,
-                                        );
-                                        eprintln!("i2c router reject: {err}");
+                                        let _ = err;
                                         continue;
                                     }
                                 }
@@ -1201,11 +1113,7 @@ impl CommsDevice for I2cComms {
                                 match serialize::peek_frame_info(&self.rx_payload_buf) {
                                     Ok(_) => {}
                                     Err(err) => {
-                                        log_i2c_router_decode_error(
-                                            "buffered payload did not form a serialized packet",
-                                            &self.rx_payload_buf,
-                                            &err,
-                                        );
+                                        let _ = err;
                                     }
                                 }
                             }
@@ -1213,7 +1121,7 @@ impl CommsDevice for I2cComms {
                     }
                     Ok(None) => continue,
                     Err(err) => {
-                        eprintln!("i2c receive failed: {err}");
+                        let _ = err;
                         continue;
                     }
                 }
