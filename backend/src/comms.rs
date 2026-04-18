@@ -182,14 +182,34 @@ impl UartComms {
     fn fill_rx_buf(&mut self) -> std::io::Result<()> {
         let mut scratch = [0u8; 512];
         match self.inner.read(&mut scratch) {
-            Ok(0) => Ok(()),
+            Ok(0) => {
+                maybe_log_raw_uart_read_outcome("read returned 0 bytes", self.rx_buf.len(), None, &self.protocol);
+                Ok(())
+            }
             Ok(n) => {
+                maybe_log_raw_uart_read_outcome(
+                    "read returned bytes",
+                    self.rx_buf.len(),
+                    Some(n),
+                    &self.protocol,
+                );
                 self.rx_buf.extend_from_slice(&scratch[..n]);
                 maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
                 Ok(())
             }
-            Err(err) if is_idle_serial_timeout(&err) => Ok(()),
-            Err(err) => Err(err),
+            Err(err) if is_idle_serial_timeout(&err) => {
+                maybe_log_raw_uart_read_outcome(
+                    "read timeout/wouldblock",
+                    self.rx_buf.len(),
+                    None,
+                    &self.protocol,
+                );
+                Ok(())
+            }
+            Err(err) => {
+                maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
+                Err(err)
+            }
         }
     }
 
@@ -338,6 +358,39 @@ fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
         bytes.len(),
         hex_preview(bytes, RAW_UART_DEBUG_PREVIEW_BYTES)
     );
+}
+
+fn maybe_log_raw_uart_read_outcome(
+    context: &str,
+    buffered_len: usize,
+    read_len: Option<usize>,
+    protocol: &SerialProtocol,
+) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = unix_now_ms();
+    let last = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 200 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    match read_len {
+        Some(n) => eprintln!("{context}: n={n} buffered={buffered_len}"),
+        None => eprintln!("{context}: buffered={buffered_len}"),
+    }
+}
+
+fn maybe_log_raw_uart_read_error(
+    err: &std::io::Error,
+    buffered_len: usize,
+    protocol: &SerialProtocol,
+) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    eprintln!("raw_uart read error: {err}; buffered={buffered_len}");
 }
 
 fn maybe_log_raw_uart_parse_issue(context: &str, bytes: &[u8]) {
