@@ -33,13 +33,45 @@ pub struct CommsWorkerHandle {
     pub tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
-fn spawn_comms_worker_thread(
+fn spawn_comms_worker_threads(
     router: Arc<Router>,
     state: Arc<AppState>,
     mut comms_handle: CommsWorkerHandle,
-) -> std::io::Result<thread::JoinHandle<()>> {
-    thread::Builder::new()
-        .name(format!("{}_worker", comms_handle.name))
+) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
+    let worker_name = comms_handle.name;
+    let tx_comms = comms_handle.comms.clone();
+    let tx_state = state.clone();
+    let tx_worker = thread::Builder::new()
+        .name(format!("{}_tx_worker", worker_name))
+        .spawn(move || {
+            let mut comms_shutdown_rx = tx_state.shutdown_subscribe();
+            loop {
+                match comms_shutdown_rx.try_recv() {
+                    Ok(_)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                }
+
+                match comms_handle.tx_rx.try_recv() {
+                    Ok(payload) => match tx_comms.lock().expect("failed to get lock").send_data(&payload)
+                    {
+                        Ok(()) => {}
+                        Err(e) => {
+                            eprintln!("{worker_name} tx worker send_data failed: {e}");
+                        }
+                    },
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+                }
+            }
+        })?;
+
+    let rx_comms = tx_comms.clone();
+    let rx_worker = thread::Builder::new()
+        .name(format!("{}_rx_worker", worker_name))
         .spawn(move || {
             let mut comms_shutdown_rx = state.shutdown_subscribe();
             loop {
@@ -50,34 +82,12 @@ fn spawn_comms_worker_thread(
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
                 }
 
-                loop {
-                    match comms_handle.tx_rx.try_recv() {
-                        Ok(payload) => match comms_handle
-                            .comms
-                            .lock()
-                            .expect("failed to get lock")
-                            .send_data(&payload)
-                        {
-                            Ok(()) => {}
-                            Err(e) => {
-                                eprintln!("{} worker send_data failed: {e}", comms_handle.name);
-                            }
-                        },
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
-                    }
-                }
-
-                match comms_handle
-                    .comms
-                    .lock()
-                    .expect("failed to get lock")
-                    .recv_packet(&router)
+                match rx_comms.lock().expect("failed to get lock").recv_packet(&router)
                 {
                     Ok(_) => {}
                     Err(e) => {
                         log_telemetry_error(
-                            &format!("{} worker recv_packet failed", comms_handle.name),
+                            &format!("{worker_name} rx worker recv_packet failed"),
                             e,
                         );
                     }
@@ -85,7 +95,9 @@ fn spawn_comms_worker_thread(
 
                 thread::sleep(Duration::from_millis(2));
             }
-        })
+        })?;
+
+    Ok(vec![tx_worker, rx_worker])
 }
 
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
@@ -1261,14 +1273,14 @@ pub async fn telemetry_task(
 
     let comms_workers: Vec<_> = comms
         .into_iter()
-        .filter_map(|comms_handle| {
+        .flat_map(|comms_handle| {
             let router = router.clone();
             let state = state.clone();
-            match spawn_comms_worker_thread(router, state, comms_handle) {
-                Ok(handle) => Some(handle),
+            match spawn_comms_worker_threads(router, state, comms_handle) {
+                Ok(handles) => handles,
                 Err(err) => {
                     eprintln!("Failed to spawn comms worker thread: {err}");
-                    None
+                    Vec::new()
                 }
             }
         })
