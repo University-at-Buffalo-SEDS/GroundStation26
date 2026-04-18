@@ -403,15 +403,20 @@ fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
     if payload.len() < RAW_UART_FRAME_HEADER_SIZE {
         return None;
     }
-    let header = (payload[0], payload[1]);
-    if !matches!(
-        header,
+    let header = match (payload[0], payload[1]) {
         (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1)
-            | (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1)
-            | (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1)
-    ) {
-        return None;
-    }
+        | (RAW_UART_FRAME_SYNC_1, RAW_UART_FRAME_SYNC_0) => {
+            (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1)
+        }
+        (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1)
+        | (RAW_UART_COMMAND_SYNC_1, RAW_UART_COMMAND_SYNC_0) => {
+            (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1)
+        }
+        (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1) => {
+            (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1)
+        }
+        _ => return None,
+    };
     let len = u16::from_le_bytes([payload[2], payload[3]]) as usize;
     if payload.len() < RAW_UART_FRAME_HEADER_SIZE + len {
         return None;

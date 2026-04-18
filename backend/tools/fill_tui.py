@@ -162,8 +162,14 @@ def build_link_frame(
 def parse_link_frame(data: bytes) -> tuple[tuple[int, int], bytes] | None:
     if len(data) < RAW_UART_HEADER_SIZE:
         return None
-    header = (data[0], data[1])
-    if header not in {RAW_UART_DATA_HEADER, RAW_UART_COMMAND_HEADER, RAW_UART_ASCII_HEADER}:
+    raw_header = (data[0], data[1])
+    if raw_header in {RAW_UART_DATA_HEADER, tuple(reversed(RAW_UART_DATA_HEADER))}:
+        header = RAW_UART_DATA_HEADER
+    elif raw_header in {RAW_UART_COMMAND_HEADER, tuple(reversed(RAW_UART_COMMAND_HEADER))}:
+        header = RAW_UART_COMMAND_HEADER
+    elif raw_header == RAW_UART_ASCII_HEADER:
+        header = RAW_UART_ASCII_HEADER
+    else:
         return None
     frame_len = int.from_bytes(data[2:4], "little")
     if len(data) < RAW_UART_HEADER_SIZE + frame_len:
