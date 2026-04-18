@@ -265,6 +265,11 @@ impl UartComms {
             SerialProtocol::RawUart => self.try_take_raw_uart_packet(),
         }
     }
+
+    fn handle_raw_uart_router_reject(&mut self, payload: &[u8]) {
+        maybe_log_raw_uart_router_error(payload, &self.protocol);
+        self.rx_buf.clear();
+    }
 }
 
 fn is_idle_serial_timeout(err: &std::io::Error) -> bool {
@@ -430,12 +435,12 @@ fn maybe_log_raw_uart_parse_issue(context: &str, bytes: &[u8]) {
     );
 }
 
-fn maybe_log_raw_uart_router_error(payload: &[u8], err: &TelemetryError) {
-    if !raw_uart_debug_enabled() {
+fn maybe_log_raw_uart_router_error(payload: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
         return;
     }
     eprintln!(
-        "raw_uart router rejected {} bytes: {err}; payload: {}",
+        "raw_uart router rejected {} bytes; payload: {}",
         payload.len(),
         hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
     );
@@ -729,8 +734,13 @@ impl CommsDevice for UartComms {
                     Ok(())
                 }
                 Err(err) => {
-                    maybe_log_raw_uart_router_error(&payload, &err);
-                    Err(err)
+                    if matches!(self.protocol, SerialProtocol::RawUart) {
+                        let _ = err;
+                        self.handle_raw_uart_router_reject(&payload);
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
                 }
             };
         }
@@ -748,8 +758,13 @@ impl CommsDevice for UartComms {
                     Ok(())
                 }
                 Err(err) => {
-                    maybe_log_raw_uart_router_error(&payload, &err);
-                    Err(err)
+                    if matches!(self.protocol, SerialProtocol::RawUart) {
+                        let _ = err;
+                        self.handle_raw_uart_router_reject(&payload);
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
                 }
             };
         }
