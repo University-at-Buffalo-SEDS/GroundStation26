@@ -51,6 +51,8 @@ RAW_UART_DATA_HEADER = (0xA5, 0x5A)
 RAW_UART_COMMAND_HEADER = (0xA6, 0x5B)
 RAW_UART_ASCII_HEADER = (0xA7, 0x7A)
 RAW_UART_HEADER_SIZE = 4
+I2C_PACKET_MAX_BYTES = 4096
+I2C_FRAME_PAYLOAD_MAX_BYTES = I2C_PACKET_MAX_BYTES - RAW_UART_HEADER_SIZE
 I2C_SLOT_SIZE = 32
 I2C_SLOT_HEADER_SIZE = 18
 I2C_SLOT_PAYLOAD_SIZE = I2C_SLOT_SIZE - I2C_SLOT_HEADER_SIZE
@@ -147,8 +149,13 @@ def is_valid_serialized_frame(data: bytes) -> bool:
     return int(pkt.wire_size()) == len(data)
 
 
-def build_link_frame(header: tuple[int, int], payload: bytes) -> bytes:
-    payload = payload[:RAW_UART_MAX_FRAME_BYTES]
+def build_link_frame(
+        header: tuple[int, int],
+        payload: bytes,
+        max_payload: int = RAW_UART_MAX_FRAME_BYTES,
+) -> bytes:
+    if len(payload) > max_payload:
+        raise ValueError(f"link payload too large: {len(payload)} > {max_payload}")
     return bytes([header[0], header[1]]) + len(payload).to_bytes(2, "little") + payload
 
 
@@ -784,7 +791,11 @@ class I2cTransport(Transport):
         return None
 
     def send_serialized(self, payload: bytes) -> None:
-        payload = build_link_frame(RAW_UART_DATA_HEADER, payload)
+        payload = build_link_frame(
+            RAW_UART_DATA_HEADER,
+            payload,
+            max_payload=I2C_FRAME_PAYLOAD_MAX_BYTES,
+        )
         with self.io_lock:
             if self._tx_backoff_active():
                 return
@@ -859,14 +870,17 @@ class I2cTransport(Transport):
             kind, payload = assembled
             if kind == I2C_KIND_ERROR:
                 return None
-            if kind not in {I2C_KIND_DATA, I2C_KIND_COMMAND}:
+            if kind == I2C_KIND_COMMAND:
+                continue
+            if kind != I2C_KIND_DATA:
                 continue
             parsed = parse_link_frame(payload)
-            if parsed is not None:
-                header, body = parsed
-                if header != RAW_UART_DATA_HEADER:
-                    continue
-                payload = body
+            if parsed is None:
+                continue
+            header, body = parsed
+            if header != RAW_UART_DATA_HEADER:
+                continue
+            payload = body
             if is_valid_serialized_frame(payload):
                 return payload
             self.rx_payload_buf.extend(payload)

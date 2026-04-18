@@ -38,6 +38,10 @@ const RAW_UART_ASCII_SYNC_1: u8 = 0x7A;
 const RAW_UART_FRAME_HEADER_SIZE: usize = 4;
 const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
+#[cfg(target_os = "linux")]
+const I2C_PACKET_MAX_BYTES: usize = 4_096;
+#[cfg(target_os = "linux")]
+const I2C_FRAME_PAYLOAD_MAX_BYTES: usize = I2C_PACKET_MAX_BYTES - RAW_UART_FRAME_HEADER_SIZE;
 const UART_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const UART_NORMAL_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
@@ -314,7 +318,7 @@ impl UartComms {
         let mut processed_any = false;
 
         loop {
-            let payload = match self.try_take_packet()? {
+            let payload: Vec<u8> = match self.try_take_packet()? {
                 Some(payload) => payload,
                 None => break,
             };
@@ -361,6 +365,19 @@ fn unix_now_ms() -> u64 {
 }
 
 fn build_raw_uart_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    build_link_frame(RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1, payload)
+}
+
+#[cfg(target_os = "linux")]
+fn build_i2c_data_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    if payload.len() > I2C_FRAME_PAYLOAD_MAX_BYTES {
+        return Err(format!(
+            "packet too large to send over i2c framed link: {} > {} bytes",
+            payload.len(),
+            I2C_FRAME_PAYLOAD_MAX_BYTES
+        )
+        .into());
+    }
     build_link_frame(RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1, payload)
 }
 
@@ -1138,29 +1155,28 @@ impl CommsDevice for I2cComms {
                                 }
                                 continue;
                             }
-                            let payload = match parse_link_frame(&payload) {
-                                Some(((RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1), body)) => {
-                                    body
-                                }
-                                Some((
-                                    (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1),
-                                    body,
-                                )) => {
+                            let Some((header, payload)) = parse_link_frame(&payload) else {
+                                log_i2c_router_decode_error(
+                                    "data packet missing Pico link frame header",
+                                    &payload,
+                                    &std::io::Error::other("missing link frame header"),
+                                );
+                                continue;
+                            };
+                            if header != (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1) {
+                                if header == (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1) {
                                     eprintln!(
                                         "i2c command response ignored on telemetry path: {}",
-                                        String::from_utf8_lossy(body)
+                                        String::from_utf8_lossy(payload)
                                     );
-                                    continue;
-                                }
-                                Some(((RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1), body)) => {
+                                } else if header == (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1) {
                                     eprintln!(
                                         "i2c raw ascii response ignored on telemetry path: {}",
-                                        String::from_utf8_lossy(body)
+                                        String::from_utf8_lossy(payload)
                                     );
-                                    continue;
                                 }
-                                _ => payload.as_slice(),
-                            };
+                                continue;
+                            }
                             self.rx_payload_buf.extend_from_slice(payload);
                             while let Some(packet) = self.try_take_buffered_packet()? {
                                 match router.rx_serialized_queue_from_side(&packet, side_id) {
@@ -1212,7 +1228,7 @@ impl CommsDevice for I2cComms {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(target_os = "linux")]
         {
-            let framed = build_raw_uart_frame(payload)?;
+            let framed = build_i2c_data_frame(payload)?;
             self.write_payload(I2C_KIND_DATA, &framed)
         }
         #[cfg(not(target_os = "linux"))]
