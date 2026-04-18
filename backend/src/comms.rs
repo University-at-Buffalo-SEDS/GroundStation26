@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::SystemTime;
 
 pub const ROCKET_COMMS_PORT: &str = "/dev/ttyUSB1";
@@ -33,6 +33,8 @@ const RAW_UART_FRAME_SYNC_1: u8 = 0x5A;
 const RAW_UART_FRAME_HEADER_SIZE: usize = 4;
 const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
+const UART_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const UART_NORMAL_TIMEOUT: Duration = Duration::from_millis(10);
 #[cfg(target_os = "linux")]
 const I2C_DEBUG_PREVIEW_BYTES: usize = 48;
 #[cfg(target_os = "linux")]
@@ -159,6 +161,7 @@ pub struct UartComms {
     side_id: Option<RouterSideId>,
     rx_buf: Vec<u8>,
     protocol: SerialProtocol,
+    slow_start_deadline: Option<Instant>,
 }
 
 impl UartComms {
@@ -168,7 +171,7 @@ impl UartComms {
             .parity(serialport::Parity::None)
             .stop_bits(serialport::StopBits::One)
             .flow_control(serialport::FlowControl::None)
-            .timeout(Duration::from_millis(10))
+            .timeout(UART_STARTUP_TIMEOUT)
             .open()
             .context("failed to configure serial port")?;
         Ok(Self {
@@ -176,10 +179,23 @@ impl UartComms {
             side_id: None,
             rx_buf: Vec::with_capacity(MAX_PACKET_SIZE * 2),
             protocol: cfg.protocol.clone(),
+            slow_start_deadline: Some(Instant::now() + UART_STARTUP_TIMEOUT),
         })
     }
 
+    fn update_uart_timeout_mode(&mut self) -> std::io::Result<()> {
+        if self
+            .slow_start_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+            self.slow_start_deadline = None;
+        }
+        Ok(())
+    }
+
     fn fill_rx_buf(&mut self) -> std::io::Result<()> {
+        self.update_uart_timeout_mode()?;
         let mut scratch = [0u8; 512];
         match self.inner.read(&mut scratch) {
             Ok(0) => {
@@ -187,6 +203,9 @@ impl UartComms {
                 Ok(())
             }
             Ok(n) => {
+                if self.slow_start_deadline.take().is_some() {
+                    self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+                }
                 maybe_log_raw_uart_read_outcome(
                     "read returned bytes",
                     self.rx_buf.len(),
