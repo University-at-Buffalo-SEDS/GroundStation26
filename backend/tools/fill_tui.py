@@ -184,6 +184,21 @@ class PacketEvent:
     payload_text: str
 
 
+@dataclass
+class TxMetadata:
+    timestamp_ms: int
+    label: str
+    kind: str
+    serialized_len: int | None
+    transport_len: int
+    data_type: str
+    endpoint: str
+    payload_len: int
+    command_id: int | None
+    sender: str
+    wire_hex: str
+
+
 def build_command_groups(include_hitl: bool) -> list[tuple[str, list[CommandSpec]]]:
     rocket = [
         CommandSpec("Launch", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 3, "FlightCommands::Launch"),
@@ -377,6 +392,9 @@ class Transport:
     def send_raw_ascii(self, text: str) -> None:
         raise NotImplementedError
 
+    def tx_wire_len(self, serialized_len: int) -> int:
+        return serialized_len
+
     def close(self) -> None:
         raise NotImplementedError
 
@@ -519,6 +537,13 @@ class SerialTransport(Transport):
         self.tx_bytes += len(wire)
         self.last_tx_ms = now_ms()
         self.last_tx_hex = hex_preview(wire, limit=24)
+
+    def tx_wire_len(self, serialized_len: int) -> int:
+        if self.tx_protocol == "packet_framed":
+            return serialized_len + 2
+        if self.tx_protocol == "raw_uart":
+            return serialized_len + RAW_UART_HEADER_SIZE
+        return serialized_len
 
     def activity_snapshot(self) -> dict[str, object]:
         return {
@@ -856,6 +881,12 @@ class I2cTransport(Transport):
     def send_raw_ascii(self, text: str) -> None:
         raise RuntimeError("raw ASCII bypass is only available on UART links")
 
+    def tx_wire_len(self, serialized_len: int) -> int:
+        framed_len = serialized_len + RAW_UART_HEADER_SIZE
+        if framed_len == RAW_UART_HEADER_SIZE:
+            return I2C_SLOT_SIZE
+        return ((framed_len + I2C_SLOT_PAYLOAD_SIZE - 1) // I2C_SLOT_PAYLOAD_SIZE) * I2C_SLOT_SIZE
+
     def activity_snapshot(self) -> dict[str, object]:
         return {
             "kind": "i2c",
@@ -886,7 +917,7 @@ class FillLinkApp:
         self.command_index = 0
         self.packet_events: deque[PacketEvent] = deque(maxlen=200)
         self.packet_counts: Counter[tuple[str, str]] = Counter()
-        self.sent_log: deque[str] = deque(maxlen=16)
+        self.tx_metadata: deque[TxMetadata] = deque(maxlen=64)
         self.status = "Connected"
         self.error: str | None = None
         self.raw_rx_count = 0
@@ -972,25 +1003,51 @@ class FillLinkApp:
             payload=bytes([spec.command_id]),
         )
         wire = bytes(packet.serialize())
-        print(f"[fill_tui tx] {spec.label}: {hex_preview(wire, limit=64)}", file=sys.stderr)
         self.transport.send_serialized(wire)
         with self.lock:
-            self.sent_log.appendleft(
-                f"{spec.label} -> id={spec.command_id} ep={spec.endpoint} raw={hex_preview(wire, limit=32)}"
+            self.tx_metadata.appendleft(
+                TxMetadata(
+                    timestamp_ms=now_ms(),
+                    label=spec.label,
+                    kind="packet",
+                    serialized_len=len(wire),
+                    transport_len=self.transport.tx_wire_len(len(wire)),
+                    data_type=str(spec.data_type),
+                    endpoint=str(spec.endpoint),
+                    payload_len=1,
+                    command_id=spec.command_id,
+                    sender=self.sender,
+                    wire_hex=hex_preview(wire, limit=32),
+                )
             )
             self.status = f"Sent {spec.label}"
 
     def send_raw_ascii(self, text: str) -> None:
         self.transport.send_raw_ascii(text)
         with self.lock:
-            self.sent_log.appendleft(f"raw ascii -> {text[:48]}")
+            payload_len = len(text.encode("ascii", errors="replace"))
+            self.tx_metadata.appendleft(
+                TxMetadata(
+                    timestamp_ms=now_ms(),
+                    label="Raw ASCII",
+                    kind="raw_ascii",
+                    serialized_len=None,
+                    transport_len=payload_len + RAW_UART_HEADER_SIZE,
+                    data_type="-",
+                    endpoint="-",
+                    payload_len=payload_len,
+                    command_id=None,
+                    sender=self.sender,
+                    wire_hex=safe_decode_ascii(text.encode("ascii", errors="replace"), limit=32),
+                )
+            )
             self.status = "Sent raw ASCII"
 
     def clear_packets(self) -> None:
         with self.lock:
             self.packet_events.clear()
             self.packet_counts.clear()
-            self.sent_log.clear()
+            self.tx_metadata.clear()
 
     def group(self) -> tuple[str, list[CommandSpec]]:
         return self.command_groups[self.group_index]
@@ -1045,23 +1102,27 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
     while not app.stop_event.is_set():
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        if h < 20 or w < 90:
-            stdscr.addstr(0, 0, "Terminal too small. Need at least 90x20.")
+        if h < 20 or w < 110:
+            stdscr.addstr(0, 0, "Terminal too small. Need at least 110x20.")
             stdscr.refresh()
             time.sleep(0.1)
             continue
 
-        left_w = int(w * 0.58)
-        right_w = w - left_w - 1
+        left_w = max(42, int(w * 0.43))
+        tx_w = max(28, int(w * 0.24))
+        cmd_w = w - left_w - tx_w - 2
+        cmd_x = left_w
+        tx_x = left_w + cmd_w + 1
         top_h = h - 8
         draw_box(stdscr, 0, 0, top_h, left_w, "Fill Telemetry")
-        draw_box(stdscr, 0, left_w, top_h, right_w, "Commands")
+        draw_box(stdscr, 0, cmd_x, top_h, cmd_w, "Commands")
+        draw_box(stdscr, 0, tx_x, top_h, tx_w, "TX Metadata")
         draw_box(stdscr, top_h, 0, h - top_h, w, "Status")
 
         with app.lock:
             packet_events = list(app.packet_events)
             counts = app.packet_counts.copy()
-            sent_log = list(app.sent_log)
+            tx_metadata = list(app.tx_metadata)
             status = app.status
             error = app.error
             raw_rx_count = app.raw_rx_count
@@ -1105,15 +1166,33 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
                 stdscr.addnstr(3 + idx, 2, line, left_w - 4)
 
         group_name, group_commands = app.group()
-        stdscr.addstr(1, left_w + 2, f"Group: {group_name} ({app.group_index + 1}/{len(app.command_groups)})",
-                      curses.A_BOLD)
-        stdscr.addstr(2, left_w + 2, "Tab/Shift-Tab switch group. Up/Down select. Enter sends.")
+        stdscr.addstr(
+            1,
+            cmd_x + 2,
+            f"Group: {group_name} ({app.group_index + 1}/{len(app.command_groups)})",
+            curses.A_BOLD,
+        )
+        stdscr.addstr(2, cmd_x + 2, "Tab/Shift-Tab group. Up/Down select. Enter sends.")
         cmd_rows = min(len(group_commands), top_h - 5)
         for idx in range(cmd_rows):
             spec = group_commands[idx]
             attr = curses.A_REVERSE if idx == app.command_index else curses.A_NORMAL
             line = f"{spec.label:<24} id={spec.command_id:<2} {spec.detail}"
-            stdscr.addnstr(4 + idx, left_w + 2, line, right_w - 4, attr)
+            stdscr.addnstr(4 + idx, cmd_x + 2, line, cmd_w - 4, attr)
+
+        if tx_metadata:
+            for idx, meta in enumerate(tx_metadata[: max(0, top_h - 3)]):
+                row = 1 + idx
+                ser_len = "-" if meta.serialized_len is None else str(meta.serialized_len)
+                cmd = "-" if meta.command_id is None else str(meta.command_id)
+                line = (
+                    f"{meta.label[:12]:<12} {meta.kind:<9} ser={ser_len:<4} "
+                    f"wire={meta.transport_len:<4} dt={meta.data_type:<4} ep={meta.endpoint:<4} "
+                    f"cmd={cmd:<3} pay={meta.payload_len:<3}"
+                )
+                stdscr.addnstr(row, tx_x + 2, line, tx_w - 4)
+        else:
+            stdscr.addnstr(1, tx_x + 2, "No TX packets yet.", tx_w - 4)
 
         base_y = top_h + 1
         stdscr.addstr(base_y, 2, f"Status: {status}")
@@ -1169,9 +1248,6 @@ def draw_tui(stdscr: curses.window, app: FillLinkApp) -> None:
         tx_preview = str(transport_activity.get("last_tx_hex", ""))
         if tx_preview:
             status_lines.append(f"Last TX raw: {tx_preview}")
-        for line in sent_log[:2]:
-            status_lines.append(f"Sent: {line}")
-
         status_row = base_y + 2
         max_status_row = h - 2
         for line in status_lines:
