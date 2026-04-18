@@ -175,6 +175,12 @@ impl UartComms {
             })
             .context("failed to configure serial port")?;
         inner.set_timeout(Duration::from_millis(10))?;
+        if let Err(err) = inner.set_dtr(true) {
+            eprintln!("WARNING: failed to assert DTR on {}: {err}", cfg.port);
+        }
+        if let Err(err) = inner.set_rts(true) {
+            eprintln!("WARNING: failed to assert RTS on {}: {err}", cfg.port);
+        }
         Ok(Self {
             inner,
             side_id: None,
