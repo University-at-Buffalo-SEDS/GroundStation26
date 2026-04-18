@@ -33,6 +33,21 @@ pub struct CommsWorkerHandle {
     pub tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
+fn tx_payload_preview(payload: &[u8]) -> String {
+    const LIMIT: usize = 48;
+    let preview = payload
+        .iter()
+        .take(LIMIT)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if payload.len() > LIMIT {
+        format!("{preview} ...")
+    } else {
+        preview
+    }
+}
+
 fn spawn_comms_worker_threads(
     router: Arc<Router>,
     state: Arc<AppState>,
@@ -55,13 +70,25 @@ fn spawn_comms_worker_threads(
                 }
 
                 match comms_handle.tx_rx.try_recv() {
-                    Ok(payload) => match tx_comms.lock().expect("failed to get lock").send_data(&payload)
-                    {
-                        Ok(()) => {}
+                    Ok(payload) => {
+                        eprintln!(
+                            "{} tx worker sending {} bytes: {}",
+                            worker_name,
+                            payload.len(),
+                            tx_payload_preview(&payload)
+                        );
+                        match tx_comms.lock().expect("failed to get lock").send_data(&payload) {
+                        Ok(()) => {
+                            eprintln!(
+                                "{} tx worker sent {} bytes",
+                                worker_name,
+                                payload.len()
+                            );
+                        }
                         Err(e) => {
                             eprintln!("{worker_name} tx worker send_data failed: {e}");
                         }
-                    },
+                    }},
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                         thread::sleep(Duration::from_millis(2));
                     }
@@ -2214,6 +2241,14 @@ fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
     );
 }
 
+fn log_command_flush_start(context: &str) {
+    eprintln!("{context}: flushing router tx queue");
+}
+
+fn log_command_flush_success(context: &str) {
+    eprintln!("{context}: router tx queue flushed");
+}
+
 fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::TelemetryError> {
     router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS)?;
     if ROUTER_RX_BUDGET_MS > 0 {
@@ -2223,8 +2258,11 @@ fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::Tele
 }
 
 fn flush_command_tx(router: &Router, context: &str) {
+    log_command_flush_start(context);
     if let Err(err) = router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS) {
         log_telemetry_error(context, err);
+    } else {
+        log_command_flush_success(context);
     }
 }
 
