@@ -838,6 +838,8 @@ pub struct I2cComms {
     #[cfg(target_os = "linux")]
     chunk_delay: Duration,
     #[cfg(target_os = "linux")]
+    initial_wait: Duration,
+    #[cfg(target_os = "linux")]
     tx_transfer_id: u16,
     #[cfg(target_os = "linux")]
     rx_assembly: Option<I2cRxAssembly>,
@@ -856,6 +858,7 @@ impl I2cComms {
                 side_id: None,
                 addr: cfg.addr,
                 chunk_delay: Duration::from_millis(cfg.chunk_delay_ms),
+                initial_wait: Duration::from_millis(cfg.initial_wait_ms),
                 tx_transfer_id: 1,
                 rx_assembly: None,
                 rx_payload_buf: Vec::with_capacity(MAX_PACKET_SIZE * 4),
@@ -929,6 +932,9 @@ impl I2cComms {
                 std::thread::sleep(self.chunk_delay);
             }
         }
+        if !self.initial_wait.is_zero() {
+            std::thread::sleep(self.initial_wait);
+        }
         Ok(())
     }
 
@@ -954,7 +960,10 @@ impl I2cComms {
             .rx_assembly
             .as_mut()
             .ok_or_else(|| std::io::Error::other("i2c slot arrived without an active transfer"));
-        let assembly = assembly?;
+        let assembly = match assembly {
+            Ok(assembly) => assembly,
+            Err(_) => return Ok(None),
+        };
         let completed = match assembly.push(&slot) {
             Ok(completed) => completed,
             Err(err) => {
@@ -1038,10 +1047,14 @@ impl CommsDevice for I2cComms {
             for _ in 0..32 {
                 match self.read_slot() {
                     Ok(Some(slot)) => {
-                        if let Some((kind, payload)) = self.ingest_rx_slot(slot).map_err(|err| {
-                            eprintln!("i2c receive failed: {err}");
-                            TelemetryError::HandlerError("i2c receive failed")
-                        })? {
+                        let assembled = match self.ingest_rx_slot(slot) {
+                            Ok(assembled) => assembled,
+                            Err(err) => {
+                                eprintln!("i2c receive failed: {err}");
+                                continue;
+                            }
+                        };
+                        if let Some((kind, payload)) = assembled {
                             maybe_log_i2c_decoded(&payload);
                             if kind != I2C_KIND_DATA {
                                 if kind == I2C_KIND_ERROR {
@@ -1052,14 +1065,12 @@ impl CommsDevice for I2cComms {
                                 } else {
                                     eprintln!("i2c non-data packet kind {kind} ignored");
                                 }
-                                return Ok(());
+                                continue;
                             }
                             self.rx_payload_buf.extend_from_slice(&payload);
                             while let Some(packet) = self.try_take_buffered_packet()? {
                                 match router.rx_serialized_queue_from_side(&packet, side_id) {
-                                    Ok(()) => {
-                                        let _ = side_id;
-                                    }
+                                    Ok(()) => {}
                                     Err(err) => {
                                         log_i2c_router_decode_error(
                                             "router rejected serialized packet",
@@ -1067,10 +1078,9 @@ impl CommsDevice for I2cComms {
                                             &err,
                                         );
                                         eprintln!("i2c router reject: {err}");
-                                        return Err(err);
+                                        continue;
                                     }
                                 }
-                                return Ok(());
                             }
                             if !self.rx_payload_buf.is_empty() {
                                 match serialize::peek_frame_info(&self.rx_payload_buf) {
@@ -1089,7 +1099,7 @@ impl CommsDevice for I2cComms {
                     Ok(None) => continue,
                     Err(err) => {
                         eprintln!("i2c receive failed: {err}");
-                        return Err(TelemetryError::HandlerError("i2c receive failed"));
+                        continue;
                     }
                 }
             }
