@@ -463,25 +463,29 @@ fn maybe_log_raw_uart_decoded(payload: &[u8], protocol: &SerialProtocol) {
     if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
         return;
     }
-    match serialize::peek_envelope(payload) {
-        Ok(envelope) => {
-            eprintln!(
-                "raw_uart decoded {} bytes: sender={} ty={:?} endpoints={:?} ts={}",
-                payload.len(),
-                envelope.sender,
-                envelope.ty,
-                envelope.endpoints,
-                envelope.timestamp_ms
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "raw_uart decoded {} bytes but peek_envelope failed: {err}; payload: {}",
-                payload.len(),
-                hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
-            );
-        }
+    eprintln!(
+        "raw_uart decoded {} bytes: {}",
+        payload.len(),
+        hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn maybe_log_raw_uart_router_queue_before(payload: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
     }
+    eprintln!(
+        "raw_uart queueing {} bytes to router: {}",
+        payload.len(),
+        hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn maybe_log_raw_uart_router_queue_after(payload: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    eprintln!("raw_uart router accepted {} bytes", payload.len());
 }
 
 #[cfg(target_os = "linux")]
@@ -718,8 +722,12 @@ impl CommsDevice for UartComms {
         }
         if let Some(payload) = self.try_take_packet()? {
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
+            maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
             return match router.rx_serialized_queue_from_side(&payload, side_id) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
+                    Ok(())
+                }
                 Err(err) => {
                     maybe_log_raw_uart_router_error(&payload, &err);
                     Err(err)
@@ -733,8 +741,12 @@ impl CommsDevice for UartComms {
 
         if let Some(payload) = self.try_take_packet()? {
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
+            maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
             return match router.rx_serialized_queue_from_side(&payload, side_id) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
+                    Ok(())
+                }
                 Err(err) => {
                     maybe_log_raw_uart_router_error(&payload, &err);
                     Err(err)
