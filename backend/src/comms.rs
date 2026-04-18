@@ -492,11 +492,6 @@ fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<
         return Ok(None);
     }
 
-    if rx_buf[0] != RAW_UART_FRAME_SYNC_0 || rx_buf[1] != RAW_UART_FRAME_SYNC_1 {
-        rx_buf.drain(..total_len);
-        return Ok(None);
-    }
-
     let payload = rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len].to_vec();
     rx_buf.drain(..total_len);
     Ok(Some(payload))
