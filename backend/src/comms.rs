@@ -268,7 +268,59 @@ impl UartComms {
 
     fn handle_raw_uart_router_reject(&mut self, payload: &[u8]) {
         maybe_log_raw_uart_router_error(payload, &self.protocol);
-        self.rx_buf.clear();
+
+        // If a corrupted payload swallowed the next frame start, salvage from the
+        // embedded sync marker rather than dropping the entire burst.
+        let mut recovered = payload
+            .windows(2)
+            .enumerate()
+            .skip(1)
+            .find_map(|(idx, pair)| (pair == [RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1]).then_some(idx))
+            .map(|idx| payload[idx..].to_vec())
+            .unwrap_or_default();
+
+        if !self.rx_buf.is_empty() {
+            recovered.extend_from_slice(&self.rx_buf);
+        }
+        self.rx_buf = recovered;
+        maybe_log_raw_uart_buffer_state(
+            &self.rx_buf,
+            "resynced after router reject",
+            &self.protocol,
+        );
+    }
+
+    fn process_buffered_packets(
+        &mut self,
+        router: &Router,
+        side_id: RouterSideId,
+    ) -> TelemetryResult<bool> {
+        let mut processed_any = false;
+
+        loop {
+            let Some(payload) = self.try_take_packet()? else {
+                break;
+            };
+            processed_any = true;
+            maybe_log_raw_uart_decoded(&payload, &self.protocol);
+            maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
+            match router.rx_serialized_queue_from_side(&payload, side_id) {
+                Ok(()) => {
+                    maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
+                }
+                Err(err) => {
+                    if matches!(self.protocol, SerialProtocol::RawUart) {
+                        let _ = err;
+                        self.handle_raw_uart_router_reject(&payload);
+                        continue;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        Ok(processed_any)
     }
 }
 
@@ -725,48 +777,16 @@ impl CommsDevice for UartComms {
         {
             return Err(err.into());
         }
-        if let Some(payload) = self.try_take_packet()? {
-            maybe_log_raw_uart_decoded(&payload, &self.protocol);
-            maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
-            return match router.rx_serialized_queue_from_side(&payload, side_id) {
-                Ok(()) => {
-                    maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
-                    Ok(())
-                }
-                Err(err) => {
-                    if matches!(self.protocol, SerialProtocol::RawUart) {
-                        let _ = err;
-                        self.handle_raw_uart_router_reject(&payload);
-                        Ok(())
-                    } else {
-                        Err(err)
-                    }
-                }
-            };
+        if self.process_buffered_packets(router, side_id)? {
+            return Ok(());
         }
 
         if let Err(err) = self.fill_rx_buf() {
             return Err(err.into());
         }
 
-        if let Some(payload) = self.try_take_packet()? {
-            maybe_log_raw_uart_decoded(&payload, &self.protocol);
-            maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
-            return match router.rx_serialized_queue_from_side(&payload, side_id) {
-                Ok(()) => {
-                    maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
-                    Ok(())
-                }
-                Err(err) => {
-                    if matches!(self.protocol, SerialProtocol::RawUart) {
-                        let _ = err;
-                        self.handle_raw_uart_router_reject(&payload);
-                        Ok(())
-                    } else {
-                        Err(err)
-                    }
-                }
-            };
+        if self.process_buffered_packets(router, side_id)? {
+            return Ok(());
         }
 
         maybe_log_raw_uart_buffer_state(&self.rx_buf, "waiting for complete frame", &self.protocol);
