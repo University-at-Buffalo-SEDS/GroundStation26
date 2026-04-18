@@ -4,12 +4,12 @@ use crate::comms_config::{
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
+use serialport::SerialPort;
 use sedsprintf_rs_2026::{
     TelemetryError, TelemetryResult,
     router::{Router, RouterSideId},
     serialize,
 };
-use serial::{SerialPort, SystemPort};
 use std::error::Error;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
@@ -155,7 +155,7 @@ fn i2c_description(i2c: &I2cLinkConfig) -> String {
 //  Real Comms Implementation
 // ======================================================================
 pub struct UartComms {
-    inner: SystemPort,
+    inner: Box<dyn SerialPort>,
     side_id: Option<RouterSideId>,
     rx_buf: Vec<u8>,
     protocol: SerialProtocol,
@@ -163,18 +163,14 @@ pub struct UartComms {
 
 impl UartComms {
     pub fn open(cfg: &SerialLinkConfig) -> anyhow::Result<Self> {
-        let mut inner = serial::open(&cfg.port)?;
-        inner
-            .reconfigure(&|settings| {
-                settings.set_baud_rate(serial::BaudRate::from_speed(cfg.baud_rate))?;
-                settings.set_char_size(serial::CharSize::Bits8);
-                settings.set_parity(serial::Parity::ParityNone);
-                settings.set_stop_bits(serial::StopBits::Stop1);
-                settings.set_flow_control(serial::FlowControl::FlowNone);
-                Ok(())
-            })
+        let inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
+            .data_bits(serialport::DataBits::Eight)
+            .parity(serialport::Parity::None)
+            .stop_bits(serialport::StopBits::One)
+            .flow_control(serialport::FlowControl::None)
+            .timeout(Duration::from_millis(10))
+            .open()
             .context("failed to configure serial port")?;
-        inner.set_timeout(Duration::from_millis(10))?;
         Ok(Self {
             inner,
             side_id: None,
