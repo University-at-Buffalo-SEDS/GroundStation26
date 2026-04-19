@@ -2,9 +2,9 @@ use crate::flight_sim::{_next_state_aware_packet, sim_mode_enabled};
 use crate::telemetry_task::get_current_timestamp_ms;
 use crate::types::Board;
 use rand::RngExt;
+use sedsprintf_rs_2026::TelemetryResult;
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
-use sedsprintf_rs_2026::TelemetryResult;
 use std::sync::Arc;
 
 const BASE_LAT: f32 = 31.7619;
@@ -18,7 +18,7 @@ fn random_sender() -> &'static str {
 
 fn random_packet() -> TelemetryResult<Packet> {
     let now_ms = get_current_timestamp_ms();
-    let sender = random_sender();
+    let mut sender = random_sender();
     let mut rng = rand::rng();
 
     let choices = [
@@ -61,8 +61,26 @@ fn random_packet() -> TelemetryResult<Packet> {
             let az = rng.random_range(8.0..11.0);
             vec![ax, ay, az]
         }
-        DataType::BatteryVoltage => vec![rng.random_range(11.0..12.6)],
-        DataType::BatteryCurrent => vec![rng.random_range(0.0..18.0)],
+        DataType::BatteryVoltage => {
+            let sources = [
+                (Board::PowerBoard.sender_id(), 6.3, 8.4),
+                (Board::ValveBoard.sender_id(), 6.3, 8.4),
+                (Board::GatewayBoard.sender_id(), 13.3, 15.5),
+            ];
+            let (source, low, high) = sources[rng.random_range(0..sources.len())];
+            sender = source;
+            vec![rng.random_range(low..high)]
+        }
+        DataType::BatteryCurrent => {
+            let sources = [
+                (Board::PowerBoard.sender_id(), 0.5, 8.0),
+                (Board::ValveBoard.sender_id(), 0.1, 2.0),
+                (Board::GatewayBoard.sender_id(), 0.2, 2.5),
+            ];
+            let (source, low, high) = sources[rng.random_range(0..sources.len())];
+            sender = source;
+            vec![rng.random_range(low..high)]
+        }
         DataType::BarometerData => {
             let pressure_pa = rng.random_range(98_000.0..102_000.0);
             let temp_c = rng.random_range(10.0..35.0);

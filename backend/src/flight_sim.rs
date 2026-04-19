@@ -11,10 +11,10 @@ use crate::types::TelemetryCommand;
 use crate::types::{Board, FlightState};
 #[cfg(feature = "testing")]
 use rand::RngExt;
+use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
-use sedsprintf_rs_2026::TelemetryResult;
 #[cfg(feature = "testing")]
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
@@ -24,12 +24,14 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "testing")]
 const BASE_LAT: f32 = 31.7619;
 #[cfg(feature = "testing")]
-const BASE_LON: f32 = -106.4850;
+const BASE_LON: f32 = -106.485;
 
 #[cfg(feature = "testing")]
 const SENSOR_PERIOD_MS: u64 = 25;
 #[cfg(feature = "testing")]
 const FLIGHT_STATE_PERIOD_MS: u64 = 1_000;
+#[cfg(feature = "testing")]
+const LAUNCH_COUNTDOWN_DURATION_MS: u64 = 10_000;
 #[cfg(feature = "testing")]
 const HOUSEKEEPING_PERIOD_MS: u64 = 900;
 #[cfg(feature = "testing")]
@@ -37,9 +39,13 @@ const AV_BAY_BATTERY_CUTOFF_V: f32 = 6.3;
 #[cfg(feature = "testing")]
 const AV_BAY_BATTERY_MAX_V: f32 = 8.4;
 #[cfg(feature = "testing")]
-const GROUND_STATION_BATTERY_CUTOFF_V: f32 = 13.3;
+const VALVE_BOARD_BATTERY_CUTOFF_V: f32 = 6.3;
 #[cfg(feature = "testing")]
-const GROUND_STATION_BATTERY_MAX_V: f32 = 15.5;
+const VALVE_BOARD_BATTERY_MAX_V: f32 = 8.4;
+#[cfg(feature = "testing")]
+const FILL_BOX_POWER_CUTOFF_V: f32 = 13.3;
+#[cfg(feature = "testing")]
+const FILL_BOX_POWER_MAX_V: f32 = 15.5;
 #[cfg(feature = "testing")]
 const LOADCELL_NOISE_KG: f32 = 0.01;
 #[cfg(feature = "testing")]
@@ -61,49 +67,103 @@ const GRAVITY_FPS2: f32 = 32.174;
 
 #[cfg(feature = "testing")]
 fn sim_full_mass_kg() -> f32 {
-    static FULL_MASS_KG: OnceLock<f32> = OnceLock::new();
-    *FULL_MASS_KG.get_or_init(|| {
-        fill_targets::load_or_default()
-            .nitrous
-            .target_mass_kg
-            .max(
-                loadcell::load_or_default()
-                    .full_mass_kg
-                    .unwrap_or(loadcell::DEFAULT_FULL_MASS_KG),
-            )
-            .max(0.1)
-    })
+    sim_full_mass_kg_from(
+        &fill_targets::load_or_default(),
+        &loadcell::load_or_default(),
+    )
+}
+
+#[cfg(feature = "testing")]
+fn sim_full_mass_kg_from(
+    fill_cfg: &fill_targets::FillTargetsConfig,
+    loadcell_cfg: &loadcell::LoadcellCalibrationFile,
+) -> f32 {
+    fill_cfg
+        .nitrous
+        .target_mass_kg
+        .max(
+            loadcell_cfg
+                .full_mass_kg
+                .unwrap_or(loadcell::DEFAULT_FULL_MASS_KG),
+        )
+        .max(0.1)
 }
 
 #[cfg(feature = "testing")]
 fn sim_nitrogen_target_mass_kg() -> f32 {
-    static NITROGEN_TARGET_KG: OnceLock<f32> = OnceLock::new();
-    *NITROGEN_TARGET_KG.get_or_init(|| {
-        std::env::var("GS_SEQUENCE_NITROGEN_TARGET_MASS_KG")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v > 0.0)
-            .unwrap_or_else(|| {
-                fill_targets::load_or_default()
-                    .nitrogen
-                    .target_mass_kg
-                    .max(0.1)
-            })
-    })
+    sim_nitrogen_target_mass_kg_from(&fill_targets::load_or_default())
+}
+
+#[cfg(feature = "testing")]
+fn sim_nitrogen_target_mass_kg_from(fill_cfg: &fill_targets::FillTargetsConfig) -> f32 {
+    std::env::var("GS_SEQUENCE_NITROGEN_TARGET_MASS_KG")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or_else(|| fill_cfg.nitrogen.target_mass_kg.max(0.1))
 }
 
 #[cfg(feature = "testing")]
 fn sim_nitrogen_pressure_ceiling_psi() -> f32 {
-    static NITROGEN_PRESSURE_CEILING_PSI: OnceLock<f32> = OnceLock::new();
-    *NITROGEN_PRESSURE_CEILING_PSI.get_or_init(|| {
-        std::env::var("GS_SEQUENCE_NITROGEN_PRESSURE_TARGET_PSI")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v > 0.0)
-            .map(|target| target + 5.0)
-            .unwrap_or(fill_targets::load_or_default().nitrogen.target_pressure_psi + 5.0)
-            .max(NITROGEN_PRESSURE_MAX_PSI)
-    })
+    sim_nitrogen_pressure_ceiling_psi_from(&fill_targets::load_or_default())
+}
+
+#[cfg(feature = "testing")]
+fn sim_nitrogen_pressure_ceiling_psi_from(fill_cfg: &fill_targets::FillTargetsConfig) -> f32 {
+    std::env::var("GS_SEQUENCE_NITROGEN_PRESSURE_TARGET_PSI")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .map(|target| target + 5.0)
+        .unwrap_or(fill_cfg.nitrogen.target_pressure_psi + 5.0)
+        .max(NITROGEN_PRESSURE_MAX_PSI)
+}
+
+#[cfg(feature = "testing")]
+fn sim_nitrogen_pressure_setpoint_psi_from(fill_cfg: &fill_targets::FillTargetsConfig) -> f32 {
+    std::env::var("GS_SEQUENCE_NITROGEN_PRESSURE_TARGET_PSI")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(fill_cfg.nitrogen.target_pressure_psi)
+        .max(0.0)
+}
+
+#[cfg(feature = "testing")]
+pub fn effective_fill_targets(
+    mut cfg: fill_targets::FillTargetsConfig,
+    loadcell_cfg: &loadcell::LoadcellCalibrationFile,
+    flight_state: FlightState,
+) -> fill_targets::FillTargetsConfig {
+    if !sim_mode_enabled() {
+        return cfg;
+    }
+
+    cfg.nitrogen.target_mass_kg = sim_nitrogen_target_mass_kg_from(&cfg);
+    cfg.nitrogen.target_pressure_psi = sim_nitrogen_pressure_setpoint_psi_from(&cfg);
+    cfg.nitrous.target_mass_kg = sim_full_mass_kg_from(&cfg, loadcell_cfg);
+    cfg.nitrous.target_pressure_psi = cfg
+        .nitrous
+        .target_pressure_psi
+        .max(NITROUS_ROOM_TEMP_SATURATION_PSI);
+
+    if matches!(
+        flight_state,
+        FlightState::PreFill | FlightState::FillTest | FlightState::NitrogenFill
+    ) {
+        cfg.nitrous = cfg.nitrogen.clone();
+    }
+
+    cfg
+}
+
+#[cfg(not(feature = "testing"))]
+pub fn effective_fill_targets(
+    cfg: crate::fill_targets::FillTargetsConfig,
+    _loadcell_cfg: &crate::loadcell::LoadcellCalibrationFile,
+    _flight_state: crate::types::FlightState,
+) -> crate::fill_targets::FillTargetsConfig {
+    cfg
 }
 
 #[cfg(feature = "testing")]
@@ -143,6 +203,7 @@ fn vented_pressure_target_psi(loadcell_mass_kg: f32, nitrous_loaded: bool) -> f3
 #[derive(Debug)]
 struct FlightSimState {
     flight_state: FlightState,
+    launch_sequence_started_ms: Option<u64>,
     launch_time_ms: Option<u64>,
     last_state_emit_ms: u64,
     last_sensor_emit_ms: u64,
@@ -161,10 +222,12 @@ struct FlightSimState {
     yaw_dps: f32,
     last_physics_ms: u64,
     av_bay_battery_v: f32,
-    ground_station_battery_v: f32,
-    ground_station_battery_a: f32,
-    next_battery_sender_gateway: bool,
-    last_battery_sender_gateway: bool,
+    valve_board_battery_v: f32,
+    valve_board_battery_a: f32,
+    fill_box_power_v: f32,
+    fill_box_power_a: f32,
+    next_battery_sender_idx: usize,
+    last_battery_sender: Board,
     loadcell_mass_kg: f32,
     valves: HashMap<u8, bool>,
     saw_dump_open_after_n2: bool,
@@ -200,6 +263,7 @@ impl FlightSimState {
 
         Self {
             flight_state: FlightState::Idle,
+            launch_sequence_started_ms: None,
             launch_time_ms: None,
             last_state_emit_ms: 0,
             last_sensor_emit_ms: 0,
@@ -218,10 +282,12 @@ impl FlightSimState {
             yaw_dps: 0.0,
             last_physics_ms: 0,
             av_bay_battery_v: AV_BAY_BATTERY_MAX_V,
-            ground_station_battery_v: GROUND_STATION_BATTERY_MAX_V,
-            ground_station_battery_a: 0.7,
-            next_battery_sender_gateway: false,
-            last_battery_sender_gateway: false,
+            valve_board_battery_v: VALVE_BOARD_BATTERY_MAX_V,
+            valve_board_battery_a: 0.55,
+            fill_box_power_v: FILL_BOX_POWER_MAX_V,
+            fill_box_power_a: 0.7,
+            next_battery_sender_idx: 0,
+            last_battery_sender: Board::PowerBoard,
             loadcell_mass_kg: 0.0,
             valves,
             saw_dump_open_after_n2: false,
@@ -260,6 +326,16 @@ impl FlightSimState {
         ) {
             self.queued.push_back(pkt);
         }
+    }
+
+    fn pop_next_queued(&mut self) -> Option<Packet> {
+        let flight_state_idx = self
+            .queued
+            .iter()
+            .position(|pkt| pkt.data_type() == DataType::FlightState);
+        flight_state_idx
+            .and_then(|idx| self.queued.remove(idx))
+            .or_else(|| self.queued.pop_front())
     }
 
     fn queue_abort(&mut self, board: Board, reason: &str, now_ms: u64) {
@@ -303,6 +379,19 @@ impl FlightSimState {
         }
     }
 
+    fn queue_scalar_f32(&mut self, dtype: DataType, sender: Board, value: f32, now_ms: u64) {
+        let bytes = value.to_le_bytes();
+        if let Ok(pkt) = Packet::new(
+            dtype,
+            &[DataEndpoint::GroundStation],
+            sender.sender_id(),
+            now_ms,
+            Arc::from(bytes.as_slice()),
+        ) {
+            self.queued.push_back(pkt);
+        }
+    }
+
     fn queue_housekeeping(&mut self, now_ms: u64) {
         let valve_board_online = !valve_board_disconnected_for_state(self.flight_state);
         for board in Board::ALL {
@@ -334,12 +423,59 @@ impl FlightSimState {
         self.next_valve_emit_idx = (self.next_valve_emit_idx + 1) % keys.len();
         let on = self.valve_on(key);
         self.queue_umbilical_status(key, on, now_ms);
+
+        // Keep battery telemetry present even when other sensor traffic is sparse.
+        self.queue_scalar_f32(
+            DataType::BatteryVoltage,
+            Board::PowerBoard,
+            self.av_bay_battery_v,
+            now_ms,
+        );
+        self.queue_scalar_f32(
+            DataType::BatteryCurrent,
+            Board::PowerBoard,
+            self.battery_a,
+            now_ms,
+        );
+        if valve_board_online {
+            self.queue_scalar_f32(
+                DataType::BatteryVoltage,
+                Board::ValveBoard,
+                self.valve_board_battery_v,
+                now_ms,
+            );
+            self.queue_scalar_f32(
+                DataType::BatteryCurrent,
+                Board::ValveBoard,
+                self.valve_board_battery_a,
+                now_ms,
+            );
+        }
+        self.queue_scalar_f32(
+            DataType::BatteryVoltage,
+            Board::GatewayBoard,
+            self.fill_box_power_v,
+            now_ms,
+        );
+        self.queue_scalar_f32(
+            DataType::BatteryCurrent,
+            Board::GatewayBoard,
+            self.fill_box_power_a,
+            now_ms,
+        );
     }
 
     fn apply_command(&mut self, cmd: &TelemetryCommand, now_ms: u64) {
         match cmd {
             TelemetryCommand::Abort => {
+                self.launch_sequence_started_ms = None;
                 self.launch_time_ms = None;
+                self.valves
+                    .insert(ActuatorBoardCommands::IgniterOn as u8, false);
+                self.queue_umbilical_status(ActuatorBoardCommands::IgniterOn as u8, false, now_ms);
+                self.valves
+                    .insert(ValveBoardCommands::PilotOpen as u8, false);
+                self.queue_umbilical_status(ValveBoardCommands::PilotOpen as u8, false, now_ms);
                 self.queue_abort(Board::ValveBoard, "simulated valve board abort", now_ms);
                 self.queue_abort(
                     Board::ActuatorBoard,
@@ -349,8 +485,17 @@ impl FlightSimState {
                 self.set_flight_state(FlightState::Aborted, now_ms);
             }
             TelemetryCommand::Launch => {
-                if self.flight_state == FlightState::Armed {
-                    self.launch_time_ms = Some(now_ms);
+                if self.flight_state == FlightState::Armed
+                    && self.launch_sequence_started_ms.is_none()
+                {
+                    self.launch_sequence_started_ms = Some(now_ms);
+                    self.valves
+                        .insert(ActuatorBoardCommands::IgniterOn as u8, true);
+                    self.queue_umbilical_status(
+                        ActuatorBoardCommands::IgniterOn as u8,
+                        true,
+                        now_ms,
+                    );
                     self.set_flight_state(FlightState::Launch, now_ms);
                 }
             }
@@ -420,6 +565,12 @@ impl FlightSimState {
                     self.set_flight_state(FlightState::NitrousFill, now_ms);
                 }
             }
+            TelemetryCommand::StartWritingNow
+            | TelemetryCommand::StartWritingLastTwoMinutes
+            | TelemetryCommand::PauseWritingDb
+            | TelemetryCommand::StopWritingDb => {
+                // Recording controls are backend-local and do not affect simulator state.
+            }
             #[cfg(feature = "hitl_mode")]
             TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
@@ -451,11 +602,45 @@ impl FlightSimState {
             }
         }
 
+        self.update_launch_sequence(now_ms);
         self.update_ground_sequence(now_ms);
     }
 
+    fn update_launch_sequence(&mut self, now_ms: u64) {
+        let Some(sequence_start_ms) = self.launch_sequence_started_ms else {
+            return;
+        };
+
+        if self.flight_state == FlightState::Aborted {
+            self.launch_sequence_started_ms = None;
+            self.launch_time_ms = None;
+            return;
+        }
+
+        if self.launch_time_ms.is_none()
+            && now_ms.saturating_sub(sequence_start_ms) >= LAUNCH_COUNTDOWN_DURATION_MS
+        {
+            let pilot_key = ValveBoardCommands::PilotOpen as u8;
+            if !self.valve_on(pilot_key) {
+                self.valves.insert(pilot_key, true);
+                self.queue_umbilical_status(pilot_key, true, now_ms);
+            }
+            self.launch_time_ms = Some(now_ms);
+            self.set_flight_state(FlightState::Ascent, now_ms);
+        }
+
+        if now_ms.saturating_sub(sequence_start_ms) >= LAUNCH_COUNTDOWN_DURATION_MS {
+            let igniter_key = ActuatorBoardCommands::IgniterOn as u8;
+            if self.valve_on(igniter_key) {
+                self.valves.insert(igniter_key, false);
+                self.queue_umbilical_status(igniter_key, false, now_ms);
+            }
+            self.launch_sequence_started_ms = None;
+        }
+    }
+
     fn update_ground_sequence(&mut self, now_ms: u64) {
-        if self.launch_time_ms.is_some() {
+        if self.launch_sequence_started_ms.is_some() || self.launch_time_ms.is_some() {
             return;
         }
 
@@ -505,6 +690,8 @@ impl FlightSimState {
     }
 
     fn update_physics(&mut self, now_ms: u64) {
+        self.update_launch_sequence(now_ms);
+
         let dt_s = if self.last_physics_ms == 0 {
             SENSOR_PERIOD_MS as f32 / 1000.0
         } else {
@@ -580,19 +767,33 @@ impl FlightSimState {
         }
 
         self.battery_a = (1.0 + self.fuel_flow_lpm * 0.12).min(35.0);
-        self.ground_station_battery_a = if self.launch_time_ms.is_some() {
+        let valve_board_online = !valve_board_disconnected_for_state(self.flight_state);
+        self.valve_board_battery_a = if valve_board_online {
+            if self.launch_time_ms.is_some() {
+                0.85
+            } else {
+                0.55
+            }
+        } else {
+            0.0
+        };
+        self.fill_box_power_a = if self.launch_time_ms.is_some() {
             0.95
         } else {
             0.7
         };
 
-        let av_bay_drop_v_per_s = 0.00008 + self.battery_a * 0.00006;
-        let gs_drop_v_per_s = 0.00005 + self.ground_station_battery_a * 0.00003;
+        // Make simulated pack drain visible over test sessions instead of effectively flat.
+        let av_bay_drop_v_per_s = 0.00035 + self.battery_a * 0.00012;
+        let valve_board_drop_v_per_s = 0.00024 + self.valve_board_battery_a * 0.00010;
+        let fill_box_drop_v_per_s = 0.00020 + self.fill_box_power_a * 0.00008;
 
         self.av_bay_battery_v =
             (self.av_bay_battery_v - av_bay_drop_v_per_s * dt_s).max(AV_BAY_BATTERY_CUTOFF_V);
-        self.ground_station_battery_v = (self.ground_station_battery_v - gs_drop_v_per_s * dt_s)
-            .max(GROUND_STATION_BATTERY_CUTOFF_V);
+        self.valve_board_battery_v = (self.valve_board_battery_v - valve_board_drop_v_per_s * dt_s)
+            .max(VALVE_BOARD_BATTERY_CUTOFF_V);
+        self.fill_box_power_v =
+            (self.fill_box_power_v - fill_box_drop_v_per_s * dt_s).max(FILL_BOX_POWER_CUTOFF_V);
         self.battery_v = self.av_bay_battery_v;
     }
 
@@ -731,26 +932,47 @@ impl FlightSimState {
                 .into_iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect(),
-            DataType::BatteryVoltage => if self.next_battery_sender_gateway {
-                self.next_battery_sender_gateway = false;
-                self.last_battery_sender_gateway = true;
-                sender = Board::GatewayBoard.sender_id();
-                vec![self.ground_station_battery_v]
-            } else {
-                self.next_battery_sender_gateway = true;
-                self.last_battery_sender_gateway = false;
-                sender = Board::PowerBoard.sender_id();
-                vec![self.av_bay_battery_v]
+            DataType::BatteryVoltage => {
+                let valve_board_online = !valve_board_disconnected_for_state(self.flight_state);
+                let battery_sources: &[(Board, f32)] = if valve_board_online {
+                    &[
+                        (Board::PowerBoard, self.av_bay_battery_v),
+                        (Board::ValveBoard, self.valve_board_battery_v),
+                        (Board::GatewayBoard, self.fill_box_power_v),
+                    ]
+                } else {
+                    &[
+                        (Board::PowerBoard, self.av_bay_battery_v),
+                        (Board::GatewayBoard, self.fill_box_power_v),
+                    ]
+                };
+                let (board, voltage) =
+                    battery_sources[self.next_battery_sender_idx % battery_sources.len()];
+                self.next_battery_sender_idx =
+                    (self.next_battery_sender_idx + 1) % battery_sources.len();
+                self.last_battery_sender = board;
+                sender = board.sender_id();
+                vec![voltage]
             }
             .into_iter()
             .flat_map(|v| v.to_le_bytes())
             .collect(),
-            DataType::BatteryCurrent => if self.last_battery_sender_gateway {
-                sender = Board::GatewayBoard.sender_id();
-                vec![self.ground_station_battery_a]
-            } else {
-                sender = Board::PowerBoard.sender_id();
-                vec![self.battery_a]
+            DataType::BatteryCurrent => {
+                let current = match self.last_battery_sender {
+                    Board::GatewayBoard => {
+                        sender = Board::GatewayBoard.sender_id();
+                        self.fill_box_power_a
+                    }
+                    Board::ValveBoard => {
+                        sender = Board::ValveBoard.sender_id();
+                        self.valve_board_battery_a
+                    }
+                    _ => {
+                        sender = Board::PowerBoard.sender_id();
+                        self.battery_a
+                    }
+                };
+                vec![current]
             }
             .into_iter()
             .flat_map(|v| v.to_le_bytes())
@@ -856,21 +1078,14 @@ pub fn simulated_board_endpoints(board: Board) -> Vec<String> {
             DataEndpoint::FlightState.as_str().to_string(),
             DataEndpoint::SdCard.as_str().to_string(),
         ],
-        Board::RFBoard => vec![
-            DataEndpoint::FlightController.as_str().to_string(),
-            DataEndpoint::FlightState.as_str().to_string(),
-        ],
+        Board::RFBoard => Vec::new(),
         Board::PowerBoard => Vec::new(),
         Board::ValveBoard => vec![
             DataEndpoint::ValveBoard.as_str().to_string(),
             DataEndpoint::Abort.as_str().to_string(),
             DataEndpoint::FlightState.as_str().to_string(),
         ],
-        Board::GatewayBoard => vec![
-            DataEndpoint::ValveBoard.as_str().to_string(),
-            DataEndpoint::ActuatorBoard.as_str().to_string(),
-            DataEndpoint::Abort.as_str().to_string(),
-        ],
+        Board::GatewayBoard => Vec::new(),
         Board::ActuatorBoard => vec![
             DataEndpoint::ActuatorBoard.as_str().to_string(),
             DataEndpoint::Abort.as_str().to_string(),
@@ -886,18 +1101,6 @@ pub fn simulated_board_endpoints(board: Board) -> Vec<String> {
 #[cfg(not(feature = "testing"))]
 pub fn simulated_board_endpoints(_board: crate::types::Board) -> Vec<String> {
     Vec::new()
-}
-
-#[cfg(test)]
-mod tests {
-    #[cfg(feature = "testing")]
-    #[test]
-    fn flight_computer_simulated_endpoints_include_sd_card() {
-        let endpoints = super::simulated_board_endpoints(crate::types::Board::FlightComputer);
-        assert!(endpoints.iter().any(|endpoint| {
-            endpoint == sedsprintf_rs_2026::config::DataEndpoint::SdCard.as_str()
-        }));
-    }
 }
 
 #[cfg(feature = "testing")]
@@ -929,14 +1132,14 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
     let now_ms = get_current_timestamp_ms();
     let mut s = sim().lock().expect("flight sim mutex poisoned");
 
-    if let Some(pkt) = s.queued.pop_front() {
+    if let Some(pkt) = s.pop_next_queued() {
         return Ok(pkt);
     }
 
     if now_ms.saturating_sub(s.last_housekeeping_emit_ms) >= HOUSEKEEPING_PERIOD_MS {
         s.last_housekeeping_emit_ms = now_ms;
         s.queue_housekeeping(now_ms);
-        if let Some(pkt) = s.queued.pop_front() {
+        if let Some(pkt) = s.pop_next_queued() {
             return Ok(pkt);
         }
     }
@@ -944,18 +1147,20 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
     if now_ms.saturating_sub(s.last_state_emit_ms) >= FLIGHT_STATE_PERIOD_MS {
         s.last_state_emit_ms = now_ms;
         s.queue_flight_state(now_ms);
-        if let Some(pkt) = s.queued.pop_front() {
+        if let Some(pkt) = s.pop_next_queued() {
             return Ok(pkt);
         }
     }
 
     if now_ms.saturating_sub(s.last_sensor_emit_ms) < SENSOR_PERIOD_MS {
         // Keep packets flowing even under very fast poll cadence.
-        return s.next_sensor_packet(now_ms);
+        let pkt = s.next_sensor_packet(now_ms)?;
+        return Ok(s.pop_next_queued().unwrap_or(pkt));
     }
 
     s.last_sensor_emit_ms = now_ms;
-    s.next_sensor_packet(now_ms)
+    let pkt = s.next_sensor_packet(now_ms)?;
+    Ok(s.pop_next_queued().unwrap_or(pkt))
 }
 
 #[cfg(not(feature = "testing"))]
@@ -966,4 +1171,40 @@ pub fn handle_command(_cmd: &TelemetryCommand) -> bool {
 #[cfg(not(feature = "testing"))]
 pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
     unreachable!("flight sim only available with testing feature")
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "testing")]
+    #[test]
+    fn flight_computer_simulated_endpoints_include_sd_card() {
+        let endpoints = super::simulated_board_endpoints(crate::types::Board::FlightComputer);
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint == sedsprintf_rs_2026::config::DataEndpoint::SdCard.as_str()
+        }));
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn relay_boards_have_no_simulated_endpoints() {
+        assert!(super::simulated_board_endpoints(crate::types::Board::RFBoard).is_empty());
+        assert!(super::simulated_board_endpoints(crate::types::Board::GatewayBoard).is_empty());
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn queued_flight_state_is_prioritized_for_launch_clock_sync() {
+        let mut sim = super::FlightSimState::new();
+        sim.queue_umbilical_status(super::ActuatorBoardCommands::IgniterOn as u8, true, 1_000);
+        sim.queue_flight_state(1_000);
+
+        let pkt = sim
+            .pop_next_queued()
+            .expect("queued flight state packet should be returned");
+
+        assert_eq!(
+            pkt.data_type(),
+            sedsprintf_rs_2026::config::DataType::FlightState
+        );
+    }
 }

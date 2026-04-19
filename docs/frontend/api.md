@@ -48,7 +48,8 @@ Purpose:
 
 Expected response:
 
-- JSON array of `TelemetryRow`.
+- Default/fallback: JSON array of `TelemetryRow`.
+- Preferred when the client sends `Accept: application/x-ndjson`: NDJSON stream with one `TelemetryRow` JSON object per line.
 
 Shape:
 
@@ -63,12 +64,23 @@ Shape:
 ]
 ```
 
+NDJSON shape:
+
+```text
+{"timestamp_ms":1742400000000,"data_type":"VALVE_STATE","sender_id":"VB","values":[1.0,0.0,0.0]}
+{"timestamp_ms":1742400000020,"data_type":"PT","sender_id":"FC","values":[512.4]}
+```
+
 Frontend expectations:
 
 - `timestamp_ms` is milliseconds since Unix epoch.
 - `data_type` is the primary routing key for widgets and charts.
 - `sender_id` must stay stable across frontend/backend/device builds.
 - `values` ordering must remain stable for a given `data_type`.
+- NDJSON mode uses `Content-Type: application/x-ndjson; charset=utf-8`.
+- Each NDJSON line is one complete `TelemetryRow` object followed by `\n`.
+- Streamed rows are not wrapped in `[` or `]`.
+- Empty history is either an empty NDJSON body or `[]` in array mode.
 
 Failure impact:
 
@@ -137,6 +149,7 @@ Frontend expectations:
 Purpose:
 
 - Provide the top-level tab list and the layout for state/data/network/calibration views.
+- Provide the backend-defined action ordering and action presentation hints.
 
 Expected response:
 
@@ -157,6 +170,14 @@ Critical expectations:
     - `network-topology`
     - `detailed`
 - Tab IDs must be unique.
+- `actions_tab.actions` order is authoritative and must be rendered in-order by the frontend.
+- Action layout entries may include:
+  - `illuminated: bool` to request backend-driven default illumination for that action.
+  - `spacer_before: bool` and `spacer_after: bool` to request a visual separator around that action.
+- Action layout entries may also include row-flow hints:
+  - `new_row_before: bool` and `new_row_after: bool` to force the next action(s) onto a new row.
+  - `spacer_row_before: bool` and `spacer_row_after: bool` to insert a blank spacer row before or after an action group.
+- Frontend-specific action highlighting should not be hardcoded for particular commands; it should follow backend layout plus live `ActionPolicyMsg` updates.
 - Data tab channel labels and boolean label sets must line up with actual telemetry value ordering.
 - State widgets must reference valid data types and valid per-value indexes.
 
@@ -173,7 +194,27 @@ Purpose:
 
 Expected response:
 
-- Calibration layout JSON produced by `backend/src/loadcell.rs`.
+- Calibration layout JSON loaded by the backend from `backend/config/calibration_config.json`, or
+  from `GS_CALIBRATION_CONFIG_PATH` when set.
+- The response includes `capture_target_samples`, top-level backend-supported `fit_modes`, and
+  `sensors`.
+- Each sensor provides `id`, `label`, `data_type`, `channel`, `fit_color`, `raw_label`,
+  `expected_label`, and optional per-sensor `fit_modes`.
+- The frontend must render calibration channels, labels, colors, and regression choices from this
+  response. These values are intentionally not hard-coded in the frontend so future sensors can be
+  added by backend config.
+
+Supported regression ids:
+
+- `best`
+- `linear`
+- `linear_zero`
+- `parabolic` / `poly2`
+- `parabolic_zero` / `poly2_zero`
+- `cubic` / `poly3`
+- `cubic_zero` / `poly3_zero`
+- `quartic` / `poly4`
+- `quartic_zero` / `poly4_zero`
 
 Failure impact:
 
@@ -214,6 +255,35 @@ Expected response:
 Failure impact:
 
 - The state tab boots in a stale/default state until the backend pushes a live state update.
+
+### `GET /api/launch_clock`
+
+Purpose:
+
+- Seed the launch-clock state used by the top bar on connect and reconnect.
+
+Expected response:
+
+```json
+{
+  "kind": "t_minus",
+  "anchor_timestamp_ms": 1742400000000,
+  "duration_ms": 10000
+}
+```
+
+Clock kinds:
+
+- `idle`: no backend-started countdown is active.
+- `t_minus`: `anchor_timestamp_ms` is the backend network time when countdown started and `duration_ms` is the countdown length.
+- `t_plus`: `anchor_timestamp_ms` is T0 in backend network time and `duration_ms` is null.
+
+Frontend expectations:
+
+- Remaining T-minus time is `duration_ms - (network_now_ms - anchor_timestamp_ms)`, clamped at zero.
+- Once `t_minus` starts, the backend preserves the first countdown anchor and ignores repeated launch commands or stale prelaunch state packets that would reset it.
+- Once `t_plus` starts, the backend preserves the first T0 anchor and ignores all later attempts to reset it to idle, restart `t_minus`, or re-anchor `t_plus`.
+- Clients should keep displaying `T- 00:00.00` at countdown completion until the backend sends `t_plus`.
 
 ### `GET /api/gps`
 
@@ -331,6 +401,10 @@ Legacy aliases still exposed:
 
 These are required for the calibration tab to be interactive.
 
+Calibration documents keep legacy fields for `ch0`, `ch1`, and `iadc`. Additional channels use
+`extra_channels[channel_id]` with generic `linear`, `zero_raw`, `points`, and `fit` fields. Generic
+points use `{ "expected": number, "raw": number }`.
+
 ### `POST /api/notifications/{id}/dismiss`
 
 Purpose:
@@ -420,6 +494,7 @@ The backend sends tagged JSON objects:
 { "ty": "Warning", "data": { ... } }
 { "ty": "Error", "data": { ... } }
 { "ty": "FlightState", "data": { ... } }
+{ "ty": "LaunchClock", "data": { ... } }
 { "ty": "BoardStatus", "data": { ... } }
 { "ty": "NetworkTopology", "data": { ... } }
 { "ty": "Notifications", "data": [ ... ] }
@@ -443,6 +518,8 @@ Notes:
   Append to the respective alert lists.
 - `FlightState`
   Updates the current mission state signal.
+- `LaunchClock`
+  Replaces the current launch-clock snapshot. Semantics match `GET /api/launch_clock`.
 - `BoardStatus`
   Replaces the board-freshness view.
 - `NetworkTopology`

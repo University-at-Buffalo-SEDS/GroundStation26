@@ -33,7 +33,7 @@ impl Default for FillTargetsConfig {
             },
             nitrous: FluidFillTarget {
                 target_mass_kg: 10.0,
-                target_pressure_psi: 80.0,
+                target_pressure_psi: 745.0,
             },
         }
     }

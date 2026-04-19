@@ -2,8 +2,8 @@
   "version": 1,
   "av_bay": {
     "interface": "serial",
-    "port": "/dev/ttyAMA0",
-    "baud_rate": 57600,
+    "port": "/dev/ttyUSB0",
+    "baud_rate": 9600,
     "protocol": "raw_uart"
   },
   "fill_box": {

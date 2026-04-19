@@ -4,8 +4,8 @@ use crate::state::AppState;
 use crate::types::TelemetryCommand;
 use crate::web::{emit_error, emit_warning};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -43,6 +43,10 @@ pub const NITROUS_TANK_VALVE_LED: u8 = 13;
 pub const NORMALLY_OPEN_PIN: u8 = 26;
 pub const NORMALLY_OPEN_LED: u8 = 19;
 
+const LED_FRAME_MS: u64 = 16;
+const LED_DISABLED_BRIGHTNESS: f64 = 0.0;
+const LED_ENABLED_IDLE_BRIGHTNESS: f64 = 0.62;
+
 //####################################################################
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -73,14 +77,14 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
 
     // Outputs (LEDs + ignition line)
     gpio.setup_output_pin(IGNITION_PIN)?;
-    gpio.setup_output_pin(ABORT_PIN_LED)?;
-    gpio.setup_output_pin(LAUNCH_PIN_LED)?;
-    gpio.setup_output_pin(DUMP_PIN_LED)?;
-    gpio.setup_output_pin(NORMALLY_OPEN_LED)?;
-    gpio.setup_output_pin(RETRACT_PIN_LED)?;
-    gpio.setup_output_pin(PILOT_VALVE_LED)?;
-    gpio.setup_output_pin(NITROGEN_TANK_VALVE_LED)?;
-    gpio.setup_output_pin(NITROUS_TANK_VALVE_LED)?;
+    gpio.setup_led_pin(ABORT_PIN_LED)?;
+    gpio.setup_led_pin(LAUNCH_PIN_LED)?;
+    gpio.setup_led_pin(DUMP_PIN_LED)?;
+    gpio.setup_led_pin(NORMALLY_OPEN_LED)?;
+    gpio.setup_led_pin(RETRACT_PIN_LED)?;
+    gpio.setup_led_pin(PILOT_VALVE_LED)?;
+    gpio.setup_led_pin(NITROGEN_TANK_VALVE_LED)?;
+    gpio.setup_led_pin(NITROUS_TANK_VALVE_LED)?;
 
     setup_callbacks(&state, allowed.clone())?;
 
@@ -237,11 +241,11 @@ where
 }
 
 async fn gpio_led_task(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>) {
-    let mut tick = interval(Duration::from_millis(200));
-    let mut tick_count: u64 = 0;
+    let mut tick = interval(Duration::from_millis(LED_FRAME_MS));
+    let mut last_levels: HashMap<u8, u8> = HashMap::new();
     loop {
         tick.tick().await;
-        tick_count = tick_count.wrapping_add(1);
+        let now_ms = crate::telemetry_task::get_current_timestamp_ms();
 
         let policy = state.action_policy_snapshot();
         let actions = allowed_from_policy(&policy);
@@ -252,29 +256,53 @@ async fn gpio_led_task(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>
         }
 
         let gpio = &state.gpio;
-        set_led(gpio, ABORT_PIN_LED, led_for(&policy, "Abort", tick_count));
-        set_led(gpio, LAUNCH_PIN_LED, led_for(&policy, "Launch", tick_count));
-        set_led(gpio, DUMP_PIN_LED, led_for(&policy, "Dump", tick_count));
         set_led(
             gpio,
+            &mut last_levels,
+            ABORT_PIN_LED,
+            led_for(&policy, "Abort", now_ms),
+        );
+        set_led(
+            gpio,
+            &mut last_levels,
+            LAUNCH_PIN_LED,
+            led_for(&policy, "Launch", now_ms),
+        );
+        set_led(
+            gpio,
+            &mut last_levels,
+            DUMP_PIN_LED,
+            led_for(&policy, "Dump", now_ms),
+        );
+        set_led(
+            gpio,
+            &mut last_levels,
             NORMALLY_OPEN_LED,
-            led_for(&policy, "NormallyOpen", tick_count),
+            led_for(&policy, "NormallyOpen", now_ms),
         );
-        set_led(gpio, PILOT_VALVE_LED, led_for(&policy, "Pilot", tick_count));
         set_led(
             gpio,
+            &mut last_levels,
+            PILOT_VALVE_LED,
+            led_for(&policy, "Pilot", now_ms),
+        );
+        set_led(
+            gpio,
+            &mut last_levels,
             NITROGEN_TANK_VALVE_LED,
-            led_for(&policy, "Nitrogen", tick_count),
+            led_for(&policy, "Nitrogen", now_ms),
         );
         set_led(
             gpio,
+            &mut last_levels,
             NITROUS_TANK_VALVE_LED,
-            led_for(&policy, "Nitrous", tick_count),
+            led_for(&policy, "Nitrous", now_ms),
         );
         set_led(
             gpio,
+            &mut last_levels,
             RETRACT_PIN_LED,
-            led_for(&policy, "RetractPlumbing", tick_count),
+            led_for(&policy, "RetractPlumbing", now_ms),
         );
     }
 }
@@ -301,40 +329,49 @@ fn allowed_from_policy(policy: &ActionPolicyMsg) -> AllowedActions {
     }
 }
 
-fn led_for(policy: &ActionPolicyMsg, cmd: &str, tick_count: u64) -> bool {
+fn led_for(policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -> f64 {
     let Some(control) = policy.controls.iter().find(|c| c.cmd == cmd) else {
-        return false;
+        return LED_DISABLED_BRIGHTNESS;
     };
     if !control.enabled {
-        return false;
+        return LED_DISABLED_BRIGHTNESS;
     }
-    if matches!(control.blink, BlinkMode::None) {
-        // Enabled but non-prompting controls stay dark unless currently actuated.
-        return control.actuated.unwrap_or(false);
-    }
-    blink_to_level(
-        control.blink.clone(),
-        control.actuated.unwrap_or(false),
-        tick_count,
-    )
-}
-
-fn blink_to_level(blink: BlinkMode, actuated: bool, tick_count: u64) -> bool {
-    match blink {
-        BlinkMode::None => true,
-        BlinkMode::Slow => {
-            let phase = tick_count % 10;
-            if actuated { phase < 8 } else { phase < 2 }
-        }
-        BlinkMode::Fast => {
-            let phase = tick_count % 4;
-            if actuated { phase < 3 } else { phase < 2 }
-        }
+    let recommended = !matches!(control.blink, BlinkMode::None);
+    if recommended {
+        blink_brightness(control.blink.clone(), control.actuated, now_ms)
+    } else if control.actuated.unwrap_or(false) {
+        1.0
+    } else {
+        LED_ENABLED_IDLE_BRIGHTNESS
     }
 }
 
-fn set_led(gpio: &crate::gpio::GpioPins, pin: u8, on: bool) {
-    if let Err(e) = gpio.write_output_pin(pin, on) {
-        eprintln!("GPIO LED pin {pin} write failed: {e}");
+fn blink_brightness(blink: BlinkMode, actuated: Option<bool>, now_ms: u64) -> f64 {
+    let (period_ms, dim, bright, invert) = match (blink, actuated.unwrap_or(false)) {
+        (BlinkMode::None, _) => return 1.0,
+        (BlinkMode::Slow, false) => (1_800_u64, 0.2, 1.0, false),
+        (BlinkMode::Slow, true) => (1_800_u64, 0.25, 1.0, true),
+        (BlinkMode::Fast, false) => (600_u64, 0.15, 1.0, false),
+        (BlinkMode::Fast, true) => (600_u64, 0.2, 1.0, true),
+    };
+    let phase = (now_ms % period_ms) as f64 / period_ms as f64;
+    let wave = 0.5 - 0.5 * (std::f64::consts::TAU * phase).cos();
+    let pulse = if invert { 1.0 - wave } else { wave };
+    dim + (bright - dim) * pulse
+}
+
+fn set_led(
+    gpio: &crate::gpio::GpioPins,
+    last_levels: &mut HashMap<u8, u8>,
+    pin: u8,
+    brightness: f64,
+) {
+    let quantized = (brightness.clamp(0.0, 1.0) * 255.0).round() as u8;
+    if last_levels.get(&pin).copied() == Some(quantized) {
+        return;
+    }
+    last_levels.insert(pin, quantized);
+    if let Err(e) = gpio.write_led_brightness(pin, f64::from(quantized) / 255.0) {
+        eprintln!("GPIO LED pin {pin} PWM write failed: {e}");
     }
 }

@@ -49,11 +49,13 @@ Responsibilities:
 - hold recent telemetry cache
 - hold notifications and action policy
 - hold network topology snapshot state
+- hold the launch-clock snapshot and enforce monotonic T-minus/T-plus transitions
 - provide broadcast channels used by websocket and tasks
 
 Why it matters:
 
 - almost every backend subsystem touches `AppState`
+- launch-clock updates are normalized here so stale packets or repeated commands cannot reset an active countdown or T-plus anchor
 
 ### `backend/src/telemetry_task.rs`
 
@@ -84,6 +86,7 @@ Responsibilities:
 
 - define the HTTP router
 - expose bootstrap endpoints such as `/api/recent`, `/api/layout`, `/api/boards`, `/flightstate`
+- support `/api/recent` as either the legacy JSON array response or an opt-in NDJSON stream for faster reseed startup
 - expose calibration and diagnostics endpoints
 - expose `/ws` for live websocket updates
 - serve tiles, favicon, and static frontend assets
@@ -192,6 +195,9 @@ Responsibilities:
 - load/save calibration files
 - implement capture-zero, capture-span, and refit logic
 - expose calibration tab layout config used by the frontend
+- load calibration UI sensor/channel metadata from `backend/config/calibration_config.json` or
+  `GS_CALIBRATION_CONFIG_PATH`
+- support backend-declared regression modes, including linear, parabolic, cubic, and quartic fits
 
 ### `backend/src/layout.rs`
 

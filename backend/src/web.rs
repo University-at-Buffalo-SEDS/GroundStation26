@@ -4,42 +4,46 @@ use crate::flight_setup::{self, FlightSetupConfig};
 use crate::i18n::{self, TranslateRequest, TranslateResponse, TranslationCatalogResponse};
 use crate::layout;
 use crate::loadcell;
-use crate::map::{detect_max_native_zoom, tile_bundle_path, DEFAULT_MAP_REGION};
-use crate::sequences::{command_name, ActionPolicyMsg, PersistentNotification};
+use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_bundle_path};
+use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::state::AppState;
+use crate::telemetry_db::{DbQueueItem, DbWrite, LaunchClockMsg, RecordingStatusMsg};
 use crate::types::{
     BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryCommand, TelemetryRow,
 };
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::body::Body;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::{
-    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade}, extract::{Path, Query, State},
-    response::IntoResponse,
+    Json, Router,
+    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+    extract::{Path, Query, State},
+    response::{IntoResponse, Response},
     routing::{get, get_service, post},
-    Json,
-    Router,
 };
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, TryStreamExt, stream};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::Row;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::{OnceCell, mpsc};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 // NEW
 
-static FAVICON_DATA: OnceCell<Vec<u8>> = OnceCell::const_new();
+static FAVICON_DATA: OnceCell<Option<Vec<u8>>> = OnceCell::const_new();
 static TILE_DB_POOL: OnceCell<Option<sqlx::SqlitePool>> = OnceCell::const_new();
 static TILE_DB_MODE: OnceCell<TileDbMode> = OnceCell::const_new();
 const RECENT_HISTORY_MS: i64 = 20 * 60 * 1000;
 const RECENT_BUCKET_MS: i64 = 20;
+const SOFTWARE_COMMAND_DEDUP_MS_DEFAULT: u64 = 500;
 
 #[derive(Clone, Copy)]
 enum TileDbMode {
@@ -55,6 +59,13 @@ struct TranslationCatalogQuery {
 
 fn default_translation_lang() -> String {
     "en".to_string()
+}
+
+fn software_command_dedup_ms() -> u64 {
+    std::env::var("GS_SOFTWARE_COMMAND_DEDUP_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(SOFTWARE_COMMAND_DEDUP_MS_DEFAULT)
 }
 
 /// Extracts the numeric telemetry payload from either the newer JSON column or the legacy blob.
@@ -114,6 +125,19 @@ fn compact_recent_rows(rows: Vec<TelemetryRow>, cutoff: i64) -> Vec<TelemetryRow
     rows
 }
 
+fn wants_ndjson(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|mime| mime.starts_with("application/x-ndjson"))
+        })
+        .unwrap_or(false)
+}
+
 /// Public router constructor
 pub fn router(state: Arc<AppState>) -> Router {
     let spa_index = ServeFile::new("./frontend/dist/public/index.html");
@@ -124,8 +148,13 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .layer(CompressionLayer::new())
         .route("/", get_service(spa_index.clone()))
+        .route("/connect", get_service(spa_index.clone()))
         .route("/login", get_service(spa_index.clone()))
         .route("/dashboard", get_service(spa_index))
+        .route(
+            "/version",
+            get_service(ServeFile::new("./frontend/dist/public/index.html")),
+        )
         .route("/api/auth/login", post(login))
         .route("/api/auth/session", get(get_session_status))
         .route("/api/auth/logout", post(logout))
@@ -162,7 +191,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/calibration/capture_span", post(capture_loadcell_span))
         .route("/api/calibration/refit", post(refit_loadcell_channel))
         .route("/api/network_time", get(get_network_time))
+        .route("/api/launch_clock", get(get_launch_clock))
         .route("/api/network_topology", get(get_network_topology))
+        .route("/api/recording_status", get(get_recording_status))
         .route("/api/notifications", get(get_notifications))
         .route(
             "/api/notifications/{id}/dismiss",
@@ -222,6 +253,18 @@ async fn authorize_headers(
         .map_err(auth_failure_response)
 }
 
+fn calibration_edit_forbidden_response() -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        "calibration editing is restricted to the rylan user",
+    )
+        .into_response()
+}
+
+fn principal_can_edit_calibration(principal: &crate::auth::AuthPrincipal) -> bool {
+    principal.calibration_access.edit
+}
+
 /// Creates a new authenticated session from username/password credentials.
 async fn login(
     State(state): State<Arc<AppState>>,
@@ -270,11 +313,14 @@ pub enum WsOutMsg {
     TelemetryBatch(Vec<TelemetryRow>),
     Warning(WarningMsg),
     FlightState(FlightStateMsg),
+    LaunchClock(LaunchClockMsg),
     Error(ErrorMsg),
     BoardStatus(BoardStatusMsg),
     NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
+    FillTargets(FillTargetsConfig),
+    RecordingStatus(RecordingStatusMsg),
     NetworkTime(NetworkTimeMsg),
 }
 
@@ -343,6 +389,7 @@ async fn get_valve_state(
         return response;
     }
     // Latest valve state row: data_type = 'VALVE_STATE'
+    let db = state.telemetry_db_pool();
     let row = sqlx::query(
         r#"
         SELECT timestamp_ms, values_json, payload_json
@@ -352,7 +399,7 @@ async fn get_valve_state(
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
+    .fetch_optional(&db)
     .await
     .unwrap_or(None);
 
@@ -381,17 +428,18 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-    // Latest GPS row: assumes `data_type = 'GPS'`
+    let db = state.telemetry_db_pool();
+    // Prefer the normalized GPS stream, but keep compatibility with older row tags.
     let row = sqlx::query(
         r#"
         SELECT values_json, payload_json
         FROM telemetry
-        WHERE data_type = 'GPS'
+        WHERE data_type IN ('GPS_DATA', 'GPS', 'ROCKET_GPS')
         ORDER BY timestamp_ms DESC
         LIMIT 1
         "#,
     )
-    .fetch_optional(&state.db)
+    .fetch_optional(&db)
     .await
     .unwrap_or(None);
 
@@ -444,18 +492,16 @@ async fn post_translate_texts(
 
 /// Returns the UI layout metadata for the loadcell calibration tab.
 async fn get_calibration_config(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    State(_state): State<Arc<AppState>>,
+    _headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
-        return response;
-    }
     Json(loadcell::calibration_tab_layout()).into_response()
 }
 
 #[derive(Serialize)]
 struct MapConfigDto {
     max_native_zoom: u32,
+    max_display_zoom: u32,
     default_center_lat: f64,
     default_center_lon: f64,
     default_zoom: f64,
@@ -482,6 +528,7 @@ async fn get_map_config(
 
     Json(MapConfigDto {
         max_native_zoom,
+        max_display_zoom: max_native_zoom.saturating_add(1),
         default_center_lat: 31.0,
         default_center_lon: -99.0,
         default_zoom: 7.0,
@@ -513,11 +560,8 @@ struct RefitLoadcellReq {
 /// Returns the in-memory loadcell calibration file.
 async fn get_loadcell_calibration(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
-        return response;
-    }
     Json(state.loadcell_calibration.lock().unwrap().clone()).into_response()
 }
 
@@ -527,8 +571,12 @@ async fn set_loadcell_calibration(
     headers: HeaderMap,
     Json(cfg): Json<loadcell::LoadcellCalibrationFile>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
-        return response;
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal_can_edit_calibration(&principal) {
+        return calibration_edit_forbidden_response();
     }
     {
         let mut slot = state.loadcell_calibration.lock().unwrap();
@@ -537,6 +585,7 @@ async fn set_loadcell_calibration(
     if let Err(err) = loadcell::save(&cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
     }
+    state.broadcast_fill_targets_snapshot();
     Json(cfg).into_response()
 }
 
@@ -546,8 +595,12 @@ async fn capture_loadcell_zero(
     headers: HeaderMap,
     Json(req): Json<CaptureLoadcellPointReq>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
-        return response;
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal_can_edit_calibration(&principal) {
+        return calibration_edit_forbidden_response();
     }
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
@@ -557,6 +610,7 @@ async fn capture_loadcell_zero(
     if let Err(err) = loadcell::save(&updated) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
     }
+    state.broadcast_fill_targets_snapshot();
     Json(updated).into_response()
 }
 
@@ -566,8 +620,12 @@ async fn capture_loadcell_span(
     headers: HeaderMap,
     Json(req): Json<CaptureLoadcellSpanReq>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
-        return response;
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal_can_edit_calibration(&principal) {
+        return calibration_edit_forbidden_response();
     }
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
@@ -577,6 +635,7 @@ async fn capture_loadcell_span(
     if let Err(err) = loadcell::save(&updated) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
     }
+    state.broadcast_fill_targets_snapshot();
     Json(updated).into_response()
 }
 
@@ -586,12 +645,14 @@ async fn refit_loadcell_channel(
     headers: HeaderMap,
     Json(req): Json<RefitLoadcellReq>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
-        return response;
-    }
-    let Some(channel) = loadcell::CalibrationChannel::from_str(req.channel.trim()) else {
-        return (StatusCode::BAD_REQUEST, "invalid channel".to_string()).into_response();
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
     };
+    if !principal_can_edit_calibration(&principal) {
+        return calibration_edit_forbidden_response();
+    }
+    let channel = loadcell::CalibrationChannel::from_str(req.channel.trim());
     let Some(mode) = loadcell::FitMode::from_str(req.mode.trim()) else {
         return (StatusCode::BAD_REQUEST, "invalid fit mode".to_string()).into_response();
     };
@@ -607,6 +668,7 @@ async fn refit_loadcell_channel(
     if let Err(err) = loadcell::save(&updated) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
     }
+    state.broadcast_fill_targets_snapshot();
     Json(updated).into_response()
 }
 
@@ -618,8 +680,22 @@ async fn get_tile_jpg(Path((z, x, y_raw)): Path<(u32, u32, String)>) -> impl Int
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    if let Some(bytes) = read_tile_with_fallback(z, x, y).await {
-        return ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response();
+    if let Some(tile) = read_tile_with_fallback(z, x, y).await {
+        let source_value = match tile.source {
+            TileResponseSource::Exact => "exact".to_string(),
+            TileResponseSource::Fallback { ancestor_z } => format!("fallback:{ancestor_z}"),
+        };
+        return (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (
+                    header::HeaderName::from_static("x-gs26-tile-source"),
+                    source_value.as_str(),
+                ),
+            ],
+            tile.bytes,
+        )
+            .into_response();
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -738,10 +814,25 @@ async fn read_exact_tile(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
     }
 }
 
+#[derive(Clone, Debug)]
+enum TileResponseSource {
+    Exact,
+    Fallback { ancestor_z: u32 },
+}
+
+#[derive(Clone, Debug)]
+struct TileResponse {
+    bytes: Vec<u8>,
+    source: TileResponseSource,
+}
+
 /// Walks up the tile pyramid until it can synthesize a usable child tile.
-async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
+async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<TileResponse> {
     if let Some(bytes) = read_exact_tile(z, x, y).await {
-        return Some(bytes);
+        return Some(TileResponse {
+            bytes,
+            source: TileResponseSource::Exact,
+        });
     }
 
     let mut az = z;
@@ -755,7 +846,12 @@ async fn read_tile_with_fallback(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
             continue;
         };
         match synthesize_zoom_tile_from_ancestor(&parent_bytes, az, ax, ay, z, x, y) {
-            Ok(bytes) => return Some(bytes),
+            Ok(bytes) => {
+                return Some(TileResponse {
+                    bytes,
+                    source: TileResponseSource::Fallback { ancestor_z: az },
+                });
+            }
             Err(err) => {
                 eprintln!(
                     "WARNING: failed synthesizing fallback tile z={z} x={x} y={y} from ancestor z={az} x={ax} y={ay}: {err}"
@@ -819,10 +915,14 @@ fn synthesize_zoom_tile_from_ancestor(
 }
 
 /// Returns the recent telemetry window, preferring the in-memory cache to cover DB write lag.
-async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
+    if wants_ndjson(&headers) {
+        return stream_recent_rows_response(state).await;
+    }
+
     let cache_snapshot = state.recent_telemetry_snapshot();
     let latest_cache_ts = cache_snapshot.last().map(|r| r.timestamp_ms);
     let oldest_cache_ts = cache_snapshot.first().map(|r| r.timestamp_ms);
@@ -850,9 +950,10 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
         return Json(compact_recent_rows(merged_rows, cutoff)).into_response();
     }
 
+    let db = state.telemetry_db_pool();
     let Some(now_ms) =
         sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(timestamp_ms) FROM telemetry")
-            .fetch_one(&state.db)
+            .fetch_one(&db)
             .await
             .ok()
             .flatten()
@@ -865,6 +966,110 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
         cutoff,
     ))
     .into_response()
+}
+
+async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
+    let cache_snapshot = state.recent_telemetry_snapshot();
+    let latest_cache_ts = cache_snapshot.last().map(|r| r.timestamp_ms);
+    let oldest_cache_ts = cache_snapshot.first().map(|r| r.timestamp_ms);
+
+    let now_ms = if let Some(now_ms) = latest_cache_ts {
+        now_ms
+    } else {
+        let db = state.telemetry_db_pool();
+        if let Some(now_ms) =
+            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(timestamp_ms) FROM telemetry")
+                .fetch_one(&db)
+                .await
+                .ok()
+                .flatten()
+        {
+            now_ms
+        } else {
+            return (
+                [(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
+                Body::empty(),
+            )
+                .into_response();
+        }
+    };
+
+    let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
+    let cache_covers_window = latest_cache_ts.is_some()
+        && oldest_cache_ts.is_some_and(|oldest| oldest <= cutoff + RECENT_BUCKET_MS);
+    let db_end_ms = if cache_covers_window {
+        None
+    } else {
+        oldest_cache_ts
+            .unwrap_or(now_ms)
+            .checked_sub(1)
+            .filter(|end_ms| *end_ms >= cutoff)
+    };
+
+    let state_for_task = Arc::clone(&state);
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+    tokio::spawn(async move {
+        if let Some(end_ms) = db_end_ms {
+            let db = state_for_task.telemetry_db_pool();
+            let mut rows = sqlx::query(
+                r#"
+                SELECT
+                    timestamp_ms,
+                    data_type,
+                    sender_id,
+                    values_json,
+                    payload_json
+                FROM telemetry
+                WHERE timestamp_ms BETWEEN ? AND ?
+                ORDER BY timestamp_ms ASC
+                "#,
+            )
+            .bind(cutoff)
+            .bind(end_ms)
+            .fetch(&db);
+
+            while let Ok(Some(row)) = rows.try_next().await {
+                let telemetry_row = TelemetryRow {
+                    timestamp_ms: row.get::<i64, _>("timestamp_ms"),
+                    data_type: row.get::<String, _>("data_type"),
+                    sender_id: row.get::<String, _>("sender_id"),
+                    values: values_from_row(&row),
+                };
+                if send_ndjson_row(&tx, &telemetry_row).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        for row in cache_snapshot {
+            if row.timestamp_ms < cutoff || row.timestamp_ms > now_ms {
+                continue;
+            }
+            if send_ndjson_row(&tx, &row).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let body_stream = stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|chunk| (Ok::<Vec<u8>, Infallible>(chunk), rx))
+    });
+
+    (
+        [(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
+        Body::from_stream(body_stream),
+    )
+        .into_response()
+}
+
+async fn send_ndjson_row(tx: &mpsc::Sender<Vec<u8>>, row: &TelemetryRow) -> Result<(), ()> {
+    let Ok(mut bytes) = serde_json::to_vec(row) else {
+        return Ok(());
+    };
+    bytes.push(b'\n');
+    tx.send(bytes).await.map_err(|_| ())
 }
 
 /// Loads telemetry rows for a bounded time range directly from SQLite.
@@ -892,7 +1097,7 @@ async fn load_recent_rows_from_db(
     )
     .bind(start_ms)
     .bind(end_ms)
-    .fetch_all(&state.db)
+    .fetch_all(&state.telemetry_db_pool())
     .await
     .unwrap_or_default();
 
@@ -910,20 +1115,34 @@ async fn load_recent_rows_from_db(
 
 /// Serves the app icon and caches it after the first disk read.
 async fn get_favicon() -> impl IntoResponse {
-    // Load the favicon into memory on first request, reuse later
     let bytes = FAVICON_DATA
         .get_or_init(|| async {
-            // Adjust this path if needed
-            let path: PathBuf = "./frontend/assets/icon.png".into();
-            tokio::fs::read(&path)
-                .await
-                .unwrap_or_else(|e| panic!("failed to read favicon at {:?}: {e}", path))
+            let candidates: [PathBuf; 3] = [
+                "./frontend/dist/public/icon.png".into(),
+                "./frontend/dist/public/assets/icon.png".into(),
+                "./frontend/dist/public/favicon.png".into(),
+            ];
+            for path in candidates {
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => return Some(bytes),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        eprintln!("failed to read favicon at {:?}: {err}", path);
+                        return None;
+                    }
+                }
+            }
+            None
         })
         .await
         .clone();
 
-    // Return as an image/png response
-    ([(header::CONTENT_TYPE, "image/png")], bytes)
+    match bytes {
+        Some(bytes) => {
+            (StatusCode::OK, [(header::CONTENT_TYPE, "image/png")], bytes).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 /// Returns the latest persisted flight-state enum value.
 async fn get_flight_state(
@@ -936,7 +1155,7 @@ async fn get_flight_state(
     // get the state from the db
     let flight_state: i64 =
         match sqlx::query("SELECT f_state FROM flight_state ORDER BY timestamp_ms DESC LIMIT 1")
-            .fetch_one(&state.db)
+            .fetch_one(&state.telemetry_db_pool())
             .await
         {
             Ok(data) => data.get::<i64, _>("f_state"),
@@ -959,6 +1178,26 @@ async fn get_network_time(
         timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
     })
     .into_response()
+}
+
+async fn get_launch_clock(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(state.launch_clock_snapshot()).into_response()
+}
+
+async fn get_recording_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(state.recording_status_snapshot()).into_response()
 }
 
 /// Returns the current list of operator notifications.
@@ -1037,7 +1276,7 @@ async fn get_fill_targets(
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-    Json(fill_targets::load_or_default()).into_response()
+    Json(state.fill_targets_snapshot()).into_response()
 }
 
 /// Persists the local fill targets used by the Ground Station fill sequence.
@@ -1054,7 +1293,11 @@ async fn set_fill_targets(
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
     match fill_targets::save(&cfg) {
-        Ok(()) => Json(fill_targets::load_or_default()).into_response(),
+        Ok(()) => {
+            let saved = fill_targets::load_or_default();
+            state.set_fill_targets(saved.clone());
+            Json(saved).into_response()
+        }
         Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
     }
 }
@@ -1163,6 +1406,11 @@ async fn send_command(
         );
         return (StatusCode::FORBIDDEN, "command disabled");
     }
+    let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+    if !state.record_software_command_if_fresh(&cmd, now_ms, software_command_dedup_ms()) {
+        gs_debug_println!("Ignored duplicate software command {cmd:?}");
+        return (StatusCode::OK, "duplicate ignored");
+    }
     let _ = state.cmd_tx.send(cmd).await;
     (StatusCode::OK, "ok")
 }
@@ -1202,9 +1450,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let mut warnings_rx = state.warnings_tx.subscribe();
     let mut errors_rx = state.errors_tx.subscribe();
     let mut state_rx = state.state_tx.subscribe();
+    let mut launch_clock_rx = state.launch_clock_tx.subscribe();
     let mut board_status_rx = state.board_status_tx.subscribe();
     let mut notifications_rx = state.notifications_tx.subscribe();
     let mut action_policy_rx = state.action_policy_tx.subscribe();
+    let mut fill_targets_rx = state.fill_targets_tx.subscribe();
+    let mut recording_status_rx = state.recording_status_tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
     let state_for_send = state.clone();
@@ -1244,6 +1495,27 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_action_policy).await.is_err() {
+            return;
+        }
+        let initial_fill_targets = serde_json::to_string(&WsOutMsg::FillTargets(
+            state_for_send.fill_targets_snapshot(),
+        ))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_fill_targets).await.is_err() {
+            return;
+        }
+        let initial_launch_clock = serde_json::to_string(&WsOutMsg::LaunchClock(
+            state_for_send.launch_clock_snapshot(),
+        ))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_launch_clock).await.is_err() {
+            return;
+        }
+        let initial_recording_status = serde_json::to_string(&WsOutMsg::RecordingStatus(
+            state_for_send.recording_status_snapshot(),
+        ))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_recording_status).await.is_err() {
             return;
         }
         let initial_network_topology = serde_json::to_string(&WsOutMsg::NetworkTopology(
@@ -1336,6 +1608,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     }
                 }
 
+                recv = launch_clock_rx.recv() => {
+                    match recv {
+                        Ok(clock) => {
+                            let msg = WsOutMsg::LaunchClock(clock);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
                 recv = board_status_rx.recv() => {
                     match recv {
                         Ok(status) => {
@@ -1377,6 +1663,34 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     match recv {
                         Ok(policy) => {
                             let msg = WsOutMsg::ActionPolicy(policy);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = fill_targets_rx.recv() => {
+                    match recv {
+                        Ok(targets) => {
+                            let msg = WsOutMsg::FillTargets(targets);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = recording_status_rx.recv() => {
+                    match recv {
+                        Ok(status) => {
+                            let msg = WsOutMsg::RecordingStatus(status);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;
@@ -1490,12 +1804,26 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             );
                             continue;
                         }
-                        if let Err(e) = cmd_tx.send(cmd.cmd).await {
-                            println!("Failed to forward WS command to cmd_tx: {e}");
+                        let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+                        if !state_for_recv.record_software_command_if_fresh(
+                            &cmd.cmd,
+                            now_ms,
+                            software_command_dedup_ms(),
+                        ) {
+                            gs_debug_println!("Ignored duplicate websocket command {:?}", cmd.cmd);
+                            continue;
+                        }
+                        let received_cmd = cmd.cmd;
+                        gs_debug_println!(
+                            "\x1b[32mWebsocket command received: {:?}\x1b[0m",
+                            received_cmd
+                        );
+                        if let Err(e) = cmd_tx.send(received_cmd).await {
+                            gs_debug_println!("Failed to forward WS command to cmd_tx: {e}");
                         }
                     }
                     Err(e) => {
-                        println!("Invalid WS command JSON {text:?}: {e}");
+                        gs_debug_println!("Invalid WS command JSON {text:?}: {e}");
                     }
                 }
             }
@@ -1524,8 +1852,9 @@ async fn get_alerts(
         return response;
     }
     let minutes = params.minutes.unwrap_or(20);
+    let db = state.telemetry_db_pool();
     let latest_db_ts: Option<i64> = sqlx::query_scalar("SELECT MAX(timestamp_ms) FROM alerts")
-        .fetch_one(&state.db)
+        .fetch_one(&db)
         .await
         .ok()
         .flatten();
@@ -1550,7 +1879,7 @@ async fn get_alerts(
     )
     .bind(cutoff)
     .bind(now_ms)
-    .fetch_all(&state.db)
+    .fetch_all(&db)
     .await
     .unwrap_or_default();
 
@@ -1603,23 +1932,15 @@ fn spawn_alert_insert(
         severity: severity.to_string(),
         message: message.clone(),
     });
-    state.begin_db_write();
-    let db = state.db.clone();
-    let state_for_task = state.clone();
-
+    let tx = state.db_queue_tx.clone();
     tokio::spawn(async move {
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO alerts (timestamp_ms, severity, message)
-            VALUES (?, ?, ?)
-            "#,
-        )
-        .bind(timestamp_ms)
-        .bind(severity)
-        .bind(message)
-        .execute(&db)
-        .await;
-        state_for_task.end_db_write();
+        let _ = tx
+            .send(DbQueueItem::Write(DbWrite::Alert {
+                timestamp_ms,
+                severity: severity.to_string(),
+                message,
+            }))
+            .await;
     });
 }
 

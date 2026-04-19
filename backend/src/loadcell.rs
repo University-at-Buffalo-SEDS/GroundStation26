@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const DEFAULT_FULL_MASS_KG: f32 = 10.0;
@@ -12,10 +13,12 @@ pub const DERIVED_FILL_PERCENT_DATA_TYPE: &str = "LOADCELL_FILL_PERCENT";
 pub const DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE: &str = "PRESSURE_TRANSDUCER_CALIBRATED";
 #[cfg(feature = "testing")]
 const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration_testing.json";
-#[cfg(not(feature = "testing"))]
+#[cfg(all(not(feature = "testing"), feature = "test_fire_mode"))]
+const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration_test_fire.json";
+#[cfg(all(not(feature = "testing"), not(feature = "test_fire_mode")))]
 const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration.json";
 
-const ALL_CALIBRATION_FIT_MODES: [&str; 7] = [
+const ALL_CALIBRATION_FIT_MODES: [&str; 9] = [
     "best",
     "linear",
     "linear_zero",
@@ -23,23 +26,23 @@ const ALL_CALIBRATION_FIT_MODES: [&str; 7] = [
     "parabolic_zero",
     "cubic",
     "cubic_zero",
+    "quartic",
+    "quartic_zero",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CalibrationChannel {
-    Ch0,
-    Ch1,
-    Iadc,
+    Custom(String),
 }
 
 impl CalibrationChannel {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "50kg" | "KG50" | "ch0" | "CH0" => Some(Self::Ch0),
-            "1000kg" | "KG1000" | "ch1" | "CH1" => Some(Self::Ch1),
-            "Tank Pressure" | "IADC" | "iadc" => Some(Self::Iadc),
-            _ => None,
-        }
+    pub fn from_str(s: &str) -> Self {
+        let trimmed = s.trim();
+        Self::Custom(if trimmed.is_empty() {
+            "unknown".to_string()
+        } else {
+            trimmed.to_string()
+        })
     }
 }
 
@@ -52,6 +55,8 @@ pub enum FitMode {
     Poly2Zero,
     Poly3,
     Poly3Zero,
+    Poly4,
+    Poly4Zero,
 }
 
 impl FitMode {
@@ -64,6 +69,8 @@ impl FitMode {
             "poly2_zero" | "parabolic_zero" | "quadratic_zero" => Some(Self::Poly2Zero),
             "poly3" | "cubic" => Some(Self::Poly3),
             "poly3_zero" | "cubic_zero" => Some(Self::Poly3Zero),
+            "poly4" | "quartic" => Some(Self::Poly4),
+            "poly4_zero" | "quartic_zero" => Some(Self::Poly4Zero),
             _ => None,
         }
     }
@@ -83,6 +90,7 @@ pub struct FitMeta {
     pub b: Option<f32>,
     pub c: Option<f32>,
     pub d: Option<f32>,
+    pub e: Option<f32>,
     pub x0: Option<f32>,
 }
 
@@ -102,6 +110,24 @@ pub struct PointCh1 {
 pub struct PointIadc {
     pub expected: f32,
     pub iadc_raw: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CalibrationPoint {
+    pub expected: f32,
+    pub raw: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GenericCalibrationChannel {
+    #[serde(default)]
+    pub linear: ChannelLinear,
+    #[serde(default)]
+    pub zero_raw: Option<f32>,
+    #[serde(default)]
+    pub points: Vec<CalibrationPoint>,
+    #[serde(default)]
+    pub fit: Option<FitMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +162,8 @@ pub struct LoadcellCalibrationFile {
     pub iadc_fit: Option<FitMeta>,
     #[serde(default)]
     pub weights_kg: Vec<f32>,
+    #[serde(default)]
+    pub extra_channels: BTreeMap<String, GenericCalibrationChannel>,
 }
 
 impl Default for LoadcellCalibrationFile {
@@ -174,6 +202,7 @@ impl Default for LoadcellCalibrationFile {
                 ..FitMeta::default()
             }),
             weights_kg: Vec::new(),
+            extra_channels: BTreeMap::new(),
         }
     }
 }
@@ -182,18 +211,22 @@ fn default_calibration_version() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationSensorSpec {
     pub id: String,
     pub label: String,
     pub data_type: String,
     pub channel: String,
+    pub fit_color: String,
+    pub raw_label: String,
+    pub expected_label: String,
     pub fit_modes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationTabLayout {
     pub capture_target_samples: usize,
+    pub fit_modes: Vec<String>,
     pub sensors: Vec<CalibrationSensorSpec>,
 }
 
@@ -202,14 +235,21 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+    if let Some(config) = load_calibration_tab_layout_from_file() {
+        return config;
+    }
     CalibrationTabLayout {
         capture_target_samples: CALIBRATION_CAPTURE_TARGET_SAMPLES,
+        fit_modes: fit_modes.clone(),
         sensors: vec![
             CalibrationSensorSpec {
                 id: "KG50".to_string(),
                 label: "50kg".to_string(),
                 data_type: "KG50".to_string(),
                 channel: "ch0".to_string(),
+                fit_color: "#f59e0b".to_string(),
+                raw_label: "Raw".to_string(),
+                expected_label: "kg".to_string(),
                 fit_modes: fit_modes.clone(),
             },
             CalibrationSensorSpec {
@@ -217,6 +257,9 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                 label: "1000kg".to_string(),
                 data_type: "KG1000".to_string(),
                 channel: "ch1".to_string(),
+                fit_color: "#22d3ee".to_string(),
+                raw_label: "Raw".to_string(),
+                expected_label: "kg".to_string(),
                 fit_modes: fit_modes.clone(),
             },
             CalibrationSensorSpec {
@@ -224,10 +267,28 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                 label: "Tank Pressure".to_string(),
                 data_type: "FUEL_TANK_PRESSURE".to_string(),
                 channel: "iadc".to_string(),
+                fit_color: "#a78bfa".to_string(),
+                raw_label: "Raw".to_string(),
+                expected_label: "psi".to_string(),
                 fit_modes,
             },
         ],
     }
+}
+
+fn calibration_config_path() -> PathBuf {
+    if let Ok(path) = std::env::var("GS_CALIBRATION_CONFIG_PATH") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("config")
+        .join("calibration_config.json")
+}
+
+fn load_calibration_tab_layout_from_file() -> Option<CalibrationTabLayout> {
+    let path = calibration_config_path();
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<CalibrationTabLayout>(&raw).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,9 +316,9 @@ fn calibration_path() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     #[cfg(feature = "testing")]
     {
-        return manifest_dir
+        manifest_dir
             .join("calibration")
-            .join(DEFAULT_LOADCELL_CALIBRATION_FILENAME);
+            .join(DEFAULT_LOADCELL_CALIBRATION_FILENAME)
     }
     #[cfg(not(feature = "testing"))]
     {
@@ -298,7 +359,7 @@ fn from_old_format(old: OldCalibrationFile) -> LoadcellCalibrationFile {
 
 pub fn load_or_default() -> LoadcellCalibrationFile {
     let path = calibration_path();
-    let cfg = std::fs::read_to_string(&path)
+    let mut cfg = std::fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str::<LoadcellCalibrationFile>(&raw).ok())
         .or_else(|| {
@@ -308,8 +369,74 @@ pub fn load_or_default() -> LoadcellCalibrationFile {
                 .map(from_old_format)
         })
         .unwrap_or_default();
+    sync_legacy_channels_into_extra(&mut cfg);
     let _ = save(&cfg);
     cfg
+}
+
+fn sync_legacy_channels_into_extra(cfg: &mut LoadcellCalibrationFile) {
+    let ch0 = cfg.extra_channels.entry("ch0".to_string()).or_default();
+    if ch0.points.is_empty() && !cfg.points.is_empty() {
+        ch0.points = cfg
+            .points
+            .iter()
+            .map(|point| CalibrationPoint {
+                expected: point.kg,
+                raw: point.ch0_raw,
+            })
+            .collect();
+    }
+    if ch0.linear.m.is_none() && ch0.linear.b.is_none() {
+        ch0.linear = cfg.ch0.clone();
+    }
+    if ch0.zero_raw.is_none() {
+        ch0.zero_raw = cfg.ch0_zero_raw;
+    }
+    if ch0.fit.is_none() {
+        ch0.fit = cfg.ch0_fit.clone();
+    }
+
+    let ch1 = cfg.extra_channels.entry("ch1".to_string()).or_default();
+    if ch1.points.is_empty() && !cfg.points_ch1.is_empty() {
+        ch1.points = cfg
+            .points_ch1
+            .iter()
+            .map(|point| CalibrationPoint {
+                expected: point.kg,
+                raw: point.ch1_raw,
+            })
+            .collect();
+    }
+    if ch1.linear.m.is_none() && ch1.linear.b.is_none() {
+        ch1.linear = cfg.ch1.clone();
+    }
+    if ch1.zero_raw.is_none() {
+        ch1.zero_raw = cfg.ch1_zero_raw;
+    }
+    if ch1.fit.is_none() {
+        ch1.fit = cfg.ch1_fit.clone();
+    }
+
+    let iadc = cfg.extra_channels.entry("iadc".to_string()).or_default();
+    if iadc.points.is_empty() && !cfg.points_iadc.is_empty() {
+        iadc.points = cfg
+            .points_iadc
+            .iter()
+            .map(|point| CalibrationPoint {
+                expected: point.expected,
+                raw: point.iadc_raw,
+            })
+            .collect();
+    }
+    if iadc.linear.m.is_none() && iadc.linear.b.is_none() {
+        iadc.linear = cfg.iadc.clone();
+    }
+    if iadc.zero_raw.is_none() {
+        iadc.zero_raw = cfg.iadc_zero_raw;
+    }
+    if iadc.fit.is_none() {
+        iadc.fit = cfg.iadc_fit.clone();
+    }
 }
 
 pub fn save(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
@@ -325,57 +452,53 @@ pub fn save(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
 
 fn points_for_channel(
     cfg: &LoadcellCalibrationFile,
-    channel: CalibrationChannel,
+    channel: &CalibrationChannel,
 ) -> Vec<(f64, f64)> {
     match channel {
-        CalibrationChannel::Ch0 => cfg
-            .points
-            .iter()
-            .map(|p| (p.ch0_raw as f64, p.kg as f64))
-            .collect(),
-        CalibrationChannel::Ch1 => cfg
-            .points_ch1
-            .iter()
-            .map(|p| (p.ch1_raw as f64, p.kg as f64))
-            .collect(),
-        CalibrationChannel::Iadc => cfg
-            .points_iadc
-            .iter()
-            .map(|p| (p.iadc_raw as f64, p.expected as f64))
-            .collect(),
+        CalibrationChannel::Custom(key) => cfg
+            .extra_channels
+            .get(key)
+            .map(|channel| {
+                channel
+                    .points
+                    .iter()
+                    .map(|p| (p.raw as f64, p.expected as f64))
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
-fn channel_linear_mut(
-    cfg: &mut LoadcellCalibrationFile,
-    channel: CalibrationChannel,
-) -> &mut ChannelLinear {
+fn channel_linear_mut<'a>(
+    cfg: &'a mut LoadcellCalibrationFile,
+    channel: &CalibrationChannel,
+) -> &'a mut ChannelLinear {
     match channel {
-        CalibrationChannel::Ch0 => &mut cfg.ch0,
-        CalibrationChannel::Ch1 => &mut cfg.ch1,
-        CalibrationChannel::Iadc => &mut cfg.iadc,
+        CalibrationChannel::Custom(key) => {
+            &mut cfg.extra_channels.entry(key.clone()).or_default().linear
+        }
     }
 }
 
-fn zero_raw_mut(
-    cfg: &mut LoadcellCalibrationFile,
-    channel: CalibrationChannel,
-) -> &mut Option<f32> {
+fn zero_raw_mut<'a>(
+    cfg: &'a mut LoadcellCalibrationFile,
+    channel: &CalibrationChannel,
+) -> &'a mut Option<f32> {
     match channel {
-        CalibrationChannel::Ch0 => &mut cfg.ch0_zero_raw,
-        CalibrationChannel::Ch1 => &mut cfg.ch1_zero_raw,
-        CalibrationChannel::Iadc => &mut cfg.iadc_zero_raw,
+        CalibrationChannel::Custom(key) => {
+            &mut cfg.extra_channels.entry(key.clone()).or_default().zero_raw
+        }
     }
 }
 
-fn fit_meta_mut(
-    cfg: &mut LoadcellCalibrationFile,
-    channel: CalibrationChannel,
-) -> &mut Option<FitMeta> {
+fn fit_meta_mut<'a>(
+    cfg: &'a mut LoadcellCalibrationFile,
+    channel: &CalibrationChannel,
+) -> &'a mut Option<FitMeta> {
     match channel {
-        CalibrationChannel::Ch0 => &mut cfg.ch0_fit,
-        CalibrationChannel::Ch1 => &mut cfg.ch1_fit,
-        CalibrationChannel::Iadc => &mut cfg.iadc_fit,
+        CalibrationChannel::Custom(key) => {
+            &mut cfg.extra_channels.entry(key.clone()).or_default().fit
+        }
     }
 }
 
@@ -386,6 +509,11 @@ fn update_weights_kg(cfg: &mut LoadcellCalibrationFile) {
         .map(|p| p.kg)
         .chain(cfg.points_ch1.iter().map(|p| p.kg))
         .chain(cfg.points_iadc.iter().map(|p| p.expected))
+        .chain(
+            cfg.extra_channels
+                .values()
+                .flat_map(|channel| channel.points.iter().map(|p| p.expected)),
+        )
         .filter(|v| v.is_finite())
         .collect();
     values.sort_by(f32::total_cmp);
@@ -400,47 +528,17 @@ pub fn upsert_point(
     raw: f32,
 ) {
     let expected = expected.max(0.0);
-    match channel {
-        CalibrationChannel::Ch0 => {
-            if let Some(p) = cfg
+    match &channel {
+        CalibrationChannel::Custom(key) => {
+            let channel = cfg.extra_channels.entry(key.clone()).or_default();
+            if let Some(p) = channel
                 .points
-                .iter_mut()
-                .find(|p| (p.kg - expected).abs() < 1e-6)
-            {
-                p.ch0_raw = raw;
-            } else {
-                cfg.points.push(PointCh0 {
-                    kg: expected,
-                    ch0_raw: raw,
-                });
-            }
-        }
-        CalibrationChannel::Ch1 => {
-            if let Some(p) = cfg
-                .points_ch1
-                .iter_mut()
-                .find(|p| (p.kg - expected).abs() < 1e-6)
-            {
-                p.ch1_raw = raw;
-            } else {
-                cfg.points_ch1.push(PointCh1 {
-                    kg: expected,
-                    ch1_raw: raw,
-                });
-            }
-        }
-        CalibrationChannel::Iadc => {
-            if let Some(p) = cfg
-                .points_iadc
                 .iter_mut()
                 .find(|p| (p.expected - expected).abs() < 1e-6)
             {
-                p.iadc_raw = raw;
+                p.raw = raw;
             } else {
-                cfg.points_iadc.push(PointIadc {
-                    expected,
-                    iadc_raw: raw,
-                });
+                channel.points.push(CalibrationPoint { expected, raw });
             }
         }
     }
@@ -448,18 +546,14 @@ pub fn upsert_point(
 }
 
 pub fn capture_zero(cfg: &mut LoadcellCalibrationFile, sensor_id: &str, raw: f32) {
-    let Some(channel) = CalibrationChannel::from_str(sensor_id) else {
-        return;
-    };
-    *zero_raw_mut(cfg, channel) = Some(raw);
+    let channel = CalibrationChannel::from_str(sensor_id);
+    *zero_raw_mut(cfg, &channel) = Some(raw);
 }
 
 pub fn capture_span(cfg: &mut LoadcellCalibrationFile, sensor_id: &str, raw: f32, known_kg: f32) {
-    let Some(channel) = CalibrationChannel::from_str(sensor_id) else {
-        return;
-    };
-    upsert_point(cfg, channel, known_kg, raw);
-    let mode = if zero_raw(channel, cfg).is_some() {
+    let channel = CalibrationChannel::from_str(sensor_id);
+    upsert_point(cfg, channel.clone(), known_kg, raw);
+    let mode = if zero_raw(&channel, cfg).is_some() {
         FitMode::LinearZero
     } else {
         FitMode::Linear
@@ -467,11 +561,9 @@ pub fn capture_span(cfg: &mut LoadcellCalibrationFile, sensor_id: &str, raw: f32
     let _ = refit_channel(cfg, channel, mode);
 }
 
-fn zero_raw(channel: CalibrationChannel, cfg: &LoadcellCalibrationFile) -> Option<f32> {
+fn zero_raw(channel: &CalibrationChannel, cfg: &LoadcellCalibrationFile) -> Option<f32> {
     match channel {
-        CalibrationChannel::Ch0 => cfg.ch0_zero_raw,
-        CalibrationChannel::Ch1 => cfg.ch1_zero_raw,
-        CalibrationChannel::Iadc => cfg.iadc_zero_raw,
+        CalibrationChannel::Custom(key) => cfg.extra_channels.get(key).and_then(|c| c.zero_raw),
     }
 }
 
@@ -652,6 +744,72 @@ fn fit_poly3_through_zero(xs: &[f64], ys: &[f64]) -> Result<(f64, f64, f64), Str
     Ok((sol[0], sol[1], sol[2]))
 }
 
+fn fit_poly_degree(xs: &[f64], ys: &[f64], degree: usize) -> Result<Vec<f64>, String> {
+    if xs.len() <= degree {
+        return Err(format!(
+            "need at least {} points for poly{degree} fit",
+            degree + 1
+        ));
+    }
+    let n = degree + 1;
+    let mut a = vec![vec![0.0; n]; n];
+    let mut b = vec![0.0; n];
+    for (row, row_values) in a.iter_mut().enumerate().take(n) {
+        for (col, slot) in row_values.iter_mut().enumerate().take(n) {
+            let power = (2 * degree).saturating_sub(row + col) as i32;
+            *slot = xs.iter().map(|x| x.powi(power)).sum();
+        }
+        let power = degree.saturating_sub(row) as i32;
+        b[row] = xs.iter().zip(ys).map(|(x, y)| x.powi(power) * y).sum();
+    }
+    solve_linear_system(a, b)
+}
+
+fn fit_poly4(xs: &[f64], ys: &[f64]) -> Result<(f64, f64, f64, f64, f64), String> {
+    let sol = fit_poly_degree(xs, ys, 4)?;
+    Ok((sol[0], sol[1], sol[2], sol[3], sol[4]))
+}
+
+fn fit_poly4_through_zero(xs: &[f64], ys: &[f64]) -> Result<(f64, f64, f64, f64), String> {
+    if xs.len() < 4 {
+        return Err("need at least 4 points for poly4-zero fit".to_string());
+    }
+    let a = vec![
+        vec![
+            xs.iter().map(|x| x.powi(8)).sum(),
+            xs.iter().map(|x| x.powi(7)).sum(),
+            xs.iter().map(|x| x.powi(6)).sum(),
+            xs.iter().map(|x| x.powi(5)).sum(),
+        ],
+        vec![
+            xs.iter().map(|x| x.powi(7)).sum(),
+            xs.iter().map(|x| x.powi(6)).sum(),
+            xs.iter().map(|x| x.powi(5)).sum(),
+            xs.iter().map(|x| x.powi(4)).sum(),
+        ],
+        vec![
+            xs.iter().map(|x| x.powi(6)).sum(),
+            xs.iter().map(|x| x.powi(5)).sum(),
+            xs.iter().map(|x| x.powi(4)).sum(),
+            xs.iter().map(|x| x.powi(3)).sum(),
+        ],
+        vec![
+            xs.iter().map(|x| x.powi(5)).sum(),
+            xs.iter().map(|x| x.powi(4)).sum(),
+            xs.iter().map(|x| x.powi(3)).sum(),
+            xs.iter().map(|x| x.powi(2)).sum(),
+        ],
+    ];
+    let b = vec![
+        xs.iter().zip(ys).map(|(x, y)| x.powi(4) * y).sum(),
+        xs.iter().zip(ys).map(|(x, y)| x.powi(3) * y).sum(),
+        xs.iter().zip(ys).map(|(x, y)| x.powi(2) * y).sum(),
+        xs.iter().zip(ys).map(|(x, y)| x * y).sum(),
+    ];
+    let sol = solve_linear_system(a, b)?;
+    Ok((sol[0], sol[1], sol[2], sol[3]))
+}
+
 fn sse_line(xs: &[f64], ys: &[f64], m: f64, b: f64) -> f64 {
     xs.iter()
         .zip(ys)
@@ -682,6 +840,16 @@ fn sse_poly3(xs: &[f64], ys: &[f64], a: f64, b: f64, c: f64, d: f64) -> f64 {
         .sum()
 }
 
+fn sse_poly4(xs: &[f64], ys: &[f64], a: f64, b: f64, c: f64, d: f64, e0: f64) -> f64 {
+    xs.iter()
+        .zip(ys)
+        .map(|(x, y)| {
+            let e = y - (a * x.powi(4) + b * x.powi(3) + c * x * x + d * x + e0);
+            e * e
+        })
+        .sum()
+}
+
 fn aic(sse: f64, n: usize, k: usize) -> f64 {
     if n == 0 {
         return f64::INFINITY;
@@ -695,14 +863,14 @@ pub fn refit_channel(
     channel: CalibrationChannel,
     mode: FitMode,
 ) -> Result<(), String> {
-    let pts = points_for_channel(cfg, channel);
+    let pts = points_for_channel(cfg, &channel);
     if pts.len() < 2 {
         return Err("need at least 2 points".to_string());
     }
 
     let xs: Vec<f64> = pts.iter().map(|(x, _)| *x).collect();
     let ys: Vec<f64> = pts.iter().map(|(_, y)| *y).collect();
-    let zero_hint = zero_raw(channel, cfg)
+    let zero_hint = zero_raw(&channel, cfg)
         .map(|v| v as f64)
         .or_else(|| pts.iter().find(|(_, y)| y.abs() < 1e-9).map(|(x, _)| *x));
 
@@ -771,6 +939,33 @@ pub fn refit_channel(
         ));
     }
 
+    let mut poly4 = None;
+    if xs.len() >= 5 {
+        let (a, b, c, d, e) = fit_poly4(&xs, &ys)?;
+        poly4 = Some((a, b, c, d, e));
+        candidates.push((
+            FitMode::Poly4,
+            aic(sse_poly4(&xs, &ys, a, b, c, d, e), xs.len(), 5),
+        ));
+    }
+
+    let mut poly4_zero = None;
+    if let Some(x0) = zero_hint
+        && xs.len() >= 4
+    {
+        let xs_shift: Vec<f64> = xs.iter().map(|x| x - x0).collect();
+        let (a, b, c, d) = fit_poly4_through_zero(&xs_shift, &ys)?;
+        poly4_zero = Some((a, b, c, d, x0));
+        candidates.push((
+            FitMode::Poly4Zero,
+            aic(
+                sse_poly4(&xs_shift, &ys, a, b, c, d, 0.0),
+                xs_shift.len(),
+                4,
+            ),
+        ));
+    }
+
     let chosen = if mode == FitMode::Best {
         candidates
             .iter()
@@ -784,10 +979,10 @@ pub fn refit_channel(
     match chosen {
         FitMode::Best => unreachable!(),
         FitMode::Linear => {
-            let lin_slot = channel_linear_mut(cfg, channel);
+            let lin_slot = channel_linear_mut(cfg, &channel);
             lin_slot.m = Some(lin_m as f32);
             lin_slot.b = Some(lin_b as f32);
-            *fit_meta_mut(cfg, channel) = Some(FitMeta {
+            *fit_meta_mut(cfg, &channel) = Some(FitMeta {
                 fit_type: Some("linear".to_string()),
                 x0: None,
                 ..FitMeta::default()
@@ -795,10 +990,10 @@ pub fn refit_channel(
         }
         FitMode::LinearZero => {
             let (m, x0) = lin0_m.ok_or_else(|| "linear_zero fit unavailable".to_string())?;
-            let lin_slot = channel_linear_mut(cfg, channel);
+            let lin_slot = channel_linear_mut(cfg, &channel);
             lin_slot.m = Some(m as f32);
             lin_slot.b = Some((-m * x0) as f32);
-            *fit_meta_mut(cfg, channel) = Some(FitMeta {
+            *fit_meta_mut(cfg, &channel) = Some(FitMeta {
                 fit_type: Some("linear".to_string()),
                 x0: Some(x0 as f32),
                 ..FitMeta::default()
@@ -806,59 +1001,94 @@ pub fn refit_channel(
         }
         FitMode::Poly2 => {
             let (a, b, c) = poly2.ok_or_else(|| "poly2 fit unavailable".to_string())?;
-            let lin_slot = channel_linear_mut(cfg, channel);
+            let lin_slot = channel_linear_mut(cfg, &channel);
             lin_slot.m = Some(b as f32);
             lin_slot.b = Some(c as f32);
-            *fit_meta_mut(cfg, channel) = Some(FitMeta {
+            *fit_meta_mut(cfg, &channel) = Some(FitMeta {
                 fit_type: Some("poly2".to_string()),
                 a: Some(a as f32),
                 b: Some(b as f32),
                 c: Some(c as f32),
                 d: None,
                 x0: None,
+                ..FitMeta::default()
             });
         }
         FitMode::Poly2Zero => {
             let (a, b, x0) = poly2_zero.ok_or_else(|| "poly2_zero fit unavailable".to_string())?;
             let m_lin = a + b;
-            let lin_slot = channel_linear_mut(cfg, channel);
+            let lin_slot = channel_linear_mut(cfg, &channel);
             lin_slot.m = Some(m_lin as f32);
             lin_slot.b = Some((-m_lin * x0) as f32);
-            *fit_meta_mut(cfg, channel) = Some(FitMeta {
+            *fit_meta_mut(cfg, &channel) = Some(FitMeta {
                 fit_type: Some("poly2".to_string()),
                 a: Some(a as f32),
                 b: Some(b as f32),
                 c: Some(0.0),
                 d: Some(0.0),
                 x0: Some(x0 as f32),
+                ..FitMeta::default()
             });
         }
         FitMode::Poly3 => {
             let (a, b, c, d) = poly3.ok_or_else(|| "poly3 fit unavailable".to_string())?;
-            let lin_slot = channel_linear_mut(cfg, channel);
+            let lin_slot = channel_linear_mut(cfg, &channel);
             lin_slot.m = Some(c as f32);
             lin_slot.b = Some(d as f32);
-            *fit_meta_mut(cfg, channel) = Some(FitMeta {
+            *fit_meta_mut(cfg, &channel) = Some(FitMeta {
                 fit_type: Some("poly3".to_string()),
                 a: Some(a as f32),
                 b: Some(b as f32),
                 c: Some(c as f32),
                 d: Some(d as f32),
                 x0: None,
+                ..FitMeta::default()
             });
         }
         FitMode::Poly3Zero => {
             let (a, b, c, x0) =
                 poly3_zero.ok_or_else(|| "poly3_zero fit unavailable".to_string())?;
-            let lin_slot = channel_linear_mut(cfg, channel);
+            let lin_slot = channel_linear_mut(cfg, &channel);
             lin_slot.m = Some(c as f32);
             lin_slot.b = Some((-c * x0) as f32);
-            *fit_meta_mut(cfg, channel) = Some(FitMeta {
+            *fit_meta_mut(cfg, &channel) = Some(FitMeta {
                 fit_type: Some("poly3".to_string()),
                 a: Some(a as f32),
                 b: Some(b as f32),
                 c: Some(c as f32),
                 d: Some(0.0),
+                x0: Some(x0 as f32),
+                ..FitMeta::default()
+            });
+        }
+        FitMode::Poly4 => {
+            let (a, b, c, d, e) = poly4.ok_or_else(|| "poly4 fit unavailable".to_string())?;
+            let lin_slot = channel_linear_mut(cfg, &channel);
+            lin_slot.m = Some(d as f32);
+            lin_slot.b = Some(e as f32);
+            *fit_meta_mut(cfg, &channel) = Some(FitMeta {
+                fit_type: Some("poly4".to_string()),
+                a: Some(a as f32),
+                b: Some(b as f32),
+                c: Some(c as f32),
+                d: Some(d as f32),
+                e: Some(e as f32),
+                x0: None,
+            });
+        }
+        FitMode::Poly4Zero => {
+            let (a, b, c, d, x0) =
+                poly4_zero.ok_or_else(|| "poly4_zero fit unavailable".to_string())?;
+            let lin_slot = channel_linear_mut(cfg, &channel);
+            lin_slot.m = Some(d as f32);
+            lin_slot.b = Some((-d * x0) as f32);
+            *fit_meta_mut(cfg, &channel) = Some(FitMeta {
+                fit_type: Some("poly4".to_string()),
+                a: Some(a as f32),
+                b: Some(b as f32),
+                c: Some(c as f32),
+                d: Some(d as f32),
+                e: Some(0.0),
                 x0: Some(x0 as f32),
             });
         }
@@ -870,6 +1100,14 @@ fn eval_channel_with_fit(linear: &ChannelLinear, fit: Option<&FitMeta>, raw: f32
     let fit_type = fit.and_then(|f| f.fit_type.as_deref());
     if let Some(meta) = fit {
         let x = raw - meta.x0.unwrap_or(0.0);
+        if fit_type == Some("poly4") {
+            let a = meta.a?;
+            let b = meta.b?;
+            let c = meta.c.unwrap_or(0.0);
+            let d = meta.d.unwrap_or(0.0);
+            let e = meta.e.unwrap_or(0.0);
+            return Some((a * x.powi(4) + b * x.powi(3) + c * x * x + d * x + e).max(0.0));
+        }
         if fit_type == Some("poly3") {
             let a = meta.a?;
             let b = meta.b?;

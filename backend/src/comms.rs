@@ -4,12 +4,13 @@ use crate::comms_config::{
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
+#[cfg(target_os = "linux")]
+use sedsprintf_rs_2026::serialize;
 use sedsprintf_rs_2026::{
-    router::{Router, RouterSideId}, serialize,
-    TelemetryError,
-    TelemetryResult,
+    TelemetryError, TelemetryResult,
+    router::{Router, RouterSideId},
 };
-use serial::{SerialPort, SystemPort};
+use serialport::SerialPort;
 use std::error::Error;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
@@ -21,16 +22,29 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::time::Duration;
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 pub const ROCKET_COMMS_PORT: &str = "/dev/ttyUSB1";
 pub const UMBILICAL_COMMS_PORT: &str = "/dev/ttyUSB2";
 pub const COMMS_BAUD_RATE: usize = 57_600;
 pub const MAX_PACKET_SIZE: usize = 256;
+const STREAM_PACKET_MAX_SIZE: usize = 4_096;
+const RAW_UART_FRAME_SYNC_0: u8 = 0xA5;
+const RAW_UART_FRAME_SYNC_1: u8 = 0x5A;
+const RAW_UART_COMMAND_SYNC_0: u8 = 0xA6;
+const RAW_UART_COMMAND_SYNC_1: u8 = 0x5B;
+const RAW_UART_ASCII_SYNC_0: u8 = 0xA7;
+const RAW_UART_ASCII_SYNC_1: u8 = 0x7A;
+const RAW_UART_FRAME_HEADER_SIZE: usize = 4;
 const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
 #[cfg(target_os = "linux")]
-const I2C_DEBUG_PREVIEW_BYTES: usize = 48;
+const I2C_PACKET_MAX_BYTES: usize = 4_096;
+#[cfg(target_os = "linux")]
+const I2C_FRAME_PAYLOAD_MAX_BYTES: usize = I2C_PACKET_MAX_BYTES - RAW_UART_FRAME_HEADER_SIZE;
+const UART_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const UART_NORMAL_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const I2C_SLOT_SIZE: usize = 32;
 #[cfg(target_os = "linux")]
@@ -48,15 +62,15 @@ const I2C_KIND_IDLE: u8 = 0;
 #[cfg(target_os = "linux")]
 const I2C_KIND_DATA: u8 = 1;
 #[cfg(target_os = "linux")]
-const I2C_KIND_ERROR: u8 = 127;
-#[cfg(target_os = "linux")]
 const I2C_FLAG_START: u8 = 0x01;
 #[cfg(target_os = "linux")]
 const I2C_FLAG_END: u8 = 0x02;
+#[cfg(target_os = "linux")]
+const I2C_PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_millis(50);
 
-#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+#[cfg(feature = "testing")]
 const DUMMY_ROCKET_TIMESYNC_SOURCES: &[&str] = &["RF", "FC", "PB"];
-#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+#[cfg(feature = "testing")]
 const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GW", "VB", "AB", "DAQ"];
 
 // ======================================================================
@@ -151,45 +165,83 @@ fn i2c_description(i2c: &I2cLinkConfig) -> String {
 //  Real Comms Implementation
 // ======================================================================
 pub struct UartComms {
-    inner: SystemPort,
+    inner: Box<dyn SerialPort>,
     side_id: Option<RouterSideId>,
     rx_buf: Vec<u8>,
     protocol: SerialProtocol,
+    slow_start_deadline: Option<Instant>,
 }
 
 impl UartComms {
     pub fn open(cfg: &SerialLinkConfig) -> anyhow::Result<Self> {
-        let mut inner = serial::open(&cfg.port)?;
-        inner
-            .reconfigure(&|settings| {
-                settings.set_baud_rate(serial::BaudRate::from_speed(cfg.baud_rate))?;
-                settings.set_char_size(serial::CharSize::Bits8);
-                settings.set_parity(serial::Parity::ParityNone);
-                settings.set_stop_bits(serial::StopBits::Stop1);
-                settings.set_flow_control(serial::FlowControl::FlowNone);
-                Ok(())
-            })
+        let inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
+            .data_bits(serialport::DataBits::Eight)
+            .parity(serialport::Parity::None)
+            .stop_bits(serialport::StopBits::One)
+            .flow_control(serialport::FlowControl::None)
+            .timeout(UART_STARTUP_TIMEOUT)
+            .open()
             .context("failed to configure serial port")?;
-        inner.set_timeout(Duration::from_millis(10))?;
         Ok(Self {
             inner,
             side_id: None,
-            rx_buf: Vec::with_capacity(MAX_PACKET_SIZE * 2),
+            rx_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
             protocol: cfg.protocol.clone(),
+            slow_start_deadline: Some(Instant::now() + UART_STARTUP_TIMEOUT),
         })
     }
 
+    fn update_uart_timeout_mode(&mut self) -> std::io::Result<()> {
+        if self
+            .slow_start_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+            self.slow_start_deadline = None;
+        }
+        Ok(())
+    }
+
     fn fill_rx_buf(&mut self) -> std::io::Result<()> {
+        self.update_uart_timeout_mode()?;
         let mut scratch = [0u8; 512];
         match self.inner.read(&mut scratch) {
-            Ok(0) => Ok(()),
+            Ok(0) => {
+                maybe_log_raw_uart_read_outcome(
+                    "read returned 0 bytes",
+                    self.rx_buf.len(),
+                    None,
+                    &self.protocol,
+                );
+                Ok(())
+            }
             Ok(n) => {
+                if self.slow_start_deadline.take().is_some() {
+                    self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+                }
+                maybe_log_raw_uart_read_outcome(
+                    "read returned bytes",
+                    self.rx_buf.len(),
+                    Some(n),
+                    &self.protocol,
+                );
                 self.rx_buf.extend_from_slice(&scratch[..n]);
                 maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
                 Ok(())
             }
-            Err(err) if is_idle_serial_timeout(&err) => Ok(()),
-            Err(err) => Err(err),
+            Err(err) if is_idle_serial_timeout(&err) => {
+                maybe_log_raw_uart_read_outcome(
+                    "read timeout/wouldblock",
+                    self.rx_buf.len(),
+                    None,
+                    &self.protocol,
+                );
+                Ok(())
+            }
+            Err(err) => {
+                maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
+                Err(err)
+            }
         }
     }
 
@@ -217,37 +269,7 @@ impl UartComms {
     }
 
     fn try_take_raw_uart_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
-        let scan_len = self.rx_buf.len().min(RAW_UART_MAX_FRAME_BYTES);
-        for start in 0..scan_len {
-            for end in (start + 1)..=scan_len {
-                let candidate = &self.rx_buf[start..end];
-                if serialize::peek_frame_info(candidate).is_ok() {
-                    let payload = candidate.to_vec();
-                    self.rx_buf.drain(..end);
-                    return Ok(Some(payload));
-                }
-            }
-        }
-
-        if self.rx_buf.len() > RAW_UART_MAX_FRAME_BYTES {
-            let drop_len = self.rx_buf.len() - RAW_UART_MAX_FRAME_BYTES;
-            maybe_log_raw_uart_parse_issue(
-                "dropping oversized raw UART buffer",
-                &self.rx_buf[..self.rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
-            );
-            self.rx_buf.drain(..drop_len);
-        }
-
-        if !self.rx_buf.is_empty() {
-            if let Err(err) = serialize::peek_frame_info(&self.rx_buf) {
-                maybe_log_raw_uart_parse_issue(
-                    &format!("raw UART parse pending: {err}"),
-                    &self.rx_buf[..self.rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
-                );
-            }
-        }
-
-        Ok(None)
+        take_raw_uart_framed_payload(&mut self.rx_buf)
     }
 
     fn try_take_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
@@ -255,6 +277,66 @@ impl UartComms {
             SerialProtocol::PacketFramed => self.try_take_framed_packet(),
             SerialProtocol::RawUart => self.try_take_raw_uart_packet(),
         }
+    }
+
+    fn handle_raw_uart_router_reject(&mut self, payload: &[u8]) {
+        maybe_log_raw_uart_router_error(payload, &self.protocol);
+
+        // If a corrupted payload swallowed the next frame start, salvage from the
+        // embedded sync marker rather than dropping the entire burst.
+        let mut recovered = payload
+            .windows(2)
+            .enumerate()
+            .skip(1)
+            .find_map(|(idx, pair)| {
+                (pair == [RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1]).then_some(idx)
+            })
+            .map(|idx| payload[idx..].to_vec())
+            .unwrap_or_default();
+
+        if !self.rx_buf.is_empty() {
+            recovered.extend_from_slice(&self.rx_buf);
+        }
+        self.rx_buf = recovered;
+        maybe_log_raw_uart_buffer_state(
+            &self.rx_buf,
+            "resynced after router reject",
+            &self.protocol,
+        );
+    }
+
+    fn process_buffered_packets(
+        &mut self,
+        router: &Router,
+        side_id: RouterSideId,
+    ) -> TelemetryResult<bool> {
+        let mut processed_any = false;
+
+        loop {
+            let payload: Vec<u8> = match self.try_take_packet()? {
+                Some(payload) => payload,
+                None => break,
+            };
+            processed_any = true;
+            maybe_log_raw_uart_decoded(&payload, &self.protocol);
+            maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
+            match router.rx_serialized_queue_from_side(&payload, side_id) {
+                Ok(()) => {
+                    maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
+                }
+                Err(err) => {
+                    if matches!(self.protocol, SerialProtocol::RawUart) {
+                        let _ = err;
+                        self.handle_raw_uart_router_reject(&payload);
+                        continue;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        Ok(processed_any)
     }
 }
 
@@ -270,10 +352,152 @@ fn raw_uart_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("GS_RAW_UART_DEBUG").ok().as_deref() == Some("1"))
 }
 
+fn unix_now_ms() -> u64 {
+    match SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => 0,
+    }
+}
+
+fn build_raw_uart_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    build_link_frame(RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1, payload)
+}
+
 #[cfg(target_os = "linux")]
-fn i2c_debug_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("GS_I2C_DEBUG").ok().as_deref() == Some("1"))
+fn build_i2c_data_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    if payload.len() > I2C_FRAME_PAYLOAD_MAX_BYTES {
+        return Err(format!(
+            "packet too large to send over i2c framed link: {} > {} bytes",
+            payload.len(),
+            I2C_FRAME_PAYLOAD_MAX_BYTES
+        )
+        .into());
+    }
+    build_link_frame(RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1, payload)
+}
+
+fn build_link_frame(
+    sync_0: u8,
+    sync_1: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    let len = payload.len();
+    if len == 0 || len > STREAM_PACKET_MAX_SIZE {
+        return Err(format!("packet too large to send over framed link: {len} bytes").into());
+    }
+
+    let mut framed = Vec::with_capacity(RAW_UART_FRAME_HEADER_SIZE + len);
+    framed.push(sync_0);
+    framed.push(sync_1);
+    framed.extend_from_slice(&(len as u16).to_le_bytes());
+    framed.extend_from_slice(payload);
+    Ok(framed)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
+    if payload.len() < RAW_UART_FRAME_HEADER_SIZE {
+        return None;
+    }
+    let header = match (payload[0], payload[1]) {
+        (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1)
+        | (RAW_UART_FRAME_SYNC_1, RAW_UART_FRAME_SYNC_0) => {
+            (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1)
+        }
+        (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1)
+        | (RAW_UART_COMMAND_SYNC_1, RAW_UART_COMMAND_SYNC_0) => {
+            (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1)
+        }
+        (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1) => {
+            (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1)
+        }
+        _ => return None,
+    };
+    let len = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+    if payload.len() < RAW_UART_FRAME_HEADER_SIZE + len {
+        return None;
+    }
+    Some((
+        header,
+        &payload[RAW_UART_FRAME_HEADER_SIZE..RAW_UART_FRAME_HEADER_SIZE + len],
+    ))
+}
+
+fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<Vec<u8>>> {
+    if rx_buf.len() > RAW_UART_MAX_FRAME_BYTES {
+        let drop_len = rx_buf.len() - RAW_UART_MAX_FRAME_BYTES;
+        maybe_log_raw_uart_parse_issue(
+            "dropping oversized raw UART buffer",
+            &rx_buf[..rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+        );
+        rx_buf.drain(..drop_len);
+    }
+
+    let sync_pos = rx_buf.windows(2).position(|pair| {
+        pair == [RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1]
+            || pair == [RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1]
+            || pair == [RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1]
+    });
+    match sync_pos {
+        Some(0) => {}
+        Some(pos) => {
+            maybe_log_raw_uart_parse_issue(
+                "dropping bytes before raw UART frame sync",
+                &rx_buf[..pos.min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+            );
+            rx_buf.drain(..pos);
+        }
+        None => {
+            if !rx_buf.is_empty() {
+                maybe_log_raw_uart_parse_issue(
+                    "raw UART waiting for frame sync",
+                    &rx_buf[..rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+                );
+                let keep = usize::from(matches!(
+                    rx_buf.last().copied(),
+                    Some(RAW_UART_FRAME_SYNC_0 | RAW_UART_COMMAND_SYNC_0 | RAW_UART_ASCII_SYNC_0)
+                ));
+                let drop_len = rx_buf.len().saturating_sub(keep);
+                if drop_len > 0 {
+                    rx_buf.drain(..drop_len);
+                }
+            }
+            return Ok(None);
+        }
+    }
+
+    if rx_buf.len() < RAW_UART_FRAME_HEADER_SIZE {
+        return Ok(None);
+    }
+
+    let frame_len = u16::from_le_bytes([rx_buf[2], rx_buf[3]]) as usize;
+    if frame_len == 0 {
+        maybe_log_raw_uart_parse_issue(
+            "ignoring empty raw UART frame",
+            &rx_buf[..RAW_UART_FRAME_HEADER_SIZE],
+        );
+        rx_buf.drain(..RAW_UART_FRAME_HEADER_SIZE);
+        return Ok(None);
+    }
+
+    if frame_len > STREAM_PACKET_MAX_SIZE {
+        maybe_log_raw_uart_parse_issue(
+            &format!("invalid raw UART frame length: {frame_len}"),
+            &rx_buf[..rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+        );
+        rx_buf.drain(..1);
+        return Ok(None);
+    }
+
+    let total_len = RAW_UART_FRAME_HEADER_SIZE + frame_len;
+    if rx_buf.len() < total_len {
+        return Ok(None);
+    }
+
+    let is_data_frame = rx_buf[0] == RAW_UART_FRAME_SYNC_0 && rx_buf[1] == RAW_UART_FRAME_SYNC_1;
+    let payload = rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len].to_vec();
+    rx_buf.drain(..total_len);
+    Ok(is_data_frame.then_some(payload))
 }
 
 fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
@@ -287,15 +511,45 @@ fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
     );
 }
 
+fn maybe_log_raw_uart_read_outcome(
+    context: &str,
+    buffered_len: usize,
+    read_len: Option<usize>,
+    protocol: &SerialProtocol,
+) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = unix_now_ms();
+    let last = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 200 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    match read_len {
+        Some(n) => eprintln!("{context}: n={n} buffered={buffered_len}"),
+        None => eprintln!("{context}: buffered={buffered_len}"),
+    }
+}
+
+fn maybe_log_raw_uart_read_error(
+    err: &std::io::Error,
+    buffered_len: usize,
+    protocol: &SerialProtocol,
+) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    eprintln!("raw_uart read error: {err}; buffered={buffered_len}");
+}
+
 fn maybe_log_raw_uart_parse_issue(context: &str, bytes: &[u8]) {
     if !raw_uart_debug_enabled() {
         return;
     }
     static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_millis() as u64,
-        Err(_) => 0,
-    };
+    let now_ms = unix_now_ms();
     let last = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
     if now_ms.saturating_sub(last) < 500 {
         return;
@@ -308,64 +562,62 @@ fn maybe_log_raw_uart_parse_issue(context: &str, bytes: &[u8]) {
     );
 }
 
+fn maybe_log_raw_uart_router_error(payload: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    eprintln!(
+        "raw_uart router rejected {} bytes; payload: {}",
+        payload.len(),
+        hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn maybe_log_raw_uart_buffer_state(rx_buf: &[u8], context: &str, protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = unix_now_ms();
+    let last = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 1_000 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "raw_uart {context}: buffered={} preview={}",
+        rx_buf.len(),
+        hex_preview(rx_buf, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
 fn maybe_log_raw_uart_decoded(payload: &[u8], protocol: &SerialProtocol) {
     if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
         return;
     }
-    match serialize::peek_envelope(payload) {
-        Ok(envelope) => {
-            eprintln!(
-                "raw_uart decoded {} bytes: sender={} ty={:?} endpoints={:?} ts={}",
-                payload.len(),
-                envelope.sender,
-                envelope.ty,
-                envelope.endpoints,
-                envelope.timestamp_ms
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "raw_uart decoded {} bytes but peek_envelope failed: {err}; payload: {}",
-                payload.len(),
-                hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
-            );
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn maybe_log_i2c_frame(context: &str, bytes: &[u8]) {
-    if !i2c_debug_enabled() {
-        return;
-    }
     eprintln!(
-        "{context}: {} bytes: {}",
-        bytes.len(),
-        hex_preview(bytes, I2C_DEBUG_PREVIEW_BYTES)
+        "raw_uart decoded {} bytes: {}",
+        payload.len(),
+        hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
     );
 }
 
-#[cfg(target_os = "linux")]
-fn maybe_log_i2c_decoded(payload: &[u8]) {
-    if !i2c_debug_enabled() {
+fn maybe_log_raw_uart_router_queue_before(payload: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
         return;
     }
-    match serialize::peek_frame_info(payload) {
-        Ok(_) => {
-            eprintln!(
-                "i2c decoded {} bytes: {}",
-                payload.len(),
-                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-            );
-        }
-        Err(_) => {
-            eprintln!(
-                "i2c decoded {} bytes but payload is not a valid serialized packet: {}",
-                payload.len(),
-                hex_preview(payload, I2C_DEBUG_PREVIEW_BYTES)
-            );
-        }
+    eprintln!(
+        "raw_uart queueing {} bytes to router: {}",
+        payload.len(),
+        hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn maybe_log_raw_uart_router_queue_after(payload: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
     }
+    eprintln!("raw_uart router accepted {} bytes", payload.len());
 }
 
 #[cfg(target_os = "linux")]
@@ -387,6 +639,7 @@ struct I2cRxAssembly {
     total_len: usize,
     next_offset: usize,
     payload: Vec<u8>,
+    started_at: Instant,
 }
 
 #[cfg(target_os = "linux")]
@@ -399,6 +652,9 @@ impl I2cRxAssembly {
             return Err(std::io::Error::other("i2c transfer start must have offset 0").into());
         }
         let total_len = slot.total_len as usize;
+        if total_len > STREAM_PACKET_MAX_SIZE {
+            return Err(std::io::Error::other("i2c transfer exceeds max packet size").into());
+        }
         if total_len < slot.data.len() {
             return Err(
                 std::io::Error::other("i2c transfer total length smaller than first slot").into(),
@@ -412,6 +668,7 @@ impl I2cRxAssembly {
             total_len,
             next_offset: slot.data.len(),
             payload,
+            started_at: Instant::now(),
         })
     }
 
@@ -490,9 +747,6 @@ fn decode_i2c_slot(
     if all_zero || all_ff {
         return Ok(None);
     }
-    if raw[0] == 0x00 && raw[1] == 0x00 {
-        return Ok(None);
-    }
     if raw[0] != I2C_SLOT_MAGIC_0 || raw[1] != I2C_SLOT_MAGIC_1 {
         return Err(std::io::Error::other(format!(
             "invalid i2c slot magic: {:02x} {:02x}",
@@ -556,19 +810,19 @@ impl CommsDevice for UartComms {
         {
             return Err(err.into());
         }
-        if let Some(payload) = self.try_take_packet()? {
-            maybe_log_raw_uart_decoded(&payload, &self.protocol);
-            return router.rx_serialized_queue_from_side(&payload, side_id);
+        if self.process_buffered_packets(router, side_id)? {
+            return Ok(());
         }
 
         if let Err(err) = self.fill_rx_buf() {
             return Err(err.into());
         }
 
-        if let Some(payload) = self.try_take_packet()? {
-            maybe_log_raw_uart_decoded(&payload, &self.protocol);
-            return router.rx_serialized_queue_from_side(&payload, side_id);
+        if self.process_buffered_packets(router, side_id)? {
+            return Ok(());
         }
+
+        maybe_log_raw_uart_buffer_state(&self.rx_buf, "waiting for complete frame", &self.protocol);
 
         Ok(())
     }
@@ -588,7 +842,7 @@ impl CommsDevice for UartComms {
                 self.inner.write_all(payload)?;
             }
             SerialProtocol::RawUart => {
-                self.inner.write_all(payload)?;
+                self.inner.write_all(&build_raw_uart_frame(payload)?)?;
             }
         }
         self.inner.flush()?;
@@ -604,6 +858,10 @@ impl CommsDevice for UartComms {
 // I2C Comms Implementation
 // ======================================================================
 
+// This Linux backend speaks the Pico slot-based I2C protocol directly:
+// one self-describing 32-byte slot per transfer, not the legacy fake 258-byte
+// framing model used by older host experiments.
+
 pub struct I2cComms {
     #[cfg(target_os = "linux")]
     inner: File,
@@ -614,8 +872,6 @@ pub struct I2cComms {
     chunk_delay: Duration,
     #[cfg(target_os = "linux")]
     initial_wait: Duration,
-    #[cfg(target_os = "linux")]
-    tx_backoff_until: Option<std::time::Instant>,
     #[cfg(target_os = "linux")]
     tx_transfer_id: u16,
     #[cfg(target_os = "linux")]
@@ -636,10 +892,9 @@ impl I2cComms {
                 addr: cfg.addr,
                 chunk_delay: Duration::from_millis(cfg.chunk_delay_ms),
                 initial_wait: Duration::from_millis(cfg.initial_wait_ms),
-                tx_backoff_until: None,
                 tx_transfer_id: 1,
                 rx_assembly: None,
-                rx_payload_buf: Vec::with_capacity(MAX_PACKET_SIZE * 4),
+                rx_payload_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -653,24 +908,10 @@ impl I2cComms {
     fn read_slot(&mut self) -> Result<Option<I2cMailboxSlot>, Box<dyn Error + Send + Sync>> {
         let mut raw = [0u8; I2C_SLOT_SIZE];
         match self.transfer_read(&mut raw) {
-            Ok(()) => {
-                maybe_log_i2c_frame("i2c rx slot", &raw);
-                decode_i2c_slot(&raw)
-            }
+            Ok(()) => decode_i2c_slot(&raw),
             Err(err) if is_i2c_idle_read_error(err.as_ref()) => Ok(None),
             Err(err) => Err(err),
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn tx_backoff_active(&self) -> bool {
-        self.tx_backoff_until
-            .is_some_and(|deadline| std::time::Instant::now() < deadline)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn arm_tx_backoff(&mut self) {
-        self.tx_backoff_until = Some(std::time::Instant::now() + Duration::from_secs(1));
     }
 
     #[cfg(target_os = "linux")]
@@ -687,12 +928,14 @@ impl I2cComms {
         payload: &[u8],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let total_len = payload.len();
+        if total_len > STREAM_PACKET_MAX_SIZE {
+            return Err(format!("packet too large to send over i2c: {total_len} bytes").into());
+        }
         let transfer_id = self.next_transfer_id();
         let mut offset = 0usize;
 
         if total_len == 0 {
             let slot = encode_i2c_slot(kind, I2C_FLAG_START | I2C_FLAG_END, transfer_id, 0, 0, &[]);
-            maybe_log_i2c_frame("i2c tx slot", &slot);
             self.transfer_write(&slot)?;
             return Ok(());
         }
@@ -714,12 +957,14 @@ impl I2cComms {
                 total_len as u32,
                 &payload[offset..end],
             );
-            maybe_log_i2c_frame("i2c tx slot", &slot);
             self.transfer_write(&slot)?;
             offset = end;
             if offset < total_len {
                 std::thread::sleep(self.chunk_delay);
             }
+        }
+        if !self.initial_wait.is_zero() {
+            std::thread::sleep(self.initial_wait);
         }
         Ok(())
     }
@@ -731,6 +976,12 @@ impl I2cComms {
     ) -> Result<Option<(u8, Vec<u8>)>, Box<dyn Error + Send + Sync>> {
         if slot.kind == I2C_KIND_IDLE {
             return Ok(None);
+        }
+
+        if self.rx_assembly.as_ref().is_some_and(|assembly| {
+            Instant::now().duration_since(assembly.started_at) >= I2C_PARTIAL_PACKET_TIMEOUT
+        }) {
+            self.rx_assembly = None;
         }
 
         if slot.flags & I2C_FLAG_START != 0 {
@@ -745,15 +996,12 @@ impl I2cComms {
         let assembly = self
             .rx_assembly
             .as_mut()
-            .ok_or_else(|| std::io::Error::other("i2c slot arrived without an active transfer"));
-        let Ok(assembly) = assembly else {
-            return Ok(None);
-        };
+            .ok_or_else(|| std::io::Error::other("i2c slot arrived without an active transfer"))?;
         let completed = match assembly.push(&slot) {
             Ok(completed) => completed,
-            Err(_) => {
+            Err(err) => {
                 self.rx_assembly = None;
-                return Ok(None);
+                return Err(err);
             }
         };
         if completed.is_some() {
@@ -832,38 +1080,47 @@ impl CommsDevice for I2cComms {
             for _ in 0..32 {
                 match self.read_slot() {
                     Ok(Some(slot)) => {
-                        if let Some((kind, payload)) = self.ingest_rx_slot(slot).map_err(|err| {
-                            eprintln!("i2c receive failed: {err}");
-                            TelemetryError::HandlerError("i2c receive failed")
-                        })? {
-                            maybe_log_i2c_decoded(&payload);
-                            if kind != I2C_KIND_DATA {
-                                if kind == I2C_KIND_ERROR {
-                                    let msg = String::from_utf8_lossy(&payload);
-                                    if msg != "error invalid i2c slot" || i2c_debug_enabled() {
-                                        eprintln!("i2c error packet: {msg}");
-                                    }
-                                } else {
-                                    eprintln!("i2c non-data packet kind {kind} ignored");
-                                }
-                                return Ok(());
+                        let assembled = match self.ingest_rx_slot(slot) {
+                            Ok(assembled) => assembled,
+                            Err(err) => {
+                                let _ = err;
+                                continue;
                             }
-                            self.rx_payload_buf.extend_from_slice(&payload);
+                        };
+                        if let Some((kind, payload)) = assembled {
+                            if kind != I2C_KIND_DATA {
+                                continue;
+                            }
+                            let Some((header, payload)) = parse_link_frame(&payload) else {
+                                continue;
+                            };
+                            if header != (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1) {
+                                continue;
+                            }
+                            self.rx_payload_buf.extend_from_slice(payload);
                             while let Some(packet) = self.try_take_buffered_packet()? {
-                                if let Err(err) =
-                                    router.rx_serialized_queue_from_side(&packet, side_id)
-                                {
-                                    eprintln!("i2c router reject: {err}");
-                                    return Err(err);
+                                match router.rx_serialized_queue_from_side(&packet, side_id) {
+                                    Ok(()) => {}
+                                    Err(err) => {
+                                        let _ = err;
+                                        continue;
+                                    }
                                 }
-                                return Ok(());
+                            }
+                            if !self.rx_payload_buf.is_empty() {
+                                match serialize::peek_frame_info(&self.rx_payload_buf) {
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        let _ = err;
+                                    }
+                                }
                             }
                         }
                     }
-                    Ok(None) => return Ok(()),
+                    Ok(None) => continue,
                     Err(err) => {
-                        eprintln!("i2c receive failed: {err}");
-                        return Err(TelemetryError::HandlerError("i2c receive failed"));
+                        let _ = err;
+                        continue;
                     }
                 }
             }
@@ -882,22 +1139,8 @@ impl CommsDevice for I2cComms {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(target_os = "linux")]
         {
-            if self.tx_backoff_active() {
-                return Ok(());
-            }
-
-            if let Err(err) = self.write_payload(I2C_KIND_DATA, payload) {
-                if is_i2c_retryable_write_error(err.as_ref()) {
-                    self.arm_tx_backoff();
-                    return Ok(());
-                }
-                return Err(err);
-            }
-            if !self.initial_wait.is_zero() {
-                std::thread::sleep(self.initial_wait);
-            }
-            self.tx_backoff_until = None;
-            Ok(())
+            let framed = build_i2c_data_frame(payload)?;
+            self.write_payload(I2C_KIND_DATA, &framed)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -986,23 +1229,20 @@ impl CommsDevice for SpiComms {
 
         #[cfg(target_os = "linux")]
         {
-            let mut tx = vec![0u8; MAX_PACKET_SIZE + 2];
-            let mut rx = vec![0u8; MAX_PACKET_SIZE + 2];
+            let mut tx = vec![0u8; MAX_PACKET_SIZE + RAW_UART_FRAME_HEADER_SIZE];
+            let mut rx = vec![0u8; MAX_PACKET_SIZE + RAW_UART_FRAME_HEADER_SIZE];
             self.transfer(&tx, &mut rx)
                 .map_err(|_| TelemetryError::HandlerError("spi transfer failed"))?;
             tx.clear();
 
-            let frame_len = u16::from_le_bytes([rx[0], rx[1]]) as usize;
-            if frame_len == 0 {
+            let Some(((RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1), payload)) =
+                parse_link_frame(&rx)
+            else {
+                return Ok(());
+            };
+            if payload.is_empty() {
                 return Ok(());
             }
-            if frame_len > MAX_PACKET_SIZE {
-                return Err(TelemetryError::HandlerError(
-                    "invalid frame length from spi",
-                ));
-            }
-
-            let payload = &rx[2..2 + frame_len];
             return router.rx_serialized_queue_from_side(payload, side_id);
         }
         #[cfg(not(target_os = "linux"))]
@@ -1016,7 +1256,7 @@ impl CommsDevice for SpiComms {
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if payload.is_empty() || payload.len() > u16::MAX as usize {
+        if payload.is_empty() || payload.len() > MAX_PACKET_SIZE {
             return Err(
                 format!("packet too large to send over spi: {} bytes", payload.len()).into(),
             );
@@ -1024,9 +1264,7 @@ impl CommsDevice for SpiComms {
 
         #[cfg(target_os = "linux")]
         {
-            let mut tx = Vec::with_capacity(payload.len() + 2);
-            tx.extend_from_slice(&(payload.len() as u16).to_le_bytes());
-            tx.extend_from_slice(payload);
+            let tx = build_raw_uart_frame(payload)?;
             let mut rx = vec![0u8; tx.len()];
             self.transfer(&tx, &mut rx)?;
             Ok(())
@@ -1211,27 +1449,31 @@ impl CommsDevice for CanComms {
 // ======================================================================
 //  Dummy Comms (fallback when hardware missing)
 // ======================================================================
-#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+#[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 #[derive(Debug)]
 pub struct DummyComms {
     name: &'static str,
     side_id: Option<RouterSideId>,
+    #[cfg(feature = "testing")]
     discovery_next_announce_ms: u64,
+    #[cfg(feature = "testing")]
     pending_rx: std::collections::VecDeque<sedsprintf_rs_2026::packet::Packet>,
 }
 
-#[cfg(any(feature = "testing", feature = "hitl_mode"))]
-
+#[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 impl DummyComms {
     pub fn new(name: &'static str) -> Self {
         DummyComms {
             name,
             side_id: None,
+            #[cfg(feature = "testing")]
             discovery_next_announce_ms: 0,
+            #[cfg(feature = "testing")]
             pending_rx: std::collections::VecDeque::new(),
         }
     }
 
+    #[cfg(feature = "testing")]
     fn simulated_discovery_sender(&self) -> &'static str {
         match self.name {
             "Rocket Comms" => crate::types::Board::RFBoard.sender_id(),
@@ -1240,6 +1482,7 @@ impl DummyComms {
         }
     }
 
+    #[cfg(feature = "testing")]
     fn simulated_discovery_endpoints(&self) -> &'static [sedsprintf_rs_2026::config::DataEndpoint] {
         use sedsprintf_rs_2026::config::DataEndpoint;
 
@@ -1258,6 +1501,7 @@ impl DummyComms {
         }
     }
 
+    #[cfg(feature = "testing")]
     fn simulated_timesync_sources(&self) -> &'static [&'static str] {
         match self.name {
             "Rocket Comms" => DUMMY_ROCKET_TIMESYNC_SOURCES,
@@ -1266,6 +1510,7 @@ impl DummyComms {
         }
     }
 
+    #[cfg(feature = "testing")]
     fn maybe_queue_discovery(&mut self) -> TelemetryResult<()> {
         let now_ms = crate::telemetry_task::get_current_timestamp_ms();
         if now_ms < self.discovery_next_announce_ms {
@@ -1297,7 +1542,7 @@ impl DummyComms {
     }
 }
 
-#[cfg(any(feature = "testing", feature = "hitl_mode"))]
+#[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 impl CommsDevice for DummyComms {
     fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
         #[cfg(feature = "testing")]
@@ -1310,18 +1555,15 @@ impl CommsDevice for DummyComms {
                 return _router.rx_queue_from_side(pkt, side_id);
             }
             let pkt = get_dummy_packet()?;
-            return _router.rx_queue_from_side(pkt, side_id);
+            _router.rx_queue_from_side(pkt, side_id)
         }
 
         #[cfg(not(feature = "testing"))]
         {
             let _ = _router;
             // In hitl_mode, dummy comms links are used only as disconnected-link placeholders.
-            return Ok(());
+            Ok(())
         }
-
-        #[allow(unreachable_code)]
-        Ok(())
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -1349,7 +1591,7 @@ impl CommsDevice for DummyComms {
             let prev = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
             if now_ms.saturating_sub(prev) >= interval_ms {
                 LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
-                println!(
+                gs_debug_println!(
                     "DummyComms: dropping {} bytes of outgoing telemetry send from {}",
                     payload.len(),
                     self.name
@@ -1456,14 +1698,6 @@ fn is_i2c_idle_read_error(err: &(dyn Error + 'static)) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn is_i2c_retryable_write_error(err: &(dyn Error + 'static)) -> bool {
-    err.downcast_ref::<std::io::Error>()
-        .and_then(std::io::Error::raw_os_error)
-        .is_some_and(|code| {
-            code == libc::ETIMEDOUT || code == libc::EREMOTEIO || code == libc::ENXIO
-        })
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -1512,6 +1746,30 @@ mod tests {
     fn timed_out_i2c_read_is_treated_as_idle() {
         let err = std::io::Error::from_raw_os_error(libc::ETIMEDOUT);
         assert!(is_i2c_idle_read_error(&err));
+    }
+}
+
+#[cfg(test)]
+mod raw_uart_tests {
+    use super::*;
+
+    #[test]
+    fn raw_uart_frame_roundtrip() {
+        let payload = vec![1, 2, 3, 4, 5];
+        let mut framed = build_raw_uart_frame(&payload).unwrap();
+        let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
+        assert_eq!(decoded, payload);
+        assert!(framed.is_empty());
+    }
+
+    #[test]
+    fn raw_uart_frame_resyncs_after_garbage() {
+        let payload = vec![9, 8, 7];
+        let mut framed = vec![0x00, 0x11, 0x22];
+        framed.extend_from_slice(&build_raw_uart_frame(&payload).unwrap());
+        let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
+        assert_eq!(decoded, payload);
+        assert!(framed.is_empty());
     }
 }
 

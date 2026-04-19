@@ -52,6 +52,17 @@ def normalize_command_access(value: dict[str, Any] | None) -> dict[str, list[str
     return {"allowed_commands": allowed}
 
 
+def normalize_calibration_access(value: dict[str, Any] | None) -> dict[str, bool]:
+    value = dict(value or {})
+    access = {
+        "view": bool(value.get("view", False)),
+        "edit": bool(value.get("edit", False)),
+    }
+    if access["edit"]:
+        access["view"] = True
+    return access
+
+
 def parse_command_csv(raw: str) -> list[str]:
     return normalize_command_access(
         {"allowed_commands": [part.strip() for part in raw.split(",")]}
@@ -81,6 +92,7 @@ def default_config() -> dict[str, Any]:
         "session_ttl_seconds": DEFAULT_SESSION_TTL_SECONDS,
         "anonymous": normalize_permissions({}),
         "anonymous_command_access": normalize_command_access({}),
+        "anonymous_calibration_access": normalize_calibration_access({}),
         "users": [],
     }
 
@@ -96,12 +108,16 @@ def load_config(path: Path) -> dict[str, Any]:
     cfg["session_ttl_seconds"] = int(cfg.get("session_ttl_seconds", DEFAULT_SESSION_TTL_SECONDS))
     cfg["anonymous"] = normalize_permissions(cfg.get("anonymous"))
     cfg["anonymous_command_access"] = normalize_command_access(cfg.get("anonymous_command_access"))
+    cfg["anonymous_calibration_access"] = normalize_calibration_access(
+        cfg.get("anonymous_calibration_access")
+    )
     users = []
     for raw_user in cfg.get("users", []):
         user = dict(raw_user)
         user["disabled"] = bool(user.get("disabled", False))
         user["permissions"] = normalize_permissions(user.get("permissions"))
         user["command_access"] = normalize_command_access(user.get("command_access"))
+        user["calibration_access"] = normalize_calibration_access(user.get("calibration_access"))
         users.append(user)
     cfg["users"] = users
     return cfg
@@ -121,6 +137,8 @@ def upsert_user(
         password: str | None,
         view_data: bool,
         send_commands: bool,
+        calibration_view: bool,
+        calibration_edit: bool,
         disabled: bool,
         allowed_commands: list[str] | None,
 ) -> None:
@@ -131,6 +149,9 @@ def upsert_user(
         {"view_data": view_data, "send_commands": send_commands}
     )
     command_access = normalize_command_access({"allowed_commands": allowed_commands or []})
+    calibration_access = normalize_calibration_access(
+        {"view": calibration_view, "edit": calibration_edit}
+    )
     existing = next((user for user in cfg["users"] if user["username"] == username), None)
     if existing is None:
         if password is None:
@@ -141,6 +162,7 @@ def upsert_user(
                 "password": hash_password(password),
                 "permissions": permissions,
                 "command_access": command_access,
+                "calibration_access": calibration_access,
                 "disabled": disabled,
             }
         )
@@ -149,6 +171,7 @@ def upsert_user(
 
     existing["permissions"] = permissions
     existing["command_access"] = command_access
+    existing["calibration_access"] = calibration_access
     existing["disabled"] = disabled
     if password:
         existing["password"] = hash_password(password)
@@ -170,6 +193,10 @@ def print_summary(cfg: dict[str, Any]) -> None:
         "Anonymous command access: "
         + (", ".join(cfg["anonymous_command_access"]["allowed_commands"]) or "all commands")
     )
+    anon_cal = cfg["anonymous_calibration_access"]
+    print(
+        f"Anonymous calibration: view={anon_cal['view']} edit={anon_cal['edit']}"
+    )
     if not cfg["users"]:
         print("No configured users.")
         return
@@ -179,7 +206,9 @@ def print_summary(cfg: dict[str, Any]) -> None:
         print(
             f"  - {user['username']}: view_data={perms['view_data']} "
             f"send_commands={perms['send_commands']} disabled={user['disabled']} "
-            f"allowed_commands={','.join(user['command_access']['allowed_commands']) or 'all'}"
+            f"allowed_commands={','.join(user['command_access']['allowed_commands']) or 'all'} "
+            f"calibration_view={user['calibration_access']['view']} "
+            f"calibration_edit={user['calibration_access']['edit']}"
         )
 
 
@@ -203,6 +232,9 @@ def cli_mode(args: argparse.Namespace) -> int:
                 else parse_command_csv(args.allowed_commands or "")
             }
         )
+        cfg["anonymous_calibration_access"] = normalize_calibration_access(
+            {"view": args.calibration_view, "edit": args.calibration_edit}
+        )
         changed = True
     elif args.command == "set-ttl":
         cfg["session_ttl_seconds"] = max(1, int(args.seconds))
@@ -222,6 +254,8 @@ def cli_mode(args: argparse.Namespace) -> int:
             password=password,
             view_data=args.view_data,
             send_commands=args.send_commands,
+            calibration_view=args.calibration_view,
+            calibration_edit=args.calibration_edit,
             disabled=args.disabled,
             allowed_commands=commands_catalog
             if args.select_all_commands
@@ -260,6 +294,8 @@ def tui_mode(path: Path) -> int:
                 password = getpass.getpass("Password: ")
                 view_data = prompt_bool("Allow view data", True)
                 send_commands = prompt_bool("Allow send commands", False)
+                calibration_view = prompt_bool("Allow calibration view", False)
+                calibration_edit = prompt_bool("Allow calibration edit", False)
                 disabled = prompt_bool("Disabled", False)
                 allowed_commands = prompt_command_selection(
                     "Allowed commands",
@@ -272,6 +308,8 @@ def tui_mode(path: Path) -> int:
                     password=password,
                     view_data=view_data,
                     send_commands=send_commands,
+                    calibration_view=calibration_view,
+                    calibration_edit=calibration_edit,
                     disabled=disabled,
                     allowed_commands=allowed_commands,
                 )
@@ -283,8 +321,15 @@ def tui_mode(path: Path) -> int:
                     continue
                 password = getpass.getpass("New password (leave blank to keep current): ").strip()
                 perms = user["permissions"]
+                calibration = user["calibration_access"]
                 view_data = prompt_bool("Allow view data", perms["view_data"])
                 send_commands = prompt_bool("Allow send commands", perms["send_commands"])
+                calibration_view = prompt_bool(
+                    "Allow calibration view", calibration["view"]
+                )
+                calibration_edit = prompt_bool(
+                    "Allow calibration edit", calibration["edit"]
+                )
                 disabled = prompt_bool("Disabled", bool(user.get("disabled", False)))
                 allowed_commands = prompt_command_selection(
                     "Allowed commands",
@@ -297,6 +342,8 @@ def tui_mode(path: Path) -> int:
                     password=password or None,
                     view_data=view_data,
                     send_commands=send_commands,
+                    calibration_view=calibration_view,
+                    calibration_edit=calibration_edit,
                     disabled=disabled,
                     allowed_commands=allowed_commands,
                 )
@@ -321,6 +368,17 @@ def tui_mode(path: Path) -> int:
                             commands_catalog,
                             cfg["anonymous_command_access"]["allowed_commands"],
                         )
+                    }
+                )
+                anon_cal = cfg["anonymous_calibration_access"]
+                cfg["anonymous_calibration_access"] = normalize_calibration_access(
+                    {
+                        "view": prompt_bool(
+                            "Anonymous calibration view", anon_cal["view"]
+                        ),
+                        "edit": prompt_bool(
+                            "Anonymous calibration edit", anon_cal["edit"]
+                        ),
                     }
                 )
             elif choice == "6":
@@ -421,8 +479,16 @@ def gui_mode(path: Path) -> int:
     ttl_var = tk.StringVar(value=str(cfg["session_ttl_seconds"]))
     anon_view_var = tk.BooleanVar(value=cfg["anonymous"]["view_data"])
     anon_send_var = tk.BooleanVar(value=cfg["anonymous"]["send_commands"])
+    anon_calibration_view_var = tk.BooleanVar(
+        value=cfg["anonymous_calibration_access"]["view"]
+    )
+    anon_calibration_edit_var = tk.BooleanVar(
+        value=cfg["anonymous_calibration_access"]["edit"]
+    )
     user_view_var = tk.BooleanVar(value=True)
     user_send_var = tk.BooleanVar(value=False)
+    user_calibration_view_var = tk.BooleanVar(value=False)
+    user_calibration_edit_var = tk.BooleanVar(value=False)
     user_disabled_var = tk.BooleanVar(value=False)
 
     def refresh_user_list() -> None:
@@ -439,6 +505,8 @@ def gui_mode(path: Path) -> int:
         password_var.set("")
         user_view_var.set(bool(user["permissions"]["view_data"]))
         user_send_var.set(bool(user["permissions"]["send_commands"]))
+        user_calibration_view_var.set(bool(user["calibration_access"]["view"]))
+        user_calibration_edit_var.set(bool(user["calibration_access"]["edit"]))
         user_disabled_var.set(bool(user.get("disabled", False)))
         set_selected_commands(user_commands_listbox, user["command_access"]["allowed_commands"])
 
@@ -453,6 +521,12 @@ def gui_mode(path: Path) -> int:
         )
         cfg["anonymous_command_access"] = normalize_command_access(
             {"allowed_commands": selected_commands(anon_commands_listbox)}
+        )
+        cfg["anonymous_calibration_access"] = normalize_calibration_access(
+            {
+                "view": anon_calibration_view_var.get(),
+                "edit": anon_calibration_edit_var.get(),
+            }
         )
         save_config(path, cfg)
         messagebox.showinfo("Saved", f"Saved {path}")
@@ -471,6 +545,8 @@ def gui_mode(path: Path) -> int:
                 password=password or None,
                 view_data=user_view_var.get(),
                 send_commands=user_send_var.get(),
+                calibration_view=user_calibration_view_var.get(),
+                calibration_edit=user_calibration_edit_var.get(),
                 disabled=user_disabled_var.get(),
                 allowed_commands=selected_commands(user_commands_listbox),
             )
@@ -491,6 +567,8 @@ def gui_mode(path: Path) -> int:
         password_var.set("")
         user_view_var.set(True)
         user_send_var.set(False)
+        user_calibration_view_var.set(False)
+        user_calibration_edit_var.set(False)
         user_disabled_var.set(False)
         user_commands_listbox.selection_clear(0, tk.END)
         listbox.selection_clear(0, tk.END)
@@ -574,21 +652,27 @@ def gui_mode(path: Path) -> int:
     ttk.Checkbutton(right, text="Send Commands", variable=user_send_var).grid(
         row=2, column=1, sticky="w"
     )
-    ttk.Checkbutton(right, text="Disabled", variable=user_disabled_var).grid(
-        row=3, column=0, sticky="w", pady=(0, 10)
+    ttk.Checkbutton(right, text="Calibration View", variable=user_calibration_view_var).grid(
+        row=3, column=0, sticky="w"
     )
-    ttk.Label(right, text="Allowed Commands").grid(row=4, column=0, sticky="nw")
+    ttk.Checkbutton(right, text="Calibration Edit", variable=user_calibration_edit_var).grid(
+        row=3, column=1, sticky="w"
+    )
+    ttk.Checkbutton(right, text="Disabled", variable=user_disabled_var).grid(
+        row=4, column=0, sticky="w", pady=(0, 10)
+    )
+    ttk.Label(right, text="Allowed Commands").grid(row=5, column=0, sticky="nw")
     user_commands_listbox = tk.Listbox(
         right,
         selectmode=tk.MULTIPLE,
         exportselection=False,
         height=min(max(len(commands_catalog), 6), 12),
     )
-    user_commands_listbox.grid(row=4, column=1, sticky="ew", pady=(0, 8))
+    user_commands_listbox.grid(row=5, column=1, sticky="ew", pady=(0, 8))
     for command in commands_catalog:
         user_commands_listbox.insert(tk.END, command)
     user_cmd_buttons = ttk.Frame(right)
-    user_cmd_buttons.grid(row=5, column=1, sticky="w", pady=(0, 8))
+    user_cmd_buttons.grid(row=6, column=1, sticky="w", pady=(0, 8))
     ttk.Button(
         user_cmd_buttons,
         text="Select All",
@@ -600,35 +684,41 @@ def gui_mode(path: Path) -> int:
         command=lambda: user_commands_listbox.selection_clear(0, tk.END),
     ).pack(side=tk.LEFT, padx=(8, 0))
     ttk.Button(right, text="Save User", command=save_user).grid(
-        row=6, column=0, columnspan=2, sticky="ew", pady=(0, 18)
+        row=7, column=0, columnspan=2, sticky="ew", pady=(0, 18)
     )
 
     ttk.Separator(right, orient="horizontal").grid(
-        row=7, column=0, columnspan=2, sticky="ew", pady=(0, 12)
+        row=8, column=0, columnspan=2, sticky="ew", pady=(0, 12)
     )
 
-    ttk.Label(right, text="Anonymous Permissions").grid(row=8, column=0, sticky="w")
+    ttk.Label(right, text="Anonymous Permissions").grid(row=9, column=0, sticky="w")
     ttk.Checkbutton(right, text="View Data", variable=anon_view_var).grid(
-        row=9, column=0, sticky="w"
+        row=10, column=0, sticky="w"
     )
     ttk.Checkbutton(right, text="Send Commands", variable=anon_send_var).grid(
-        row=9, column=1, sticky="w"
+        row=10, column=1, sticky="w"
     )
-    ttk.Label(right, text="Anonymous Allowed Commands").grid(row=10, column=0, sticky="nw")
+    ttk.Checkbutton(
+        right, text="Calibration View", variable=anon_calibration_view_var
+    ).grid(row=11, column=0, sticky="w")
+    ttk.Checkbutton(
+        right, text="Calibration Edit", variable=anon_calibration_edit_var
+    ).grid(row=11, column=1, sticky="w")
+    ttk.Label(right, text="Anonymous Allowed Commands").grid(row=12, column=0, sticky="nw")
     anon_commands_listbox = tk.Listbox(
         right,
         selectmode=tk.MULTIPLE,
         exportselection=False,
         height=min(max(len(commands_catalog), 6), 12),
     )
-    anon_commands_listbox.grid(row=10, column=1, sticky="ew", pady=(0, 8))
+    anon_commands_listbox.grid(row=12, column=1, sticky="ew", pady=(0, 8))
     for command in commands_catalog:
         anon_commands_listbox.insert(tk.END, command)
     set_selected_commands(
         anon_commands_listbox, cfg["anonymous_command_access"]["allowed_commands"]
     )
     anon_cmd_buttons = ttk.Frame(right)
-    anon_cmd_buttons.grid(row=11, column=1, sticky="w", pady=(0, 8))
+    anon_cmd_buttons.grid(row=13, column=1, sticky="w", pady=(0, 8))
     ttk.Button(
         anon_cmd_buttons,
         text="Select All",
@@ -639,10 +729,10 @@ def gui_mode(path: Path) -> int:
         text="Clear",
         command=lambda: anon_commands_listbox.selection_clear(0, tk.END),
     ).pack(side=tk.LEFT, padx=(8, 0))
-    ttk.Label(right, text="Session TTL Seconds").grid(row=12, column=0, sticky="w", pady=(10, 0))
-    ttk.Entry(right, textvariable=ttl_var).grid(row=12, column=1, sticky="ew", pady=(10, 0))
+    ttk.Label(right, text="Session TTL Seconds").grid(row=14, column=0, sticky="w", pady=(10, 0))
+    ttk.Entry(right, textvariable=ttl_var).grid(row=14, column=1, sticky="ew", pady=(10, 0))
     ttk.Button(right, text="Save Config", command=save_all).grid(
-        row=13, column=0, columnspan=2, sticky="ew", pady=(16, 0)
+        row=15, column=0, columnspan=2, sticky="ew", pady=(16, 0)
     )
 
     root.bind_all("<Control-s>", save_all_event)
@@ -670,6 +760,8 @@ def build_parser() -> argparse.ArgumentParser:
     anon = sub.add_parser("set-anonymous", help="Set anonymous permissions")
     anon.add_argument("--view-data", action="store_true")
     anon.add_argument("--send-commands", action="store_true")
+    anon.add_argument("--calibration-view", action="store_true")
+    anon.add_argument("--calibration-edit", action="store_true")
     anon.add_argument("--allowed-commands", help="Comma-separated allowed commands")
     anon.add_argument(
         "--select-all-commands",
@@ -690,6 +782,8 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--prompt-password", action="store_true")
         cmd.add_argument("--view-data", action="store_true")
         cmd.add_argument("--send-commands", action="store_true")
+        cmd.add_argument("--calibration-view", action="store_true")
+        cmd.add_argument("--calibration-edit", action="store_true")
         cmd.add_argument("--disabled", action="store_true")
         cmd.add_argument("--allowed-commands", help="Comma-separated allowed commands")
         cmd.add_argument(

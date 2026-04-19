@@ -8,6 +8,10 @@
   "anonymous_command_access": {
     "allowed_commands": []
   },
+  "anonymous_calibration_access": {
+    "view": true,
+    "edit": false
+  },
   "users": [
     {
       "username": "rylan",
@@ -44,6 +48,7 @@
           "Nitrogen",
           "Nitrous",
           "NormallyOpen",
+          "PauseWritingDb",
           "Pilot",
           "ReinitAfter12",
           "ReinitAfter26",
@@ -57,8 +62,15 @@
           "RevokeResetFailures",
           "RevokeValidateMeasms",
           "RewindFlightState",
+          "StartWritingLastTwoMinutes",
+          "StartWritingNow",
+          "StopWritingDb",
           "ValidateMeasms"
         ]
+      },
+      "calibration_access": {
+        "view": true,
+        "edit": true
       },
       "disabled": false
     }

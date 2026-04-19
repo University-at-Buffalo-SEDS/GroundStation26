@@ -1,0 +1,76 @@
+{
+  "capture_target_samples": 200,
+  "fit_modes": [
+    "best",
+    "linear",
+    "linear_zero",
+    "parabolic",
+    "parabolic_zero",
+    "cubic",
+    "cubic_zero",
+    "quartic",
+    "quartic_zero"
+  ],
+  "sensors": [
+    {
+      "id": "KG50",
+      "label": "50kg",
+      "data_type": "KG50",
+      "channel": "ch0",
+      "fit_color": "#f59e0b",
+      "raw_label": "Raw",
+      "expected_label": "kg",
+      "fit_modes": [
+        "best",
+        "linear",
+        "linear_zero",
+        "parabolic",
+        "parabolic_zero",
+        "cubic",
+        "cubic_zero",
+        "quartic",
+        "quartic_zero"
+      ]
+    },
+    {
+      "id": "KG1000",
+      "label": "1000kg",
+      "data_type": "KG1000",
+      "channel": "ch1",
+      "fit_color": "#22d3ee",
+      "raw_label": "Raw",
+      "expected_label": "kg",
+      "fit_modes": [
+        "best",
+        "linear",
+        "linear_zero",
+        "parabolic",
+        "parabolic_zero",
+        "cubic",
+        "cubic_zero",
+        "quartic",
+        "quartic_zero"
+      ]
+    },
+    {
+      "id": "IADC",
+      "label": "Tank Pressure",
+      "data_type": "FUEL_TANK_PRESSURE",
+      "channel": "iadc",
+      "fit_color": "#a78bfa",
+      "raw_label": "Raw",
+      "expected_label": "psi",
+      "fit_modes": [
+        "best",
+        "linear",
+        "linear_zero",
+        "parabolic",
+        "parabolic_zero",
+        "cubic",
+        "cubic_zero",
+        "quartic",
+        "quartic_zero"
+      ]
+    }
+  ]
+}

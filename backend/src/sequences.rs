@@ -1,10 +1,11 @@
+use crate::layout;
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 use crate::state::AppState;
 use crate::types::{FlightState, TelemetryCommand};
 use crate::web::emit_warning;
 use crate::{fill_targets, loadcell};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -18,6 +19,7 @@ enum NitrogenAutocloseMode {
     Pressure,
     Weight,
     Both,
+    Either,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,6 +43,43 @@ pub struct ActionPolicyMsg {
     pub key_enabled: bool,
     pub software_buttons_enabled: bool,
     pub controls: Vec<ActionControl>,
+}
+
+fn backend_illuminated_commands() -> HashSet<String> {
+    layout::load_layout()
+        .map(|layout| {
+            layout
+                .actions_tab
+                .actions
+                .into_iter()
+                .filter(|action| action.illuminated)
+                .map(|action| action.cmd)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn backend_blink_for(cmd: &str, enabled: bool, recommended: Option<&BlinkMode>) -> BlinkMode {
+    if !enabled {
+        return BlinkMode::None;
+    }
+    if let Some(blink) = recommended {
+        return blink.clone();
+    }
+    if is_recording_command(cmd) {
+        return BlinkMode::None;
+    }
+    if backend_illuminated_commands().contains(cmd) {
+        return BlinkMode::Slow;
+    }
+    BlinkMode::None
+}
+
+fn is_recording_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "StartWritingNow" | "StartWritingLastTwoMinutes" | "PauseWritingDb" | "StopWritingDb"
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,11 +175,12 @@ impl SequenceConfig {
                 "pressure" => Some(NitrogenAutocloseMode::Pressure),
                 "weight" => Some(NitrogenAutocloseMode::Weight),
                 "both" => Some(NitrogenAutocloseMode::Both),
+                "either" | "any" => Some(NitrogenAutocloseMode::Either),
                 _ => None,
             })
             .unwrap_or_else(|| {
                 if nitrogen_target_mass_kg.is_some() {
-                    NitrogenAutocloseMode::Weight
+                    NitrogenAutocloseMode::Either
                 } else {
                     NitrogenAutocloseMode::Pressure
                 }
@@ -346,7 +386,6 @@ fn is_fill_state(state: FlightState) -> bool {
 
 pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
     match cmd {
-        TelemetryCommand::LaunchSignal => "LaunchSignal",
         TelemetryCommand::Dump => "Dump",
         TelemetryCommand::Abort => "Abort",
         TelemetryCommand::NormallyOpen => "NormallyOpen",
@@ -355,17 +394,37 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::RetractPlumbing => "RetractPlumbing",
         TelemetryCommand::Nitrogen | TelemetryCommand::NitrogenClose => "Nitrogen",
         TelemetryCommand::Nitrous | TelemetryCommand::NitrousClose => "Nitrous",
+        TelemetryCommand::StartWritingNow => "StartWritingNow",
+        TelemetryCommand::StartWritingLastTwoMinutes => "StartWritingLastTwoMinutes",
+        TelemetryCommand::PauseWritingDb => "PauseWritingDb",
+        TelemetryCommand::StopWritingDb => "StopWritingDb",
         TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
+        TelemetryCommand::PostinitSignal => "PostinitSignal",
+        TelemetryCommand::LaunchSignal => "LaunchSignal",
+        TelemetryCommand::RollbackSignal => "RollbackSignal",
+        TelemetryCommand::MonitorAltitude => "MonitorAltitude",
+        TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
+        TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
+        TelemetryCommand::RevokeConsecutiveSamples => "RevokeConsecutiveSamples",
+        TelemetryCommand::ResetFailures => "ResetFailures",
+        TelemetryCommand::RevokeResetFailures => "RevokeResetFailures",
+        TelemetryCommand::ValidateMeasms => "ValidateMeasms",
+        TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ExpandParachute => "ExpandParachute",
-        TelemetryCommand::ReinitSensors => "ReinitSensors",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationRelax => "EvaluationRelax",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationFocus => "EvaluationFocus",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationAbort => "EvaluationAbort",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ReinitSensors => "ReinitSensors",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitBarometer => "ReinitBarometer",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitIMU => "ReinitIMU",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DisableIMU => "DisableIMU",
@@ -373,22 +432,11 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::RewindFlightState => "RewindFlightState",
-        TelemetryCommand::MonitorAltitude => "MonitorAltitude",
-        TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::RevokeConsecutiveSamples => "RevokeConsecutiveSamples",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ResetFailures => "ResetFailures",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::RevokeResetFailures => "RevokeResetFailures",
-        TelemetryCommand::ValidateMeasms => "ValidateMeasms",
-        TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter40 => "AbortAfter40",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter100 => "AbortAfter100",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter250 => "AbortAfter250",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitAfter15 => "ReinitAfter15",
@@ -399,7 +447,7 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
     }
 }
 
-#[cfg(not(feature = "hitl_mode"))]
+#[cfg(all(not(feature = "hitl_mode"), not(feature = "test_fire_mode")))]
 pub fn all_command_names() -> Vec<&'static str> {
     vec![
         "Launch",
@@ -411,6 +459,10 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
+        "StartWritingNow",
+        "StartWritingLastTwoMinutes",
+        "PauseWritingDb",
+        "StopWritingDb",
         "ContinueFillSequence",
     ]
 }
@@ -427,6 +479,10 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
+        "StartWritingNow",
+        "StartWritingLastTwoMinutes",
+        "PauseWritingDb",
+        "StopWritingDb",
         "ContinueFillSequence",
         "DeployParachute",
         "ExpandParachute",
@@ -457,14 +513,50 @@ pub fn all_command_names() -> Vec<&'static str> {
     ]
 }
 
+#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+pub fn all_command_names() -> Vec<&'static str> {
+    vec![
+        "Launch",
+        "Dump",
+        "Abort",
+        "NormallyOpen",
+        "Pilot",
+        "Igniter",
+        "RetractPlumbing",
+        "Nitrogen",
+        "Nitrous",
+        "StartWritingNow",
+        "StartWritingLastTwoMinutes",
+        "PauseWritingDb",
+        "StopWritingDb",
+        "ContinueFillSequence",
+        "AdvanceFlightState",
+        "RewindFlightState",
+    ]
+}
+
 pub fn default_action_policy() -> ActionPolicyMsg {
     let controls = all_command_names()
         .into_iter()
-        .map(|cmd| ActionControl {
-            cmd: cmd.to_string(),
-            enabled: cmd == "Abort",
-            blink: BlinkMode::None,
-            actuated: None,
+        .map(|cmd| {
+            let enabled = matches!(
+                cmd,
+                "Abort"
+                    | "StartWritingNow"
+                    | "StartWritingLastTwoMinutes"
+                    | "PauseWritingDb"
+                    | "StopWritingDb"
+            );
+            ActionControl {
+                cmd: cmd.to_string(),
+                enabled,
+                blink: backend_blink_for(cmd, enabled, None),
+                actuated: if is_recording_command(cmd) {
+                    Some(true)
+                } else {
+                    None
+                },
+            }
         })
         .collect();
     ActionPolicyMsg {
@@ -482,10 +574,16 @@ fn policy_with_overrides(
 ) -> ActionPolicyMsg {
     let controls = all_command_names()
         .into_iter()
-        .map(|cmd| ActionControl {
-            cmd: cmd.to_string(),
+        .map(|cmd| {
             // Keep controls pressable while key is enabled; blink indicates recommendation.
-            enabled: if cmd == "Abort" {
+            let enabled = if matches!(
+                cmd,
+                "Abort"
+                    | "StartWritingNow"
+                    | "StartWritingLastTwoMinutes"
+                    | "PauseWritingDb"
+                    | "StopWritingDb"
+            ) {
                 true
             } else if cmd == "ContinueFillSequence" {
                 false
@@ -494,9 +592,17 @@ fn policy_with_overrides(
                 false
             } else {
                 key_enabled
-            },
-            blink: recommended.get(cmd).cloned().unwrap_or(BlinkMode::None),
-            actuated: valves.actuated_for_cmd(cmd),
+            };
+            ActionControl {
+                cmd: cmd.to_string(),
+                enabled,
+                blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
+                actuated: if is_recording_command(cmd) {
+                    Some(true)
+                } else {
+                    valves.actuated_for_cmd(cmd)
+                },
+            }
         })
         .collect();
 
@@ -571,6 +677,7 @@ fn update_sequence_runtime(
                 NitrogenAutocloseMode::Pressure => pressure_ready,
                 NitrogenAutocloseMode::Weight => weight_ready,
                 NitrogenAutocloseMode::Both => pressure_ready && weight_ready,
+                NitrogenAutocloseMode::Either => pressure_ready || weight_ready,
             };
 
             if should_close && !runtime.auto_close_nitrogen_sent {
@@ -596,6 +703,14 @@ fn update_sequence_runtime(
                                     cfg.nitrogen_target_mass_kg.unwrap_or_default();
                                 state.add_notification(format!(
                                     "Nitrogen targets reached ({target_mass_kg:.2} kg, {:.1} psi). Closing nitrogen valve.",
+                                    cfg.nitrogen_pressure_target_psi
+                                ));
+                            }
+                            NitrogenAutocloseMode::Either => {
+                                let target_mass_kg =
+                                    cfg.nitrogen_target_mass_kg.unwrap_or_default();
+                                state.add_notification(format!(
+                                    "Nitrogen fill target reached by weight or pressure ({target_mass_kg:.2} kg / {:.1} psi). Closing nitrogen valve.",
                                     cfg.nitrogen_pressure_target_psi
                                 ));
                             }
@@ -857,7 +972,7 @@ fn maybe_drive_local_prelaunch_state(
         return current_state;
     }
 
-    if current_state == FlightState::Startup && state.all_boards_seen() {
+    if current_state == FlightState::Startup && state.all_required_boards_seen() {
         state.set_local_flight_state(FlightState::Idle);
         return FlightState::Idle;
     }
@@ -898,11 +1013,18 @@ fn maybe_drive_local_prelaunch_state(
 fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
     let controls = all_command_names()
         .into_iter()
-        .map(|cmd| ActionControl {
-            cmd: cmd.to_string(),
-            enabled: !(cmd == "RetractPlumbing" && valves.retract == Some(true)),
-            blink: BlinkMode::None,
-            actuated: valves.actuated_for_cmd(cmd),
+        .map(|cmd| {
+            let actuated = if is_recording_command(cmd) {
+                Some(true)
+            } else {
+                valves.actuated_for_cmd(cmd)
+            };
+            ActionControl {
+                cmd: cmd.to_string(),
+                enabled: true,
+                blink: BlinkMode::None,
+                actuated,
+            }
         })
         .collect();
 
@@ -1079,7 +1201,7 @@ fn read_key_enabled(state: &AppState, cfg: &SequenceConfig) -> bool {
     if cfg!(feature = "testing") {
         return true;
     }
-    if cfg!(feature = "hitl_mode") {
+    if cfg!(feature = "hitl_mode") || cfg!(feature = "test_fire_mode") {
         return true;
     }
     if !cfg.key_required {
@@ -1098,7 +1220,7 @@ fn read_software_buttons_enabled(state: &AppState, cfg: &SequenceConfig) -> bool
     if cfg!(feature = "testing") {
         return true;
     }
-    if cfg!(feature = "hitl_mode") {
+    if cfg!(feature = "hitl_mode") || cfg!(feature = "test_fire_mode") {
         return true;
     }
     state
@@ -1134,6 +1256,7 @@ pub fn start_sequence_task(
 
     if cfg.key_required
         && !cfg!(feature = "hitl_mode")
+        && !cfg!(feature = "test_fire_mode")
         && let Err(err) = state.gpio.setup_input_pin(cfg.key_enable_pin)
     {
         eprintln!(
@@ -1144,6 +1267,7 @@ pub fn start_sequence_task(
 
     if !cfg!(feature = "testing")
         && !cfg!(feature = "hitl_mode")
+        && !cfg!(feature = "test_fire_mode")
         && let Err(err) = state.gpio.setup_input_pin(cfg.software_disable_pin)
     {
         eprintln!(

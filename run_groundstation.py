@@ -83,8 +83,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=["testing", "hitl-mode", "debug"],
-        help="Legacy positional mode. Use 'testing', 'hitl-mode', or 'debug'.",
+        choices=["testing", "hitl-mode", "test-fire-mode", "debug"],
+        help="Legacy positional mode. Use 'testing', 'hitl-mode', 'test-fire-mode', or 'debug'.",
     )
     parser.add_argument(
         "--testing",
@@ -95,6 +95,11 @@ def parse_args() -> argparse.Namespace:
         "--hitl-mode",
         action="store_true",
         help="Enable backend 'hitl_mode' feature.",
+    )
+    parser.add_argument(
+        "--test-fire-mode",
+        action="store_true",
+        help="Enable backend 'test_fire_mode' feature.",
     )
     parser.add_argument(
         "--debug",
@@ -113,9 +118,10 @@ def main() -> None:
     args = parse_args()
     testing_mode = args.testing or args.mode == "testing"
     hitl_mode = args.hitl_mode or args.mode == "hitl-mode"
+    test_fire_mode = args.test_fire_mode or args.mode == "test-fire-mode"
     debug_mode = args.debug or args.mode == "debug"
-    if testing_mode and hitl_mode:
-        print("Error: testing mode and hitl-mode are mutually exclusive.", file=sys.stderr)
+    if sum([testing_mode, hitl_mode, test_fire_mode]) > 1:
+        print("Error: testing mode, hitl-mode, and test-fire-mode are mutually exclusive.", file=sys.stderr)
         sys.exit(2)
 
     cmd = ["cargo", "run"]
@@ -129,11 +135,13 @@ def main() -> None:
         features.append("testing")
     if hitl_mode:
         features.append("hitl_mode")
+    if test_fire_mode:
+        features.append("test_fire_mode")
     if features:
         cmd.extend(["--features", ",".join(features)])
     repo_root = Path(__file__).resolve().parent
     if not args.backend_only_build:
-        frontend_cmd = [sys.executable, str(repo_root / "frontend" / "build.py"), "frontend_web"]
+        frontend_cmd = [sys.executable, str(repo_root / "build.py"), "frontend_web"]
         if debug_mode:
             frontend_cmd.append("debug")
         print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")

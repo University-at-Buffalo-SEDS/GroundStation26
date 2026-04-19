@@ -6,11 +6,9 @@ use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "hitl_mode")]
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 // Acceleration thresholds (m/s²)
 const ACCELERATION_X_MIN_THRESHOLD: f32 = -2.0; // m/s²
@@ -46,6 +44,8 @@ const GPS_LONGITUDE_MAX_THRESHOLD: f32 = -93.5; // degrees
 // Default battery voltage thresholds (V), used as fallback sender ranges.
 const BATTERY_VOLTAGE_AV_BAY_MIN_THRESHOLD: f32 = 6.3; // V
 const BATTERY_VOLTAGE_AV_BAY_MAX_THRESHOLD: f32 = 8.4; // V
+const BATTERY_VOLTAGE_VALVE_BOARD_MIN_THRESHOLD: f32 = 6.3; // V
+const BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD: f32 = 8.4; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD: f32 = 13.3; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 15.5; // V
 
@@ -101,6 +101,13 @@ fn battery_voltage_bounds_by_sender() -> &'static HashMap<String, (f32, f32)> {
                     BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD,
                 ),
             ),
+            (
+                Board::ValveBoard.sender_id().to_string(),
+                (
+                    BATTERY_VOLTAGE_VALVE_BOARD_MIN_THRESHOLD,
+                    BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD,
+                ),
+            ),
         ]);
 
         if let Ok(layout) = crate::layout::load_layout() {
@@ -123,29 +130,6 @@ fn battery_voltage_bounds_by_sender() -> &'static HashMap<String, (f32, f32)> {
 
         out
     })
-}
-
-#[cfg(feature = "hitl_mode")]
-fn ignore_missing_board_in_hitl(state: &AppState, board: Board) -> bool {
-    let av_link_up = state.av_bay_radio_connected.load(Ordering::Relaxed);
-    let fill_link_up = state.fill_radio_connected.load(Ordering::Relaxed);
-    if !av_link_up
-        && matches!(
-            board,
-            Board::FlightComputer | Board::RFBoard | Board::PowerBoard | Board::DaqBoard
-        )
-    {
-        return true;
-    }
-    if !fill_link_up
-        && matches!(
-            board,
-            Board::ValveBoard | Board::ActuatorBoard | Board::GatewayBoard
-        )
-    {
-        return true;
-    }
-    false
 }
 
 async fn insert_flight_state_with_retry(
@@ -232,8 +216,7 @@ pub async fn safety_task(
         let all_boards_seen = {
             let mut board_status = state.board_status.lock().unwrap();
             for (board, status) in board_status.iter_mut() {
-                #[cfg(feature = "hitl_mode")]
-                if ignore_missing_board_in_hitl(&state, *board) {
+                if !state.board_required_for_progression(*board) {
                     status.warned = false;
                     continue;
                 }
@@ -286,8 +269,7 @@ pub async fn safety_task(
                 }
             }
             Board::ALL.iter().all(|board| {
-                #[cfg(feature = "hitl_mode")]
-                if ignore_missing_board_in_hitl(&state, *board) {
+                if !state.board_required_for_progression(*board) {
                     return true;
                 }
                 board_status
@@ -308,7 +290,10 @@ pub async fn safety_task(
             .board_status_tx
             .send(state.board_status_snapshot(now_ms));
 
-        if current_state == FlightState::Startup && all_boards_seen && !cfg!(feature = "hitl_mode")
+        if current_state == FlightState::Startup
+            && all_boards_seen
+            && !cfg!(feature = "hitl_mode")
+            && !cfg!(feature = "test_fire_mode")
         {
             let should_advance = {
                 let mut fs = state.state.lock().unwrap();
@@ -322,14 +307,20 @@ pub async fn safety_task(
 
             if should_advance {
                 let ts_ms = get_current_timestamp_ms() as i64;
-                if let Err(e) =
-                    insert_flight_state_with_retry(&state.db, ts_ms, FlightState::Idle as i64).await
+                state.update_launch_clock_for_state(FlightState::Idle, ts_ms);
+                if let Err(e) = insert_flight_state_with_retry(
+                    &state.telemetry_db_pool(),
+                    ts_ms,
+                    FlightState::Idle as i64,
+                )
+                .await
                 {
                     eprintln!("DB insert into flight_state failed after retry: {e}");
                 }
                 let _ = state.state_tx.send(crate::web::FlightStateMsg {
                     state: FlightState::Idle,
                 });
+                state.broadcast_fill_targets_snapshot();
             }
         }
 
@@ -344,7 +335,7 @@ pub async fn safety_task(
                     &state,
                     "Warning: No telemetry packets received for 10 seconds!",
                 );
-                println!("Safety: No telemetry packets received for >=10 seconds!");
+                gs_debug_println!("Safety: No telemetry packets received for >=10 seconds!");
                 last_no_packet_warning_ms = now_ms;
             }
         } else {
@@ -550,7 +541,7 @@ pub async fn safety_task(
                 DataType::GenericError => {
                     abort = true;
                     cycle_warnings.insert("Generic Error received from vehicle!");
-                    println!("Safety: Generic Error packet received");
+                    gs_debug_println!("Safety: Generic Error packet received");
                 }
 
                 _ => {}
@@ -578,7 +569,7 @@ pub async fn safety_task(
                 .unwrap_or_else(|e| {
                     eprintln!("failed to log Abort command: {:?}", e);
                 });
-            println!("Safety task: Abort command sent");
+            gs_debug_println!("Safety task: Abort command sent");
             break;
         }
     }

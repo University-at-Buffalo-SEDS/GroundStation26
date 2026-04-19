@@ -38,6 +38,7 @@
     "b": null,
     "c": null,
     "d": null,
+    "e": null,
     "x0": null
   },
   "ch1_fit": {
@@ -46,6 +47,7 @@
     "b": null,
     "c": null,
     "d": null,
+    "e": null,
     "x0": null
   },
   "iadc_fit": {
@@ -54,10 +56,77 @@
     "b": null,
     "c": null,
     "d": null,
+    "e": null,
     "x0": null
   },
   "weights_kg": [
     5.0,
     10.0
-  ]
+  ],
+  "extra_channels": {
+    "ch0": {
+      "linear": {
+        "m": 1.0,
+        "b": 0.0
+      },
+      "zero_raw": null,
+      "points": [],
+      "fit": {
+        "type": "linear",
+        "a": null,
+        "b": null,
+        "c": null,
+        "d": null,
+        "e": null,
+        "x0": null
+      }
+    },
+    "ch1": {
+      "linear": {
+        "m": 1.0,
+        "b": 0.0
+      },
+      "zero_raw": 0.0,
+      "points": [
+        {
+          "expected": 0.0,
+          "raw": 0.0
+        },
+        {
+          "expected": 5.0,
+          "raw": 5.0
+        },
+        {
+          "expected": 10.0,
+          "raw": 10.0
+        }
+      ],
+      "fit": {
+        "type": "linear",
+        "a": null,
+        "b": null,
+        "c": null,
+        "d": null,
+        "e": null,
+        "x0": null
+      }
+    },
+    "iadc": {
+      "linear": {
+        "m": 1.0,
+        "b": 0.0
+      },
+      "zero_raw": null,
+      "points": [],
+      "fit": {
+        "type": "linear",
+        "a": null,
+        "b": null,
+        "c": null,
+        "d": null,
+        "e": null,
+        "x0": null
+      }
+    }
+  }
 }

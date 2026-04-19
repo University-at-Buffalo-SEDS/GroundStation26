@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
-use whatlang::{detect, Lang};
+use whatlang::{Lang, detect};
 
 #[derive(Serialize, Deserialize, Default)]
 struct TranslationCacheFile {
@@ -127,11 +127,6 @@ const KNOWN_TRANSLATIONS: &[(&str, &str, &str)] = &[
     ("Startup", "Inicio", "Démarrage"),
     ("Abort", "Abortar", "Abandon"),
     (
-        "Current Flight State",
-        "Estado actual de vuelo",
-        "État de vol actuel",
-    ),
-    (
         "Fuel Tank Pressure",
         "Presión del tanque de combustible",
         "Pression du réservoir carburant",
@@ -163,9 +158,9 @@ const KNOWN_TRANSLATIONS: &[(&str, &str, &str)] = &[
         "Batterie AV Bay (carte puissance)",
     ),
     (
-        "Ground Station Battery (Gateway Board)",
-        "Batería de estación base (placa gateway)",
-        "Batterie station sol (carte passerelle)",
+        "Fill Box Power (Gateway Board)",
+        "Energía de caja de llenado (placa gateway)",
+        "Alimentation boîtier de remplissage (carte passerelle)",
     ),
     ("Gyro Data", "Datos de giroscopio", "Données gyroscope"),
     (

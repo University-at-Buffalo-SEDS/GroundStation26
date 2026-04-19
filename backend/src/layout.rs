@@ -5,6 +5,8 @@ use std::path::PathBuf;
 const DEFAULT_LAYOUT_PATH: &str = "layout/layout.json";
 #[cfg(feature = "hitl_mode")]
 const DEFAULT_HITL_LAYOUT_PATH: &str = "layout/layout_hitl.json";
+#[cfg(feature = "test_fire_mode")]
+const DEFAULT_TEST_FIRE_LAYOUT_PATH: &str = "layout/layout_test_fire.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
@@ -269,6 +271,8 @@ pub struct NetworkTabLayout {
     #[serde(default)]
     pub enabled: bool,
     pub title: Option<String>,
+    #[serde(default)]
+    pub expected_boards: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,7 +408,25 @@ pub struct DataTabChart {
 pub struct ActionsTabLayout {
     #[serde(default)]
     pub disable_actions_by_default: bool,
+    #[serde(default = "default_show_flight_setup")]
+    pub show_flight_setup: bool,
+    #[serde(default = "default_show_fill_targets")]
+    pub show_fill_targets: bool,
+    #[serde(default = "default_fill_targets_require_actions_enabled")]
+    pub fill_targets_require_actions_enabled: bool,
     pub actions: Vec<ActionSpec>,
+}
+
+fn default_show_flight_setup() -> bool {
+    true
+}
+
+fn default_show_fill_targets() -> bool {
+    true
+}
+
+fn default_fill_targets_require_actions_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,6 +436,20 @@ pub struct ActionSpec {
     pub border: String,
     pub bg: String,
     pub fg: String,
+    #[serde(default)]
+    pub illuminated: bool,
+    #[serde(default)]
+    pub spacer_before: bool,
+    #[serde(default)]
+    pub spacer_after: bool,
+    #[serde(default)]
+    pub new_row_before: bool,
+    #[serde(default)]
+    pub new_row_after: bool,
+    #[serde(default)]
+    pub spacer_row_before: bool,
+    #[serde(default)]
+    pub spacer_row_after: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +468,17 @@ pub struct StateSection {
     pub title: Option<String>,
     pub widgets: Vec<StateWidget>,
     pub style: Option<StateSectionStyle>,
+    #[serde(default)]
+    pub value_layout: StateSectionValueLayout,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StateSectionValueLayout {
+    #[default]
+    Auto,
+    Vertical,
+    Horizontal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -443,6 +490,10 @@ pub struct StateWidget {
     pub chart_title: Option<String>,
     pub width: Option<f64>,
     pub height: Option<f64>,
+    #[serde(default)]
+    pub full_width: bool,
+    #[serde(default)]
+    pub width_fraction: Option<f64>,
     pub actions: Option<Vec<String>>,
     pub valves: Option<Vec<SummaryItem>>,
     pub valve_colors: Option<ValveColorSet>,
@@ -531,6 +582,15 @@ pub enum StateWidgetKind {
 pub fn layout_path() -> PathBuf {
     if let Ok(path) = std::env::var("GS_LAYOUT_PATH") {
         return PathBuf::from(path);
+    }
+
+    #[cfg(feature = "test_fire_mode")]
+    {
+        let test_fire =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_TEST_FIRE_LAYOUT_PATH);
+        if test_fire.exists() {
+            return test_fire;
+        }
     }
 
     #[cfg(feature = "hitl_mode")]

@@ -1,1 +1,0 @@
--keep class com.ubseds.gs26.LocationShim { *; }

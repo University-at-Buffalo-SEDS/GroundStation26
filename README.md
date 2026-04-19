@@ -15,6 +15,7 @@ The frontend uses Dioxus. No separate WASM toolchain workflow is needed beyond t
 - Radio link selection lives in `backend/comms/coms.json` by default and can be overridden with `GS_RADIO_LINK_CONFIG`.
 - Link interfaces can be configured as serial/UART, SPI, or CAN. The Linux backend supports all three; this covers
   Ubuntu and Raspberry Pi OS.
+- Set `GS_DEBUG_PRINTS=1` to enable backend debug/status prints that are muted by default.
 - Use `python3 backend/tools/radio_link_config_gui.py` to detect serial, SPI, and CAN candidates, assign the AV bay and
   fill box links, and save the JSON config.
 - If no display is available, the same script falls back to a terminal UI automatically. You can also force modes with
@@ -41,21 +42,8 @@ python3 build.py debug
 Scoped build entry points:
 
 ```bash
-python3 frontend/build.py frontend_web
-python3 frontend/build.py macos
 python3 backend/build.py
 python3 backend/build.py testing
-```
-
-Platform-specific frontend bundles:
-
-```bash
-python3 build.py ios
-python3 build.py ios_sim
-python3 build.py macos
-python3 build.py windows
-python3 build.py android
-python3 build.py linux
 ```
 
 Docker images:
@@ -65,14 +53,6 @@ python3 build.py docker
 python3 build.py docker pi_build
 python3 build.py docker testing
 ```
-
-Build output notes:
-
-- Web builds write to `frontend/dist/public`.
-- Native frontend bundles write to `frontend/dist/...`.
-- Web and native builds no longer delete each other's output directories.
-- `build.py` is now the compatibility wrapper; use `frontend/build.py` and `backend/build.py` when you only need one
-  side.
 
 ## Documentation
 
@@ -119,7 +99,6 @@ Mode notes:
 
 ## Frontend / Backend Notes
 
-- The frontend is served by the backend from `frontend/dist/public`.
 - For geolocation to work correctly in browsers, the backend should be behind HTTPS.
 - `docker-compose.yml` is set up for local TLS testing with a self-signed certificate.
 

@@ -1,5 +1,5 @@
-use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use ring::pbkdf2;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
@@ -64,6 +64,23 @@ impl CommandAccess {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CalibrationAccess {
+    #[serde(default)]
+    pub view: bool,
+    #[serde(default)]
+    pub edit: bool,
+}
+
+impl CalibrationAccess {
+    pub fn normalized(mut self) -> Self {
+        if self.edit {
+            self.view = true;
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
     ViewData,
@@ -89,6 +106,8 @@ pub struct UserRecord {
     #[serde(default)]
     pub command_access: CommandAccess,
     #[serde(default)]
+    pub calibration_access: CalibrationAccess,
+    #[serde(default)]
     pub disabled: bool,
 }
 
@@ -103,6 +122,8 @@ pub struct UsersFile {
     #[serde(default)]
     pub anonymous_command_access: CommandAccess,
     #[serde(default)]
+    pub anonymous_calibration_access: CalibrationAccess,
+    #[serde(default)]
     pub users: Vec<UserRecord>,
 }
 
@@ -113,6 +134,7 @@ impl Default for UsersFile {
             session_ttl_seconds: DEFAULT_SESSION_TTL_SECONDS,
             anonymous: Permissions::default(),
             anonymous_command_access: CommandAccess::default(),
+            anonymous_calibration_access: CalibrationAccess::default(),
             users: Vec::new(),
         }
     }
@@ -127,6 +149,8 @@ pub struct SessionStatus {
     pub anonymous: bool,
     pub session_type: Option<String>,
     pub allowed_commands: Vec<String>,
+    pub can_view_calibration: bool,
+    pub can_edit_calibration: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +161,7 @@ pub struct AuthPrincipal {
     pub anonymous: bool,
     pub session_type: Option<String>,
     pub command_access: CommandAccess,
+    pub calibration_access: CalibrationAccess,
 }
 
 impl AuthPrincipal {
@@ -149,6 +174,8 @@ impl AuthPrincipal {
             anonymous: self.anonymous,
             session_type: self.session_type.clone(),
             allowed_commands: self.command_access.allowed_commands.clone(),
+            can_view_calibration: self.calibration_access.view,
+            can_edit_calibration: self.calibration_access.edit,
         }
     }
 
@@ -210,9 +237,11 @@ impl AuthManager {
         let mut config = serde_json::from_str::<UsersFile>(&raw).map_err(|e| e.to_string())?;
         config.anonymous = config.anonymous.normalized();
         config.anonymous_command_access = config.anonymous_command_access.normalized();
+        config.anonymous_calibration_access = config.anonymous_calibration_access.normalized();
         for user in &mut config.users {
             user.permissions = user.permissions.normalized();
             user.command_access = user.command_access.clone().normalized();
+            user.calibration_access = user.calibration_access.normalized();
         }
         Ok(config)
     }
@@ -282,6 +311,7 @@ impl AuthManager {
                 anonymous: false,
                 session_type: Some(session_type.to_string()),
                 command_access: user.command_access.clone(),
+                calibration_access: user.calibration_access,
             }
             .session_status(),
         })
@@ -361,6 +391,18 @@ impl AuthManager {
                     .unwrap_or_default(),
                 }
                 .normalized(),
+                calibration_access: {
+                    let config = self.load_users_file().map_err(|e| {
+                        AuthFailure::Internal(format!("failed to load users.json: {e}"))
+                    })?;
+                    let username = row.get::<String, _>("username");
+                    config
+                        .users
+                        .iter()
+                        .find(|user| user.username.eq_ignore_ascii_case(username.as_str()))
+                        .map(|user| user.calibration_access)
+                        .unwrap_or_default()
+                },
             });
         }
 
@@ -381,6 +423,7 @@ impl AuthManager {
             anonymous: true,
             session_type: None,
             command_access: config.anonymous_command_access,
+            calibration_access: config.anonymous_calibration_access,
         })
     }
 
@@ -402,6 +445,7 @@ impl AuthManager {
                     anonymous: true,
                     session_type: None,
                     command_access: config.anonymous_command_access,
+                    calibration_access: config.anonymous_calibration_access,
                 }
                 .session_status())
             }
