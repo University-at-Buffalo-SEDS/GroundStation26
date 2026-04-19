@@ -2,48 +2,53 @@
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum FlightComputerCommands {
-    DeployParachute = 0,
-    ExpandParachute = 1,
-    ReinitSensors = 2,
-    LaunchSignal = 3,
+    PostinitSignal = 0,
+    LaunchSignal = 1,
+    RollbackSignal = 2,
+    MonitorAltitude = 3,
+    RevokeMonitorAltitude = 4,
+    ConsecutiveSamples = 5,
+    RevokeConsecutiveSamples = 6,
+    ResetFailures = 7,
+    RevokeResetFailures = 8,
+    ValidateMeasms = 9,
+    RevokeValidateMeasms = 10,
     #[cfg(feature = "hitl_mode")]
-    EvaluationRelax = 4,
+    DeployParachute = 11,
     #[cfg(feature = "hitl_mode")]
-    EvaluationFocus = 5,
+    ExpandParachute = 12,
     #[cfg(feature = "hitl_mode")]
-    EvaluationAbort = 6,
-    ReinitBarometer = 7,
-    ReinitIMU = 8,
+    EvaluationRelax = 13,
     #[cfg(feature = "hitl_mode")]
-    DisableIMU = 9,
+    EvaluationFocus = 14,
     #[cfg(feature = "hitl_mode")]
-    AdvanceFlightState = 10,
+    EvaluationAbort = 15,
     #[cfg(feature = "hitl_mode")]
-    RewindFlightState = 11,
-    MonitorAltitude = 12,
-    RevokeMonitorAltitude = 13,
+    ReinitSensors = 16,
     #[cfg(feature = "hitl_mode")]
-    ConsecutiveSamples = 14,
+    ReinitBarometer = 17,
     #[cfg(feature = "hitl_mode")]
-    RevokeConsecutiveSamples = 15,
+    ReinitIMU = 18,
     #[cfg(feature = "hitl_mode")]
-    ResetFailures = 16,
+    DisableIMU = 19,
     #[cfg(feature = "hitl_mode")]
-    RevokeResetFailures = 17,
-    ValidateMeasms = 18,
-    RevokeValidateMeasms = 19,
+    AdvanceFlightState = 20,
     #[cfg(feature = "hitl_mode")]
-    AbortAfter40 = 20,
+    RewindFlightState = 21,
     #[cfg(feature = "hitl_mode")]
-    AbortAfter100 = 21,
-    AbortAfter250 = 22,
+    AbortAfter40 = 22,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter15 = 23,
+    AbortAfter100 = 23,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter30 = 24,
+    AbortAfter250 = 24,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter50 = 25,
+    ReinitAfter15 = 25,
+    #[cfg(feature = "hitl_mode")]
+    ReinitAfter30 = 26,
+    #[cfg(feature = "hitl_mode")]
+    ReinitAfter50 = 27,
 }
+
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]

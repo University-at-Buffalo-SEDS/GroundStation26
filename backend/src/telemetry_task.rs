@@ -155,16 +155,18 @@ const GRAVITY_MPS2: f32 = 9.80665;
 #[cfg(feature = "hitl_mode")]
 fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     Some(match cmd {
+        TelemetryCommand::DeployParachute => FlightComputerCommands::DeployParachute as u8,
+        TelemetryCommand::ExpandParachute => FlightComputerCommands::ExpandParachute as u8,
         TelemetryCommand::EvaluationRelax => FlightComputerCommands::EvaluationRelax as u8,
         TelemetryCommand::EvaluationFocus => FlightComputerCommands::EvaluationFocus as u8,
         TelemetryCommand::EvaluationAbort => FlightComputerCommands::EvaluationAbort as u8,
+        TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
+        TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
+        TelemetryCommand::ReinitIMU => FlightComputerCommands::ReinitIMU as u8,
         TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
-        TelemetryCommand::ConsecutiveSamples => FlightComputerCommands::ConsecutiveSamples as u8,
-        TelemetryCommand::RevokeConsecutiveSamples => FlightComputerCommands::RevokeConsecutiveSamples as u8,
-        TelemetryCommand::ResetFailures => FlightComputerCommands::ResetFailures as u8,
-        TelemetryCommand::RevokeResetFailures => FlightComputerCommands::RevokeResetFailures as u8,
         TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
         TelemetryCommand::AbortAfter100 => FlightComputerCommands::AbortAfter100 as u8,
+        TelemetryCommand::AbortAfter250 => FlightComputerCommands::AbortAfter250 as u8,
         TelemetryCommand::ReinitAfter15 => FlightComputerCommands::ReinitAfter15 as u8,
         TelemetryCommand::ReinitAfter30 => FlightComputerCommands::ReinitAfter30 as u8,
         TelemetryCommand::ReinitAfter50 => FlightComputerCommands::ReinitAfter50 as u8,
