@@ -43,9 +43,9 @@ const VALVE_BOARD_BATTERY_CUTOFF_V: f32 = 6.3;
 #[cfg(feature = "testing")]
 const VALVE_BOARD_BATTERY_MAX_V: f32 = 8.4;
 #[cfg(feature = "testing")]
-const GROUND_STATION_BATTERY_CUTOFF_V: f32 = 13.3;
+const FILL_BOX_POWER_CUTOFF_V: f32 = 13.3;
 #[cfg(feature = "testing")]
-const GROUND_STATION_BATTERY_MAX_V: f32 = 15.5;
+const FILL_BOX_POWER_MAX_V: f32 = 15.5;
 #[cfg(feature = "testing")]
 const LOADCELL_NOISE_KG: f32 = 0.01;
 #[cfg(feature = "testing")]
@@ -224,8 +224,8 @@ struct FlightSimState {
     av_bay_battery_v: f32,
     valve_board_battery_v: f32,
     valve_board_battery_a: f32,
-    ground_station_battery_v: f32,
-    ground_station_battery_a: f32,
+    fill_box_power_v: f32,
+    fill_box_power_a: f32,
     next_battery_sender_idx: usize,
     last_battery_sender: Board,
     loadcell_mass_kg: f32,
@@ -284,8 +284,8 @@ impl FlightSimState {
             av_bay_battery_v: AV_BAY_BATTERY_MAX_V,
             valve_board_battery_v: VALVE_BOARD_BATTERY_MAX_V,
             valve_board_battery_a: 0.55,
-            ground_station_battery_v: GROUND_STATION_BATTERY_MAX_V,
-            ground_station_battery_a: 0.7,
+            fill_box_power_v: FILL_BOX_POWER_MAX_V,
+            fill_box_power_a: 0.7,
             next_battery_sender_idx: 0,
             last_battery_sender: Board::PowerBoard,
             loadcell_mass_kg: 0.0,
@@ -454,13 +454,13 @@ impl FlightSimState {
         self.queue_scalar_f32(
             DataType::BatteryVoltage,
             Board::GatewayBoard,
-            self.ground_station_battery_v,
+            self.fill_box_power_v,
             now_ms,
         );
         self.queue_scalar_f32(
             DataType::BatteryCurrent,
             Board::GatewayBoard,
-            self.ground_station_battery_a,
+            self.fill_box_power_a,
             now_ms,
         );
     }
@@ -777,7 +777,7 @@ impl FlightSimState {
         } else {
             0.0
         };
-        self.ground_station_battery_a = if self.launch_time_ms.is_some() {
+        self.fill_box_power_a = if self.launch_time_ms.is_some() {
             0.95
         } else {
             0.7
@@ -786,14 +786,14 @@ impl FlightSimState {
         // Make simulated pack drain visible over test sessions instead of effectively flat.
         let av_bay_drop_v_per_s = 0.00035 + self.battery_a * 0.00012;
         let valve_board_drop_v_per_s = 0.00024 + self.valve_board_battery_a * 0.00010;
-        let gs_drop_v_per_s = 0.00020 + self.ground_station_battery_a * 0.00008;
+        let fill_box_drop_v_per_s = 0.00020 + self.fill_box_power_a * 0.00008;
 
         self.av_bay_battery_v =
             (self.av_bay_battery_v - av_bay_drop_v_per_s * dt_s).max(AV_BAY_BATTERY_CUTOFF_V);
         self.valve_board_battery_v = (self.valve_board_battery_v - valve_board_drop_v_per_s * dt_s)
             .max(VALVE_BOARD_BATTERY_CUTOFF_V);
-        self.ground_station_battery_v = (self.ground_station_battery_v - gs_drop_v_per_s * dt_s)
-            .max(GROUND_STATION_BATTERY_CUTOFF_V);
+        self.fill_box_power_v =
+            (self.fill_box_power_v - fill_box_drop_v_per_s * dt_s).max(FILL_BOX_POWER_CUTOFF_V);
         self.battery_v = self.av_bay_battery_v;
     }
 
@@ -938,12 +938,12 @@ impl FlightSimState {
                     &[
                         (Board::PowerBoard, self.av_bay_battery_v),
                         (Board::ValveBoard, self.valve_board_battery_v),
-                        (Board::GatewayBoard, self.ground_station_battery_v),
+                        (Board::GatewayBoard, self.fill_box_power_v),
                     ]
                 } else {
                     &[
                         (Board::PowerBoard, self.av_bay_battery_v),
-                        (Board::GatewayBoard, self.ground_station_battery_v),
+                        (Board::GatewayBoard, self.fill_box_power_v),
                     ]
                 };
                 let (board, voltage) =
@@ -961,7 +961,7 @@ impl FlightSimState {
                 let current = match self.last_battery_sender {
                     Board::GatewayBoard => {
                         sender = Board::GatewayBoard.sender_id();
-                        self.ground_station_battery_a
+                        self.fill_box_power_a
                     }
                     Board::ValveBoard => {
                         sender = Board::ValveBoard.sender_id();
@@ -1078,21 +1078,14 @@ pub fn simulated_board_endpoints(board: Board) -> Vec<String> {
             DataEndpoint::FlightState.as_str().to_string(),
             DataEndpoint::SdCard.as_str().to_string(),
         ],
-        Board::RFBoard => vec![
-            DataEndpoint::FlightController.as_str().to_string(),
-            DataEndpoint::FlightState.as_str().to_string(),
-        ],
+        Board::RFBoard => Vec::new(),
         Board::PowerBoard => Vec::new(),
         Board::ValveBoard => vec![
             DataEndpoint::ValveBoard.as_str().to_string(),
             DataEndpoint::Abort.as_str().to_string(),
             DataEndpoint::FlightState.as_str().to_string(),
         ],
-        Board::GatewayBoard => vec![
-            DataEndpoint::ValveBoard.as_str().to_string(),
-            DataEndpoint::ActuatorBoard.as_str().to_string(),
-            DataEndpoint::Abort.as_str().to_string(),
-        ],
+        Board::GatewayBoard => Vec::new(),
         Board::ActuatorBoard => vec![
             DataEndpoint::ActuatorBoard.as_str().to_string(),
             DataEndpoint::Abort.as_str().to_string(),
@@ -1189,6 +1182,13 @@ mod tests {
         assert!(endpoints.iter().any(|endpoint| {
             endpoint == sedsprintf_rs_2026::config::DataEndpoint::SdCard.as_str()
         }));
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn relay_boards_have_no_simulated_endpoints() {
+        assert!(super::simulated_board_endpoints(crate::types::Board::RFBoard).is_empty());
+        assert!(super::simulated_board_endpoints(crate::types::Board::GatewayBoard).is_empty());
     }
 
     #[cfg(feature = "testing")]

@@ -2229,13 +2229,13 @@ class LayoutEditor(tk.Tk):
     def _add_fill_box_battery_preset(self) -> None:
         self.data["battery"]["sources"].append(
             {
-                "id": "ground_station",
-                "label": "Ground Station Battery",
+                "id": "fill_box_power",
+                "label": "Fill Box Power",
                 "sender_id": "GW",
                 "input_data_type": "BATTERY_VOLTAGE",
-                "percent_data_type": "GROUND_STATION_BATTERY_PERCENT",
-                "drop_rate_data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
-                "remaining_minutes_data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+                "percent_data_type": "FILL_BOX_POWER_PERCENT",
+                "drop_rate_data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
+                "remaining_minutes_data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
                 "empty_voltage": 13.3,
                 "nominal_voltage": 14.0,
                 "full_voltage": 15.5,

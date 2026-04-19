@@ -405,30 +405,6 @@ impl AppState {
             .filter(|endpoint| endpoint.as_str() != DataEndpoint::GroundStation.as_str())
             .cloned()
             .collect::<Vec<_>>();
-        let side_endpoints = |side_name: &str| {
-            let mut endpoints = route_snapshot
-                .and_then(|snapshot| {
-                    snapshot
-                        .routes
-                        .iter()
-                        .find(|route| route.side_name == side_name)
-                })
-                .map(|route| {
-                    route
-                        .reachable_endpoints
-                        .iter()
-                        .copied()
-                        .map(|ep| ep.as_str().to_string())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            endpoints.sort();
-            endpoints.dedup();
-            endpoints
-        };
-        let rocket_side_endpoints = side_endpoints("rocket_comms");
-        let fill_side_endpoints = side_endpoints("umbilical_comms");
-
         let router_endpoints = if simulated {
             vec![DataEndpoint::GroundStation.as_str().to_string()]
         } else {
@@ -589,8 +565,6 @@ impl AppState {
                     entry.board,
                     simulated,
                     &local_visible_endpoint_list,
-                    &rocket_side_endpoints,
-                    &fill_side_endpoints,
                 ),
                 show_in_details: true,
                 detail: entry
@@ -979,26 +953,11 @@ fn modeled_board_endpoints(
     board: Board,
     simulated: bool,
     local_endpoint_list: &[String],
-    rocket_side_endpoints: &[String],
-    fill_side_endpoints: &[String],
 ) -> Vec<String> {
     if simulated {
         return match board {
             Board::GroundStation => local_endpoint_list.to_vec(),
-            Board::RFBoard => {
-                let mut endpoints = crate::flight_sim::simulated_board_endpoints(board);
-                endpoints.extend_from_slice(rocket_side_endpoints);
-                endpoints.sort();
-                endpoints.dedup();
-                endpoints
-            }
-            Board::GatewayBoard => {
-                let mut endpoints = crate::flight_sim::simulated_board_endpoints(board);
-                endpoints.extend_from_slice(fill_side_endpoints);
-                endpoints.sort();
-                endpoints.dedup();
-                endpoints
-            }
+            Board::RFBoard | Board::GatewayBoard => Vec::new(),
             _ => crate::flight_sim::simulated_board_endpoints(board),
         };
     }
@@ -1010,13 +969,13 @@ fn modeled_board_endpoints(
             DataEndpoint::FlightState.as_str().to_string(),
             DataEndpoint::SdCard.as_str().to_string(),
         ],
-        Board::RFBoard => rocket_side_endpoints.to_vec(),
+        Board::RFBoard => Vec::new(),
         Board::PowerBoard => Vec::new(),
         Board::ValveBoard => vec![
             DataEndpoint::ValveBoard.as_str().to_string(),
             DataEndpoint::Abort.as_str().to_string(),
         ],
-        Board::GatewayBoard => fill_side_endpoints.to_vec(),
+        Board::GatewayBoard => Vec::new(),
         Board::ActuatorBoard => vec![
             DataEndpoint::ActuatorBoard.as_str().to_string(),
             DataEndpoint::Abort.as_str().to_string(),
@@ -1118,12 +1077,18 @@ mod tests {
 
     #[test]
     fn flight_computer_modeled_endpoints_include_sd_card() {
-        let endpoints = modeled_board_endpoints(Board::FlightComputer, false, &[], &[], &[]);
+        let endpoints = modeled_board_endpoints(Board::FlightComputer, false, &[]);
         assert!(
             endpoints
                 .iter()
                 .any(|endpoint| endpoint == DataEndpoint::SdCard.as_str())
         );
+    }
+
+    #[test]
+    fn relay_boards_do_not_model_endpoints() {
+        assert!(modeled_board_endpoints(Board::RFBoard, false, &[]).is_empty());
+        assert!(modeled_board_endpoints(Board::GatewayBoard, false, &[]).is_empty());
     }
 
     #[test]

@@ -158,9 +158,9 @@ const KNOWN_TRANSLATIONS: &[(&str, &str, &str)] = &[
         "Batterie AV Bay (carte puissance)",
     ),
     (
-        "Ground Station Battery (Gateway Board)",
-        "Batería de estación base (placa gateway)",
-        "Batterie station sol (carte passerelle)",
+        "Fill Box Power (Gateway Board)",
+        "Energía de caja de llenado (placa gateway)",
+        "Alimentation boîtier de remplissage (carte passerelle)",
     ),
     ("Gyro Data", "Datos de giroscopio", "Données gyroscope"),
     (

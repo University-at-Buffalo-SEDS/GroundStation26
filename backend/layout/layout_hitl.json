@@ -516,7 +516,7 @@
           },
           {
             "id": "battery_voltage_gw",
-            "label": "Ground Station",
+            "label": "Fill Box",
             "data_type": "BATTERY_VOLTAGE",
             "sender_id": "GW",
             "channels": [
@@ -564,7 +564,7 @@
           },
           {
             "id": "battery_current_gw",
-            "label": "Ground Station",
+            "label": "Fill Box",
             "data_type": "BATTERY_CURRENT",
             "sender_id": "GW",
             "channels": [
@@ -589,9 +589,9 @@
           "Valve Board %",
           "Valve Board Drop",
           "Valve Board Runtime",
-          "Ground Station %",
-          "Ground Station Drop",
-          "Ground Station Runtime"
+          "Fill Box %",
+          "Fill Box Drop",
+          "Fill Box Runtime"
         ],
         "subtabs": [
           {
@@ -644,24 +644,24 @@
           },
           {
             "id": "battery_runtime_gw",
-            "label": "Ground Station",
+            "label": "Fill Box",
             "chart": {
               "enabled": false
             },
             "summary_items": [
               {
                 "label": "Battery %",
-                "data_type": "GROUND_STATION_BATTERY_PERCENT",
+                "data_type": "FILL_BOX_POWER_PERCENT",
                 "index": 0
               },
               {
                 "label": "Drop Rate",
-                "data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
+                "data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
                 "index": 0
               },
               {
                 "label": "Runtime",
-                "data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+                "data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
                 "index": 0
               }
             ]
@@ -1161,13 +1161,13 @@
         "curve_exponent": 1.0
       },
       {
-        "id": "ground_station",
-        "label": "Ground Station Battery",
+        "id": "fill_box_power",
+        "label": "Fill Box Power",
         "sender_id": "GW",
         "input_data_type": "BATTERY_VOLTAGE",
-        "percent_data_type": "GROUND_STATION_BATTERY_PERCENT",
-        "drop_rate_data_type": "GROUND_STATION_BATTERY_DROP_RATE_V_PER_MIN",
-        "remaining_minutes_data_type": "GROUND_STATION_BATTERY_REMAINING_MINUTES",
+        "percent_data_type": "FILL_BOX_POWER_PERCENT",
+        "drop_rate_data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
+        "remaining_minutes_data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
         "empty_voltage": 13.3,
         "full_voltage": 15.5,
         "curve_exponent": 1.0
