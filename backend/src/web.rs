@@ -1408,7 +1408,7 @@ async fn send_command(
     }
     let now_ms = crate::telemetry_task::get_current_timestamp_ms();
     if !state.record_software_command_if_fresh(&cmd, now_ms, software_command_dedup_ms()) {
-        println!("Ignored duplicate software command {cmd:?}");
+        gs_debug_println!("Ignored duplicate software command {cmd:?}");
         return (StatusCode::OK, "duplicate ignored");
     }
     let _ = state.cmd_tx.send(cmd).await;
@@ -1810,20 +1810,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             now_ms,
                             software_command_dedup_ms(),
                         ) {
-                            println!("Ignored duplicate websocket command {:?}", cmd.cmd);
+                            gs_debug_println!("Ignored duplicate websocket command {:?}", cmd.cmd);
                             continue;
                         }
                         let received_cmd = cmd.cmd;
-                        println!(
+                        gs_debug_println!(
                             "\x1b[32mWebsocket command received: {:?}\x1b[0m",
                             received_cmd
                         );
                         if let Err(e) = cmd_tx.send(received_cmd).await {
-                            println!("Failed to forward WS command to cmd_tx: {e}");
+                            gs_debug_println!("Failed to forward WS command to cmd_tx: {e}");
                         }
                     }
                     Err(e) => {
-                        println!("Invalid WS command JSON {text:?}: {e}");
+                        gs_debug_println!("Invalid WS command JSON {text:?}: {e}");
                     }
                 }
             }

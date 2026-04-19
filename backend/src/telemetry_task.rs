@@ -1001,14 +1001,14 @@ fn schedule_launch_command_after_delay(state: Arc<AppState>, router: Arc<Router>
                 match recv {
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {}
                 }
-                println!("Delayed launch command canceled by shutdown");
+                gs_debug_println!("Delayed launch command canceled by shutdown");
                 return;
             }
         }
 
         let current_state = { *state.state.lock().unwrap() };
         if current_state == FlightState::Aborted {
-            println!("Delayed launch command canceled because flight state is Aborted");
+            gs_debug_println!("Delayed launch command canceled because flight state is Aborted");
             return;
         }
 
@@ -1033,7 +1033,7 @@ fn send_launch_command(state: &AppState, router: &Router) {
             );
             flush_command_tx(router, "Delayed test-fire Launch command tx");
         }
-        println!("Delayed test-fire launch command sent to actuator board");
+        gs_debug_println!("Delayed test-fire launch command sent to actuator board");
     }
 
     #[cfg(not(feature = "test_fire_mode"))]
@@ -1055,7 +1055,7 @@ fn send_launch_command(state: &AppState, router: &Router) {
             .gpio
             .write_output_pin(IGNITION_PIN, true)
             .expect("failed to set gpio output");
-        println!("Delayed launch command sent");
+        gs_debug_println!("Delayed launch command sent");
     }
 }
 
@@ -1350,17 +1350,17 @@ pub async fn telemetry_task(
                                     state.launch_clock_snapshot().kind,
                                     LaunchClockKind::TMinus | LaunchClockKind::TPlus
                                 ) {
-                                    println!("Launch command ignored because launch clock is already running");
+                                    gs_debug_println!("Launch command ignored because launch clock is already running");
                                     continue;
                                 }
                                 if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
                                     let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartNow)).await;
-                                    println!("Launch auto-started DB recording");
+                                    gs_debug_println!("Launch auto-started DB recording");
                                 }
                                 let now_ms = get_current_timestamp_ms() as i64;
                                 state.set_launch_clock(launch_countdown_clock(now_ms));
                                 schedule_launch_command_after_delay(state.clone(), router.clone());
-                                println!("Launch command scheduled after {LAUNCH_COMMAND_DELAY_MS} ms");
+                                gs_debug_println!("Launch command scheduled after {LAUNCH_COMMAND_DELAY_MS} ms");
                             }
                         TelemetryCommand::Dump => {
                                 let key = ValveBoardCommands::DumpOpen as u8;
@@ -1383,7 +1383,7 @@ pub async fn telemetry_task(
                                     let gpio = &state.gpio;
                                     gpio.write_output_pin(IGNITION_PIN, false).expect("failed to set gpio output");
                                 }
-                                println!("Dump command sent {:?}", cmd);
+                                gs_debug_println!("Dump command sent {:?}", cmd);
                             }
                         TelemetryCommand::Abort => {
                                 if let Err(e) = router.log(
@@ -1392,7 +1392,7 @@ pub async fn telemetry_task(
                                 ) {
                                     log_telemetry_error("failed to log Abort command", e);
                                 }
-                                println!("Abort command sent");
+                                gs_debug_println!("Abort command sent");
                             }
                         TelemetryCommand::Igniter => {
                                 let key = ActuatorBoardCommands::IgniterOn as u8;
@@ -1411,7 +1411,7 @@ pub async fn telemetry_task(
                                     log_command_queue_success("Igniter command", DataType::ActuatorCommand, &[cmd as u8]);
                                     flush_command_tx(&router, "Igniter command tx");
                                 }
-                                println!("Igniter command sent {:?}", cmd);
+                                gs_debug_println!("Igniter command sent {:?}", cmd);
                             }
                         TelemetryCommand::Pilot => {
                                 let key = ValveBoardCommands::PilotOpen as u8;
@@ -1430,7 +1430,7 @@ pub async fn telemetry_task(
                                     log_command_queue_success("Pilot command", DataType::ValveCommand, &[cmd as u8]);
                                     flush_command_tx(&router, "Pilot command tx");
                                 }
-                                println!("Pilot command sent {:?}", cmd);
+                                gs_debug_println!("Pilot command sent {:?}", cmd);
                             }
                         TelemetryCommand::NormallyOpen => {
                                 let key = ValveBoardCommands::NormallyOpenOpen as u8;
@@ -1449,7 +1449,7 @@ pub async fn telemetry_task(
                                     log_command_queue_success("NormallyOpen command", DataType::ValveCommand, &[cmd as u8]);
                                     flush_command_tx(&router, "NormallyOpen command tx");
                                 }
-                                println!("Tanks command sent {:?}", cmd);
+                                gs_debug_println!("Tanks command sent {:?}", cmd);
                             }
                         TelemetryCommand::Nitrogen => {
                                 let cmd_id = ActuatorBoardCommands::NitrogenOpen as u8;
@@ -1468,7 +1468,7 @@ pub async fn telemetry_task(
                                     log_command_queue_success("Nitrogen command", DataType::ActuatorCommand, &[cmd as u8]);
                                     flush_command_tx(&router, "Nitrogen command tx");
                                 }
-                                println!("Nitrogen command sent {:?}", cmd);
+                                gs_debug_println!("Nitrogen command sent {:?}", cmd);
                             }
                         TelemetryCommand::NitrogenClose => {
                                 if let Err(e) = router.log_queue(
@@ -1484,7 +1484,7 @@ pub async fn telemetry_task(
                                     );
                                     flush_command_tx(&router, "NitrogenClose command tx");
                                 }
-                                println!("Nitrogen explicit close command sent");
+                                gs_debug_println!("Nitrogen explicit close command sent");
                             }
                         TelemetryCommand::RetractPlumbing => {
                                 if let Err(e) = router.log_queue(
@@ -1500,7 +1500,7 @@ pub async fn telemetry_task(
                                     );
                                     flush_command_tx(&router, "RetractPlumbing command tx");
                                 }
-                                println!("RetractPlumbing command sent");
+                                gs_debug_println!("RetractPlumbing command sent");
                         }
                         TelemetryCommand::Nitrous => {
                                 let cmd_id = ActuatorBoardCommands::NitrousOpen as u8;
@@ -1519,7 +1519,7 @@ pub async fn telemetry_task(
                                     log_command_queue_success("Nitrous command", DataType::ActuatorCommand, &[cmd as u8]);
                                     flush_command_tx(&router, "Nitrous command tx");
                                 }
-                                println!("Nitrous command sent: {:?}", cmd);
+                                gs_debug_println!("Nitrous command sent: {:?}", cmd);
                         }
                         TelemetryCommand::NitrousClose => {
                                 if let Err(e) = router.log_queue(
@@ -1535,41 +1535,41 @@ pub async fn telemetry_task(
                                     );
                                     flush_command_tx(&router, "NitrousClose command tx");
                                 }
-                                println!("Nitrous explicit close command sent");
+                                gs_debug_println!("Nitrous explicit close command sent");
                         }
                         TelemetryCommand::StartWritingNow => {
                                 let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartNow)).await;
-                                println!("DB recording started without backfill");
+                                gs_debug_println!("DB recording started without backfill");
                         }
                         TelemetryCommand::StartWritingLastTwoMinutes => {
                                 let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartWithRecent)).await;
-                                println!("DB recording started with recent backfill");
+                                gs_debug_println!("DB recording started with recent backfill");
                         }
                         TelemetryCommand::PauseWritingDb => {
                                 let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::Pause)).await;
-                                println!("DB recording paused");
+                                gs_debug_println!("DB recording paused");
                         }
                         TelemetryCommand::StopWritingDb => {
                                 let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::Stop)).await;
-                                println!("DB recording stopped");
+                                gs_debug_println!("DB recording stopped");
                         }
                         TelemetryCommand::ContinueFillSequence => {
                                 state.request_fill_sequence_continue();
-                                println!("ContinueFillSequence command accepted");
+                                gs_debug_println!("ContinueFillSequence command accepted");
                         }
                         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
                         TelemetryCommand::AdvanceFlightState => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, 1);
                                 set_local_flight_state_for_operator_mode(&state, next).await;
-                                println!("Operator-mode flight state advanced: {:?} -> {:?}", current, next);
+                                gs_debug_println!("Operator-mode flight state advanced: {:?} -> {:?}", current, next);
                         }
                         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
                         TelemetryCommand::RewindFlightState => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, -1);
                                 set_local_flight_state_for_operator_mode(&state, next).await;
-                                println!("Operator-mode flight state rewound: {:?} -> {:?}", current, next);
+                                gs_debug_println!("Operator-mode flight state rewound: {:?} -> {:?}", current, next);
                         }
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::DeployParachute
@@ -1600,7 +1600,7 @@ pub async fn telemetry_task(
                                     if let Err(e) = router.log_queue(DataType::FlightCommand, &[cmd_id]) {
                                         log_telemetry_error("failed to log HITL flight command", e);
                                     }
-                                    println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
+                                    gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
                                 }
                         }
                     }

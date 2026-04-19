@@ -113,7 +113,7 @@ pub fn ensure_sqlite_db_file(path: &Path) -> Result<String> {
     if !path.exists() {
         fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
         fs::write(path, b"")?;
-        println!("Created empty DB file: {}", path.display());
+        gs_debug_println!("Created empty DB file: {}", path.display());
     }
     Ok(fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())

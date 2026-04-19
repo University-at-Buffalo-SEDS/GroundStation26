@@ -1,5 +1,13 @@
 // main.rs
 
+macro_rules! gs_debug_println {
+    ($($arg:tt)*) => {
+        if crate::debug_prints_enabled() {
+            std::println!($($arg)*);
+        }
+    };
+}
+
 mod auth;
 mod comms;
 mod comms_config;
@@ -68,6 +76,21 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(default)
         .clamp(min, max)
+}
+
+pub(crate) fn debug_prints_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GS_DEBUG_PRINTS")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
@@ -341,8 +364,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Radios ---
-    println!("AV bay config: {}", link_description(&comms_links.av_bay));
-    println!(
+    gs_debug_println!("AV bay config: {}", link_description(&comms_links.av_bay));
+    gs_debug_println!(
         "Fill box config: {}",
         link_description(&comms_links.fill_box)
     );
@@ -350,11 +373,11 @@ async fn main() -> anyhow::Result<()> {
     let (rocket_comms, av_bay_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
         match open_link(&comms_links.av_bay) {
             Ok(r) => {
-                println!("Rocket comms online");
+                gs_debug_println!("Rocket comms online");
                 (Arc::new(Mutex::new(r)), true)
             }
             Err(e) => {
-                println!("Rocket comms missing, using DummyComms: {}", e);
+                gs_debug_println!("Rocket comms missing, using DummyComms: {}", e);
                 eprintln!(
                     "AV bay link setup hint: {}",
                     startup_failure_hint(&comms_links.av_bay)
@@ -386,11 +409,11 @@ async fn main() -> anyhow::Result<()> {
     let (umbilical_comms, fill_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
         match open_link(&comms_links.fill_box) {
             Ok(r) => {
-                println!("Umbilical comms online");
+                gs_debug_println!("Umbilical comms online");
                 (Arc::new(Mutex::new(r)), true)
             }
             Err(e) => {
-                println!("Umbilical comms missing, using DummyComms: {}", e);
+                gs_debug_println!("Umbilical comms missing, using DummyComms: {}", e);
                 eprintln!(
                     "Fill box link setup hint: {}",
                     startup_failure_hint(&comms_links.fill_box)

@@ -189,7 +189,7 @@ mod dummy {
                 .lock()
                 .expect("failed to get lock")
                 .insert(pin_number, false);
-            println!(
+            gs_debug_println!(
                 "Input pin {} is configured (no gpio is actually attached)",
                 pin_number
             );
@@ -201,7 +201,7 @@ mod dummy {
                 .lock()
                 .expect("failed to get lock")
                 .insert(pin_number, false);
-            println!(
+            gs_debug_println!(
                 "Output pin {} is configured (no gpio is actually attached)",
                 pin_number
             );
@@ -215,7 +215,7 @@ mod dummy {
         pub fn read_input_pin(&self, pin_number: u8) -> Result<bool, Box<dyn std::error::Error>> {
             let input_pins = self.input_pins.lock().expect("failed to get lock");
             if let Some(pin) = input_pins.get(&pin_number) {
-                println!("Reading input pin {} (dummy value: {})", pin_number, pin);
+                gs_debug_println!("Reading input pin {} (dummy value: {})", pin_number, pin);
                 Ok(*pin)
             } else {
                 Err(format!("Input pin {} not configured", pin_number).into())
@@ -255,7 +255,7 @@ mod dummy {
             F: Fn(bool) + Send + 'static,
         {
             // No-op in dummy implementation
-            println!(
+            gs_debug_println!(
                 "Setting up callback on pin {} (dummy, no actual effect)",
                 _pin_number
             );

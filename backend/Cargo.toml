@@ -21,8 +21,6 @@ sedsprintf_rs_2026 = { git = "https://github.com/University-at-Buffalo-SEDS/seds
 
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite"] }
 
-
-# for ring buffer, ws, etc.
 anyhow = "1.0.102"
 tower-http = { version = "0.6.8", features = ["fs", "compression-full"] }
 rand = "0.10.1"

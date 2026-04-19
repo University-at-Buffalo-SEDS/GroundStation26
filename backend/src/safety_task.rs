@@ -335,7 +335,7 @@ pub async fn safety_task(
                     &state,
                     "Warning: No telemetry packets received for 10 seconds!",
                 );
-                println!("Safety: No telemetry packets received for >=10 seconds!");
+                gs_debug_println!("Safety: No telemetry packets received for >=10 seconds!");
                 last_no_packet_warning_ms = now_ms;
             }
         } else {
@@ -541,7 +541,7 @@ pub async fn safety_task(
                 DataType::GenericError => {
                     abort = true;
                     cycle_warnings.insert("Generic Error received from vehicle!");
-                    println!("Safety: Generic Error packet received");
+                    gs_debug_println!("Safety: Generic Error packet received");
                 }
 
                 _ => {}
@@ -569,7 +569,7 @@ pub async fn safety_task(
                 .unwrap_or_else(|e| {
                     eprintln!("failed to log Abort command: {:?}", e);
                 });
-            println!("Safety task: Abort command sent");
+            gs_debug_println!("Safety task: Abort command sent");
             break;
         }
     }

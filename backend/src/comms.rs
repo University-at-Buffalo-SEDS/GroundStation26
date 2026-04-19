@@ -1591,7 +1591,7 @@ impl CommsDevice for DummyComms {
             let prev = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
             if now_ms.saturating_sub(prev) >= interval_ms {
                 LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
-                println!(
+                gs_debug_println!(
                     "DummyComms: dropping {} bytes of outgoing telemetry send from {}",
                     payload.len(),
                     self.name
