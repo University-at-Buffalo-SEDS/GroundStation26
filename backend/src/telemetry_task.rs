@@ -2076,11 +2076,6 @@ async fn handle_packet(
     let payload_json = payload_json_from_pkt(&pkt);
 
     if pkt.data_type() == DataType::GpsSatelliteNumber {
-        eprintln!(
-            "inbound gps satellites: sender={} ts={}",
-            pkt.sender(),
-            pkt.timestamp()
-        );
         return handle_gps_satellite_count_packet(state, db_tx, db_overflow, &pkt, &payload_json)
             .await;
     }
@@ -2088,12 +2083,6 @@ async fn handle_packet(
     if let Ok(values) = pkt.data_as_f32() {
         let mut values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
         if pkt.data_type() == DataType::GpsData {
-            eprintln!(
-                "inbound gps fix: sender={} ts={} values={:?}",
-                pkt.sender(),
-                pkt.timestamp(),
-                values_vec
-            );
             values_vec = normalized_gps_values(state, pkt.sender(), &values_vec);
         }
         if pkt.data_type() == DataType::FuelTankPressure {
