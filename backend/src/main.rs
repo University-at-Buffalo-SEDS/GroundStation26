@@ -41,6 +41,7 @@ use crate::telemetry_task::{
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 use crate::comms::DummyComms;
 use crate::comms::{CommsDevice, link_description, open_link, startup_failure_hint};
+use crate::comms_config::{CommsLinkConfig, SerialProtocol};
 use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
 use sedsprintf_rs_2026::TelemetryError;
@@ -67,6 +68,18 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(default)
         .clamp(min, max)
+}
+
+fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
+    match link {
+        CommsLinkConfig::I2c { .. } => false,
+        CommsLinkConfig::Serial { serial }
+        | CommsLinkConfig::RaspberryPiGpioUart { serial }
+        | CommsLinkConfig::CustomSerial { serial } => {
+            !matches!(serial.protocol, SerialProtocol::RawUart)
+        }
+        CommsLinkConfig::Spi { .. } | CommsLinkConfig::Can { .. } => true,
+    }
 }
 
 /// Creates or upgrades the auth session table used by token-based login.
@@ -425,10 +438,7 @@ async fn main() -> anyhow::Result<()> {
     let rocket_side = {
         let rocket_tx = rocket_tx.clone();
         let opts = RouterSideOptions {
-            reliable_enabled: !matches!(
-                comms_links.av_bay,
-                crate::comms_config::CommsLinkConfig::I2c { .. }
-            ),
+            reliable_enabled: router_hop_reliable_enabled(&comms_links.av_bay),
             link_local_enabled: false,
         };
         router.add_side_serialized_with_options(
@@ -446,10 +456,7 @@ async fn main() -> anyhow::Result<()> {
     let umbilical_side = {
         let umbilical_tx = umbilical_tx.clone();
         let opts = RouterSideOptions {
-            reliable_enabled: !matches!(
-                comms_links.fill_box,
-                crate::comms_config::CommsLinkConfig::I2c { .. }
-            ),
+            reliable_enabled: router_hop_reliable_enabled(&comms_links.fill_box),
             // The Pico bridge on the I2C side needs router-local packets (for example
             // GroundStation-addressed traffic and local heartbeat/discovery flow) to traverse
             // the physical link so it can forward them back out over its UART/USB bridge.

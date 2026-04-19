@@ -4,10 +4,11 @@ use crate::comms_config::{
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
+#[cfg(target_os = "linux")]
+use sedsprintf_rs_2026::serialize;
 use sedsprintf_rs_2026::{
     TelemetryError, TelemetryResult,
     router::{Router, RouterSideId},
-    serialize,
 };
 use serialport::SerialPort;
 use std::error::Error;
@@ -393,6 +394,7 @@ fn build_link_frame(
     Ok(framed)
 }
 
+#[cfg(target_os = "linux")]
 fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
     if payload.len() < RAW_UART_FRAME_HEADER_SIZE {
         return None;

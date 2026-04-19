@@ -1031,10 +1031,7 @@ fn send_launch_command(state: &AppState, router: &Router) {
                 DataType::ActuatorCommand,
                 &[ActuatorBoardCommands::IgniterSequence as u8],
             );
-            flush_command_tx(
-                router,
-                "failed to flush delayed test-fire Launch command tx",
-            );
+            flush_command_tx(router, "Delayed test-fire Launch command tx");
         }
         println!("Delayed test-fire launch command sent to actuator board");
     }
@@ -1052,7 +1049,7 @@ fn send_launch_command(state: &AppState, router: &Router) {
                 DataType::FlightCommand,
                 &[crate::rocket_commands::FlightCommands::Launch as u8],
             );
-            flush_command_tx(router, "failed to flush delayed Launch command tx");
+            flush_command_tx(router, "Delayed Launch command tx");
         }
         state
             .gpio
@@ -1380,7 +1377,7 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Dump command", e);
                                 } else {
                                     log_command_queue_success("Dump command", DataType::ValveCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "failed to flush Dump command tx");
+                                    flush_command_tx(&router, "Dump command tx");
                                 }
                                 {
                                     let gpio = &state.gpio;
@@ -1412,7 +1409,7 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Igniter command", e);
                                 } else {
                                     log_command_queue_success("Igniter command", DataType::ActuatorCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "failed to flush Igniter command tx");
+                                    flush_command_tx(&router, "Igniter command tx");
                                 }
                                 println!("Igniter command sent {:?}", cmd);
                             }
@@ -1431,7 +1428,7 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Pilot command", e);
                                 } else {
                                     log_command_queue_success("Pilot command", DataType::ValveCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "failed to flush Pilot command tx");
+                                    flush_command_tx(&router, "Pilot command tx");
                                 }
                                 println!("Pilot command sent {:?}", cmd);
                             }
@@ -1450,7 +1447,7 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log NormallyOpen command", e);
                                 } else {
                                     log_command_queue_success("NormallyOpen command", DataType::ValveCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "failed to flush NormallyOpen command tx");
+                                    flush_command_tx(&router, "NormallyOpen command tx");
                                 }
                                 println!("Tanks command sent {:?}", cmd);
                             }
@@ -1469,7 +1466,7 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Nitrogen command", e);
                                 } else {
                                     log_command_queue_success("Nitrogen command", DataType::ActuatorCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "failed to flush Nitrogen command tx");
+                                    flush_command_tx(&router, "Nitrogen command tx");
                                 }
                                 println!("Nitrogen command sent {:?}", cmd);
                             }
@@ -1485,7 +1482,7 @@ pub async fn telemetry_task(
                                         DataType::ActuatorCommand,
                                         &[ActuatorBoardCommands::NitrogenClose as u8],
                                     );
-                                    flush_command_tx(&router, "failed to flush NitrogenClose command tx");
+                                    flush_command_tx(&router, "NitrogenClose command tx");
                                 }
                                 println!("Nitrogen explicit close command sent");
                             }
@@ -1501,7 +1498,7 @@ pub async fn telemetry_task(
                                         DataType::ActuatorCommand,
                                         &[ActuatorBoardCommands::RetractPlumbing as u8],
                                     );
-                                    flush_command_tx(&router, "failed to flush RetractPlumbing command tx");
+                                    flush_command_tx(&router, "RetractPlumbing command tx");
                                 }
                                 println!("RetractPlumbing command sent");
                         }
@@ -1520,7 +1517,7 @@ pub async fn telemetry_task(
                                     log_telemetry_error("failed to log Nitrous command", e);
                                 } else {
                                     log_command_queue_success("Nitrous command", DataType::ActuatorCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "failed to flush Nitrous command tx");
+                                    flush_command_tx(&router, "Nitrous command tx");
                                 }
                                 println!("Nitrous command sent: {:?}", cmd);
                         }
@@ -1536,7 +1533,7 @@ pub async fn telemetry_task(
                                         DataType::ActuatorCommand,
                                         &[ActuatorBoardCommands::NitrousClose as u8],
                                     );
-                                    flush_command_tx(&router, "failed to flush NitrousClose command tx");
+                                    flush_command_tx(&router, "NitrousClose command tx");
                                 }
                                 println!("Nitrous explicit close command sent");
                         }
@@ -2233,14 +2230,6 @@ fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
     );
 }
 
-fn log_command_flush_start(context: &str) {
-    eprintln!("{context}: flushing router tx queue");
-}
-
-fn log_command_flush_success(context: &str) {
-    eprintln!("{context}: router tx queue flushed");
-}
-
 fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::TelemetryError> {
     router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS)?;
     if ROUTER_RX_BUDGET_MS > 0 {
@@ -2250,11 +2239,8 @@ fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::Tele
 }
 
 fn flush_command_tx(router: &Router, context: &str) {
-    log_command_flush_start(context);
     if let Err(err) = router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS) {
         log_telemetry_error(context, err);
-    } else {
-        log_command_flush_success(context);
     }
 }
 
