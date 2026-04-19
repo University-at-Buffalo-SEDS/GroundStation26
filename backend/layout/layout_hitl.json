@@ -453,8 +453,57 @@
             "kind": "integer"
           }
         ],
+        "subtabs": [
+          {
+            "id": "gps_fix",
+            "label": "GPS Fix",
+            "data_type": "GPS_DATA",
+            "channels": [
+              "Lat",
+              "Lon",
+              "Altitude",
+              "Satellites"
+            ],
+            "channel_formatters": [
+              {},
+              {},
+              {},
+              {
+                "kind": "integer"
+              }
+            ],
+            "chart": {
+              "enabled": false
+            },
+            "summary_items": [
+              {
+                "label": "Lat",
+                "data_type": "GPS_DATA",
+                "index": 0
+              },
+              {
+                "label": "Lon",
+                "data_type": "GPS_DATA",
+                "index": 1
+              },
+              {
+                "label": "Altitude",
+                "data_type": "GPS_DATA",
+                "index": 2
+              },
+              {
+                "label": "Satellites",
+                "data_type": "GPS_DATA",
+                "index": 3,
+                "formatter": {
+                  "kind": "integer"
+                }
+              }
+            ]
+          }
+        ],
         "chart": {
-          "enabled": true
+          "enabled": false
         }
       },
       {
