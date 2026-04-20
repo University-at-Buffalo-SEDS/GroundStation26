@@ -139,13 +139,20 @@ pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
 }
 
 fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(&Packet)) {
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
-        return;
+    let pkt = match serialize::deserialize_packet(payload) {
+        Ok(pkt) => pkt,
+        Err(err) => {
+            maybe_log_comms_packet_decode_error(payload, &err);
+            return;
+        }
     };
     let is_gps = matches!(
         pkt.data_type(),
         DataType::GpsData | DataType::GpsSatelliteNumber
     );
+    if is_gps || pkt.sender() == "RF" {
+        maybe_log_comms_decoded_packet(&pkt);
+    }
     if !is_gps {
         return;
     }
@@ -155,6 +162,38 @@ fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(
     if !has_groundstation {
         packet_tap(&pkt);
     }
+}
+
+fn maybe_log_comms_packet_decode_error(payload: &[u8], err: &TelemetryError) {
+    static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = unix_now_ms();
+    let prev = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) < 2_000 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "SEDS packet decode failed in comms: err={err:?} payload_len={} payload={}",
+        payload.len(),
+        hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn maybe_log_comms_decoded_packet(pkt: &Packet) {
+    static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = unix_now_ms();
+    let prev = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) < 2_000 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "SEDS packet decoded in comms: ty={:?} sender={} endpoints={:?} payload_len={}",
+        pkt.data_type(),
+        pkt.sender(),
+        pkt.endpoints(),
+        pkt.payload().len()
+    );
 }
 
 fn maybe_log_comms_gps_packet(pkt: &Packet, mirrored_to_telemetry_ring: bool) {

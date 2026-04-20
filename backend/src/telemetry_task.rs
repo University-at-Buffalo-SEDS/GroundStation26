@@ -2052,6 +2052,7 @@ async fn handle_packet(
     }
 
     let data_type_str = pkt.data_type().as_str().to_string();
+    maybe_log_rf_packet_reached_telemetry_worker(&pkt, &data_type_str);
     let ts_ms = if pkt.data_type() == DataType::GpsData {
         get_current_timestamp_ms() as i64
     } else {
@@ -2210,6 +2211,27 @@ fn maybe_log_processed_gps_row(data_type: &str, sender_id: &str, values: &[Optio
     }
     LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
     eprintln!("GPS telemetry row processed: ty={data_type} sender={sender_id} values={values:?}");
+}
+
+fn maybe_log_rf_packet_reached_telemetry_worker(pkt: &Packet, data_type: &str) {
+    if pkt.sender() != "RF" {
+        return;
+    }
+
+    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+    let now_ms = get_system_timestamp_ms();
+    let prev = LAST_LOG_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) < 2_000 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+    eprintln!(
+        "RF packet reached telemetry worker: ty={:?}/{data_type} endpoints={:?} payload_len={} timestamp={}",
+        pkt.data_type(),
+        pkt.endpoints(),
+        pkt.payload().len(),
+        pkt.timestamp()
+    );
 }
 
 fn maybe_log_gps_delivery(stage: &str, row: &TelemetryRow) {
