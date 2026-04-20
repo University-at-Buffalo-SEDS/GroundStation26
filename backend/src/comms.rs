@@ -4,11 +4,12 @@ use crate::comms_config::{
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
-#[cfg(target_os = "linux")]
-use sedsprintf_rs_2026::serialize;
 use sedsprintf_rs_2026::{
     TelemetryError, TelemetryResult,
+    config::{DataEndpoint, DataType},
+    packet::Packet,
     router::{Router, RouterSideId},
+    serialize,
 };
 use serialport::SerialPort;
 use std::error::Error;
@@ -77,7 +78,11 @@ const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GW", "VB", "AB", "DAQ"];
 //  Comms Device Trait
 // ======================================================================
 pub trait CommsDevice: Send {
-    fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()>;
+    fn recv_packet(
+        &mut self,
+        router: &Router,
+        packet_tap: &mut dyn FnMut(&Packet),
+    ) -> TelemetryResult<()>;
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>>;
     fn set_side_id(&mut self, side_id: RouterSideId);
 }
@@ -130,6 +135,21 @@ pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
             "Check that /dev/i2c-{} exists, I2C is enabled on the Pi, the remote Pico is at address 0x{:02x}, and SDA/SCL plus pull-ups are correct.",
             i2c.bus, i2c.addr
         ),
+    }
+}
+
+fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(&Packet)) {
+    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+        return;
+    };
+    if pkt.endpoints().contains(&DataEndpoint::GroundStation) {
+        return;
+    }
+    if matches!(
+        pkt.data_type(),
+        DataType::GpsData | DataType::GpsSatelliteNumber
+    ) {
+        packet_tap(&pkt);
     }
 }
 
@@ -309,6 +329,7 @@ impl UartComms {
         &mut self,
         router: &Router,
         side_id: RouterSideId,
+        packet_tap: &mut dyn FnMut(&Packet),
     ) -> TelemetryResult<bool> {
         let mut processed_any = false;
 
@@ -320,6 +341,7 @@ impl UartComms {
             processed_any = true;
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
             maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
+            tap_non_groundstation_gps_payload(&payload, packet_tap);
             match router.rx_serialized_queue_from_side(&payload, side_id) {
                 Ok(()) => {
                     maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
@@ -800,7 +822,11 @@ fn hex_preview(bytes: &[u8], limit: usize) -> String {
 
 impl CommsDevice for UartComms {
     /// Blocking receive of one Packet
-    fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
+    fn recv_packet(
+        &mut self,
+        router: &Router,
+        packet_tap: &mut dyn FnMut(&Packet),
+    ) -> TelemetryResult<()> {
         let side_id = self
             .side_id
             .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
@@ -810,7 +836,7 @@ impl CommsDevice for UartComms {
         {
             return Err(err.into());
         }
-        if self.process_buffered_packets(router, side_id)? {
+        if self.process_buffered_packets(router, side_id, packet_tap)? {
             return Ok(());
         }
 
@@ -818,7 +844,7 @@ impl CommsDevice for UartComms {
             return Err(err.into());
         }
 
-        if self.process_buffered_packets(router, side_id)? {
+        if self.process_buffered_packets(router, side_id, packet_tap)? {
             return Ok(());
         }
 
@@ -1070,7 +1096,11 @@ impl I2cComms {
 }
 
 impl CommsDevice for I2cComms {
-    fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
+    fn recv_packet(
+        &mut self,
+        router: &Router,
+        packet_tap: &mut dyn FnMut(&Packet),
+    ) -> TelemetryResult<()> {
         let side_id = self
             .side_id
             .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
@@ -1099,6 +1129,7 @@ impl CommsDevice for I2cComms {
                             }
                             self.rx_payload_buf.extend_from_slice(payload);
                             while let Some(packet) = self.try_take_buffered_packet()? {
+                                tap_non_groundstation_gps_payload(&packet, packet_tap);
                                 match router.rx_serialized_queue_from_side(&packet, side_id) {
                                     Ok(()) => {}
                                     Err(err) => {
@@ -1130,6 +1161,7 @@ impl CommsDevice for I2cComms {
         {
             let _ = router;
             let _ = side_id;
+            let _ = packet_tap;
             Err(TelemetryError::HandlerError(
                 "i2c comms support is only implemented on Linux",
             ))
@@ -1222,7 +1254,11 @@ impl SpiComms {
 }
 
 impl CommsDevice for SpiComms {
-    fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
+    fn recv_packet(
+        &mut self,
+        router: &Router,
+        packet_tap: &mut dyn FnMut(&Packet),
+    ) -> TelemetryResult<()> {
         let side_id = self
             .side_id
             .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
@@ -1243,12 +1279,14 @@ impl CommsDevice for SpiComms {
             if payload.is_empty() {
                 return Ok(());
             }
+            tap_non_groundstation_gps_payload(payload, packet_tap);
             return router.rx_serialized_queue_from_side(payload, side_id);
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = router;
             let _ = side_id;
+            let _ = packet_tap;
             Err(TelemetryError::HandlerError(
                 "spi comms support is only implemented on Linux",
             ))
@@ -1333,7 +1371,11 @@ impl CanComms {
 }
 
 impl CommsDevice for CanComms {
-    fn recv_packet(&mut self, router: &Router) -> TelemetryResult<()> {
+    fn recv_packet(
+        &mut self,
+        router: &Router,
+        packet_tap: &mut dyn FnMut(&Packet),
+    ) -> TelemetryResult<()> {
         let side_id = self
             .side_id
             .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
@@ -1395,12 +1437,14 @@ impl CommsDevice for CanComms {
 
             let packet = std::mem::take(&mut self.rx_buf);
             self.reset_rx();
+            tap_non_groundstation_gps_payload(&packet, packet_tap);
             return router.rx_serialized_queue_from_side(&packet, side_id);
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = router;
             let _ = side_id;
+            let _ = packet_tap;
             Err(TelemetryError::HandlerError(
                 "can comms support is only implemented on Linux",
             ))
@@ -1544,7 +1588,11 @@ impl DummyComms {
 
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 impl CommsDevice for DummyComms {
-    fn recv_packet(&mut self, _router: &Router) -> TelemetryResult<()> {
+    fn recv_packet(
+        &mut self,
+        _router: &Router,
+        packet_tap: &mut dyn FnMut(&Packet),
+    ) -> TelemetryResult<()> {
         #[cfg(feature = "testing")]
         {
             let side_id = self
@@ -1552,15 +1600,32 @@ impl CommsDevice for DummyComms {
                 .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
             self.maybe_queue_discovery()?;
             if let Some(pkt) = self.pending_rx.pop_front() {
+                if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
+                    && matches!(
+                        pkt.data_type(),
+                        DataType::GpsData | DataType::GpsSatelliteNumber
+                    )
+                {
+                    packet_tap(&pkt);
+                }
                 return _router.rx_queue_from_side(pkt, side_id);
             }
             let pkt = get_dummy_packet()?;
+            if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
+                && matches!(
+                    pkt.data_type(),
+                    DataType::GpsData | DataType::GpsSatelliteNumber
+                )
+            {
+                packet_tap(&pkt);
+            }
             _router.rx_queue_from_side(pkt, side_id)
         }
 
         #[cfg(not(feature = "testing"))]
         {
             let _ = _router;
+            let _ = packet_tap;
             // In hitl_mode, dummy comms links are used only as disconnected-link placeholders.
             Ok(())
         }

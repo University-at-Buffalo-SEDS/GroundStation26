@@ -88,10 +88,17 @@ fn spawn_comms_worker_threads(
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
                 }
 
+                let tap_state = state.clone();
+                let mut packet_tap = |pkt: &Packet| {
+                    tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+                    tap_state.mark_packet_received(get_current_timestamp_ms());
+                    let mut rb = tap_state.ring_buffer.lock().unwrap();
+                    rb.push(pkt.clone());
+                };
                 match rx_comms
                     .lock()
                     .expect("failed to get lock")
-                    .recv_packet(&router)
+                    .recv_packet(&router, &mut packet_tap)
                 {
                     Ok(_) => {}
                     Err(e) => {
@@ -851,6 +858,29 @@ fn normalized_gps_values(
     }
 
     vec![lat, lon, alt]
+}
+
+fn f32_values_from_payload_bytes(bytes: &[u8]) -> Option<Vec<Option<f32>>> {
+    if bytes.is_empty() || bytes.len() % std::mem::size_of::<f32>() != 0 {
+        return None;
+    }
+
+    Some(
+        bytes
+            .chunks_exact(std::mem::size_of::<f32>())
+            .map(|chunk| Some(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
+            .collect(),
+    )
+}
+
+fn telemetry_f32_values(pkt: &Packet) -> Option<Vec<Option<f32>>> {
+    match pkt.data_as_f32() {
+        Ok(values) => Some(values.into_iter().map(Some).collect()),
+        Err(_) if pkt.data_type() == DataType::GpsData => {
+            f32_values_from_payload_bytes(pkt.payload())
+        }
+        Err(_) => None,
+    }
 }
 
 async fn handle_gps_satellite_count_packet(
@@ -2014,8 +2044,7 @@ async fn handle_packet(
             .await;
     }
 
-    if let Ok(values) = pkt.data_as_f32() {
-        let mut values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
+    if let Some(mut values_vec) = telemetry_f32_values(&pkt) {
         if pkt.data_type() == DataType::GpsData {
             values_vec = normalized_gps_values(state, pkt.sender(), &values_vec);
         }

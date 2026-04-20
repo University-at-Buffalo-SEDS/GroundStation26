@@ -428,6 +428,21 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
+    let live_rocket = {
+        let fixes = state.latest_gps_fix_by_sender.lock().unwrap();
+        ["RF", "GW", "FC"]
+            .iter()
+            .filter_map(|sender_id| fixes.get(*sender_id))
+            .chain(fixes.values())
+            .find_map(gps_point_from_values)
+    };
+    if live_rocket.is_some() {
+        return Json(GpsResponse {
+            rocket: live_rocket,
+        })
+        .into_response();
+    }
+
     let db = state.telemetry_db_pool();
     // Prefer the normalized GPS stream, but keep compatibility with older row tags.
     let row = sqlx::query(
@@ -443,18 +458,19 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     .await
     .unwrap_or(None);
 
-    let rocket = row.and_then(|r| {
-        let values = values_from_row(&r);
-        match (value_at(&values, 0), value_at(&values, 1)) {
-            (Some(lat), Some(lon)) => Some(GpsPoint {
-                lat: lat as f64,
-                lon: lon as f64,
-            }),
-            _ => None,
-        }
-    });
+    let rocket = row.and_then(|r| gps_point_from_values(&values_from_row(&r)));
 
     Json(GpsResponse { rocket }).into_response()
+}
+
+fn gps_point_from_values(values: &Vec<Option<f32>>) -> Option<GpsPoint> {
+    match (value_at(values, 0), value_at(values, 1)) {
+        (Some(lat), Some(lon)) => Some(GpsPoint {
+            lat: lat as f64,
+            lon: lon as f64,
+        }),
+        _ => None,
+    }
 }
 
 /// Serves the current frontend layout configuration.
