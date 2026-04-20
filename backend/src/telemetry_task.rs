@@ -2070,8 +2070,12 @@ async fn handle_packet(
         return None;
     }
 
-    let ts_ms = pkt.timestamp() as i64;
     let data_type_str = pkt.data_type().as_str().to_string();
+    let ts_ms = if pkt.data_type() == DataType::GpsData {
+        get_current_timestamp_ms() as i64
+    } else {
+        pkt.timestamp() as i64
+    };
 
     let payload_json = payload_json_from_pkt(&pkt);
 
@@ -2220,9 +2224,15 @@ fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
 }
 
 fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::TelemetryError> {
-    router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS)?;
+    if let Err(err) = router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS) {
+        log_telemetry_error("router tx queue processing failed", err);
+        return Ok(());
+    }
     if ROUTER_RX_BUDGET_MS > 0 {
-        router.process_rx_queue_with_timeout(ROUTER_RX_BUDGET_MS)?;
+        if let Err(err) = router.process_rx_queue_with_timeout(ROUTER_RX_BUDGET_MS) {
+            log_telemetry_error("router rx queue processing failed", err);
+            return Ok(());
+        }
     }
     Ok(())
 }
