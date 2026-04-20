@@ -850,50 +850,7 @@ fn normalized_gps_values(
         fixes.insert(sender_id.to_string(), vec![lat, lon, alt]);
     }
 
-    let satellites = state
-        .latest_gps_satellites_by_sender
-        .lock()
-        .unwrap()
-        .get(sender_id)
-        .copied()
-        .map(|v| v as f32);
-
-    vec![lat, lon, alt, satellites]
-}
-
-async fn emit_normalized_gps_row(
-    state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbQueueItem>,
-    db_overflow: &DbOverflow,
-    ts_ms: i64,
-    sender_id: &str,
-    values: Vec<Option<f32>>,
-    payload_json: &str,
-) {
-    if should_persist_telemetry_sample(DataType::GpsData.as_str(), ts_ms) {
-        queue_db_write(
-            state,
-            db_tx,
-            db_overflow,
-            DbWrite::Telemetry {
-                timestamp_ms: ts_ms,
-                data_type: DataType::GpsData.as_str().to_string(),
-                sender_id: sender_id.to_string(),
-                values_json: telemetry_values_json(&values),
-                payload_json: payload_json.to_string(),
-            },
-        )
-        .await;
-    }
-
-    let row = TelemetryRow {
-        timestamp_ms: ts_ms,
-        data_type: DataType::GpsData.as_str().to_string(),
-        sender_id: sender_id.to_string(),
-        values,
-    };
-    state.cache_recent_telemetry(row.clone());
-    let _ = state.ws_tx.send(row);
+    vec![lat, lon, alt]
 }
 
 async fn handle_gps_satellite_count_packet(
@@ -925,33 +882,6 @@ async fn handle_gps_satellite_count_packet(
                 values_json: telemetry_values_json(&values),
                 payload_json: payload_json.to_string(),
             },
-        )
-        .await;
-    }
-
-    let fix_values = {
-        state
-            .latest_gps_fix_by_sender
-            .lock()
-            .unwrap()
-            .get(&sender_id)
-            .cloned()
-    };
-    if let Some(fix_values) = fix_values {
-        let normalized = vec![
-            fix_values.first().copied().flatten(),
-            fix_values.get(1).copied().flatten(),
-            fix_values.get(2).copied().flatten(),
-            Some(count as f32),
-        ];
-        emit_normalized_gps_row(
-            state,
-            db_tx,
-            db_overflow,
-            ts_ms,
-            &sender_id,
-            normalized,
-            payload_json,
         )
         .await;
     }

@@ -442,16 +442,12 @@
         "channels": [
           "Lat",
           "Lon",
-          "Altitude",
-          "Satellites"
+          "Altitude"
         ],
         "channel_formatters": [
           {},
           {},
-          {},
-          {
-            "kind": "integer"
-          }
+          {}
         ],
         "subtabs": [
           {
@@ -461,16 +457,12 @@
             "channels": [
               "Lat",
               "Lon",
-              "Altitude",
-              "Satellites"
+              "Altitude"
             ],
             "channel_formatters": [
               {},
               {},
-              {},
-              {
-                "kind": "integer"
-              }
+              {}
             ],
             "chart": {
               "enabled": false
@@ -493,8 +485,8 @@
               },
               {
                 "label": "Satellites",
-                "data_type": "GPS_DATA",
-                "index": 3,
+                "data_type": "GPS_SATELLITE_NUMBER",
+                "index": 0,
                 "formatter": {
                   "kind": "integer"
                 }
@@ -1024,7 +1016,7 @@
               },
               {
                 "kind": "summary",
-                "data_type": "GPS_DATA",
+                "data_type": "GPS_SATELLITE_NUMBER",
                 "summary_style": {
                   "background": "#1f2937",
                   "border": "#facc15",
@@ -1034,7 +1026,7 @@
                 "items": [
                   {
                     "label": "Satellites",
-                    "index": 3,
+                    "index": 0,
                     "formatter": {
                       "kind": "integer",
                       "prefix": "🛰 "
