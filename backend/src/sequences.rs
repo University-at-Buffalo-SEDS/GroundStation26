@@ -450,7 +450,6 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
 #[cfg(all(not(feature = "hitl_mode"), not(feature = "test_fire_mode")))]
 pub fn all_command_names() -> Vec<&'static str> {
     vec![
-        "Launch",
         "Dump",
         "Abort",
         "NormallyOpen",
@@ -464,36 +463,9 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
-    ]
-}
-
-#[cfg(feature = "hitl_mode")]
-pub fn all_command_names() -> Vec<&'static str> {
-    vec![
+        "Postinit",
         "Launch",
-        "Dump",
-        "Abort",
-        "NormallyOpen",
-        "Pilot",
-        "Igniter",
-        "RetractPlumbing",
-        "Nitrogen",
-        "Nitrous",
-        "StartWritingNow",
-        "StartWritingLastTwoMinutes",
-        "PauseWritingDb",
-        "StopWritingDb",
-        "ContinueFillSequence",
-        "DeployParachute",
-        "ExpandParachute",
-        "ReinitSensors",
-        "LaunchSignal",
-        "EvaluationRelax",
-        "EvaluationFocus",
-        "EvaluationAbort",
-        "ReinitBarometer",
-        "EnableIMU",
-        "DisableIMU",
+        "Rollback",
         "MonitorAltitude",
         "RevokeMonitorAltitude",
         "ConsecutiveSamples",
@@ -502,21 +474,12 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RevokeResetFailures",
         "ValidateMeasms",
         "RevokeValidateMeasms",
-        "AbortAfter15",
-        "AbortAfter40",
-        "AbortAfter70",
-        "ReinitAfter12",
-        "ReinitAfter26",
-        "ReinitAfter44",
-        "AdvanceFlightState",
-        "RewindFlightState",
     ]
 }
 
-#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+#[cfg(feature = "hitl_mode")]
 pub fn all_command_names() -> Vec<&'static str> {
     vec![
-        "Launch",
         "Dump",
         "Abort",
         "NormallyOpen",
@@ -530,8 +493,64 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
+        "Postinit",
+        "Launch",
+        "Rollback",
+        "MonitorAltitude",
+        "RevokeMonitorAltitude",
+        "ConsecutiveSamples",
+        "RevokeConsecutiveSamples",
+        "ResetFailures",
+        "RevokeResetFailures",
+        "ValidateMeasms",
+        "RevokeValidateMeasms",
+        "DeployParachute",
+        "ExpandParachute",
+        "EvaluationRelax",
+        "EvaluationFocus",
+        "EvaluationAbort",
+        "ReinitSensors",
+        "ReinitBarometer",
+        "ReinitIMU",
+        "DisableIMU",
         "AdvanceFlightState",
         "RewindFlightState",
+        "AbortAfter40",
+        "AbortAfter100",
+        "AbortAfter250",
+        "ReinitAfter15",
+        "ReinitAfter30",
+        "ReinitAfter50",
+    ]
+}
+
+#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+pub fn all_command_names() -> Vec<&'static str> {
+    vec![
+        "Dump",
+        "Abort",
+        "NormallyOpen",
+        "Pilot",
+        "Igniter",
+        "RetractPlumbing",
+        "Nitrogen",
+        "Nitrous",
+        "StartWritingNow",
+        "StartWritingLastTwoMinutes",
+        "PauseWritingDb",
+        "StopWritingDb",
+        "ContinueFillSequence",
+        "Postinit",
+        "Launch",
+        "Rollback",
+        "MonitorAltitude",
+        "RevokeMonitorAltitude",
+        "ConsecutiveSamples",
+        "RevokeConsecutiveSamples",
+        "ResetFailures",
+        "RevokeResetFailures",
+        "ValidateMeasms",
+        "RevokeValidateMeasms",
     ]
 }
 
