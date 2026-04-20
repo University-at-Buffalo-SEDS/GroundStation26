@@ -142,15 +142,37 @@ fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(
     let Ok(pkt) = serialize::deserialize_packet(payload) else {
         return;
     };
-    if pkt.endpoints().contains(&DataEndpoint::GroundStation) {
-        return;
-    }
-    if matches!(
+    let is_gps = matches!(
         pkt.data_type(),
         DataType::GpsData | DataType::GpsSatelliteNumber
-    ) {
+    );
+    if !is_gps {
+        return;
+    }
+
+    let has_groundstation = pkt.endpoints().contains(&DataEndpoint::GroundStation);
+    maybe_log_comms_gps_packet(&pkt, !has_groundstation);
+    if !has_groundstation {
         packet_tap(&pkt);
     }
+}
+
+fn maybe_log_comms_gps_packet(pkt: &Packet, mirrored_to_telemetry_ring: bool) {
+    static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = unix_now_ms();
+    let prev = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) < 2_000 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "GPS packet decoded from comms: ty={:?} sender={} endpoints={:?} payload_len={} mirrored={}",
+        pkt.data_type(),
+        pkt.sender(),
+        pkt.endpoints(),
+        pkt.payload().len(),
+        mirrored_to_telemetry_ring,
+    );
 }
 
 fn serial_description(name: &str, serial: &SerialLinkConfig) -> String {

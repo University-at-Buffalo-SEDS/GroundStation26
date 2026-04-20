@@ -916,6 +916,8 @@ async fn handle_gps_satellite_count_packet(
         .await;
     }
 
+    maybe_log_processed_gps_row(GPS_SATELLITES_DATA_TYPE, &sender_id, &values);
+
     Some(TelemetryRow {
         timestamp_ms: ts_ms,
         data_type: GPS_SATELLITES_DATA_TYPE.to_string(),
@@ -2047,6 +2049,7 @@ async fn handle_packet(
     if let Some(mut values_vec) = telemetry_f32_values(&pkt) {
         if pkt.data_type() == DataType::GpsData {
             values_vec = normalized_gps_values(state, pkt.sender(), &values_vec);
+            maybe_log_processed_gps_row(&data_type_str, pkt.sender(), &values_vec);
         }
         if pkt.data_type() == DataType::FuelTankPressure {
             let latest = values_vec.first().copied().flatten();
@@ -2134,6 +2137,14 @@ async fn handle_packet(
 
         Some(row)
     } else {
+        if pkt.data_type() == DataType::GpsData {
+            eprintln!(
+                "GPS_DATA packet could not be decoded into telemetry row: sender={} payload_len={} endpoints={:?}",
+                pkt.sender(),
+                pkt.payload().len(),
+                pkt.endpoints()
+            );
+        }
         if should_persist_telemetry_sample(&data_type_str, ts_ms) {
             queue_db_write(
                 state,
@@ -2169,6 +2180,17 @@ fn get_system_timestamp_ms() -> u64 {
 
 fn log_telemetry_error(context: &str, err: sedsprintf_rs_2026::TelemetryError) {
     eprintln!("{context}: {:?}", err);
+}
+
+fn maybe_log_processed_gps_row(data_type: &str, sender_id: &str, values: &[Option<f32>]) {
+    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+    let now_ms = get_system_timestamp_ms();
+    let prev = LAST_LOG_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) < 2_000 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+    eprintln!("GPS telemetry row processed: ty={data_type} sender={sender_id} values={values:?}");
 }
 
 fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
