@@ -1260,8 +1260,27 @@ pub async fn telemetry_task(
         tokio::spawn(async move {
             while let Some(pkt) = packet_rx.recv().await {
                 if let Some(row) = handle_packet(&state, &db_tx, &db_overflow, pkt).await {
+                    maybe_log_gps_delivery("packet_worker row returned", &row);
                     state.cache_recent_telemetry(row.clone());
-                    let _ = state.ws_tx.send(row);
+                    maybe_log_gps_delivery("packet_worker cached row", &row);
+                    match state.ws_tx.send(row.clone()) {
+                        Ok(receivers) => {
+                            if is_gps_telemetry_row(&row) {
+                                eprintln!(
+                                    "GPS telemetry delivery: stage=packet_worker websocket broadcast receivers={receivers} ty={} sender={} ts={} values={:?}",
+                                    row.data_type, row.sender_id, row.timestamp_ms, row.values
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            if is_gps_telemetry_row(&row) {
+                                eprintln!(
+                                    "GPS telemetry delivery: stage=packet_worker websocket broadcast failed receivers=0 ty={} sender={} ts={} values={:?}",
+                                    row.data_type, row.sender_id, row.timestamp_ms, row.values
+                                );
+                            }
+                        }
+                    }
                 }
             }
         })
@@ -2191,6 +2210,24 @@ fn maybe_log_processed_gps_row(data_type: &str, sender_id: &str, values: &[Optio
     }
     LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
     eprintln!("GPS telemetry row processed: ty={data_type} sender={sender_id} values={values:?}");
+}
+
+fn maybe_log_gps_delivery(stage: &str, row: &TelemetryRow) {
+    if !is_gps_telemetry_row(row) {
+        return;
+    }
+
+    eprintln!(
+        "GPS telemetry delivery: stage={stage} ty={} sender={} ts={} values={:?}",
+        row.data_type, row.sender_id, row.timestamp_ms, row.values
+    );
+}
+
+fn is_gps_telemetry_row(row: &TelemetryRow) -> bool {
+    matches!(
+        row.data_type.as_str(),
+        "GPS_DATA" | "GPS" | "ROCKET_GPS" | GPS_SATELLITES_DATA_TYPE
+    )
 }
 
 fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
