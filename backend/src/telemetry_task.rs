@@ -2216,8 +2216,21 @@ pub fn timesync_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::timesync_enabled;
+    use super::*;
+    use crate::auth::AuthManager;
+    use crate::fill_targets;
+    use crate::gpio::GpioPins;
+    use crate::loadcell;
+    use crate::ring_buffer::RingBuffer;
+    use crate::sequences::default_action_policy;
+    use crate::telemetry_db::{LaunchClockMsg, RecordingModeWire};
+    use crate::types::Board;
+    use sqlx::SqlitePool;
+    use std::collections::{HashMap, VecDeque};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
     use std::sync::{Mutex, OnceLock};
+    use tokio::sync::{Notify, broadcast, mpsc};
 
     fn timesync_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2243,5 +2256,189 @@ mod tests {
         unsafe {
             std::env::remove_var("GROUNDSTATION_TIMESYNC");
         }
+    }
+
+    fn test_db_overflow() -> DbOverflow {
+        DbOverflow {
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            notify: Arc::new(Notify::new()),
+            running: Arc::new(AtomicBool::new(true)),
+            max_entries: 16,
+        }
+    }
+
+    async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
+        let db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory telemetry db");
+        let auth_db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory auth db");
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (ws_tx, _ws_rx) = broadcast::channel(16);
+        let (state_tx, _state_rx) = broadcast::channel(4);
+        let (board_status_tx, _board_status_rx) = broadcast::channel(4);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
+        let (notifications_tx, _notifications_rx) = broadcast::channel(4);
+        let (action_policy_tx, _action_policy_rx) = broadcast::channel(4);
+        let (fill_targets_tx, _fill_targets_rx) = broadcast::channel(4);
+        let (launch_clock_tx, _launch_clock_rx) = broadcast::channel(4);
+        let (recording_status_tx, _recording_status_rx) = broadcast::channel(4);
+
+        let mut board_status = HashMap::new();
+        for board in Board::ALL {
+            board_status.insert(
+                *board,
+                crate::state::BoardStatus {
+                    last_seen_ms: None,
+                    ema_gap_ms: None,
+                    warned: false,
+                },
+            );
+        }
+
+        Arc::new(AppState {
+            ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
+            cmd_tx,
+            ws_tx,
+            warnings_tx: broadcast::channel(4).0,
+            errors_tx: broadcast::channel(4).0,
+            db: Arc::new(Mutex::new(db)),
+            db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
+            placeholder_db_path: "sqlite::memory:".to_string(),
+            db_queue_tx: db_tx,
+            auth_db,
+            state: Arc::new(Mutex::new(FlightState::Startup)),
+            state_tx,
+            gpio: GpioPins::new(),
+            board_status: Arc::new(Mutex::new(board_status)),
+            board_status_tx,
+            last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
+            umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
+            latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+            latest_fill_mass_kg: Arc::new(Mutex::new(None)),
+            loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
+            shutdown_tx,
+            pending_db_writes: Arc::new(AtomicUsize::new(0)),
+            db_write_notify: Arc::new(Notify::new()),
+            notifications: Arc::new(Mutex::new(Vec::new())),
+            notifications_tx,
+            next_notification_id: Arc::new(AtomicU64::new(0)),
+            action_policy: Arc::new(Mutex::new(default_action_policy())),
+            action_policy_tx,
+            fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
+            fill_targets_tx,
+            launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
+            launch_clock_tx,
+            recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
+                mode: RecordingModeWire::Idle,
+                db_path: None,
+            })),
+            recording_status_tx,
+            last_command_ms: Arc::new(Mutex::new(HashMap::new())),
+            fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
+            recent_telemetry_cache: Arc::new(Mutex::new(VecDeque::new())),
+            latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
+            latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),
+            recent_alerts_cache: Arc::new(Mutex::new(VecDeque::new())),
+            av_bay_comms_connected: Arc::new(AtomicBool::new(false)),
+            fill_comms_connected: Arc::new(AtomicBool::new(false)),
+            topology_router: Arc::new(OnceLock::new()),
+            auth: Arc::new(AuthManager::new(PathBuf::from(
+                "/tmp/groundstation-test-users.json",
+            ))),
+        })
+    }
+
+    fn f32_payload(values: &[f32]) -> Arc<[u8]> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    #[tokio::test]
+    async fn rf_gps_packets_become_graphable_telemetry_rows() {
+        let (db_tx, mut db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        let gps_values = [31.7619_f32, -106.485_f32, 1412.5_f32];
+        let gps_pkt = Packet::new(
+            DataType::GpsData,
+            &[
+                sedsprintf_rs_2026::config::DataEndpoint::GroundStation,
+                sedsprintf_rs_2026::config::DataEndpoint::SdCard,
+                sedsprintf_rs_2026::config::DataEndpoint::FlightController,
+            ],
+            Board::RFBoard.sender_id(),
+            123_456,
+            f32_payload(&gps_values),
+        )
+        .expect("failed to build RF GPS_DATA packet");
+
+        let row = handle_packet(&state, &db_tx, &db_overflow, gps_pkt)
+            .await
+            .expect("RF GPS_DATA packet should produce telemetry row");
+
+        assert_eq!(row.data_type, DataType::GpsData.as_str());
+        assert_eq!(row.sender_id, Board::RFBoard.sender_id());
+        assert_eq!(row.values.len(), 3);
+        for (actual, expected) in row.values.iter().zip(gps_values) {
+            assert_eq!(actual.unwrap(), expected);
+        }
+        assert_eq!(
+            state
+                .latest_gps_fix_by_sender
+                .lock()
+                .unwrap()
+                .get(Board::RFBoard.sender_id())
+                .cloned(),
+            Some(row.values.clone())
+        );
+
+        let write = db_rx.recv().await.expect("GPS_DATA should queue DB write");
+        match write {
+            DbQueueItem::Write(DbWrite::Telemetry {
+                data_type,
+                sender_id,
+                values_json,
+                ..
+            }) => {
+                assert_eq!(data_type, DataType::GpsData.as_str());
+                assert_eq!(sender_id, Board::RFBoard.sender_id());
+                assert_eq!(
+                    serde_json::from_str::<Vec<Option<f32>>>(&values_json.unwrap()).unwrap(),
+                    row.values
+                );
+            }
+            other => panic!("unexpected DB item for GPS_DATA: {other:?}"),
+        }
+
+        let sat_pkt = Packet::new(
+            DataType::GpsSatelliteNumber,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            Board::RFBoard.sender_id(),
+            123_789,
+            Arc::from([14_u8]),
+        )
+        .expect("failed to build RF GPS_SATELLITE_NUMBER packet");
+
+        let sat_row = handle_packet(&state, &db_tx, &db_overflow, sat_pkt)
+            .await
+            .expect("RF GPS_SATELLITE_NUMBER packet should produce telemetry row");
+
+        assert_eq!(sat_row.data_type, GPS_SATELLITES_DATA_TYPE);
+        assert_eq!(sat_row.sender_id, Board::RFBoard.sender_id());
+        assert_eq!(sat_row.values, vec![Some(14.0)]);
+        assert_eq!(
+            state
+                .latest_gps_satellites_by_sender
+                .lock()
+                .unwrap()
+                .get(Board::RFBoard.sender_id())
+                .copied(),
+            Some(14)
+        );
     }
 }

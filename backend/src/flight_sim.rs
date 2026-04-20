@@ -1011,7 +1011,7 @@ impl FlightSimState {
 
         Packet::new(
             dtype,
-            &[DataEndpoint::GroundStation],
+            sim_endpoints_for_datatype(dtype),
             sender,
             now_ms,
             Arc::from(bytes.as_slice()),
@@ -1031,8 +1031,21 @@ fn sender_for_datatype(dtype: DataType) -> &'static str {
         }
         DataType::KG1000 => Board::DaqBoard.sender_id(),
         DataType::BatteryVoltage | DataType::BatteryCurrent => Board::PowerBoard.sender_id(),
-        DataType::GpsData | DataType::GpsSatelliteNumber => Board::GatewayBoard.sender_id(),
+        DataType::GpsData | DataType::GpsSatelliteNumber => Board::RFBoard.sender_id(),
         _ => Board::GroundStation.sender_id(),
+    }
+}
+
+#[cfg(feature = "testing")]
+fn sim_endpoints_for_datatype(dtype: DataType) -> &'static [DataEndpoint] {
+    match dtype {
+        DataType::GpsData => &[
+            DataEndpoint::GroundStation,
+            DataEndpoint::SdCard,
+            DataEndpoint::FlightController,
+        ],
+        DataType::GpsSatelliteNumber => &[DataEndpoint::GroundStation],
+        _ => &[DataEndpoint::GroundStation],
     }
 }
 
