@@ -32,7 +32,6 @@ use std::convert::Infallible;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{OnceCell, mpsc};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -438,7 +437,6 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
             .find_map(gps_point_from_values)
     };
     if live_rocket.is_some() {
-        maybe_log_gps_api_point("api/gps live cache", live_rocket.as_ref());
         return Json(GpsResponse {
             rocket: live_rocket,
         })
@@ -461,7 +459,6 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     .unwrap_or(None);
 
     let rocket = row.and_then(|r| gps_point_from_values(&values_from_row(&r)));
-    maybe_log_gps_api_point("api/gps db fallback", rocket.as_ref());
 
     Json(GpsResponse { rocket }).into_response()
 }
@@ -473,65 +470,6 @@ fn gps_point_from_values(values: &Vec<Option<f32>>) -> Option<GpsPoint> {
             lon: lon as f64,
         }),
         _ => None,
-    }
-}
-
-fn is_gps_row(row: &TelemetryRow) -> bool {
-    matches!(
-        row.data_type.as_str(),
-        "GPS_DATA" | "GPS" | "ROCKET_GPS" | "GPS_SATELLITE_NUMBER"
-    )
-}
-
-fn maybe_log_gps_web_row(stage: &str, row: &TelemetryRow) {
-    if !is_gps_row(row) {
-        return;
-    }
-    eprintln!(
-        "GPS frontend delivery: stage={stage} ty={} sender={} ts={} values={:?}",
-        row.data_type, row.sender_id, row.timestamp_ms, row.values
-    );
-}
-
-fn maybe_log_recent_gps_response(stage: &str, rows: &[TelemetryRow]) {
-    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
-    let now_ms = crate::telemetry_task::get_current_timestamp_ms();
-    let prev = LAST_LOG_MS.load(Ordering::Relaxed);
-    if now_ms.saturating_sub(prev) < 2_000 {
-        return;
-    }
-    LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
-
-    let gps_rows = rows.iter().filter(|row| is_gps_row(row)).count();
-    let latest_gps = rows.iter().rev().find(|row| is_gps_row(row));
-    eprintln!(
-        "GPS frontend delivery: stage={stage} response_rows={} gps_rows={} latest_gps={:?}",
-        rows.len(),
-        gps_rows,
-        latest_gps.map(|row| (
-            &row.data_type,
-            &row.sender_id,
-            row.timestamp_ms,
-            &row.values
-        ))
-    );
-}
-
-fn maybe_log_gps_api_point(stage: &str, point: Option<&GpsPoint>) {
-    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
-    let now_ms = crate::telemetry_task::get_current_timestamp_ms();
-    let prev = LAST_LOG_MS.load(Ordering::Relaxed);
-    if now_ms.saturating_sub(prev) < 2_000 {
-        return;
-    }
-    LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
-
-    match point {
-        Some(point) => eprintln!(
-            "GPS frontend delivery: stage={stage} point=lat:{:.7} lon:{:.7}",
-            point.lat, point.lon
-        ),
-        None => eprintln!("GPS frontend delivery: stage={stage} point=None"),
     }
 }
 
@@ -1011,7 +949,6 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
             oldest_cache_ts.is_some_and(|oldest| oldest <= cutoff + RECENT_BUCKET_MS);
         if cache_covers_window {
             let rows = compact_recent_rows(cache_snapshot, cutoff);
-            maybe_log_recent_gps_response("api/recent cache", &rows);
             return Json(rows).into_response();
         }
 
@@ -1028,7 +965,6 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
                 .filter(|row| row.timestamp_ms >= cutoff && row.timestamp_ms <= now_ms),
         );
         let rows = compact_recent_rows(merged_rows, cutoff);
-        maybe_log_recent_gps_response("api/recent merged", &rows);
         return Json(rows).into_response();
     }
 
@@ -1040,7 +976,6 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
             .ok()
             .flatten()
     else {
-        maybe_log_recent_gps_response("api/recent empty", &[]);
         return Json(Vec::<TelemetryRow>::new()).into_response();
     };
     let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
@@ -1048,7 +983,6 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         load_recent_rows_from_db(&state, cutoff, now_ms).await,
         cutoff,
     );
-    maybe_log_recent_gps_response("api/recent db", &rows);
     Json(rows).into_response()
 }
 
@@ -1070,7 +1004,6 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
         {
             now_ms
         } else {
-            maybe_log_recent_gps_response("api/recent ndjson empty", &[]);
             return (
                 [(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
                 Body::empty(),
@@ -1120,7 +1053,6 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
                     sender_id: row.get::<String, _>("sender_id"),
                     values: values_from_row(&row),
                 };
-                maybe_log_gps_web_row("api/recent ndjson db", &telemetry_row);
                 if send_ndjson_row(&tx, &telemetry_row).await.is_err() {
                     return;
                 }
@@ -1131,7 +1063,6 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
             if row.timestamp_ms < cutoff || row.timestamp_ms > now_ms {
                 continue;
             }
-            maybe_log_gps_web_row("api/recent ndjson cache", &row);
             if send_ndjson_row(&tx, &row).await.is_err() {
                 return;
             }
@@ -1801,7 +1732,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                 recv = telemetry_rx.recv() => {
                     match recv {
                         Ok(pkt) => {
-                            maybe_log_gps_web_row("websocket broadcast received", &pkt);
                             telemetry_pending.push_back(pkt);
                             while telemetry_pending.len() > telemetry_pending_cap {
                                 telemetry_pending.pop_front();
@@ -1832,7 +1762,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     }
                     let mut rows: Vec<TelemetryRow> = telemetry_pending.drain(..).collect();
                     rows.sort_by_key(|r| r.timestamp_ms);
-                    maybe_log_recent_gps_response("websocket telemetry_batch", &rows);
 
                     let msg = WsOutMsg::TelemetryBatch(rows);
                     let text = serde_json::to_string(&msg).unwrap_or_default();
