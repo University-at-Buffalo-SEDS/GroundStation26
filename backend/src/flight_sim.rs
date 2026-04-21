@@ -35,17 +35,17 @@ const LAUNCH_COUNTDOWN_DURATION_MS: u64 = 10_000;
 #[cfg(feature = "testing")]
 const HOUSEKEEPING_PERIOD_MS: u64 = 900;
 #[cfg(feature = "testing")]
-const AV_BAY_BATTERY_CUTOFF_V: f32 = 6.3;
+const AV_BAY_BATTERY_CUTOFF_V: f32 = 7.3;
 #[cfg(feature = "testing")]
 const AV_BAY_BATTERY_MAX_V: f32 = 8.4;
 #[cfg(feature = "testing")]
-const VALVE_BOARD_BATTERY_CUTOFF_V: f32 = 6.3;
+const VALVE_BOARD_BATTERY_CUTOFF_V: f32 = 13.6;
 #[cfg(feature = "testing")]
-const VALVE_BOARD_BATTERY_MAX_V: f32 = 8.4;
+const VALVE_BOARD_BATTERY_MAX_V: f32 = 15.2;
 #[cfg(feature = "testing")]
-const FILL_BOX_POWER_CUTOFF_V: f32 = 13.3;
+const FILL_BOX_POWER_CUTOFF_V: f32 = 13.6;
 #[cfg(feature = "testing")]
-const FILL_BOX_POWER_MAX_V: f32 = 15.5;
+const FILL_BOX_POWER_MAX_V: f32 = 15.2;
 #[cfg(feature = "testing")]
 const LOADCELL_NOISE_KG: f32 = 0.01;
 #[cfg(feature = "testing")]
@@ -63,6 +63,14 @@ const NITROGEN_PRESSURE_RESPONSE_PER_S: f32 = 1.0;
 #[cfg(feature = "testing")]
 const NITROGEN_MASS_GAIN_KG_PER_S: f32 = 0.08;
 #[cfg(feature = "testing")]
+const DUMP_MASS_VENT_KG_PER_S: f32 = 0.55;
+#[cfg(feature = "testing")]
+const NORMALLY_OPEN_MASS_LEAK_KG_PER_S: f32 = 0.0002;
+#[cfg(feature = "testing")]
+const DUMP_PRESSURE_BLEED_PSI_PER_S: f32 = 80.0;
+#[cfg(feature = "testing")]
+const NORMALLY_OPEN_PRESSURE_BLEED_PSI_PER_S: f32 = 0.25;
+#[cfg(feature = "testing")]
 const GRAVITY_FPS2: f32 = 32.174;
 
 #[cfg(feature = "testing")]
@@ -78,14 +86,9 @@ fn sim_full_mass_kg_from(
     fill_cfg: &fill_targets::FillTargetsConfig,
     loadcell_cfg: &loadcell::LoadcellCalibrationFile,
 ) -> f32 {
-    fill_cfg
-        .nitrous
-        .target_mass_kg
-        .max(
-            loadcell_cfg
-                .full_mass_kg
-                .unwrap_or(loadcell::DEFAULT_FULL_MASS_KG),
-        )
+    loadcell_cfg
+        .full_mass_kg
+        .unwrap_or(fill_cfg.nitrous.target_mass_kg)
         .max(0.1)
 }
 
@@ -187,16 +190,8 @@ fn nitrous_equilibrium_pressure_psi(loadcell_mass_kg: f32) -> f32 {
 }
 
 #[cfg(feature = "testing")]
-fn vented_pressure_target_psi(loadcell_mass_kg: f32, nitrous_loaded: bool) -> f32 {
-    if loadcell_mass_kg <= 0.01 {
-        return 0.0;
-    }
-    if nitrous_loaded {
-        let fill_frac = (loadcell_mass_kg / sim_full_mass_kg()).clamp(0.0, 1.0);
-        NITROUS_ROOM_TEMP_SATURATION_PSI * fill_frac
-    } else {
-        nitrogen_pressure_target_psi(loadcell_mass_kg)
-    }
+fn vented_pressure_target_psi(_loadcell_mass_kg: f32, _nitrous_loaded: bool) -> f32 {
+    0.0
 }
 
 #[cfg(feature = "testing")]
@@ -256,7 +251,7 @@ impl FlightSimState {
     fn new() -> Self {
         let mut valves = HashMap::new();
         // Start in idle with fill lines installed and both NO + dump open.
-        // Closing both is required before entering fill sequence.
+        // Dump closes for fill; NO stays open until just before fill-line retract.
         valves.insert(ValveBoardCommands::NormallyOpenOpen as u8, true);
         valves.insert(ValveBoardCommands::DumpOpen as u8, true);
         valves.insert(ActuatorBoardCommands::RetractPlumbing as u8, false);
@@ -504,6 +499,13 @@ impl FlightSimState {
                 let next = !self.valve_on(key);
                 self.valves.insert(key, next);
                 self.queue_umbilical_status(key, next, now_ms);
+                if next && self.flight_state == FlightState::NitrogenFill {
+                    self.saw_dump_open_after_n2 = false;
+                    self.saw_dump_closed_after_n2 = false;
+                }
+                if next && self.flight_state == FlightState::NitrousFill {
+                    self.nitrous_fill_started_ms = None;
+                }
                 if self.flight_state == FlightState::FillTest && next {
                     self.saw_dump_open_after_n2 = true;
                 }
@@ -553,6 +555,15 @@ impl FlightSimState {
                 let next = !self.valve_on(key);
                 self.valves.insert(key, next);
                 self.queue_umbilical_status(key, next, now_ms);
+                if next
+                    && matches!(
+                        self.flight_state,
+                        FlightState::FillTest | FlightState::NitrousFill
+                    )
+                {
+                    self.nitrous_fill_started_ms.get_or_insert(now_ms);
+                    self.set_flight_state(FlightState::NitrousFill, now_ms);
+                }
             }
             TelemetryCommand::NitrousClose => {
                 let key = ActuatorBoardCommands::NitrousOpen as u8;
@@ -644,7 +655,7 @@ impl FlightSimState {
             return;
         }
 
-        let no_open = !self.valve_on(ValveBoardCommands::NormallyOpenOpen as u8);
+        let no_open = self.valve_on(ValveBoardCommands::NormallyOpenOpen as u8);
         let dump_closed = !self.valve_on(ValveBoardCommands::DumpOpen as u8);
         let n2_open = self.valve_on(ActuatorBoardCommands::NitrogenOpen as u8);
         let n2o_open = self.valve_on(ActuatorBoardCommands::NitrousOpen as u8);
@@ -667,7 +678,11 @@ impl FlightSimState {
                 }
             }
             FlightState::FillTest => {
-                if self.saw_dump_open_after_n2 && self.saw_dump_closed_after_n2 && n2o_open {
+                if n2_open {
+                    self.saw_dump_open_after_n2 = false;
+                    self.saw_dump_closed_after_n2 = false;
+                    self.set_flight_state(FlightState::NitrogenFill, now_ms);
+                } else if self.saw_dump_open_after_n2 && self.saw_dump_closed_after_n2 && n2o_open {
                     self.set_flight_state(FlightState::NitrousFill, now_ms);
                     self.nitrous_fill_started_ms.get_or_insert(now_ms);
                 }
@@ -677,6 +692,7 @@ impl FlightSimState {
                     self.nitrous_fill_started_ms.get_or_insert(now_ms);
                 }
                 if !n2o_open
+                    && !no_open
                     && fill_lines_removed
                     && self
                         .nitrous_fill_started_ms
@@ -713,22 +729,22 @@ impl FlightSimState {
         } else if n2o_open && !dump_open {
             self.loadcell_mass_kg =
                 (self.loadcell_mass_kg + dt_s * (fill_target / 18.0)).min(fill_target);
-        } else if dump_open || no_open {
-            self.loadcell_mass_kg = (self.loadcell_mass_kg - dt_s * 0.35).max(0.0);
         }
 
-        if dump_open || no_open {
-            let target_psi = vented_pressure_target_psi(self.loadcell_mass_kg, nitrous_loaded);
-            let vent_response = if dump_open && no_open { 3.0 } else { 2.1 };
-            let max_step = vent_response * dt_s.max(0.02) * 20.0;
-            let delta = target_psi - self.fuel_tank_pressure_psi;
-            self.fuel_tank_pressure_psi += delta.clamp(-max_step, max_step);
-        } else if n2_open {
+        if dump_open {
+            self.loadcell_mass_kg =
+                (self.loadcell_mass_kg - dt_s * DUMP_MASS_VENT_KG_PER_S).max(0.0);
+        } else if no_open {
+            self.loadcell_mass_kg =
+                (self.loadcell_mass_kg - dt_s * NORMALLY_OPEN_MASS_LEAK_KG_PER_S).max(0.0);
+        }
+
+        if n2_open && !dump_open {
             let target_psi = nitrogen_pressure_target_psi(self.loadcell_mass_kg);
             let delta = target_psi - self.fuel_tank_pressure_psi;
             let max_step = NITROGEN_PRESSURE_RESPONSE_PER_S * dt_s.max(0.02) * 20.0;
             self.fuel_tank_pressure_psi += delta.clamp(-max_step, max_step);
-        } else if n2o_open {
+        } else if n2o_open && !dump_open {
             // Nitrous is self-pressurizing: pressure trends toward equilibrium
             // while the actual quantity is determined by the loadcell mass.
             let target_psi = nitrous_equilibrium_pressure_psi(self.loadcell_mass_kg);
@@ -746,6 +762,22 @@ impl FlightSimState {
             }
             self.fuel_tank_pressure_psi = self.fuel_tank_pressure_psi.max(0.0);
         }
+
+        if dump_open {
+            let target_psi = vented_pressure_target_psi(self.loadcell_mass_kg, nitrous_loaded);
+            let delta = target_psi - self.fuel_tank_pressure_psi;
+            self.fuel_tank_pressure_psi += delta.clamp(
+                -DUMP_PRESSURE_BLEED_PSI_PER_S * dt_s,
+                DUMP_PRESSURE_BLEED_PSI_PER_S * dt_s,
+            );
+        } else if no_open {
+            let delta = -self.fuel_tank_pressure_psi;
+            self.fuel_tank_pressure_psi += delta.clamp(
+                -NORMALLY_OPEN_PRESSURE_BLEED_PSI_PER_S * dt_s,
+                NORMALLY_OPEN_PRESSURE_BLEED_PSI_PER_S * dt_s,
+            );
+        }
+        self.fuel_tank_pressure_psi = self.fuel_tank_pressure_psi.max(0.0);
 
         if let Some(t0_ms) = self.launch_time_ms {
             let t = (now_ms.saturating_sub(t0_ms) as f32) / 1000.0;
@@ -1011,7 +1043,7 @@ impl FlightSimState {
 
         Packet::new(
             dtype,
-            &[DataEndpoint::GroundStation],
+            sim_endpoints_for_datatype(dtype),
             sender,
             now_ms,
             Arc::from(bytes.as_slice()),
@@ -1031,8 +1063,17 @@ fn sender_for_datatype(dtype: DataType) -> &'static str {
         }
         DataType::KG1000 => Board::DaqBoard.sender_id(),
         DataType::BatteryVoltage | DataType::BatteryCurrent => Board::PowerBoard.sender_id(),
-        DataType::GpsData | DataType::GpsSatelliteNumber => Board::GatewayBoard.sender_id(),
+        DataType::GpsData | DataType::GpsSatelliteNumber => Board::RFBoard.sender_id(),
         _ => Board::GroundStation.sender_id(),
+    }
+}
+
+#[cfg(feature = "testing")]
+fn sim_endpoints_for_datatype(dtype: DataType) -> &'static [DataEndpoint] {
+    match dtype {
+        DataType::GpsData => &[DataEndpoint::GroundStation, DataEndpoint::FlightController],
+        DataType::GpsSatelliteNumber => &[DataEndpoint::GroundStation],
+        _ => &[DataEndpoint::GroundStation],
     }
 }
 

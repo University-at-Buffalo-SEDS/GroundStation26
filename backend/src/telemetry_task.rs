@@ -86,10 +86,17 @@ fn spawn_comms_worker_threads(
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
                 }
 
+                let tap_state = state.clone();
+                let mut packet_tap = |pkt: &Packet| {
+                    tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+                    tap_state.mark_packet_received(get_current_timestamp_ms());
+                    let mut rb = tap_state.ring_buffer.lock().unwrap();
+                    rb.push(pkt.clone());
+                };
                 match rx_comms
                     .lock()
                     .expect("failed to get lock")
-                    .recv_packet(&router)
+                    .recv_packet(&router, &mut packet_tap)
                 {
                     Ok(_) => {}
                     Err(e) => {
@@ -642,7 +649,7 @@ async fn emit_derived_battery_rows(
     }
 
     let window_ms = (cfg.estimator.window_seconds.max(30) as i64) * 1000;
-    let min_drop_rate = cfg.estimator.min_drop_rate_v_per_min.max(0.0001);
+    let min_drop_rate = cfg.estimator.min_drop_rate_v_per_min.max(0.000001);
 
     for source in cfg.sources.iter() {
         if source.sender_id != sender_id || source.input_data_type != input_data_type {
@@ -712,13 +719,29 @@ async fn emit_derived_loadcell_rows(
     db_overflow: &DbOverflow,
     sample: DerivedLoadcellSample<'_>,
 ) {
+    let calibration_sensor_id = if sample.sensor_id == DataType::FuelTankPressure.as_str() {
+        loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
+    } else {
+        sample.sensor_id
+    };
     let cfg = state.loadcell_calibration.lock().unwrap().clone();
     let Some(calibrated_value) =
-        loadcell::calibrated_sensor_value(&cfg, sample.sensor_id, sample.raw_value)
+        loadcell::calibrated_sensor_value(&cfg, calibration_sensor_id, sample.raw_value)
     else {
+        match calibration_sensor_id {
+            loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
+                let mut latest = state.latest_fill_mass_kg.lock().unwrap();
+                *latest = None;
+            }
+            loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
+                let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
+                *pressure = None;
+            }
+            _ => {}
+        }
         return;
     };
-    let rows: Vec<(&str, Vec<Option<f32>>)> = match sample.sensor_id {
+    let rows: Vec<(&str, Vec<Option<f32>>)> = match calibration_sensor_id {
         loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
             let percent = loadcell::fill_percent(&cfg, calibrated_value);
             {
@@ -736,23 +759,16 @@ async fn emit_derived_loadcell_rows(
                 ),
             ]
         }
-        loadcell::RAW_LOADCELL_DATA_TYPE_50KG => {
-            let percent = loadcell::fill_percent(&cfg, calibrated_value);
-            vec![
-                (
-                    loadcell::DERIVED_50KG_CALIBRATED_DATA_TYPE,
-                    vec![Some(calibrated_value)],
-                ),
-                (
-                    loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
-                    vec![Some(percent)],
-                ),
-            ]
+        loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
+            {
+                let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
+                *pressure = Some(calibrated_value);
+            }
+            vec![(
+                loadcell::DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE,
+                vec![Some(calibrated_value)],
+            )]
         }
-        loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => vec![(
-            loadcell::DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE,
-            vec![Some(calibrated_value)],
-        )],
         _ => Vec::new(),
     };
 
@@ -833,50 +849,30 @@ fn normalized_gps_values(
         fixes.insert(sender_id.to_string(), vec![lat, lon, alt]);
     }
 
-    let satellites = state
-        .latest_gps_satellites_by_sender
-        .lock()
-        .unwrap()
-        .get(sender_id)
-        .copied()
-        .map(|v| v as f32);
-
-    vec![lat, lon, alt, satellites]
+    vec![lat, lon, alt]
 }
 
-async fn emit_normalized_gps_row(
-    state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbQueueItem>,
-    db_overflow: &DbOverflow,
-    ts_ms: i64,
-    sender_id: &str,
-    values: Vec<Option<f32>>,
-    payload_json: &str,
-) {
-    if should_persist_telemetry_sample(DataType::GpsData.as_str(), ts_ms) {
-        queue_db_write(
-            state,
-            db_tx,
-            db_overflow,
-            DbWrite::Telemetry {
-                timestamp_ms: ts_ms,
-                data_type: DataType::GpsData.as_str().to_string(),
-                sender_id: sender_id.to_string(),
-                values_json: telemetry_values_json(&values),
-                payload_json: payload_json.to_string(),
-            },
-        )
-        .await;
+fn f32_values_from_payload_bytes(bytes: &[u8]) -> Option<Vec<Option<f32>>> {
+    if bytes.is_empty() || bytes.len() % std::mem::size_of::<f32>() != 0 {
+        return None;
     }
 
-    let row = TelemetryRow {
-        timestamp_ms: ts_ms,
-        data_type: DataType::GpsData.as_str().to_string(),
-        sender_id: sender_id.to_string(),
-        values,
-    };
-    state.cache_recent_telemetry(row.clone());
-    let _ = state.ws_tx.send(row);
+    Some(
+        bytes
+            .chunks_exact(std::mem::size_of::<f32>())
+            .map(|chunk| Some(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
+            .collect(),
+    )
+}
+
+fn telemetry_f32_values(pkt: &Packet) -> Option<Vec<Option<f32>>> {
+    match pkt.data_as_f32() {
+        Ok(values) => Some(values.into_iter().map(Some).collect()),
+        Err(_) if pkt.data_type() == DataType::GpsData => {
+            f32_values_from_payload_bytes(pkt.payload())
+        }
+        Err(_) => None,
+    }
 }
 
 async fn handle_gps_satellite_count_packet(
@@ -908,33 +904,6 @@ async fn handle_gps_satellite_count_packet(
                 values_json: telemetry_values_json(&values),
                 payload_json: payload_json.to_string(),
             },
-        )
-        .await;
-    }
-
-    let fix_values = {
-        state
-            .latest_gps_fix_by_sender
-            .lock()
-            .unwrap()
-            .get(&sender_id)
-            .cloned()
-    };
-    if let Some(fix_values) = fix_values {
-        let normalized = vec![
-            fix_values.first().copied().flatten(),
-            fix_values.get(1).copied().flatten(),
-            fix_values.get(2).copied().flatten(),
-            Some(count as f32),
-        ];
-        emit_normalized_gps_row(
-            state,
-            db_tx,
-            db_overflow,
-            ts_ms,
-            &sender_id,
-            normalized,
-            payload_json,
         )
         .await;
     }
@@ -2138,8 +2107,16 @@ async fn handle_packet(
         return None;
     }
 
-    let ts_ms = pkt.timestamp() as i64;
     let data_type_str = pkt.data_type().as_str().to_string();
+    let use_ingest_timestamp = matches!(
+        pkt.data_type(),
+        DataType::GpsData | DataType::FuelTankPressure
+    );
+    let ts_ms = if use_ingest_timestamp {
+        get_current_timestamp_ms() as i64
+    } else {
+        pkt.timestamp() as i64
+    };
 
     let payload_json = payload_json_from_pkt(&pkt);
 
@@ -2148,15 +2125,9 @@ async fn handle_packet(
             .await;
     }
 
-    if let Ok(values) = pkt.data_as_f32() {
-        let mut values_vec: Vec<Option<f32>> = values.into_iter().map(Some).collect();
+    if let Some(mut values_vec) = telemetry_f32_values(&pkt) {
         if pkt.data_type() == DataType::GpsData {
             values_vec = normalized_gps_values(state, pkt.sender(), &values_vec);
-        }
-        if pkt.data_type() == DataType::FuelTankPressure {
-            let latest = values_vec.first().copied().flatten();
-            let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
-            *pressure = latest;
         }
         let values_json = serde_json::to_string(
             &values_vec
@@ -2199,8 +2170,8 @@ async fn handle_packet(
             if matches!(
                 data_type_str.as_str(),
                 loadcell::RAW_LOADCELL_DATA_TYPE_1000KG
-                    | loadcell::RAW_LOADCELL_DATA_TYPE_50KG
                     | loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
+                    | "FUEL_TANK_PRESSURE"
             ) {
                 emit_derived_loadcell_rows(
                     state,
@@ -2288,9 +2259,15 @@ fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
 }
 
 fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::TelemetryError> {
-    router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS)?;
+    if let Err(err) = router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS) {
+        log_telemetry_error("router tx queue processing failed", err);
+        return Ok(());
+    }
     if ROUTER_RX_BUDGET_MS > 0 {
-        router.process_rx_queue_with_timeout(ROUTER_RX_BUDGET_MS)?;
+        if let Err(err) = router.process_rx_queue_with_timeout(ROUTER_RX_BUDGET_MS) {
+            log_telemetry_error("router rx queue processing failed", err);
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -2315,8 +2292,21 @@ pub fn timesync_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::timesync_enabled;
+    use super::*;
+    use crate::auth::AuthManager;
+    use crate::fill_targets;
+    use crate::gpio::GpioPins;
+    use crate::loadcell;
+    use crate::ring_buffer::RingBuffer;
+    use crate::sequences::default_action_policy;
+    use crate::telemetry_db::{LaunchClockMsg, RecordingModeWire};
+    use crate::types::Board;
+    use sqlx::SqlitePool;
+    use std::collections::{HashMap, VecDeque};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
     use std::sync::{Mutex, OnceLock};
+    use tokio::sync::{Notify, broadcast, mpsc};
 
     fn timesync_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2342,5 +2332,324 @@ mod tests {
         unsafe {
             std::env::remove_var("GROUNDSTATION_TIMESYNC");
         }
+    }
+
+    fn test_db_overflow() -> DbOverflow {
+        DbOverflow {
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            notify: Arc::new(Notify::new()),
+            running: Arc::new(AtomicBool::new(true)),
+            max_entries: 16,
+        }
+    }
+
+    async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
+        let db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory telemetry db");
+        let auth_db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory auth db");
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (ws_tx, _ws_rx) = broadcast::channel(16);
+        let (state_tx, _state_rx) = broadcast::channel(4);
+        let (board_status_tx, _board_status_rx) = broadcast::channel(4);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
+        let (notifications_tx, _notifications_rx) = broadcast::channel(4);
+        let (action_policy_tx, _action_policy_rx) = broadcast::channel(4);
+        let (fill_targets_tx, _fill_targets_rx) = broadcast::channel(4);
+        let (launch_clock_tx, _launch_clock_rx) = broadcast::channel(4);
+        let (recording_status_tx, _recording_status_rx) = broadcast::channel(4);
+
+        let mut board_status = HashMap::new();
+        for board in Board::ALL {
+            board_status.insert(
+                *board,
+                crate::state::BoardStatus {
+                    last_seen_ms: None,
+                    ema_gap_ms: None,
+                    warned: false,
+                },
+            );
+        }
+
+        Arc::new(AppState {
+            ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
+            cmd_tx,
+            ws_tx,
+            warnings_tx: broadcast::channel(4).0,
+            errors_tx: broadcast::channel(4).0,
+            db: Arc::new(Mutex::new(db)),
+            db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
+            placeholder_db_path: "sqlite::memory:".to_string(),
+            db_queue_tx: db_tx,
+            auth_db,
+            state: Arc::new(Mutex::new(FlightState::Startup)),
+            state_tx,
+            gpio: GpioPins::new(),
+            board_status: Arc::new(Mutex::new(board_status)),
+            board_status_tx,
+            last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
+            umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
+            latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+            latest_fill_mass_kg: Arc::new(Mutex::new(None)),
+            loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
+            shutdown_tx,
+            pending_db_writes: Arc::new(AtomicUsize::new(0)),
+            db_write_notify: Arc::new(Notify::new()),
+            notifications: Arc::new(Mutex::new(Vec::new())),
+            notifications_tx,
+            next_notification_id: Arc::new(AtomicU64::new(0)),
+            action_policy: Arc::new(Mutex::new(default_action_policy())),
+            action_policy_tx,
+            fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
+            fill_targets_tx,
+            launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
+            launch_clock_tx,
+            recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
+                mode: RecordingModeWire::Idle,
+                db_path: None,
+            })),
+            recording_status_tx,
+            last_command_ms: Arc::new(Mutex::new(HashMap::new())),
+            fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
+            recent_telemetry_cache: Arc::new(Mutex::new(VecDeque::new())),
+            latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
+            latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),
+            recent_alerts_cache: Arc::new(Mutex::new(VecDeque::new())),
+            av_bay_comms_connected: Arc::new(AtomicBool::new(false)),
+            fill_comms_connected: Arc::new(AtomicBool::new(false)),
+            topology_router: Arc::new(OnceLock::new()),
+            auth: Arc::new(AuthManager::new(PathBuf::from(
+                "/tmp/groundstation-test-users.json",
+            ))),
+        })
+    }
+
+    fn f32_payload(values: &[f32]) -> Arc<[u8]> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    #[tokio::test]
+    async fn rf_gps_packets_become_graphable_telemetry_rows() {
+        let (db_tx, mut db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        let gps_values = [31.7619_f32, -106.485_f32, 1412.5_f32];
+        let gps_pkt = Packet::new(
+            DataType::GpsData,
+            &[
+                sedsprintf_rs_2026::config::DataEndpoint::GroundStation,
+                sedsprintf_rs_2026::config::DataEndpoint::SdCard,
+                sedsprintf_rs_2026::config::DataEndpoint::FlightController,
+            ],
+            Board::RFBoard.sender_id(),
+            123_456,
+            f32_payload(&gps_values),
+        )
+        .expect("failed to build RF GPS_DATA packet");
+
+        let row = handle_packet(&state, &db_tx, &db_overflow, gps_pkt)
+            .await
+            .expect("RF GPS_DATA packet should produce telemetry row");
+
+        assert_eq!(row.data_type, DataType::GpsData.as_str());
+        assert_eq!(row.sender_id, Board::RFBoard.sender_id());
+        assert_eq!(row.values.len(), 3);
+        for (actual, expected) in row.values.iter().zip(gps_values) {
+            assert_eq!(actual.unwrap(), expected);
+        }
+        assert_eq!(
+            state
+                .latest_gps_fix_by_sender
+                .lock()
+                .unwrap()
+                .get(Board::RFBoard.sender_id())
+                .cloned(),
+            Some(row.values.clone())
+        );
+
+        let write = db_rx.recv().await.expect("GPS_DATA should queue DB write");
+        match write {
+            DbQueueItem::Write(DbWrite::Telemetry {
+                data_type,
+                sender_id,
+                values_json,
+                ..
+            }) => {
+                assert_eq!(data_type, DataType::GpsData.as_str());
+                assert_eq!(sender_id, Board::RFBoard.sender_id());
+                assert_eq!(
+                    serde_json::from_str::<Vec<Option<f32>>>(&values_json.unwrap()).unwrap(),
+                    row.values
+                );
+            }
+            other => panic!("unexpected DB item for GPS_DATA: {other:?}"),
+        }
+
+        let sat_pkt = Packet::new(
+            DataType::GpsSatelliteNumber,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            Board::RFBoard.sender_id(),
+            123_789,
+            Arc::from([14_u8]),
+        )
+        .expect("failed to build RF GPS_SATELLITE_NUMBER packet");
+
+        let sat_row = handle_packet(&state, &db_tx, &db_overflow, sat_pkt)
+            .await
+            .expect("RF GPS_SATELLITE_NUMBER packet should produce telemetry row");
+
+        assert_eq!(sat_row.data_type, GPS_SATELLITES_DATA_TYPE);
+        assert_eq!(sat_row.sender_id, Board::RFBoard.sender_id());
+        assert_eq!(sat_row.values, vec![Some(14.0)]);
+        assert_eq!(
+            state
+                .latest_gps_satellites_by_sender
+                .lock()
+                .unwrap()
+                .get(Board::RFBoard.sender_id())
+                .copied(),
+            Some(14)
+        );
+    }
+
+    #[tokio::test]
+    async fn kg1000_packet_emits_state_tab_loadcell_rows() {
+        let (db_tx, mut db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        let mut ws_rx = state.ws_tx.subscribe();
+
+        let pkt = Packet::new(
+            DataType::KG1000,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            Board::DaqBoard.sender_id(),
+            456_789,
+            f32_payload(&[4.25]),
+        )
+        .expect("failed to build KG1000 packet");
+
+        let row = handle_packet(&state, &db_tx, &db_overflow, pkt)
+            .await
+            .expect("KG1000 packet should produce raw telemetry row");
+
+        assert_eq!(row.data_type, loadcell::RAW_LOADCELL_DATA_TYPE_1000KG);
+        assert_eq!(row.sender_id, Board::DaqBoard.sender_id());
+        assert_eq!(row.values, vec![Some(4.25)]);
+
+        let mut broadcast_rows = Vec::new();
+        for _ in 0..2 {
+            broadcast_rows.push(
+                ws_rx
+                    .recv()
+                    .await
+                    .expect("derived loadcell rows should be broadcast"),
+            );
+        }
+        broadcast_rows.sort_by(|a, b| a.data_type.cmp(&b.data_type));
+
+        assert_eq!(
+            broadcast_rows
+                .iter()
+                .map(|row| row.data_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
+                loadcell::DERIVED_WEIGHT_DATA_TYPE
+            ]
+        );
+        assert_eq!(broadcast_rows[0].sender_id, Board::DaqBoard.sender_id());
+        assert_eq!(broadcast_rows[1].sender_id, Board::DaqBoard.sender_id());
+        assert_eq!(broadcast_rows[0].values, vec![Some(42.5)]);
+        assert_eq!(broadcast_rows[1].values, vec![Some(4.25)]);
+
+        let cache = state.recent_telemetry_snapshot();
+        assert!(
+            cache
+                .iter()
+                .any(|row| row.data_type == loadcell::DERIVED_WEIGHT_DATA_TYPE)
+        );
+        assert!(
+            cache
+                .iter()
+                .any(|row| row.data_type == loadcell::DERIVED_FILL_PERCENT_DATA_TYPE)
+        );
+
+        let mut db_types = Vec::new();
+        for _ in 0..3 {
+            match db_rx
+                .recv()
+                .await
+                .expect("telemetry DB write should be queued")
+            {
+                DbQueueItem::Write(DbWrite::Telemetry { data_type, .. }) => {
+                    db_types.push(data_type);
+                }
+                other => panic!("unexpected DB item for KG1000 path: {other:?}"),
+            }
+        }
+        db_types.sort();
+        assert_eq!(
+            db_types,
+            vec![
+                loadcell::RAW_LOADCELL_DATA_TYPE_1000KG.to_string(),
+                loadcell::DERIVED_FILL_PERCENT_DATA_TYPE.to_string(),
+                loadcell::DERIVED_WEIGHT_DATA_TYPE.to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fuel_tank_pressure_updates_latest_with_calibrated_value() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        let mut ws_rx = state.ws_tx.subscribe();
+
+        {
+            let mut cfg = state.loadcell_calibration.lock().unwrap();
+            cfg.iadc.m = Some(2.0);
+            cfg.iadc.b = Some(5.0);
+            cfg.iadc_fit = None;
+        }
+
+        let pkt = Packet::new(
+            DataType::FuelTankPressure,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            Board::DaqBoard.sender_id(),
+            567_890,
+            f32_payload(&[370.0]),
+        )
+        .expect("failed to build fuel tank pressure packet");
+
+        let row = handle_packet(&state, &db_tx, &db_overflow, pkt)
+            .await
+            .expect("fuel tank pressure packet should produce raw telemetry row");
+
+        assert_eq!(row.data_type, DataType::FuelTankPressure.as_str());
+        assert_eq!(row.values, vec![Some(370.0)]);
+        assert!(
+            row.timestamp_ms > 567_890,
+            "raw pressure row should use ground-station ingest time, not stale board timestamp"
+        );
+
+        let derived = ws_rx
+            .recv()
+            .await
+            .expect("derived calibrated pressure row should be broadcast");
+        assert_eq!(
+            derived.data_type,
+            loadcell::DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE
+        );
+        assert_eq!(derived.values, vec![Some(745.0)]);
+        assert_eq!(
+            *state.latest_fuel_tank_pressure.lock().unwrap(),
+            Some(745.0)
+        );
     }
 }

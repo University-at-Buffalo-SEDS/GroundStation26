@@ -1313,10 +1313,10 @@ class LayoutEditor(tk.Tk):
         nitrogen = targets.get("nitrogen", {})
         nitrous = targets.get("nitrous", {})
         for entry, value in (
-            (self.nitrogen_target_mass, nitrogen.get("target_mass_kg", 10.0)),
-            (self.nitrogen_target_pressure, nitrogen.get("target_pressure_psi", 120.0)),
-            (self.nitrous_target_mass, nitrous.get("target_mass_kg", 10.0)),
-            (self.nitrous_target_pressure, nitrous.get("target_pressure_psi", 745.0)),
+                (self.nitrogen_target_mass, nitrogen.get("target_mass_kg", 10.0)),
+                (self.nitrogen_target_pressure, nitrogen.get("target_pressure_psi", 120.0)),
+                (self.nitrous_target_mass, nitrous.get("target_mass_kg", 10.0)),
+                (self.nitrous_target_pressure, nitrous.get("target_pressure_psi", 745.0)),
         ):
             entry.delete(0, tk.END)
             entry.insert(0, str(value))

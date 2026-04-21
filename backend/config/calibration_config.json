@@ -13,26 +13,6 @@
   ],
   "sensors": [
     {
-      "id": "KG50",
-      "label": "50kg",
-      "data_type": "KG50",
-      "channel": "ch0",
-      "fit_color": "#f59e0b",
-      "raw_label": "Raw",
-      "expected_label": "kg",
-      "fit_modes": [
-        "best",
-        "linear",
-        "linear_zero",
-        "parabolic",
-        "parabolic_zero",
-        "cubic",
-        "cubic_zero",
-        "quartic",
-        "quartic_zero"
-      ]
-    },
-    {
       "id": "KG1000",
       "label": "1000kg",
       "data_type": "KG1000",

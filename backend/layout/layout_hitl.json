@@ -442,16 +442,12 @@
         "channels": [
           "Lat",
           "Lon",
-          "Altitude",
-          "Satellites"
+          "Altitude"
         ],
         "channel_formatters": [
           {},
           {},
-          {},
-          {
-            "kind": "integer"
-          }
+          {}
         ],
         "subtabs": [
           {
@@ -461,16 +457,12 @@
             "channels": [
               "Lat",
               "Lon",
-              "Altitude",
-              "Satellites"
+              "Altitude"
             ],
             "channel_formatters": [
               {},
               {},
-              {},
-              {
-                "kind": "integer"
-              }
+              {}
             ],
             "chart": {
               "enabled": false
@@ -493,8 +485,8 @@
               },
               {
                 "label": "Satellites",
-                "data_type": "GPS_DATA",
-                "index": 3,
+                "data_type": "GPS_SATELLITE_NUMBER",
+                "index": 0,
                 "formatter": {
                   "kind": "integer"
                 }
@@ -658,7 +650,12 @@
               {
                 "label": "Drop Rate",
                 "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 6,
+                  "suffix": " V/min"
+                }
               },
               {
                 "label": "Runtime",
@@ -682,7 +679,12 @@
               {
                 "label": "Drop Rate",
                 "data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 6,
+                  "suffix": " V/min"
+                }
               },
               {
                 "label": "Runtime",
@@ -706,7 +708,12 @@
               {
                 "label": "Drop Rate",
                 "data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 6,
+                  "suffix": " V/min"
+                }
               },
               {
                 "label": "Runtime",
@@ -792,71 +799,10 @@
         "id": "LOADCELL",
         "label": "Loadcell",
         "channels": [
-          "50kg",
           "1000kg",
           "Pressure Transducer"
         ],
         "subtabs": [
-          {
-            "id": "loadcell_50kg",
-            "label": "50kg",
-            "data_type": "KG50",
-            "channels": [
-              "50kg"
-            ],
-            "chart_groups": [
-              {
-                "title": "Raw",
-                "data_type": "KG50",
-                "labels": [
-                  "Raw"
-                ],
-                "channels": [
-                  0
-                ]
-              },
-              {
-                "title": "Calibrated",
-                "data_type": "LOADCELL_50KG_CALIBRATED",
-                "labels": [
-                  "Calibrated"
-                ],
-                "channels": [
-                  0
-                ]
-              },
-              {
-                "title": "Fill %",
-                "data_type": "LOADCELL_FILL_PERCENT",
-                "labels": [
-                  "Fill %"
-                ],
-                "channels": [
-                  0
-                ]
-              }
-            ],
-            "summary_items": [
-              {
-                "label": "Raw",
-                "data_type": "KG50",
-                "index": 0
-              },
-              {
-                "label": "Calibrated",
-                "data_type": "LOADCELL_50KG_CALIBRATED",
-                "index": 0
-              },
-              {
-                "label": "Fill %",
-                "data_type": "LOADCELL_FILL_PERCENT",
-                "index": 0
-              }
-            ],
-            "chart": {
-              "enabled": true
-            }
-          },
           {
             "id": "loadcell_1000kg",
             "label": "1000kg",
@@ -920,14 +866,14 @@
           {
             "id": "loadcell_pressure_transducer",
             "label": "Pressure Transducer",
-            "data_type": "IADC",
+            "data_type": "FUEL_TANK_PRESSURE",
             "channels": [
               "Pressure Transducer"
             ],
             "chart_groups": [
               {
                 "title": "Raw",
-                "data_type": "IADC",
+                "data_type": "FUEL_TANK_PRESSURE",
                 "labels": [
                   "Raw"
                 ],
@@ -949,7 +895,7 @@
             "summary_items": [
               {
                 "label": "Raw",
-                "data_type": "IADC",
+                "data_type": "FUEL_TANK_PRESSURE",
                 "index": 0
               },
               {
@@ -1024,7 +970,7 @@
               },
               {
                 "kind": "summary",
-                "data_type": "GPS_DATA",
+                "data_type": "GPS_SATELLITE_NUMBER",
                 "summary_style": {
                   "background": "#1f2937",
                   "border": "#facc15",
@@ -1034,10 +980,10 @@
                 "items": [
                   {
                     "label": "Satellites",
-                    "index": 3,
+                    "index": 0,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -1048,6 +994,80 @@
                 "chart_title": "Vehicle Speed",
                 "width": 1200.0,
                 "height": 240.0,
+                "full_width": true
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Fill Metrics",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "items": [
+                  {
+                    "label": "Tank Pressure",
+                    "index": 0,
+                    "fill_target_fluid": "nitrous",
+                    "fill_target_kind": "pressure_psi",
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 1,
+                      "suffix": " psi"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_WEIGHT_KG",
+                "items": [
+                  {
+                    "label": "Mass (kg)",
+                    "index": 0,
+                    "fill_target_fluid": "nitrous",
+                    "fill_target_kind": "mass_kg",
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 2,
+                      "suffix": " kg"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "items": [
+                  {
+                    "label": "Fill Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "chart",
+                "chart_title": "Pressure and Loadcell",
+                "chart_series": [
+                  {
+                    "data_type": "FUEL_TANK_PRESSURE",
+                    "index": 0,
+                    "label": "Tank Pressure"
+                  },
+                  {
+                    "data_type": "LOADCELL_WEIGHT_KG",
+                    "index": 0,
+                    "label": "Mass (kg)"
+                  },
+                  {
+                    "data_type": "LOADCELL_FILL_PERCENT",
+                    "index": 0,
+                    "label": "Fill Percent"
+                  }
+                ],
+                "width": 1200.0,
+                "height": 260.0,
                 "full_width": true
               }
             ],
@@ -1182,7 +1202,7 @@
   "battery": {
     "estimator": {
       "window_seconds": 300,
-      "min_drop_rate_v_per_min": 0.005
+      "min_drop_rate_v_per_min": 1e-06
     },
     "sources": [
       {
@@ -1193,7 +1213,7 @@
         "percent_data_type": "AV_BAY_BATTERY_PERCENT",
         "drop_rate_data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-        "empty_voltage": 6.3,
+        "empty_voltage": 7.3,
         "full_voltage": 8.4,
         "curve_exponent": 1.0
       },
@@ -1205,8 +1225,8 @@
         "percent_data_type": "VALVE_BOARD_BATTERY_PERCENT",
         "drop_rate_data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
-        "empty_voltage": 6.3,
-        "full_voltage": 8.4,
+        "empty_voltage": 13.6,
+        "full_voltage": 15.2,
         "curve_exponent": 1.0
       },
       {
@@ -1217,8 +1237,8 @@
         "percent_data_type": "FILL_BOX_POWER_PERCENT",
         "drop_rate_data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
-        "empty_voltage": 13.3,
-        "full_voltage": 15.5,
+        "empty_voltage": 13.6,
+        "full_voltage": 15.2,
         "curve_exponent": 1.0
       }
     ]

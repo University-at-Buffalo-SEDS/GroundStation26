@@ -4,10 +4,8 @@ use std::path::PathBuf;
 
 pub const DEFAULT_FULL_MASS_KG: f32 = 10.0;
 pub const CALIBRATION_CAPTURE_TARGET_SAMPLES: usize = 200;
-pub const RAW_LOADCELL_DATA_TYPE_50KG: &str = "KG50";
 pub const RAW_LOADCELL_DATA_TYPE_1000KG: &str = "KG1000";
 pub const RAW_PRESSURE_TRANSDUCER_DATA_TYPE: &str = "IADC";
-pub const DERIVED_50KG_CALIBRATED_DATA_TYPE: &str = "LOADCELL_50KG_CALIBRATED";
 pub const DERIVED_WEIGHT_DATA_TYPE: &str = "LOADCELL_WEIGHT_KG";
 pub const DERIVED_FILL_PERCENT_DATA_TYPE: &str = "LOADCELL_FILL_PERCENT";
 pub const DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE: &str = "PRESSURE_TRANSDUCER_CALIBRATED";
@@ -95,12 +93,6 @@ pub struct FitMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PointCh0 {
-    pub kg: f32,
-    pub ch0_raw: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PointCh1 {
     pub kg: f32,
     pub ch1_raw: f32,
@@ -137,25 +129,17 @@ pub struct LoadcellCalibrationFile {
     #[serde(default)]
     pub full_mass_kg: Option<f32>,
     #[serde(default)]
-    pub ch0: ChannelLinear,
-    #[serde(default)]
     pub ch1: ChannelLinear,
     #[serde(default)]
     pub iadc: ChannelLinear,
-    #[serde(default)]
-    pub ch0_zero_raw: Option<f32>,
     #[serde(default)]
     pub ch1_zero_raw: Option<f32>,
     #[serde(default)]
     pub iadc_zero_raw: Option<f32>,
     #[serde(default)]
-    pub points: Vec<PointCh0>,
-    #[serde(default)]
     pub points_ch1: Vec<PointCh1>,
     #[serde(default)]
     pub points_iadc: Vec<PointIadc>,
-    #[serde(default)]
-    pub ch0_fit: Option<FitMeta>,
     #[serde(default)]
     pub ch1_fit: Option<FitMeta>,
     #[serde(default)]
@@ -171,10 +155,6 @@ impl Default for LoadcellCalibrationFile {
         Self {
             version: default_calibration_version(),
             full_mass_kg: Some(DEFAULT_FULL_MASS_KG),
-            ch0: ChannelLinear {
-                m: Some(1.0),
-                b: Some(0.0),
-            },
             ch1: ChannelLinear {
                 m: Some(1.0),
                 b: Some(0.0),
@@ -183,16 +163,10 @@ impl Default for LoadcellCalibrationFile {
                 m: Some(1.0),
                 b: Some(0.0),
             },
-            ch0_zero_raw: None,
             ch1_zero_raw: None,
             iadc_zero_raw: None,
-            points: Vec::new(),
             points_ch1: Vec::new(),
             points_iadc: Vec::new(),
-            ch0_fit: Some(FitMeta {
-                fit_type: Some("linear".to_string()),
-                ..FitMeta::default()
-            }),
             ch1_fit: Some(FitMeta {
                 fit_type: Some("linear".to_string()),
                 ..FitMeta::default()
@@ -242,16 +216,6 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
         capture_target_samples: CALIBRATION_CAPTURE_TARGET_SAMPLES,
         fit_modes: fit_modes.clone(),
         sensors: vec![
-            CalibrationSensorSpec {
-                id: "KG50".to_string(),
-                label: "50kg".to_string(),
-                data_type: "KG50".to_string(),
-                channel: "ch0".to_string(),
-                fit_color: "#f59e0b".to_string(),
-                raw_label: "Raw".to_string(),
-                expected_label: "kg".to_string(),
-                fit_modes: fit_modes.clone(),
-            },
             CalibrationSensorSpec {
                 id: "KG1000".to_string(),
                 label: "1000kg".to_string(),
@@ -335,14 +299,6 @@ fn from_old_format(old: OldCalibrationFile) -> LoadcellCalibrationFile {
     };
     for s in old.sensors {
         match s.sensor_id.as_str() {
-            "KG50" => {
-                cfg.ch0.m = Some(s.slope);
-                cfg.ch0.b = Some(s.intercept);
-                cfg.ch0_zero_raw = s.zero_raw;
-                if let (Some(raw), Some(kg)) = (s.span_raw, s.span_known_kg) {
-                    cfg.points.push(PointCh0 { kg, ch0_raw: raw });
-                }
-            }
             "KG1000" => {
                 cfg.ch1.m = Some(s.slope);
                 cfg.ch1.b = Some(s.intercept);
@@ -375,27 +331,6 @@ pub fn load_or_default() -> LoadcellCalibrationFile {
 }
 
 fn sync_legacy_channels_into_extra(cfg: &mut LoadcellCalibrationFile) {
-    let ch0 = cfg.extra_channels.entry("ch0".to_string()).or_default();
-    if ch0.points.is_empty() && !cfg.points.is_empty() {
-        ch0.points = cfg
-            .points
-            .iter()
-            .map(|point| CalibrationPoint {
-                expected: point.kg,
-                raw: point.ch0_raw,
-            })
-            .collect();
-    }
-    if ch0.linear.m.is_none() && ch0.linear.b.is_none() {
-        ch0.linear = cfg.ch0.clone();
-    }
-    if ch0.zero_raw.is_none() {
-        ch0.zero_raw = cfg.ch0_zero_raw;
-    }
-    if ch0.fit.is_none() {
-        ch0.fit = cfg.ch0_fit.clone();
-    }
-
     let ch1 = cfg.extra_channels.entry("ch1".to_string()).or_default();
     if ch1.points.is_empty() && !cfg.points_ch1.is_empty() {
         ch1.points = cfg
@@ -504,10 +439,9 @@ fn fit_meta_mut<'a>(
 
 fn update_weights_kg(cfg: &mut LoadcellCalibrationFile) {
     let mut values: Vec<f32> = cfg
-        .points
+        .points_ch1
         .iter()
         .map(|p| p.kg)
-        .chain(cfg.points_ch1.iter().map(|p| p.kg))
         .chain(cfg.points_iadc.iter().map(|p| p.expected))
         .chain(
             cfg.extra_channels
@@ -1134,7 +1068,6 @@ pub fn calibrated_weight_kg(
 ) -> Option<f32> {
     match sensor_id {
         "KG1000" => eval_channel_with_fit(&cfg.ch1, cfg.ch1_fit.as_ref(), raw),
-        "KG50" => eval_channel_with_fit(&cfg.ch0, cfg.ch0_fit.as_ref(), raw),
         _ => None,
     }
 }
@@ -1145,9 +1078,7 @@ pub fn calibrated_sensor_value(
     raw: f32,
 ) -> Option<f32> {
     match sensor_id {
-        RAW_LOADCELL_DATA_TYPE_1000KG | RAW_LOADCELL_DATA_TYPE_50KG => {
-            calibrated_weight_kg(cfg, sensor_id, raw)
-        }
+        RAW_LOADCELL_DATA_TYPE_1000KG => calibrated_weight_kg(cfg, sensor_id, raw),
         RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
             eval_channel_with_fit(&cfg.iadc, cfg.iadc_fit.as_ref(), raw)
         }

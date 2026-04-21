@@ -211,12 +211,18 @@ pub async fn safety_task(
                 | FlightState::Aborted
         );
         let now_ms = get_current_timestamp_ms();
+        let sim_mode = crate::flight_sim::sim_mode_enabled();
         let mut board_warnings = Vec::new();
         let mut board_log_only = Vec::new();
         let all_boards_seen = {
             let mut board_status = state.board_status.lock().unwrap();
             for (board, status) in board_status.iter_mut() {
                 if !state.board_required_for_progression(*board) {
+                    status.warned = false;
+                    continue;
+                }
+                if sim_mode {
+                    status.last_seen_ms = Some(now_ms);
                     status.warned = false;
                     continue;
                 }

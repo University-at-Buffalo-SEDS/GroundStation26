@@ -265,6 +265,7 @@ impl AppState {
         if cfg!(feature = "test_fire_mode") {
             return;
         }
+        let now_ms = telemetry_task::get_current_timestamp_ms();
         let Some(router) = self.topology_router.get() else {
             return;
         };
@@ -282,11 +283,13 @@ impl AppState {
             let Some(status) = map.get_mut(&board) else {
                 continue;
             };
+            let route_last_seen_ms = now_ms.saturating_sub(route.age_ms);
             status.last_seen_ms = Some(
                 status
                     .last_seen_ms
-                    .map(|existing| existing.max(route.last_seen_ms))
-                    .unwrap_or(route.last_seen_ms),
+                    .filter(|existing| *existing <= now_ms)
+                    .map(|existing| existing.max(route_last_seen_ms))
+                    .unwrap_or(route_last_seen_ms),
             );
             status.warned = false;
         }

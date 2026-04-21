@@ -428,6 +428,21 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
+    let live_rocket = {
+        let fixes = state.latest_gps_fix_by_sender.lock().unwrap();
+        ["RF", "GW", "FC"]
+            .iter()
+            .filter_map(|sender_id| fixes.get(*sender_id))
+            .chain(fixes.values())
+            .find_map(gps_point_from_values)
+    };
+    if live_rocket.is_some() {
+        return Json(GpsResponse {
+            rocket: live_rocket,
+        })
+        .into_response();
+    }
+
     let db = state.telemetry_db_pool();
     // Prefer the normalized GPS stream, but keep compatibility with older row tags.
     let row = sqlx::query(
@@ -443,18 +458,19 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     .await
     .unwrap_or(None);
 
-    let rocket = row.and_then(|r| {
-        let values = values_from_row(&r);
-        match (value_at(&values, 0), value_at(&values, 1)) {
-            (Some(lat), Some(lon)) => Some(GpsPoint {
-                lat: lat as f64,
-                lon: lon as f64,
-            }),
-            _ => None,
-        }
-    });
+    let rocket = row.and_then(|r| gps_point_from_values(&values_from_row(&r)));
 
     Json(GpsResponse { rocket }).into_response()
+}
+
+fn gps_point_from_values(values: &Vec<Option<f32>>) -> Option<GpsPoint> {
+    match (value_at(values, 0), value_at(values, 1)) {
+        (Some(lat), Some(lon)) => Some(GpsPoint {
+            lat: lat as f64,
+            lon: lon as f64,
+        }),
+        _ => None,
+    }
 }
 
 /// Serves the current frontend layout configuration.
@@ -932,7 +948,8 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         let cache_covers_window =
             oldest_cache_ts.is_some_and(|oldest| oldest <= cutoff + RECENT_BUCKET_MS);
         if cache_covers_window {
-            return Json(compact_recent_rows(cache_snapshot, cutoff)).into_response();
+            let rows = compact_recent_rows(cache_snapshot, cutoff);
+            return Json(rows).into_response();
         }
 
         let db_end_ms = oldest_cache_ts.unwrap_or(now_ms).saturating_sub(1);
@@ -947,7 +964,8 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
                 .into_iter()
                 .filter(|row| row.timestamp_ms >= cutoff && row.timestamp_ms <= now_ms),
         );
-        return Json(compact_recent_rows(merged_rows, cutoff)).into_response();
+        let rows = compact_recent_rows(merged_rows, cutoff);
+        return Json(rows).into_response();
     }
 
     let db = state.telemetry_db_pool();
@@ -961,11 +979,11 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         return Json(Vec::<TelemetryRow>::new()).into_response();
     };
     let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
-    Json(compact_recent_rows(
+    let rows = compact_recent_rows(
         load_recent_rows_from_db(&state, cutoff, now_ms).await,
         cutoff,
-    ))
-    .into_response()
+    );
+    Json(rows).into_response()
 }
 
 async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {

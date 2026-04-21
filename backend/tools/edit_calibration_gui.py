@@ -21,15 +21,6 @@ PLOT_PAD_TOP = 16
 PLOT_PAD_BOTTOM = 30
 
 CHANNEL_SPECS = {
-    "ch0": {
-        "label": "50kg",
-        "points_key": "points",
-        "raw_key": "ch0_raw",
-        "linear_key": "ch0",
-        "zero_key": "ch0_zero_raw",
-        "fit_key": "ch0_fit",
-        "color": "#f59e0b",
-    },
     "ch1": {
         "label": "1000kg",
         "points_key": "points_ch1",

@@ -8,8 +8,23 @@ pub enum Trigger {
 }
 
 #[cfg(feature = "raspberry_pi")]
+const PI_5_UART_GPIO_PINS: &[u8] = &[14, 15];
+
+#[cfg(feature = "raspberry_pi")]
+fn ensure_regular_gpio_pin_allowed(pin_number: u8) -> Result<(), Box<dyn std::error::Error>> {
+    if PI_5_UART_GPIO_PINS.contains(&pin_number) {
+        return Err(format!(
+            "GPIO pin {pin_number} is reserved for the Raspberry Pi 5 UART and cannot be used as regular GPIO"
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "raspberry_pi")]
 mod real {
-    use super::Trigger;
+    use super::{Trigger, ensure_regular_gpio_pin_allowed};
     use rppal::gpio::{Gpio, InputPin, OutputPin, Trigger as PiTrigger};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -40,6 +55,7 @@ mod real {
         }
 
         pub fn setup_input_pin(&self, pin_number: u8) -> Result<(), Box<dyn std::error::Error>> {
+            ensure_regular_gpio_pin_allowed(pin_number)?;
             let pin = self.gpio.get(pin_number)?.into_input();
             self.input_pins
                 .lock()
@@ -49,6 +65,7 @@ mod real {
         }
 
         pub fn setup_output_pin(&self, pin_number: u8) -> Result<(), Box<dyn std::error::Error>> {
+            ensure_regular_gpio_pin_allowed(pin_number)?;
             let pin = self.gpio.get(pin_number)?.into_output();
             self.output_pins
                 .lock()
