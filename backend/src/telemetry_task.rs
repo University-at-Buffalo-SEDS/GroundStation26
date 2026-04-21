@@ -2447,4 +2447,90 @@ mod tests {
             Some(14)
         );
     }
+
+    #[tokio::test]
+    async fn kg1000_packet_emits_state_tab_loadcell_rows() {
+        let (db_tx, mut db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        let mut ws_rx = state.ws_tx.subscribe();
+
+        let pkt = Packet::new(
+            DataType::KG1000,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            Board::DaqBoard.sender_id(),
+            456_789,
+            f32_payload(&[4.25]),
+        )
+        .expect("failed to build KG1000 packet");
+
+        let row = handle_packet(&state, &db_tx, &db_overflow, pkt)
+            .await
+            .expect("KG1000 packet should produce raw telemetry row");
+
+        assert_eq!(row.data_type, loadcell::RAW_LOADCELL_DATA_TYPE_1000KG);
+        assert_eq!(row.sender_id, Board::DaqBoard.sender_id());
+        assert_eq!(row.values, vec![Some(4.25)]);
+
+        let mut broadcast_rows = Vec::new();
+        for _ in 0..2 {
+            broadcast_rows.push(
+                ws_rx
+                    .recv()
+                    .await
+                    .expect("derived loadcell rows should be broadcast"),
+            );
+        }
+        broadcast_rows.sort_by(|a, b| a.data_type.cmp(&b.data_type));
+
+        assert_eq!(
+            broadcast_rows
+                .iter()
+                .map(|row| row.data_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
+                loadcell::DERIVED_WEIGHT_DATA_TYPE
+            ]
+        );
+        assert_eq!(broadcast_rows[0].sender_id, Board::DaqBoard.sender_id());
+        assert_eq!(broadcast_rows[1].sender_id, Board::DaqBoard.sender_id());
+        assert_eq!(broadcast_rows[0].values, vec![Some(42.5)]);
+        assert_eq!(broadcast_rows[1].values, vec![Some(4.25)]);
+
+        let cache = state.recent_telemetry_snapshot();
+        assert!(
+            cache
+                .iter()
+                .any(|row| row.data_type == loadcell::DERIVED_WEIGHT_DATA_TYPE)
+        );
+        assert!(
+            cache
+                .iter()
+                .any(|row| row.data_type == loadcell::DERIVED_FILL_PERCENT_DATA_TYPE)
+        );
+
+        let mut db_types = Vec::new();
+        for _ in 0..3 {
+            match db_rx
+                .recv()
+                .await
+                .expect("telemetry DB write should be queued")
+            {
+                DbQueueItem::Write(DbWrite::Telemetry { data_type, .. }) => {
+                    db_types.push(data_type);
+                }
+                other => panic!("unexpected DB item for KG1000 path: {other:?}"),
+            }
+        }
+        db_types.sort();
+        assert_eq!(
+            db_types,
+            vec![
+                loadcell::RAW_LOADCELL_DATA_TYPE_1000KG.to_string(),
+                loadcell::DERIVED_FILL_PERCENT_DATA_TYPE.to_string(),
+                loadcell::DERIVED_WEIGHT_DATA_TYPE.to_string(),
+            ]
+        );
+    }
 }

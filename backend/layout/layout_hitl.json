@@ -1046,6 +1046,80 @@
             "value_layout": "horizontal"
           },
           {
+            "title": "Fill Metrics",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "items": [
+                  {
+                    "label": "Tank Pressure",
+                    "index": 0,
+                    "fill_target_fluid": "nitrous",
+                    "fill_target_kind": "pressure_psi",
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 1,
+                      "suffix": " psi"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_WEIGHT_KG",
+                "items": [
+                  {
+                    "label": "Mass (kg)",
+                    "index": 0,
+                    "fill_target_fluid": "nitrous",
+                    "fill_target_kind": "mass_kg",
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 2,
+                      "suffix": " kg"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "items": [
+                  {
+                    "label": "Fill Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "chart",
+                "chart_title": "Pressure and Loadcell",
+                "chart_series": [
+                  {
+                    "data_type": "FUEL_TANK_PRESSURE",
+                    "index": 0,
+                    "label": "Tank Pressure"
+                  },
+                  {
+                    "data_type": "LOADCELL_WEIGHT_KG",
+                    "index": 0,
+                    "label": "Mass (kg)"
+                  },
+                  {
+                    "data_type": "LOADCELL_FILL_PERCENT",
+                    "index": 0,
+                    "label": "Fill Percent"
+                  }
+                ],
+                "width": 1200.0,
+                "height": 260.0,
+                "full_width": true
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
             "title": "Actions",
             "widgets": [
               {

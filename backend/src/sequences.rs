@@ -103,9 +103,15 @@ enum SequenceStep {
     DumpNitrogen,
     CloseDump,
     AwaitFillTestDecision,
+    RecoverNitrogenClose,
+    RecoverNitrogenVent,
+    RecoverNitrogenCloseDump,
     OpenNitrous,
     NitrousSoak,
     CloseNitrous,
+    RecoverNitrousClose,
+    RecoverNitrousVent,
+    RecoverNitrousCloseDump,
     CloseNormallyOpen,
     RetractFillLines,
     ArmedReady,
@@ -128,6 +134,7 @@ struct SequenceConfig {
     normally_open_hold_drop_psi_per_min: f32,
     allowed_hold_mass_drop_kg_per_min: f32,
     nitrous_weight_rise_epsilon_kg: f32,
+    empty_mass_noise_allowance_kg: f32,
     pending_fast_window: Duration,
     key_required: bool,
     key_enable_pin: u8,
@@ -244,6 +251,12 @@ impl SequenceConfig {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(0.03);
 
+        let empty_mass_noise_allowance_kg = std::env::var("GS_SEQUENCE_EMPTY_MASS_NOISE_KG")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(3.0)
+            .max(0.0);
+
         let pending_fast_window = std::env::var("GS_SEQUENCE_PENDING_FAST_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -290,6 +303,7 @@ impl SequenceConfig {
             normally_open_hold_drop_psi_per_min,
             allowed_hold_mass_drop_kg_per_min,
             nitrous_weight_rise_epsilon_kg,
+            empty_mass_noise_allowance_kg,
             pending_fast_window,
             key_required,
             key_enable_pin,
@@ -318,6 +332,13 @@ struct SequenceRuntime {
     notified_retract_fill_lines: bool,
     auto_close_nitrogen_sent: bool,
     auto_close_nitrous_sent: bool,
+    notified_reopen_normally_open: bool,
+    notified_nitrogen_dump_recovery: bool,
+    notified_nitrogen_recovery_vent: bool,
+    notified_nitrogen_recovery_close_dump: bool,
+    notified_nitrous_dump_recovery: bool,
+    notified_nitrous_recovery_vent: bool,
+    notified_nitrous_recovery_close_dump: bool,
 }
 
 impl Default for SequenceRuntime {
@@ -341,6 +362,13 @@ impl Default for SequenceRuntime {
             notified_retract_fill_lines: false,
             auto_close_nitrogen_sent: false,
             auto_close_nitrous_sent: false,
+            notified_reopen_normally_open: false,
+            notified_nitrogen_dump_recovery: false,
+            notified_nitrogen_recovery_vent: false,
+            notified_nitrogen_recovery_close_dump: false,
+            notified_nitrous_dump_recovery: false,
+            notified_nitrous_recovery_vent: false,
+            notified_nitrous_recovery_close_dump: false,
         }
     }
 }
@@ -659,6 +687,71 @@ fn set_control_enabled(policy: &mut ActionPolicyMsg, cmd: &str, enabled: bool) {
     }
 }
 
+fn sequence_expects_normally_open(step: SequenceStep) -> bool {
+    matches!(
+        step,
+        SequenceStep::NitrogenFill
+            | SequenceStep::CloseNitrogen
+            | SequenceStep::NitrogenLeakCheck
+            | SequenceStep::DumpNitrogen
+            | SequenceStep::CloseDump
+            | SequenceStep::AwaitFillTestDecision
+            | SequenceStep::RecoverNitrogenClose
+            | SequenceStep::RecoverNitrogenVent
+            | SequenceStep::RecoverNitrogenCloseDump
+            | SequenceStep::OpenNitrous
+            | SequenceStep::NitrousSoak
+            | SequenceStep::CloseNitrous
+            | SequenceStep::RecoverNitrousClose
+            | SequenceStep::RecoverNitrousVent
+            | SequenceStep::RecoverNitrousCloseDump
+    )
+}
+
+fn sequence_blocks_until_normally_open(step: SequenceStep) -> bool {
+    matches!(
+        step,
+        SequenceStep::NitrogenFill
+            | SequenceStep::CloseNitrogen
+            | SequenceStep::NitrogenLeakCheck
+            | SequenceStep::DumpNitrogen
+            | SequenceStep::CloseDump
+            | SequenceStep::AwaitFillTestDecision
+            | SequenceStep::OpenNitrous
+            | SequenceStep::NitrousSoak
+            | SequenceStep::CloseNitrous
+    )
+}
+
+fn dump_open_fails_nitrogen_step(step: SequenceStep) -> bool {
+    matches!(
+        step,
+        SequenceStep::NitrogenFill | SequenceStep::CloseNitrogen | SequenceStep::NitrogenLeakCheck
+    )
+}
+
+fn dump_open_fails_nitrous_step(step: SequenceStep) -> bool {
+    matches!(
+        step,
+        SequenceStep::OpenNitrous | SequenceStep::CloseNitrous | SequenceStep::NitrousSoak
+    )
+}
+
+fn mass_is_vented(current_mass_kg: Option<f32>, cfg: &SequenceConfig) -> bool {
+    current_mass_kg
+        .map(|m| m <= cfg.empty_mass_noise_allowance_kg)
+        .unwrap_or(true)
+}
+
+fn tank_is_vented(
+    pressure_psi: Option<f32>,
+    current_mass_kg: Option<f32>,
+    cfg: &SequenceConfig,
+) -> bool {
+    pressure_psi.is_some_and(|p| p <= cfg.dump_pressure_max_psi)
+        && mass_is_vented(current_mass_kg, cfg)
+}
+
 fn update_sequence_runtime(
     state: &AppState,
     runtime: &mut SequenceRuntime,
@@ -669,12 +762,51 @@ fn update_sequence_runtime(
     now: Instant,
 ) {
     let at_or_above = |p: Option<f32>, threshold: f32| p.is_some_and(|x| x >= threshold);
-    let at_or_below = |p: Option<f32>, threshold: f32| p.is_some_and(|x| x <= threshold);
     let dismiss_leak_fail_notification = |state: &AppState, runtime: &mut SequenceRuntime| {
         if let Some(id) = runtime.leak_fail_notification_id.take() {
             let _ = state.dismiss_notification(id);
         }
     };
+
+    if valves.dump_open == Some(true) && dump_open_fails_nitrogen_step(runtime.step) {
+        dismiss_leak_fail_notification(state, runtime);
+        runtime.step = SequenceStep::RecoverNitrogenClose;
+        runtime.step_started_at = None;
+        runtime.pressure_at_close_psi = None;
+        runtime.mass_at_close_kg = None;
+        runtime.next_step_after_dump = None;
+        runtime.nitrous_level_since = None;
+        runtime.auto_close_nitrogen_sent = false;
+        runtime.notified_nitrogen_dump_recovery = false;
+        runtime.notified_nitrogen_recovery_vent = false;
+        runtime.notified_nitrogen_recovery_close_dump = false;
+    }
+
+    if valves.dump_open == Some(true) && dump_open_fails_nitrous_step(runtime.step) {
+        dismiss_leak_fail_notification(state, runtime);
+        runtime.step = SequenceStep::RecoverNitrousClose;
+        runtime.step_started_at = None;
+        runtime.nitrous_level_since = None;
+        runtime.last_nitrous_pressure_psi = None;
+        runtime.last_nitrous_mass_kg = None;
+        runtime.auto_close_nitrous_sent = false;
+        runtime.notified_nitrous_dump_recovery = false;
+        runtime.notified_nitrous_recovery_vent = false;
+        runtime.notified_nitrous_recovery_close_dump = false;
+    }
+
+    if sequence_blocks_until_normally_open(runtime.step) && valves.normally_open == Some(false) {
+        if !runtime.notified_reopen_normally_open {
+            state.add_notification(
+                "Normally open valve is closed early. Open N/O before continuing the fill sequence.",
+            );
+            runtime.notified_reopen_normally_open = true;
+        }
+        return;
+    }
+    if valves.normally_open == Some(true) {
+        runtime.notified_reopen_normally_open = false;
+    }
 
     match runtime.step {
         SequenceStep::SetupValves => {
@@ -844,8 +976,7 @@ fn update_sequence_runtime(
             }
         }
         SequenceStep::DumpNitrogen => {
-            if valves.dump_open == Some(true)
-                && at_or_below(pressure_psi, cfg.dump_pressure_max_psi)
+            if valves.dump_open == Some(true) && tank_is_vented(pressure_psi, current_mass_kg, cfg)
             {
                 runtime.step = SequenceStep::CloseDump;
             }
@@ -871,6 +1002,52 @@ fn update_sequence_runtime(
             if valves.nitrogen_open == Some(true) {
                 dismiss_leak_fail_notification(state, runtime);
                 runtime.auto_close_nitrogen_sent = false;
+                runtime.step = SequenceStep::NitrogenFill;
+            }
+        }
+        SequenceStep::RecoverNitrogenClose => {
+            if !runtime.notified_nitrogen_dump_recovery {
+                state.add_notification(
+                    "Dump opened during nitrogen fill. Treating nitrogen fill as failed: close Nitrogen, keep Dump open while pressure and loadcell vent, then close Dump and refill nitrogen.",
+                );
+                runtime.notified_nitrogen_dump_recovery = true;
+            }
+            if valves.dump_open != Some(true) {
+                return;
+            }
+            if valves.nitrogen_open == Some(false) {
+                runtime.notified_nitrogen_recovery_vent = false;
+                runtime.step = SequenceStep::RecoverNitrogenVent;
+            }
+        }
+        SequenceStep::RecoverNitrogenVent => {
+            if valves.dump_open != Some(true) {
+                if !runtime.notified_nitrogen_recovery_vent {
+                    state.add_notification(
+                        "Nitrogen recovery is not vented yet. Reopen Dump and wait for pressure and loadcell to vent.",
+                    );
+                    runtime.notified_nitrogen_recovery_vent = true;
+                }
+                return;
+            }
+            if tank_is_vented(pressure_psi, current_mass_kg, cfg) {
+                runtime.notified_nitrogen_recovery_close_dump = false;
+                runtime.step = SequenceStep::RecoverNitrogenCloseDump;
+            }
+        }
+        SequenceStep::RecoverNitrogenCloseDump => {
+            if !runtime.notified_nitrogen_recovery_close_dump {
+                state.add_notification(format!(
+                    "Nitrogen recovery vented below {:.1} psi and {:.1} kg. Close Dump, then refill nitrogen.",
+                    cfg.dump_pressure_max_psi, cfg.empty_mass_noise_allowance_kg
+                ));
+                runtime.notified_nitrogen_recovery_close_dump = true;
+            }
+            if valves.dump_open == Some(false) {
+                runtime.auto_close_nitrogen_sent = false;
+                runtime.notified_leak_pass = false;
+                runtime.warned_rapid_drop = false;
+                runtime.warned_mass_shift = false;
                 runtime.step = SequenceStep::NitrogenFill;
             }
         }
@@ -1000,6 +1177,53 @@ fn update_sequence_runtime(
                 runtime.step = SequenceStep::CloseNormallyOpen;
             }
         }
+        SequenceStep::RecoverNitrousClose => {
+            if !runtime.notified_nitrous_dump_recovery {
+                state.add_notification(
+                    "Dump opened during nitrous fill. Treating nitrous fill as failed: close Nitrous, keep Dump open while pressure and loadcell vent, then close Dump and refill nitrous only.",
+                );
+                runtime.notified_nitrous_dump_recovery = true;
+            }
+            if valves.dump_open != Some(true) {
+                return;
+            }
+            if valves.nitrous_open == Some(false) {
+                runtime.notified_nitrous_recovery_vent = false;
+                runtime.step = SequenceStep::RecoverNitrousVent;
+            }
+        }
+        SequenceStep::RecoverNitrousVent => {
+            if valves.dump_open != Some(true) {
+                if !runtime.notified_nitrous_recovery_vent {
+                    state.add_notification(
+                        "Nitrous recovery is not vented yet. Reopen Dump and wait for pressure and loadcell to vent.",
+                    );
+                    runtime.notified_nitrous_recovery_vent = true;
+                }
+                return;
+            }
+            if tank_is_vented(pressure_psi, current_mass_kg, cfg) {
+                runtime.notified_nitrous_recovery_close_dump = false;
+                runtime.step = SequenceStep::RecoverNitrousCloseDump;
+            }
+        }
+        SequenceStep::RecoverNitrousCloseDump => {
+            if !runtime.notified_nitrous_recovery_close_dump {
+                state.add_notification(format!(
+                    "Nitrous recovery vented below {:.1} psi and {:.1} kg. Close Dump, then refill nitrous.",
+                    cfg.dump_pressure_max_psi, cfg.empty_mass_noise_allowance_kg
+                ));
+                runtime.notified_nitrous_recovery_close_dump = true;
+            }
+            if valves.dump_open == Some(false) {
+                runtime.nitrous_level_since = None;
+                runtime.last_nitrous_pressure_psi = None;
+                runtime.last_nitrous_mass_kg = None;
+                runtime.auto_close_nitrous_sent = false;
+                runtime.notified_close_nitrous = false;
+                runtime.step = SequenceStep::OpenNitrous;
+            }
+        }
         SequenceStep::CloseNormallyOpen => {
             if !runtime.notified_close_normally_open {
                 state.add_notification(
@@ -1059,13 +1283,19 @@ fn maybe_drive_local_prelaunch_state(
             }
         }
         SequenceStep::NitrogenFill | SequenceStep::CloseNitrogen => Some(FlightState::NitrogenFill),
-        SequenceStep::NitrogenLeakCheck | SequenceStep::DumpNitrogen | SequenceStep::CloseDump => {
-            Some(FlightState::FillTest)
-        }
+        SequenceStep::NitrogenLeakCheck
+        | SequenceStep::DumpNitrogen
+        | SequenceStep::CloseDump
+        | SequenceStep::RecoverNitrogenClose
+        | SequenceStep::RecoverNitrogenVent
+        | SequenceStep::RecoverNitrogenCloseDump => Some(FlightState::FillTest),
         SequenceStep::AwaitFillTestDecision => Some(FlightState::FillTest),
         SequenceStep::OpenNitrous
         | SequenceStep::CloseNitrous
         | SequenceStep::NitrousSoak
+        | SequenceStep::RecoverNitrousClose
+        | SequenceStep::RecoverNitrousVent
+        | SequenceStep::RecoverNitrousCloseDump
         | SequenceStep::CloseNormallyOpen
         | SequenceStep::RetractFillLines => Some(FlightState::NitrousFill),
         SequenceStep::ArmedReady => Some(FlightState::Armed),
@@ -1178,6 +1408,13 @@ fn build_policy(
 
     let mut recommended: HashMap<&'static str, BlinkMode> = HashMap::new();
 
+    if sequence_expects_normally_open(runtime.step) && inputs.valves.normally_open != Some(true) {
+        recommended.insert(
+            "NormallyOpen",
+            pending_mode(state, "NormallyOpen", inputs.now_ms, cfg),
+        );
+    }
+
     match runtime.step {
         SequenceStep::SetupValves => {
             if inputs.valves.normally_open != Some(true) {
@@ -1207,6 +1444,26 @@ fn build_policy(
             }
         }
         SequenceStep::NitrogenLeakCheck => {}
+        SequenceStep::RecoverNitrogenClose => {
+            if inputs.valves.nitrogen_open != Some(false) {
+                recommended.insert(
+                    "Nitrogen",
+                    pending_mode(state, "Nitrogen", inputs.now_ms, cfg),
+                );
+            } else if inputs.valves.dump_open != Some(true) {
+                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            }
+        }
+        SequenceStep::RecoverNitrogenVent => {
+            if inputs.valves.dump_open != Some(true) {
+                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            }
+        }
+        SequenceStep::RecoverNitrogenCloseDump => {
+            if inputs.valves.dump_open != Some(false) {
+                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            }
+        }
         SequenceStep::DumpNitrogen => {
             if inputs.valves.dump_open != Some(true) {
                 recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
@@ -1242,6 +1499,26 @@ fn build_policy(
             }
         }
         SequenceStep::NitrousSoak => {}
+        SequenceStep::RecoverNitrousClose => {
+            if inputs.valves.nitrous_open != Some(false) {
+                recommended.insert(
+                    "Nitrous",
+                    pending_mode(state, "Nitrous", inputs.now_ms, cfg),
+                );
+            } else if inputs.valves.dump_open != Some(true) {
+                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            }
+        }
+        SequenceStep::RecoverNitrousVent => {
+            if inputs.valves.dump_open != Some(true) {
+                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            }
+        }
+        SequenceStep::RecoverNitrousCloseDump => {
+            if inputs.valves.dump_open != Some(false) {
+                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            }
+        }
         SequenceStep::CloseNormallyOpen => {
             if inputs.valves.normally_open != Some(false) {
                 recommended.insert(
