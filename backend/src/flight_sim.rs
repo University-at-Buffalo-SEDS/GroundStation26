@@ -256,7 +256,7 @@ impl FlightSimState {
     fn new() -> Self {
         let mut valves = HashMap::new();
         // Start in idle with fill lines installed and both NO + dump open.
-        // Closing both is required before entering fill sequence.
+        // Dump closes for fill; NO stays open until just before fill-line retract.
         valves.insert(ValveBoardCommands::NormallyOpenOpen as u8, true);
         valves.insert(ValveBoardCommands::DumpOpen as u8, true);
         valves.insert(ActuatorBoardCommands::RetractPlumbing as u8, false);
@@ -644,7 +644,7 @@ impl FlightSimState {
             return;
         }
 
-        let no_open = !self.valve_on(ValveBoardCommands::NormallyOpenOpen as u8);
+        let no_open = self.valve_on(ValveBoardCommands::NormallyOpenOpen as u8);
         let dump_closed = !self.valve_on(ValveBoardCommands::DumpOpen as u8);
         let n2_open = self.valve_on(ActuatorBoardCommands::NitrogenOpen as u8);
         let n2o_open = self.valve_on(ActuatorBoardCommands::NitrousOpen as u8);
@@ -677,6 +677,7 @@ impl FlightSimState {
                     self.nitrous_fill_started_ms.get_or_insert(now_ms);
                 }
                 if !n2o_open
+                    && !no_open
                     && fill_lines_removed
                     && self
                         .nitrous_fill_started_ms

@@ -106,6 +106,7 @@ enum SequenceStep {
     OpenNitrous,
     NitrousSoak,
     CloseNitrous,
+    CloseNormallyOpen,
     RetractFillLines,
     ArmedReady,
 }
@@ -302,6 +303,7 @@ struct SequenceRuntime {
     warned_mass_shift: bool,
     leak_fail_notification_id: Option<u64>,
     notified_close_nitrous: bool,
+    notified_close_normally_open: bool,
     nitrous_level_since: Option<Instant>,
     last_nitrous_pressure_psi: Option<f32>,
     last_nitrous_mass_kg: Option<f32>,
@@ -324,6 +326,7 @@ impl Default for SequenceRuntime {
             warned_mass_shift: false,
             leak_fail_notification_id: None,
             notified_close_nitrous: false,
+            notified_close_normally_open: false,
             nitrous_level_since: None,
             last_nitrous_pressure_psi: None,
             last_nitrous_mass_kg: None,
@@ -667,7 +670,7 @@ fn update_sequence_runtime(
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if valves.normally_open == Some(false) && valves.dump_open == Some(false) {
+            if valves.normally_open == Some(true) && valves.dump_open == Some(false) {
                 runtime.step = SequenceStep::NitrogenFill;
             }
         }
@@ -946,13 +949,25 @@ fn update_sequence_runtime(
                 return;
             };
             if now.saturating_duration_since(started) >= cfg.nitrous_soak_duration {
+                runtime.notified_close_normally_open = false;
+                runtime.step = SequenceStep::CloseNormallyOpen;
+            }
+        }
+        SequenceStep::CloseNormallyOpen => {
+            if !runtime.notified_close_normally_open {
+                state.add_notification(
+                    "Nitrous settle complete. Close normally open valve before retracting fill lines.",
+                );
+                runtime.notified_close_normally_open = true;
+            }
+            if valves.normally_open == Some(false) {
                 runtime.notified_retract_fill_lines = false;
                 runtime.step = SequenceStep::RetractFillLines;
             }
         }
         SequenceStep::RetractFillLines => {
             if !runtime.notified_retract_fill_lines {
-                state.add_notification("Nitrous settle complete. Remove fill lines.");
+                state.add_notification("Normally open valve closed. Retract fill lines.");
                 runtime.notified_retract_fill_lines = true;
             }
             if valves.retract == Some(true) {
@@ -962,7 +977,7 @@ fn update_sequence_runtime(
         SequenceStep::ArmedReady => {
             if !runtime.notified_armed {
                 state.add_notification(
-                    "Fill sequence complete: nitrous closed, fill lines removed. Launch state is ready.",
+                    "Fill sequence complete: nitrous closed, normally open closed, fill lines removed. Launch state is ready.",
                 );
                 runtime.notified_armed = true;
             }
@@ -988,7 +1003,7 @@ fn maybe_drive_local_prelaunch_state(
     let desired_state = match runtime.step {
         SequenceStep::SetupValves => {
             if current_state == FlightState::Idle
-                && valves.normally_open == Some(false)
+                && valves.normally_open == Some(true)
                 && valves.dump_open == Some(false)
             {
                 Some(FlightState::PreFill)
@@ -1004,6 +1019,7 @@ fn maybe_drive_local_prelaunch_state(
         SequenceStep::OpenNitrous
         | SequenceStep::CloseNitrous
         | SequenceStep::NitrousSoak
+        | SequenceStep::CloseNormallyOpen
         | SequenceStep::RetractFillLines => Some(FlightState::NitrousFill),
         SequenceStep::ArmedReady => Some(FlightState::Armed),
     };
@@ -1094,7 +1110,7 @@ fn build_policy(
         }
         // In Idle, make the first fill-transition action the only illuminated action.
         // All other controls remain available (dimmed client-side when not blinking).
-        if inputs.flight_state == FlightState::Idle && inputs.valves.normally_open != Some(false) {
+        if inputs.flight_state == FlightState::Idle && inputs.valves.normally_open != Some(true) {
             enabled.insert(
                 "NormallyOpen",
                 pending_mode(state, "NormallyOpen", inputs.now_ms, cfg),
@@ -1117,7 +1133,7 @@ fn build_policy(
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if inputs.valves.normally_open != Some(false) {
+            if inputs.valves.normally_open != Some(true) {
                 recommended.insert(
                     "NormallyOpen",
                     pending_mode(state, "NormallyOpen", inputs.now_ms, cfg),
@@ -1179,6 +1195,14 @@ fn build_policy(
             }
         }
         SequenceStep::NitrousSoak => {}
+        SequenceStep::CloseNormallyOpen => {
+            if inputs.valves.normally_open != Some(false) {
+                recommended.insert(
+                    "NormallyOpen",
+                    pending_mode(state, "NormallyOpen", inputs.now_ms, cfg),
+                );
+            }
+        }
         SequenceStep::RetractFillLines => {
             if inputs.valves.retract != Some(true) {
                 recommended.insert(
