@@ -666,7 +666,7 @@ async fn emit_derived_battery_rows(
     }
 
     let window_ms = (cfg.estimator.window_seconds.max(30) as i64) * 1000;
-    let min_drop_rate = cfg.estimator.min_drop_rate_v_per_min.max(0.0001);
+    let min_drop_rate = cfg.estimator.min_drop_rate_v_per_min.max(0.000001);
 
     for source in cfg.sources.iter() {
         if source.sender_id != sender_id || source.input_data_type != input_data_type {

@@ -35,17 +35,17 @@ const LAUNCH_COUNTDOWN_DURATION_MS: u64 = 10_000;
 #[cfg(feature = "testing")]
 const HOUSEKEEPING_PERIOD_MS: u64 = 900;
 #[cfg(feature = "testing")]
-const AV_BAY_BATTERY_CUTOFF_V: f32 = 6.3;
+const AV_BAY_BATTERY_CUTOFF_V: f32 = 7.3;
 #[cfg(feature = "testing")]
 const AV_BAY_BATTERY_MAX_V: f32 = 8.4;
 #[cfg(feature = "testing")]
-const VALVE_BOARD_BATTERY_CUTOFF_V: f32 = 6.3;
+const VALVE_BOARD_BATTERY_CUTOFF_V: f32 = 13.6;
 #[cfg(feature = "testing")]
-const VALVE_BOARD_BATTERY_MAX_V: f32 = 8.4;
+const VALVE_BOARD_BATTERY_MAX_V: f32 = 15.2;
 #[cfg(feature = "testing")]
-const FILL_BOX_POWER_CUTOFF_V: f32 = 13.3;
+const FILL_BOX_POWER_CUTOFF_V: f32 = 13.6;
 #[cfg(feature = "testing")]
-const FILL_BOX_POWER_MAX_V: f32 = 15.5;
+const FILL_BOX_POWER_MAX_V: f32 = 15.2;
 #[cfg(feature = "testing")]
 const LOADCELL_NOISE_KG: f32 = 0.01;
 #[cfg(feature = "testing")]
@@ -86,14 +86,9 @@ fn sim_full_mass_kg_from(
     fill_cfg: &fill_targets::FillTargetsConfig,
     loadcell_cfg: &loadcell::LoadcellCalibrationFile,
 ) -> f32 {
-    fill_cfg
-        .nitrous
-        .target_mass_kg
-        .max(
-            loadcell_cfg
-                .full_mass_kg
-                .unwrap_or(loadcell::DEFAULT_FULL_MASS_KG),
-        )
+    loadcell_cfg
+        .full_mass_kg
+        .unwrap_or(fill_cfg.nitrous.target_mass_kg)
         .max(0.1)
 }
 
@@ -504,6 +499,13 @@ impl FlightSimState {
                 let next = !self.valve_on(key);
                 self.valves.insert(key, next);
                 self.queue_umbilical_status(key, next, now_ms);
+                if next && self.flight_state == FlightState::NitrogenFill {
+                    self.saw_dump_open_after_n2 = false;
+                    self.saw_dump_closed_after_n2 = false;
+                }
+                if next && self.flight_state == FlightState::NitrousFill {
+                    self.nitrous_fill_started_ms = None;
+                }
                 if self.flight_state == FlightState::FillTest && next {
                     self.saw_dump_open_after_n2 = true;
                 }
@@ -553,6 +555,15 @@ impl FlightSimState {
                 let next = !self.valve_on(key);
                 self.valves.insert(key, next);
                 self.queue_umbilical_status(key, next, now_ms);
+                if next
+                    && matches!(
+                        self.flight_state,
+                        FlightState::FillTest | FlightState::NitrousFill
+                    )
+                {
+                    self.nitrous_fill_started_ms.get_or_insert(now_ms);
+                    self.set_flight_state(FlightState::NitrousFill, now_ms);
+                }
             }
             TelemetryCommand::NitrousClose => {
                 let key = ActuatorBoardCommands::NitrousOpen as u8;
@@ -667,7 +678,11 @@ impl FlightSimState {
                 }
             }
             FlightState::FillTest => {
-                if self.saw_dump_open_after_n2 && self.saw_dump_closed_after_n2 && n2o_open {
+                if n2_open {
+                    self.saw_dump_open_after_n2 = false;
+                    self.saw_dump_closed_after_n2 = false;
+                    self.set_flight_state(FlightState::NitrogenFill, now_ms);
+                } else if self.saw_dump_open_after_n2 && self.saw_dump_closed_after_n2 && n2o_open {
                     self.set_flight_state(FlightState::NitrousFill, now_ms);
                     self.nitrous_fill_started_ms.get_or_insert(now_ms);
                 }
@@ -1056,11 +1071,7 @@ fn sender_for_datatype(dtype: DataType) -> &'static str {
 #[cfg(feature = "testing")]
 fn sim_endpoints_for_datatype(dtype: DataType) -> &'static [DataEndpoint] {
     match dtype {
-        DataType::GpsData => &[
-            DataEndpoint::GroundStation,
-            DataEndpoint::SdCard,
-            DataEndpoint::FlightController,
-        ],
+        DataType::GpsData => &[DataEndpoint::GroundStation, DataEndpoint::FlightController],
         DataType::GpsSatelliteNumber => &[DataEndpoint::GroundStation],
         _ => &[DataEndpoint::GroundStation],
     }

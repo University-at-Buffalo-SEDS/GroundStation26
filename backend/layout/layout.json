@@ -471,7 +471,8 @@
               {
                 "label": "Drop Rate",
                 "data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
-                "index": 0
+                "index": 0,
+                "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
               },
               {
                 "label": "Runtime",
@@ -495,7 +496,8 @@
               {
                 "label": "Drop Rate",
                 "data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
-                "index": 0
+                "index": 0,
+                "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
               },
               {
                 "label": "Runtime",
@@ -519,7 +521,8 @@
               {
                 "label": "Drop Rate",
                 "data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
-                "index": 0
+                "index": 0,
+                "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
               },
               {
                 "label": "Runtime",
@@ -817,7 +820,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -873,7 +877,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -909,7 +914,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1154,7 +1160,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1190,7 +1197,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1226,7 +1234,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1422,7 +1431,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1458,7 +1468,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1494,7 +1505,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1730,7 +1742,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1766,7 +1779,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1802,7 +1816,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1910,7 +1925,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1946,7 +1962,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -1982,7 +1999,8 @@
                 "items": [
                   {
                     "label": "Drop Rate (V/min)",
-                    "index": 0
+                    "index": 0,
+                    "formatter": { "kind": "number", "precision": 6, "suffix": " V/min" }
                   }
                 ]
               },
@@ -2037,7 +2055,7 @@
   "battery": {
     "estimator": {
       "window_seconds": 300,
-      "min_drop_rate_v_per_min": 0.005
+      "min_drop_rate_v_per_min": 0.000001
     },
     "sources": [
       {
@@ -2048,7 +2066,7 @@
         "percent_data_type": "AV_BAY_BATTERY_PERCENT",
         "drop_rate_data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-        "empty_voltage": 6.3,
+        "empty_voltage": 7.3,
         "full_voltage": 8.4,
         "curve_exponent": 1.0
       },
@@ -2060,8 +2078,8 @@
         "percent_data_type": "VALVE_BOARD_BATTERY_PERCENT",
         "drop_rate_data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
-        "empty_voltage": 6.3,
-        "full_voltage": 8.4,
+        "empty_voltage": 13.6,
+        "full_voltage": 15.2,
         "curve_exponent": 1.0
       },
       {
@@ -2072,8 +2090,8 @@
         "percent_data_type": "FILL_BOX_POWER_PERCENT",
         "drop_rate_data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
-        "empty_voltage": 13.3,
-        "full_voltage": 15.5,
+        "empty_voltage": 13.6,
+        "full_voltage": 15.2,
         "curve_exponent": 1.0
       }
     ]

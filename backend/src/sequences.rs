@@ -752,6 +752,17 @@ fn tank_is_vented(
         && mass_is_vented(current_mass_kg, cfg)
 }
 
+fn nitrous_fill_status(state: &AppState, current_mass_kg: f32) -> (f32, f32) {
+    let fill_target_mass_kg = fill_targets::load_or_default().nitrous.target_mass_kg;
+    let loadcell_cfg = state.loadcell_calibration.lock().unwrap().clone();
+    let target_mass_kg = loadcell_cfg
+        .full_mass_kg
+        .unwrap_or(fill_target_mass_kg)
+        .max(0.0001);
+    let percent = loadcell::fill_percent(&loadcell_cfg, current_mass_kg);
+    (target_mass_kg, percent)
+}
+
 fn update_sequence_runtime(
     state: &AppState,
     runtime: &mut SequenceRuntime,
@@ -1061,25 +1072,22 @@ fn update_sequence_runtime(
                 return;
             }
 
-            let target_mass_kg = {
-                let cfg_target = fill_targets::load_or_default().nitrous.target_mass_kg;
-                cfg_target.max(
-                    state
-                        .loadcell_calibration
-                        .lock()
-                        .unwrap()
-                        .full_mass_kg
-                        .unwrap_or(loadcell::DEFAULT_FULL_MASS_KG)
-                        .max(0.0001),
+            let nitrous_full_by_loadcell = current_mass_kg.map(|m| {
+                let (target_mass_kg, fill_percent) = nitrous_fill_status(state, m);
+                (
+                    target_mass_kg,
+                    fill_percent,
+                    m + cfg.nitrous_weight_rise_epsilon_kg >= target_mass_kg
+                        || fill_percent >= 99.5,
                 )
-            };
-            if current_mass_kg.is_some_and(|m| m >= target_mass_kg) {
+            });
+            if let Some((target_mass_kg, fill_percent, true)) = nitrous_full_by_loadcell {
                 if !runtime.auto_close_nitrous_sent {
                     match state.cmd_tx.try_send(TelemetryCommand::NitrousClose) {
                         Ok(_) => {
                             runtime.auto_close_nitrous_sent = true;
                             state.add_notification(format!(
-                                "Nitrous loadcell target reached ({target_mass_kg:.2} kg). Auto-closing nitrous valve."
+                                "Nitrous loadcell target reached ({target_mass_kg:.2} kg, {fill_percent:.1}%). Auto-closing nitrous valve."
                             ));
                         }
                         Err(err) => {

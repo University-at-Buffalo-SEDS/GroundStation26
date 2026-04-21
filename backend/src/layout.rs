@@ -388,7 +388,7 @@ fn default_battery_window_seconds() -> u64 {
 }
 
 fn default_battery_min_drop_rate_v_per_min() -> f32 {
-    0.005
+    0.000001
 }
 
 fn default_battery_input_data_type() -> String {
