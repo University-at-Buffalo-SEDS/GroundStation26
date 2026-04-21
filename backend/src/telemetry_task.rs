@@ -776,19 +776,6 @@ async fn emit_derived_loadcell_rows(
                 ),
             ]
         }
-        loadcell::RAW_LOADCELL_DATA_TYPE_50KG => {
-            let percent = loadcell::fill_percent(&cfg, calibrated_value);
-            vec![
-                (
-                    loadcell::DERIVED_50KG_CALIBRATED_DATA_TYPE,
-                    vec![Some(calibrated_value)],
-                ),
-                (
-                    loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
-                    vec![Some(percent)],
-                ),
-            ]
-        }
         loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
             {
                 let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
@@ -2111,7 +2098,6 @@ async fn handle_packet(
             if matches!(
                 data_type_str.as_str(),
                 loadcell::RAW_LOADCELL_DATA_TYPE_1000KG
-                    | loadcell::RAW_LOADCELL_DATA_TYPE_50KG
                     | loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
                     | "FUEL_TANK_PRESSURE"
             ) {

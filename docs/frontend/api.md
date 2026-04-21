@@ -401,7 +401,7 @@ Legacy aliases still exposed:
 
 These are required for the calibration tab to be interactive.
 
-Calibration documents keep legacy fields for `ch0`, `ch1`, and `iadc`. Additional channels use
+Calibration documents keep legacy fields for `ch1` and `iadc`. Additional channels use
 `extra_channels[channel_id]` with generic `linear`, `zero_raw`, `points`, and `fit` fields. Generic
 points use `{ "expected": number, "raw": number }`.
 

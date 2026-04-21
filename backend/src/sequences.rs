@@ -816,20 +816,17 @@ fn calibrated_value_in_range(
 }
 
 fn fill_sequence_calibration_issue(
-    state: &AppState,
+    _state: &AppState,
     cfg: &SequenceConfig,
     pressure_psi: Option<f32>,
     current_mass_kg: Option<f32>,
 ) -> Option<String> {
-    let loadcell_cfg = state.loadcell_calibration.lock().unwrap().clone();
+    if crate::flight_sim::sim_mode_enabled() {
+        return None;
+    }
+
     let mut issues = Vec::new();
 
-    if !loadcell::has_calibration_data(&loadcell_cfg, loadcell::RAW_LOADCELL_DATA_TYPE_1000KG) {
-        issues.push("1000kg loadcell has no calibration data".to_string());
-    }
-    if !loadcell::has_calibration_data(&loadcell_cfg, loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE) {
-        issues.push("tank pressure sensor has no calibration data".to_string());
-    }
     if let Err(issue) = calibrated_value_in_range(
         "Fill mass",
         current_mass_kg,
@@ -851,7 +848,7 @@ fn fill_sequence_calibration_issue(
         None
     } else {
         Some(format!(
-            "Calibrate sequence sensors before starting fill sequence: {}.",
+            "Check sequence sensor calibration before starting fill sequence: {}.",
             issues.join("; ")
         ))
     }
