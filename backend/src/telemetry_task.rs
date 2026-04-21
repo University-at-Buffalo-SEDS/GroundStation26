@@ -2040,7 +2040,11 @@ async fn handle_packet(
     }
 
     let data_type_str = pkt.data_type().as_str().to_string();
-    let ts_ms = if pkt.data_type() == DataType::GpsData {
+    let use_ingest_timestamp = matches!(
+        pkt.data_type(),
+        DataType::GpsData | DataType::FuelTankPressure
+    );
+    let ts_ms = if use_ingest_timestamp {
         get_current_timestamp_ms() as i64
     } else {
         pkt.timestamp() as i64
@@ -2561,6 +2565,10 @@ mod tests {
 
         assert_eq!(row.data_type, DataType::FuelTankPressure.as_str());
         assert_eq!(row.values, vec![Some(370.0)]);
+        assert!(
+            row.timestamp_ms > 567_890,
+            "raw pressure row should use ground-station ingest time, not stale board timestamp"
+        );
 
         let derived = ws_rx
             .recv()
