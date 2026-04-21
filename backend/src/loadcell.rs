@@ -1155,7 +1155,75 @@ pub fn calibrated_sensor_value(
     }
 }
 
+fn non_default_linear(linear: &ChannelLinear) -> bool {
+    linear.m.is_some_and(|m| (m - 1.0).abs() > f32::EPSILON)
+        || linear.b.is_some_and(|b| b.abs() > f32::EPSILON)
+}
+
+fn fit_has_coefficients(fit: Option<&FitMeta>) -> bool {
+    fit.is_some_and(|fit| {
+        fit.a.is_some() || fit.b.is_some() || fit.c.is_some() || fit.d.is_some() || fit.e.is_some()
+    })
+}
+
+/// Returns true when a sequence-critical sensor has evidence of real calibration data.
+pub fn has_calibration_data(cfg: &LoadcellCalibrationFile, sensor_id: &str) -> bool {
+    match sensor_id {
+        RAW_LOADCELL_DATA_TYPE_1000KG => {
+            !cfg.points_ch1.is_empty()
+                || cfg.ch1_zero_raw.is_some()
+                || non_default_linear(&cfg.ch1)
+                || fit_has_coefficients(cfg.ch1_fit.as_ref())
+        }
+        RAW_LOADCELL_DATA_TYPE_50KG => {
+            !cfg.points.is_empty()
+                || cfg.ch0_zero_raw.is_some()
+                || non_default_linear(&cfg.ch0)
+                || fit_has_coefficients(cfg.ch0_fit.as_ref())
+        }
+        RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
+            !cfg.points_iadc.is_empty()
+                || cfg.iadc_zero_raw.is_some()
+                || non_default_linear(&cfg.iadc)
+                || fit_has_coefficients(cfg.iadc_fit.as_ref())
+        }
+        _ => false,
+    }
+}
+
 pub fn fill_percent(cfg: &LoadcellCalibrationFile, weight_kg: f32) -> f32 {
     let denom = cfg.full_mass_kg.unwrap_or(DEFAULT_FULL_MASS_KG).max(0.0001);
     ((weight_kg / denom) * 100.0).clamp(0.0, 100.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_linear_fit_is_not_calibration_evidence() {
+        let cfg = LoadcellCalibrationFile::default();
+
+        assert!(!has_calibration_data(&cfg, RAW_LOADCELL_DATA_TYPE_1000KG));
+        assert!(!has_calibration_data(
+            &cfg,
+            RAW_PRESSURE_TRANSDUCER_DATA_TYPE
+        ));
+    }
+
+    #[test]
+    fn points_or_non_default_coefficients_count_as_calibration_evidence() {
+        let mut cfg = LoadcellCalibrationFile::default();
+        cfg.points_ch1.push(PointCh1 {
+            kg: 10.0,
+            ch1_raw: 0.25,
+        });
+        cfg.iadc.m = Some(12.5);
+
+        assert!(has_calibration_data(&cfg, RAW_LOADCELL_DATA_TYPE_1000KG));
+        assert!(has_calibration_data(
+            &cfg,
+            RAW_PRESSURE_TRANSDUCER_DATA_TYPE
+        ));
+    }
 }

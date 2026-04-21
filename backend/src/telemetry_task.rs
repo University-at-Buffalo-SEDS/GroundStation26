@@ -745,6 +745,17 @@ async fn emit_derived_loadcell_rows(
     let Some(calibrated_value) =
         loadcell::calibrated_sensor_value(&cfg, calibration_sensor_id, sample.raw_value)
     else {
+        match calibration_sensor_id {
+            loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
+                let mut latest = state.latest_fill_mass_kg.lock().unwrap();
+                *latest = None;
+            }
+            loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
+                let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
+                *pressure = None;
+            }
+            _ => {}
+        }
         return;
     };
     let rows: Vec<(&str, Vec<Option<f32>>)> = match calibration_sensor_id {
@@ -778,10 +789,16 @@ async fn emit_derived_loadcell_rows(
                 ),
             ]
         }
-        loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => vec![(
-            loadcell::DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE,
-            vec![Some(calibrated_value)],
-        )],
+        loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
+            {
+                let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
+                *pressure = Some(calibrated_value);
+            }
+            vec![(
+                loadcell::DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE,
+                vec![Some(calibrated_value)],
+            )]
+        }
         _ => Vec::new(),
     };
 
@@ -2053,11 +2070,6 @@ async fn handle_packet(
         if pkt.data_type() == DataType::GpsData {
             values_vec = normalized_gps_values(state, pkt.sender(), &values_vec);
         }
-        if pkt.data_type() == DataType::FuelTankPressure {
-            let latest = values_vec.first().copied().flatten();
-            let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
-            *pressure = latest;
-        }
         let values_json = serde_json::to_string(
             &values_vec
                 .iter()
@@ -2531,6 +2543,51 @@ mod tests {
                 loadcell::DERIVED_FILL_PERCENT_DATA_TYPE.to_string(),
                 loadcell::DERIVED_WEIGHT_DATA_TYPE.to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fuel_tank_pressure_updates_latest_with_calibrated_value() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        let mut ws_rx = state.ws_tx.subscribe();
+
+        {
+            let mut cfg = state.loadcell_calibration.lock().unwrap();
+            cfg.iadc.m = Some(2.0);
+            cfg.iadc.b = Some(5.0);
+            cfg.iadc_fit = None;
+        }
+
+        let pkt = Packet::new(
+            DataType::FuelTankPressure,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            Board::DaqBoard.sender_id(),
+            567_890,
+            f32_payload(&[370.0]),
+        )
+        .expect("failed to build fuel tank pressure packet");
+
+        let row = handle_packet(&state, &db_tx, &db_overflow, pkt)
+            .await
+            .expect("fuel tank pressure packet should produce raw telemetry row");
+
+        assert_eq!(row.data_type, DataType::FuelTankPressure.as_str());
+        assert_eq!(row.values, vec![Some(370.0)]);
+
+        let derived = ws_rx
+            .recv()
+            .await
+            .expect("derived calibrated pressure row should be broadcast");
+        assert_eq!(
+            derived.data_type,
+            loadcell::DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE
+        );
+        assert_eq!(derived.values, vec![Some(745.0)]);
+        assert_eq!(
+            *state.latest_fuel_tank_pressure.lock().unwrap(),
+            Some(745.0)
         );
     }
 }

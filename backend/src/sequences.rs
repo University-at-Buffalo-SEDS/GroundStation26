@@ -135,6 +135,10 @@ struct SequenceConfig {
     allowed_hold_mass_drop_kg_per_min: f32,
     nitrous_weight_rise_epsilon_kg: f32,
     empty_mass_noise_allowance_kg: f32,
+    calibration_pressure_min_psi: f32,
+    calibration_pressure_max_psi: f32,
+    calibration_mass_min_kg: f32,
+    calibration_mass_max_kg: f32,
     pending_fast_window: Duration,
     key_required: bool,
     key_enable_pin: u8,
@@ -257,6 +261,37 @@ impl SequenceConfig {
             .unwrap_or(3.0)
             .max(0.0);
 
+        let calibration_pressure_min_psi =
+            std::env::var("GS_SEQUENCE_CALIBRATION_PRESSURE_MIN_PSI")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.0);
+
+        let calibration_pressure_max_psi =
+            std::env::var("GS_SEQUENCE_CALIBRATION_PRESSURE_MAX_PSI")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(3000.0)
+                .max(calibration_pressure_min_psi);
+
+        let calibration_mass_min_kg = std::env::var("GS_SEQUENCE_CALIBRATION_MASS_MIN_KG")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(-empty_mass_noise_allowance_kg);
+
+        let calibration_mass_max_kg = std::env::var("GS_SEQUENCE_CALIBRATION_MASS_MAX_KG")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or_else(|| {
+                fill_cfg
+                    .nitrous
+                    .target_mass_kg
+                    .max(fill_cfg.nitrogen.target_mass_kg)
+                    .max(loadcell::DEFAULT_FULL_MASS_KG)
+                    + empty_mass_noise_allowance_kg
+            })
+            .max(calibration_mass_min_kg);
+
         let pending_fast_window = std::env::var("GS_SEQUENCE_PENDING_FAST_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -304,6 +339,10 @@ impl SequenceConfig {
             allowed_hold_mass_drop_kg_per_min,
             nitrous_weight_rise_epsilon_kg,
             empty_mass_noise_allowance_kg,
+            calibration_pressure_min_psi,
+            calibration_pressure_max_psi,
+            calibration_mass_min_kg,
+            calibration_mass_max_kg,
             pending_fast_window,
             key_required,
             key_enable_pin,
@@ -339,6 +378,9 @@ struct SequenceRuntime {
     notified_nitrous_dump_recovery: bool,
     notified_nitrous_recovery_vent: bool,
     notified_nitrous_recovery_close_dump: bool,
+    calibration_ready: bool,
+    calibration_block_notification_id: Option<u64>,
+    calibration_block_message: Option<String>,
 }
 
 impl Default for SequenceRuntime {
@@ -369,6 +411,9 @@ impl Default for SequenceRuntime {
             notified_nitrous_dump_recovery: false,
             notified_nitrous_recovery_vent: false,
             notified_nitrous_recovery_close_dump: false,
+            calibration_ready: false,
+            calibration_block_notification_id: None,
+            calibration_block_message: None,
         }
     }
 }
@@ -752,6 +797,66 @@ fn tank_is_vented(
         && mass_is_vented(current_mass_kg, cfg)
 }
 
+fn calibrated_value_in_range(
+    label: &str,
+    value: Option<f32>,
+    min: f32,
+    max: f32,
+) -> Result<(), String> {
+    let value = value.ok_or_else(|| format!("{label} has no calibrated telemetry yet"))?;
+    if !value.is_finite() {
+        return Err(format!("{label} calibrated value is not finite"));
+    }
+    if value < min || value > max {
+        return Err(format!(
+            "{label} calibrated value {value:.2} is outside {min:.2}..{max:.2}"
+        ));
+    }
+    Ok(())
+}
+
+fn fill_sequence_calibration_issue(
+    state: &AppState,
+    cfg: &SequenceConfig,
+    pressure_psi: Option<f32>,
+    current_mass_kg: Option<f32>,
+) -> Option<String> {
+    let loadcell_cfg = state.loadcell_calibration.lock().unwrap().clone();
+    let mut issues = Vec::new();
+
+    if !loadcell::has_calibration_data(&loadcell_cfg, loadcell::RAW_LOADCELL_DATA_TYPE_1000KG) {
+        issues.push("1000kg loadcell has no calibration data".to_string());
+    }
+    if !loadcell::has_calibration_data(&loadcell_cfg, loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE) {
+        issues.push("tank pressure sensor has no calibration data".to_string());
+    }
+    if let Err(issue) = calibrated_value_in_range(
+        "Fill mass",
+        current_mass_kg,
+        cfg.calibration_mass_min_kg,
+        cfg.calibration_mass_max_kg,
+    ) {
+        issues.push(issue);
+    }
+    if let Err(issue) = calibrated_value_in_range(
+        "Tank pressure",
+        pressure_psi,
+        cfg.calibration_pressure_min_psi,
+        cfg.calibration_pressure_max_psi,
+    ) {
+        issues.push(issue);
+    }
+
+    if issues.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Calibrate sequence sensors before starting fill sequence: {}.",
+            issues.join("; ")
+        ))
+    }
+}
+
 fn nitrous_fill_status(state: &AppState, current_mass_kg: f32) -> (f32, f32) {
     let fill_target_mass_kg = fill_targets::load_or_default().nitrous.target_mass_kg;
     let loadcell_cfg = state.loadcell_calibration.lock().unwrap().clone();
@@ -817,6 +922,29 @@ fn update_sequence_runtime(
     }
     if valves.normally_open == Some(true) {
         runtime.notified_reopen_normally_open = false;
+    }
+
+    if matches!(runtime.step, SequenceStep::SetupValves) {
+        if let Some(issue) =
+            fill_sequence_calibration_issue(state, cfg, pressure_psi, current_mass_kg)
+        {
+            runtime.calibration_ready = false;
+            if runtime.calibration_block_message.as_deref() != Some(issue.as_str()) {
+                if let Some(id) = runtime.calibration_block_notification_id.take() {
+                    let _ = state.dismiss_notification(id);
+                }
+                let id = state.add_notification(issue.clone());
+                runtime.calibration_block_notification_id = Some(id);
+                runtime.calibration_block_message = Some(issue);
+            }
+            return;
+        }
+
+        runtime.calibration_ready = true;
+        if let Some(id) = runtime.calibration_block_notification_id.take() {
+            let _ = state.dismiss_notification(id);
+        }
+        runtime.calibration_block_message = None;
     }
 
     match runtime.step {
@@ -1282,6 +1410,7 @@ fn maybe_drive_local_prelaunch_state(
     let desired_state = match runtime.step {
         SequenceStep::SetupValves => {
             if current_state == FlightState::Idle
+                && runtime.calibration_ready
                 && valves.normally_open == Some(true)
                 && valves.dump_open == Some(false)
             {
@@ -1410,6 +1539,18 @@ fn build_policy(
             inputs.valves,
             enabled,
         );
+        if inputs.flight_state == FlightState::Idle && !runtime.calibration_ready {
+            for cmd in [
+                "NormallyOpen",
+                "Nitrogen",
+                "Nitrous",
+                "Pilot",
+                "Igniter",
+                "RetractPlumbing",
+            ] {
+                set_control_enabled(&mut policy, cmd, false);
+            }
+        }
         set_control_enabled(&mut policy, "Launch", false);
         return policy;
     }
