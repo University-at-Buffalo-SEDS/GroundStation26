@@ -63,6 +63,14 @@ const NITROGEN_PRESSURE_RESPONSE_PER_S: f32 = 1.0;
 #[cfg(feature = "testing")]
 const NITROGEN_MASS_GAIN_KG_PER_S: f32 = 0.08;
 #[cfg(feature = "testing")]
+const DUMP_MASS_VENT_KG_PER_S: f32 = 0.55;
+#[cfg(feature = "testing")]
+const NORMALLY_OPEN_MASS_LEAK_KG_PER_S: f32 = 0.0002;
+#[cfg(feature = "testing")]
+const DUMP_PRESSURE_BLEED_PSI_PER_S: f32 = 80.0;
+#[cfg(feature = "testing")]
+const NORMALLY_OPEN_PRESSURE_BLEED_PSI_PER_S: f32 = 0.25;
+#[cfg(feature = "testing")]
 const GRAVITY_FPS2: f32 = 32.174;
 
 #[cfg(feature = "testing")]
@@ -187,16 +195,8 @@ fn nitrous_equilibrium_pressure_psi(loadcell_mass_kg: f32) -> f32 {
 }
 
 #[cfg(feature = "testing")]
-fn vented_pressure_target_psi(loadcell_mass_kg: f32, nitrous_loaded: bool) -> f32 {
-    if loadcell_mass_kg <= 0.01 {
-        return 0.0;
-    }
-    if nitrous_loaded {
-        let fill_frac = (loadcell_mass_kg / sim_full_mass_kg()).clamp(0.0, 1.0);
-        NITROUS_ROOM_TEMP_SATURATION_PSI * fill_frac
-    } else {
-        nitrogen_pressure_target_psi(loadcell_mass_kg)
-    }
+fn vented_pressure_target_psi(_loadcell_mass_kg: f32, _nitrous_loaded: bool) -> f32 {
+    0.0
 }
 
 #[cfg(feature = "testing")]
@@ -714,22 +714,22 @@ impl FlightSimState {
         } else if n2o_open && !dump_open {
             self.loadcell_mass_kg =
                 (self.loadcell_mass_kg + dt_s * (fill_target / 18.0)).min(fill_target);
-        } else if dump_open || no_open {
-            self.loadcell_mass_kg = (self.loadcell_mass_kg - dt_s * 0.35).max(0.0);
         }
 
-        if dump_open || no_open {
-            let target_psi = vented_pressure_target_psi(self.loadcell_mass_kg, nitrous_loaded);
-            let vent_response = if dump_open && no_open { 3.0 } else { 2.1 };
-            let max_step = vent_response * dt_s.max(0.02) * 20.0;
-            let delta = target_psi - self.fuel_tank_pressure_psi;
-            self.fuel_tank_pressure_psi += delta.clamp(-max_step, max_step);
-        } else if n2_open {
+        if dump_open {
+            self.loadcell_mass_kg =
+                (self.loadcell_mass_kg - dt_s * DUMP_MASS_VENT_KG_PER_S).max(0.0);
+        } else if no_open {
+            self.loadcell_mass_kg =
+                (self.loadcell_mass_kg - dt_s * NORMALLY_OPEN_MASS_LEAK_KG_PER_S).max(0.0);
+        }
+
+        if n2_open && !dump_open {
             let target_psi = nitrogen_pressure_target_psi(self.loadcell_mass_kg);
             let delta = target_psi - self.fuel_tank_pressure_psi;
             let max_step = NITROGEN_PRESSURE_RESPONSE_PER_S * dt_s.max(0.02) * 20.0;
             self.fuel_tank_pressure_psi += delta.clamp(-max_step, max_step);
-        } else if n2o_open {
+        } else if n2o_open && !dump_open {
             // Nitrous is self-pressurizing: pressure trends toward equilibrium
             // while the actual quantity is determined by the loadcell mass.
             let target_psi = nitrous_equilibrium_pressure_psi(self.loadcell_mass_kg);
@@ -747,6 +747,22 @@ impl FlightSimState {
             }
             self.fuel_tank_pressure_psi = self.fuel_tank_pressure_psi.max(0.0);
         }
+
+        if dump_open {
+            let target_psi = vented_pressure_target_psi(self.loadcell_mass_kg, nitrous_loaded);
+            let delta = target_psi - self.fuel_tank_pressure_psi;
+            self.fuel_tank_pressure_psi += delta.clamp(
+                -DUMP_PRESSURE_BLEED_PSI_PER_S * dt_s,
+                DUMP_PRESSURE_BLEED_PSI_PER_S * dt_s,
+            );
+        } else if no_open {
+            let delta = -self.fuel_tank_pressure_psi;
+            self.fuel_tank_pressure_psi += delta.clamp(
+                -NORMALLY_OPEN_PRESSURE_BLEED_PSI_PER_S * dt_s,
+                NORMALLY_OPEN_PRESSURE_BLEED_PSI_PER_S * dt_s,
+            );
+        }
+        self.fuel_tank_pressure_psi = self.fuel_tank_pressure_psi.max(0.0);
 
         if let Some(t0_ms) = self.launch_time_ms {
             let t = (now_ms.saturating_sub(t0_ms) as f32) / 1000.0;

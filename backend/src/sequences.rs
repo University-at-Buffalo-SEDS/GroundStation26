@@ -125,6 +125,7 @@ struct SequenceConfig {
     max_leak_drop_psi: f32,
     max_leak_mass_delta_kg: f32,
     allowed_hold_drop_psi_per_min: f32,
+    normally_open_hold_drop_psi_per_min: f32,
     allowed_hold_mass_drop_kg_per_min: f32,
     nitrous_weight_rise_epsilon_kg: f32,
     pending_fast_window: Duration,
@@ -225,6 +226,12 @@ impl SequenceConfig {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(0.2);
 
+        let normally_open_hold_drop_psi_per_min =
+            std::env::var("GS_SEQUENCE_NO_HOLD_DROP_PSI_PER_MIN")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(20.0);
+
         let allowed_hold_mass_drop_kg_per_min =
             std::env::var("GS_SEQUENCE_ALLOWED_HOLD_MASS_DROP_KG_PER_MIN")
                 .ok()
@@ -280,6 +287,7 @@ impl SequenceConfig {
             max_leak_drop_psi,
             max_leak_mass_delta_kg,
             allowed_hold_drop_psi_per_min,
+            normally_open_hold_drop_psi_per_min,
             allowed_hold_mass_drop_kg_per_min,
             nitrous_weight_rise_epsilon_kg,
             pending_fast_window,
@@ -698,7 +706,7 @@ fn update_sequence_runtime(
                         match cfg.nitrogen_autoclose_mode {
                             NitrogenAutocloseMode::Pressure => {
                                 state.add_notification(format!(
-                                    "Nitrogen pressure target reached ({:.1} psi). Closing nitrogen valve.",
+                                    "Nitrogen pressure target reached ({:.1} psi). Auto-closing nitrogen valve.",
                                     cfg.nitrogen_pressure_target_psi
                                 ));
                             }
@@ -706,14 +714,14 @@ fn update_sequence_runtime(
                                 let target_mass_kg =
                                     cfg.nitrogen_target_mass_kg.unwrap_or_default();
                                 state.add_notification(format!(
-                                    "Nitrogen weight target reached ({target_mass_kg:.2} kg). Closing nitrogen valve."
+                                    "Nitrogen weight target reached ({target_mass_kg:.2} kg). Auto-closing nitrogen valve."
                                 ));
                             }
                             NitrogenAutocloseMode::Both => {
                                 let target_mass_kg =
                                     cfg.nitrogen_target_mass_kg.unwrap_or_default();
                                 state.add_notification(format!(
-                                    "Nitrogen targets reached ({target_mass_kg:.2} kg, {:.1} psi). Closing nitrogen valve.",
+                                    "Nitrogen targets reached ({target_mass_kg:.2} kg, {:.1} psi). Auto-closing nitrogen valve.",
                                     cfg.nitrogen_pressure_target_psi
                                 ));
                             }
@@ -721,7 +729,7 @@ fn update_sequence_runtime(
                                 let target_mass_kg =
                                     cfg.nitrogen_target_mass_kg.unwrap_or_default();
                                 state.add_notification(format!(
-                                    "Nitrogen fill target reached by weight or pressure ({target_mass_kg:.2} kg / {:.1} psi). Closing nitrogen valve.",
+                                    "Nitrogen fill target reached by weight or pressure ({target_mass_kg:.2} kg / {:.1} psi). Auto-closing nitrogen valve.",
                                     cfg.nitrogen_pressure_target_psi
                                 ));
                             }
@@ -731,7 +739,7 @@ fn update_sequence_runtime(
                     Err(err) => {
                         emit_warning(
                             state,
-                            format!("Auto-close nitrogen command failed at loadcell target: {err}"),
+                            format!("Auto-close nitrogen command failed at fill target: {err}"),
                         );
                     }
                 }
@@ -745,10 +753,17 @@ fn update_sequence_runtime(
                 runtime.step_started_at = Some(now);
                 runtime.warned_rapid_drop = false;
                 runtime.warned_mass_shift = false;
-                state.add_temporary_notification(format!(
-                    "Nitrogen fill test started. Monitoring pressure and loadcell hold for {}s.",
-                    cfg.leak_check_duration.as_secs()
-                ));
+                if valves.normally_open == Some(true) {
+                    state.add_temporary_notification(format!(
+                        "Nitrogen fill test started. N/O is open, so a controlled pressure bleed is expected while loadcell hold is monitored for {}s.",
+                        cfg.leak_check_duration.as_secs()
+                    ));
+                } else {
+                    state.add_temporary_notification(format!(
+                        "Nitrogen fill test started. Monitoring pressure and loadcell hold for {}s.",
+                        cfg.leak_check_duration.as_secs()
+                    ));
+                }
                 runtime.step = SequenceStep::NitrogenLeakCheck;
             }
         }
@@ -765,16 +780,21 @@ fn update_sequence_runtime(
                 .map(|m| (m - mass_baseline).abs())
                 .unwrap_or(0.0);
             let elapsed_min = now.saturating_duration_since(started).as_secs_f32() / 60.0;
-            let allowed_pressure_drop =
-                cfg.max_leak_drop_psi + elapsed_min * cfg.allowed_hold_drop_psi_per_min;
+            let allowed_pressure_drop = cfg.max_leak_drop_psi
+                + elapsed_min
+                    * if valves.normally_open == Some(true) {
+                        cfg.normally_open_hold_drop_psi_per_min
+                    } else {
+                        cfg.allowed_hold_drop_psi_per_min
+                    };
             let allowed_mass_shift =
                 cfg.max_leak_mass_delta_kg + elapsed_min * cfg.allowed_hold_mass_drop_kg_per_min;
-            if !runtime.warned_rapid_drop && drop_psi > cfg.max_leak_drop_psi {
+            if !runtime.warned_rapid_drop && drop_psi > allowed_pressure_drop {
                 runtime.warned_rapid_drop = true;
                 emit_warning(
                     state,
                     format!(
-                        "Rapid pressure drop detected during fill test: -{drop_psi:.2} psi from hold baseline"
+                        "Pressure drop exceeded fill-test allowance: -{drop_psi:.2} psi from hold baseline"
                     ),
                 );
             }
@@ -797,9 +817,15 @@ fn update_sequence_runtime(
             if pressure_ok && mass_ok {
                 dismiss_leak_fail_notification(state, runtime);
                 if !runtime.notified_leak_pass {
-                    state.add_notification(
-                        "Nitrogen hold check passed. Pressure and loadcell are stable.",
-                    );
+                    if valves.normally_open == Some(true) {
+                        state.add_notification(
+                            "Nitrogen hold check passed. N/O bleed stayed within allowance and loadcell is stable.",
+                        );
+                    } else {
+                        state.add_notification(
+                            "Nitrogen hold check passed. Pressure and loadcell are stable.",
+                        );
+                    }
                     runtime.notified_leak_pass = true;
                 }
                 runtime.next_step_after_dump = Some(SequenceStep::OpenNitrous);
@@ -807,7 +833,7 @@ fn update_sequence_runtime(
                 runtime.step_started_at = None;
             } else {
                 runtime.leak_fail_notification_id = Some(state.add_notification_action(
-                    "Nitrogen hold check failed: pressure or loadcell drifted. Dumping and awaiting operator decision.",
+                    "Nitrogen hold check failed: pressure exceeded allowance or loadcell drifted. Dumping and awaiting operator decision.",
                     true,
                     Some("Continue anyway".to_string()),
                     Some("ContinueFillSequence".to_string()),
@@ -876,7 +902,7 @@ fn update_sequence_runtime(
                         Ok(_) => {
                             runtime.auto_close_nitrous_sent = true;
                             state.add_notification(format!(
-                                "Loadcell target reached ({target_mass_kg:.2} kg). Closing nitrous valve."
+                                "Nitrous loadcell target reached ({target_mass_kg:.2} kg). Auto-closing nitrous valve."
                             ));
                         }
                         Err(err) => {
@@ -924,17 +950,38 @@ fn update_sequence_runtime(
             let leveled_since = runtime.nitrous_level_since.get_or_insert(now);
             if now.saturating_duration_since(*leveled_since) >= cfg.nitrous_level_duration {
                 runtime.notified_close_nitrous = false;
+                if !runtime.auto_close_nitrous_sent {
+                    match state.cmd_tx.try_send(TelemetryCommand::NitrousClose) {
+                        Ok(_) => {
+                            runtime.auto_close_nitrous_sent = true;
+                            state.add_notification(
+                                "Nitrous fill has leveled by pressure and loadcell. Auto-closing nitrous valve.",
+                            );
+                        }
+                        Err(err) => {
+                            emit_warning(
+                                state,
+                                format!(
+                                    "Auto-close nitrous command failed after fill leveled: {err}"
+                                ),
+                            );
+                        }
+                    }
+                }
                 runtime.step = SequenceStep::CloseNitrous;
             }
         }
         SequenceStep::CloseNitrous => {
             if !runtime.notified_close_nitrous {
-                state.add_notification(
-                    "Nitrous fill has leveled by pressure and loadcell. Close Nitrous valve to start settle timer.",
-                );
+                if runtime.auto_close_nitrous_sent {
+                    state.add_notification("Waiting for nitrous valve to report closed.");
+                } else {
+                    state.add_notification("Close Nitrous valve to start the settle timer.");
+                }
                 runtime.notified_close_nitrous = true;
             }
             if valves.nitrous_open == Some(false) {
+                runtime.auto_close_nitrous_sent = false;
                 runtime.step_started_at = Some(now);
                 state.add_temporary_notification(format!(
                     "Nitrous settle started. Waiting {}s before fill line removal.",

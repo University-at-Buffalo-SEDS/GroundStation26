@@ -733,14 +733,14 @@
           {
             "id": "loadcell_pressure_transducer",
             "label": "Pressure Transducer",
-            "data_type": "IADC",
+            "data_type": "FUEL_TANK_PRESSURE",
             "channels": [
               "Pressure Transducer"
             ],
             "chart_groups": [
               {
                 "title": "Raw",
-                "data_type": "IADC",
+                "data_type": "FUEL_TANK_PRESSURE",
                 "labels": [
                   "Raw"
                 ],
@@ -762,7 +762,7 @@
             "summary_items": [
               {
                 "label": "Raw",
-                "data_type": "IADC",
+                "data_type": "FUEL_TANK_PRESSURE",
                 "index": 0
               },
               {

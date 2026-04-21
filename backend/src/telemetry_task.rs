@@ -736,13 +736,18 @@ async fn emit_derived_loadcell_rows(
     db_overflow: &DbOverflow,
     sample: DerivedLoadcellSample<'_>,
 ) {
+    let calibration_sensor_id = if sample.sensor_id == DataType::FuelTankPressure.as_str() {
+        loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
+    } else {
+        sample.sensor_id
+    };
     let cfg = state.loadcell_calibration.lock().unwrap().clone();
     let Some(calibrated_value) =
-        loadcell::calibrated_sensor_value(&cfg, sample.sensor_id, sample.raw_value)
+        loadcell::calibrated_sensor_value(&cfg, calibration_sensor_id, sample.raw_value)
     else {
         return;
     };
-    let rows: Vec<(&str, Vec<Option<f32>>)> = match sample.sensor_id {
+    let rows: Vec<(&str, Vec<Option<f32>>)> = match calibration_sensor_id {
         loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
             let percent = loadcell::fill_percent(&cfg, calibrated_value);
             {
@@ -2096,6 +2101,7 @@ async fn handle_packet(
                 loadcell::RAW_LOADCELL_DATA_TYPE_1000KG
                     | loadcell::RAW_LOADCELL_DATA_TYPE_50KG
                     | loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
+                    | "FUEL_TANK_PRESSURE"
             ) {
                 emit_derived_loadcell_rows(
                     state,
