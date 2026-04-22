@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TelemetryCommand {
+    Launch,
     Dump,
     Abort,
     NormallyOpen,

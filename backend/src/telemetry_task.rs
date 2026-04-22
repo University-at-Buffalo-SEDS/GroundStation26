@@ -44,6 +44,8 @@ fn spawn_comms_worker_threads(
         .name(format!("{}_tx_worker", worker_name))
         .spawn(move || {
             let mut comms_shutdown_rx = tx_state.shutdown_subscribe();
+            let mut last_send_error_log_ms = 0;
+            let mut suppressed_send_errors = 0;
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -59,9 +61,22 @@ fn spawn_comms_worker_threads(
                             .expect("failed to get lock")
                             .send_data(&payload)
                         {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                if suppressed_send_errors > 0 {
+                                    eprintln!(
+                                        "{worker_name} tx worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
+                                    );
+                                    suppressed_send_errors = 0;
+                                    last_send_error_log_ms = 0;
+                                }
+                            }
                             Err(e) => {
-                                eprintln!("{worker_name} tx worker send_data failed: {e}");
+                                log_repeated_worker_error(
+                                    &format!("{worker_name} tx worker send_data failed"),
+                                    &e.to_string(),
+                                    &mut last_send_error_log_ms,
+                                    &mut suppressed_send_errors,
+                                );
                             }
                         }
                     }
@@ -78,6 +93,8 @@ fn spawn_comms_worker_threads(
         .name(format!("{}_rx_worker", worker_name))
         .spawn(move || {
             let mut comms_shutdown_rx = state.shutdown_subscribe();
+            let mut last_recv_error_log_ms = 0;
+            let mut suppressed_recv_errors = 0;
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -100,9 +117,11 @@ fn spawn_comms_worker_threads(
                 {
                     Ok(_) => {}
                     Err(e) => {
-                        log_telemetry_error(
+                        log_repeated_worker_error(
                             &format!("{worker_name} rx worker recv_packet failed"),
-                            e,
+                            &format!("{e:?}"),
+                            &mut last_recv_error_log_ms,
+                            &mut suppressed_recv_errors,
                         );
                     }
                 }
@@ -112,6 +131,26 @@ fn spawn_comms_worker_threads(
         })?;
 
     Ok(vec![tx_worker, rx_worker])
+}
+
+fn log_repeated_worker_error(
+    context: &str,
+    detail: &str,
+    last_log_ms: &mut u64,
+    suppressed_count: &mut u64,
+) {
+    let now_ms = get_current_timestamp_ms();
+    if *last_log_ms == 0 || now_ms.saturating_sub(*last_log_ms) >= COMMS_ERROR_LOG_INTERVAL_MS {
+        if *suppressed_count > 0 {
+            eprintln!("{context}: {detail} (suppressed {suppressed_count} repeated errors)");
+        } else {
+            eprintln!("{context}: {detail}");
+        }
+        *last_log_ms = now_ms;
+        *suppressed_count = 0;
+    } else {
+        *suppressed_count += 1;
+    }
 }
 
 fn spawn_router_worker_thread(
@@ -154,10 +193,15 @@ const DB_BATCH_WAIT_MS_DEFAULT: u64 = 8;
 const ROUTER_QUEUE_BUDGET_MS: u32 = 6;
 const ROUTER_TX_BUDGET_MS: u32 = 3;
 const ROUTER_RX_BUDGET_MS: u32 = ROUTER_QUEUE_BUDGET_MS - ROUTER_TX_BUDGET_MS;
+const COMMS_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
+const ROUTER_DECODE_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 const LAUNCH_COMMAND_DELAY_MS: u64 = 5_000;
 const GPS_SATELLITES_DATA_TYPE: &str = "GPS_SATELLITE_NUMBER";
 const VEHICLE_SPEED_DATA_TYPE: &str = "VEHICLE_SPEED";
 const GRAVITY_MPS2: f32 = 9.80665;
+
+static ROUTER_DECODE_ERROR_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static ROUTER_DECODE_ERROR_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "hitl_mode")]
 fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
@@ -992,14 +1036,14 @@ fn send_launch_command(state: &AppState, router: &Router) {
     {
         if let Err(e) = router.log_queue(
             DataType::FlightCommand,
-            &[crate::rocket_commands::FlightCommands::Launch as u8],
+            &[FlightComputerCommands::LaunchSignal as u8],
         ) {
             log_telemetry_error("failed to log delayed Launch command", e);
         } else {
             log_command_queue_success(
                 "Delayed Launch command",
                 DataType::FlightCommand,
-                &[crate::rocket_commands::FlightCommands::Launch as u8],
+                &[FlightComputerCommands::LaunchSignal as u8],
             );
             flush_command_tx(router, "Delayed Launch command tx");
         }
@@ -1320,10 +1364,6 @@ pub async fn telemetry_task(
                                 }
                                 gs_debug_println!("Dump command sent {:?}", cmd);
                             }
-                            {
-                                let gpio = &state.gpio;
-                                gpio.write_output_pin(IGNITION_PIN, false).expect("failed to set gpio output");
-                            }
                         TelemetryCommand::Abort => {
                                 if let Err(e) = router.log(
                                     DataType::Abort,
@@ -1521,6 +1561,15 @@ pub async fn telemetry_task(
                                 state.set_launch_clock(launch_countdown_clock(now_ms));
                                 schedule_launch_command_after_delay(state.clone(), router.clone());
                                 gs_debug_println!("Launch command scheduled after {LAUNCH_COMMAND_DELAY_MS} ms");
+                            }
+                        TelemetryCommand::LaunchSignal => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::LaunchSignal as u8],
+                                ) {
+                                    log_telemetry_error("failed to log LaunchSignal command", e);
+                                }
+                                gs_debug_println!("LaunchSignal command sent");
                             }
                         TelemetryCommand::RollbackSignal => {
                                 if let Err(e) = router.log_queue(
@@ -2247,6 +2296,38 @@ fn log_telemetry_error(context: &str, err: sedsprintf_rs_2026::TelemetryError) {
     eprintln!("{context}: {:?}", err);
 }
 
+fn log_router_rx_error(err: sedsprintf_rs_2026::TelemetryError) {
+    if matches!(
+        err,
+        sedsprintf_rs_2026::TelemetryError::Deserialize(_)
+            | sedsprintf_rs_2026::TelemetryError::InvalidType
+    ) {
+        log_router_decode_error(err);
+    } else {
+        log_telemetry_error("router rx queue processing failed", err);
+    }
+}
+
+fn log_router_decode_error(err: sedsprintf_rs_2026::TelemetryError) {
+    let now_ms = get_current_timestamp_ms();
+    let last_log_ms = ROUTER_DECODE_ERROR_LAST_LOG_MS.load(Ordering::Relaxed);
+    if last_log_ms == 0 || now_ms.saturating_sub(last_log_ms) >= ROUTER_DECODE_ERROR_LOG_INTERVAL_MS
+    {
+        ROUTER_DECODE_ERROR_LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+        let suppressed = ROUTER_DECODE_ERROR_SUPPRESSED.swap(0, Ordering::Relaxed);
+        if suppressed > 0 {
+            eprintln!(
+                "router rx queue decode failed: {:?} (suppressed {suppressed} repeated decode errors)",
+                err
+            );
+        } else {
+            eprintln!("router rx queue decode failed: {:?}", err);
+        }
+    } else {
+        ROUTER_DECODE_ERROR_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
     eprintln!(
         "{context}: queued ty={ty:?} payload={}",
@@ -2265,7 +2346,7 @@ fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::Tele
     }
     if ROUTER_RX_BUDGET_MS > 0 {
         if let Err(err) = router.process_rx_queue_with_timeout(ROUTER_RX_BUDGET_MS) {
-            log_telemetry_error("router rx queue processing failed", err);
+            log_router_rx_error(err);
             return Ok(());
         }
     }

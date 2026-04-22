@@ -156,6 +156,33 @@ fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(
     }
 }
 
+fn take_buffered_serialized_packet(
+    rx_payload_buf: &mut Vec<u8>,
+) -> TelemetryResult<Option<Vec<u8>>> {
+    let scan_len = rx_payload_buf.len().min(RAW_UART_MAX_FRAME_BYTES);
+    for start in 0..scan_len {
+        for end in (start + 1)..=scan_len {
+            let candidate = &rx_payload_buf[start..end];
+            let Ok(frame) = serialize::peek_frame_info(candidate) else {
+                continue;
+            };
+            if !frame.ack_only() && serialize::deserialize_packet(candidate).is_err() {
+                continue;
+            }
+            let payload = candidate.to_vec();
+            rx_payload_buf.drain(..end);
+            return Ok(Some(payload));
+        }
+    }
+
+    if rx_payload_buf.len() > RAW_UART_MAX_FRAME_BYTES {
+        let drop_len = rx_payload_buf.len() - RAW_UART_MAX_FRAME_BYTES;
+        rx_payload_buf.drain(..drop_len);
+    }
+
+    Ok(None)
+}
+
 fn serial_description(name: &str, serial: &SerialLinkConfig) -> String {
     format!(
         "interface={name} port={} baud_rate={} protocol={:?}",
@@ -1041,24 +1068,7 @@ impl I2cComms {
 
     #[cfg(target_os = "linux")]
     fn try_take_buffered_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
-        let scan_len = self.rx_payload_buf.len().min(RAW_UART_MAX_FRAME_BYTES);
-        for start in 0..scan_len {
-            for end in (start + 1)..=scan_len {
-                let candidate = &self.rx_payload_buf[start..end];
-                if serialize::peek_frame_info(candidate).is_ok() {
-                    let payload = candidate.to_vec();
-                    self.rx_payload_buf.drain(..end);
-                    return Ok(Some(payload));
-                }
-            }
-        }
-
-        if self.rx_payload_buf.len() > RAW_UART_MAX_FRAME_BYTES {
-            let drop_len = self.rx_payload_buf.len() - RAW_UART_MAX_FRAME_BYTES;
-            self.rx_payload_buf.drain(..drop_len);
-        }
-
-        Ok(None)
+        take_buffered_serialized_packet(&mut self.rx_payload_buf)
     }
 
     #[cfg(target_os = "linux")]
@@ -1838,6 +1848,34 @@ mod raw_uart_tests {
         let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
         assert_eq!(decoded, payload);
         assert!(framed.is_empty());
+    }
+
+    #[test]
+    fn buffered_serialized_packet_waits_for_complete_packet() {
+        let pkt = Packet::from_f32_slice(
+            DataType::GpsData,
+            &[1.0, 2.0, 3.0],
+            &[DataEndpoint::GroundStation],
+            123,
+        )
+        .unwrap();
+        let wire = serialize::serialize_packet(&pkt);
+        let split_at = wire.len() / 2;
+        let mut buffered = wire[..split_at].to_vec();
+
+        assert!(
+            take_buffered_serialized_packet(&mut buffered)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(buffered, wire[..split_at]);
+
+        buffered.extend_from_slice(&wire[split_at..]);
+        let decoded = take_buffered_serialized_packet(&mut buffered)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, wire.as_ref());
+        assert!(buffered.is_empty());
     }
 }
 
