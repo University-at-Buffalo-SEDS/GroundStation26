@@ -2271,7 +2271,7 @@ async fn handle_packet(
                 db_overflow,
                 DbWrite::Telemetry {
                     timestamp_ms: ts_ms,
-                    data_type: data_type_str,
+                    data_type: data_type_str.clone(),
                     sender_id: pkt.sender().to_string(),
                     values_json: None,
                     payload_json,
@@ -2279,6 +2279,16 @@ async fn handle_packet(
             )
             .await;
         }
+
+        if pkt.data_type() == DataType::Heartbeat {
+            return Some(TelemetryRow {
+                timestamp_ms: ts_ms,
+                data_type: data_type_str,
+                sender_id: pkt.sender().to_string(),
+                values: Vec::new(),
+            });
+        }
+
         None
     }
 }
