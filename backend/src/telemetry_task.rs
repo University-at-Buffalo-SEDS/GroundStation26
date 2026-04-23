@@ -2142,7 +2142,7 @@ async fn handle_packet(
                     DbWrite::Telemetry {
                         timestamp_ms: ts_ms,
                         data_type: VALVE_STATE_DATA_TYPE.to_string(),
-                        sender_id: Board::GroundStation.sender_id().to_string(),
+                        sender_id: pkt.sender().to_string(),
                         values_json,
                         payload_json,
                     },
@@ -2152,7 +2152,7 @@ async fn handle_packet(
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
                     data_type: VALVE_STATE_DATA_TYPE.to_string(),
-                    sender_id: Board::GroundStation.sender_id().to_string(),
+                    sender_id: pkt.sender().to_string(),
                     values: values_vec,
                 };
                 return Some(row);

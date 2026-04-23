@@ -1467,6 +1467,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
     let controls = all_command_names()
         .into_iter()
         .map(|cmd| {
+            let enabled = cmd != "RetractPlumbing";
             let actuated = if is_recording_command(cmd) {
                 Some(true)
             } else {
@@ -1474,7 +1475,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
             };
             ActionControl {
                 cmd: cmd.to_string(),
-                enabled: true,
+                enabled,
                 blink: BlinkMode::None,
                 actuated,
             }
