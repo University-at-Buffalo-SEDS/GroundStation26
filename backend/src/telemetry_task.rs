@@ -1688,7 +1688,7 @@ pub async fn telemetry_task(
                         | TelemetryCommand::ReinitAfter30
                         | TelemetryCommand::ReinitAfter50 => {
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
-                                if let Err(e) = router.log_queue(DataType::FlightComputerCommand, &[cmd_id]) {
+                                if let Err(e) = router.log_queue(DataType::FlightCommand, &[cmd_id]) {
                                     log_telemetry_error("failed to log HITL flight command", e);
                                 }
                                 gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
