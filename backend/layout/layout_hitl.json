@@ -425,12 +425,57 @@
         }
       },
       {
-        "id": "KALMAN_FILTER_DATA",
-        "label": "Kalman Filter Data",
+        "id": "ASCENT_STATE",
+        "label": "Ascent Filter State",
         "channels": [
-          "X",
-          "Y",
-          "Z"
+          "Q0",
+          "Q1",
+          "Q2",
+          "Q3",
+          "Altitude",
+          "Velocity"
+        ],
+        "chart_groups": [
+          {
+            "channels": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "scale_mode": "shared"
+          },
+          {
+            "channels": [
+              4,
+              5
+            ],
+            "scale_mode": "per_series"
+          }
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "DESCENT_STATE",
+        "label": "Descent Filter State",
+        "channels": [
+          "Lat",
+          "Lon",
+          "Altitude",
+          "Velocity"
+        ],
+        "chart_groups": [
+          {
+            "channels": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "scale_mode": "per_series"
+          }
         ],
         "chart": {
           "enabled": true
@@ -940,14 +985,6 @@
           "NitrogenFill",
           "NitrousFill",
           "Armed",
-          "Launch",
-          "Ascent",
-          "Coast",
-          "Apogee",
-          "ParachuteDeploy",
-          "Descent",
-          "Landed",
-          "Recovery",
           "Aborted"
         ],
         "sections": [
@@ -1211,6 +1248,189 @@
                     "unknown_label": "Unknown"
                   }
                 ]
+              }
+            ],
+            "value_layout": "horizontal"
+          }
+        ]
+      },
+      {
+        "states": [
+          "Launch",
+          "Ascent",
+          "Coast",
+          "Apogee"
+        ],
+        "sections": [
+          {
+            "title": "Ascent Overview",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "ASCENT_STATE",
+                "items": [
+                  {
+                    "label": "Q0",
+                    "index": 0
+                  },
+                  {
+                    "label": "Altitude",
+                    "index": 4
+                  },
+                  {
+                    "label": "Velocity",
+                    "index": 5,
+                    "formatter": {
+                      "precision": 2,
+                      "suffix": " m/s"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "BAROMETER_DATA",
+                "items": [
+                  {
+                    "label": "Baro Alt",
+                    "index": 2
+                  },
+                  {
+                    "label": "Pressure",
+                    "index": 0
+                  },
+                  {
+                    "label": "Temp",
+                    "index": 1
+                  }
+                ]
+              },
+              {
+                "kind": "chart",
+                "chart_title": "Altitude Estimates",
+                "chart_series": [
+                  {
+                    "data_type": "BAROMETER_DATA",
+                    "index": 2,
+                    "label": "Barometer"
+                  },
+                  {
+                    "data_type": "ASCENT_STATE",
+                    "index": 4,
+                    "label": "Ascent KF"
+                  }
+                ],
+                "width": 1200.0,
+                "height": 260.0,
+                "full_width": true
+              },
+              {
+                "kind": "chart",
+                "chart_title": "Vertical Speed Comparison",
+                "chart_series": [
+                  {
+                    "data_type": "VEHICLE_SPEED",
+                    "index": 0,
+                    "label": "Fused"
+                  },
+                  {
+                    "data_type": "ASCENT_STATE",
+                    "index": 5,
+                    "label": "Ascent KF"
+                  }
+                ],
+                "width": 1200.0,
+                "height": 240.0,
+                "full_width": true
+              }
+            ],
+            "value_layout": "horizontal"
+          }
+        ]
+      },
+      {
+        "states": [
+          "ParachuteDeploy",
+          "Descent",
+          "Landed",
+          "Recovery"
+        ],
+        "sections": [
+          {
+            "title": "Descent Overview",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "DESCENT_STATE",
+                "items": [
+                  {
+                    "label": "Lat",
+                    "index": 0,
+                    "formatter": {
+                      "precision": 7
+                    }
+                  },
+                  {
+                    "label": "Lon",
+                    "index": 1,
+                    "formatter": {
+                      "precision": 7
+                    }
+                  },
+                  {
+                    "label": "Altitude",
+                    "index": 2
+                  },
+                  {
+                    "label": "Velocity",
+                    "index": 3,
+                    "formatter": {
+                      "precision": 2,
+                      "suffix": " m/s"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "map"
+              },
+              {
+                "kind": "chart",
+                "chart_title": "Altitude Estimates",
+                "chart_series": [
+                  {
+                    "data_type": "BAROMETER_DATA",
+                    "index": 2,
+                    "label": "Barometer"
+                  },
+                  {
+                    "data_type": "DESCENT_STATE",
+                    "index": 2,
+                    "label": "Descent KF"
+                  }
+                ],
+                "width": 1200.0,
+                "height": 260.0,
+                "full_width": true
+              },
+              {
+                "kind": "chart",
+                "chart_title": "Vertical Speed Comparison",
+                "chart_series": [
+                  {
+                    "data_type": "VEHICLE_SPEED",
+                    "index": 0,
+                    "label": "Fused"
+                  },
+                  {
+                    "data_type": "DESCENT_STATE",
+                    "index": 3,
+                    "label": "Descent KF"
+                  }
+                ],
+                "width": 1200.0,
+                "height": 240.0,
+                "full_width": true
               }
             ],
             "value_layout": "horizontal"

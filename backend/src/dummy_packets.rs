@@ -23,7 +23,8 @@ fn random_packet() -> TelemetryResult<Packet> {
 
     let choices = [
         DataType::GpsData,
-        DataType::KalmanFilterData,
+        DataType::AscentState,
+        DataType::DescentState,
         DataType::GyroData,
         DataType::AccelData,
         DataType::BatteryVoltage,
@@ -43,11 +44,22 @@ fn random_packet() -> TelemetryResult<Packet> {
             let alt_m = rng.random_range(0.0..200.0);
             vec![lat, lon, alt_m]
         }
-        DataType::KalmanFilterData => {
-            let x = rng.random_range(-20.0..20.0);
-            let y = rng.random_range(-20.0..20.0);
-            let z = rng.random_range(-20.0..20.0);
-            vec![x, y, z]
+        DataType::AscentState => {
+            let q0 = rng.random_range(0.95..1.0);
+            let q1 = rng.random_range(-0.05..0.05);
+            let q2 = rng.random_range(-0.05..0.05);
+            let q3 = rng.random_range(-0.05..0.05);
+            let altitude_m = rng.random_range(0.0..200.0);
+            let velocity_mps = rng.random_range(-20.0..120.0);
+            vec![q0, q1, q2, q3, altitude_m, velocity_mps]
+        }
+        DataType::DescentState => {
+            let margin = 0.001;
+            let lat = BASE_LAT + rng.random_range(-margin..margin);
+            let lon = BASE_LON + rng.random_range(-margin..margin);
+            let altitude_m = rng.random_range(0.0..200.0);
+            let velocity_mps = rng.random_range(-80.0..10.0);
+            vec![lat, lon, altitude_m, velocity_mps]
         }
         DataType::GyroData => {
             let gx = rng.random_range(-5.0..5.0);

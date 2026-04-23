@@ -921,7 +921,8 @@ impl FlightSimState {
         let seq = [
             DataType::GyroData,
             DataType::AccelData,
-            DataType::KalmanFilterData,
+            DataType::AscentState,
+            DataType::DescentState,
             DataType::BarometerData,
             DataType::FuelTankPressure,
             DataType::FuelFlow,
@@ -956,14 +957,35 @@ impl FlightSimState {
                 .flat_map(|v| v.to_le_bytes())
                 .collect()
             }
-            DataType::KalmanFilterData => vec![
-                self.altitude_ft * 0.3048,
-                self.velocity_fps * 0.3048,
-                self.accel_g,
-            ]
-            .into_iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
+            DataType::AscentState => {
+                let roll_rad = self.roll_dps.to_radians() * 0.02;
+                let pitch_rad = self.pitch_dps.to_radians() * 0.02;
+                let yaw_rad = self.yaw_dps.to_radians() * 0.02;
+                vec![
+                    1.0_f32,
+                    roll_rad,
+                    pitch_rad,
+                    yaw_rad,
+                    self.altitude_ft * 0.3048,
+                    self.velocity_fps * 0.3048,
+                ]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect()
+            }
+            DataType::DescentState => {
+                let dlat_deg = (self.altitude_ft / 5_280.0) * 0.00001;
+                let dlon_deg = dlat_deg * 0.8;
+                vec![
+                    BASE_LAT + dlat_deg,
+                    BASE_LON + dlon_deg,
+                    self.altitude_ft * 0.3048,
+                    self.velocity_fps * 0.3048,
+                ]
+                .into_iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect()
+            }
             DataType::BarometerData => {
                 let altitude_m = self.altitude_ft * 0.3048;
                 let pressure_pa = 101_325.0_f32 * f32::powf(1.0 - altitude_m / 44_330.0, 5.255);
@@ -1073,7 +1095,8 @@ fn sender_for_datatype(dtype: DataType) -> &'static str {
     match dtype {
         DataType::GyroData
         | DataType::AccelData
-        | DataType::KalmanFilterData
+        | DataType::AscentState
+        | DataType::DescentState
         | DataType::FlightState => Board::FlightComputer.sender_id(),
         DataType::BarometerData | DataType::FuelFlow | DataType::FuelTankPressure => {
             Board::DaqBoard.sender_id()

@@ -61,12 +61,8 @@ const FUEL_TANK_PRESSURE_MIN_THRESHOLD: f32 = 0.0; // psi
 const FUEL_TANK_PRESSURE_MAX_THRESHOLD: f32 = 3000.0; // psi
 
 // Kalman Filter thresholds
-const KALMAN_X_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
-const KALMAN_X_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
-const KALMAN_Y_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
-const KALMAN_Y_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
-const KALMAN_Z_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
-const KALMAN_Z_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
+const KALMAN_STATE_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
+const KALMAN_STATE_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
 
 #[cfg(not(feature = "testing"))]
 const BOARD_TIMEOUT_MS: u64 = 500;
@@ -517,30 +513,16 @@ pub async fn safety_task(
                     }
                 }
 
-                // Kalman filter XYZ state
-                DataType::KalmanFilterData => {
-                    // [x, y, z] in "xyz"
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
+                // Ascent/descent Kalman filter state packets.
+                DataType::AscentState | DataType::DescentState => {
+                    let values = pkt.data_as_f32().unwrap_or_default();
 
-                    // X
-                    if let Some(kx) = values.first()
-                        && ((KALMAN_X_MIN_THRESHOLD > *kx) || (*kx > KALMAN_X_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Kalman X state out of range!");
-                    }
-
-                    // Y
-                    if let Some(ky) = values.get(1)
-                        && ((KALMAN_Y_MIN_THRESHOLD > *ky) || (*ky > KALMAN_Y_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Kalman Y state out of range!");
-                    }
-
-                    // Z
-                    if let Some(kz) = values.get(2)
-                        && ((KALMAN_Z_MIN_THRESHOLD > *kz) || (*kz > KALMAN_Z_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Kalman Z state out of range!");
+                    if values.iter().any(|value| {
+                        !value.is_finite()
+                            || *value < KALMAN_STATE_MIN_THRESHOLD
+                            || *value > KALMAN_STATE_MAX_THRESHOLD
+                    }) {
+                        cycle_warnings.insert("Critical: Kalman filter state out of range!");
                     }
                 }
 
