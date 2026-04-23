@@ -425,60 +425,75 @@
         }
       },
       {
-        "id": "ASCENT_STATE",
-        "label": "Ascent Filter State",
+        "id": "KALMAN_FILTER",
+        "label": "Kalman Filter",
         "channels": [
-          "Q0",
-          "Q1",
-          "Q2",
-          "Q3",
           "Altitude",
           "Velocity"
         ],
-        "chart_groups": [
+        "subtabs": [
           {
+            "id": "kalman_ascent",
+            "label": "Ascent",
+            "data_type": "ASCENT_STATE",
             "channels": [
-              0,
-              1,
-              2,
-              3
+              "Q0",
+              "Q1",
+              "Q2",
+              "Q3",
+              "Altitude",
+              "Velocity"
             ],
-            "scale_mode": "shared"
+            "chart_groups": [
+              {
+                "channels": [
+                  0,
+                  1,
+                  2,
+                  3
+                ],
+                "scale_mode": "shared"
+              },
+              {
+                "channels": [
+                  4,
+                  5
+                ],
+                "scale_mode": "per_series"
+              }
+            ],
+            "chart": {
+              "enabled": true
+            }
           },
           {
+            "id": "kalman_descent",
+            "label": "Descent",
+            "data_type": "DESCENT_STATE",
             "channels": [
-              4,
-              5
+              "Lat",
+              "Lon",
+              "Altitude",
+              "Velocity"
             ],
-            "scale_mode": "per_series"
+            "chart_groups": [
+              {
+                "channels": [
+                  0,
+                  1,
+                  2,
+                  3
+                ],
+                "scale_mode": "per_series"
+              }
+            ],
+            "chart": {
+              "enabled": true
+            }
           }
         ],
         "chart": {
-          "enabled": true
-        }
-      },
-      {
-        "id": "DESCENT_STATE",
-        "label": "Descent Filter State",
-        "channels": [
-          "Lat",
-          "Lon",
-          "Altitude",
-          "Velocity"
-        ],
-        "chart_groups": [
-          {
-            "channels": [
-              0,
-              1,
-              2,
-              3
-            ],
-            "scale_mode": "per_series"
-          }
-        ],
-        "chart": {
-          "enabled": true
+          "enabled": false
         }
       },
       {

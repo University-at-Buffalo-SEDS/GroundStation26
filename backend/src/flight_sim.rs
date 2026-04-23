@@ -72,6 +72,47 @@ const DUMP_PRESSURE_BLEED_PSI_PER_S: f32 = 80.0;
 const NORMALLY_OPEN_PRESSURE_BLEED_PSI_PER_S: f32 = 0.25;
 #[cfg(feature = "testing")]
 const GRAVITY_FPS2: f32 = 32.174;
+#[cfg(feature = "testing")]
+const GROUND_SENSOR_SEQUENCE: &[DataType] = &[
+    DataType::GyroData,
+    DataType::AccelData,
+    DataType::BarometerData,
+    DataType::FuelTankPressure,
+    DataType::FuelFlow,
+    DataType::BatteryVoltage,
+    DataType::BatteryCurrent,
+    DataType::GpsData,
+    DataType::GpsSatelliteNumber,
+    DataType::KG1000,
+];
+#[cfg(feature = "testing")]
+const ASCENT_SENSOR_SEQUENCE: &[DataType] = &[
+    DataType::GyroData,
+    DataType::AccelData,
+    DataType::AscentState,
+    DataType::BarometerData,
+    DataType::FuelTankPressure,
+    DataType::FuelFlow,
+    DataType::BatteryVoltage,
+    DataType::BatteryCurrent,
+    DataType::GpsData,
+    DataType::GpsSatelliteNumber,
+    DataType::KG1000,
+];
+#[cfg(feature = "testing")]
+const DESCENT_SENSOR_SEQUENCE: &[DataType] = &[
+    DataType::GyroData,
+    DataType::AccelData,
+    DataType::DescentState,
+    DataType::BarometerData,
+    DataType::FuelTankPressure,
+    DataType::FuelFlow,
+    DataType::BatteryVoltage,
+    DataType::BatteryCurrent,
+    DataType::GpsData,
+    DataType::GpsSatelliteNumber,
+    DataType::KG1000,
+];
 
 #[cfg(feature = "testing")]
 fn sim_full_mass_kg() -> f32 {
@@ -918,20 +959,7 @@ impl FlightSimState {
     fn next_sensor_packet(&mut self, now_ms: u64) -> TelemetryResult<Packet> {
         self.update_physics(now_ms);
 
-        let seq = [
-            DataType::GyroData,
-            DataType::AccelData,
-            DataType::AscentState,
-            DataType::DescentState,
-            DataType::BarometerData,
-            DataType::FuelTankPressure,
-            DataType::FuelFlow,
-            DataType::BatteryVoltage,
-            DataType::BatteryCurrent,
-            DataType::GpsData,
-            DataType::GpsSatelliteNumber,
-            DataType::KG1000,
-        ];
+        let seq = sensor_sequence_for_state(self.flight_state);
         let dtype = seq[self.next_sensor_idx % seq.len()];
         self.next_sensor_idx = (self.next_sensor_idx + 1) % seq.len();
 
@@ -1087,6 +1115,20 @@ impl FlightSimState {
             now_ms,
             Arc::from(bytes.as_slice()),
         )
+    }
+}
+
+#[cfg(feature = "testing")]
+fn sensor_sequence_for_state(state: FlightState) -> &'static [DataType] {
+    match state {
+        FlightState::Launch | FlightState::Ascent | FlightState::Coast | FlightState::Apogee => {
+            ASCENT_SENSOR_SEQUENCE
+        }
+        FlightState::ParachuteDeploy
+        | FlightState::Descent
+        | FlightState::Landed
+        | FlightState::Recovery => DESCENT_SENSOR_SEQUENCE,
+        _ => GROUND_SENSOR_SEQUENCE,
     }
 }
 
@@ -1328,5 +1370,49 @@ mod tests {
         assert!(actuator_statuses.contains(&(super::ActuatorBoardCommands::NitrogenOpen as u8)));
         assert!(actuator_statuses.contains(&(super::ActuatorBoardCommands::NitrousOpen as u8)));
         assert!(actuator_statuses.contains(&(super::ActuatorBoardCommands::RetractPlumbing as u8)));
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn kalman_filter_packets_are_scheduled_for_the_matching_flight_phase() {
+        use crate::types::FlightState;
+        use sedsprintf_rs_2026::config::DataType;
+
+        for state in [
+            FlightState::Startup,
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::NitrousFill,
+            FlightState::Armed,
+            FlightState::Aborted,
+        ] {
+            let sequence = super::sensor_sequence_for_state(state);
+            assert!(!sequence.contains(&DataType::AscentState));
+            assert!(!sequence.contains(&DataType::DescentState));
+        }
+
+        for state in [
+            FlightState::Launch,
+            FlightState::Ascent,
+            FlightState::Coast,
+            FlightState::Apogee,
+        ] {
+            let sequence = super::sensor_sequence_for_state(state);
+            assert!(sequence.contains(&DataType::AscentState));
+            assert!(!sequence.contains(&DataType::DescentState));
+        }
+
+        for state in [
+            FlightState::ParachuteDeploy,
+            FlightState::Descent,
+            FlightState::Landed,
+            FlightState::Recovery,
+        ] {
+            let sequence = super::sensor_sequence_for_state(state);
+            assert!(sequence.contains(&DataType::DescentState));
+            assert!(!sequence.contains(&DataType::AscentState));
+        }
     }
 }
