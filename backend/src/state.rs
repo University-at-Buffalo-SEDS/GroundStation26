@@ -49,6 +49,9 @@ pub struct AppState {
     /// Error messages → frontend
     pub errors_tx: broadcast::Sender<ErrorMsg>,
 
+    /// Dashboard reset events → frontend
+    pub dashboard_reset_tx: broadcast::Sender<()>,
+
     /// Current telemetry/application SQLite database used by HTTP seeds.
     pub db: Arc<Mutex<SqlitePool>>,
 
@@ -192,6 +195,10 @@ impl AppState {
         self.recording_status.lock().unwrap().clone()
     }
 
+    pub fn broadcast_dashboard_reset(&self) {
+        let _ = self.dashboard_reset_tx.send(());
+    }
+
     pub fn launch_clock_snapshot(&self) -> LaunchClockMsg {
         self.launch_clock.lock().unwrap().clone()
     }
@@ -204,6 +211,12 @@ impl AppState {
         }
 
         *current = next.clone();
+        let _ = self.launch_clock_tx.send(next);
+    }
+
+    pub fn reset_launch_clock(&self) {
+        let next = LaunchClockMsg::idle();
+        *self.launch_clock.lock().unwrap() = next.clone();
         let _ = self.launch_clock_tx.send(next);
     }
 
@@ -815,6 +828,9 @@ impl AppState {
 
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
+        if matches!(cmd, TelemetryCommand::ResetSim) && crate::flight_sim::sim_mode_enabled() {
+            return true;
+        }
         if matches!(
             cmd,
             TelemetryCommand::Abort
@@ -932,6 +948,25 @@ impl AppState {
             .iter()
             .cloned()
             .collect()
+    }
+
+    pub fn clear_runtime_data_for_sim_reset(&self) {
+        self.ring_buffer.lock().unwrap().clear();
+        self.recent_telemetry_cache.lock().unwrap().clear();
+        self.recent_alerts_cache.lock().unwrap().clear();
+        self.latest_gps_fix_by_sender.lock().unwrap().clear();
+        self.latest_gps_satellites_by_sender.lock().unwrap().clear();
+        self.umbilical_valve_states.lock().unwrap().clear();
+        for status in self.board_status.lock().unwrap().values_mut() {
+            status.last_seen_ms = None;
+            status.ema_gap_ms = None;
+            status.warned = false;
+        }
+        *self.latest_fuel_tank_pressure.lock().unwrap() = None;
+        *self.latest_fill_mass_kg.lock().unwrap() = None;
+        self.last_command_ms.lock().unwrap().clear();
+        self.fill_sequence_continue_requests
+            .store(0, Ordering::Relaxed);
     }
 }
 

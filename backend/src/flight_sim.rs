@@ -290,6 +290,12 @@ impl FlightSimState {
         }
     }
 
+    fn reset(&mut self, now_ms: u64) {
+        *self = Self::new();
+        self.queue_flight_state(now_ms);
+        self.queue_housekeeping(now_ms);
+    }
+
     fn valve_on(&self, cmd_id: u8) -> bool {
         self.valves.get(&cmd_id).copied().unwrap_or(false)
     }
@@ -577,8 +583,9 @@ impl FlightSimState {
             TelemetryCommand::StartWritingNow
             | TelemetryCommand::StartWritingLastTwoMinutes
             | TelemetryCommand::PauseWritingDb
-            | TelemetryCommand::StopWritingDb => {
-                // Recording controls are backend-local and do not affect simulator state.
+            | TelemetryCommand::StopWritingDb
+            | TelemetryCommand::ResetSim => {
+                // Backend-local controls are handled outside the simulator command stream.
             }
             TelemetryCommand::PostinitSignal
             | TelemetryCommand::LaunchSignal
@@ -1159,11 +1166,27 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
     if !sim_mode_enabled() {
         return false;
     }
+    if matches!(cmd, TelemetryCommand::ResetSim) {
+        return false;
+    }
     let now_ms = get_current_timestamp_ms();
     let mut s = sim().lock().expect("flight sim mutex poisoned");
     s.apply_command(cmd, now_ms);
     true
 }
+
+#[cfg(feature = "testing")]
+pub fn reset_simulation() {
+    if !sim_mode_enabled() {
+        return;
+    }
+    let now_ms = get_current_timestamp_ms();
+    let mut s = sim().lock().expect("flight sim mutex poisoned");
+    s.reset(now_ms);
+}
+
+#[cfg(not(feature = "testing"))]
+pub fn reset_simulation() {}
 
 #[cfg(feature = "testing")]
 pub fn sync_local_flight_state(next_state: FlightState) {

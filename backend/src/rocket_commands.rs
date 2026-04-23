@@ -49,7 +49,6 @@ pub enum FlightComputerCommands {
     ReinitAfter50 = 27,
 }
 
-
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 pub enum ValveBoardCommands {

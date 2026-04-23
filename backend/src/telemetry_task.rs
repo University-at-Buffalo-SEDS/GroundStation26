@@ -1329,6 +1329,10 @@ pub async fn telemetry_task(
             biased;
 
                 Some(cmd) = rx.recv() => {
+                    if matches!(cmd, TelemetryCommand::ResetSim) {
+                        reset_testing_simulation(&state).await;
+                        continue;
+                    }
                     if !state.is_command_allowed(&cmd) {
                         emit_warning(
                             &state,
@@ -1532,6 +1536,7 @@ pub async fn telemetry_task(
                                 let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::Stop)).await;
                                 gs_debug_println!("DB recording stopped");
                             }
+                        TelemetryCommand::ResetSim => {}
                         TelemetryCommand::ContinueFillSequence => {
                                 state.request_fill_sequence_continue();
                                 gs_debug_println!("ContinueFillSequence command accepted");
@@ -2353,6 +2358,56 @@ fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::Tele
     Ok(())
 }
 
+async fn reset_testing_simulation(state: &Arc<AppState>) {
+    if !flight_sim::sim_mode_enabled() {
+        emit_warning(
+            state,
+            "Reset Sim ignored: simulator mode is not enabled for this backend",
+        );
+        return;
+    }
+
+    flight_sim::reset_simulation();
+    state.clear_runtime_data_for_sim_reset();
+    {
+        let mut flight_state = state.state.lock().unwrap();
+        *flight_state = FlightState::Idle;
+    }
+    state.reset_launch_clock();
+    state.broadcast_fill_targets_snapshot();
+
+    let now_ms = get_current_timestamp_ms() as i64;
+    let db = state.telemetry_db_pool();
+    if let Err(err) = sqlx::query("DELETE FROM telemetry").execute(&db).await {
+        eprintln!("Reset Sim failed to clear telemetry table: {err}");
+    }
+    if let Err(err) = sqlx::query("DELETE FROM alerts").execute(&db).await {
+        eprintln!("Reset Sim failed to clear alerts table: {err}");
+    }
+    if let Err(err) = sqlx::query("DELETE FROM flight_state").execute(&db).await {
+        eprintln!("Reset Sim failed to clear flight_state table: {err}");
+    }
+    if let Err(err) = state
+        .db_queue_tx
+        .send(DbQueueItem::Write(DbWrite::FlightState {
+            timestamp_ms: now_ms,
+            state_code: FlightState::Idle as i64,
+        }))
+        .await
+    {
+        eprintln!("Reset Sim failed to enqueue idle flight state write: {err}");
+    }
+
+    let _ = state.state_tx.send(FlightStateMsg {
+        state: FlightState::Idle,
+    });
+    let now_ms = get_current_timestamp_ms();
+    let _ = state
+        .board_status_tx
+        .send(state.board_status_snapshot(now_ms));
+    state.broadcast_dashboard_reset();
+}
+
 fn flush_command_tx(router: &Router, context: &str) {
     if let Err(err) = router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS) {
         log_telemetry_error(context, err);
@@ -2460,6 +2515,7 @@ mod tests {
             ws_tx,
             warnings_tx: broadcast::channel(4).0,
             errors_tx: broadcast::channel(4).0,
+            dashboard_reset_tx: broadcast::channel(4).0,
             db: Arc::new(Mutex::new(db)),
             db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
             placeholder_db_path: "sqlite::memory:".to_string(),

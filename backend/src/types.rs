@@ -18,6 +18,7 @@ pub enum TelemetryCommand {
     StartWritingLastTwoMinutes,
     PauseWritingDb,
     StopWritingDb,
+    ResetSim,
     ContinueFillSequence,
     PostinitSignal,
     LaunchSignal,

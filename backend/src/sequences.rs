@@ -483,6 +483,7 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::StartWritingLastTwoMinutes => "StartWritingLastTwoMinutes",
         TelemetryCommand::PauseWritingDb => "PauseWritingDb",
         TelemetryCommand::StopWritingDb => "StopWritingDb",
+        TelemetryCommand::ResetSim => "ResetSim",
         TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
         TelemetryCommand::PostinitSignal => "PostinitSignal",
         TelemetryCommand::LaunchSignal => "LaunchSignal",
@@ -534,7 +535,7 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
 
 #[cfg(all(not(feature = "hitl_mode"), not(feature = "test_fire_mode")))]
 pub fn all_command_names() -> Vec<&'static str> {
-    vec![
+    let mut names = vec![
         "Dump",
         "Abort",
         "NormallyOpen",
@@ -559,7 +560,11 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RevokeResetFailures",
         "ValidateMeasms",
         "RevokeValidateMeasms",
-    ]
+    ];
+    if crate::flight_sim::sim_mode_enabled() {
+        names.push("ResetSim");
+    }
+    names
 }
 
 #[cfg(feature = "hitl_mode")]
@@ -646,6 +651,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
             let enabled = matches!(
                 cmd,
                 "Abort"
+                    | "ResetSim"
                     | "StartWritingNow"
                     | "StartWritingLastTwoMinutes"
                     | "PauseWritingDb"

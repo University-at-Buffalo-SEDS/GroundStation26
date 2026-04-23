@@ -322,6 +322,7 @@ pub enum WsOutMsg {
     FillTargets(FillTargetsConfig),
     RecordingStatus(RecordingStatusMsg),
     NetworkTime(NetworkTimeMsg),
+    DashboardReset,
 }
 
 #[derive(Clone, Serialize)]
@@ -1474,6 +1475,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let mut action_policy_rx = state.action_policy_tx.subscribe();
     let mut fill_targets_rx = state.fill_targets_tx.subscribe();
     let mut recording_status_rx = state.recording_status_tx.subscribe();
+    let mut dashboard_reset_rx = state.dashboard_reset_tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
     let state_for_send = state.clone();
@@ -1602,6 +1604,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     match recv {
                         Ok(err) => {
                             let msg = WsOutMsg::Error(err);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = dashboard_reset_rx.recv() => {
+                    match recv {
+                        Ok(()) => {
+                            let msg = WsOutMsg::DashboardReset;
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;

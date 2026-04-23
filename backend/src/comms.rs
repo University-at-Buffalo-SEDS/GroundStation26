@@ -156,6 +156,7 @@ fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn take_buffered_serialized_packet(
     rx_payload_buf: &mut Vec<u8>,
 ) -> TelemetryResult<Option<Vec<u8>>> {

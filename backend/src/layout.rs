@@ -608,7 +608,41 @@ pub fn load_layout() -> Result<LayoutConfig, String> {
     let path = layout_path();
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read layout file {path:?}: {e}"))?;
-    serde_json::from_str(&raw).map_err(|e| format!("Invalid layout JSON: {e}"))
+    let mut layout: LayoutConfig =
+        serde_json::from_str(&raw).map_err(|e| format!("Invalid layout JSON: {e}"))?;
+    apply_runtime_layout_overrides(&mut layout);
+    Ok(layout)
+}
+
+fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
+    if !crate::flight_sim::sim_mode_enabled() {
+        return;
+    }
+    if layout
+        .actions_tab
+        .actions
+        .iter()
+        .any(|action| action.cmd == "ResetSim")
+    {
+        return;
+    }
+    layout.actions_tab.actions.insert(
+        0,
+        ActionSpec {
+            label: "Reset Sim".to_string(),
+            cmd: "ResetSim".to_string(),
+            border: "#38bdf8".to_string(),
+            bg: "#082f49".to_string(),
+            fg: "#e0f2fe".to_string(),
+            illuminated: false,
+            spacer_before: false,
+            spacer_after: false,
+            new_row_before: false,
+            new_row_after: true,
+            spacer_row_before: false,
+            spacer_row_after: true,
+        },
+    );
 }
 
 #[cfg(test)]
@@ -623,5 +657,18 @@ mod tests {
         assert!(!layout.actions_tab.actions.is_empty());
         assert!(!layout.data_tab.tabs.is_empty());
         assert!(!layout.state_tab.states.is_empty());
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn testing_layout_includes_reset_sim_action() {
+        let layout = load_layout().expect("layout should parse");
+        assert!(
+            layout
+                .actions_tab
+                .actions
+                .iter()
+                .any(|action| action.cmd == "ResetSim")
+        );
     }
 }
