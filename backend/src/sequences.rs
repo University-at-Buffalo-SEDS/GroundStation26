@@ -483,15 +483,23 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::StartWritingLastTwoMinutes => "StartWritingLastTwoMinutes",
         TelemetryCommand::PauseWritingDb => "PauseWritingDb",
         TelemetryCommand::StopWritingDb => "StopWritingDb",
+        TelemetryCommand::ResetSim => "ResetSim",
         TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
+        TelemetryCommand::PostinitSignal => "PostinitSignal",
+        TelemetryCommand::LaunchSignal => "LaunchSignal",
+        TelemetryCommand::RollbackSignal => "RollbackSignal",
+        TelemetryCommand::MonitorAltitude => "MonitorAltitude",
+        TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
+        TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
+        TelemetryCommand::RevokeConsecutiveSamples => "RevokeConsecutiveSamples",
+        TelemetryCommand::ResetFailures => "ResetFailures",
+        TelemetryCommand::RevokeResetFailures => "RevokeResetFailures",
+        TelemetryCommand::ValidateMeasms => "ValidateMeasms",
+        TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ExpandParachute => "ExpandParachute",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitSensors => "ReinitSensors",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::LaunchSignal => "LaunchSignal",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationRelax => "EvaluationRelax",
         #[cfg(feature = "hitl_mode")]
@@ -499,50 +507,35 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationAbort => "EvaluationAbort",
         #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ReinitSensors => "ReinitSensors",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitBarometer => "ReinitBarometer",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::EnableIMU => "EnableIMU",
+        TelemetryCommand::ReinitIMU => "ReinitIMU",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DisableIMU => "DisableIMU",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::MonitorAltitude => "MonitorAltitude",
+        TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::RevokeConsecutiveSamples => "RevokeConsecutiveSamples",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ResetFailures => "ResetFailures",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::RevokeResetFailures => "RevokeResetFailures",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ValidateMeasms => "ValidateMeasms",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::AbortAfter15 => "AbortAfter15",
+        TelemetryCommand::RewindFlightState => "RewindFlightState",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter40 => "AbortAfter40",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::AbortAfter70 => "AbortAfter70",
+        TelemetryCommand::AbortAfter100 => "AbortAfter100",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter12 => "ReinitAfter12",
+        TelemetryCommand::AbortAfter250 => "AbortAfter250",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter26 => "ReinitAfter26",
+        TelemetryCommand::ReinitAfter15 => "ReinitAfter15",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter44 => "ReinitAfter44",
-        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-        TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
-        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-        TelemetryCommand::RewindFlightState => "RewindFlightState",
+        TelemetryCommand::ReinitAfter30 => "ReinitAfter30",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ReinitAfter50 => "ReinitAfter50",
     }
 }
 
 #[cfg(all(not(feature = "hitl_mode"), not(feature = "test_fire_mode")))]
 pub fn all_command_names() -> Vec<&'static str> {
-    vec![
-        "Launch",
+    let mut names = vec![
         "Dump",
         "Abort",
         "NormallyOpen",
@@ -556,36 +549,9 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
-    ]
-}
-
-#[cfg(feature = "hitl_mode")]
-pub fn all_command_names() -> Vec<&'static str> {
-    vec![
+        "Postinit",
         "Launch",
-        "Dump",
-        "Abort",
-        "NormallyOpen",
-        "Pilot",
-        "Igniter",
-        "RetractPlumbing",
-        "Nitrogen",
-        "Nitrous",
-        "StartWritingNow",
-        "StartWritingLastTwoMinutes",
-        "PauseWritingDb",
-        "StopWritingDb",
-        "ContinueFillSequence",
-        "DeployParachute",
-        "ExpandParachute",
-        "ReinitSensors",
-        "LaunchSignal",
-        "EvaluationRelax",
-        "EvaluationFocus",
-        "EvaluationAbort",
-        "ReinitBarometer",
-        "EnableIMU",
-        "DisableIMU",
+        "Rollback",
         "MonitorAltitude",
         "RevokeMonitorAltitude",
         "ConsecutiveSamples",
@@ -594,21 +560,16 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RevokeResetFailures",
         "ValidateMeasms",
         "RevokeValidateMeasms",
-        "AbortAfter15",
-        "AbortAfter40",
-        "AbortAfter70",
-        "ReinitAfter12",
-        "ReinitAfter26",
-        "ReinitAfter44",
-        "AdvanceFlightState",
-        "RewindFlightState",
-    ]
+    ];
+    if crate::flight_sim::sim_mode_enabled() {
+        names.push("ResetSim");
+    }
+    names
 }
 
-#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+#[cfg(feature = "hitl_mode")]
 pub fn all_command_names() -> Vec<&'static str> {
     vec![
-        "Launch",
         "Dump",
         "Abort",
         "NormallyOpen",
@@ -622,8 +583,64 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
+        "Postinit",
+        "Launch",
+        "Rollback",
+        "MonitorAltitude",
+        "RevokeMonitorAltitude",
+        "ConsecutiveSamples",
+        "RevokeConsecutiveSamples",
+        "ResetFailures",
+        "RevokeResetFailures",
+        "ValidateMeasms",
+        "RevokeValidateMeasms",
+        "DeployParachute",
+        "ExpandParachute",
+        "EvaluationRelax",
+        "EvaluationFocus",
+        "EvaluationAbort",
+        "ReinitSensors",
+        "ReinitBarometer",
+        "ReinitIMU",
+        "DisableIMU",
         "AdvanceFlightState",
         "RewindFlightState",
+        "AbortAfter40",
+        "AbortAfter100",
+        "AbortAfter250",
+        "ReinitAfter15",
+        "ReinitAfter30",
+        "ReinitAfter50",
+    ]
+}
+
+#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+pub fn all_command_names() -> Vec<&'static str> {
+    vec![
+        "Dump",
+        "Abort",
+        "NormallyOpen",
+        "Pilot",
+        "Igniter",
+        "RetractPlumbing",
+        "Nitrogen",
+        "Nitrous",
+        "StartWritingNow",
+        "StartWritingLastTwoMinutes",
+        "PauseWritingDb",
+        "StopWritingDb",
+        "ContinueFillSequence",
+        "Postinit",
+        "Launch",
+        "Rollback",
+        "MonitorAltitude",
+        "RevokeMonitorAltitude",
+        "ConsecutiveSamples",
+        "RevokeConsecutiveSamples",
+        "ResetFailures",
+        "RevokeResetFailures",
+        "ValidateMeasms",
+        "RevokeValidateMeasms",
     ]
 }
 
@@ -634,6 +651,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
             let enabled = matches!(
                 cmd,
                 "Abort"
+                    | "ResetSim"
                     | "StartWritingNow"
                     | "StartWritingLastTwoMinutes"
                     | "PauseWritingDb"

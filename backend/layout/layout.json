@@ -266,8 +266,12 @@
           "Altitude"
         ],
         "channel_formatters": [
-          {},
-          {},
+          {
+            "precision": 7
+          },
+          {
+            "precision": 7
+          },
           {}
         ],
         "subtabs": [
@@ -281,8 +285,12 @@
               "Altitude"
             ],
             "channel_formatters": [
-              {},
-              {},
+              {
+                "precision": 7
+              },
+              {
+                "precision": 7
+              },
               {}
             ],
             "chart": {
@@ -292,12 +300,18 @@
               {
                 "label": "Lat",
                 "data_type": "GPS_DATA",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "precision": 7
+                }
               },
               {
                 "label": "Lon",
                 "data_type": "GPS_DATA",
-                "index": 1
+                "index": 1,
+                "formatter": {
+                  "precision": 7
+                }
               },
               {
                 "label": "Altitude",
@@ -802,11 +816,17 @@
                 "items": [
                   {
                     "label": "Lat",
-                    "index": 0
+                    "index": 0,
+                    "formatter": {
+                      "precision": 7
+                    }
                   },
                   {
                     "label": "Lon",
-                    "index": 1
+                    "index": 1,
+                    "formatter": {
+                      "precision": 7
+                    }
                   }
                 ]
               }

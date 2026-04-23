@@ -34,4 +34,8 @@ impl<T> RingBuffer<T> {
     pub fn len(&self) -> usize {
         self.buf.len()
     }
+
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
 }

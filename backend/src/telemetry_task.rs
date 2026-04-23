@@ -3,9 +3,7 @@ use crate::flight_sim;
 use crate::gpio_panel::IGNITION_PIN;
 use crate::layout;
 use crate::loadcell;
-#[cfg(feature = "hitl_mode")]
-use crate::rocket_commands::FlightComputerCommands;
-use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
+use crate::rocket_commands::{ActuatorBoardCommands, FlightComputerCommands, ValveBoardCommands};
 use crate::state::{AppState, launch_countdown_clock};
 use crate::telemetry_db::{
     DbQueueItem, DbWrite, LaunchClockKind, RecordingCommand, RecordingMode, RecordingModeWire,
@@ -46,6 +44,8 @@ fn spawn_comms_worker_threads(
         .name(format!("{}_tx_worker", worker_name))
         .spawn(move || {
             let mut comms_shutdown_rx = tx_state.shutdown_subscribe();
+            let mut last_send_error_log_ms = 0;
+            let mut suppressed_send_errors = 0;
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -61,9 +61,22 @@ fn spawn_comms_worker_threads(
                             .expect("failed to get lock")
                             .send_data(&payload)
                         {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                if suppressed_send_errors > 0 {
+                                    eprintln!(
+                                        "{worker_name} tx worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
+                                    );
+                                    suppressed_send_errors = 0;
+                                    last_send_error_log_ms = 0;
+                                }
+                            }
                             Err(e) => {
-                                eprintln!("{worker_name} tx worker send_data failed: {e}");
+                                log_repeated_worker_error(
+                                    &format!("{worker_name} tx worker send_data failed"),
+                                    &e.to_string(),
+                                    &mut last_send_error_log_ms,
+                                    &mut suppressed_send_errors,
+                                );
                             }
                         }
                     }
@@ -80,6 +93,8 @@ fn spawn_comms_worker_threads(
         .name(format!("{}_rx_worker", worker_name))
         .spawn(move || {
             let mut comms_shutdown_rx = state.shutdown_subscribe();
+            let mut last_recv_error_log_ms = 0;
+            let mut suppressed_recv_errors = 0;
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -102,9 +117,11 @@ fn spawn_comms_worker_threads(
                 {
                     Ok(_) => {}
                     Err(e) => {
-                        log_telemetry_error(
+                        log_repeated_worker_error(
                             &format!("{worker_name} rx worker recv_packet failed"),
-                            e,
+                            &format!("{e:?}"),
+                            &mut last_recv_error_log_ms,
+                            &mut suppressed_recv_errors,
                         );
                     }
                 }
@@ -114,6 +131,26 @@ fn spawn_comms_worker_threads(
         })?;
 
     Ok(vec![tx_worker, rx_worker])
+}
+
+fn log_repeated_worker_error(
+    context: &str,
+    detail: &str,
+    last_log_ms: &mut u64,
+    suppressed_count: &mut u64,
+) {
+    let now_ms = get_current_timestamp_ms();
+    if *last_log_ms == 0 || now_ms.saturating_sub(*last_log_ms) >= COMMS_ERROR_LOG_INTERVAL_MS {
+        if *suppressed_count > 0 {
+            eprintln!("{context}: {detail} (suppressed {suppressed_count} repeated errors)");
+        } else {
+            eprintln!("{context}: {detail}");
+        }
+        *last_log_ms = now_ms;
+        *suppressed_count = 0;
+    } else {
+        *suppressed_count += 1;
+    }
 }
 
 fn spawn_router_worker_thread(
@@ -156,44 +193,34 @@ const DB_BATCH_WAIT_MS_DEFAULT: u64 = 8;
 const ROUTER_QUEUE_BUDGET_MS: u32 = 6;
 const ROUTER_TX_BUDGET_MS: u32 = 3;
 const ROUTER_RX_BUDGET_MS: u32 = ROUTER_QUEUE_BUDGET_MS - ROUTER_TX_BUDGET_MS;
+const COMMS_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
+const ROUTER_DECODE_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 const LAUNCH_COMMAND_DELAY_MS: u64 = 5_000;
 const GPS_SATELLITES_DATA_TYPE: &str = "GPS_SATELLITE_NUMBER";
 const VEHICLE_SPEED_DATA_TYPE: &str = "VEHICLE_SPEED";
 const GRAVITY_MPS2: f32 = 9.80665;
+
+static ROUTER_DECODE_ERROR_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static ROUTER_DECODE_ERROR_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "hitl_mode")]
 fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     Some(match cmd {
         TelemetryCommand::DeployParachute => FlightComputerCommands::DeployParachute as u8,
         TelemetryCommand::ExpandParachute => FlightComputerCommands::ExpandParachute as u8,
-        TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
-        TelemetryCommand::LaunchSignal => FlightComputerCommands::LaunchSignal as u8,
         TelemetryCommand::EvaluationRelax => FlightComputerCommands::EvaluationRelax as u8,
         TelemetryCommand::EvaluationFocus => FlightComputerCommands::EvaluationFocus as u8,
         TelemetryCommand::EvaluationAbort => FlightComputerCommands::EvaluationAbort as u8,
+        TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
         TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
-        TelemetryCommand::EnableIMU => FlightComputerCommands::EnableIMU as u8,
+        TelemetryCommand::ReinitIMU => FlightComputerCommands::ReinitIMU as u8,
         TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
-        TelemetryCommand::MonitorAltitude => FlightComputerCommands::MonitorAltitude as u8,
-        TelemetryCommand::RevokeMonitorAltitude => {
-            FlightComputerCommands::RevokeMonitorAltitude as u8
-        }
-        TelemetryCommand::ConsecutiveSamples => FlightComputerCommands::ConsecutiveSamples as u8,
-        TelemetryCommand::RevokeConsecutiveSamples => {
-            FlightComputerCommands::RevokeConsecutiveSamples as u8
-        }
-        TelemetryCommand::ResetFailures => FlightComputerCommands::ResetFailures as u8,
-        TelemetryCommand::RevokeResetFailures => FlightComputerCommands::RevokeResetFailures as u8,
-        TelemetryCommand::ValidateMeasms => FlightComputerCommands::ValidateMeasms as u8,
-        TelemetryCommand::RevokeValidateMeasms => {
-            FlightComputerCommands::RevokeValidateMeasms as u8
-        }
-        TelemetryCommand::AbortAfter15 => FlightComputerCommands::AbortAfter15 as u8,
         TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
-        TelemetryCommand::AbortAfter70 => FlightComputerCommands::AbortAfter70 as u8,
-        TelemetryCommand::ReinitAfter12 => FlightComputerCommands::ReinitAfter12 as u8,
-        TelemetryCommand::ReinitAfter26 => FlightComputerCommands::ReinitAfter26 as u8,
-        TelemetryCommand::ReinitAfter44 => FlightComputerCommands::ReinitAfter44 as u8,
+        TelemetryCommand::AbortAfter100 => FlightComputerCommands::AbortAfter100 as u8,
+        TelemetryCommand::AbortAfter250 => FlightComputerCommands::AbortAfter250 as u8,
+        TelemetryCommand::ReinitAfter15 => FlightComputerCommands::ReinitAfter15 as u8,
+        TelemetryCommand::ReinitAfter30 => FlightComputerCommands::ReinitAfter30 as u8,
+        TelemetryCommand::ReinitAfter50 => FlightComputerCommands::ReinitAfter50 as u8,
         _ => return None,
     })
 }
@@ -1009,14 +1036,14 @@ fn send_launch_command(state: &AppState, router: &Router) {
     {
         if let Err(e) = router.log_queue(
             DataType::FlightCommand,
-            &[crate::rocket_commands::FlightCommands::Launch as u8],
+            &[FlightComputerCommands::LaunchSignal as u8],
         ) {
             log_telemetry_error("failed to log delayed Launch command", e);
         } else {
             log_command_queue_success(
                 "Delayed Launch command",
                 DataType::FlightCommand,
-                &[crate::rocket_commands::FlightCommands::Launch as u8],
+                &[FlightComputerCommands::LaunchSignal as u8],
             );
             flush_command_tx(router, "Delayed Launch command tx");
         }
@@ -1302,6 +1329,10 @@ pub async fn telemetry_task(
             biased;
 
                 Some(cmd) = rx.recv() => {
+                    if matches!(cmd, TelemetryCommand::ResetSim) {
+                        reset_testing_simulation(&state).await;
+                        continue;
+                    }
                     if !state.is_command_allowed(&cmd) {
                         emit_warning(
                             &state,
@@ -1314,23 +1345,6 @@ pub async fn telemetry_task(
                         continue;
                     }
                     match cmd {
-                        TelemetryCommand::Launch => {
-                                if matches!(
-                                    state.launch_clock_snapshot().kind,
-                                    LaunchClockKind::TMinus | LaunchClockKind::TPlus
-                                ) {
-                                    gs_debug_println!("Launch command ignored because launch clock is already running");
-                                    continue;
-                                }
-                                if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
-                                    let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartNow)).await;
-                                    gs_debug_println!("Launch auto-started DB recording");
-                                }
-                                let now_ms = get_current_timestamp_ms() as i64;
-                                state.set_launch_clock(launch_countdown_clock(now_ms));
-                                schedule_launch_command_after_delay(state.clone(), router.clone());
-                                gs_debug_println!("Launch command scheduled after {LAUNCH_COMMAND_DELAY_MS} ms");
-                            }
                         TelemetryCommand::Dump => {
                                 let key = ValveBoardCommands::DumpOpen as u8;
                                 let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
@@ -1470,7 +1484,7 @@ pub async fn telemetry_task(
                                     flush_command_tx(&router, "RetractPlumbing command tx");
                                 }
                                 gs_debug_println!("RetractPlumbing command sent");
-                        }
+                            }
                         TelemetryCommand::Nitrous => {
                                 let cmd_id = ActuatorBoardCommands::NitrousOpen as u8;
                                 let is_on = state.get_umbilical_valve_state(cmd_id).unwrap_or(false);
@@ -1489,7 +1503,7 @@ pub async fn telemetry_task(
                                     flush_command_tx(&router, "Nitrous command tx");
                                 }
                                 gs_debug_println!("Nitrous command sent: {:?}", cmd);
-                        }
+                            }
                         TelemetryCommand::NitrousClose => {
                                 if let Err(e) = router.log_queue(
                                     DataType::ActuatorCommand,
@@ -1505,28 +1519,145 @@ pub async fn telemetry_task(
                                     flush_command_tx(&router, "NitrousClose command tx");
                                 }
                                 gs_debug_println!("Nitrous explicit close command sent");
-                        }
+                            }
                         TelemetryCommand::StartWritingNow => {
                                 let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartNow)).await;
                                 gs_debug_println!("DB recording started without backfill");
-                        }
+                            }
                         TelemetryCommand::StartWritingLastTwoMinutes => {
                                 let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartWithRecent)).await;
                                 gs_debug_println!("DB recording started with recent backfill");
-                        }
+                            }
                         TelemetryCommand::PauseWritingDb => {
                                 let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::Pause)).await;
                                 gs_debug_println!("DB recording paused");
-                        }
+                            }
                         TelemetryCommand::StopWritingDb => {
                                 let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::Stop)).await;
                                 gs_debug_println!("DB recording stopped");
-                        }
+                            }
+                        TelemetryCommand::ResetSim => {}
                         TelemetryCommand::ContinueFillSequence => {
                                 state.request_fill_sequence_continue();
                                 gs_debug_println!("ContinueFillSequence command accepted");
-                        }
-                        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                            }
+                        TelemetryCommand::PostinitSignal => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::PostinitSignal as u8],
+                                ) {
+                                    log_telemetry_error("failed to log PostinitSignal command", e);
+                                }
+                                gs_debug_println!("PostinitSignal command sent");
+                            }
+                        TelemetryCommand::Launch => {
+                                if matches!(
+                                    state.launch_clock_snapshot().kind,
+                                    LaunchClockKind::TMinus | LaunchClockKind::TPlus
+                                ) {
+                                    gs_debug_println!("Launch command ignored because launch clock is already running");
+                                    continue;
+                                }
+                                if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
+                                    let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartNow)).await;
+                                    gs_debug_println!("Launch auto-started DB recording");
+                                }
+                                let now_ms = get_current_timestamp_ms() as i64;
+                                state.set_launch_clock(launch_countdown_clock(now_ms));
+                                schedule_launch_command_after_delay(state.clone(), router.clone());
+                                gs_debug_println!("Launch command scheduled after {LAUNCH_COMMAND_DELAY_MS} ms");
+                            }
+                        TelemetryCommand::LaunchSignal => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::LaunchSignal as u8],
+                                ) {
+                                    log_telemetry_error("failed to log LaunchSignal command", e);
+                                }
+                                gs_debug_println!("LaunchSignal command sent");
+                            }
+                        TelemetryCommand::RollbackSignal => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::RollbackSignal as u8],
+                                ) {
+                                    log_telemetry_error("failed to log RollbackSignal command", e);
+                                }
+                                gs_debug_println!("RollbackSignal command sent");
+                            }
+                        TelemetryCommand::MonitorAltitude => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::MonitorAltitude as u8],
+                                ) {
+                                    log_telemetry_error("failed to log MonitorAltitude command", e);
+                                }
+                                gs_debug_println!("MonitorAltitude command sent");
+                            }
+                        TelemetryCommand::RevokeMonitorAltitude => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::RevokeMonitorAltitude as u8],
+                                ) {
+                                    log_telemetry_error("failed to log RevokeMonitorAltitude command", e);
+                                }
+                                gs_debug_println!("RevokeMonitorAltitude command sent");
+                            }
+                        TelemetryCommand::ConsecutiveSamples => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::ConsecutiveSamples as u8],
+                                ) {
+                                    log_telemetry_error("failed to log ConsecutiveSamples command", e);
+                                }
+                                gs_debug_println!("ConsecutiveSamples command sent");
+                            }
+                        TelemetryCommand::RevokeConsecutiveSamples => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::RevokeConsecutiveSamples as u8],
+                                ) {
+                                    log_telemetry_error("failed to log RevokeConsecutiveSamples command", e);
+                                }
+                                gs_debug_println!("RevokeConsecutiveSamples command sent");
+                            }
+                        TelemetryCommand::ResetFailures => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::ResetFailures as u8],
+                                ) {
+                                    log_telemetry_error("failed to log ResetFailures command", e);
+                                }
+                                gs_debug_println!("ResetFailures command sent");
+                            }
+                        TelemetryCommand::RevokeResetFailures => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::RevokeResetFailures as u8],
+                                ) {
+                                    log_telemetry_error("failed to log RevokeResetFailures command", e);
+                                }
+                                gs_debug_println!("RevokeResetFailures command sent");
+                            }
+                        TelemetryCommand::ValidateMeasms => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::ValidateMeasms as u8],
+                                ) {
+                                    log_telemetry_error("failed to log ValidateMeasms command", e);
+                                }
+                                gs_debug_println!("ValidateMeasms command sent");
+                            }
+                        TelemetryCommand::RevokeValidateMeasms => {
+                                if let Err(e) = router.log_queue(
+                                    DataType::FlightCommand,
+                                    &[FlightComputerCommands::RevokeValidateMeasms as u8],
+                                ) {
+                                    log_telemetry_error("failed to log RevokeValidateMeasms command", e);
+                                }
+                                gs_debug_println!("RevokeValidateMeasms command sent");
+                            }
+                        #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::AdvanceFlightState => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, 1);
@@ -1543,34 +1674,25 @@ pub async fn telemetry_task(
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::DeployParachute
                         | TelemetryCommand::ExpandParachute
-                        | TelemetryCommand::ReinitSensors
-                        | TelemetryCommand::LaunchSignal
                         | TelemetryCommand::EvaluationRelax
                         | TelemetryCommand::EvaluationFocus
                         | TelemetryCommand::EvaluationAbort
+                        | TelemetryCommand::ReinitSensors
                         | TelemetryCommand::ReinitBarometer
-                        | TelemetryCommand::EnableIMU
+                        | TelemetryCommand::ReinitIMU
                         | TelemetryCommand::DisableIMU
-                        | TelemetryCommand::MonitorAltitude
-                        | TelemetryCommand::RevokeMonitorAltitude
-                        | TelemetryCommand::ConsecutiveSamples
-                        | TelemetryCommand::RevokeConsecutiveSamples
-                        | TelemetryCommand::ResetFailures
-                        | TelemetryCommand::RevokeResetFailures
-                        | TelemetryCommand::ValidateMeasms
-                        | TelemetryCommand::RevokeValidateMeasms
-                        | TelemetryCommand::AbortAfter15
                         | TelemetryCommand::AbortAfter40
-                        | TelemetryCommand::AbortAfter70
-                        | TelemetryCommand::ReinitAfter12
-                        | TelemetryCommand::ReinitAfter26
-                        | TelemetryCommand::ReinitAfter44 => {
-                                if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
-                                    if let Err(e) = router.log_queue(DataType::FlightCommand, &[cmd_id]) {
-                                        log_telemetry_error("failed to log HITL flight command", e);
-                                    }
-                                    gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
+                        | TelemetryCommand::AbortAfter100
+                        | TelemetryCommand::AbortAfter250
+                        | TelemetryCommand::ReinitAfter15
+                        | TelemetryCommand::ReinitAfter30
+                        | TelemetryCommand::ReinitAfter50 => {
+                            if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
+                                if let Err(e) = router.log_queue(DataType::FlightComputerCommand, &[cmd_id]) {
+                                    log_telemetry_error("failed to log HITL flight command", e);
                                 }
+                                gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
+                            }
                         }
                     }
                 }
@@ -2179,6 +2301,38 @@ fn log_telemetry_error(context: &str, err: sedsprintf_rs_2026::TelemetryError) {
     eprintln!("{context}: {:?}", err);
 }
 
+fn log_router_rx_error(err: sedsprintf_rs_2026::TelemetryError) {
+    if matches!(
+        err,
+        sedsprintf_rs_2026::TelemetryError::Deserialize(_)
+            | sedsprintf_rs_2026::TelemetryError::InvalidType
+    ) {
+        log_router_decode_error(err);
+    } else {
+        log_telemetry_error("router rx queue processing failed", err);
+    }
+}
+
+fn log_router_decode_error(err: sedsprintf_rs_2026::TelemetryError) {
+    let now_ms = get_current_timestamp_ms();
+    let last_log_ms = ROUTER_DECODE_ERROR_LAST_LOG_MS.load(Ordering::Relaxed);
+    if last_log_ms == 0 || now_ms.saturating_sub(last_log_ms) >= ROUTER_DECODE_ERROR_LOG_INTERVAL_MS
+    {
+        ROUTER_DECODE_ERROR_LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+        let suppressed = ROUTER_DECODE_ERROR_SUPPRESSED.swap(0, Ordering::Relaxed);
+        if suppressed > 0 {
+            eprintln!(
+                "router rx queue decode failed: {:?} (suppressed {suppressed} repeated decode errors)",
+                err
+            );
+        } else {
+            eprintln!("router rx queue decode failed: {:?}", err);
+        }
+    } else {
+        ROUTER_DECODE_ERROR_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
     eprintln!(
         "{context}: queued ty={ty:?} payload={}",
@@ -2197,11 +2351,61 @@ fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::Tele
     }
     if ROUTER_RX_BUDGET_MS > 0 {
         if let Err(err) = router.process_rx_queue_with_timeout(ROUTER_RX_BUDGET_MS) {
-            log_telemetry_error("router rx queue processing failed", err);
+            log_router_rx_error(err);
             return Ok(());
         }
     }
     Ok(())
+}
+
+async fn reset_testing_simulation(state: &Arc<AppState>) {
+    if !flight_sim::sim_mode_enabled() {
+        emit_warning(
+            state,
+            "Reset Sim ignored: simulator mode is not enabled for this backend",
+        );
+        return;
+    }
+
+    flight_sim::reset_simulation();
+    state.clear_runtime_data_for_sim_reset();
+    {
+        let mut flight_state = state.state.lock().unwrap();
+        *flight_state = FlightState::Idle;
+    }
+    state.reset_launch_clock();
+    state.broadcast_fill_targets_snapshot();
+
+    let now_ms = get_current_timestamp_ms() as i64;
+    let db = state.telemetry_db_pool();
+    if let Err(err) = sqlx::query("DELETE FROM telemetry").execute(&db).await {
+        eprintln!("Reset Sim failed to clear telemetry table: {err}");
+    }
+    if let Err(err) = sqlx::query("DELETE FROM alerts").execute(&db).await {
+        eprintln!("Reset Sim failed to clear alerts table: {err}");
+    }
+    if let Err(err) = sqlx::query("DELETE FROM flight_state").execute(&db).await {
+        eprintln!("Reset Sim failed to clear flight_state table: {err}");
+    }
+    if let Err(err) = state
+        .db_queue_tx
+        .send(DbQueueItem::Write(DbWrite::FlightState {
+            timestamp_ms: now_ms,
+            state_code: FlightState::Idle as i64,
+        }))
+        .await
+    {
+        eprintln!("Reset Sim failed to enqueue idle flight state write: {err}");
+    }
+
+    let _ = state.state_tx.send(FlightStateMsg {
+        state: FlightState::Idle,
+    });
+    let now_ms = get_current_timestamp_ms();
+    let _ = state
+        .board_status_tx
+        .send(state.board_status_snapshot(now_ms));
+    state.broadcast_dashboard_reset();
 }
 
 fn flush_command_tx(router: &Router, context: &str) {
@@ -2311,6 +2515,7 @@ mod tests {
             ws_tx,
             warnings_tx: broadcast::channel(4).0,
             errors_tx: broadcast::channel(4).0,
+            dashboard_reset_tx: broadcast::channel(4).0,
             db: Arc::new(Mutex::new(db)),
             db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
             placeholder_db_path: "sqlite::memory:".to_string(),

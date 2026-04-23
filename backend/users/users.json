@@ -62,6 +62,7 @@
           "RevokeResetFailures",
           "RevokeValidateMeasms",
           "RewindFlightState",
+          "ResetSim",
           "StartWritingLastTwoMinutes",
           "StartWritingNow",
           "StopWritingDb",

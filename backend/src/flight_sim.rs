@@ -204,7 +204,6 @@ struct FlightSimState {
     last_sensor_emit_ms: u64,
     last_housekeeping_emit_ms: u64,
     next_sensor_idx: usize,
-    next_valve_emit_idx: usize,
     fuel_tank_pressure_psi: f32,
     fuel_flow_lpm: f32,
     battery_v: f32,
@@ -264,7 +263,6 @@ impl FlightSimState {
             last_sensor_emit_ms: 0,
             last_housekeeping_emit_ms: 0,
             next_sensor_idx: 0,
-            next_valve_emit_idx: 0,
             fuel_tank_pressure_psi: 5.0,
             fuel_flow_lpm: 0.0,
             battery_v: AV_BAY_BATTERY_MAX_V,
@@ -290,6 +288,12 @@ impl FlightSimState {
             nitrous_fill_started_ms: None,
             queued: VecDeque::new(),
         }
+    }
+
+    fn reset(&mut self, now_ms: u64) {
+        *self = Self::new();
+        self.queue_flight_state(now_ms);
+        self.queue_housekeeping(now_ms);
     }
 
     fn valve_on(&self, cmd_id: u8) -> bool {
@@ -414,10 +418,10 @@ impl FlightSimState {
                 ActuatorBoardCommands::RetractPlumbing as u8,
             ]
         };
-        let key = keys[self.next_valve_emit_idx % keys.len()];
-        self.next_valve_emit_idx = (self.next_valve_emit_idx + 1) % keys.len();
-        let on = self.valve_on(key);
-        self.queue_umbilical_status(key, on, now_ms);
+        for key in keys {
+            let on = self.valve_on(*key);
+            self.queue_umbilical_status(*key, on, now_ms);
+        }
 
         // Keep battery telemetry present even when other sensor traffic is sparse.
         self.queue_scalar_f32(
@@ -579,14 +583,27 @@ impl FlightSimState {
             TelemetryCommand::StartWritingNow
             | TelemetryCommand::StartWritingLastTwoMinutes
             | TelemetryCommand::PauseWritingDb
-            | TelemetryCommand::StopWritingDb => {
-                // Recording controls are backend-local and do not affect simulator state.
+            | TelemetryCommand::StopWritingDb
+            | TelemetryCommand::ResetSim => {
+                // Backend-local controls are handled outside the simulator command stream.
+            }
+            TelemetryCommand::PostinitSignal
+            | TelemetryCommand::LaunchSignal
+            | TelemetryCommand::RollbackSignal
+            | TelemetryCommand::MonitorAltitude
+            | TelemetryCommand::RevokeMonitorAltitude
+            | TelemetryCommand::ConsecutiveSamples
+            | TelemetryCommand::RevokeConsecutiveSamples
+            | TelemetryCommand::ResetFailures
+            | TelemetryCommand::RevokeResetFailures
+            | TelemetryCommand::ValidateMeasms
+            | TelemetryCommand::RevokeValidateMeasms => {
+                // Flight-computer commands are backend-forwarded and do not affect fill simulation.
             }
             #[cfg(feature = "hitl_mode")]
             TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
             | TelemetryCommand::ReinitSensors
-            | TelemetryCommand::LaunchSignal
             | TelemetryCommand::EvaluationRelax
             | TelemetryCommand::EvaluationFocus
             | TelemetryCommand::EvaluationAbort
@@ -1149,11 +1166,27 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
     if !sim_mode_enabled() {
         return false;
     }
+    if matches!(cmd, TelemetryCommand::ResetSim) {
+        return false;
+    }
     let now_ms = get_current_timestamp_ms();
     let mut s = sim().lock().expect("flight sim mutex poisoned");
     s.apply_command(cmd, now_ms);
     true
 }
+
+#[cfg(feature = "testing")]
+pub fn reset_simulation() {
+    if !sim_mode_enabled() {
+        return;
+    }
+    let now_ms = get_current_timestamp_ms();
+    let mut s = sim().lock().expect("flight sim mutex poisoned");
+    s.reset(now_ms);
+}
+
+#[cfg(not(feature = "testing"))]
+pub fn reset_simulation() {}
 
 #[cfg(feature = "testing")]
 pub fn sync_local_flight_state(next_state: FlightState) {
@@ -1247,5 +1280,30 @@ mod tests {
             pkt.data_type(),
             sedsprintf_rs_2026::config::DataType::FlightState
         );
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn housekeeping_queues_actuator_valve_states() {
+        let mut sim = super::FlightSimState::new();
+        sim.queue_housekeeping(1_000);
+
+        let mut actuator_statuses = std::collections::HashSet::new();
+        while let Some(pkt) = sim.queued.pop_front() {
+            if pkt.data_type() != sedsprintf_rs_2026::config::DataType::UmbilicalStatus {
+                continue;
+            }
+            if pkt.sender() != crate::types::Board::ActuatorBoard.sender_id() {
+                continue;
+            }
+            let payload = pkt.payload();
+            if let Some(cmd_id) = payload.first().copied() {
+                actuator_statuses.insert(cmd_id);
+            }
+        }
+
+        assert!(actuator_statuses.contains(&(super::ActuatorBoardCommands::NitrogenOpen as u8)));
+        assert!(actuator_statuses.contains(&(super::ActuatorBoardCommands::NitrousOpen as u8)));
+        assert!(actuator_statuses.contains(&(super::ActuatorBoardCommands::RetractPlumbing as u8)));
     }
 }

@@ -124,7 +124,7 @@ fn setup_callbacks(
         tx.clone(),
         LAUNCH_PIN,
         |a| a.launch,
-        TelemetryCommand::Launch,
+        TelemetryCommand::LaunchSignal,
         debounce,
     )?;
     setup_button_callback(

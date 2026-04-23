@@ -212,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
         env_usize("GS_RECORDING_STATUS_BROADCAST_CAPACITY", 32, 8, 1024);
     let (ws_tx, _ws_rx) = broadcast::channel(ws_broadcast_capacity);
     let (board_status_tx, _board_status_rx) = broadcast::channel(board_status_capacity);
+    let (dashboard_reset_tx, _dashboard_reset_rx) = broadcast::channel(16);
     let (notifications_tx, _notifications_rx) = broadcast::channel(notifications_capacity);
     let (action_policy_tx, _action_policy_rx) = broadcast::channel(actions_capacity);
     let (fill_targets_tx, _fill_targets_rx) = broadcast::channel(actions_capacity);
@@ -254,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
         ws_tx,
         warnings_tx: broadcast::channel(alerts_capacity).0,
         errors_tx: broadcast::channel(alerts_capacity).0,
+        dashboard_reset_tx,
         db: Arc::new(Mutex::new(db)),
         db_path: Arc::new(Mutex::new(db_path_str.clone())),
         placeholder_db_path: db_path_str.clone(),

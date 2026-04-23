@@ -18,19 +18,23 @@ pub enum TelemetryCommand {
     StartWritingLastTwoMinutes,
     PauseWritingDb,
     StopWritingDb,
+    ResetSim,
     ContinueFillSequence,
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-    AdvanceFlightState,
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-    RewindFlightState,
+    PostinitSignal,
+    LaunchSignal,
+    RollbackSignal,
+    MonitorAltitude,
+    RevokeMonitorAltitude,
+    ConsecutiveSamples,
+    RevokeConsecutiveSamples,
+    ResetFailures,
+    RevokeResetFailures,
+    ValidateMeasms,
+    RevokeValidateMeasms,
     #[cfg(feature = "hitl_mode")]
     DeployParachute,
     #[cfg(feature = "hitl_mode")]
     ExpandParachute,
-    #[cfg(feature = "hitl_mode")]
-    ReinitSensors,
-    #[cfg(feature = "hitl_mode")]
-    LaunchSignal,
     #[cfg(feature = "hitl_mode")]
     EvaluationRelax,
     #[cfg(feature = "hitl_mode")]
@@ -38,39 +42,29 @@ pub enum TelemetryCommand {
     #[cfg(feature = "hitl_mode")]
     EvaluationAbort,
     #[cfg(feature = "hitl_mode")]
+    ReinitSensors,
+    #[cfg(feature = "hitl_mode")]
     ReinitBarometer,
     #[cfg(feature = "hitl_mode")]
-    EnableIMU,
+    ReinitIMU,
     #[cfg(feature = "hitl_mode")]
     DisableIMU,
     #[cfg(feature = "hitl_mode")]
-    MonitorAltitude,
+    AdvanceFlightState,
     #[cfg(feature = "hitl_mode")]
-    RevokeMonitorAltitude,
-    #[cfg(feature = "hitl_mode")]
-    ConsecutiveSamples,
-    #[cfg(feature = "hitl_mode")]
-    RevokeConsecutiveSamples,
-    #[cfg(feature = "hitl_mode")]
-    ResetFailures,
-    #[cfg(feature = "hitl_mode")]
-    RevokeResetFailures,
-    #[cfg(feature = "hitl_mode")]
-    ValidateMeasms,
-    #[cfg(feature = "hitl_mode")]
-    RevokeValidateMeasms,
-    #[cfg(feature = "hitl_mode")]
-    AbortAfter15,
+    RewindFlightState,
     #[cfg(feature = "hitl_mode")]
     AbortAfter40,
     #[cfg(feature = "hitl_mode")]
-    AbortAfter70,
+    AbortAfter100,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter12,
+    AbortAfter250,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter26,
+    ReinitAfter15,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter44,
+    ReinitAfter30,
+    #[cfg(feature = "hitl_mode")]
+    ReinitAfter50,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
