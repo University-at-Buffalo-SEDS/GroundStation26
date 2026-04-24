@@ -271,6 +271,10 @@ impl AppState {
             status.last_seen_ms = Some(timestamp_ms);
             status.warned = false;
         }
+        drop(map);
+        let _ = self
+            .board_status_tx
+            .send(self.board_status_snapshot(timestamp_ms));
     }
 
     /// Marks side-relay boards as seen when the router has an active discovery route for that side.
@@ -283,8 +287,10 @@ impl AppState {
             return;
         };
         let snapshot = router.export_topology();
+        let mut saw_active_route = false;
         let mut map = self.board_status.lock().unwrap();
         for route in snapshot.routes {
+            saw_active_route = true;
             let relay_board = match route.side_name {
                 "rocket_comms" => Some(Board::RFBoard),
                 "umbilical_comms" => Some(Board::GatewayBoard),
@@ -305,6 +311,13 @@ impl AppState {
                     .unwrap_or(route_last_seen_ms),
             );
             status.warned = false;
+        }
+        drop(map);
+        if saw_active_route {
+            self.mark_packet_received(now_ms);
+            let _ = self
+                .board_status_tx
+                .send(self.board_status_snapshot(now_ms));
         }
     }
 
@@ -370,9 +383,6 @@ impl AppState {
             let status = map.get(board);
             let last_seen_ms = status.and_then(|s| s.last_seen_ms);
             let seen = last_seen_ms.is_some();
-            if !seen {
-                continue;
-            }
             let age_ms = last_seen_ms.map(|ts| now_ms.saturating_sub(ts));
 
             boards.push(BoardStatusEntry {
