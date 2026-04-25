@@ -226,7 +226,7 @@ fn i2c_rx_poll_burst() -> usize {
         std::env::var("GS_I2C_RX_POLL_BURST")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8)
+            .unwrap_or(128)
             .clamp(1, 4096)
     })
 }
