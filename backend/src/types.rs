@@ -134,7 +134,7 @@ impl Board {
             Board::RFBoard => "RF",
             Board::PowerBoard => "PB",
             Board::ValveBoard => "VB",
-            Board::GatewayBoard => "GW",
+            Board::GatewayBoard => "GB",
             Board::ActuatorBoard => "AB",
             Board::DaqBoard => "DAQ",
         }
@@ -152,6 +152,14 @@ impl Board {
             "DAQ" | "DAQB" => Some(Board::DaqBoard),
             _ => None,
         }
+    }
+}
+
+pub fn canonical_sender_id(sender: &str) -> &str {
+    match sender {
+        "GW" => Board::GatewayBoard.sender_id(),
+        "DAQB" => Board::DaqBoard.sender_id(),
+        _ => sender,
     }
 }
 

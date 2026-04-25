@@ -431,7 +431,7 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     }
     let live_rocket = {
         let fixes = state.latest_gps_fix_by_sender.lock().unwrap();
-        ["RF", "GW", "FC"]
+        ["RF", "GB", "FC"]
             .iter()
             .filter_map(|sender_id| fixes.get(*sender_id))
             .chain(fixes.values())

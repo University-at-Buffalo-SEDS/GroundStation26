@@ -94,7 +94,7 @@
       "RF",
       "PB",
       "VB",
-      "GW",
+      "GB",
       "AB",
       "DAQ"
     ]
@@ -454,7 +454,7 @@
             "id": "battery_voltage_gw",
             "label": "Fill Box",
             "data_type": "BATTERY_VOLTAGE",
-            "sender_id": "GW",
+            "sender_id": "GB",
             "channels": [
               "Voltage"
             ],
@@ -502,7 +502,7 @@
             "id": "battery_current_gw",
             "label": "Fill Box",
             "data_type": "BATTERY_CURRENT",
-            "sender_id": "GW",
+            "sender_id": "GB",
             "channels": [
               "Current"
             ],
@@ -2331,7 +2331,7 @@
       {
         "id": "fill_box_power",
         "label": "Fill Box Power",
-        "sender_id": "GW",
+        "sender_id": "GB",
         "input_data_type": "BATTERY_VOLTAGE",
         "percent_data_type": "FILL_BOX_POWER_PERCENT",
         "drop_rate_data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",

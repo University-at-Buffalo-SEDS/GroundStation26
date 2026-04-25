@@ -10,7 +10,9 @@ use crate::telemetry_db::{
     RecordingStatusMsg, close_and_finalize_sqlite, open_telemetry_db, prune_recent_writes,
     session_db_path,
 };
-use crate::types::{Board, FlightState, TelemetryCommand, TelemetryRow, u8_to_flight_state};
+use crate::types::{
+    Board, FlightState, TelemetryCommand, TelemetryRow, canonical_sender_id, u8_to_flight_state,
+};
 use crate::web::{FlightStateMsg, emit_warning};
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
@@ -2091,6 +2093,7 @@ async fn handle_packet(
     pkt: Packet,
 ) -> Option<TelemetryRow> {
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+    let sender_id = canonical_sender_id(pkt.sender()).to_string();
 
     if pkt.data_type() == DataType::Warning {
         if let Ok(msg) = pkt.data_as_string() {
@@ -2165,7 +2168,7 @@ async fn handle_packet(
                     DbWrite::Telemetry {
                         timestamp_ms: ts_ms,
                         data_type: VALVE_STATE_DATA_TYPE.to_string(),
-                        sender_id: pkt.sender().to_string(),
+                        sender_id: sender_id.clone(),
                         values_json,
                         payload_json,
                     },
@@ -2175,7 +2178,7 @@ async fn handle_packet(
                 let row = TelemetryRow {
                     timestamp_ms: ts_ms,
                     data_type: VALVE_STATE_DATA_TYPE.to_string(),
-                    sender_id: pkt.sender().to_string(),
+                    sender_id,
                     values: values_vec,
                 };
                 return Some(row);
@@ -2222,7 +2225,7 @@ async fn handle_packet(
                 DbWrite::Telemetry {
                     timestamp_ms: ts_ms,
                     data_type: data_type_str.clone(),
-                    sender_id: pkt.sender().to_string(),
+                    sender_id: sender_id.clone(),
                     values_json,
                     payload_json: payload_json.clone(),
                 },
@@ -2237,7 +2240,7 @@ async fn handle_packet(
                 db_tx,
                 db_overflow,
                 derived_ts_ms,
-                pkt.sender(),
+                &sender_id,
                 &data_type_str,
                 voltage,
                 &payload_json,
@@ -2256,7 +2259,7 @@ async fn handle_packet(
                     db_overflow,
                     DerivedLoadcellSample {
                         ts_ms: derived_ts_ms,
-                        sender_id: pkt.sender(),
+                        sender_id: &sender_id,
                         sensor_id: &data_type_str,
                         raw_value: voltage,
                         payload_json: &payload_json,
@@ -2281,7 +2284,7 @@ async fn handle_packet(
         let row = TelemetryRow {
             timestamp_ms: ts_ms,
             data_type: data_type_str,
-            sender_id: pkt.sender().to_string(),
+            sender_id,
             values: values_vec,
         };
 
@@ -2295,7 +2298,7 @@ async fn handle_packet(
                 DbWrite::Telemetry {
                     timestamp_ms: ts_ms,
                     data_type: data_type_str.clone(),
-                    sender_id: pkt.sender().to_string(),
+                    sender_id: sender_id.clone(),
                     values_json: None,
                     payload_json,
                 },
@@ -2307,7 +2310,7 @@ async fn handle_packet(
             return Some(TelemetryRow {
                 timestamp_ms: ts_ms,
                 data_type: data_type_str,
-                sender_id: pkt.sender().to_string(),
+                sender_id,
                 values: Vec::new(),
             });
         }

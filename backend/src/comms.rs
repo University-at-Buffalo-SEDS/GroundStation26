@@ -72,7 +72,7 @@ const I2C_PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(feature = "testing")]
 const DUMMY_ROCKET_TIMESYNC_SOURCES: &[&str] = &["RF", "FC", "PB"];
 #[cfg(feature = "testing")]
-const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GW", "VB", "AB", "DAQ"];
+const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GB", "VB", "AB", "DAQ"];
 
 // ======================================================================
 //  Comms Device Trait

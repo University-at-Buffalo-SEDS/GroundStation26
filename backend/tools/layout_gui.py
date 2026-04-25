@@ -20,7 +20,7 @@ EXPECTED_BOARD_OPTIONS = [
     ("RF Board (RF)", "RF"),
     ("Power Board (PB)", "PB"),
     ("Valve Board (VB)", "VB"),
-    ("Gateway Board (GW)", "GW"),
+    ("Gateway Board (GB)", "GB"),
     ("Actuator Board (AB)", "AB"),
     ("DAQ Board (DAQ)", "DAQ"),
 ]
@@ -119,7 +119,7 @@ def default_layout() -> dict:
         "network_tab": {
             "enabled": False,
             "title": "SEDSprintf Network",
-            "expected_boards": ["FC", "RF", "PB", "VB", "GW", "AB", "DAQ"],
+            "expected_boards": ["FC", "RF", "PB", "VB", "GB", "AB", "DAQ"],
         },
         "actions_tab": {
             "disable_actions_by_default": False,
@@ -2091,7 +2091,7 @@ class LayoutEditor(tk.Tk):
         network = self.data.setdefault("network_tab", {})
         network.setdefault("enabled", False)
         network.setdefault("title", "SEDSprintf Network")
-        network.setdefault("expected_boards", ["FC", "RF", "PB", "VB", "GW", "AB", "DAQ"])
+        network.setdefault("expected_boards", ["FC", "RF", "PB", "VB", "GB", "AB", "DAQ"])
         actions_tab = self.data.setdefault("actions_tab", {})
         actions_tab.setdefault("disable_actions_by_default", False)
         actions_tab.setdefault("show_flight_setup", True)
@@ -2231,7 +2231,7 @@ class LayoutEditor(tk.Tk):
             {
                 "id": "fill_box_power",
                 "label": "Fill Box Power",
-                "sender_id": "GW",
+                "sender_id": "GB",
                 "input_data_type": "BATTERY_VOLTAGE",
                 "percent_data_type": "FILL_BOX_POWER_PERCENT",
                 "drop_rate_data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",

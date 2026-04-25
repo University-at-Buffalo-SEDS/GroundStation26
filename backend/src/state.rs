@@ -9,7 +9,7 @@ use crate::telemetry_task;
 use crate::types::{
     Board, BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyLink, NetworkTopologyMsg,
     NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus, TelemetryCommand,
-    TelemetryRow,
+    TelemetryRow, canonical_sender_id,
 };
 use crate::web::{AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
 use sedsprintf_rs_2026::config::DataEndpoint;
@@ -257,7 +257,7 @@ impl AppState {
 
     /// Updates heartbeat tracking for a board after a packet arrives from that sender.
     pub fn mark_board_seen(&self, sender: &str, timestamp_ms: u64) {
-        let Some(board) = Board::from_sender_id(sender) else {
+        let Some(board) = Board::from_sender_id(canonical_sender_id(sender)) else {
             return;
         };
         let mut map = self.board_status.lock().unwrap();
