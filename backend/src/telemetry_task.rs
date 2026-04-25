@@ -277,7 +277,7 @@ async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_st
 
 static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static DB_BACKPRESSURE_DROPPED: AtomicU64 = AtomicU64::new(0);
-static DB_LAST_BUCKET_BY_TYPE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+static DB_LAST_BUCKET_BY_TYPE: OnceLock<Mutex<HashMap<(String, String), i64>>> = OnceLock::new();
 static DB_OVERFLOW_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static BATTERY_ESTIMATOR_STATE: OnceLock<Mutex<HashMap<String, BatteryEstimatorState>>> =
     OnceLock::new();
@@ -338,7 +338,7 @@ fn db_bucket_ms() -> i64 {
     })
 }
 
-fn should_persist_telemetry_sample(data_type: &str, ts_ms: i64) -> bool {
+fn should_persist_telemetry_sample(data_type: &str, sender_id: &str, ts_ms: i64) -> bool {
     let bucket_ms = db_bucket_ms();
     if bucket_ms <= 1 {
         return true;
@@ -346,10 +346,11 @@ fn should_persist_telemetry_sample(data_type: &str, ts_ms: i64) -> bool {
     let bucket_id = ts_ms.div_euclid(bucket_ms);
     let map = DB_LAST_BUCKET_BY_TYPE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut by_type = map.lock().unwrap();
-    match by_type.get(data_type).copied() {
+    let key = (data_type.to_string(), sender_id.to_string());
+    match by_type.get(&key).copied() {
         Some(prev) if prev == bucket_id => false,
         _ => {
-            by_type.insert(data_type.to_string(), bucket_id);
+            by_type.insert(key, bucket_id);
             true
         }
     }
@@ -721,7 +722,7 @@ async fn emit_derived_battery_rows(
         ];
 
         for (data_type, values) in rows {
-            if should_persist_telemetry_sample(data_type, ts_ms) {
+            if should_persist_telemetry_sample(data_type, sender_id, ts_ms) {
                 queue_db_write(
                     state,
                     db_tx,
@@ -817,7 +818,7 @@ async fn emit_derived_loadcell_rows(
     };
 
     for (data_type, values) in rows {
-        if should_persist_telemetry_sample(data_type, sample.ts_ms) {
+        if should_persist_telemetry_sample(data_type, sample.sender_id, sample.ts_ms) {
             queue_db_write(
                 state,
                 db_tx,
@@ -853,7 +854,7 @@ async fn emit_derived_vehicle_speed_row(
     payload_json: &str,
 ) {
     let values = vec![Some(speed_mps)];
-    if should_persist_telemetry_sample(VEHICLE_SPEED_DATA_TYPE, ts_ms) {
+    if should_persist_telemetry_sample(VEHICLE_SPEED_DATA_TYPE, "", ts_ms) {
         queue_db_write(
             state,
             db_tx,
@@ -936,7 +937,7 @@ async fn handle_gps_satellite_count_packet(
     }
 
     let values = vec![Some(count as f32)];
-    if should_persist_telemetry_sample(GPS_SATELLITES_DATA_TYPE, ts_ms) {
+    if should_persist_telemetry_sample(GPS_SATELLITES_DATA_TYPE, &sender_id, ts_ms) {
         queue_db_write(
             state,
             db_tx,
@@ -2217,7 +2218,7 @@ async fn handle_packet(
         )
         .ok();
 
-        if should_persist_telemetry_sample(&data_type_str, ts_ms) {
+        if should_persist_telemetry_sample(&data_type_str, &sender_id, ts_ms) {
             queue_db_write(
                 state,
                 db_tx,
@@ -2290,7 +2291,7 @@ async fn handle_packet(
 
         Some(row)
     } else {
-        if should_persist_telemetry_sample(&data_type_str, ts_ms) {
+        if should_persist_telemetry_sample(&data_type_str, &sender_id, ts_ms) {
             queue_db_write(
                 state,
                 db_tx,
@@ -2538,6 +2539,7 @@ mod tests {
             board_status.insert(
                 *board,
                 crate::state::BoardStatus {
+                    packet_count: 0,
                     last_seen_ms: None,
                     ema_gap_ms: None,
                     warned: false,
@@ -2825,5 +2827,104 @@ mod tests {
             *state.latest_fuel_tank_pressure.lock().unwrap(),
             Some(745.0)
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_battery_voltage_packet_matches_fill_box_layout_sender() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        let mut ws_rx = state.ws_tx.subscribe();
+
+        let pkt = Packet::new(
+            DataType::BatteryVoltage,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            "GB",
+            678_901,
+            f32_payload(&[14.4]),
+        )
+        .expect("failed to build gateway BATTERY_VOLTAGE packet");
+
+        let row = handle_packet(&state, &db_tx, &db_overflow, pkt)
+            .await
+            .expect("gateway battery packet should produce raw telemetry row");
+
+        assert_eq!(row.data_type, DataType::BatteryVoltage.as_str());
+        assert_eq!(row.sender_id, Board::GatewayBoard.sender_id());
+        assert_eq!(row.values, vec![Some(14.4)]);
+
+        let mut derived_rows = Vec::new();
+        for _ in 0..3 {
+            derived_rows.push(
+                ws_rx
+                    .recv()
+                    .await
+                    .expect("derived battery rows should be broadcast"),
+            );
+        }
+        derived_rows.sort_by(|a, b| a.data_type.cmp(&b.data_type));
+
+        assert_eq!(
+            derived_rows
+                .iter()
+                .map(|row| row.data_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
+                "FILL_BOX_POWER_PERCENT",
+                "FILL_BOX_POWER_REMAINING_MINUTES",
+            ]
+        );
+        assert!(derived_rows.iter().all(|row| row.sender_id == "GB"));
+    }
+
+    #[tokio::test]
+    async fn battery_voltage_db_bucketing_is_sender_aware() {
+        let (db_tx, mut db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+
+        let pb_pkt = Packet::new(
+            DataType::BatteryVoltage,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            "PB",
+            700_000,
+            f32_payload(&[7.8]),
+        )
+        .expect("failed to build PB battery packet");
+        let gb_pkt = Packet::new(
+            DataType::BatteryVoltage,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            "GB",
+            700_000,
+            f32_payload(&[14.2]),
+        )
+        .expect("failed to build GB battery packet");
+
+        let _ = handle_packet(&state, &db_tx, &db_overflow, pb_pkt).await;
+        let _ = handle_packet(&state, &db_tx, &db_overflow, gb_pkt).await;
+
+        let mut writes = Vec::new();
+        for _ in 0..8 {
+            match tokio::time::timeout(std::time::Duration::from_millis(10), db_rx.recv()).await {
+                Ok(Some(DbQueueItem::Write(DbWrite::Telemetry {
+                    data_type,
+                    sender_id,
+                    values_json,
+                    ..
+                }))) if data_type == DataType::BatteryVoltage.as_str() => {
+                    writes.push((sender_id, values_json));
+                    if writes.len() == 2 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        writes.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].0, "GB");
+        assert_eq!(writes[1].0, "PB");
     }
 }

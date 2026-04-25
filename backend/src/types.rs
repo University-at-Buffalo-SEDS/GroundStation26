@@ -170,6 +170,8 @@ pub struct BoardStatusEntry {
     pub board_label: String,
     pub sender_id: String,
     pub seen: bool,
+    #[serde(default)]
+    pub packet_count: u64,
     pub last_seen_ms: Option<u64>,
     pub age_ms: Option<u64>,
 }

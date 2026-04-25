@@ -28,6 +28,7 @@ const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
 
 #[derive(Debug, Clone)]
 pub struct BoardStatus {
+    pub packet_count: u64,
     pub last_seen_ms: Option<u64>,
     pub ema_gap_ms: Option<u64>,
     pub warned: bool,
@@ -263,6 +264,7 @@ impl AppState {
         let mut map = self.board_status.lock().unwrap();
         let mut force_broadcast = false;
         if let Some(status) = map.get_mut(&board) {
+            status.packet_count = status.packet_count.saturating_add(1);
             if let Some(last_seen) = status.last_seen_ms {
                 let observed_ms = timestamp_ms.max(last_seen);
                 let gap_ms = observed_ms.saturating_sub(last_seen);
@@ -404,6 +406,7 @@ impl AppState {
         for board in Board::ALL {
             let status = map.get(board);
             let last_seen_ms = status.and_then(|s| s.last_seen_ms);
+            let packet_count = status.map(|s| s.packet_count).unwrap_or(0);
             let seen = last_seen_ms.is_some();
             let age_ms = last_seen_ms.map(|ts| now_ms.saturating_sub(ts));
 
@@ -412,6 +415,7 @@ impl AppState {
                 board_label: board.as_str().to_string(),
                 sender_id: board.sender_id().to_string(),
                 seen,
+                packet_count,
                 last_seen_ms,
                 age_ms,
             });
@@ -615,9 +619,13 @@ impl AppState {
                     &local_visible_endpoint_list,
                 ),
                 show_in_details: true,
-                detail: entry
-                    .age_ms
-                    .map(|age_ms| format!("Last packet {} ms ago", age_ms)),
+                detail: Some(match entry.age_ms {
+                    Some(age_ms) => format!(
+                        "Packets seen: {} | Last packet {} ms ago",
+                        entry.packet_count, age_ms
+                    ),
+                    None => format!("Packets seen: {}", entry.packet_count),
+                }),
             });
             let source = if let Some(side_name) = board_side(entry.board) {
                 if side_relay(side_name) == Some(entry.board) {

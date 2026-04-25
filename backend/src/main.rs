@@ -226,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         board_status.insert(
             *board,
             BoardStatus {
+                packet_count: 0,
                 last_seen_ms: None,
                 ema_gap_ms: None,
                 warned: false,
