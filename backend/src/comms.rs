@@ -219,6 +219,18 @@ fn i2c_description(i2c: &I2cLinkConfig) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn i2c_rx_poll_burst() -> usize {
+    static BURST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BURST.get_or_init(|| {
+        std::env::var("GS_I2C_RX_POLL_BURST")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(128)
+            .clamp(1, 4096)
+    })
+}
+
 // ======================================================================
 //  Real Comms Implementation
 // ======================================================================
@@ -1134,7 +1146,7 @@ impl CommsDevice for I2cComms {
 
         #[cfg(target_os = "linux")]
         {
-            for _ in 0..32 {
+            for _ in 0..i2c_rx_poll_burst() {
                 match self.read_slot() {
                     Ok(Some(slot)) => {
                         let assembled = match self.ingest_rx_slot(slot) {
