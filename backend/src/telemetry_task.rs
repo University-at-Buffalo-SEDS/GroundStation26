@@ -1063,9 +1063,7 @@ fn send_fill_command_direct(
 ) -> Result<(), String> {
     let endpoints: &[DataEndpoint] = match ty {
         DataType::ValveCommand => &[DataEndpoint::GroundStation, DataEndpoint::ValveBoard],
-        DataType::ActuatorCommand => {
-            &[DataEndpoint::GroundStation, DataEndpoint::ActuatorBoard]
-        }
+        DataType::ActuatorCommand => &[DataEndpoint::GroundStation, DataEndpoint::ActuatorBoard],
         _ => return Err(format!("unsupported direct fill command type: {ty:?}")),
     };
     let pkt = Packet::new(
@@ -1340,13 +1338,10 @@ pub async fn telemetry_task(
         .flat_map(|comms_handle| {
             let router = router.clone();
             let state = state.clone();
-            match spawn_comms_worker_threads(router, state, comms_handle) {
-                Ok(handles) => handles,
-                Err(err) => {
-                    eprintln!("Failed to spawn comms worker thread: {err}");
-                    Vec::new()
-                }
-            }
+            spawn_comms_worker_threads(router, state, comms_handle).unwrap_or_else(|err| {
+                eprintln!("Failed to spawn comms worker thread: {err}");
+                Vec::new()
+            })
         })
         .collect();
 
