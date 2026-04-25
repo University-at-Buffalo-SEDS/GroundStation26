@@ -14,6 +14,69 @@
   },
   "users": [
     {
+      "username": "justin",
+      "password": {
+        "algorithm": "pbkdf2_sha256",
+        "iterations": 120000,
+        "salt_b64": "hlpn2ygxb47WUiakjo+YYw==",
+        "hash_b64": "cdp54MvjoM9bkwe9CYuubuzzSBGKTa2b2uQT/SH3MDA="
+      },
+      "permissions": {
+        "view_data": true,
+        "send_commands": true
+      },
+      "command_access": {
+        "allowed_commands": [
+          "Abort",
+          "AbortAfter100",
+          "AbortAfter250",
+          "AbortAfter40",
+          "AdvanceFlightState",
+          "ConsecutiveSamples",
+          "ContinueFillSequence",
+          "DeployParachute",
+          "DisableIMU",
+          "Dump",
+          "EvaluationAbort",
+          "EvaluationFocus",
+          "EvaluationRelax",
+          "ExpandParachute",
+          "Igniter",
+          "Launch",
+          "MonitorAltitude",
+          "Nitrogen",
+          "Nitrous",
+          "NormallyOpen",
+          "PauseWritingDb",
+          "Pilot",
+          "Postinit",
+          "ReinitAfter15",
+          "ReinitAfter30",
+          "ReinitAfter50",
+          "ReinitBarometer",
+          "ReinitIMU",
+          "ReinitSensors",
+          "ResetFailures",
+          "RetractPlumbing",
+          "RevokeConsecutiveSamples",
+          "RevokeMonitorAltitude",
+          "RevokeResetFailures",
+          "RevokeValidateMeasms",
+          "RewindFlightState",
+          "Rollback",
+          "StartWritingLastTwoMinutes",
+          "StartWritingNow",
+          "StopWritingDb",
+          "ValidateMeasms"
+        ]
+      },
+      "calibration_access": {
+        "view": true,
+        "edit": true
+      },
+      "disabled": false
+    },
+    {
       "username": "rylan",
       "password": {
         "algorithm": "pbkdf2_sha256",
@@ -56,13 +119,13 @@
           "ReinitBarometer",
           "ReinitSensors",
           "ResetFailures",
+          "ResetSim",
           "RetractPlumbing",
           "RevokeConsecutiveSamples",
           "RevokeMonitorAltitude",
           "RevokeResetFailures",
           "RevokeValidateMeasms",
           "RewindFlightState",
-          "ResetSim",
           "StartWritingLastTwoMinutes",
           "StartWritingNow",
           "StopWritingDb",
