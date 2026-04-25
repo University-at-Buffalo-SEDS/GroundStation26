@@ -12,9 +12,10 @@ use crate::telemetry_db::{
 };
 use crate::types::{Board, FlightState, TelemetryCommand, TelemetryRow, u8_to_flight_state};
 use crate::web::{FlightStateMsg, emit_warning};
-use sedsprintf_rs_2026::config::DataType;
+use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::Router;
+use sedsprintf_rs_2026::serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -1074,9 +1075,34 @@ fn send_launch_command(state: &AppState, router: &Router) {
     }
 }
 
+fn send_fill_command_direct(
+    tx: &mpsc::UnboundedSender<Vec<u8>>,
+    ty: DataType,
+    payload: &[u8],
+) -> Result<(), String> {
+    let endpoints: &[DataEndpoint] = match ty {
+        DataType::ValveCommand => &[DataEndpoint::GroundStation, DataEndpoint::ValveBoard],
+        DataType::ActuatorCommand => {
+            &[DataEndpoint::GroundStation, DataEndpoint::ActuatorBoard]
+        }
+        _ => return Err(format!("unsupported direct fill command type: {ty:?}")),
+    };
+    let pkt = Packet::new(
+        ty,
+        endpoints,
+        Board::GroundStation.sender_id(),
+        get_current_timestamp_ms(),
+        Arc::<[u8]>::from(payload),
+    )
+    .map_err(|err| format!("build packet: {err:?}"))?;
+    tx.send(serialize::serialize_packet(&pkt).to_vec())
+        .map_err(|_| "umbilical direct tx queue closed".to_string())
+}
+
 pub async fn telemetry_task(
     state: Arc<AppState>,
     router: Arc<sedsprintf_rs_2026::router::Router>,
+    fill_command_tx: mpsc::UnboundedSender<Vec<u8>>,
     comms: Vec<CommsWorkerHandle>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
     mut db_rx: mpsc::Receiver<DbQueueItem>,
@@ -1372,14 +1398,14 @@ pub async fn telemetry_task(
                                 } else {
                                     ValveBoardCommands::DumpOpen
                                 };
-                                if let Err(e) = router.log_queue(
+                                if let Err(err) = send_fill_command_direct(
+                                    &fill_command_tx,
                                     DataType::ValveCommand,
                                     &[cmd as u8],
                                 ) {
-                                    log_telemetry_error("failed to log Dump command", e);
+                                    eprintln!("failed to send Dump command directly: {err}");
                                 } else {
                                     log_command_queue_success("Dump command", DataType::ValveCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "Dump command tx");
                                 }
                                 {
                                     let gpio = &state.gpio;
@@ -1404,14 +1430,14 @@ pub async fn telemetry_task(
                                 } else {
                                     ActuatorBoardCommands::IgniterOn
                                 };
-                                if let Err(e) = router.log_queue(
+                                if let Err(err) = send_fill_command_direct(
+                                    &fill_command_tx,
                                     DataType::ActuatorCommand,
                                     &[cmd as u8],
                                 ) {
-                                    log_telemetry_error("failed to log Igniter command", e);
+                                    eprintln!("failed to send Igniter command directly: {err}");
                                 } else {
                                     log_command_queue_success("Igniter command", DataType::ActuatorCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "Igniter command tx");
                                 }
                                 gs_debug_println!("Igniter command sent {:?}", cmd);
                             }
@@ -1423,14 +1449,14 @@ pub async fn telemetry_task(
                                 } else {
                                     ValveBoardCommands::PilotOpen
                                 };
-                                if let Err(e) = router.log_queue(
+                                if let Err(err) = send_fill_command_direct(
+                                    &fill_command_tx,
                                     DataType::ValveCommand,
                                     &[cmd as u8],
                                 ) {
-                                    log_telemetry_error("failed to log Pilot command", e);
+                                    eprintln!("failed to send Pilot command directly: {err}");
                                 } else {
                                     log_command_queue_success("Pilot command", DataType::ValveCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "Pilot command tx");
                                 }
                                 gs_debug_println!("Pilot command sent {:?}", cmd);
                             }
@@ -1442,14 +1468,14 @@ pub async fn telemetry_task(
                                 } else {
                                     ValveBoardCommands::NormallyOpenOpen
                                 };
-                                if let Err(e) = router.log_queue(
+                                if let Err(err) = send_fill_command_direct(
+                                    &fill_command_tx,
                                     DataType::ValveCommand,
                                     &[cmd as u8],
                                 ) {
-                                    log_telemetry_error("failed to log NormallyOpen command", e);
+                                    eprintln!("failed to send NormallyOpen command directly: {err}");
                                 } else {
                                     log_command_queue_success("NormallyOpen command", DataType::ValveCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "NormallyOpen command tx");
                                 }
                                 gs_debug_println!("Tanks command sent {:?}", cmd);
                             }
@@ -1461,46 +1487,46 @@ pub async fn telemetry_task(
                                 } else {
                                     ActuatorBoardCommands::NitrogenOpen
                                 };
-                                if let Err(e) = router.log_queue(
+                                if let Err(err) = send_fill_command_direct(
+                                    &fill_command_tx,
                                     DataType::ActuatorCommand,
                                     &[cmd as u8],
                                 ) {
-                                    log_telemetry_error("failed to log Nitrogen command", e);
+                                    eprintln!("failed to send Nitrogen command directly: {err}");
                                 } else {
                                     log_command_queue_success("Nitrogen command", DataType::ActuatorCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "Nitrogen command tx");
                                 }
                                 gs_debug_println!("Nitrogen command sent {:?}", cmd);
                             }
                         TelemetryCommand::NitrogenClose => {
-                                if let Err(e) = router.log_queue(
+                                if let Err(err) = send_fill_command_direct(
+                                    &fill_command_tx,
                                     DataType::ActuatorCommand,
                                     &[ActuatorBoardCommands::NitrogenClose as u8],
                                 ) {
-                                    log_telemetry_error("failed to log NitrogenClose command", e);
+                                    eprintln!("failed to send NitrogenClose command directly: {err}");
                                 } else {
                                     log_command_queue_success(
                                         "NitrogenClose command",
                                         DataType::ActuatorCommand,
                                         &[ActuatorBoardCommands::NitrogenClose as u8],
                                     );
-                                    flush_command_tx(&router, "NitrogenClose command tx");
                                 }
                                 gs_debug_println!("Nitrogen explicit close command sent");
                             }
                         TelemetryCommand::RetractPlumbing => {
-                                if let Err(e) = router.log_queue(
+                                if let Err(err) = send_fill_command_direct(
+                                    &fill_command_tx,
                                     DataType::ActuatorCommand,
                                     &[ActuatorBoardCommands::RetractPlumbing as u8],
                                 ) {
-                                    log_telemetry_error("failed to log RetractPlumbing command", e);
+                                    eprintln!("failed to send RetractPlumbing command directly: {err}");
                                 } else {
                                     log_command_queue_success(
                                         "RetractPlumbing command",
                                         DataType::ActuatorCommand,
                                         &[ActuatorBoardCommands::RetractPlumbing as u8],
                                     );
-                                    flush_command_tx(&router, "RetractPlumbing command tx");
                                 }
                                 gs_debug_println!("RetractPlumbing command sent");
                             }
@@ -1512,30 +1538,30 @@ pub async fn telemetry_task(
                                 } else {
                                     ActuatorBoardCommands::NitrousOpen
                                 };
-                                if let Err(e) = router.log_queue(
+                                if let Err(err) = send_fill_command_direct(
+                                    &fill_command_tx,
                                     DataType::ActuatorCommand,
                                     &[cmd as u8],
                                 ) {
-                                    log_telemetry_error("failed to log Nitrous command", e);
+                                    eprintln!("failed to send Nitrous command directly: {err}");
                                 } else {
                                     log_command_queue_success("Nitrous command", DataType::ActuatorCommand, &[cmd as u8]);
-                                    flush_command_tx(&router, "Nitrous command tx");
                                 }
                                 gs_debug_println!("Nitrous command sent: {:?}", cmd);
                             }
                         TelemetryCommand::NitrousClose => {
-                                if let Err(e) = router.log_queue(
+                                if let Err(err) = send_fill_command_direct(
+                                    &fill_command_tx,
                                     DataType::ActuatorCommand,
                                     &[ActuatorBoardCommands::NitrousClose as u8],
                                 ) {
-                                    log_telemetry_error("failed to log NitrousClose command", e);
+                                    eprintln!("failed to send NitrousClose command directly: {err}");
                                 } else {
                                     log_command_queue_success(
                                         "NitrousClose command",
                                         DataType::ActuatorCommand,
                                         &[ActuatorBoardCommands::NitrousClose as u8],
                                     );
-                                    flush_command_tx(&router, "NitrousClose command tx");
                                 }
                                 gs_debug_println!("Nitrous explicit close command sent");
                             }

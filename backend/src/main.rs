@@ -522,6 +522,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tt = tokio::spawn(telemetry_task(
         state.clone(),
         router.clone(),
+        umbilical_tx.clone(),
         vec![
             CommsWorkerHandle {
                 name: "rocket_comms",
