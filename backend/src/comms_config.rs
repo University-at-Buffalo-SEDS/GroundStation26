@@ -139,11 +139,11 @@ fn default_i2c_addr() -> u16 {
 }
 
 fn default_i2c_chunk_delay_ms() -> u64 {
-    1
+    0
 }
 
 fn default_i2c_initial_wait_ms() -> u64 {
-    10
+    1
 }
 
 impl Default for CommsLinksConfig {
