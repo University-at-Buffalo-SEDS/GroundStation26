@@ -226,7 +226,7 @@ fn i2c_rx_poll_burst() -> usize {
         std::env::var("GS_I2C_RX_POLL_BURST")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(128)
+            .unwrap_or(8)
             .clamp(1, 4096)
     })
 }
@@ -1190,7 +1190,10 @@ impl CommsDevice for I2cComms {
                             }
                         }
                     }
-                    Ok(None) => continue,
+                    // An idle slot means the slave mailbox is currently empty,
+                    // so release the shared comms lock instead of burning the
+                    // rest of the poll burst on guaranteed-empty reads.
+                    Ok(None) => break,
                     Err(err) => {
                         let _ = err;
                         continue;

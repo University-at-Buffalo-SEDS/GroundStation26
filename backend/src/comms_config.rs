@@ -143,7 +143,7 @@ fn default_i2c_chunk_delay_ms() -> u64 {
 }
 
 fn default_i2c_initial_wait_ms() -> u64 {
-    1
+    0
 }
 
 impl Default for CommsLinksConfig {
@@ -389,8 +389,8 @@ mod tests {
             i2c: I2cLinkConfig {
                 bus: 1,
                 addr: 0x55,
-                chunk_delay_ms: 1,
-                initial_wait_ms: 10,
+                chunk_delay_ms: 0,
+                initial_wait_ms: 0,
             },
         };
 

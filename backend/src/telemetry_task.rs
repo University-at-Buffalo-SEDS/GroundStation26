@@ -41,15 +41,15 @@ fn spawn_comms_worker_threads(
     mut comms_handle: CommsWorkerHandle,
 ) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
     let worker_name = comms_handle.name;
-    let shared_comms = comms_handle.comms.clone();
-    let tx_comms = shared_comms.clone();
-    let tx_state = state.clone();
-    let tx_worker = thread::Builder::new()
-        .name(format!("{}_tx_worker", worker_name))
+    let comms = comms_handle.comms;
+    let comms_worker = thread::Builder::new()
+        .name(format!("{}_comms_worker", worker_name))
         .spawn(move || {
-            let mut comms_shutdown_rx = tx_state.shutdown_subscribe();
+            let mut comms_shutdown_rx = state.shutdown_subscribe();
             let mut last_send_error_log_ms = 0;
             let mut suppressed_send_errors = 0;
+            let mut last_recv_error_log_ms = 0;
+            let mut suppressed_recv_errors = 0;
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -59,19 +59,23 @@ fn spawn_comms_worker_threads(
                 }
 
                 let mut sent_any = false;
+                let tap_state = state.clone();
+                let mut packet_tap = |pkt: &Packet| {
+                    tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+                    tap_state.mark_packet_received(get_current_timestamp_ms());
+                    let mut rb = tap_state.ring_buffer.lock().unwrap();
+                    rb.push(pkt.clone());
+                };
+                let mut comms = comms.lock().expect("failed to get lock");
                 for _ in 0..COMMS_TX_BURST {
                     match comms_handle.tx_rx.try_recv() {
                         Ok(payload) => {
                             sent_any = true;
-                            match tx_comms
-                                .lock()
-                                .expect("failed to get lock")
-                                .send_data(&payload)
-                            {
+                            match comms.send_data(&payload) {
                                 Ok(()) => {
                                     if suppressed_send_errors > 0 {
                                         eprintln!(
-                                            "{worker_name} tx worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
+                                            "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
                                         );
                                         suppressed_send_errors = 0;
                                         last_send_error_log_ms = 0;
@@ -79,7 +83,7 @@ fn spawn_comms_worker_threads(
                                 }
                                 Err(e) => {
                                     log_repeated_worker_error(
-                                        &format!("{worker_name} tx worker send_data failed"),
+                                        &format!("{worker_name} comms worker send_data failed"),
                                         &e.to_string(),
                                         &mut last_send_error_log_ms,
                                         &mut suppressed_send_errors,
@@ -92,54 +96,28 @@ fn spawn_comms_worker_threads(
                     }
                 }
 
-                if !sent_any {
-                    thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
-                }
-            }
-        })?;
-
-    let rx_comms = shared_comms;
-    let rx_worker = thread::Builder::new()
-        .name(format!("{}_rx_worker", worker_name))
-        .spawn(move || {
-            let mut comms_shutdown_rx = state.shutdown_subscribe();
-            let mut last_recv_error_log_ms = 0;
-            let mut suppressed_recv_errors = 0;
-            loop {
-                match comms_shutdown_rx.try_recv() {
-                    Ok(_)
-                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
-                    | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
-                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
-                }
-
-                let tap_state = state.clone();
-                let mut packet_tap = |pkt: &Packet| {
-                    tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
-                    tap_state.mark_packet_received(get_current_timestamp_ms());
-                    let mut rb = tap_state.ring_buffer.lock().unwrap();
-                    rb.push(pkt.clone());
-                };
-                match rx_comms
-                    .lock()
-                    .expect("failed to get lock")
-                    .recv_packet(&router, &mut packet_tap)
-                {
+                match comms.recv_packet(&router, &mut packet_tap) {
                     Ok(_) => {}
                     Err(e) => {
                         log_repeated_worker_error(
-                            &format!("{worker_name} rx worker recv_packet failed"),
+                            &format!("{worker_name} comms worker recv_packet failed"),
                             &format!("{e:?}"),
                             &mut last_recv_error_log_ms,
                             &mut suppressed_recv_errors,
                         );
                     }
                 }
-                thread::yield_now();
+                drop(comms);
+
+                if sent_any {
+                    thread::yield_now();
+                } else {
+                    thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
+                }
             }
         })?;
 
-    Ok(vec![tx_worker, rx_worker])
+    Ok(vec![comms_worker])
 }
 
 fn log_repeated_worker_error(
