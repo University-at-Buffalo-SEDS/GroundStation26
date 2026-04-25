@@ -266,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
         gpio,
         board_status: Arc::new(Mutex::new(board_status)),
         board_status_tx,
+        last_board_status_broadcast_ms: Arc::new(AtomicU64::new(0)),
         last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
         umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),

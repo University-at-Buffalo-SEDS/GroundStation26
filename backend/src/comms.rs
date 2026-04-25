@@ -156,6 +156,13 @@ fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(
     }
 }
 
+fn is_valid_serialized_packet_or_ack(payload: &[u8]) -> bool {
+    let Ok(frame) = serialize::peek_frame_info(payload) else {
+        return false;
+    };
+    frame.ack_only() || serialize::deserialize_packet(payload).is_ok()
+}
+
 #[cfg(any(test, target_os = "linux"))]
 fn take_buffered_serialized_packet(
     rx_payload_buf: &mut Vec<u8>,
@@ -370,6 +377,12 @@ impl UartComms {
                 None => break,
             };
             processed_any = true;
+            if !is_valid_serialized_packet_or_ack(&payload) {
+                if matches!(self.protocol, SerialProtocol::RawUart) {
+                    self.handle_raw_uart_router_reject(&payload);
+                }
+                continue;
+            }
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
             maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
             tap_non_groundstation_gps_payload(&payload, packet_tap);
@@ -1143,6 +1156,9 @@ impl CommsDevice for I2cComms {
                             }
                             self.rx_payload_buf.extend_from_slice(payload);
                             while let Some(packet) = self.try_take_buffered_packet()? {
+                                if !is_valid_serialized_packet_or_ack(&packet) {
+                                    continue;
+                                }
                                 tap_non_groundstation_gps_payload(&packet, packet_tap);
                                 match router.rx_serialized_queue_from_side(&packet, side_id) {
                                     Ok(()) => {}
@@ -1291,6 +1307,9 @@ impl CommsDevice for SpiComms {
                 return Ok(());
             };
             if payload.is_empty() {
+                return Ok(());
+            }
+            if !is_valid_serialized_packet_or_ack(payload) {
                 return Ok(());
             }
             tap_non_groundstation_gps_payload(payload, packet_tap);
@@ -1451,6 +1470,9 @@ impl CommsDevice for CanComms {
 
             let packet = std::mem::take(&mut self.rx_buf);
             self.reset_rx();
+            if !is_valid_serialized_packet_or_ack(&packet) {
+                return Ok(());
+            }
             tap_non_groundstation_gps_payload(&packet, packet_tap);
             return router.rx_serialized_queue_from_side(&packet, side_id);
         }

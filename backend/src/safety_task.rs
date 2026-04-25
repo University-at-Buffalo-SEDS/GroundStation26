@@ -36,9 +36,13 @@ const BARO_ALTITUDE_MAX_THRESHOLD: f32 = 11000.0; // m
 
 // GPS thresholds
 // Should be in texas
+#[cfg(not(feature = "hitl_mode"))]
 const GPS_LATITUDE_MIN_THRESHOLD: f32 = 25.0; // degrees
+#[cfg(not(feature = "hitl_mode"))]
 const GPS_LATITUDE_MAX_THRESHOLD: f32 = 36.5; // degrees
+#[cfg(not(feature = "hitl_mode"))]
 const GPS_LONGITUDE_MIN_THRESHOLD: f32 = -106.5; // degrees
+#[cfg(not(feature = "hitl_mode"))]
 const GPS_LONGITUDE_MAX_THRESHOLD: f32 = -93.5; // degrees
 
 // Default battery voltage thresholds (V), used as fallback sender ranges.
@@ -444,24 +448,27 @@ pub async fn safety_task(
 
                 // GPS: [lat, lon] in "xy"
                 DataType::GpsData => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
-
-                    // Latitude (x)
-                    if let Some(lat) = values.first()
-                        && ((GPS_LATITUDE_MIN_THRESHOLD > *lat)
-                            || (*lat > GPS_LATITUDE_MAX_THRESHOLD))
+                    #[cfg(not(feature = "hitl_mode"))]
                     {
-                        cycle_warnings
-                            .insert("Critical: GPS latitude out of bounds (Texas check)!");
-                    }
+                        let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
 
-                    // Longitude (y)
-                    if let Some(lon) = values.get(1)
-                        && ((GPS_LONGITUDE_MIN_THRESHOLD > *lon)
-                            || (*lon > GPS_LONGITUDE_MAX_THRESHOLD))
-                    {
-                        cycle_warnings
-                            .insert("Critical: GPS longitude out of bounds (Texas check)!");
+                        // Latitude (x)
+                        if let Some(lat) = values.first()
+                            && ((GPS_LATITUDE_MIN_THRESHOLD > *lat)
+                                || (*lat > GPS_LATITUDE_MAX_THRESHOLD))
+                        {
+                            cycle_warnings
+                                .insert("Critical: GPS latitude out of bounds (Texas check)!");
+                        }
+
+                        // Longitude (y)
+                        if let Some(lon) = values.get(1)
+                            && ((GPS_LONGITUDE_MIN_THRESHOLD > *lon)
+                                || (*lon > GPS_LONGITUDE_MAX_THRESHOLD))
+                        {
+                            cycle_warnings
+                                .insert("Critical: GPS longitude out of bounds (Texas check)!");
+                        }
                     }
                 }
 

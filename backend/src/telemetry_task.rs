@@ -31,6 +31,9 @@ pub struct CommsWorkerHandle {
     pub tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
+const COMMS_TX_BURST: usize = 32;
+const COMMS_IDLE_SLEEP_MS: u64 = 1;
+
 fn spawn_comms_worker_threads(
     router: Arc<Router>,
     state: Arc<AppState>,
@@ -54,36 +57,42 @@ fn spawn_comms_worker_threads(
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
                 }
 
-                match comms_handle.tx_rx.try_recv() {
-                    Ok(payload) => {
-                        match tx_comms
-                            .lock()
-                            .expect("failed to get lock")
-                            .send_data(&payload)
-                        {
-                            Ok(()) => {
-                                if suppressed_send_errors > 0 {
-                                    eprintln!(
-                                        "{worker_name} tx worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
+                let mut sent_any = false;
+                for _ in 0..COMMS_TX_BURST {
+                    match comms_handle.tx_rx.try_recv() {
+                        Ok(payload) => {
+                            sent_any = true;
+                            match tx_comms
+                                .lock()
+                                .expect("failed to get lock")
+                                .send_data(&payload)
+                            {
+                                Ok(()) => {
+                                    if suppressed_send_errors > 0 {
+                                        eprintln!(
+                                            "{worker_name} tx worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
+                                        );
+                                        suppressed_send_errors = 0;
+                                        last_send_error_log_ms = 0;
+                                    }
+                                }
+                                Err(e) => {
+                                    log_repeated_worker_error(
+                                        &format!("{worker_name} tx worker send_data failed"),
+                                        &e.to_string(),
+                                        &mut last_send_error_log_ms,
+                                        &mut suppressed_send_errors,
                                     );
-                                    suppressed_send_errors = 0;
-                                    last_send_error_log_ms = 0;
                                 }
                             }
-                            Err(e) => {
-                                log_repeated_worker_error(
-                                    &format!("{worker_name} tx worker send_data failed"),
-                                    &e.to_string(),
-                                    &mut last_send_error_log_ms,
-                                    &mut suppressed_send_errors,
-                                );
-                            }
                         }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
                     }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                        thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+                }
+
+                if !sent_any {
+                    thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
                 }
             }
         })?;
@@ -125,8 +134,7 @@ fn spawn_comms_worker_threads(
                         );
                     }
                 }
-
-                thread::sleep(Duration::from_millis(2));
+                thread::yield_now();
             }
         })?;
 
@@ -169,18 +177,29 @@ fn spawn_router_worker_thread(
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
                 }
 
-                if let Err(e) = router.poll_discovery() {
-                    log_telemetry_error("router discovery polling failed", e);
+                let mut did_work = false;
+                match router.poll_discovery() {
+                    Ok(queued) => {
+                        did_work |= queued;
+                    }
+                    Err(e) => {
+                        log_telemetry_error("router discovery polling failed", e);
+                    }
                 }
                 if timesync_enabled() {
-                    let _ = router.poll_timesync();
+                    if let Ok(queued) = router.poll_timesync() {
+                        did_work |= queued;
+                    }
                 }
                 if let Err(e) = process_router_queues(&router) {
                     log_telemetry_error("router queue processing failed", e);
                 }
                 state.mark_discovered_relays_seen();
-
-                thread::sleep(Duration::from_millis(1));
+                if !did_work {
+                    thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
+                } else {
+                    thread::yield_now();
+                }
             }
         })
 }
@@ -2536,6 +2555,7 @@ mod tests {
             gpio: GpioPins::new(),
             board_status: Arc::new(Mutex::new(board_status)),
             board_status_tx,
+            last_board_status_broadcast_ms: Arc::new(AtomicU64::new(0)),
             last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
             umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),

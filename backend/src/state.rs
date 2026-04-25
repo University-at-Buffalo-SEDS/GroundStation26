@@ -24,6 +24,7 @@ use tokio::time::{Duration, Instant};
 
 pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
 const NETWORK_TOPOLOGY_BOARD_TIMEOUT_MS_DEFAULT: u64 = 120_000;
+const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
 
 #[derive(Debug, Clone)]
 pub struct BoardStatus {
@@ -81,6 +82,9 @@ pub struct AppState {
 
     /// Board status updates → frontend
     pub board_status_tx: broadcast::Sender<BoardStatusMsg>,
+
+    /// Last time a packet-driven board-status snapshot was broadcast.
+    pub last_board_status_broadcast_ms: Arc<AtomicU64>,
 
     /// Last time (ms) any telemetry packet was received by the router.
     pub last_packet_rx_ms: Arc<AtomicU64>,
@@ -257,9 +261,11 @@ impl AppState {
             return;
         };
         let mut map = self.board_status.lock().unwrap();
+        let mut force_broadcast = false;
         if let Some(status) = map.get_mut(&board) {
             if let Some(last_seen) = status.last_seen_ms {
-                let gap_ms = timestamp_ms.saturating_sub(last_seen);
+                let observed_ms = timestamp_ms.max(last_seen);
+                let gap_ms = observed_ms.saturating_sub(last_seen);
                 // Smooth the inter-packet gap so the UI can reason about board health
                 // without reacting to every short burst or stall.
                 let ema = status
@@ -267,14 +273,15 @@ impl AppState {
                     .map(|prev| ((prev * 7) + gap_ms) / 8)
                     .unwrap_or(gap_ms);
                 status.ema_gap_ms = Some(ema.clamp(10, 60_000));
+                status.last_seen_ms = Some(observed_ms);
+            } else {
+                status.last_seen_ms = Some(timestamp_ms);
+                force_broadcast = true;
             }
-            status.last_seen_ms = Some(timestamp_ms);
             status.warned = false;
         }
         drop(map);
-        let _ = self
-            .board_status_tx
-            .send(self.board_status_snapshot(timestamp_ms));
+        self.broadcast_board_status_snapshot(timestamp_ms, force_broadcast);
     }
 
     /// Marks side-relay boards as seen when the router has an active discovery route for that side.
@@ -288,6 +295,7 @@ impl AppState {
         };
         let snapshot = router.export_topology();
         let mut saw_active_route = false;
+        let mut force_broadcast = false;
         let mut map = self.board_status.lock().unwrap();
         for route in snapshot.routes {
             saw_active_route = true;
@@ -302,6 +310,7 @@ impl AppState {
             let Some(status) = map.get_mut(&board) else {
                 continue;
             };
+            force_broadcast |= status.last_seen_ms.is_none();
             let route_last_seen_ms = now_ms.saturating_sub(route.age_ms);
             status.last_seen_ms = Some(
                 status
@@ -315,10 +324,23 @@ impl AppState {
         drop(map);
         if saw_active_route {
             self.mark_packet_received(now_ms);
-            let _ = self
-                .board_status_tx
-                .send(self.board_status_snapshot(now_ms));
+            self.broadcast_board_status_snapshot(now_ms, force_broadcast);
         }
+    }
+
+    fn broadcast_board_status_snapshot(&self, now_ms: u64, force: bool) {
+        let last_sent_ms = self.last_board_status_broadcast_ms.load(Ordering::Relaxed);
+        if !force
+            && last_sent_ms != 0
+            && now_ms.saturating_sub(last_sent_ms) < BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS
+        {
+            return;
+        }
+        self.last_board_status_broadcast_ms
+            .store(now_ms, Ordering::Relaxed);
+        let _ = self
+            .board_status_tx
+            .send(self.board_status_snapshot(now_ms));
     }
 
     /// Returns whether every known board has been observed at least once.
