@@ -227,8 +227,29 @@
         "fg": "#e0f2fe"
       },
       {
+        "label": "Continue Fill Sequence",
+        "cmd": "ContinueFillSequence",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Postinit Signal",
+        "cmd": "PostinitSignal",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
         "label": "Launch Signal",
         "cmd": "LaunchSignal",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Rollback Signal",
+        "cmd": "RollbackSignal",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -262,8 +283,8 @@
         "fg": "#e0f2fe"
       },
       {
-        "label": "Enable IMU",
-        "cmd": "EnableIMU",
+        "label": "Reinit IMU",
+        "cmd": "ReinitIMU",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -332,13 +353,6 @@
         "fg": "#e0f2fe"
       },
       {
-        "label": "Abort After 15",
-        "cmd": "AbortAfter15",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
         "label": "Abort After 40",
         "cmd": "AbortAfter40",
         "border": "#38bdf8",
@@ -346,29 +360,36 @@
         "fg": "#e0f2fe"
       },
       {
-        "label": "Abort After 70",
-        "cmd": "AbortAfter70",
+        "label": "Abort After 100",
+        "cmd": "AbortAfter100",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Reinit After 12",
-        "cmd": "ReinitAfter12",
+        "label": "Abort After 250",
+        "cmd": "AbortAfter250",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Reinit After 26",
-        "cmd": "ReinitAfter26",
+        "label": "Reinit After 15",
+        "cmd": "ReinitAfter15",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Reinit After 44",
-        "cmd": "ReinitAfter44",
+        "label": "Reinit After 30",
+        "cmd": "ReinitAfter30",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Reinit After 50",
+        "cmd": "ReinitAfter50",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -997,84 +1018,110 @@
     "states": [
       {
         "states": [
-          "Startup",
-          "Idle",
-          "PreFill",
-          "FillTest",
-          "NitrogenFill",
-          "NitrousFill",
-          "Armed",
-          "Aborted"
+          "Startup"
         ],
         "sections": [
           {
-            "title": "Flight Overview",
+            "title": "Connected Devices",
             "widgets": [
               {
-                "kind": "summary",
-                "data_type": "GPS_DATA",
-                "items": [
-                  {
-                    "label": "Lat",
-                    "index": 0,
-                    "formatter": {
-                      "precision": 7
-                    }
-                  },
-                  {
-                    "label": "Lon",
-                    "index": 1,
-                    "formatter": {
-                      "precision": 7
-                    }
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "VEHICLE_SPEED",
-                "items": [
-                  {
-                    "label": "Vertical Speed",
-                    "index": 0,
-                    "formatter": {
-                      "precision": 2,
-                      "suffix": " m/s"
-                    }
-                  }
-                ]
-              },
-              {
-                "kind": "summary",
-                "data_type": "GPS_SATELLITE_NUMBER",
-                "summary_style": {
-                  "background": "#1f2937",
-                  "border": "#facc15",
-                  "label_color": "#fde68a",
-                  "value_color": "#fef3c7"
-                },
-                "items": [
-                  {
-                    "label": "Satellites",
-                    "index": 0,
-                    "formatter": {
-                      "kind": "integer",
-                      "prefix": "\ud83d\udef0 "
-                    }
-                  }
-                ]
-              },
-              {
-                "kind": "chart",
-                "data_type": "VEHICLE_SPEED",
-                "chart_title": "Vehicle Speed",
-                "width": 1200.0,
-                "height": 240.0,
-                "full_width": true
+                "kind": "board_status"
               }
             ],
             "value_layout": "horizontal"
           },
+          {
+            "title": "Valve Board Battery (Valve Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0,
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 6,
+                      "suffix": " V/min"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Fill Box Power (Gateway Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0,
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 6,
+                      "suffix": " V/min"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          }
+        ]
+      },
+      {
+        "states": [
+          "PreFill",
+          "FillTest",
+          "NitrogenFill",
+          "NitrousFill"
+        ],
+        "sections": [
           {
             "title": "Fill Metrics",
             "widgets": [
@@ -1143,53 +1190,7 @@
                   }
                 ],
                 "width": 1200.0,
-                "height": 260.0,
-                "full_width": true
-              }
-            ],
-            "value_layout": "horizontal"
-          },
-          {
-            "title": "Actions",
-            "widgets": [
-              {
-                "kind": "actions",
-                "actions": [
-                  "Launch",
-                  "Dump",
-                  "Igniter",
-                  "Pilot",
-                  "NormallyOpen",
-                  "Nitrogen",
-                  "Nitrous",
-                  "RetractPlumbing",
-                  "AdvanceFlightState",
-                  "RewindFlightState",
-                  "DeployParachute",
-                  "ExpandParachute",
-                  "ReinitSensors",
-                  "LaunchSignal",
-                  "EvaluationRelax",
-                  "EvaluationFocus",
-                  "EvaluationAbort",
-                  "ReinitBarometer",
-                  "EnableIMU",
-                  "DisableIMU",
-                  "MonitorAltitude",
-                  "RevokeMonitorAltitude",
-                  "ConsecutiveSamples",
-                  "RevokeConsecutiveSamples",
-                  "ResetFailures",
-                  "RevokeResetFailures",
-                  "ValidateMeasms",
-                  "RevokeValidateMeasms",
-                  "AbortAfter15",
-                  "AbortAfter40",
-                  "AbortAfter70",
-                  "ReinitAfter12",
-                  "ReinitAfter26",
-                  "ReinitAfter44"
-                ]
+                "height": 260.0
               }
             ],
             "value_layout": "horizontal"
@@ -1270,97 +1271,104 @@
               }
             ],
             "value_layout": "horizontal"
-          }
-        ]
-      },
-      {
-        "states": [
-          "Launch",
-          "Ascent",
-          "Coast",
-          "Apogee"
-        ],
-        "sections": [
+          },
           {
-            "title": "Ascent Overview",
+            "title": "Actions",
+            "widgets": [
+              {
+                "kind": "actions",
+                "actions": [
+                  "Dump",
+                  "NormallyOpen",
+                  "Nitrogen",
+                  "Nitrous",
+                  "Pilot",
+                  "RetractPlumbing",
+                  "AdvanceFlightState",
+                  "RewindFlightState"
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Valve Board Battery (Valve Board)",
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "ASCENT_STATE",
+                "data_type": "VALVE_BOARD_BATTERY_PERCENT",
                 "items": [
                   {
-                    "label": "Q0",
+                    "label": "Percent",
                     "index": 0
-                  },
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
                   {
-                    "label": "Altitude",
-                    "index": 4
-                  },
-                  {
-                    "label": "Velocity",
-                    "index": 5,
+                    "label": "Drop Rate (V/min)",
+                    "index": 0,
                     "formatter": {
-                      "precision": 2,
-                      "suffix": " m/s"
+                      "kind": "number",
+                      "precision": 6,
+                      "suffix": " V/min"
                     }
                   }
                 ]
               },
               {
                 "kind": "summary",
-                "data_type": "BAROMETER_DATA",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
                 "items": [
                   {
-                    "label": "Baro Alt",
-                    "index": 2
-                  },
-                  {
-                    "label": "Pressure",
+                    "label": "Remaining Minutes",
                     "index": 0
-                  },
+                  }
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Fill Box Power (Gateway Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_PERCENT",
+                "items": [
                   {
-                    "label": "Temp",
-                    "index": 1
+                    "label": "Percent",
+                    "index": 0
                   }
                 ]
               },
               {
-                "kind": "chart",
-                "chart_title": "Altitude Estimates",
-                "chart_series": [
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
+                "items": [
                   {
-                    "data_type": "BAROMETER_DATA",
-                    "index": 2,
-                    "label": "Barometer"
-                  },
-                  {
-                    "data_type": "ASCENT_STATE",
-                    "index": 4,
-                    "label": "Ascent KF"
+                    "label": "Drop Rate (V/min)",
+                    "index": 0,
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 6,
+                      "suffix": " V/min"
+                    }
                   }
-                ],
-                "width": 1200.0,
-                "height": 260.0,
-                "full_width": true
+                ]
               },
               {
-                "kind": "chart",
-                "chart_title": "Vertical Speed Comparison",
-                "chart_series": [
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
+                "items": [
                   {
-                    "data_type": "VEHICLE_SPEED",
-                    "index": 0,
-                    "label": "Fused"
-                  },
-                  {
-                    "data_type": "ASCENT_STATE",
-                    "index": 5,
-                    "label": "Ascent KF"
+                    "label": "Remaining Minutes",
+                    "index": 0
                   }
-                ],
-                "width": 1200.0,
-                "height": 240.0,
-                "full_width": true
+                ]
               }
             ],
             "value_layout": "horizontal"
@@ -1369,87 +1377,564 @@
       },
       {
         "states": [
-          "ParachuteDeploy",
-          "Descent",
-          "Landed",
-          "Recovery"
+          "Armed"
         ],
         "sections": [
           {
-            "title": "Descent Overview",
+            "title": "Armed Metrics",
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "DESCENT_STATE",
+                "data_type": "FUEL_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Lat",
+                    "label": "Tank Pressure",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_WEIGHT_KG",
+                "items": [
+                  {
+                    "label": "Mass (kg)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "items": [
+                  {
+                    "label": "Fill Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "chart",
+                "chart_title": "Pressure and Loadcell",
+                "chart_series": [
+                  {
+                    "data_type": "FUEL_TANK_PRESSURE",
                     "index": 0,
-                    "formatter": {
-                      "precision": 7
-                    }
+                    "label": "Tank Pressure"
                   },
                   {
-                    "label": "Lon",
-                    "index": 1,
-                    "formatter": {
-                      "precision": 7
-                    }
+                    "data_type": "LOADCELL_WEIGHT_KG",
+                    "index": 0,
+                    "label": "Mass (kg)"
                   },
                   {
-                    "label": "Altitude",
+                    "data_type": "LOADCELL_FILL_PERCENT",
+                    "index": 0,
+                    "label": "Fill Percent"
+                  }
+                ],
+                "width": 1200.0,
+                "height": 260.0
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Pressure",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "items": [
+                  {
+                    "label": "Tank Pressure",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "chart",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "chart_title": "Fuel Tank Pressure",
+                "width": 1200.0,
+                "height": 260.0
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Valve States",
+            "widgets": [
+              {
+                "kind": "valve_state",
+                "data_type": "VALVE_STATE",
+                "valves": [
+                  {
+                    "label": "Pilot",
+                    "index": 0
+                  },
+                  {
+                    "label": "NormallyOpen",
+                    "index": 1
+                  },
+                  {
+                    "label": "Dump",
                     "index": 2
                   },
                   {
-                    "label": "Velocity",
-                    "index": 3,
+                    "label": "Igniter",
+                    "index": 3
+                  },
+                  {
+                    "label": "Nitrogen",
+                    "index": 4
+                  },
+                  {
+                    "label": "Nitrous",
+                    "index": 5
+                  },
+                  {
+                    "label": "Fill Lines",
+                    "index": 6
+                  }
+                ],
+                "valve_labels": [
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Open",
+                    "false_label": "Closed",
+                    "unknown_label": "Unknown"
+                  },
+                  {
+                    "true_label": "Removed",
+                    "false_label": "Installed",
+                    "unknown_label": "Unknown"
+                  }
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Actions",
+            "widgets": [
+              {
+                "kind": "actions",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "items": [
+                  {
+                    "label": "Tank Pressure",
+                    "index": 0
+                  }
+                ],
+                "actions": [
+                  "Launch",
+                  "Dump",
+                  "Pilot",
+                  "AdvanceFlightState",
+                  "RewindFlightState"
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Valve Board Battery (Valve Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0,
                     "formatter": {
-                      "precision": 2,
-                      "suffix": " m/s"
+                      "kind": "number",
+                      "precision": 6,
+                      "suffix": " V/min"
                     }
                   }
                 ]
               },
               {
-                "kind": "map"
-              },
-              {
-                "kind": "chart",
-                "chart_title": "Altitude Estimates",
-                "chart_series": [
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
+                "items": [
                   {
-                    "data_type": "BAROMETER_DATA",
-                    "index": 2,
-                    "label": "Barometer"
-                  },
-                  {
-                    "data_type": "DESCENT_STATE",
-                    "index": 2,
-                    "label": "Descent KF"
+                    "label": "Remaining Minutes",
+                    "index": 0
                   }
-                ],
-                "width": 1200.0,
-                "height": 260.0,
-                "full_width": true
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Fill Box Power (Gateway Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
               },
               {
-                "kind": "chart",
-                "chart_title": "Vertical Speed Comparison",
-                "chart_series": [
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
+                "items": [
                   {
-                    "data_type": "VEHICLE_SPEED",
+                    "label": "Drop Rate (V/min)",
                     "index": 0,
-                    "label": "Fused"
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 6,
+                      "suffix": " V/min"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          }
+        ]
+      },
+      {
+        "states": [
+          "Launch",
+          "Ascent",
+          "Coast",
+          "Apogee",
+          "ParachuteDeploy",
+          "Descent"
+        ],
+        "sections": [
+          {
+            "title": "Test Fire Metrics",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "items": [
+                  {
+                    "label": "Tank Pressure",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_WEIGHT_KG",
+                "items": [
+                  {
+                    "label": "Mass (kg)",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "items": [
+                  {
+                    "label": "Fill Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "chart",
+                "chart_title": "Pressure and Loadcell",
+                "chart_series": [
+                  {
+                    "data_type": "FUEL_TANK_PRESSURE",
+                    "index": 0,
+                    "label": "Tank Pressure"
                   },
                   {
-                    "data_type": "DESCENT_STATE",
-                    "index": 3,
-                    "label": "Descent KF"
+                    "data_type": "LOADCELL_WEIGHT_KG",
+                    "index": 0,
+                    "label": "Mass (kg)"
+                  },
+                  {
+                    "data_type": "LOADCELL_FILL_PERCENT",
+                    "index": 0,
+                    "label": "Fill Percent"
                   }
                 ],
                 "width": 1200.0,
-                "height": 240.0,
-                "full_width": true
+                "height": 260.0
+              }
+            ],
+            "value_layout": "horizontal"
+          }
+        ]
+      },
+      {
+        "states": [
+          "Landed",
+          "Recovery"
+        ],
+        "sections": [
+          {
+            "title": "Recovery Map",
+            "widgets": [
+              {
+                "kind": "map"
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Valve Board Battery (Valve Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0,
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 6,
+                      "suffix": " V/min"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Fill Box Power (Gateway Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0,
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 6,
+                      "suffix": " V/min"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          }
+        ]
+      },
+      {
+        "states": [
+          "Idle",
+          "Aborted"
+        ],
+        "sections": [
+          {
+            "title": "FUEL TANK PRESSURE",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FUEL_TANK_PRESSURE",
+                "items": [
+                  {
+                    "label": "Tank Pressure",
+                    "index": 0
+                  }
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Actions",
+            "widgets": [
+              {
+                "kind": "actions",
+                "actions": [
+                  "Dump",
+                  "NormallyOpen",
+                  "Nitrogen",
+                  "Nitrous",
+                  "Pilot",
+                  "RetractPlumbing",
+                  "AdvanceFlightState",
+                  "RewindFlightState"
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Valve Board Battery (Valve Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0,
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 6,
+                      "suffix": " V/min"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
+              }
+            ],
+            "value_layout": "horizontal"
+          },
+          {
+            "title": "Fill Box Power (Gateway Board)",
+            "widgets": [
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_PERCENT",
+                "items": [
+                  {
+                    "label": "Percent",
+                    "index": 0
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
+                "items": [
+                  {
+                    "label": "Drop Rate (V/min)",
+                    "index": 0,
+                    "formatter": {
+                      "kind": "number",
+                      "precision": 6,
+                      "suffix": " V/min"
+                    }
+                  }
+                ]
+              },
+              {
+                "kind": "summary",
+                "data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
+                "items": [
+                  {
+                    "label": "Remaining Minutes",
+                    "index": 0
+                  }
+                ]
               }
             ],
             "value_layout": "horizontal"
@@ -1461,7 +1946,7 @@
   "battery": {
     "estimator": {
       "window_seconds": 300,
-      "min_drop_rate_v_per_min": 1e-06
+      "min_drop_rate_v_per_min": 0.000001
     },
     "sources": [
       {
