@@ -128,7 +128,7 @@ def default_layout() -> dict:
             "fill_targets_require_actions_enabled": True,
             "actions": [],
         },
-        "data_tab": {"tabs": []},
+        "data_tab": {"sender_split_data_types": [], "tabs": []},
         "state_tab": {"states": []},
         "battery": {
             "estimator": {"window_seconds": 300, "min_drop_rate_v_per_min": 0.005},
@@ -175,6 +175,8 @@ def validate_layout(data: dict) -> list[str]:
     data_tab = data.get("data_tab", {})
     if not isinstance(data_tab, dict) or not isinstance(data_tab.get("tabs", []), list):
         errors.append("data_tab.tabs must be a list.")
+    elif not isinstance(data_tab.get("sender_split_data_types", []), list):
+        errors.append("data_tab.sender_split_data_types must be a list.")
 
     state_tab = data.get("state_tab", {})
     if not isinstance(state_tab, dict) or not isinstance(state_tab.get("states", []), list):
@@ -388,43 +390,44 @@ class LayoutEditor(tk.Tk):
         self.data_id = self._entry(form, "ID", 0)
         self.data_label = self._entry(form, "Label", 1)
         self.data_channels = self._entry(form, "Channels (comma)", 2)
+        self.data_sender_split_types = self._entry(form, "Sender-split data types", 3)
         self.data_chart = tk.BooleanVar(value=True)
         ttk.Checkbutton(form, text="Chart enabled", variable=self.data_chart).grid(
-            row=3, column=1, sticky="w", pady=(6, 6)
+            row=4, column=1, sticky="w", pady=(6, 6)
         )
         self.data_is_valve = tk.BooleanVar(value=False)
         ttk.Checkbutton(form, text="Has labels", variable=self.data_is_valve, command=self._sync_data_bool_fields).grid(
-            row=4, column=1, sticky="w", pady=(0, 6)
+            row=5, column=1, sticky="w", pady=(0, 6)
         )
         self.data_bool_true_label = ttk.Label(form, text="True label")
-        self.data_bool_true_label.grid(row=5, column=0, sticky="w")
+        self.data_bool_true_label.grid(row=6, column=0, sticky="w")
         self.data_bool_true = ttk.Entry(form)
-        self.data_bool_true.grid(row=5, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
+        self.data_bool_true.grid(row=6, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
 
         self.data_bool_false_label = ttk.Label(form, text="False label")
-        self.data_bool_false_label.grid(row=6, column=0, sticky="w")
+        self.data_bool_false_label.grid(row=7, column=0, sticky="w")
         self.data_bool_false = ttk.Entry(form)
-        self.data_bool_false.grid(row=6, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
+        self.data_bool_false.grid(row=7, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
 
         self.data_bool_unknown_label = ttk.Label(form, text="Unknown label")
-        self.data_bool_unknown_label.grid(row=7, column=0, sticky="w")
+        self.data_bool_unknown_label.grid(row=8, column=0, sticky="w")
         self.data_bool_unknown = ttk.Entry(form)
-        self.data_bool_unknown.grid(row=7, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
+        self.data_bool_unknown.grid(row=8, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
         self.data_bool_per_channel_label = ttk.Label(
             form, text="Per-channel labels (true,false,unknown | ...)"
         )
-        self.data_bool_per_channel_label.grid(row=8, column=0, sticky="w")
+        self.data_bool_per_channel_label.grid(row=9, column=0, sticky="w")
         self.data_bool_per_channel = ttk.Entry(form)
-        self.data_bool_per_channel.grid(row=8, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
+        self.data_bool_per_channel.grid(row=9, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
         self.data_bool_per_channel_hint = ttk.Label(
             form,
             text="Example: Open,Closed,Unknown | Installed,Removed,Unknown",
             foreground="#94a3b8",
         )
-        self.data_bool_per_channel_hint.grid(row=9, column=1, columnspan=2, sticky="w", padx=6)
+        self.data_bool_per_channel_hint.grid(row=10, column=1, columnspan=2, sticky="w", padx=6)
 
         self.data_channel_formatters_frame = ttk.LabelFrame(form, text="Channel formatters")
-        self.data_channel_formatters_frame.grid(row=10, column=0, columnspan=3, sticky="ew", padx=6, pady=6)
+        self.data_channel_formatters_frame.grid(row=11, column=0, columnspan=3, sticky="ew", padx=6, pady=6)
         for col in range(4):
             self.data_channel_formatters_frame.columnconfigure(col, weight=1)
         self.data_formatter_channels = tk.Listbox(self.data_channel_formatters_frame, height=5)
@@ -453,7 +456,7 @@ class LayoutEditor(tk.Tk):
         self._data_formatter_selected_idx: int | None = None
 
         btns = ttk.Frame(form)
-        btns.grid(row=11, column=1, sticky="w", pady=8)
+        btns.grid(row=12, column=1, sticky="w", pady=8)
         ttk.Button(btns, text="Add", command=self._add_data_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove", command=self._remove_data_item).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Up", command=lambda: self._move_data_item(-1)).pack(
@@ -464,7 +467,7 @@ class LayoutEditor(tk.Tk):
         )
 
         self.data_subtabs_frame = ttk.LabelFrame(form, text="Subtabs")
-        self.data_subtabs_frame.grid(row=12, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 4))
+        self.data_subtabs_frame.grid(row=13, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 4))
         for col in range(4):
             self.data_subtabs_frame.columnconfigure(col, weight=1)
         self.data_subtabs_list = tk.Listbox(self.data_subtabs_frame, height=5)
@@ -562,7 +565,7 @@ class LayoutEditor(tk.Tk):
         ttk.Button(subtab_btns, text="Clear Editor", command=self._clear_data_subtab_editor).pack(side=tk.LEFT, padx=4)
 
         self.data_chart_groups_frame = ttk.LabelFrame(form, text="Chart groups")
-        self.data_chart_groups_frame.grid(row=13, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 4))
+        self.data_chart_groups_frame.grid(row=14, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 4))
         for col in range(4):
             self.data_chart_groups_frame.columnconfigure(col, weight=1)
         self.data_chart_group_scope = tk.StringVar(value="Tab")
@@ -600,7 +603,7 @@ class LayoutEditor(tk.Tk):
             side=tk.LEFT, padx=4)
 
         self.data_summary_items_frame = ttk.LabelFrame(form, text="Summary items")
-        self.data_summary_items_frame.grid(row=14, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 4))
+        self.data_summary_items_frame.grid(row=15, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 4))
         for col in range(4):
             self.data_summary_items_frame.columnconfigure(col, weight=1)
         self.data_summary_item_scope = tk.StringVar(value="Select a subtab to edit summary items")
@@ -1260,6 +1263,10 @@ class LayoutEditor(tk.Tk):
         self.data_list.delete(0, tk.END)
         for t in self.data["data_tab"]["tabs"]:
             self.data_list.insert(tk.END, t.get("label") or t.get("id") or "tab")
+        if hasattr(self, "data_sender_split_types"):
+            split_types = self.data.get("data_tab", {}).get("sender_split_data_types", [])
+            self.data_sender_split_types.delete(0, tk.END)
+            self.data_sender_split_types.insert(0, ", ".join(split_types))
 
         self.conn_list.delete(0, tk.END)
         for s in self.data["connection_tab"]["sections"]:
@@ -2098,7 +2105,9 @@ class LayoutEditor(tk.Tk):
         actions_tab.setdefault("show_fill_targets", True)
         actions_tab.setdefault("fill_targets_require_actions_enabled", True)
         actions_tab.setdefault("actions", [])
-        self.data.setdefault("data_tab", {}).setdefault("tabs", [])
+        data_tab = self.data.setdefault("data_tab", {})
+        data_tab.setdefault("sender_split_data_types", [])
+        data_tab.setdefault("tabs", [])
         self.data.setdefault("state_tab", {}).setdefault("states", [])
         for entry in self.data["state_tab"]["states"]:
             for section in entry.get("sections", []) or []:
@@ -3765,6 +3774,10 @@ class LayoutEditor(tk.Tk):
         self.after_idle(self._commit_current_tab)
 
     def _commit_data_form(self) -> None:
+        data_tab = self.data.setdefault("data_tab", {})
+        data_tab["sender_split_data_types"] = self._clean_channels(
+            self._split_list(self.data_sender_split_types.get())
+        )
         idx = self._data_selected_idx
         if idx is None or idx >= len(self.data["data_tab"]["tabs"]):
             return
