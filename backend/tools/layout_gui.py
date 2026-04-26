@@ -26,9 +26,18 @@ EXPECTED_BOARD_OPTIONS = [
 ]
 
 
-def default_layout_path() -> Path:
+def known_layout_paths() -> dict[str, Path]:
     backend_dir = Path(__file__).resolve().parents[1]
-    return backend_dir / "layout" / "layout.json"
+    layout_dir = backend_dir / "layout"
+    return {
+        "default": layout_dir / "layout.json",
+        "hitl": layout_dir / "layout_hitl.json",
+        "test_fire": layout_dir / "layout_test_fire.json",
+    }
+
+
+def default_layout_path() -> Path:
+    return known_layout_paths()["default"]
 
 
 def default_fill_targets_path() -> Path:
@@ -195,6 +204,7 @@ class LayoutEditor(tk.Tk):
         self.title("GS26 Layout Editor")
         self.geometry("1100x720")
 
+        self.layout_presets = known_layout_paths()
         self.path = initial_path or default_layout_path()
         self.fill_targets_path = default_fill_targets_path()
         self.data = default_layout()
@@ -207,6 +217,17 @@ class LayoutEditor(tk.Tk):
         tk.Button(toolbar, text="Save", command=self.save).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Save As", command=self.save_as).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Validate", command=self.validate).pack(side=tk.LEFT, padx=4)
+        ttk.Label(toolbar, text="Preset").pack(side=tk.LEFT, padx=(16, 4))
+        self.layout_preset_var = tk.StringVar(value=self._preset_name_for_path(self.path))
+        preset_choices = list(self.layout_presets.keys())
+        ttk.OptionMenu(
+            toolbar,
+            self.layout_preset_var,
+            self.layout_preset_var.get(),
+            *preset_choices,
+            command=self._switch_layout_preset,
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Button(toolbar, text="Browse Layout…", command=self._browse_layout).pack(side=tk.LEFT, padx=4)
 
         self.status = tk.StringVar(value=f"Layout path: {self.path}")
         tk.Label(self, textvariable=self.status, anchor="w").pack(fill=tk.X, padx=8)
@@ -246,6 +267,39 @@ class LayoutEditor(tk.Tk):
         self.load()
         self.after(100, self.focus_force)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _preset_name_for_path(self, path: Path) -> str:
+        resolved = path.resolve()
+        for name, preset_path in self.layout_presets.items():
+            try:
+                if resolved == preset_path.resolve():
+                    return name
+            except FileNotFoundError:
+                if str(resolved) == str(preset_path):
+                    return name
+        return "default"
+
+    def _switch_layout_preset(self, preset_name: str) -> None:
+        preset_path = self.layout_presets.get(preset_name)
+        if preset_path is None:
+            return
+        self._commit_current_tab()
+        self.path = preset_path
+        self.status.set(f"Layout path: {self.path}")
+        self.load()
+
+    def _browse_layout(self) -> None:
+        filename = filedialog.askopenfilename(
+            title="Open layout JSON",
+            filetypes=[("JSON files", "*.json")],
+            initialdir=str(default_layout_path().parent),
+        )
+        if not filename:
+            return
+        self._commit_current_tab()
+        self.path = Path(filename)
+        self.layout_preset_var.set(self._preset_name_for_path(self.path))
+        self.load()
 
     # ------------------------
     # Dashboard tabs editor
