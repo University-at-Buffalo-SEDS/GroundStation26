@@ -208,6 +208,10 @@
     "fill_targets_require_actions_enabled": true
   },
   "data_tab": {
+    "sender_split_data_types": [
+      "BATTERY_VOLTAGE",
+      "BATTERY_CURRENT"
+    ],
     "tabs": [
       {
         "id": "FUEL_TANK_PRESSURE",

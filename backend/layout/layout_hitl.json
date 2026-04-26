@@ -377,6 +377,10 @@
     "disable_actions_by_default": true
   },
   "data_tab": {
+    "sender_split_data_types": [
+      "BATTERY_VOLTAGE",
+      "BATTERY_CURRENT"
+    ],
     "tabs": [
       {
         "id": "GYRO_DATA",
