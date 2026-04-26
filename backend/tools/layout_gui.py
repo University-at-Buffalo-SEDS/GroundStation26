@@ -219,7 +219,7 @@ class LayoutEditor(tk.Tk):
         tk.Button(toolbar, text="Validate", command=self.validate).pack(side=tk.LEFT, padx=4)
         ttk.Label(toolbar, text="Preset").pack(side=tk.LEFT, padx=(16, 4))
         self.layout_preset_var = tk.StringVar(value=self._preset_name_for_path(self.path))
-        preset_choices = list(self.layout_presets.keys())
+        preset_choices = [*self.layout_presets.keys(), "custom"]
         ttk.OptionMenu(
             toolbar,
             self.layout_preset_var,
@@ -277,7 +277,7 @@ class LayoutEditor(tk.Tk):
             except FileNotFoundError:
                 if str(resolved) == str(preset_path):
                     return name
-        return "default"
+        return "custom"
 
     def _switch_layout_preset(self, preset_name: str) -> None:
         preset_path = self.layout_presets.get(preset_name)
@@ -1439,6 +1439,7 @@ class LayoutEditor(tk.Tk):
         self._load_fill_targets_file()
         self._ensure_layout_shape()
 
+        self.layout_preset_var.set(self._preset_name_for_path(self.path))
         self.status.set(f"Layout path: {self.path}")
         self._refresh_lists()
         if hasattr(self, "network_title"):
@@ -1465,6 +1466,7 @@ class LayoutEditor(tk.Tk):
         if not filename:
             return
         self.path = Path(filename)
+        self.layout_preset_var.set(self._preset_name_for_path(self.path))
         self.save()
 
     def validate(self) -> None:
