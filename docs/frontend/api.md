@@ -11,7 +11,7 @@ used, and what failures degrade the UI.
 The frontend uses two transport paths:
 
 - HTTP for bootstrap, point-in-time reads, layout/config, map config, calibration, and recovery.
-- WebSocket for live telemetry, alerts, board state, topology, notifications, action policy, and clock updates.
+- WebSocket for live telemetry, alerts, board state, topology, notifications/messages, action policy, and clock updates.
 
 The frontend is designed to survive reconnects and partial data loss, but a fully working dashboard assumes the backend
 exposes the same host for HTTP and WebSocket.
@@ -31,7 +31,7 @@ On first connection or reconnect, the frontend does roughly the following:
 1. Probe the configured base URL.
 2. Fetch layout and point-in-time state over HTTP.
 3. Seed recent telemetry history and alerts.
-4. Seed board status, flight state, network time, topology, notifications, action policy, and GPS.
+4. Seed board status, flight state, network time, topology, notifications/messages, action policy, and GPS.
 5. Open the WebSocket.
 6. Switch to incremental live updates.
 
@@ -348,11 +348,13 @@ Frontend expectations:
 
 Purpose:
 
-- Seed persistent operator notifications.
+- Seed the current backend message/notification set.
 
 Expected response:
 
 - Array of notification objects.
+- `persistent: true` entries render in the frontend Notifications tab.
+- `persistent: false` entries render in the frontend Messages tab.
 
 Shape:
 
@@ -525,7 +527,8 @@ Notes:
 - `NetworkTopology`
   Replaces the current topology snapshot.
 - `Notifications`
-  Replaces the current active persistent notification set.
+  Replaces the current active backend notification/message set. The frontend splits this
+  into the Notifications tab (`persistent: true`) and the Messages tab (`persistent: false`).
 - `ActionPolicy`
   Replaces current command enable/disable policy.
 - `NetworkTime`

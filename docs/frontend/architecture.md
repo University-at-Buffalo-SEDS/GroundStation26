@@ -276,15 +276,26 @@ Responsibilities:
 
 - integrate browser geolocation behavior for supported runtimes
 
+### `frontend/src/telemetry_dashboard/messages_tab.rs`
+
+Role:
+
+- transient backend messages history tab
+
+Responsibilities:
+
+- render stored non-persistent backend messages
+- show timestamps and message text
+
 ### `frontend/src/telemetry_dashboard/notifications_tab.rs`
 
 Role:
 
-- persistent notification history tab
+- persistent notifications history tab
 
 Responsibilities:
 
-- render stored notification history
+- render stored persistent notification history
 - show timestamps and message text
 
 ### `frontend/src/telemetry_dashboard/warnings_tab.rs`
