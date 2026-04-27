@@ -235,7 +235,8 @@ fn i2c_rx_poll_burst() -> usize {
 //  Real Comms Implementation
 // ======================================================================
 pub struct UartComms {
-    inner: Box<dyn SerialPort>,
+    rx_inner: Box<dyn SerialPort>,
+    tx_inner: Box<dyn SerialPort>,
     side_id: Option<RouterSideId>,
     rx_buf: Vec<u8>,
     protocol: SerialProtocol,
@@ -244,7 +245,7 @@ pub struct UartComms {
 
 impl UartComms {
     pub fn open(cfg: &SerialLinkConfig) -> anyhow::Result<Self> {
-        let inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
+        let rx_inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
             .data_bits(serialport::DataBits::Eight)
             .parity(serialport::Parity::None)
             .stop_bits(serialport::StopBits::One)
@@ -252,8 +253,12 @@ impl UartComms {
             .timeout(UART_STARTUP_TIMEOUT)
             .open()
             .context("failed to configure serial port")?;
+        let tx_inner = rx_inner
+            .try_clone()
+            .context("failed to clone serial port for independent tx path")?;
         Ok(Self {
-            inner,
+            rx_inner,
+            tx_inner,
             side_id: None,
             rx_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
             protocol: cfg.protocol.clone(),
@@ -266,7 +271,7 @@ impl UartComms {
             .slow_start_deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+            self.rx_inner.set_timeout(UART_NORMAL_TIMEOUT)?;
             self.slow_start_deadline = None;
         }
         Ok(())
@@ -274,26 +279,8 @@ impl UartComms {
 
     fn fill_rx_buf(&mut self) -> std::io::Result<()> {
         self.update_uart_timeout_mode()?;
-        let available = match self.inner.bytes_to_read() {
-            Ok(available) => available as usize,
-            Err(err) => {
-                let err: std::io::Error = err.into();
-                maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
-                return Err(err);
-            }
-        };
-        if available == 0 {
-            maybe_log_raw_uart_read_outcome(
-                "no bytes available",
-                self.rx_buf.len(),
-                None,
-                &self.protocol,
-            );
-            return Ok(());
-        }
         let mut scratch = [0u8; 512];
-        let read_len = available.min(scratch.len());
-        match self.inner.read(&mut scratch[..read_len]) {
+        match self.rx_inner.read(&mut scratch) {
             Ok(0) => {
                 maybe_log_raw_uart_read_outcome(
                     "read returned 0 bytes",
@@ -305,7 +292,7 @@ impl UartComms {
             }
             Ok(n) => {
                 if self.slow_start_deadline.take().is_some() {
-                    self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+                    self.rx_inner.set_timeout(UART_NORMAL_TIMEOUT)?;
                 }
                 maybe_log_raw_uart_read_outcome(
                     "read returned bytes",
@@ -938,14 +925,14 @@ impl CommsDevice for UartComms {
         match self.protocol {
             SerialProtocol::PacketFramed => {
                 let len_bytes = (len as u16).to_le_bytes();
-                self.inner.write_all(&len_bytes)?;
-                self.inner.write_all(payload)?;
+                self.tx_inner.write_all(&len_bytes)?;
+                self.tx_inner.write_all(payload)?;
             }
             SerialProtocol::RawUart => {
-                self.inner.write_all(&build_raw_uart_frame(payload)?)?;
+                self.tx_inner.write_all(&build_raw_uart_frame(payload)?)?;
             }
         }
-        self.inner.flush()?;
+        self.tx_inner.flush()?;
         Ok(())
     }
 
