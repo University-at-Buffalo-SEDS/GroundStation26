@@ -32,6 +32,7 @@ pub struct CommsWorkerHandle {
     pub name: &'static str,
     pub comms: Arc<Mutex<Box<dyn CommsDevice>>>,
     pub tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub prioritize_rx: bool,
 }
 
 const COMMS_TX_BURST: usize = 1;
@@ -43,6 +44,10 @@ fn spawn_comms_worker_threads(
     state: Arc<AppState>,
     mut comms_handle: CommsWorkerHandle,
 ) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
+    if comms_handle.prioritize_rx {
+        return spawn_rx_priority_comms_worker_thread(router, state, comms_handle);
+    }
+
     let worker_name = comms_handle.name;
     let comms = comms_handle.comms;
     let tx_worker_state = state.clone();
@@ -151,6 +156,87 @@ fn spawn_comms_worker_threads(
         })?;
 
     Ok(vec![tx_worker, rx_worker])
+}
+
+fn spawn_rx_priority_comms_worker_thread(
+    router: Arc<Router>,
+    state: Arc<AppState>,
+    mut comms_handle: CommsWorkerHandle,
+) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
+    let worker_name = comms_handle.name;
+    let comms = comms_handle.comms;
+    let worker = thread::Builder::new()
+        .name(format!("{}_comms_worker", worker_name))
+        .spawn(move || {
+            let mut comms_shutdown_rx = state.shutdown_subscribe();
+            let mut last_send_error_log_ms = 0;
+            let mut suppressed_send_errors = 0;
+            let mut last_recv_error_log_ms = 0;
+            let mut suppressed_recv_errors = 0;
+            let mut next_tx_allowed_at = std::time::Instant::now();
+
+            loop {
+                match comms_shutdown_rx.try_recv() {
+                    Ok(_)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                }
+
+                let tap_state = state.clone();
+                let mut packet_tap = |pkt: &Packet| {
+                    tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+                    tap_state.mark_packet_received(get_current_timestamp_ms());
+                    let mut rb = tap_state.ring_buffer.lock().unwrap();
+                    rb.push(pkt.clone());
+                };
+
+                let mut comms = comms.lock().expect("failed to get lock");
+                let recv_result = comms.recv_packet(&router, &mut packet_tap);
+                match recv_result {
+                    Ok(()) => {
+                        let now = std::time::Instant::now();
+                        if now >= next_tx_allowed_at {
+                            if let Ok(payload) = comms_handle.tx_rx.try_recv() {
+                                match comms.send_data(&payload) {
+                                    Ok(()) => {
+                                        if suppressed_send_errors > 0 {
+                                            eprintln!(
+                                                "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
+                                            );
+                                            suppressed_send_errors = 0;
+                                            last_send_error_log_ms = 0;
+                                        }
+                                        next_tx_allowed_at = std::time::Instant::now()
+                                            + Duration::from_millis(COMMS_TX_GAP_MS);
+                                    }
+                                    Err(e) => {
+                                        log_repeated_worker_error(
+                                            &format!("{worker_name} comms worker send_data failed"),
+                                            &e.to_string(),
+                                            &mut last_send_error_log_ms,
+                                            &mut suppressed_send_errors,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log_repeated_worker_error(
+                            &format!("{worker_name} comms worker recv_packet failed"),
+                            &format!("{e:?}"),
+                            &mut last_recv_error_log_ms,
+                            &mut suppressed_recv_errors,
+                        );
+                    }
+                }
+                drop(comms);
+                thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
+            }
+        })?;
+
+    Ok(vec![worker])
 }
 
 fn log_repeated_worker_error(

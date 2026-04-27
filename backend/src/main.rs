@@ -533,11 +533,13 @@ async fn main() -> anyhow::Result<()> {
                 name: "rocket_comms",
                 comms: rocket_comms,
                 tx_rx: rocket_rx,
+                prioritize_rx: true,
             },
             CommsWorkerHandle {
                 name: "umbilical_comms",
                 comms: umbilical_comms,
                 tx_rx: umbilical_rx,
+                prioritize_rx: false,
             },
         ],
         cmd_rx,
