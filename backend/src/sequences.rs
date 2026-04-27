@@ -479,7 +479,6 @@ fn is_fill_state(state: FlightState) -> bool {
 
 pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
     match cmd {
-        TelemetryCommand::Launch => "Launch",
         TelemetryCommand::Dump => "Dump",
         TelemetryCommand::Abort => "Abort",
         TelemetryCommand::NormallyOpen => "NormallyOpen",

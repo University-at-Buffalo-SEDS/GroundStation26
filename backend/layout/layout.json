@@ -136,13 +136,6 @@
         "spacer_row_after": true
       },
       {
-        "label": "Launch",
-        "cmd": "Launch",
-        "border": "#22c55e",
-        "bg": "#022c22",
-        "fg": "#bbf7d0"
-      },
-      {
         "label": "Dump",
         "cmd": "Dump",
         "border": "#ef4444",
@@ -190,6 +183,83 @@
         "border": "#eab308",
         "bg": "#1f2937",
         "fg": "#fef9c3"
+      },
+      {
+        "label": "Postinit Signal",
+        "cmd": "PostinitSignal",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Launch Signal",
+        "cmd": "LaunchSignal",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Rollback Signal",
+        "cmd": "RollbackSignal",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Monitor Altitude",
+        "cmd": "MonitorAltitude",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Revoke Monitor Alt",
+        "cmd": "RevokeMonitorAltitude",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Consecutive Samples",
+        "cmd": "ConsecutiveSamples",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Revoke Consecutive",
+        "cmd": "RevokeConsecutiveSamples",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Reset Failures",
+        "cmd": "ResetFailures",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Revoke Reset Fail",
+        "cmd": "RevokeResetFailures",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Validate Measms",
+        "cmd": "ValidateMeasms",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Revoke Validate",
+        "cmd": "RevokeValidateMeasms",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
       }
     ],
     "disable_actions_by_default": true,
