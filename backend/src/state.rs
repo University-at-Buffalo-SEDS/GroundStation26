@@ -133,6 +133,15 @@ pub struct AppState {
     /// Monotonic ID source for notifications.
     pub next_notification_id: Arc<AtomicU64>,
 
+    /// Telemetry-network/backend messages shown in the dashboard Messages tab.
+    pub messages: Arc<Mutex<Vec<PersistentNotification>>>,
+
+    /// Broadcast whenever telemetry/backend messages change.
+    pub messages_tx: broadcast::Sender<Vec<PersistentNotification>>,
+
+    /// Monotonic ID source for backend messages.
+    pub next_message_id: Arc<AtomicU64>,
+
     /// Current action policy (enabled/disabled/blink hints) for UI + command gating.
     pub action_policy: Arc<Mutex<ActionPolicyMsg>>,
 
@@ -766,6 +775,11 @@ impl AppState {
         self.notifications.lock().unwrap().clone()
     }
 
+    /// Clones the current backend message list for HTTP or WebSocket consumers.
+    pub fn messages_snapshot(&self) -> Vec<PersistentNotification> {
+        self.messages.lock().unwrap().clone()
+    }
+
     /// Adds a persistent operator notification and returns its assigned id.
     pub fn add_notification<S: Into<String>>(&self, message: S) -> u64 {
         self.add_notification_with_persistence(message, true)
@@ -825,6 +839,32 @@ impl AppState {
         drop(notifications);
         let _ = self.notifications_tx.send(snapshot);
         true
+    }
+
+    /// Adds a telemetry/backend message and returns its assigned id.
+    pub fn add_backend_message<S: Into<String>>(&self, message: S) -> u64 {
+        let message = message.into();
+        let mut messages = self.messages.lock().unwrap();
+        if let Some(existing) = messages.iter().find(|n| n.message == message) {
+            return existing.id;
+        }
+        let id = self.next_message_id.fetch_add(1, Ordering::Relaxed) + 1;
+        messages.push(PersistentNotification {
+            id,
+            timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+            message,
+            persistent: false,
+            action_label: None,
+            action_cmd: None,
+        });
+        messages.sort_by_key(|n| -n.timestamp_ms);
+        if messages.len() > 200 {
+            messages.truncate(200);
+        }
+        let snapshot = messages.clone();
+        drop(messages);
+        let _ = self.messages_tx.send(snapshot);
+        id
     }
 
     /// Returns the latest action-policy snapshot used by the dashboard and command gate.

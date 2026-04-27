@@ -195,6 +195,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/network_topology", get(get_network_topology))
         .route("/api/recording_status", get(get_recording_status))
         .route("/api/notifications", get(get_notifications))
+        .route("/api/messages", get(get_messages))
         .route(
             "/api/notifications/{id}/dismiss",
             post(dismiss_notification),
@@ -318,6 +319,7 @@ pub enum WsOutMsg {
     BoardStatus(BoardStatusMsg),
     NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
+    Messages(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
     FillTargets(FillTargetsConfig),
     RecordingStatus(RecordingStatusMsg),
@@ -1230,6 +1232,17 @@ async fn get_notifications(
     Json(state.notifications_snapshot()).into_response()
 }
 
+/// Returns the current list of telemetry/backend messages.
+async fn get_messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(state.messages_snapshot()).into_response()
+}
+
 /// Dismisses a persistent notification by id.
 async fn dismiss_notification(
     State(state): State<Arc<AppState>>,
@@ -1472,6 +1485,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let mut launch_clock_rx = state.launch_clock_tx.subscribe();
     let mut board_status_rx = state.board_status_tx.subscribe();
     let mut notifications_rx = state.notifications_tx.subscribe();
+    let mut messages_rx = state.messages_tx.subscribe();
     let mut action_policy_rx = state.action_policy_tx.subscribe();
     let mut fill_targets_rx = state.fill_targets_tx.subscribe();
     let mut recording_status_rx = state.recording_status_tx.subscribe();
@@ -1508,6 +1522,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_notifications).await.is_err() {
+            return;
+        }
+        let initial_messages =
+            serde_json::to_string(&WsOutMsg::Messages(state_for_send.messages_snapshot()))
+                .unwrap_or_default();
+        if ws_out_tx.send(initial_messages).await.is_err() {
             return;
         }
         let initial_action_policy = serde_json::to_string(&WsOutMsg::ActionPolicy(
@@ -1683,6 +1703,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     match recv {
                         Ok(snapshot) => {
                             let msg = WsOutMsg::Notifications(snapshot);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = messages_rx.recv() => {
+                    match recv {
+                        Ok(snapshot) => {
+                            let msg = WsOutMsg::Messages(snapshot);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;

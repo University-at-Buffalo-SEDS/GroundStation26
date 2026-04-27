@@ -348,13 +348,12 @@ Frontend expectations:
 
 Purpose:
 
-- Seed the current backend message/notification set.
+- Seed the current operator-notification set.
 
 Expected response:
 
 - Array of notification objects.
-- `persistent: true` entries render in the frontend Notifications tab.
-- `persistent: false` entries render in the frontend Messages tab.
+- Entries render in the frontend Notifications tab.
 
 Shape:
 
@@ -365,6 +364,30 @@ Shape:
     "timestamp_ms": 1742400000000,
     "message": "Sequence entered ArmedReady",
     "persistent": true
+  }
+]
+```
+
+### `GET /api/messages`
+
+Purpose:
+
+- Seed the current telemetry/backend message set.
+
+Expected response:
+
+- Array of message objects.
+- Entries render in the frontend Messages tab.
+
+Shape:
+
+```json
+[
+  {
+    "id": 41,
+    "timestamp_ms": 1742400000500,
+    "message": "FC: Flight computer entered ArmedReady",
+    "persistent": false
   }
 ]
 ```
@@ -500,6 +523,7 @@ The backend sends tagged JSON objects:
 { "ty": "BoardStatus", "data": { ... } }
 { "ty": "NetworkTopology", "data": { ... } }
 { "ty": "Notifications", "data": [ ... ] }
+{ "ty": "Messages", "data": [ ... ] }
 { "ty": "ActionPolicy", "data": { ... } }
 { "ty": "NetworkTime", "data": { ... } }
 ```
@@ -527,8 +551,11 @@ Notes:
 - `NetworkTopology`
   Replaces the current topology snapshot.
 - `Notifications`
-  Replaces the current active backend notification/message set. The frontend splits this
-  into the Notifications tab (`persistent: true`) and the Messages tab (`persistent: false`).
+  Replaces the current active operator-notification set. This is for backend/operator workflow
+  notifications such as fill completion or action-required notices.
+- `Messages`
+  Replaces the current telemetry/backend message set. This is for telemetry-network text
+  messages such as flight-computer or router status strings.
 - `ActionPolicy`
   Replaces current command enable/disable policy.
 - `NetworkTime`
@@ -551,6 +578,7 @@ channels, or wrong state.
 - `/api/recent` should return enough history to make reconnects look continuous.
 - WebSocket initial snapshots should arrive quickly after connect.
 - `BoardStatus`, `ActionPolicy`, and `NetworkTopology` should be treated as full-state replacement messages, not deltas.
+- `Messages` should be treated as a full-state replacement message, not a delta stream.
 - Clock endpoints should use a single consistent backend clock source.
 - Alerts, notifications, and telemetry timestamps should all be comparable.
 

@@ -2131,6 +2131,15 @@ async fn handle_packet(
         return None;
     }
 
+    if pkt.data_type() == DataType::MessageData {
+        let message = match pkt.data_as_string() {
+            Ok(msg) => msg.to_string(),
+            Err(_) => "Telemetry message with invalid UTF-8 payload".to_string(),
+        };
+        state.add_backend_message(format!("{sender_id}: {message}"));
+        return None;
+    }
+
     if pkt.data_type() == DataType::FlightState {
         if !cfg!(feature = "testing") && !state.all_required_boards_seen() {
             return None;
@@ -2555,6 +2564,7 @@ mod tests {
         let (board_status_tx, _board_status_rx) = broadcast::channel(4);
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
         let (notifications_tx, _notifications_rx) = broadcast::channel(4);
+        let (messages_tx, _messages_rx) = broadcast::channel(4);
         let (action_policy_tx, _action_policy_rx) = broadcast::channel(4);
         let (fill_targets_tx, _fill_targets_rx) = broadcast::channel(4);
         let (launch_clock_tx, _launch_clock_rx) = broadcast::channel(4);
@@ -2602,6 +2612,9 @@ mod tests {
             notifications: Arc::new(Mutex::new(Vec::new())),
             notifications_tx,
             next_notification_id: Arc::new(AtomicU64::new(0)),
+            messages: Arc::new(Mutex::new(Vec::new())),
+            messages_tx,
+            next_message_id: Arc::new(AtomicU64::new(0)),
             action_policy: Arc::new(Mutex::new(default_action_policy())),
             action_policy_tx,
             fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),

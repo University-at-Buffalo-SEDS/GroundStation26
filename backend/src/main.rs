@@ -214,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
     let (board_status_tx, _board_status_rx) = broadcast::channel(board_status_capacity);
     let (dashboard_reset_tx, _dashboard_reset_rx) = broadcast::channel(16);
     let (notifications_tx, _notifications_rx) = broadcast::channel(notifications_capacity);
+    let (messages_tx, _messages_rx) = broadcast::channel(notifications_capacity);
     let (action_policy_tx, _action_policy_rx) = broadcast::channel(actions_capacity);
     let (fill_targets_tx, _fill_targets_rx) = broadcast::channel(actions_capacity);
     let (launch_clock_tx, _launch_clock_rx) = broadcast::channel(launch_clock_capacity);
@@ -279,6 +280,9 @@ async fn main() -> anyhow::Result<()> {
         notifications: Arc::new(Mutex::new(Vec::new())),
         notifications_tx,
         next_notification_id: Arc::new(AtomicU64::new(0)),
+        messages: Arc::new(Mutex::new(Vec::new())),
+        messages_tx,
+        next_message_id: Arc::new(AtomicU64::new(0)),
         action_policy: Arc::new(Mutex::new(default_action_policy())),
         action_policy_tx,
         fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
