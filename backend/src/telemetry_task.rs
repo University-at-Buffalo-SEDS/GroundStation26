@@ -273,6 +273,9 @@ fn spawn_dedicated_radio_io_threads(
             let mut last_recv_error_log_ms = 0;
             let mut suppressed_recv_errors = 0;
             let mut next_tx_allowed_at = std::time::Instant::now();
+            let mut last_rx_activity_at = std::time::Instant::now();
+            let radio_gap = Duration::from_millis(radio_tx_gap_ms());
+            let radio_quiet = Duration::from_millis(radio_tx_quiet_ms());
 
             loop {
                 match comms_shutdown_rx.try_recv() {
@@ -284,6 +287,7 @@ fn spawn_dedicated_radio_io_threads(
 
                 let mut comms = comms.lock().expect("failed to get lock");
                 match comms.recv_serialized_packets(&mut |payload| {
+                    last_rx_activity_at = std::time::Instant::now();
                     let _ = incoming_tx.send(payload);
                 }) {
                     Ok(()) => {}
@@ -298,7 +302,9 @@ fn spawn_dedicated_radio_io_threads(
                 }
 
                 let now = std::time::Instant::now();
-                if now >= next_tx_allowed_at {
+                if now >= next_tx_allowed_at
+                    && now.saturating_duration_since(last_rx_activity_at) >= radio_quiet
+                {
                     match comms_handle.tx_rx.try_recv() {
                         Ok(payload) => {
                             match comms.send_data(&payload) {
@@ -310,9 +316,7 @@ fn spawn_dedicated_radio_io_threads(
                                         suppressed_send_errors = 0;
                                         last_send_error_log_ms = 0;
                                     }
-                                    next_tx_allowed_at =
-                                        std::time::Instant::now()
-                                            + Duration::from_millis(COMMS_TX_GAP_MS);
+                                    next_tx_allowed_at = std::time::Instant::now() + radio_gap;
                                 }
                                 Err(e) => {
                                     log_repeated_worker_error(
@@ -637,6 +641,16 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(default)
         .clamp(min, max)
+}
+
+fn radio_tx_gap_ms() -> u64 {
+    static GAP_MS: OnceLock<u64> = OnceLock::new();
+    *GAP_MS.get_or_init(|| env_usize("GS_RADIO_TX_GAP_MS", 250, 10, 5_000) as u64)
+}
+
+fn radio_tx_quiet_ms() -> u64 {
+    static QUIET_MS: OnceLock<u64> = OnceLock::new();
+    *QUIET_MS.get_or_init(|| env_usize("GS_RADIO_TX_QUIET_MS", 150, 0, 5_000) as u64)
 }
 
 fn drop_db_writes_on_backpressure() -> bool {
