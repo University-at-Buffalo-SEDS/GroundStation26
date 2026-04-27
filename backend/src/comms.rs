@@ -397,9 +397,10 @@ impl UartComms {
             };
             processed_any = true;
             if !is_valid_serialized_packet_or_ack(&payload) {
-                if matches!(self.protocol, SerialProtocol::RawUart) {
-                    self.handle_raw_uart_router_reject(&payload);
-                }
+                maybe_log_raw_uart_parse_issue(
+                    "dropping invalid serialized payload from framed raw UART packet",
+                    &payload[..payload.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+                );
                 continue;
             }
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
@@ -424,9 +425,10 @@ impl UartComms {
             };
             processed_any = true;
             if !is_valid_serialized_packet_or_ack(&payload) {
-                if matches!(self.protocol, SerialProtocol::RawUart) {
-                    self.handle_raw_uart_router_reject(&payload);
-                }
+                maybe_log_raw_uart_parse_issue(
+                    "dropping invalid serialized payload from framed raw UART packet",
+                    &payload[..payload.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+                );
                 continue;
             }
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
@@ -437,13 +439,7 @@ impl UartComms {
                     maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
                 }
                 Err(err) => {
-                    if matches!(self.protocol, SerialProtocol::RawUart) {
-                        let _ = err;
-                        self.handle_raw_uart_router_reject(&payload);
-                        continue;
-                    } else {
-                        return Err(err);
-                    }
+                    return Err(err);
                 }
             }
         }
