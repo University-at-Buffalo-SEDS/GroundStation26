@@ -36,8 +36,8 @@ def configure_raw_serial(fd: int, baud: int) -> None:
     if baud_attr is None:
         raise ValueError(f"unsupported baud rate for termios: {baud}")
 
-    termios.cfsetispeed(attrs, baud_attr)
-    termios.cfsetospeed(attrs, baud_attr)
+    attrs[4] = baud_attr
+    attrs[5] = baud_attr
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
