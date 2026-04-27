@@ -274,8 +274,26 @@ impl UartComms {
 
     fn fill_rx_buf(&mut self) -> std::io::Result<()> {
         self.update_uart_timeout_mode()?;
+        let available = match self.inner.bytes_to_read() {
+            Ok(available) => available as usize,
+            Err(err) => {
+                let err: std::io::Error = err.into();
+                maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
+                return Err(err);
+            }
+        };
+        if available == 0 {
+            maybe_log_raw_uart_read_outcome(
+                "no bytes available",
+                self.rx_buf.len(),
+                None,
+                &self.protocol,
+            );
+            return Ok(());
+        }
         let mut scratch = [0u8; 512];
-        match self.inner.read(&mut scratch) {
+        let read_len = available.min(scratch.len());
+        match self.inner.read(&mut scratch[..read_len]) {
             Ok(0) => {
                 maybe_log_raw_uart_read_outcome(
                     "read returned 0 bytes",
