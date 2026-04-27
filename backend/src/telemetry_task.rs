@@ -16,7 +16,7 @@ use crate::types::{
 use crate::web::{FlightStateMsg, emit_warning};
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
-use sedsprintf_rs_2026::router::Router;
+use sedsprintf_rs_2026::router::{Router, RouterSideId};
 use sedsprintf_rs_2026::serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -32,9 +32,11 @@ pub struct CommsWorkerHandle {
     pub name: &'static str,
     pub comms: Arc<Mutex<Box<dyn CommsDevice>>>,
     pub tx_comms: Option<Arc<Mutex<Box<dyn CommsDevice>>>>,
+    pub side_id: RouterSideId,
     pub tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     pub legacy_single_worker: bool,
     pub prioritize_rx: bool,
+    pub dedicated_radio_io: bool,
 }
 
 const COMMS_TX_BURST: usize = 1;
@@ -46,6 +48,9 @@ fn spawn_comms_worker_threads(
     state: Arc<AppState>,
     mut comms_handle: CommsWorkerHandle,
 ) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
+    if comms_handle.dedicated_radio_io {
+        return spawn_dedicated_radio_io_threads(router, state, comms_handle);
+    }
     if comms_handle.legacy_single_worker {
         return spawn_legacy_comms_worker_thread(router, state, comms_handle);
     }
@@ -246,6 +251,127 @@ fn spawn_legacy_comms_worker_thread(
         })?;
 
     Ok(vec![worker])
+}
+
+fn spawn_dedicated_radio_io_threads(
+    router: Arc<Router>,
+    state: Arc<AppState>,
+    mut comms_handle: CommsWorkerHandle,
+) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
+    let worker_name = comms_handle.name;
+    let side_id = comms_handle.side_id;
+    let comms = comms_handle.comms;
+    let (incoming_tx, incoming_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let io_state = state.clone();
+
+    let io_thread = thread::Builder::new()
+        .name(format!("{}_radio_io", worker_name))
+        .spawn(move || {
+            let mut comms_shutdown_rx = io_state.shutdown_subscribe();
+            let mut last_send_error_log_ms = 0;
+            let mut suppressed_send_errors = 0;
+            let mut last_recv_error_log_ms = 0;
+            let mut suppressed_recv_errors = 0;
+            let mut next_tx_allowed_at = std::time::Instant::now();
+
+            loop {
+                match comms_shutdown_rx.try_recv() {
+                    Ok(_)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                }
+
+                let mut comms = comms.lock().expect("failed to get lock");
+                match comms.recv_serialized_packets(&mut |payload| {
+                    let _ = incoming_tx.send(payload);
+                }) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        log_repeated_worker_error(
+                            &format!("{worker_name} radio io recv_serialized_packets failed"),
+                            &format!("{e:?}"),
+                            &mut last_recv_error_log_ms,
+                            &mut suppressed_recv_errors,
+                        );
+                    }
+                }
+
+                let now = std::time::Instant::now();
+                if now >= next_tx_allowed_at {
+                    match comms_handle.tx_rx.try_recv() {
+                        Ok(payload) => {
+                            match comms.send_data(&payload) {
+                                Ok(()) => {
+                                    if suppressed_send_errors > 0 {
+                                        eprintln!(
+                                            "{worker_name} radio io send_data recovered after suppressing {suppressed_send_errors} repeated errors"
+                                        );
+                                        suppressed_send_errors = 0;
+                                        last_send_error_log_ms = 0;
+                                    }
+                                    next_tx_allowed_at =
+                                        std::time::Instant::now()
+                                            + Duration::from_millis(COMMS_TX_GAP_MS);
+                                }
+                                Err(e) => {
+                                    log_repeated_worker_error(
+                                        &format!("{worker_name} radio io send_data failed"),
+                                        &e.to_string(),
+                                        &mut last_send_error_log_ms,
+                                        &mut suppressed_send_errors,
+                                    );
+                                }
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+                drop(comms);
+            }
+        })?;
+
+    let ingress_state = state.clone();
+    let ingress_thread = thread::Builder::new()
+        .name(format!("{}_radio_ingress", worker_name))
+        .spawn(move || {
+            let mut shutdown_rx = ingress_state.shutdown_subscribe();
+            let mut last_ingress_error_log_ms = 0;
+            let mut suppressed_ingress_errors = 0;
+            loop {
+                match shutdown_rx.try_recv() {
+                    Ok(_)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                }
+
+                let payload = match incoming_rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(payload) => payload,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+
+                if let Ok(pkt) = serialize::deserialize_packet(&payload) {
+                    ingress_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+                    ingress_state.mark_packet_received(get_current_timestamp_ms());
+                    let mut rb = ingress_state.ring_buffer.lock().unwrap();
+                    rb.push(pkt);
+                }
+
+                if let Err(err) = router.rx_serialized_queue_from_side(&payload, side_id) {
+                    log_repeated_worker_error(
+                        &format!("{worker_name} radio ingress queue failed"),
+                        &format!("{err:?}"),
+                        &mut last_ingress_error_log_ms,
+                        &mut suppressed_ingress_errors,
+                    );
+                }
+            }
+        })?;
+
+    Ok(vec![io_thread, ingress_thread])
 }
 
 fn spawn_rx_priority_comms_worker_thread(

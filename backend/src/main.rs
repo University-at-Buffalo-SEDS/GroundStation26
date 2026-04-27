@@ -514,19 +514,6 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to get umbilical comms lock")
         .set_side_id(umbilical_side);
 
-    let rocket_tx_comms = {
-        let cloned = rocket_comms
-            .lock()
-            .expect("failed to get rocket comms lock")
-            .clone_for_split_io()
-            .ok()
-            .flatten();
-        cloned.map(|mut comms| {
-            comms.set_side_id(rocket_side);
-            Arc::new(Mutex::new(comms))
-        })
-    };
-
     if let Err(err) = router.announce_discovery() {
         eprintln!("WARNING: failed to queue initial discovery announce: {err}");
     }
@@ -545,18 +532,22 @@ async fn main() -> anyhow::Result<()> {
             CommsWorkerHandle {
                 name: "rocket_comms",
                 comms: rocket_comms,
-                tx_comms: rocket_tx_comms,
+                tx_comms: None,
+                side_id: rocket_side,
                 tx_rx: rocket_rx,
                 legacy_single_worker: false,
                 prioritize_rx: false,
+                dedicated_radio_io: true,
             },
             CommsWorkerHandle {
                 name: "umbilical_comms",
                 comms: umbilical_comms,
                 tx_comms: None,
+                side_id: umbilical_side,
                 tx_rx: umbilical_rx,
                 legacy_single_worker: false,
                 prioritize_rx: false,
+                dedicated_radio_io: false,
             },
         ],
         cmd_rx,

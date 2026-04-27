@@ -85,8 +85,14 @@ pub trait CommsDevice: Send {
     ) -> TelemetryResult<()>;
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>>;
     fn set_side_id(&mut self, side_id: RouterSideId);
-    fn clone_for_split_io(&self) -> Result<Option<Box<dyn CommsDevice>>, Box<dyn Error + Send + Sync>> {
-        Ok(None)
+    fn recv_serialized_packets(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+    ) -> TelemetryResult<()> {
+        let _ = packet_sink;
+        Err(TelemetryError::HandlerError(
+            "serialized packet receive not supported for this comms device",
+        ))
     }
 }
 
@@ -378,6 +384,31 @@ impl UartComms {
         );
     }
 
+    fn process_buffered_payloads(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+    ) -> TelemetryResult<bool> {
+        let mut processed_any = false;
+
+        loop {
+            let payload: Vec<u8> = match self.try_take_packet()? {
+                Some(payload) => payload,
+                None => break,
+            };
+            processed_any = true;
+            if !is_valid_serialized_packet_or_ack(&payload) {
+                if matches!(self.protocol, SerialProtocol::RawUart) {
+                    self.handle_raw_uart_router_reject(&payload);
+                }
+                continue;
+            }
+            maybe_log_raw_uart_decoded(&payload, &self.protocol);
+            packet_sink(payload);
+        }
+
+        Ok(processed_any)
+    }
+
     fn process_buffered_packets(
         &mut self,
         router: &Router,
@@ -416,21 +447,7 @@ impl UartComms {
                 }
             }
         }
-
         Ok(processed_any)
-    }
-}
-
-impl UartComms {
-    fn clone_inner(&self) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let inner = self.inner.try_clone()?;
-        Ok(Self {
-            inner,
-            side_id: self.side_id,
-            rx_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
-            protocol: self.protocol.clone(),
-            slow_start_deadline: self.slow_start_deadline,
-        })
     }
 }
 
@@ -951,8 +968,26 @@ impl CommsDevice for UartComms {
         self.side_id = Some(side_id);
     }
 
-    fn clone_for_split_io(&self) -> Result<Option<Box<dyn CommsDevice>>, Box<dyn Error + Send + Sync>> {
-        Ok(Some(Box::new(self.clone_inner()?)))
+    fn recv_serialized_packets(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+    ) -> TelemetryResult<()> {
+        if self.rx_buf.len() < 2
+            && let Err(err) = self.fill_rx_buf()
+        {
+            return Err(err.into());
+        }
+        if self.process_buffered_payloads(packet_sink)? {
+            return Ok(());
+        }
+
+        if let Err(err) = self.fill_rx_buf() {
+            return Err(err.into());
+        }
+
+        let _ = self.process_buffered_payloads(packet_sink)?;
+        maybe_log_raw_uart_buffer_state(&self.rx_buf, "waiting for complete frame", &self.protocol);
+        Ok(())
     }
 }
 
