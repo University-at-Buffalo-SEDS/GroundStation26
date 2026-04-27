@@ -85,6 +85,9 @@ pub trait CommsDevice: Send {
     ) -> TelemetryResult<()>;
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>>;
     fn set_side_id(&mut self, side_id: RouterSideId);
+    fn clone_for_split_io(&self) -> Result<Option<Box<dyn CommsDevice>>, Box<dyn Error + Send + Sync>> {
+        Ok(None)
+    }
 }
 
 pub fn link_description(cfg: &CommsLinkConfig) -> String {
@@ -415,6 +418,19 @@ impl UartComms {
         }
 
         Ok(processed_any)
+    }
+}
+
+impl UartComms {
+    fn clone_inner(&self) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let inner = self.inner.try_clone()?;
+        Ok(Self {
+            inner,
+            side_id: self.side_id,
+            rx_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
+            protocol: self.protocol.clone(),
+            slow_start_deadline: self.slow_start_deadline,
+        })
     }
 }
 
@@ -933,6 +949,10 @@ impl CommsDevice for UartComms {
 
     fn set_side_id(&mut self, side_id: RouterSideId) {
         self.side_id = Some(side_id);
+    }
+
+    fn clone_for_split_io(&self) -> Result<Option<Box<dyn CommsDevice>>, Box<dyn Error + Send + Sync>> {
+        Ok(Some(Box::new(self.clone_inner()?)))
     }
 }
 

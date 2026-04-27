@@ -31,6 +31,7 @@ use tokio::time::{Duration, interval};
 pub struct CommsWorkerHandle {
     pub name: &'static str,
     pub comms: Arc<Mutex<Box<dyn CommsDevice>>>,
+    pub tx_comms: Option<Arc<Mutex<Box<dyn CommsDevice>>>>,
     pub tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     pub legacy_single_worker: bool,
     pub prioritize_rx: bool,
@@ -55,7 +56,7 @@ fn spawn_comms_worker_threads(
     let worker_name = comms_handle.name;
     let comms = comms_handle.comms;
     let tx_worker_state = state.clone();
-    let tx_worker_comms = comms.clone();
+    let tx_worker_comms = comms_handle.tx_comms.clone().unwrap_or_else(|| comms.clone());
     let tx_worker = thread::Builder::new()
         .name(format!("{}_comms_tx", worker_name))
         .spawn(move || {
