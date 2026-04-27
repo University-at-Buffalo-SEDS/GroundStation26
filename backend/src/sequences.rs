@@ -82,6 +82,15 @@ fn is_recording_command(cmd: &str) -> bool {
     )
 }
 
+fn default_recording_command_actuated(cmd: &str) -> Option<bool> {
+    match cmd {
+        "StartWritingNow" | "StartWritingLastTwoMinutes" => Some(false),
+        "PauseWritingDb" => Some(false),
+        "StopWritingDb" => Some(true),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistentNotification {
     pub id: u64,
@@ -661,11 +670,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
                 cmd: cmd.to_string(),
                 enabled,
                 blink: backend_blink_for(cmd, enabled, None),
-                actuated: if is_recording_command(cmd) {
-                    Some(true)
-                } else {
-                    None
-                },
+                actuated: default_recording_command_actuated(cmd),
             }
         })
         .collect();

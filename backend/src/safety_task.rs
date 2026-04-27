@@ -57,9 +57,6 @@ const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 15.5; // V
 const BATTERY_CURRENT_MIN_THRESHOLD: f32 = 0.0; // A
 const BATTERY_CURRENT_MAX_THRESHOLD: f32 = 50.0; // A
 
-// Fuel Flow thresholds (L/h)
-const FUEL_FLOW_MIN_THRESHOLD: f32 = 0.0; // L/h
-const FUEL_FLOW_MAX_THRESHOLD: f32 = 200.0; // L/h
 // Fuel Tank Pressure thresholds (psi)
 const FUEL_TANK_PRESSURE_MIN_THRESHOLD: f32 = 0.0; // psi
 const FUEL_TANK_PRESSURE_MAX_THRESHOLD: f32 = 3000.0; // psi
@@ -494,17 +491,6 @@ pub async fn safety_task(
                         && ((*voltage < min_v) || (*voltage > max_v))
                     {
                         cycle_warnings.insert("Critical: Battery voltage out of range!");
-                    }
-                }
-
-                // Fuel flow: [flow_L_per_hr, ...]
-                DataType::FuelFlow => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 1]);
-
-                    if let Some(flow) = values.first()
-                        && ((FUEL_FLOW_MIN_THRESHOLD > *flow) || (*flow > FUEL_FLOW_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Fuel flow out of range!");
                     }
                 }
 

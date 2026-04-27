@@ -195,7 +195,6 @@ const KNOWN_TRANSLATIONS: &[(&str, &str, &str)] = &[
         "Autonomía de batería",
         "Autonomie de batterie",
     ),
-    ("Fuel Flow", "Flujo de combustible", "Débit de carburant"),
     ("Valve State", "Estado de válvulas", "État des vannes"),
     ("Loadcell", "Celda de carga", "Cellule de charge"),
     ("Pressure", "Presión", "Pression"),

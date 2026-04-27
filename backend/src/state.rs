@@ -4,7 +4,9 @@ use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
 use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
-use crate::telemetry_db::{DbQueueItem, LaunchClockKind, LaunchClockMsg, RecordingStatusMsg};
+use crate::telemetry_db::{
+    DbQueueItem, LaunchClockKind, LaunchClockMsg, RecordingModeWire, RecordingStatusMsg,
+};
 use crate::telemetry_task;
 use crate::types::{
     Board, BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyLink, NetworkTopologyMsg,
@@ -25,6 +27,17 @@ use tokio::time::{Duration, Instant};
 pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
 const NETWORK_TOPOLOGY_BOARD_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
+
+fn recording_command_actuated(cmd: &str, mode: RecordingModeWire) -> Option<bool> {
+    match cmd {
+        "StartWritingNow" | "StartWritingLastTwoMinutes" => {
+            Some(mode == RecordingModeWire::Recording)
+        }
+        "PauseWritingDb" => Some(mode == RecordingModeWire::Paused),
+        "StopWritingDb" => Some(mode == RecordingModeWire::Idle),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct BoardStatus {
@@ -194,6 +207,8 @@ impl AppState {
     pub fn set_recording_status(&self, status: RecordingStatusMsg) {
         *self.recording_status.lock().unwrap() = status.clone();
         let _ = self.recording_status_tx.send(status);
+        let current_policy = self.action_policy_snapshot();
+        self.set_action_policy(current_policy);
     }
 
     pub fn recording_status_snapshot(&self) -> RecordingStatusMsg {
@@ -846,6 +861,13 @@ impl AppState {
 
     /// Replaces the current action policy and broadcasts it if it changed.
     pub fn set_action_policy(&self, policy: ActionPolicyMsg) {
+        let recording_mode = self.recording_status_snapshot().mode;
+        let mut policy = policy;
+        for control in &mut policy.controls {
+            if let Some(actuated) = recording_command_actuated(&control.cmd, recording_mode) {
+                control.actuated = Some(actuated);
+            }
+        }
         let mut slot = self.action_policy.lock().unwrap();
         if *slot == policy {
             return;

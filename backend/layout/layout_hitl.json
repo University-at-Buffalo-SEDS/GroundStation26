@@ -827,16 +827,6 @@
         }
       },
       {
-        "id": "FUEL_FLOW",
-        "label": "Fuel Flow",
-        "channels": [
-          "Flow Rate"
-        ],
-        "chart": {
-          "enabled": true
-        }
-      },
-      {
         "id": "VALVE_STATE",
         "label": "Valve State",
         "channels": [

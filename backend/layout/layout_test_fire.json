@@ -371,16 +371,6 @@
         }
       },
       {
-        "id": "FUEL_FLOW",
-        "label": "Fuel Flow",
-        "channels": [
-          "Flow Rate"
-        ],
-        "chart": {
-          "enabled": true
-        }
-      },
-      {
         "id": "VALVE_STATE",
         "label": "Valve State",
         "channels": [
@@ -1490,7 +1480,7 @@
   "battery": {
     "estimator": {
       "window_seconds": 300,
-      "min_drop_rate_v_per_min": 1e-06
+      "min_drop_rate_v_per_min": 0.000001
     },
     "sources": [
       {
