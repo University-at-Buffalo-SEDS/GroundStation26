@@ -14,7 +14,7 @@ use crate::types::{
     Board, FlightState, TelemetryCommand, TelemetryRow, canonical_sender_id, u8_to_flight_state,
 };
 use crate::web::{FlightStateMsg, emit_warning};
-use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
+use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{Router, RouterSideId};
 use sedsprintf_rs_2026::serialize;
