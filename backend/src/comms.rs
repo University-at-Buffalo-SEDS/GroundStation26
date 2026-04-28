@@ -318,6 +318,55 @@ impl UartComms {
 
     fn fill_rx_buf(&mut self) -> std::io::Result<()> {
         self.update_uart_timeout_mode()?;
+        #[cfg(target_os = "linux")]
+        {
+            let timeout = if self.slow_start_deadline.is_some() {
+                UART_STARTUP_TIMEOUT
+            } else {
+                UART_NORMAL_TIMEOUT
+            };
+            let mut scratch = [0u8; 512];
+            match read_once_fd_with_poll(self.inner.as_raw_fd(), &mut scratch, timeout) {
+                Ok(0) => {
+                    maybe_log_raw_uart_read_outcome(
+                        "read timeout/wouldblock",
+                        self.rx_buf.len(),
+                        None,
+                        &self.protocol,
+                    );
+                    Ok(())
+                }
+                Ok(n) => {
+                    if self.slow_start_deadline.take().is_some() {
+                        self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+                    }
+                    maybe_log_raw_uart_read_outcome(
+                        "read returned bytes",
+                        self.rx_buf.len(),
+                        Some(n),
+                        &self.protocol,
+                    );
+                    self.rx_buf.extend_from_slice(&scratch[..n]);
+                    maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
+                    Ok(())
+                }
+                Err(err) if is_idle_serial_timeout(&err) => {
+                    maybe_log_raw_uart_read_outcome(
+                        "read timeout/wouldblock",
+                        self.rx_buf.len(),
+                        None,
+                        &self.protocol,
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
+                    Err(err)
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
         let mut scratch = [0u8; 512];
         match self.inner.read(&mut scratch) {
             Ok(0) => {
@@ -356,6 +405,7 @@ impl UartComms {
                 maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
                 Err(err)
             }
+        }
         }
     }
 
@@ -551,6 +601,40 @@ fn write_once_fd(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
         return Err(err);
     }
     Ok(written as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn read_once_fd_with_poll(fd: RawFd, buf: &mut [u8], timeout: Duration) -> std::io::Result<usize> {
+    let timeout_ms = timeout.as_millis().clamp(0, i32::MAX as u128) as i32;
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    loop {
+        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if rc == 0 {
+            return Ok(0);
+        }
+
+        let read_len = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if read_len < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(read_len as usize);
+    }
 }
 
 fn is_idle_serial_timeout(err: &std::io::Error) -> bool {

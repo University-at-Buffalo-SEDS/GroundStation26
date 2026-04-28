@@ -272,13 +272,9 @@ fn spawn_dedicated_radio_io_threads(
             let mut suppressed_send_errors = 0;
             let mut last_recv_error_log_ms = 0;
             let mut suppressed_recv_errors = 0;
-            let radio_rx_slice = Duration::from_millis(radio_rx_slice_ms());
-            let radio_tx_slice = Duration::from_millis(radio_tx_slice_ms());
             let radio_follow_timeout = Duration::from_millis(radio_follow_timeout_ms());
             let radio_tx_backlog_limit = radio_tx_backlog_limit();
             let mut tx_backlog: VecDeque<Vec<u8>> = VecDeque::new();
-            let mut tx_mode = false;
-            let mut slice_started_at = std::time::Instant::now();
             let mut last_window_update_at: Option<std::time::Instant> = None;
             let mut follow_window_until: Option<std::time::Instant> = None;
             let mut follow_window_is_uplink = false;
@@ -310,34 +306,29 @@ fn spawn_dedicated_radio_io_threads(
                 let follow_mode_active = last_window_update_at
                     .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
 
-                if !has_seen_window_update {
-                    tx_mode = false;
+                let tx_allowed = if !has_seen_window_update {
+                    false
                 } else if follow_mode_active {
                     if follow_window_until.is_some_and(|deadline| now >= deadline) {
-                        tx_mode = false;
                         follow_window_until = None;
                         follow_window_is_uplink = false;
                         sent_in_current_uplink_window = false;
+                        false
                     } else {
-                        tx_mode = follow_window_is_uplink
+                        follow_window_is_uplink
                             && !sent_in_current_uplink_window
-                            && !tx_backlog.is_empty();
+                            && !tx_backlog.is_empty()
                     }
                 } else {
-                    if tx_mode {
-                        if tx_backlog.is_empty()
-                            || now.saturating_duration_since(slice_started_at) >= radio_tx_slice
-                        {
-                            tx_mode = false;
-                            slice_started_at = now;
-                        }
-                    } else if !tx_backlog.is_empty()
-                        && now.saturating_duration_since(slice_started_at) >= radio_rx_slice
-                    {
-                        tx_mode = true;
-                        slice_started_at = now;
-                    }
-                }
+                    // Lost rfboard window sync: force radio back to RX-only until
+                    // fresh command frames arrive again. Do not fall back to
+                    // locally-timed TX; that can keep the link in a self-sustaining
+                    // "TX forever, never hear the next window frame" failure mode.
+                    follow_window_until = None;
+                    follow_window_is_uplink = false;
+                    sent_in_current_uplink_window = false;
+                    false
+                };
 
                 let mut comms = comms.lock().expect("failed to get lock");
                 match comms.recv_serialized_packets(&mut |payload| {
@@ -363,23 +354,20 @@ fn spawn_dedicated_radio_io_threads(
                         RadioWindowKind::DownlinkOpen => {
                             follow_window_is_uplink = false;
                             sent_in_current_uplink_window = false;
-                            tx_mode = false;
                         }
                         RadioWindowKind::UplinkOpen => {
                             follow_window_is_uplink = true;
                             sent_in_current_uplink_window = false;
-                            tx_mode = !tx_backlog.is_empty();
                         }
                     }
                 }
-                if tx_mode {
+                if tx_allowed {
                     if let Some(payload) = tx_backlog.pop_front() {
                         maybe_log_green_radio_command_send(&worker_name, &payload);
                         match comms.send_data(&payload) {
                             Ok(()) => {
                                 if follow_mode_active && follow_window_is_uplink {
                                     sent_in_current_uplink_window = true;
-                                    tx_mode = false;
                                 }
                                 if suppressed_send_errors > 0 {
                                     eprintln!(
@@ -709,16 +697,6 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(default)
         .clamp(min, max)
-}
-
-fn radio_tx_slice_ms() -> u64 {
-    static SLICE_MS: OnceLock<u64> = OnceLock::new();
-    *SLICE_MS.get_or_init(|| env_usize("GS_RADIO_TX_SLICE_MS", 100, 10, 5_000) as u64)
-}
-
-fn radio_rx_slice_ms() -> u64 {
-    static SLICE_MS: OnceLock<u64> = OnceLock::new();
-    *SLICE_MS.get_or_init(|| env_usize("GS_RADIO_RX_SLICE_MS", 100, 10, 5_000) as u64)
 }
 
 fn radio_follow_timeout_ms() -> u64 {
