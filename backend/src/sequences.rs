@@ -657,6 +657,10 @@ pub fn all_command_names() -> Vec<&'static str> {
 }
 
 pub fn default_action_policy() -> ActionPolicyMsg {
+    #[cfg(feature = "hitl_mode")]
+    {
+        return hitl_action_policy(ValveSnapshot::default());
+    }
     let controls = all_command_names()
         .into_iter()
         .map(|cmd| {
