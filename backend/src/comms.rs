@@ -261,6 +261,9 @@ fn i2c_rx_poll_burst() -> usize {
 //  Real Comms Implementation
 // ======================================================================
 pub struct UartComms {
+    #[cfg(target_os = "linux")]
+    inner: serialport::TTYPort,
+    #[cfg(not(target_os = "linux"))]
     inner: Box<dyn SerialPort>,
     side_id: Option<RouterSideId>,
     rx_buf: Vec<u8>,
@@ -271,6 +274,16 @@ pub struct UartComms {
 
 impl UartComms {
     pub fn open(cfg: &SerialLinkConfig) -> anyhow::Result<Self> {
+        #[cfg(target_os = "linux")]
+        let mut inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
+            .data_bits(serialport::DataBits::Eight)
+            .parity(serialport::Parity::None)
+            .stop_bits(serialport::StopBits::One)
+            .flow_control(serialport::FlowControl::None)
+            .timeout(UART_STARTUP_TIMEOUT)
+            .open_native()
+            .context("failed to configure serial port")?;
+        #[cfg(not(target_os = "linux"))]
         let inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
             .data_bits(serialport::DataBits::Eight)
             .parity(serialport::Parity::None)
@@ -279,6 +292,9 @@ impl UartComms {
             .timeout(UART_STARTUP_TIMEOUT)
             .open()
             .context("failed to configure serial port")?;
+        #[cfg(target_os = "linux")]
+        configure_linux_raw_serial(inner.as_raw_fd(), cfg.baud_rate as u32)
+            .context("failed to switch serial port into raw mode")?;
         Ok(Self {
             inner,
             side_id: None,
@@ -464,6 +480,63 @@ impl UartComms {
         }
         Ok(processed_any)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_baud_rate_constant(baud: u32) -> Option<libc::speed_t> {
+    match baud {
+        9600 => Some(libc::B9600),
+        19_200 => Some(libc::B19200),
+        38_400 => Some(libc::B38400),
+        57_600 => Some(libc::B57600),
+        115_200 => Some(libc::B115200),
+        230_400 => Some(libc::B230400),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_raw_serial(fd: RawFd, baud: u32) -> std::io::Result<()> {
+    let baud = linux_baud_rate_constant(baud).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported baud rate for raw serial mode: {baud}"),
+        )
+    })?;
+
+    // Match the Python test script exactly: raw mode, local receiver enabled,
+    // nonblocking reads, and no termios-side inter-byte timers.
+    unsafe {
+        let mut tty: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut tty) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        tty.c_iflag = 0;
+        tty.c_oflag = 0;
+        tty.c_cflag &= !(libc::PARENB | libc::CSTOPB | libc::CSIZE | libc::CRTSCTS);
+        tty.c_cflag |= libc::CS8 | libc::CREAD | libc::CLOCAL;
+        tty.c_lflag = 0;
+        tty.c_cc[libc::VMIN] = 0;
+        tty.c_cc[libc::VTIME] = 0;
+
+        if libc::cfsetispeed(&mut tty, baud) != 0 || libc::cfsetospeed(&mut tty, baud) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::tcsetattr(fd, libc::TCSANOW, &tty) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
 }
 
 fn is_idle_serial_timeout(err: &std::io::Error) -> bool {
