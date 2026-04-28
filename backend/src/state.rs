@@ -941,31 +941,34 @@ impl AppState {
         #[cfg(feature = "hitl_mode")]
         {
             let _ = cmd;
-            return true;
+            true
         }
-        if matches!(cmd, TelemetryCommand::ResetSim) && crate::flight_sim::sim_mode_enabled() {
-            return true;
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            if matches!(cmd, TelemetryCommand::ResetSim) && crate::flight_sim::sim_mode_enabled() {
+                return true;
+            }
+            if matches!(
+                cmd,
+                TelemetryCommand::Abort
+                    | TelemetryCommand::NitrogenClose
+                    | TelemetryCommand::NitrousClose
+                    | TelemetryCommand::ContinueFillSequence
+            ) {
+                return true;
+            }
+            let name = command_name(cmd);
+            let policy = self.action_policy.lock().unwrap();
+            if !policy.software_buttons_enabled {
+                return false;
+            }
+            policy
+                .controls
+                .iter()
+                .find(|c| c.cmd == name)
+                .map(|c| c.enabled)
+                .unwrap_or(false)
         }
-        if matches!(
-            cmd,
-            TelemetryCommand::Abort
-                | TelemetryCommand::NitrogenClose
-                | TelemetryCommand::NitrousClose
-                | TelemetryCommand::ContinueFillSequence
-        ) {
-            return true;
-        }
-        let name = command_name(cmd);
-        let policy = self.action_policy.lock().unwrap();
-        if !policy.software_buttons_enabled {
-            return false;
-        }
-        policy
-            .controls
-            .iter()
-            .find(|c| c.cmd == name)
-            .map(|c| c.enabled)
-            .unwrap_or(false)
     }
 
     /// Records when a command was last accepted by the backend.

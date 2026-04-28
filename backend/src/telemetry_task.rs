@@ -61,7 +61,10 @@ fn spawn_comms_worker_threads(
     let worker_name = comms_handle.name;
     let comms = comms_handle.comms;
     let tx_worker_state = state.clone();
-    let tx_worker_comms = comms_handle.tx_comms.clone().unwrap_or_else(|| comms.clone());
+    let tx_worker_comms = comms_handle
+        .tx_comms
+        .clone()
+        .unwrap_or_else(|| comms.clone());
     let tx_worker = thread::Builder::new()
         .name(format!("{}_comms_tx", worker_name))
         .spawn(move || {
@@ -2504,13 +2507,15 @@ async fn handle_packet(
         let message = format!("{sender_id}: {message}");
         let (message_id, inserted) = state.add_backend_message(message.clone());
         if inserted
-            && let Err(err) = state.db_queue_tx.try_send(DbQueueItem::Write(DbWrite::Message {
-                id: message_id,
-                timestamp_ms: get_current_timestamp_ms() as i64,
-                message,
-                action_label: None,
-                action_cmd: None,
-            }))
+            && let Err(err) = state
+                .db_queue_tx
+                .try_send(DbQueueItem::Write(DbWrite::Message {
+                    id: message_id,
+                    timestamp_ms: get_current_timestamp_ms() as i64,
+                    message,
+                    action_label: None,
+                    action_cmd: None,
+                }))
         {
             eprintln!("Failed to queue backend message DB write: {err}");
         }

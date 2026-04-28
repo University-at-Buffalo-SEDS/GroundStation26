@@ -187,9 +187,12 @@ impl AuthPrincipal {
         #[cfg(feature = "hitl_mode")]
         {
             let _ = cmd;
-            return self.permissions.send_commands;
+            self.permissions.send_commands
         }
-        self.permissions.send_commands && self.command_access.allows(cmd)
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            self.permissions.send_commands && self.command_access.allows(cmd)
+        }
     }
 }
 
