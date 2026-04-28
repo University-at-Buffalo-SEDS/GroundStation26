@@ -275,6 +275,7 @@ fn spawn_dedicated_radio_io_threads(
             let radio_rx_slice = Duration::from_millis(radio_rx_slice_ms());
             let radio_tx_slice = Duration::from_millis(radio_tx_slice_ms());
             let radio_follow_timeout = Duration::from_millis(radio_follow_timeout_ms());
+            let radio_tx_backlog_limit = radio_tx_backlog_limit();
             let mut tx_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             let mut tx_mode = false;
             let mut slice_started_at = std::time::Instant::now();
@@ -282,6 +283,7 @@ fn spawn_dedicated_radio_io_threads(
             let mut follow_window_until: Option<std::time::Instant> = None;
             let mut follow_window_is_uplink = false;
             let mut has_seen_window_update = false;
+            let mut sent_in_current_uplink_window = false;
 
             loop {
                 match comms_shutdown_rx.try_recv() {
@@ -293,7 +295,12 @@ fn spawn_dedicated_radio_io_threads(
 
                 loop {
                     match comms_handle.tx_rx.try_recv() {
-                        Ok(payload) => tx_backlog.push_back(payload),
+                        Ok(payload) => {
+                            tx_backlog.push_back(payload);
+                            while tx_backlog.len() > radio_tx_backlog_limit {
+                                tx_backlog.pop_front();
+                            }
+                        }
                         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                         Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
                     }
@@ -310,8 +317,11 @@ fn spawn_dedicated_radio_io_threads(
                         tx_mode = false;
                         follow_window_until = None;
                         follow_window_is_uplink = false;
+                        sent_in_current_uplink_window = false;
                     } else {
-                        tx_mode = follow_window_is_uplink && !tx_backlog.is_empty();
+                        tx_mode = follow_window_is_uplink
+                            && !sent_in_current_uplink_window
+                            && !tx_backlog.is_empty();
                     }
                 } else {
                     if tx_mode {
@@ -334,6 +344,10 @@ fn spawn_dedicated_radio_io_threads(
                     if let Some(payload) = tx_backlog.pop_front() {
                         match comms.send_data(&payload) {
                             Ok(()) => {
+                                if follow_mode_active && follow_window_is_uplink {
+                                    sent_in_current_uplink_window = true;
+                                    tx_mode = false;
+                                }
                                 if suppressed_send_errors > 0 {
                                     eprintln!(
                                         "{worker_name} radio io send_data recovered after suppressing {suppressed_send_errors} repeated errors"
@@ -376,10 +390,12 @@ fn spawn_dedicated_radio_io_threads(
                     match update.kind {
                         RadioWindowKind::DownlinkOpen => {
                             follow_window_is_uplink = false;
+                            sent_in_current_uplink_window = false;
                             tx_mode = false;
                         }
                         RadioWindowKind::UplinkOpen => {
                             follow_window_is_uplink = true;
+                            sent_in_current_uplink_window = false;
                             tx_mode = !tx_backlog.is_empty();
                         }
                     }
@@ -708,6 +724,11 @@ fn radio_rx_slice_ms() -> u64 {
 fn radio_follow_timeout_ms() -> u64 {
     static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
     *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 1_500, 50, 10_000) as u64)
+}
+
+fn radio_tx_backlog_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_BACKLOG_LIMIT", 8, 1, 256))
 }
 
 fn drop_db_writes_on_backpressure() -> bool {
