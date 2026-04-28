@@ -1882,15 +1882,18 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             continue;
                         }
                         let received_cmd = cmd.cmd;
+                        eprintln!("Accepted websocket command: {:?}", received_cmd);
                         gs_debug_println!(
                             "\x1b[32mWebsocket command received: {:?}\x1b[0m",
                             received_cmd
                         );
                         if let Err(e) = cmd_tx.send(received_cmd).await {
+                            eprintln!("Failed to forward WS command to cmd_tx: {e}");
                             gs_debug_println!("Failed to forward WS command to cmd_tx: {e}");
                         }
                     }
                     Err(e) => {
+                        eprintln!("Invalid WS command JSON {text:?}: {e}");
                         gs_debug_println!("Invalid WS command JSON {text:?}: {e}");
                     }
                 }
