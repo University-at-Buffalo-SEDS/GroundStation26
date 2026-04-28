@@ -43,6 +43,7 @@ fn recording_command_actuated(cmd: &str, mode: RecordingModeWire) -> Option<bool
 pub struct BoardStatus {
     pub packet_count: u64,
     pub last_seen_ms: Option<u64>,
+    pub last_seen_instant: Option<std::time::Instant>,
     pub ema_gap_ms: Option<u64>,
     pub warned: bool,
 }
@@ -300,8 +301,10 @@ impl AppState {
                     .unwrap_or(gap_ms);
                 status.ema_gap_ms = Some(ema.clamp(10, 60_000));
                 status.last_seen_ms = Some(observed_ms);
+                status.last_seen_instant = Some(std::time::Instant::now());
             } else {
                 status.last_seen_ms = Some(timestamp_ms);
+                status.last_seen_instant = Some(std::time::Instant::now());
                 force_broadcast = true;
             }
             status.warned = false;
@@ -345,6 +348,9 @@ impl AppState {
                     .map(|existing| existing.max(route_last_seen_ms))
                     .unwrap_or(route_last_seen_ms),
             );
+            status.last_seen_instant = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(route.age_ms))
+                .or_else(|| Some(std::time::Instant::now()));
             status.warned = false;
         }
         drop(map);
@@ -432,7 +438,10 @@ impl AppState {
             let last_seen_ms = status.and_then(|s| s.last_seen_ms);
             let packet_count = status.map(|s| s.packet_count).unwrap_or(0);
             let seen = last_seen_ms.is_some();
-            let age_ms = last_seen_ms.map(|ts| now_ms.saturating_sub(ts));
+            let age_ms = status
+                .and_then(|s| s.last_seen_instant.as_ref())
+                .map(|instant| instant.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                .or_else(|| last_seen_ms.map(|ts| now_ms.saturating_sub(ts)));
 
             boards.push(BoardStatusEntry {
                 board: *board,
@@ -1077,6 +1086,7 @@ impl AppState {
         self.umbilical_valve_states.lock().unwrap().clear();
         for status in self.board_status.lock().unwrap().values_mut() {
             status.last_seen_ms = None;
+            status.last_seen_instant = None;
             status.ema_gap_ms = None;
             status.warned = false;
         }
