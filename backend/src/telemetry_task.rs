@@ -272,10 +272,11 @@ fn spawn_dedicated_radio_io_threads(
             let mut suppressed_send_errors = 0;
             let mut last_recv_error_log_ms = 0;
             let mut suppressed_recv_errors = 0;
-            let mut next_tx_allowed_at = std::time::Instant::now();
-            let mut last_rx_activity_at = std::time::Instant::now();
-            let radio_gap = Duration::from_millis(radio_tx_gap_ms());
-            let radio_quiet = Duration::from_millis(radio_tx_quiet_ms());
+            let radio_rx_slice = Duration::from_millis(radio_rx_slice_ms());
+            let radio_tx_slice = Duration::from_millis(radio_tx_slice_ms());
+            let mut tx_backlog: VecDeque<Vec<u8>> = VecDeque::new();
+            let mut tx_mode = false;
+            let mut slice_started_at = std::time::Instant::now();
 
             loop {
                 match comms_shutdown_rx.try_recv() {
@@ -285,51 +286,65 @@ fn spawn_dedicated_radio_io_threads(
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
                 }
 
-                let mut comms = comms.lock().expect("failed to get lock");
-                match comms.recv_serialized_packets(&mut |payload| {
-                    last_rx_activity_at = std::time::Instant::now();
-                    let _ = incoming_tx.send(payload);
-                }) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        log_repeated_worker_error(
-                            &format!("{worker_name} radio io recv_serialized_packets failed"),
-                            &format!("{e:?}"),
-                            &mut last_recv_error_log_ms,
-                            &mut suppressed_recv_errors,
-                        );
+                loop {
+                    match comms_handle.tx_rx.try_recv() {
+                        Ok(payload) => tx_backlog.push_back(payload),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
                     }
                 }
 
                 let now = std::time::Instant::now();
-                if now >= next_tx_allowed_at
-                    && now.saturating_duration_since(last_rx_activity_at) >= radio_quiet
+                if tx_mode {
+                    if tx_backlog.is_empty()
+                        || now.saturating_duration_since(slice_started_at) >= radio_tx_slice
+                    {
+                        tx_mode = false;
+                        slice_started_at = now;
+                    }
+                } else if !tx_backlog.is_empty()
+                    && now.saturating_duration_since(slice_started_at) >= radio_rx_slice
                 {
-                    match comms_handle.tx_rx.try_recv() {
-                        Ok(payload) => {
-                            match comms.send_data(&payload) {
-                                Ok(()) => {
-                                    if suppressed_send_errors > 0 {
-                                        eprintln!(
-                                            "{worker_name} radio io send_data recovered after suppressing {suppressed_send_errors} repeated errors"
-                                        );
-                                        suppressed_send_errors = 0;
-                                        last_send_error_log_ms = 0;
-                                    }
-                                    next_tx_allowed_at = std::time::Instant::now() + radio_gap;
-                                }
-                                Err(e) => {
-                                    log_repeated_worker_error(
-                                        &format!("{worker_name} radio io send_data failed"),
-                                        &e.to_string(),
-                                        &mut last_send_error_log_ms,
-                                        &mut suppressed_send_errors,
+                    tx_mode = true;
+                    slice_started_at = now;
+                }
+
+                let mut comms = comms.lock().expect("failed to get lock");
+                if tx_mode {
+                    if let Some(payload) = tx_backlog.pop_front() {
+                        match comms.send_data(&payload) {
+                            Ok(()) => {
+                                if suppressed_send_errors > 0 {
+                                    eprintln!(
+                                        "{worker_name} radio io send_data recovered after suppressing {suppressed_send_errors} repeated errors"
                                     );
+                                    suppressed_send_errors = 0;
+                                    last_send_error_log_ms = 0;
                                 }
                             }
+                            Err(e) => {
+                                log_repeated_worker_error(
+                                    &format!("{worker_name} radio io send_data failed"),
+                                    &e.to_string(),
+                                    &mut last_send_error_log_ms,
+                                    &mut suppressed_send_errors,
+                                );
+                            }
                         }
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                } else {
+                    match comms.recv_serialized_packets(&mut |payload| {
+                        let _ = incoming_tx.send(payload);
+                    }) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            log_repeated_worker_error(
+                                &format!("{worker_name} radio io recv_serialized_packets failed"),
+                                &format!("{e:?}"),
+                                &mut last_recv_error_log_ms,
+                                &mut suppressed_recv_errors,
+                            );
+                        }
                     }
                 }
                 drop(comms);
@@ -643,14 +658,14 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .clamp(min, max)
 }
 
-fn radio_tx_gap_ms() -> u64 {
-    static GAP_MS: OnceLock<u64> = OnceLock::new();
-    *GAP_MS.get_or_init(|| env_usize("GS_RADIO_TX_GAP_MS", 250, 10, 5_000) as u64)
+fn radio_tx_slice_ms() -> u64 {
+    static SLICE_MS: OnceLock<u64> = OnceLock::new();
+    *SLICE_MS.get_or_init(|| env_usize("GS_RADIO_TX_SLICE_MS", 100, 10, 5_000) as u64)
 }
 
-fn radio_tx_quiet_ms() -> u64 {
-    static QUIET_MS: OnceLock<u64> = OnceLock::new();
-    *QUIET_MS.get_or_init(|| env_usize("GS_RADIO_TX_QUIET_MS", 150, 0, 5_000) as u64)
+fn radio_rx_slice_ms() -> u64 {
+    static SLICE_MS: OnceLock<u64> = OnceLock::new();
+    *SLICE_MS.get_or_init(|| env_usize("GS_RADIO_RX_SLICE_MS", 100, 10, 5_000) as u64)
 }
 
 fn drop_db_writes_on_backpressure() -> bool {
