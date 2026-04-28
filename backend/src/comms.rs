@@ -375,7 +375,20 @@ impl UartComms {
                 RawUartFrameKind::Data => return Ok(Some(payload)),
                 RawUartFrameKind::Command => {
                     if let Some(update) = parse_radio_window_update(&payload) {
+                        maybe_log_raw_uart_command_frame(
+                            "accepted radio window command frame",
+                            &payload,
+                            Some(update),
+                            &self.protocol,
+                        );
                         self.radio_window_updates.push_back(update);
+                    } else {
+                        maybe_log_raw_uart_command_frame(
+                            "rejected raw UART command frame",
+                            &payload,
+                            None,
+                            &self.protocol,
+                        );
                     }
                 }
                 RawUartFrameKind::Ascii => {}
@@ -734,6 +747,29 @@ fn maybe_log_raw_uart_decoded(payload: &[u8], protocol: &SerialProtocol) {
         payload.len(),
         hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
     );
+}
+
+fn maybe_log_raw_uart_command_frame(
+    context: &str,
+    payload: &[u8],
+    update: Option<RadioWindowUpdate>,
+    protocol: &SerialProtocol,
+) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    match update {
+        Some(update) => eprintln!(
+            "{context}: kind={:?} duration_ms={} payload={}",
+            update.kind,
+            update.duration_ms,
+            hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+        ),
+        None => eprintln!(
+            "{context}: payload={}",
+            hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+        ),
+    }
 }
 
 fn maybe_log_raw_uart_router_queue_before(payload: &[u8], protocol: &SerialProtocol) {

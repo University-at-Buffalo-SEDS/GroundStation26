@@ -281,6 +281,7 @@ fn spawn_dedicated_radio_io_threads(
             let mut last_window_update_at: Option<std::time::Instant> = None;
             let mut follow_window_until: Option<std::time::Instant> = None;
             let mut follow_window_is_uplink = false;
+            let mut has_seen_window_update = false;
 
             loop {
                 match comms_shutdown_rx.try_recv() {
@@ -302,7 +303,9 @@ fn spawn_dedicated_radio_io_threads(
                 let follow_mode_active = last_window_update_at
                     .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
 
-                if follow_mode_active {
+                if !has_seen_window_update {
+                    tx_mode = false;
+                } else if follow_mode_active {
                     if follow_window_until.is_some_and(|deadline| now >= deadline) {
                         tx_mode = false;
                         follow_window_until = None;
@@ -367,6 +370,7 @@ fn spawn_dedicated_radio_io_threads(
                 while let Some(update) = comms.take_radio_window_update() {
                     let deadline =
                         std::time::Instant::now() + Duration::from_millis(update.duration_ms as u64);
+                    has_seen_window_update = true;
                     last_window_update_at = Some(std::time::Instant::now());
                     follow_window_until = Some(deadline);
                     match update.kind {
