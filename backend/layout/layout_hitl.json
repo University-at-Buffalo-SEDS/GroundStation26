@@ -153,13 +153,6 @@
         "fg": "#fecaca"
       },
       {
-        "label": "Abort",
-        "cmd": "Abort",
-        "border": "#dc2626",
-        "bg": "#3f0b13",
-        "fg": "#fee2e2"
-      },
-      {
         "label": "Igniter",
         "cmd": "Igniter",
         "border": "#60a5fa",
