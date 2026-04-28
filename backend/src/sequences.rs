@@ -659,32 +659,43 @@ pub fn all_command_names() -> Vec<&'static str> {
 pub fn default_action_policy() -> ActionPolicyMsg {
     #[cfg(feature = "hitl_mode")]
     {
-        return hitl_action_policy(ValveSnapshot::default());
+        return hitl_action_policy(ValveSnapshot {
+            normally_open: None,
+            dump_open: None,
+            nitrogen_open: None,
+            nitrous_open: None,
+            pilot_open: None,
+            igniter_on: None,
+            retract: None,
+        });
     }
-    let controls = all_command_names()
-        .into_iter()
-        .map(|cmd| {
-            let enabled = matches!(
-                cmd,
-                "Abort"
-                    | "ResetSim"
-                    | "StartWritingNow"
-                    | "StartWritingLastTwoMinutes"
-                    | "PauseWritingDb"
-                    | "StopWritingDb"
-            );
-            ActionControl {
-                cmd: cmd.to_string(),
-                enabled,
-                blink: backend_blink_for(cmd, enabled, None),
-                actuated: default_recording_command_actuated(cmd),
-            }
-        })
-        .collect();
-    ActionPolicyMsg {
-        key_enabled: true,
-        software_buttons_enabled: true,
-        controls,
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        let controls = all_command_names()
+            .into_iter()
+            .map(|cmd| {
+                let enabled = matches!(
+                    cmd,
+                    "Abort"
+                        | "ResetSim"
+                        | "StartWritingNow"
+                        | "StartWritingLastTwoMinutes"
+                        | "PauseWritingDb"
+                        | "StopWritingDb"
+                );
+                ActionControl {
+                    cmd: cmd.to_string(),
+                    enabled,
+                    blink: backend_blink_for(cmd, enabled, None),
+                    actuated: default_recording_command_actuated(cmd),
+                }
+            })
+            .collect();
+        ActionPolicyMsg {
+            key_enabled: true,
+            software_buttons_enabled: true,
+            controls,
+        }
     }
 }
 

@@ -155,12 +155,14 @@ fn spawn_comms_worker_threads(
                 match comms.recv_packet(&rx_worker_router, &mut packet_tap) {
                     Ok(_) => {}
                     Err(e) => {
-                        log_repeated_worker_error(
+                        if !handle_worker_recv_error(
                             &format!("{worker_name} comms worker recv_packet failed"),
                             &format!("{e:?}"),
                             &mut last_recv_error_log_ms,
                             &mut suppressed_recv_errors,
-                        );
+                        ) {
+                            break;
+                        }
                     }
                 }
                 drop(comms);
@@ -235,12 +237,14 @@ fn spawn_legacy_comms_worker_thread(
                 match comms.recv_packet(&router, &mut packet_tap) {
                     Ok(_) => {}
                     Err(e) => {
-                        log_repeated_worker_error(
+                        if !handle_worker_recv_error(
                             &format!("{worker_name} comms worker recv_packet failed"),
                             &format!("{e:?}"),
                             &mut last_recv_error_log_ms,
                             &mut suppressed_recv_errors,
-                        );
+                        ) {
+                            break;
+                        }
                     }
                 }
                 drop(comms);
@@ -339,12 +343,14 @@ fn spawn_dedicated_radio_io_threads(
                 }) {
                     Ok(()) => {}
                     Err(e) => {
-                        log_repeated_worker_error(
+                        if !handle_worker_recv_error(
                             &format!("{worker_name} radio io recv_serialized_packets failed"),
                             &format!("{e:?}"),
                             &mut last_recv_error_log_ms,
                             &mut suppressed_recv_errors,
-                        );
+                        ) {
+                            break;
+                        }
                     }
                 }
                 while let Some(update) = comms.take_radio_window_update() {
@@ -502,12 +508,14 @@ fn spawn_rx_priority_comms_worker_thread(
                         }
                     }
                     Err(e) => {
-                        log_repeated_worker_error(
+                        if !handle_worker_recv_error(
                             &format!("{worker_name} comms worker recv_packet failed"),
                             &format!("{e:?}"),
                             &mut last_recv_error_log_ms,
                             &mut suppressed_recv_errors,
-                        );
+                        ) {
+                            break;
+                        }
                     }
                 }
                 drop(comms);
@@ -535,6 +543,45 @@ fn log_repeated_worker_error(
         *suppressed_count = 0;
     } else {
         *suppressed_count += 1;
+    }
+}
+
+#[cfg(feature = "testing")]
+fn testing_should_disable_rx_loop(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    [
+        "no such file",
+        "not found",
+        "device not configured",
+        "input/output error",
+        "broken pipe",
+        "disconnected",
+        "timed out waiting",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
+}
+
+fn handle_worker_recv_error(
+    context: &str,
+    detail: &str,
+    last_log_ms: &mut u64,
+    suppressed_count: &mut u64,
+) -> bool {
+    #[cfg(feature = "testing")]
+    {
+        if testing_should_disable_rx_loop(detail) {
+            gs_debug_println!("{context}: disabling RX loop in testing mode after {detail}");
+            return false;
+        }
+        let _ = (context, detail, last_log_ms, suppressed_count);
+        return true;
+    }
+
+    #[cfg(not(feature = "testing"))]
+    {
+        log_repeated_worker_error(context, detail, last_log_ms, suppressed_count);
+        true
     }
 }
 
