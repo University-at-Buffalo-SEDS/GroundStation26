@@ -82,6 +82,7 @@ fn is_recording_command(cmd: &str) -> bool {
     )
 }
 
+#[cfg_attr(feature = "hitl_mode", allow(dead_code))]
 fn default_recording_command_actuated(cmd: &str) -> Option<bool> {
     match cmd {
         "StartWritingNow" | "StartWritingLastTwoMinutes" => Some(false),
