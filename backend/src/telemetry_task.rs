@@ -340,8 +340,41 @@ fn spawn_dedicated_radio_io_threads(
                 }
 
                 let mut comms = comms.lock().expect("failed to get lock");
+                match comms.recv_serialized_packets(&mut |payload| {
+                    let _ = incoming_tx.send(payload);
+                }) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        log_repeated_worker_error(
+                            &format!("{worker_name} radio io recv_serialized_packets failed"),
+                            &format!("{e:?}"),
+                            &mut last_recv_error_log_ms,
+                            &mut suppressed_recv_errors,
+                        );
+                    }
+                }
+                while let Some(update) = comms.take_radio_window_update() {
+                    let deadline =
+                        std::time::Instant::now() + Duration::from_millis(update.duration_ms as u64);
+                    has_seen_window_update = true;
+                    last_window_update_at = Some(std::time::Instant::now());
+                    follow_window_until = Some(deadline);
+                    match update.kind {
+                        RadioWindowKind::DownlinkOpen => {
+                            follow_window_is_uplink = false;
+                            sent_in_current_uplink_window = false;
+                            tx_mode = false;
+                        }
+                        RadioWindowKind::UplinkOpen => {
+                            follow_window_is_uplink = true;
+                            sent_in_current_uplink_window = false;
+                            tx_mode = !tx_backlog.is_empty();
+                        }
+                    }
+                }
                 if tx_mode {
                     if let Some(payload) = tx_backlog.pop_front() {
+                        maybe_log_green_radio_command_send(&worker_name, &payload);
                         match comms.send_data(&payload) {
                             Ok(()) => {
                                 if follow_mode_active && follow_window_is_uplink {
@@ -364,39 +397,6 @@ fn spawn_dedicated_radio_io_threads(
                                     &mut suppressed_send_errors,
                                 );
                             }
-                        }
-                    }
-                } else {
-                    match comms.recv_serialized_packets(&mut |payload| {
-                        let _ = incoming_tx.send(payload);
-                    }) {
-                        Ok(()) => {}
-                        Err(e) => {
-                            log_repeated_worker_error(
-                                &format!("{worker_name} radio io recv_serialized_packets failed"),
-                                &format!("{e:?}"),
-                                &mut last_recv_error_log_ms,
-                                &mut suppressed_recv_errors,
-                            );
-                        }
-                    }
-                }
-                while let Some(update) = comms.take_radio_window_update() {
-                    let deadline =
-                        std::time::Instant::now() + Duration::from_millis(update.duration_ms as u64);
-                    has_seen_window_update = true;
-                    last_window_update_at = Some(std::time::Instant::now());
-                    follow_window_until = Some(deadline);
-                    match update.kind {
-                        RadioWindowKind::DownlinkOpen => {
-                            follow_window_is_uplink = false;
-                            sent_in_current_uplink_window = false;
-                            tx_mode = false;
-                        }
-                        RadioWindowKind::UplinkOpen => {
-                            follow_window_is_uplink = true;
-                            sent_in_current_uplink_window = false;
-                            tx_mode = !tx_backlog.is_empty();
                         }
                     }
                 }
@@ -729,6 +729,31 @@ fn radio_follow_timeout_ms() -> u64 {
 fn radio_tx_backlog_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_BACKLOG_LIMIT", 8, 1, 256))
+}
+
+fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
+    if !crate::debug_prints_enabled() {
+        return;
+    }
+    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+        return;
+    };
+    if !matches!(pkt.data_type(), DataType::FlightCommand) {
+        return;
+    }
+    let cmd_bytes = pkt.payload();
+    let cmd_preview = cmd_bytes
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "\x1b[32m{worker_name} radio TX FlightCommand sender={} endpoints={:?} payload={}\x1b[0m",
+        pkt.sender(),
+        pkt.endpoints(),
+        cmd_preview
+    );
 }
 
 fn drop_db_writes_on_backpressure() -> bool {
