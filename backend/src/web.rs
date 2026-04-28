@@ -478,11 +478,21 @@ fn gps_point_from_values(values: &Vec<Option<f32>>) -> Option<GpsPoint> {
 
 /// Serves the current frontend layout configuration.
 async fn get_layout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
-        return response;
-    }
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     match layout::load_layout() {
-        Ok(layout) => Json(layout).into_response(),
+        Ok(mut layout) => {
+            if !principal.permissions.send_commands {
+                layout.actions_tab.actions.clear();
+            } else if !principal.command_access.allowed_commands.is_empty() {
+                layout.actions_tab.actions.retain(|action| {
+                    principal.command_access.allowed_commands.iter().any(|cmd| cmd == &action.cmd)
+                });
+            }
+            Json(layout).into_response()
+        }
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }

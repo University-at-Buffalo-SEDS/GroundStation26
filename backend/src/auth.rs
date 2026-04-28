@@ -166,10 +166,6 @@ pub struct AuthPrincipal {
 
 impl AuthPrincipal {
     pub fn session_status(&self) -> SessionStatus {
-        #[cfg(feature = "hitl_mode")]
-        let allowed_commands = Vec::new();
-        #[cfg(not(feature = "hitl_mode"))]
-        let allowed_commands = self.command_access.allowed_commands.clone();
         SessionStatus {
             authenticated: !self.anonymous,
             username: self.username.clone(),
@@ -177,23 +173,27 @@ impl AuthPrincipal {
             expires_at_ms: self.expires_at_ms,
             anonymous: self.anonymous,
             session_type: self.session_type.clone(),
-            allowed_commands,
+            allowed_commands: self.command_access.allowed_commands.clone(),
             can_view_calibration: self.calibration_access.view,
             can_edit_calibration: self.calibration_access.edit,
         }
     }
 
     pub fn allows_command_name(&self, cmd: &str) -> bool {
-        #[cfg(feature = "hitl_mode")]
-        {
-            let _ = cmd;
-            self.permissions.send_commands
-        }
-        #[cfg(not(feature = "hitl_mode"))]
-        {
-            self.permissions.send_commands && self.command_access.allows(cmd)
-        }
+        self.permissions.send_commands && self.command_access.allows(cmd)
     }
+}
+
+fn configured_user_access(
+    config: &UsersFile,
+    username: &str,
+) -> (CommandAccess, CalibrationAccess) {
+    config
+        .users
+        .iter()
+        .find(|user| user.username.eq_ignore_ascii_case(username))
+        .map(|user| (user.command_access.clone(), user.calibration_access))
+        .unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -390,31 +390,20 @@ impl AuthManager {
                 ));
             }
 
+            let config = self.load_users_file().map_err(|e| {
+                AuthFailure::Internal(format!("failed to load users.json: {e}"))
+            })?;
+            let username = row.get::<String, _>("username");
+            let (command_access, calibration_access) = configured_user_access(&config, &username);
+
             return Ok(AuthPrincipal {
-                username: Some(row.get::<String, _>("username")),
+                username: Some(username),
                 permissions,
                 expires_at_ms: Some(expires_at_ms),
                 anonymous: false,
                 session_type: Some(row.get::<String, _>("session_type")),
-                command_access: CommandAccess {
-                    allowed_commands: serde_json::from_str(
-                        row.get::<String, _>("allowed_commands_json").as_str(),
-                    )
-                    .unwrap_or_default(),
-                }
-                .normalized(),
-                calibration_access: {
-                    let config = self.load_users_file().map_err(|e| {
-                        AuthFailure::Internal(format!("failed to load users.json: {e}"))
-                    })?;
-                    let username = row.get::<String, _>("username");
-                    config
-                        .users
-                        .iter()
-                        .find(|user| user.username.eq_ignore_ascii_case(username.as_str()))
-                        .map(|user| user.calibration_access)
-                        .unwrap_or_default()
-                },
+                command_access,
+                calibration_access,
             });
         }
 
