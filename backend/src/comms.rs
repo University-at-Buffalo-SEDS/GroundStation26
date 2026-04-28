@@ -539,6 +539,29 @@ fn configure_linux_raw_serial(fd: RawFd, baud: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn write_all_fd(fd: RawFd, mut bytes: &[u8]) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let written = unsafe { libc::write(fd, bytes.as_ptr() as *const _, bytes.len()) };
+        if written < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        let written = written as usize;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "short write on raw UART fd",
+            ));
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
 fn is_idle_serial_timeout(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
@@ -1087,12 +1110,21 @@ impl CommsDevice for UartComms {
                 let len_bytes = (len as u16).to_le_bytes();
                 self.inner.write_all(&len_bytes)?;
                 self.inner.write_all(payload)?;
+                self.inner.flush()?;
             }
             SerialProtocol::RawUart => {
-                self.inner.write_all(&build_raw_uart_frame(payload)?)?;
+                #[cfg(target_os = "linux")]
+                {
+                    let framed = build_raw_uart_frame(payload)?;
+                    write_all_fd(self.inner.as_raw_fd(), &framed)?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    self.inner.write_all(&build_raw_uart_frame(payload)?)?;
+                    self.inner.flush()?;
+                }
             }
         }
-        self.inner.flush()?;
         Ok(())
     }
 
