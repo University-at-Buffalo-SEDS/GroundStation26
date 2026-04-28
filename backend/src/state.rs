@@ -780,6 +780,14 @@ impl AppState {
         self.messages.lock().unwrap().clone()
     }
 
+    /// Replaces the current backend message list and updates the next id source.
+    pub fn set_messages_snapshot(&self, snapshot: Vec<PersistentNotification>) {
+        let next_id = snapshot.iter().map(|msg| msg.id).max().unwrap_or(0);
+        *self.messages.lock().unwrap() = snapshot.clone();
+        self.next_message_id.store(next_id, Ordering::Relaxed);
+        let _ = self.messages_tx.send(snapshot);
+    }
+
     /// Adds a persistent operator notification and returns its assigned id.
     pub fn add_notification<S: Into<String>>(&self, message: S) -> u64 {
         self.add_notification_with_persistence(message, true)
@@ -842,11 +850,11 @@ impl AppState {
     }
 
     /// Adds a telemetry/backend message and returns its assigned id.
-    pub fn add_backend_message<S: Into<String>>(&self, message: S) -> u64 {
+    pub fn add_backend_message<S: Into<String>>(&self, message: S) -> (u64, bool) {
         let message = message.into();
         let mut messages = self.messages.lock().unwrap();
         if let Some(existing) = messages.iter().find(|n| n.message == message) {
-            return existing.id;
+            return (existing.id, false);
         }
         let id = self.next_message_id.fetch_add(1, Ordering::Relaxed) + 1;
         messages.push(PersistentNotification {
@@ -864,7 +872,7 @@ impl AppState {
         let snapshot = messages.clone();
         drop(messages);
         let _ = self.messages_tx.send(snapshot);
-        id
+        (id, true)
     }
 
     /// Returns the latest action-policy snapshot used by the dashboard and command gate.

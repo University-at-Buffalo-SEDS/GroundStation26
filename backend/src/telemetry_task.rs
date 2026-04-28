@@ -2338,6 +2338,24 @@ async fn insert_db_batch_once(
                     .execute(&mut *tx)
                     .await?;
             }
+            DbWrite::Message {
+                id,
+                timestamp_ms,
+                message,
+                action_label,
+                action_cmd,
+            } => {
+                sqlx::query(
+                    "INSERT OR REPLACE INTO messages (id, timestamp_ms, message, action_label, action_cmd) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(*id as i64)
+                .bind(*timestamp_ms)
+                .bind(message.as_str())
+                .bind(action_label.as_deref())
+                .bind(action_cmd.as_deref())
+                .execute(&mut *tx)
+                .await?;
+            }
             DbWrite::Telemetry {
                 timestamp_ms,
                 data_type,
@@ -2533,7 +2551,19 @@ async fn handle_packet(
             Ok(msg) => msg.to_string(),
             Err(_) => "Telemetry message with invalid UTF-8 payload".to_string(),
         };
-        state.add_backend_message(format!("{sender_id}: {message}"));
+        let message = format!("{sender_id}: {message}");
+        let (message_id, inserted) = state.add_backend_message(message.clone());
+        if inserted
+            && let Err(err) = state.db_queue_tx.try_send(DbQueueItem::Write(DbWrite::Message {
+                id: message_id,
+                timestamp_ms: get_current_timestamp_ms() as i64,
+                message,
+                action_label: None,
+                action_cmd: None,
+            }))
+        {
+            eprintln!("Failed to queue backend message DB write: {err}");
+        }
         return None;
     }
 
@@ -2856,6 +2886,10 @@ async fn reset_testing_simulation(state: &Arc<AppState>) {
     if let Err(err) = sqlx::query("DELETE FROM flight_state").execute(&db).await {
         eprintln!("Reset Sim failed to clear flight_state table: {err}");
     }
+    if let Err(err) = sqlx::query("DELETE FROM messages").execute(&db).await {
+        eprintln!("Reset Sim failed to clear messages table: {err}");
+    }
+    state.set_messages_snapshot(Vec::new());
     if let Err(err) = state
         .db_queue_tx
         .send(DbQueueItem::Write(DbWrite::FlightState {

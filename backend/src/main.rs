@@ -142,6 +142,33 @@ async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()>
     Ok(())
 }
 
+async fn load_persisted_messages(
+    db: &sqlx::SqlitePool,
+) -> anyhow::Result<Vec<crate::sequences::PersistentNotification>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, timestamp_ms, message, action_label, action_cmd
+        FROM messages
+        ORDER BY timestamp_ms DESC, id DESC
+        LIMIT 200
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| crate::sequences::PersistentNotification {
+            id: row.get::<i64, _>("id") as u64,
+            timestamp_ms: row.get("timestamp_ms"),
+            message: row.get("message"),
+            persistent: false,
+            action_label: row.get("action_label"),
+            action_cmd: row.get("action_cmd"),
+        })
+        .collect())
+}
+
 /// Waits for process termination signals and then fan-outs the app-wide shutdown request.
 async fn shutdown_signal(state: Arc<AppState>) {
     let ctrl_c = async {
@@ -305,6 +332,9 @@ async fn main() -> anyhow::Result<()> {
         topology_router: Arc::new(std::sync::OnceLock::new()),
         auth,
     });
+
+    let persisted_messages = load_persisted_messages(&state.telemetry_db_pool()).await?;
+    state.set_messages_snapshot(persisted_messages);
 
     gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
     let sequence_shutdown_rx = state.shutdown_subscribe();
@@ -518,7 +548,6 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("WARNING: failed to queue initial discovery announce: {err}");
     }
 
-    router.log_queue(DataType::MessageData, "hello".as_bytes())?;
     router.log_queue(DataType::FlightState, &[FlightStateMode::Startup as u8])?;
 
     // --- Background tasks ---

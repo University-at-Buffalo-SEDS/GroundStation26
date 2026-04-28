@@ -15,6 +15,13 @@ pub enum DbWrite {
         timestamp_ms: i64,
         state_code: i64,
     },
+    Message {
+        id: u64,
+        timestamp_ms: i64,
+        message: String,
+        action_label: Option<String>,
+        action_cmd: Option<String>,
+    },
     Telemetry {
         timestamp_ms: i64,
         data_type: String,
@@ -33,6 +40,7 @@ impl DbWrite {
     pub fn timestamp_ms(&self) -> i64 {
         match self {
             Self::FlightState { timestamp_ms, .. }
+            | Self::Message { timestamp_ms, .. }
             | Self::Telemetry { timestamp_ms, .. }
             | Self::Alert { timestamp_ms, .. } => *timestamp_ms,
         }
@@ -244,6 +252,26 @@ pub async fn ensure_telemetry_schema(db: &SqlitePool) -> Result<()> {
             f_state      INTEGER NOT NULL
         );
         "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS messages (
+            id           INTEGER PRIMARY KEY,
+            timestamp_ms INTEGER NOT NULL,
+            message      TEXT    NOT NULL,
+            action_label TEXT,
+            action_cmd   TEXT
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_messages_timestamp_ms ON messages (timestamp_ms DESC);",
     )
     .execute(db)
     .await?;
