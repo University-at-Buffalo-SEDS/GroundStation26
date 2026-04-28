@@ -12,6 +12,7 @@ use sedsprintf_rs_2026::{
     serialize,
 };
 use serialport::SerialPort;
+use std::collections::VecDeque;
 use std::error::Error;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
@@ -40,6 +41,7 @@ const RAW_UART_ASCII_SYNC_1: u8 = 0x7A;
 const RAW_UART_FRAME_HEADER_SIZE: usize = 4;
 const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
+const RADIO_WINDOW_CONTROL_KIND: u8 = 0x01;
 #[cfg(target_os = "linux")]
 const I2C_PACKET_MAX_BYTES: usize = 4_096;
 #[cfg(target_os = "linux")]
@@ -94,6 +96,21 @@ pub trait CommsDevice: Send {
             "serialized packet receive not supported for this comms device",
         ))
     }
+    fn take_radio_window_update(&mut self) -> Option<RadioWindowUpdate> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RadioWindowKind {
+    DownlinkOpen,
+    UplinkOpen,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RadioWindowUpdate {
+    pub kind: RadioWindowKind,
+    pub duration_ms: u16,
 }
 
 pub fn link_description(cfg: &CommsLinkConfig) -> String {
@@ -247,6 +264,7 @@ pub struct UartComms {
     inner: Box<dyn SerialPort>,
     side_id: Option<RouterSideId>,
     rx_buf: Vec<u8>,
+    radio_window_updates: VecDeque<RadioWindowUpdate>,
     protocol: SerialProtocol,
     slow_start_deadline: Option<Instant>,
 }
@@ -265,6 +283,7 @@ impl UartComms {
             inner,
             side_id: None,
             rx_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
+            radio_window_updates: VecDeque::with_capacity(8),
             protocol: cfg.protocol.clone(),
             slow_start_deadline: Some(Instant::now() + UART_STARTUP_TIMEOUT),
         })
@@ -348,7 +367,20 @@ impl UartComms {
     }
 
     fn try_take_raw_uart_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
-        take_raw_uart_framed_payload(&mut self.rx_buf)
+        loop {
+            let Some((frame_kind, payload)) = take_raw_uart_framed_payload(&mut self.rx_buf)? else {
+                return Ok(None);
+            };
+            match frame_kind {
+                RawUartFrameKind::Data => return Ok(Some(payload)),
+                RawUartFrameKind::Command => {
+                    if let Some(update) = parse_radio_window_update(&payload) {
+                        self.radio_window_updates.push_back(update);
+                    }
+                }
+                RawUartFrameKind::Ascii => {}
+            }
+        }
     }
 
     fn try_take_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
@@ -475,6 +507,13 @@ fn build_link_frame(
     Ok(framed)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawUartFrameKind {
+    Data,
+    Command,
+    Ascii,
+}
+
 #[cfg(target_os = "linux")]
 fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
     if payload.len() < RAW_UART_FRAME_HEADER_SIZE {
@@ -504,7 +543,24 @@ fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
     ))
 }
 
-fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<Vec<u8>>> {
+fn parse_radio_window_update(payload: &[u8]) -> Option<RadioWindowUpdate> {
+    if payload.len() < 4 || payload[0] != RADIO_WINDOW_CONTROL_KIND {
+        return None;
+    }
+    let kind = match payload[1] {
+        0 => RadioWindowKind::DownlinkOpen,
+        1 => RadioWindowKind::UplinkOpen,
+        _ => return None,
+    };
+    Some(RadioWindowUpdate {
+        kind,
+        duration_ms: u16::from_le_bytes([payload[2], payload[3]]),
+    })
+}
+
+fn take_raw_uart_framed_payload(
+    rx_buf: &mut Vec<u8>,
+) -> TelemetryResult<Option<(RawUartFrameKind, Vec<u8>)>> {
     if rx_buf.len() > RAW_UART_MAX_FRAME_BYTES {
         let drop_len = rx_buf.len() - RAW_UART_MAX_FRAME_BYTES;
         maybe_log_raw_uart_parse_issue(
@@ -575,10 +631,18 @@ fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<
         return Ok(None);
     }
 
-    let is_data_frame = rx_buf[0] == RAW_UART_FRAME_SYNC_0 && rx_buf[1] == RAW_UART_FRAME_SYNC_1;
+    let frame_kind = match (rx_buf[0], rx_buf[1]) {
+        (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1) => RawUartFrameKind::Data,
+        (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1) => RawUartFrameKind::Command,
+        (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1) => RawUartFrameKind::Ascii,
+        _ => {
+            rx_buf.drain(..1);
+            return Ok(None);
+        }
+    };
     let payload = rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len].to_vec();
     rx_buf.drain(..total_len);
-    Ok(is_data_frame.then_some(payload))
+    Ok(Some((frame_kind, payload)))
 }
 
 fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
@@ -947,6 +1011,10 @@ impl CommsDevice for UartComms {
         let _ = self.process_buffered_payloads(packet_sink)?;
         maybe_log_raw_uart_buffer_state(&self.rx_buf, "waiting for complete frame", &self.protocol);
         Ok(())
+    }
+
+    fn take_radio_window_update(&mut self) -> Option<RadioWindowUpdate> {
+        self.radio_window_updates.pop_front()
     }
 }
 
@@ -1888,7 +1956,7 @@ mod raw_uart_tests {
         let payload = vec![1, 2, 3, 4, 5];
         let mut framed = build_raw_uart_frame(&payload).unwrap();
         let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
-        assert_eq!(decoded, payload);
+        assert_eq!(decoded, (RawUartFrameKind::Data, payload));
         assert!(framed.is_empty());
     }
 
@@ -1898,7 +1966,7 @@ mod raw_uart_tests {
         let mut framed = vec![0x00, 0x11, 0x22];
         framed.extend_from_slice(&build_raw_uart_frame(&payload).unwrap());
         let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
-        assert_eq!(decoded, payload);
+        assert_eq!(decoded, (RawUartFrameKind::Data, payload));
         assert!(framed.is_empty());
     }
 

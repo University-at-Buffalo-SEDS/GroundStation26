@@ -1,4 +1,4 @@
-use crate::comms::CommsDevice;
+use crate::comms::{CommsDevice, RadioWindowKind};
 use crate::flight_sim;
 use crate::gpio_panel::IGNITION_PIN;
 use crate::layout;
@@ -274,9 +274,13 @@ fn spawn_dedicated_radio_io_threads(
             let mut suppressed_recv_errors = 0;
             let radio_rx_slice = Duration::from_millis(radio_rx_slice_ms());
             let radio_tx_slice = Duration::from_millis(radio_tx_slice_ms());
+            let radio_follow_timeout = Duration::from_millis(radio_follow_timeout_ms());
             let mut tx_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             let mut tx_mode = false;
             let mut slice_started_at = std::time::Instant::now();
+            let mut last_window_update_at: Option<std::time::Instant> = None;
+            let mut follow_window_until: Option<std::time::Instant> = None;
+            let mut follow_window_is_uplink = false;
 
             loop {
                 match comms_shutdown_rx.try_recv() {
@@ -295,18 +299,31 @@ fn spawn_dedicated_radio_io_threads(
                 }
 
                 let now = std::time::Instant::now();
-                if tx_mode {
-                    if tx_backlog.is_empty()
-                        || now.saturating_duration_since(slice_started_at) >= radio_tx_slice
-                    {
+                let follow_mode_active = last_window_update_at
+                    .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
+
+                if follow_mode_active {
+                    if follow_window_until.is_some_and(|deadline| now >= deadline) {
                         tx_mode = false;
+                        follow_window_until = None;
+                        follow_window_is_uplink = false;
+                    } else {
+                        tx_mode = follow_window_is_uplink && !tx_backlog.is_empty();
+                    }
+                } else {
+                    if tx_mode {
+                        if tx_backlog.is_empty()
+                            || now.saturating_duration_since(slice_started_at) >= radio_tx_slice
+                        {
+                            tx_mode = false;
+                            slice_started_at = now;
+                        }
+                    } else if !tx_backlog.is_empty()
+                        && now.saturating_duration_since(slice_started_at) >= radio_rx_slice
+                    {
+                        tx_mode = true;
                         slice_started_at = now;
                     }
-                } else if !tx_backlog.is_empty()
-                    && now.saturating_duration_since(slice_started_at) >= radio_rx_slice
-                {
-                    tx_mode = true;
-                    slice_started_at = now;
                 }
 
                 let mut comms = comms.lock().expect("failed to get lock");
@@ -344,6 +361,22 @@ fn spawn_dedicated_radio_io_threads(
                                 &mut last_recv_error_log_ms,
                                 &mut suppressed_recv_errors,
                             );
+                        }
+                    }
+                }
+                while let Some(update) = comms.take_radio_window_update() {
+                    let deadline =
+                        std::time::Instant::now() + Duration::from_millis(update.duration_ms as u64);
+                    last_window_update_at = Some(std::time::Instant::now());
+                    follow_window_until = Some(deadline);
+                    match update.kind {
+                        RadioWindowKind::DownlinkOpen => {
+                            follow_window_is_uplink = false;
+                            tx_mode = false;
+                        }
+                        RadioWindowKind::UplinkOpen => {
+                            follow_window_is_uplink = true;
+                            tx_mode = !tx_backlog.is_empty();
                         }
                     }
                 }
@@ -666,6 +699,11 @@ fn radio_tx_slice_ms() -> u64 {
 fn radio_rx_slice_ms() -> u64 {
     static SLICE_MS: OnceLock<u64> = OnceLock::new();
     *SLICE_MS.get_or_init(|| env_usize("GS_RADIO_RX_SLICE_MS", 100, 10, 5_000) as u64)
+}
+
+fn radio_follow_timeout_ms() -> u64 {
+    static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
+    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 1_500, 50, 10_000) as u64)
 }
 
 fn drop_db_writes_on_backpressure() -> bool {
