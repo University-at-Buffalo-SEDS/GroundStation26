@@ -275,7 +275,7 @@ pub struct UartComms {
 impl UartComms {
     pub fn open(cfg: &SerialLinkConfig) -> anyhow::Result<Self> {
         #[cfg(target_os = "linux")]
-        let mut inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
+        let inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
             .data_bits(serialport::DataBits::Eight)
             .parity(serialport::Parity::None)
             .stop_bits(serialport::StopBits::One)
@@ -384,7 +384,8 @@ impl UartComms {
 
     fn try_take_raw_uart_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
         loop {
-            let Some((frame_kind, payload)) = take_raw_uart_framed_payload(&mut self.rx_buf)? else {
+            let Some((frame_kind, payload)) = take_raw_uart_framed_payload(&mut self.rx_buf)?
+            else {
                 return Ok(None);
             };
             match frame_kind {
