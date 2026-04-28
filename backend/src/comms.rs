@@ -358,32 +358,6 @@ impl UartComms {
         }
     }
 
-    fn handle_raw_uart_router_reject(&mut self, payload: &[u8]) {
-        maybe_log_raw_uart_router_error(payload, &self.protocol);
-
-        // If a corrupted payload swallowed the next frame start, salvage from the
-        // embedded sync marker rather than dropping the entire burst.
-        let mut recovered = payload
-            .windows(2)
-            .enumerate()
-            .skip(1)
-            .find_map(|(idx, pair)| {
-                (pair == [RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1]).then_some(idx)
-            })
-            .map(|idx| payload[idx..].to_vec())
-            .unwrap_or_default();
-
-        if !self.rx_buf.is_empty() {
-            recovered.extend_from_slice(&self.rx_buf);
-        }
-        self.rx_buf = recovered;
-        maybe_log_raw_uart_buffer_state(
-            &self.rx_buf,
-            "resynced after router reject",
-            &self.protocol,
-        );
-    }
-
     fn process_buffered_payloads(
         &mut self,
         packet_sink: &mut dyn FnMut(Vec<u8>),
@@ -666,17 +640,6 @@ fn maybe_log_raw_uart_parse_issue(context: &str, bytes: &[u8]) {
         "{context}; buffered {} bytes: {}",
         bytes.len(),
         hex_preview(bytes, RAW_UART_DEBUG_PREVIEW_BYTES)
-    );
-}
-
-fn maybe_log_raw_uart_router_error(payload: &[u8], protocol: &SerialProtocol) {
-    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
-        return;
-    }
-    eprintln!(
-        "raw_uart router rejected {} bytes; payload: {}",
-        payload.len(),
-        hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
     );
 }
 
