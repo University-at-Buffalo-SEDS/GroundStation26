@@ -938,6 +938,11 @@ impl AppState {
 
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
+        #[cfg(feature = "hitl_mode")]
+        {
+            let _ = cmd;
+            return true;
+        }
         if matches!(cmd, TelemetryCommand::ResetSim) && crate::flight_sim::sim_mode_enabled() {
             return true;
         }

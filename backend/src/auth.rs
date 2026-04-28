@@ -166,6 +166,10 @@ pub struct AuthPrincipal {
 
 impl AuthPrincipal {
     pub fn session_status(&self) -> SessionStatus {
+        #[cfg(feature = "hitl_mode")]
+        let allowed_commands = Vec::new();
+        #[cfg(not(feature = "hitl_mode"))]
+        let allowed_commands = self.command_access.allowed_commands.clone();
         SessionStatus {
             authenticated: !self.anonymous,
             username: self.username.clone(),
@@ -173,13 +177,18 @@ impl AuthPrincipal {
             expires_at_ms: self.expires_at_ms,
             anonymous: self.anonymous,
             session_type: self.session_type.clone(),
-            allowed_commands: self.command_access.allowed_commands.clone(),
+            allowed_commands,
             can_view_calibration: self.calibration_access.view,
             can_edit_calibration: self.calibration_access.edit,
         }
     }
 
     pub fn allows_command_name(&self, cmd: &str) -> bool {
+        #[cfg(feature = "hitl_mode")]
+        {
+            let _ = cmd;
+            return self.permissions.send_commands;
+        }
         self.permissions.send_commands && self.command_access.allows(cmd)
     }
 }
