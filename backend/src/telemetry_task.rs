@@ -17,7 +17,7 @@ use crate::web::{FlightStateMsg, emit_warning};
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{Router, RouterSideId};
-use sedsprintf_rs_2026::{serialize, serialize::peek_frame_info};
+use sedsprintf_rs_2026::serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -296,9 +296,6 @@ fn spawn_dedicated_radio_io_threads(
                 loop {
                     match comms_handle.tx_rx.try_recv() {
                         Ok(payload) => {
-                            if !radio_tx_payload_allowed(&payload) {
-                                continue;
-                            }
                             tx_backlog.push_back(payload);
                             while tx_backlog.len() > radio_tx_backlog_limit {
                                 tx_backlog.pop_front();
@@ -732,19 +729,6 @@ fn radio_follow_timeout_ms() -> u64 {
 fn radio_tx_backlog_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_BACKLOG_LIMIT", 8, 1, 256))
-}
-
-fn radio_tx_payload_allowed(payload: &[u8]) -> bool {
-    let Ok(frame) = peek_frame_info(payload) else {
-        return false;
-    };
-    if frame.ack_only() {
-        return false;
-    }
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
-        return false;
-    };
-    matches!(pkt.data_type(), DataType::FlightCommand)
 }
 
 fn drop_db_writes_on_backpressure() -> bool {
