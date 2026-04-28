@@ -19,7 +19,7 @@ use std::ffi::CString;
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
 #[cfg(target_os = "linux")]
@@ -367,45 +367,45 @@ impl UartComms {
         }
         #[cfg(not(target_os = "linux"))]
         {
-        let mut scratch = [0u8; 512];
-        match self.inner.read(&mut scratch) {
-            Ok(0) => {
-                maybe_log_raw_uart_read_outcome(
-                    "read returned 0 bytes",
-                    self.rx_buf.len(),
-                    None,
-                    &self.protocol,
-                );
-                Ok(())
-            }
-            Ok(n) => {
-                if self.slow_start_deadline.take().is_some() {
-                    self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+            let mut scratch = [0u8; 512];
+            match self.inner.read(&mut scratch) {
+                Ok(0) => {
+                    maybe_log_raw_uart_read_outcome(
+                        "read returned 0 bytes",
+                        self.rx_buf.len(),
+                        None,
+                        &self.protocol,
+                    );
+                    Ok(())
                 }
-                maybe_log_raw_uart_read_outcome(
-                    "read returned bytes",
-                    self.rx_buf.len(),
-                    Some(n),
-                    &self.protocol,
-                );
-                self.rx_buf.extend_from_slice(&scratch[..n]);
-                maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
-                Ok(())
+                Ok(n) => {
+                    if self.slow_start_deadline.take().is_some() {
+                        self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+                    }
+                    maybe_log_raw_uart_read_outcome(
+                        "read returned bytes",
+                        self.rx_buf.len(),
+                        Some(n),
+                        &self.protocol,
+                    );
+                    self.rx_buf.extend_from_slice(&scratch[..n]);
+                    maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
+                    Ok(())
+                }
+                Err(err) if is_idle_serial_timeout(&err) => {
+                    maybe_log_raw_uart_read_outcome(
+                        "read timeout/wouldblock",
+                        self.rx_buf.len(),
+                        None,
+                        &self.protocol,
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
+                    Err(err)
+                }
             }
-            Err(err) if is_idle_serial_timeout(&err) => {
-                maybe_log_raw_uart_read_outcome(
-                    "read timeout/wouldblock",
-                    self.rx_buf.len(),
-                    None,
-                    &self.protocol,
-                );
-                Ok(())
-            }
-            Err(err) => {
-                maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
-                Err(err)
-            }
-        }
         }
     }
 
