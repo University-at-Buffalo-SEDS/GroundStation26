@@ -541,26 +541,16 @@ fn configure_linux_raw_serial(fd: RawFd, baud: u32) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_all_fd(fd: RawFd, mut bytes: &[u8]) -> std::io::Result<()> {
-    while !bytes.is_empty() {
-        let written = unsafe { libc::write(fd, bytes.as_ptr() as *const _, bytes.len()) };
-        if written < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
+fn write_once_fd(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
+    let written = unsafe { libc::write(fd, bytes.as_ptr() as *const _, bytes.len()) };
+    if written < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(0);
         }
-        let written = written as usize;
-        if written == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "short write on raw UART fd",
-            ));
-        }
-        bytes = &bytes[written..];
+        return Err(err);
     }
-    Ok(())
+    Ok(written as usize)
 }
 
 fn is_idle_serial_timeout(err: &std::io::Error) -> bool {
@@ -1117,7 +1107,24 @@ impl CommsDevice for UartComms {
                 #[cfg(target_os = "linux")]
                 {
                     let framed = build_raw_uart_frame(payload)?;
-                    write_all_fd(self.inner.as_raw_fd(), &framed)?;
+                    let written = write_once_fd(self.inner.as_raw_fd(), &framed)?;
+                    if written == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "raw UART tx write would block",
+                        )
+                        .into());
+                    }
+                    if written < framed.len() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            format!(
+                                "short raw UART tx write: wrote {written} of {} bytes",
+                                framed.len()
+                            ),
+                        )
+                        .into());
+                    }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
