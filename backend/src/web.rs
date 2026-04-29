@@ -1,4 +1,4 @@
-use crate::auth::{AuthFailure, LoginRequest, Permission};
+use crate::auth::{AuthFailure, LoginChallengeRequest, LoginRequest, Permission};
 use crate::fill_targets::{self, FillTargetsConfig};
 use crate::flight_setup::{self, FlightSetupConfig};
 use crate::i18n::{self, TranslateRequest, TranslateResponse, TranslationCatalogResponse};
@@ -155,6 +155,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/version",
             get_service(ServeFile::new("./frontend/dist/public/index.html")),
         )
+        .route("/api/auth/challenge", post(login_challenge))
         .route("/api/auth/login", post(login))
         .route("/api/auth/session", get(get_session_status))
         .route("/api/auth/logout", post(logout))
@@ -266,7 +267,18 @@ fn principal_can_edit_calibration(principal: &crate::auth::AuthPrincipal) -> boo
     principal.calibration_access.edit
 }
 
-/// Creates a new authenticated session from username/password credentials.
+/// Creates a one-time login challenge bound to a username.
+async fn login_challenge(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginChallengeRequest>,
+) -> impl IntoResponse {
+    match state.auth.create_login_challenge(req).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => auth_failure_response(err),
+    }
+}
+
+/// Creates a new authenticated session from challenge-bound credentials.
 async fn login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginRequest>,

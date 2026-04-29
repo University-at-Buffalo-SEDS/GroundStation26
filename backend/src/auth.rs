@@ -1,19 +1,27 @@
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
+use ring::hmac;
 use ring::pbkdf2;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const USERS_FILE_VERSION: u32 = 1;
 const DEFAULT_SESSION_TTL_SECONDS: u64 = 60 * 60 * 24 * 14;
+const LOGIN_CHALLENGE_TTL_MS: i64 = 60_000;
+const LOGIN_CHALLENGE_BYTES: usize = 32;
 #[allow(dead_code)]
 const DEFAULT_PBKDF2_ITERATIONS: u32 = 120_000;
 #[allow(dead_code)]
 const PBKDF2_OUTPUT_LEN: usize = 32;
+
+static PENDING_LOGIN_CHALLENGES: LazyLock<Mutex<HashMap<String, PendingLoginChallenge>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Permissions {
@@ -204,9 +212,25 @@ pub enum AuthFailure {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct LoginChallengeRequest {
+    pub username: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LoginChallengeResponse {
+    pub challenge_id: String,
+    pub algorithm: String,
+    pub iterations: u32,
+    pub salt_b64: String,
+    pub server_nonce_b64: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LoginRequest {
     pub username: String,
-    pub password: String,
+    pub challenge_id: String,
+    pub client_nonce_b64: String,
+    pub proof_b64: String,
     #[serde(default)]
     pub remember_me: bool,
 }
@@ -215,6 +239,22 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub token: String,
     pub session: SessionStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthProofPayload<'a> {
+    username: &'a str,
+    challenge_id: &'a str,
+    server_nonce_b64: &'a str,
+    client_nonce_b64: &'a str,
+    remember_me: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLoginChallenge {
+    username_normalized: String,
+    server_nonce_b64: String,
+    issued_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -258,12 +298,70 @@ impl AuthManager {
         Ok(config)
     }
 
+    pub async fn create_login_challenge(
+        &self,
+        req: LoginChallengeRequest,
+    ) -> Result<LoginChallengeResponse, AuthFailure> {
+        let requested_username = req.username.trim();
+        if requested_username.is_empty() {
+            return Err(AuthFailure::Unauthorized(
+                "invalid username or password".to_string(),
+            ));
+        }
+
+        let config = self
+            .load_users_file()
+            .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
+        let user = config
+            .users
+            .iter()
+            .find(|user| user.username.eq_ignore_ascii_case(requested_username));
+
+        let salt_b64 = user
+            .map(|user| user.password.salt_b64.clone())
+            .unwrap_or_else(|| B64.encode(generate_random_bytes(16)));
+        let iterations = user
+            .map(|user| user.password.iterations.max(1))
+            .unwrap_or(DEFAULT_PBKDF2_ITERATIONS);
+        let algorithm = user
+            .map(|user| user.password.algorithm.clone())
+            .unwrap_or_else(default_password_algorithm);
+
+        cleanup_expired_login_challenges();
+        let challenge_id = URL_SAFE_NO_PAD.encode(generate_random_bytes(LOGIN_CHALLENGE_BYTES));
+        let server_nonce_b64 = URL_SAFE_NO_PAD.encode(generate_random_bytes(LOGIN_CHALLENGE_BYTES));
+        let pending = PendingLoginChallenge {
+            username_normalized: normalize_username(requested_username),
+            server_nonce_b64: server_nonce_b64.clone(),
+            issued_at_ms: now_ms(),
+        };
+        if let Ok(mut challenges) = PENDING_LOGIN_CHALLENGES.lock() {
+            challenges.insert(challenge_id.clone(), pending);
+        }
+
+        Ok(LoginChallengeResponse {
+            challenge_id,
+            algorithm,
+            iterations,
+            salt_b64,
+            server_nonce_b64,
+        })
+    }
+
     pub async fn login(
         &self,
         db: &SqlitePool,
         req: LoginRequest,
     ) -> Result<LoginResponse, AuthFailure> {
         let requested_username = req.username.trim();
+        let username_normalized = normalize_username(requested_username);
+        if requested_username.is_empty() || req.challenge_id.trim().is_empty() {
+            return Err(AuthFailure::Unauthorized(
+                "invalid username or password".to_string(),
+            ));
+        }
+
+        let challenge = consume_login_challenge(req.challenge_id.trim(), &username_normalized)?;
         let config = self
             .load_users_file()
             .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
@@ -276,57 +374,18 @@ impl AuthManager {
         if user.disabled {
             return Err(AuthFailure::Forbidden("user is disabled".to_string()));
         }
-        verify_password(&user.password, &req.password)
-            .map_err(|_| AuthFailure::Unauthorized("invalid username or password".to_string()))?;
-
-        let now_ms = now_ms();
-        let expires_at_ms =
-            now_ms + (config.session_ttl_seconds.min(i64::MAX as u64 / 1000) as i64 * 1000);
-        let token = generate_token();
-        let permissions = user.permissions.normalized();
-        let session_type = if req.remember_me {
-            "remembered"
-        } else {
-            "session"
-        };
-        let allowed_commands_json = serde_json::to_string(&user.command_access.allowed_commands)
-            .map_err(|e| {
-                AuthFailure::Internal(format!("failed to serialize command access: {e}"))
-            })?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO auth_sessions (
-                token, username, session_type, can_view_data, can_send_commands, allowed_commands_json, created_at_ms, expires_at_ms
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
+        verify_login_proof(
+            &user.password,
+            &username_normalized,
+            req.challenge_id.trim(),
+            &challenge.server_nonce_b64,
+            req.client_nonce_b64.trim(),
+            req.remember_me,
+            req.proof_b64.trim(),
         )
-            .bind(&token)
-            .bind(&user.username)
-            .bind(session_type)
-            .bind(permissions.view_data as i64)
-            .bind(permissions.send_commands as i64)
-            .bind(allowed_commands_json)
-            .bind(now_ms)
-            .bind(expires_at_ms)
-            .execute(db)
-            .await
-            .map_err(|e| AuthFailure::Internal(format!("failed to create session: {e}")))?;
+        .map_err(|_| AuthFailure::Unauthorized("invalid username or password".to_string()))?;
 
-        Ok(LoginResponse {
-            token,
-            session: AuthPrincipal {
-                username: Some(user.username.clone()),
-                permissions,
-                expires_at_ms: Some(expires_at_ms),
-                anonymous: false,
-                session_type: Some(session_type.to_string()),
-                command_access: user.command_access.clone(),
-                calibration_access: user.calibration_access,
-            }
-            .session_status(),
-        })
+        create_session_for_user(db, &config, user, req.remember_me).await
     }
 
     pub async fn logout(&self, db: &SqlitePool, token: &str) -> Result<(), AuthFailure> {
@@ -462,6 +521,142 @@ impl AuthManager {
             .map_err(|e| AuthFailure::Internal(format!("failed to cleanup sessions: {e}")))?;
         Ok(())
     }
+}
+
+
+async fn create_session_for_user(
+    db: &SqlitePool,
+    config: &UsersFile,
+    user: &UserRecord,
+    remember_me: bool,
+) -> Result<LoginResponse, AuthFailure> {
+    let now_ms = now_ms();
+    let expires_at_ms =
+        now_ms + (config.session_ttl_seconds.min(i64::MAX as u64 / 1000) as i64 * 1000);
+    let token = generate_token();
+    let permissions = user.permissions.normalized();
+    let session_type = if remember_me {
+        "remembered"
+    } else {
+        "session"
+    };
+    let allowed_commands_json = serde_json::to_string(&user.command_access.allowed_commands)
+        .map_err(|e| AuthFailure::Internal(format!("failed to serialize command access: {e}")))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO auth_sessions (
+            token, username, session_type, can_view_data, can_send_commands, allowed_commands_json, created_at_ms, expires_at_ms
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&token)
+    .bind(&user.username)
+    .bind(session_type)
+    .bind(permissions.view_data as i64)
+    .bind(permissions.send_commands as i64)
+    .bind(allowed_commands_json)
+    .bind(now_ms)
+    .bind(expires_at_ms)
+    .execute(db)
+    .await
+    .map_err(|e| AuthFailure::Internal(format!("failed to create session: {e}")))?;
+
+    Ok(LoginResponse {
+        token,
+        session: AuthPrincipal {
+            username: Some(user.username.clone()),
+            permissions,
+            expires_at_ms: Some(expires_at_ms),
+            anonymous: false,
+            session_type: Some(session_type.to_string()),
+            command_access: user.command_access.clone(),
+            calibration_access: user.calibration_access,
+        }
+        .session_status(),
+    })
+}
+
+fn normalize_username(username: &str) -> String {
+    username.trim().to_ascii_lowercase()
+}
+
+fn cleanup_expired_login_challenges() {
+    let cutoff = now_ms() - LOGIN_CHALLENGE_TTL_MS;
+    if let Ok(mut challenges) = PENDING_LOGIN_CHALLENGES.lock() {
+        challenges.retain(|_, challenge| challenge.issued_at_ms >= cutoff);
+    }
+}
+
+fn consume_login_challenge(
+    challenge_id: &str,
+    expected_username_normalized: &str,
+) -> Result<PendingLoginChallenge, AuthFailure> {
+    cleanup_expired_login_challenges();
+    let challenge = PENDING_LOGIN_CHALLENGES
+        .lock()
+        .map_err(|_| AuthFailure::Internal("failed to access login challenges".to_string()))?
+        .remove(challenge_id)
+        .ok_or_else(|| AuthFailure::Unauthorized("invalid username or password".to_string()))?;
+
+    if challenge.username_normalized != expected_username_normalized {
+        return Err(AuthFailure::Unauthorized(
+            "invalid username or password".to_string(),
+        ));
+    }
+    if challenge.issued_at_ms + LOGIN_CHALLENGE_TTL_MS < now_ms() {
+        return Err(AuthFailure::Unauthorized(
+            "invalid username or password".to_string(),
+        ));
+    }
+    Ok(challenge)
+}
+
+fn auth_proof_message(
+    username_normalized: &str,
+    challenge_id: &str,
+    server_nonce_b64: &str,
+    client_nonce_b64: &str,
+    remember_me: bool,
+) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&AuthProofPayload {
+        username: username_normalized,
+        challenge_id,
+        server_nonce_b64,
+        client_nonce_b64,
+        remember_me,
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn verify_login_proof(
+    record: &PasswordHashRecord,
+    username_normalized: &str,
+    challenge_id: &str,
+    server_nonce_b64: &str,
+    client_nonce_b64: &str,
+    remember_me: bool,
+    proof_b64: &str,
+) -> Result<(), String> {
+    if record.algorithm != default_password_algorithm() {
+        return Err("unsupported password hash algorithm".to_string());
+    }
+    let verifier = B64
+        .decode(record.hash_b64.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let message = auth_proof_message(
+        username_normalized,
+        challenge_id,
+        server_nonce_b64,
+        client_nonce_b64,
+        remember_me,
+    )?;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &verifier);
+    let provided = URL_SAFE_NO_PAD
+        .decode(proof_b64.as_bytes())
+        .map_err(|e| e.to_string())?;
+    hmac::verify(&key, &message, &provided).map_err(|_| "invalid login proof".to_string())
 }
 
 #[allow(dead_code)]
