@@ -636,7 +636,7 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
             border: "#38bdf8".to_string(),
             bg: "#082f49".to_string(),
             fg: "#e0f2fe".to_string(),
-            illuminated: true,
+            illuminated: false,
             spacer_before: false,
             spacer_after: false,
             new_row_before: false,

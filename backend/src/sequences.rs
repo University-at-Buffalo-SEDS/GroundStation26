@@ -95,6 +95,13 @@ fn default_recording_command_actuated(cmd: &str) -> Option<bool> {
     }
 }
 
+fn default_command_actuated(cmd: &str) -> Option<bool> {
+    match cmd {
+        "ResetSim" => Some(true),
+        _ => default_recording_command_actuated(cmd),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistentNotification {
     pub id: u64,
@@ -691,7 +698,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
                     cmd: cmd.to_string(),
                     enabled,
                     blink: backend_blink_for(cmd, enabled, None),
-                    actuated: default_recording_command_actuated(cmd),
+                    actuated: default_command_actuated(cmd),
                 }
             })
             .collect();
@@ -734,11 +741,7 @@ fn policy_with_overrides(
                 cmd: cmd.to_string(),
                 enabled,
                 blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
-                actuated: if is_recording_command(cmd) {
-                    Some(true)
-                } else {
-                    valves.actuated_for_cmd(cmd)
-                },
+                actuated: default_command_actuated(cmd).or_else(|| valves.actuated_for_cmd(cmd)),
             }
         })
         .collect();
@@ -1494,11 +1497,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
     let controls = all_command_names()
         .into_iter()
         .map(|cmd| {
-            let actuated = if is_recording_command(cmd) {
-                Some(true)
-            } else {
-                valves.actuated_for_cmd(cmd)
-            };
+            let actuated = default_command_actuated(cmd).or_else(|| valves.actuated_for_cmd(cmd));
             ActionControl {
                 cmd: cmd.to_string(),
                 enabled: true,
