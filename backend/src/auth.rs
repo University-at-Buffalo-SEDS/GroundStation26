@@ -671,6 +671,7 @@ pub fn create_password_hash(password: &str) -> Result<PasswordHashRecord, String
     })
 }
 
+#[allow(dead_code)]
 pub fn verify_password(record: &PasswordHashRecord, password: &str) -> Result<(), String> {
     if record.algorithm != default_password_algorithm() {
         return Err("unsupported password hash algorithm".to_string());
