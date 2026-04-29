@@ -446,6 +446,18 @@
         }
       },
       {
+        "id": "EULER_ANGLES",
+        "label": "Euler Angles",
+        "channels": [
+          "Phi",
+          "Theta",
+          "Psi"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
         "id": "KALMAN_FILTER",
         "label": "Kalman Filter",
         "channels": [
