@@ -63,13 +63,16 @@ fn backend_blink_for(cmd: &str, enabled: bool, recommended: Option<&BlinkMode>) 
     if !enabled {
         return BlinkMode::None;
     }
+    let illuminated = backend_illuminated_commands().contains(cmd);
     if let Some(blink) = recommended {
-        return blink.clone();
+        if *blink != BlinkMode::None || !illuminated {
+            return blink.clone();
+        }
     }
     if is_recording_command(cmd) {
         return BlinkMode::None;
     }
-    if backend_illuminated_commands().contains(cmd) {
+    if illuminated {
         return BlinkMode::Slow;
     }
     BlinkMode::None
