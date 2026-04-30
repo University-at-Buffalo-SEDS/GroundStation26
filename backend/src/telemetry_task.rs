@@ -1209,7 +1209,7 @@ async fn emit_derived_battery_rows(
             continue;
         }
 
-        let (smoothed_voltage, drop_rate_v_per_min) =
+        let (_smoothed_voltage, drop_rate_v_per_min) =
             push_battery_sample_and_compute_drop_rate(&source.id, ts_ms, voltage, window_ms);
 
         let (empty_v, full_v) = battery_bounds_for_source(source);
@@ -1218,7 +1218,7 @@ async fn emit_derived_battery_rows(
             if rate < min_drop_rate {
                 return None;
             }
-            let remaining_voltage = (smoothed_voltage - empty_v).max(0.0);
+            let remaining_voltage = (voltage - empty_v).max(0.0);
             Some(remaining_voltage / rate)
         });
         let remaining_min = smooth_remaining_minutes(&source.id, ts_ms, raw_remaining_min);

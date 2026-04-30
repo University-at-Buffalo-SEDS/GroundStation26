@@ -2375,7 +2375,7 @@
         "percent_data_type": "AV_BAY_BATTERY_PERCENT",
         "drop_rate_data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-        "empty_voltage": 7.3,
+        "empty_voltage": 6.3,
         "full_voltage": 8.4,
         "curve_exponent": 1.0
       },
