@@ -142,6 +142,33 @@ async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()>
     Ok(())
 }
 
+async fn load_persisted_messages(
+    db: &sqlx::SqlitePool,
+) -> anyhow::Result<Vec<crate::sequences::PersistentNotification>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, timestamp_ms, message, action_label, action_cmd
+        FROM messages
+        ORDER BY timestamp_ms DESC, id DESC
+        LIMIT 200
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| crate::sequences::PersistentNotification {
+            id: row.get::<i64, _>("id") as u64,
+            timestamp_ms: row.get("timestamp_ms"),
+            message: row.get("message"),
+            persistent: false,
+            action_label: row.get("action_label"),
+            action_cmd: row.get("action_cmd"),
+        })
+        .collect())
+}
+
 /// Waits for process termination signals and then fan-outs the app-wide shutdown request.
 async fn shutdown_signal(state: Arc<AppState>) {
     let ctrl_c = async {
@@ -214,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
     let (board_status_tx, _board_status_rx) = broadcast::channel(board_status_capacity);
     let (dashboard_reset_tx, _dashboard_reset_rx) = broadcast::channel(16);
     let (notifications_tx, _notifications_rx) = broadcast::channel(notifications_capacity);
+    let (messages_tx, _messages_rx) = broadcast::channel(notifications_capacity);
     let (action_policy_tx, _action_policy_rx) = broadcast::channel(actions_capacity);
     let (fill_targets_tx, _fill_targets_rx) = broadcast::channel(actions_capacity);
     let (launch_clock_tx, _launch_clock_rx) = broadcast::channel(launch_clock_capacity);
@@ -228,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
             BoardStatus {
                 packet_count: 0,
                 last_seen_ms: None,
+                last_seen_instant: None,
                 ema_gap_ms: None,
                 warned: false,
             },
@@ -279,6 +308,9 @@ async fn main() -> anyhow::Result<()> {
         notifications: Arc::new(Mutex::new(Vec::new())),
         notifications_tx,
         next_notification_id: Arc::new(AtomicU64::new(0)),
+        messages: Arc::new(Mutex::new(Vec::new())),
+        messages_tx,
+        next_message_id: Arc::new(AtomicU64::new(0)),
         action_policy: Arc::new(Mutex::new(default_action_policy())),
         action_policy_tx,
         fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
@@ -301,6 +333,9 @@ async fn main() -> anyhow::Result<()> {
         topology_router: Arc::new(std::sync::OnceLock::new()),
         auth,
     });
+
+    let persisted_messages = load_persisted_messages(&state.telemetry_db_pool()).await?;
+    state.set_messages_snapshot(persisted_messages);
 
     gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
     let sequence_shutdown_rx = state.shutdown_subscribe();
@@ -514,7 +549,6 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("WARNING: failed to queue initial discovery announce: {err}");
     }
 
-    router.log_queue(DataType::MessageData, "hello".as_bytes())?;
     router.log_queue(DataType::FlightState, &[FlightStateMode::Startup as u8])?;
 
     // --- Background tasks ---
@@ -523,17 +557,26 @@ async fn main() -> anyhow::Result<()> {
     let mut tt = tokio::spawn(telemetry_task(
         state.clone(),
         router.clone(),
-        umbilical_tx.clone(),
         vec![
             CommsWorkerHandle {
                 name: "rocket_comms",
                 comms: rocket_comms,
+                tx_comms: None,
+                side_id: rocket_side,
                 tx_rx: rocket_rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
             },
             CommsWorkerHandle {
                 name: "umbilical_comms",
                 comms: umbilical_comms,
+                tx_comms: None,
+                side_id: umbilical_side,
                 tx_rx: umbilical_rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: false,
             },
         ],
         cmd_rx,

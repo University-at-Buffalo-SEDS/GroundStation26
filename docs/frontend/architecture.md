@@ -280,22 +280,22 @@ Responsibilities:
 
 Role:
 
-- transient backend messages history tab
+- telemetry/backend message history tab
 
 Responsibilities:
 
-- render stored non-persistent backend messages
+- render stored telemetry-network/backend messages
 - show timestamps and message text
 
 ### `frontend/src/telemetry_dashboard/notifications_tab.rs`
 
 Role:
 
-- persistent notifications history tab
+- operator notifications history tab
 
 Responsibilities:
 
-- render stored persistent notification history
+- render stored operator notification history
 - show timestamps and message text
 
 ### `frontend/src/telemetry_dashboard/warnings_tab.rs`

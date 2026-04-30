@@ -1,4 +1,4 @@
-use crate::auth::{AuthFailure, LoginRequest, Permission};
+use crate::auth::{AuthFailure, LoginChallengeRequest, LoginRequest, Permission};
 use crate::fill_targets::{self, FillTargetsConfig};
 use crate::flight_setup::{self, FlightSetupConfig};
 use crate::i18n::{self, TranslateRequest, TranslateResponse, TranslationCatalogResponse};
@@ -155,6 +155,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/version",
             get_service(ServeFile::new("./frontend/dist/public/index.html")),
         )
+        .route("/api/auth/challenge", post(login_challenge))
         .route("/api/auth/login", post(login))
         .route("/api/auth/session", get(get_session_status))
         .route("/api/auth/logout", post(logout))
@@ -195,6 +196,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/network_topology", get(get_network_topology))
         .route("/api/recording_status", get(get_recording_status))
         .route("/api/notifications", get(get_notifications))
+        .route("/api/messages", get(get_messages))
         .route(
             "/api/notifications/{id}/dismiss",
             post(dismiss_notification),
@@ -265,7 +267,18 @@ fn principal_can_edit_calibration(principal: &crate::auth::AuthPrincipal) -> boo
     principal.calibration_access.edit
 }
 
-/// Creates a new authenticated session from username/password credentials.
+/// Creates a one-time login challenge bound to a username.
+async fn login_challenge(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginChallengeRequest>,
+) -> impl IntoResponse {
+    match state.auth.create_login_challenge(req).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => auth_failure_response(err),
+    }
+}
+
+/// Creates a new authenticated session from challenge-bound credentials.
 async fn login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginRequest>,
@@ -318,6 +331,7 @@ pub enum WsOutMsg {
     BoardStatus(BoardStatusMsg),
     NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
+    Messages(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
     FillTargets(FillTargetsConfig),
     RecordingStatus(RecordingStatusMsg),
@@ -435,7 +449,7 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
             .iter()
             .filter_map(|sender_id| fixes.get(*sender_id))
             .chain(fixes.values())
-            .find_map(gps_point_from_values)
+            .find_map(|values| gps_point_from_values(values))
     };
     if live_rocket.is_some() {
         return Json(GpsResponse {
@@ -464,7 +478,7 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     Json(GpsResponse { rocket }).into_response()
 }
 
-fn gps_point_from_values(values: &Vec<Option<f32>>) -> Option<GpsPoint> {
+fn gps_point_from_values(values: &[Option<f32>]) -> Option<GpsPoint> {
     match (value_at(values, 0), value_at(values, 1)) {
         (Some(lat), Some(lon)) => Some(GpsPoint {
             lat: lat as f64,
@@ -476,11 +490,25 @@ fn gps_point_from_values(values: &Vec<Option<f32>>) -> Option<GpsPoint> {
 
 /// Serves the current frontend layout configuration.
 async fn get_layout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
-        return response;
-    }
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     match layout::load_layout() {
-        Ok(layout) => Json(layout).into_response(),
+        Ok(mut layout) => {
+            if !principal.permissions.send_commands {
+                layout.actions_tab.actions.clear();
+            } else if !principal.command_access.allowed_commands.is_empty() {
+                layout.actions_tab.actions.retain(|action| {
+                    principal
+                        .command_access
+                        .allowed_commands
+                        .iter()
+                        .any(|cmd| cmd == &action.cmd)
+                });
+            }
+            Json(layout).into_response()
+        }
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }
@@ -1230,6 +1258,14 @@ async fn get_notifications(
     Json(state.notifications_snapshot()).into_response()
 }
 
+/// Returns the current list of telemetry/backend messages.
+async fn get_messages(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(state.messages_snapshot()).into_response()
+}
+
 /// Dismisses a persistent notification by id.
 async fn dismiss_notification(
     State(state): State<Arc<AppState>>,
@@ -1472,6 +1508,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let mut launch_clock_rx = state.launch_clock_tx.subscribe();
     let mut board_status_rx = state.board_status_tx.subscribe();
     let mut notifications_rx = state.notifications_tx.subscribe();
+    let mut messages_rx = state.messages_tx.subscribe();
     let mut action_policy_rx = state.action_policy_tx.subscribe();
     let mut fill_targets_rx = state.fill_targets_tx.subscribe();
     let mut recording_status_rx = state.recording_status_tx.subscribe();
@@ -1508,6 +1545,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_notifications).await.is_err() {
+            return;
+        }
+        let initial_messages =
+            serde_json::to_string(&WsOutMsg::Messages(state_for_send.messages_snapshot()))
+                .unwrap_or_default();
+        if ws_out_tx.send(initial_messages).await.is_err() {
             return;
         }
         let initial_action_policy = serde_json::to_string(&WsOutMsg::ActionPolicy(
@@ -1693,6 +1736,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     }
                 }
 
+                recv = messages_rx.recv() => {
+                    match recv {
+                        Ok(snapshot) => {
+                            let msg = WsOutMsg::Messages(snapshot);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
                 recv = action_policy_rx.recv() => {
                     match recv {
                         Ok(policy) => {
@@ -1848,15 +1905,18 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             continue;
                         }
                         let received_cmd = cmd.cmd;
+                        eprintln!("Accepted websocket command: {:?}", received_cmd);
                         gs_debug_println!(
                             "\x1b[32mWebsocket command received: {:?}\x1b[0m",
                             received_cmd
                         );
                         if let Err(e) = cmd_tx.send(received_cmd).await {
+                            eprintln!("Failed to forward WS command to cmd_tx: {e}");
                             gs_debug_println!("Failed to forward WS command to cmd_tx: {e}");
                         }
                     }
                     Err(e) => {
+                        eprintln!("Invalid WS command JSON {text:?}: {e}");
                         gs_debug_println!("Invalid WS command JSON {text:?}: {e}");
                     }
                 }

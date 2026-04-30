@@ -12,13 +12,14 @@ use sedsprintf_rs_2026::{
     serialize,
 };
 use serialport::SerialPort;
+use std::collections::VecDeque;
 use std::error::Error;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
 #[cfg(target_os = "linux")]
@@ -40,12 +41,13 @@ const RAW_UART_ASCII_SYNC_1: u8 = 0x7A;
 const RAW_UART_FRAME_HEADER_SIZE: usize = 4;
 const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
+const RADIO_WINDOW_CONTROL_KIND: u8 = 0x01;
 #[cfg(target_os = "linux")]
 const I2C_PACKET_MAX_BYTES: usize = 4_096;
 #[cfg(target_os = "linux")]
 const I2C_FRAME_PAYLOAD_MAX_BYTES: usize = I2C_PACKET_MAX_BYTES - RAW_UART_FRAME_HEADER_SIZE;
-const UART_STARTUP_TIMEOUT: Duration = Duration::from_millis(100);
-const UART_NORMAL_TIMEOUT: Duration = Duration::from_millis(5);
+const UART_STARTUP_TIMEOUT: Duration = Duration::from_millis(500);
+const UART_NORMAL_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(target_os = "linux")]
 const I2C_SLOT_SIZE: usize = 32;
 #[cfg(target_os = "linux")]
@@ -85,6 +87,30 @@ pub trait CommsDevice: Send {
     ) -> TelemetryResult<()>;
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>>;
     fn set_side_id(&mut self, side_id: RouterSideId);
+    fn recv_serialized_packets(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+    ) -> TelemetryResult<()> {
+        let _ = packet_sink;
+        Err(TelemetryError::HandlerError(
+            "serialized packet receive not supported for this comms device",
+        ))
+    }
+    fn take_radio_window_update(&mut self) -> Option<RadioWindowUpdate> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RadioWindowKind {
+    DownlinkOpen,
+    UplinkOpen,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RadioWindowUpdate {
+    pub kind: RadioWindowKind,
+    pub duration_ms: u16,
 }
 
 pub fn link_description(cfg: &CommsLinkConfig) -> String {
@@ -235,15 +261,29 @@ fn i2c_rx_poll_burst() -> usize {
 //  Real Comms Implementation
 // ======================================================================
 pub struct UartComms {
+    #[cfg(target_os = "linux")]
+    inner: serialport::TTYPort,
+    #[cfg(not(target_os = "linux"))]
     inner: Box<dyn SerialPort>,
     side_id: Option<RouterSideId>,
     rx_buf: Vec<u8>,
+    radio_window_updates: VecDeque<RadioWindowUpdate>,
     protocol: SerialProtocol,
     slow_start_deadline: Option<Instant>,
 }
 
 impl UartComms {
     pub fn open(cfg: &SerialLinkConfig) -> anyhow::Result<Self> {
+        #[cfg(target_os = "linux")]
+        let inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
+            .data_bits(serialport::DataBits::Eight)
+            .parity(serialport::Parity::None)
+            .stop_bits(serialport::StopBits::One)
+            .flow_control(serialport::FlowControl::None)
+            .timeout(UART_STARTUP_TIMEOUT)
+            .open_native()
+            .context("failed to configure serial port")?;
+        #[cfg(not(target_os = "linux"))]
         let inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
             .data_bits(serialport::DataBits::Eight)
             .parity(serialport::Parity::None)
@@ -252,10 +292,14 @@ impl UartComms {
             .timeout(UART_STARTUP_TIMEOUT)
             .open()
             .context("failed to configure serial port")?;
+        #[cfg(target_os = "linux")]
+        configure_linux_raw_serial(inner.as_raw_fd(), cfg.baud_rate as u32)
+            .context("failed to switch serial port into raw mode")?;
         Ok(Self {
             inner,
             side_id: None,
             rx_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
+            radio_window_updates: VecDeque::with_capacity(8),
             protocol: cfg.protocol.clone(),
             slow_start_deadline: Some(Instant::now() + UART_STARTUP_TIMEOUT),
         })
@@ -274,43 +318,93 @@ impl UartComms {
 
     fn fill_rx_buf(&mut self) -> std::io::Result<()> {
         self.update_uart_timeout_mode()?;
-        let mut scratch = [0u8; 512];
-        match self.inner.read(&mut scratch) {
-            Ok(0) => {
-                maybe_log_raw_uart_read_outcome(
-                    "read returned 0 bytes",
-                    self.rx_buf.len(),
-                    None,
-                    &self.protocol,
-                );
-                Ok(())
-            }
-            Ok(n) => {
-                if self.slow_start_deadline.take().is_some() {
-                    self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+        #[cfg(target_os = "linux")]
+        {
+            let timeout = if self.slow_start_deadline.is_some() {
+                UART_STARTUP_TIMEOUT
+            } else {
+                UART_NORMAL_TIMEOUT
+            };
+            let mut scratch = [0u8; 512];
+            match read_once_fd_with_poll(self.inner.as_raw_fd(), &mut scratch, timeout) {
+                Ok(0) => {
+                    maybe_log_raw_uart_read_outcome(
+                        "read timeout/wouldblock",
+                        self.rx_buf.len(),
+                        None,
+                        &self.protocol,
+                    );
+                    Ok(())
                 }
-                maybe_log_raw_uart_read_outcome(
-                    "read returned bytes",
-                    self.rx_buf.len(),
-                    Some(n),
-                    &self.protocol,
-                );
-                self.rx_buf.extend_from_slice(&scratch[..n]);
-                maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
-                Ok(())
+                Ok(n) => {
+                    if self.slow_start_deadline.take().is_some() {
+                        self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+                    }
+                    maybe_log_raw_uart_read_outcome(
+                        "read returned bytes",
+                        self.rx_buf.len(),
+                        Some(n),
+                        &self.protocol,
+                    );
+                    self.rx_buf.extend_from_slice(&scratch[..n]);
+                    maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
+                    Ok(())
+                }
+                Err(err) if is_idle_serial_timeout(&err) => {
+                    maybe_log_raw_uart_read_outcome(
+                        "read timeout/wouldblock",
+                        self.rx_buf.len(),
+                        None,
+                        &self.protocol,
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
+                    Err(err)
+                }
             }
-            Err(err) if is_idle_serial_timeout(&err) => {
-                maybe_log_raw_uart_read_outcome(
-                    "read timeout/wouldblock",
-                    self.rx_buf.len(),
-                    None,
-                    &self.protocol,
-                );
-                Ok(())
-            }
-            Err(err) => {
-                maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
-                Err(err)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut scratch = [0u8; 512];
+            match self.inner.read(&mut scratch) {
+                Ok(0) => {
+                    maybe_log_raw_uart_read_outcome(
+                        "read returned 0 bytes",
+                        self.rx_buf.len(),
+                        None,
+                        &self.protocol,
+                    );
+                    Ok(())
+                }
+                Ok(n) => {
+                    if self.slow_start_deadline.take().is_some() {
+                        self.inner.set_timeout(UART_NORMAL_TIMEOUT)?;
+                    }
+                    maybe_log_raw_uart_read_outcome(
+                        "read returned bytes",
+                        self.rx_buf.len(),
+                        Some(n),
+                        &self.protocol,
+                    );
+                    self.rx_buf.extend_from_slice(&scratch[..n]);
+                    maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
+                    Ok(())
+                }
+                Err(err) if is_idle_serial_timeout(&err) => {
+                    maybe_log_raw_uart_read_outcome(
+                        "read timeout/wouldblock",
+                        self.rx_buf.len(),
+                        None,
+                        &self.protocol,
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
+                    Err(err)
+                }
             }
         }
     }
@@ -339,7 +433,34 @@ impl UartComms {
     }
 
     fn try_take_raw_uart_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
-        take_raw_uart_framed_payload(&mut self.rx_buf)
+        loop {
+            let Some((frame_kind, payload)) = take_raw_uart_framed_payload(&mut self.rx_buf)?
+            else {
+                return Ok(None);
+            };
+            match frame_kind {
+                RawUartFrameKind::Data => return Ok(Some(payload)),
+                RawUartFrameKind::Command => {
+                    if let Some(update) = parse_radio_window_update(&payload) {
+                        maybe_log_raw_uart_command_frame(
+                            "accepted radio window command frame",
+                            &payload,
+                            Some(update),
+                            &self.protocol,
+                        );
+                        self.radio_window_updates.push_back(update);
+                    } else {
+                        maybe_log_raw_uart_command_frame(
+                            "rejected raw UART command frame",
+                            &payload,
+                            None,
+                            &self.protocol,
+                        );
+                    }
+                }
+                RawUartFrameKind::Ascii => {}
+            }
+        }
     }
 
     fn try_take_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
@@ -349,30 +470,26 @@ impl UartComms {
         }
     }
 
-    fn handle_raw_uart_router_reject(&mut self, payload: &[u8]) {
-        maybe_log_raw_uart_router_error(payload, &self.protocol);
+    fn process_buffered_payloads(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+    ) -> TelemetryResult<bool> {
+        let mut processed_any = false;
 
-        // If a corrupted payload swallowed the next frame start, salvage from the
-        // embedded sync marker rather than dropping the entire burst.
-        let mut recovered = payload
-            .windows(2)
-            .enumerate()
-            .skip(1)
-            .find_map(|(idx, pair)| {
-                (pair == [RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1]).then_some(idx)
-            })
-            .map(|idx| payload[idx..].to_vec())
-            .unwrap_or_default();
-
-        if !self.rx_buf.is_empty() {
-            recovered.extend_from_slice(&self.rx_buf);
+        while let Some(payload) = self.try_take_packet()? {
+            processed_any = true;
+            if !is_valid_serialized_packet_or_ack(&payload) {
+                maybe_log_raw_uart_parse_issue(
+                    "dropping invalid serialized payload from framed raw UART packet",
+                    &payload[..payload.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+                );
+                continue;
+            }
+            maybe_log_raw_uart_decoded(&payload, &self.protocol);
+            packet_sink(payload);
         }
-        self.rx_buf = recovered;
-        maybe_log_raw_uart_buffer_state(
-            &self.rx_buf,
-            "resynced after router reject",
-            &self.protocol,
-        );
+
+        Ok(processed_any)
     }
 
     fn process_buffered_packets(
@@ -383,16 +500,13 @@ impl UartComms {
     ) -> TelemetryResult<bool> {
         let mut processed_any = false;
 
-        loop {
-            let payload: Vec<u8> = match self.try_take_packet()? {
-                Some(payload) => payload,
-                None => break,
-            };
+        while let Some(payload) = self.try_take_packet()? {
             processed_any = true;
             if !is_valid_serialized_packet_or_ack(&payload) {
-                if matches!(self.protocol, SerialProtocol::RawUart) {
-                    self.handle_raw_uart_router_reject(&payload);
-                }
+                maybe_log_raw_uart_parse_issue(
+                    "dropping invalid serialized payload from framed raw UART packet",
+                    &payload[..payload.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
+                );
                 continue;
             }
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
@@ -403,18 +517,115 @@ impl UartComms {
                     maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
                 }
                 Err(err) => {
-                    if matches!(self.protocol, SerialProtocol::RawUart) {
-                        let _ = err;
-                        self.handle_raw_uart_router_reject(&payload);
-                        continue;
-                    } else {
-                        return Err(err);
-                    }
+                    return Err(err);
                 }
             }
         }
-
         Ok(processed_any)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_baud_rate_constant(baud: u32) -> Option<libc::speed_t> {
+    match baud {
+        9600 => Some(libc::B9600),
+        19_200 => Some(libc::B19200),
+        38_400 => Some(libc::B38400),
+        57_600 => Some(libc::B57600),
+        115_200 => Some(libc::B115200),
+        230_400 => Some(libc::B230400),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_raw_serial(fd: RawFd, baud: u32) -> std::io::Result<()> {
+    let baud = linux_baud_rate_constant(baud).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported baud rate for raw serial mode: {baud}"),
+        )
+    })?;
+
+    // Match the Python test script exactly: raw mode, local receiver enabled,
+    // nonblocking reads, and no termios-side inter-byte timers.
+    unsafe {
+        let mut tty: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut tty) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        tty.c_iflag = 0;
+        tty.c_oflag = 0;
+        tty.c_cflag &= !(libc::PARENB | libc::CSTOPB | libc::CSIZE | libc::CRTSCTS);
+        tty.c_cflag |= libc::CS8 | libc::CREAD | libc::CLOCAL;
+        tty.c_lflag = 0;
+        tty.c_cc[libc::VMIN] = 0;
+        tty.c_cc[libc::VTIME] = 0;
+
+        if libc::cfsetispeed(&mut tty, baud) != 0 || libc::cfsetospeed(&mut tty, baud) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::tcsetattr(fd, libc::TCSANOW, &tty) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_once_fd(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
+    let written = unsafe { libc::write(fd, bytes.as_ptr() as *const _, bytes.len()) };
+    if written < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(0);
+        }
+        return Err(err);
+    }
+    Ok(written as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn read_once_fd_with_poll(fd: RawFd, buf: &mut [u8], timeout: Duration) -> std::io::Result<usize> {
+    let timeout_ms = timeout.as_millis().clamp(0, i32::MAX as u128) as i32;
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    loop {
+        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if rc == 0 {
+            return Ok(0);
+        }
+
+        let read_len = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if read_len < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(read_len as usize);
     }
 }
 
@@ -472,6 +683,13 @@ fn build_link_frame(
     Ok(framed)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawUartFrameKind {
+    Data,
+    Command,
+    Ascii,
+}
+
 #[cfg(target_os = "linux")]
 fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
     if payload.len() < RAW_UART_FRAME_HEADER_SIZE {
@@ -501,7 +719,24 @@ fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
     ))
 }
 
-fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<Vec<u8>>> {
+fn parse_radio_window_update(payload: &[u8]) -> Option<RadioWindowUpdate> {
+    if payload.len() < 4 || payload[0] != RADIO_WINDOW_CONTROL_KIND {
+        return None;
+    }
+    let kind = match payload[1] {
+        0 => RadioWindowKind::DownlinkOpen,
+        1 => RadioWindowKind::UplinkOpen,
+        _ => return None,
+    };
+    Some(RadioWindowUpdate {
+        kind,
+        duration_ms: u16::from_le_bytes([payload[2], payload[3]]),
+    })
+}
+
+fn take_raw_uart_framed_payload(
+    rx_buf: &mut Vec<u8>,
+) -> TelemetryResult<Option<(RawUartFrameKind, Vec<u8>)>> {
     if rx_buf.len() > RAW_UART_MAX_FRAME_BYTES {
         let drop_len = rx_buf.len() - RAW_UART_MAX_FRAME_BYTES;
         maybe_log_raw_uart_parse_issue(
@@ -572,10 +807,18 @@ fn take_raw_uart_framed_payload(rx_buf: &mut Vec<u8>) -> TelemetryResult<Option<
         return Ok(None);
     }
 
-    let is_data_frame = rx_buf[0] == RAW_UART_FRAME_SYNC_0 && rx_buf[1] == RAW_UART_FRAME_SYNC_1;
+    let frame_kind = match (rx_buf[0], rx_buf[1]) {
+        (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1) => RawUartFrameKind::Data,
+        (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1) => RawUartFrameKind::Command,
+        (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1) => RawUartFrameKind::Ascii,
+        _ => {
+            rx_buf.drain(..1);
+            return Ok(None);
+        }
+    };
     let payload = rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len].to_vec();
     rx_buf.drain(..total_len);
-    Ok(is_data_frame.then_some(payload))
+    Ok(Some((frame_kind, payload)))
 }
 
 fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
@@ -640,17 +883,6 @@ fn maybe_log_raw_uart_parse_issue(context: &str, bytes: &[u8]) {
     );
 }
 
-fn maybe_log_raw_uart_router_error(payload: &[u8], protocol: &SerialProtocol) {
-    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
-        return;
-    }
-    eprintln!(
-        "raw_uart router rejected {} bytes; payload: {}",
-        payload.len(),
-        hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
-    );
-}
-
 fn maybe_log_raw_uart_buffer_state(rx_buf: &[u8], context: &str, protocol: &SerialProtocol) {
     if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
         return;
@@ -678,6 +910,29 @@ fn maybe_log_raw_uart_decoded(payload: &[u8], protocol: &SerialProtocol) {
         payload.len(),
         hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
     );
+}
+
+fn maybe_log_raw_uart_command_frame(
+    context: &str,
+    payload: &[u8],
+    update: Option<RadioWindowUpdate>,
+    protocol: &SerialProtocol,
+) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    match update {
+        Some(update) => eprintln!(
+            "{context}: kind={:?} duration_ms={} payload={}",
+            update.kind,
+            update.duration_ms,
+            hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+        ),
+        None => eprintln!(
+            "{context}: payload={}",
+            hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
+        ),
+    }
 }
 
 fn maybe_log_raw_uart_router_queue_before(payload: &[u8], protocol: &SerialProtocol) {
@@ -922,17 +1177,69 @@ impl CommsDevice for UartComms {
                 let len_bytes = (len as u16).to_le_bytes();
                 self.inner.write_all(&len_bytes)?;
                 self.inner.write_all(payload)?;
+                self.inner.flush()?;
             }
             SerialProtocol::RawUart => {
-                self.inner.write_all(&build_raw_uart_frame(payload)?)?;
+                #[cfg(target_os = "linux")]
+                {
+                    let framed = build_raw_uart_frame(payload)?;
+                    let written = write_once_fd(self.inner.as_raw_fd(), &framed)?;
+                    if written == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "raw UART tx write would block",
+                        )
+                        .into());
+                    }
+                    if written < framed.len() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            format!(
+                                "short raw UART tx write: wrote {written} of {} bytes",
+                                framed.len()
+                            ),
+                        )
+                        .into());
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    self.inner.write_all(&build_raw_uart_frame(payload)?)?;
+                    self.inner.flush()?;
+                }
             }
         }
-        self.inner.flush()?;
         Ok(())
     }
 
     fn set_side_id(&mut self, side_id: RouterSideId) {
         self.side_id = Some(side_id);
+    }
+
+    fn recv_serialized_packets(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+    ) -> TelemetryResult<()> {
+        if self.rx_buf.len() < 2
+            && let Err(err) = self.fill_rx_buf()
+        {
+            return Err(err.into());
+        }
+        if self.process_buffered_payloads(packet_sink)? {
+            return Ok(());
+        }
+
+        if let Err(err) = self.fill_rx_buf() {
+            return Err(err.into());
+        }
+
+        let _ = self.process_buffered_payloads(packet_sink)?;
+        maybe_log_raw_uart_buffer_state(&self.rx_buf, "waiting for complete frame", &self.protocol);
+        Ok(())
+    }
+
+    fn take_radio_window_update(&mut self) -> Option<RadioWindowUpdate> {
+        self.radio_window_updates.pop_front()
     }
 }
 
@@ -1552,6 +1859,8 @@ pub struct DummyComms {
     #[cfg(feature = "testing")]
     discovery_next_announce_ms: u64,
     #[cfg(feature = "testing")]
+    timesync_next_announce_ms: u64,
+    #[cfg(feature = "testing")]
     pending_rx: std::collections::VecDeque<sedsprintf_rs_2026::packet::Packet>,
 }
 
@@ -1563,6 +1872,8 @@ impl DummyComms {
             side_id: None,
             #[cfg(feature = "testing")]
             discovery_next_announce_ms: 0,
+            #[cfg(feature = "testing")]
+            timesync_next_announce_ms: 0,
             #[cfg(feature = "testing")]
             pending_rx: std::collections::VecDeque::new(),
         }
@@ -1606,6 +1917,15 @@ impl DummyComms {
     }
 
     #[cfg(feature = "testing")]
+    fn simulated_timesync_priority(&self) -> u64 {
+        match self.name {
+            "Rocket Comms" => 60,
+            "Umbilical Comms" => 40,
+            _ => 100,
+        }
+    }
+
+    #[cfg(feature = "testing")]
     fn maybe_queue_discovery(&mut self) -> TelemetryResult<()> {
         let now_ms = crate::telemetry_task::get_current_timestamp_ms();
         if now_ms < self.discovery_next_announce_ms {
@@ -1635,6 +1955,31 @@ impl DummyComms {
             now_ms.saturating_add(sedsprintf_rs_2026::discovery::DISCOVERY_SLOW_INTERVAL_MS);
         Ok(())
     }
+
+    #[cfg(feature = "testing")]
+    fn maybe_queue_timesync(&mut self) -> TelemetryResult<()> {
+        if !crate::telemetry_task::timesync_enabled() {
+            return Ok(());
+        }
+
+        let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+        if now_ms < self.timesync_next_announce_ms {
+            return Ok(());
+        }
+
+        if !self.simulated_timesync_sources().is_empty() {
+            self.pending_rx.push_back(
+                sedsprintf_rs_2026::timesync::build_timesync_announce_with_sender(
+                    self.simulated_discovery_sender(),
+                    self.simulated_timesync_priority(),
+                    now_ms,
+                )?,
+            );
+        }
+
+        self.timesync_next_announce_ms = now_ms.saturating_add(1_000);
+        Ok(())
+    }
 }
 
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
@@ -1650,6 +1995,7 @@ impl CommsDevice for DummyComms {
                 .side_id
                 .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
             self.maybe_queue_discovery()?;
+            self.maybe_queue_timesync()?;
             if let Some(pkt) = self.pending_rx.pop_front() {
                 if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
                     && matches!(
@@ -1661,16 +2007,18 @@ impl CommsDevice for DummyComms {
                 }
                 return _router.rx_queue_from_side(pkt, side_id);
             }
-            let pkt = get_dummy_packet()?;
-            if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
-                && matches!(
-                    pkt.data_type(),
-                    DataType::GpsData | DataType::GpsSatelliteNumber
-                )
-            {
-                packet_tap(&pkt);
+            if let Some(pkt) = get_dummy_packet()? {
+                if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
+                    && matches!(
+                        pkt.data_type(),
+                        DataType::GpsData | DataType::GpsSatelliteNumber
+                    )
+                {
+                    packet_tap(&pkt);
+                }
+                return _router.rx_queue_from_side(pkt, side_id);
             }
-            _router.rx_queue_from_side(pkt, side_id)
+            Ok(())
         }
 
         #[cfg(not(feature = "testing"))]
@@ -1687,6 +2035,28 @@ impl CommsDevice for DummyComms {
         use sedsprintf_rs_2026::serialize::peek_envelope;
 
         if peek_envelope(payload).unwrap().ty == DataType::Heartbeat {
+            return Ok(());
+        }
+        #[cfg(feature = "testing")]
+        if crate::telemetry_task::timesync_enabled()
+            && let Ok(pkt) = sedsprintf_rs_2026::serialize::deserialize_packet(payload)
+            && pkt.data_type() == DataType::TimeSyncRequest
+            && !self.simulated_timesync_sources().is_empty()
+        {
+            let req = sedsprintf_rs_2026::timesync::decode_timesync_request(&pkt)?;
+            let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+            let mut response_bytes = Vec::with_capacity(4 * std::mem::size_of::<u64>());
+            for word in [req.seq, req.t1_ms, now_ms, now_ms] {
+                response_bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            self.pending_rx
+                .push_back(sedsprintf_rs_2026::packet::Packet::new(
+                    DataType::TimeSyncResponse,
+                    &[DataEndpoint::TimeSync],
+                    self.simulated_discovery_sender(),
+                    now_ms,
+                    response_bytes.into(),
+                )?);
             return Ok(());
         }
         static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1874,7 +2244,7 @@ mod raw_uart_tests {
         let payload = vec![1, 2, 3, 4, 5];
         let mut framed = build_raw_uart_frame(&payload).unwrap();
         let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
-        assert_eq!(decoded, payload);
+        assert_eq!(decoded, (RawUartFrameKind::Data, payload));
         assert!(framed.is_empty());
     }
 
@@ -1884,7 +2254,7 @@ mod raw_uart_tests {
         let mut framed = vec![0x00, 0x11, 0x22];
         framed.extend_from_slice(&build_raw_uart_frame(&payload).unwrap());
         let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
-        assert_eq!(decoded, payload);
+        assert_eq!(decoded, (RawUartFrameKind::Data, payload));
         assert!(framed.is_empty());
     }
 

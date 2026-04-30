@@ -43,6 +43,7 @@ fn recording_command_actuated(cmd: &str, mode: RecordingModeWire) -> Option<bool
 pub struct BoardStatus {
     pub packet_count: u64,
     pub last_seen_ms: Option<u64>,
+    pub last_seen_instant: Option<std::time::Instant>,
     pub ema_gap_ms: Option<u64>,
     pub warned: bool,
 }
@@ -132,6 +133,15 @@ pub struct AppState {
 
     /// Monotonic ID source for notifications.
     pub next_notification_id: Arc<AtomicU64>,
+
+    /// Telemetry-network/backend messages shown in the dashboard Messages tab.
+    pub messages: Arc<Mutex<Vec<PersistentNotification>>>,
+
+    /// Broadcast whenever telemetry/backend messages change.
+    pub messages_tx: broadcast::Sender<Vec<PersistentNotification>>,
+
+    /// Monotonic ID source for backend messages.
+    pub next_message_id: Arc<AtomicU64>,
 
     /// Current action policy (enabled/disabled/blink hints) for UI + command gating.
     pub action_policy: Arc<Mutex<ActionPolicyMsg>>,
@@ -291,8 +301,10 @@ impl AppState {
                     .unwrap_or(gap_ms);
                 status.ema_gap_ms = Some(ema.clamp(10, 60_000));
                 status.last_seen_ms = Some(observed_ms);
+                status.last_seen_instant = Some(std::time::Instant::now());
             } else {
                 status.last_seen_ms = Some(timestamp_ms);
+                status.last_seen_instant = Some(std::time::Instant::now());
                 force_broadcast = true;
             }
             status.warned = false;
@@ -336,6 +348,9 @@ impl AppState {
                     .map(|existing| existing.max(route_last_seen_ms))
                     .unwrap_or(route_last_seen_ms),
             );
+            status.last_seen_instant = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(route.age_ms))
+                .or_else(|| Some(std::time::Instant::now()));
             status.warned = false;
         }
         drop(map);
@@ -423,7 +438,10 @@ impl AppState {
             let last_seen_ms = status.and_then(|s| s.last_seen_ms);
             let packet_count = status.map(|s| s.packet_count).unwrap_or(0);
             let seen = last_seen_ms.is_some();
-            let age_ms = last_seen_ms.map(|ts| now_ms.saturating_sub(ts));
+            let age_ms = status
+                .and_then(|s| s.last_seen_instant.as_ref())
+                .map(|instant| instant.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                .or_else(|| last_seen_ms.map(|ts| now_ms.saturating_sub(ts)));
 
             boards.push(BoardStatusEntry {
                 board: *board,
@@ -766,6 +784,19 @@ impl AppState {
         self.notifications.lock().unwrap().clone()
     }
 
+    /// Clones the current backend message list for HTTP or WebSocket consumers.
+    pub fn messages_snapshot(&self) -> Vec<PersistentNotification> {
+        self.messages.lock().unwrap().clone()
+    }
+
+    /// Replaces the current backend message list and updates the next id source.
+    pub fn set_messages_snapshot(&self, snapshot: Vec<PersistentNotification>) {
+        let next_id = snapshot.iter().map(|msg| msg.id).max().unwrap_or(0);
+        *self.messages.lock().unwrap() = snapshot.clone();
+        self.next_message_id.store(next_id, Ordering::Relaxed);
+        let _ = self.messages_tx.send(snapshot);
+    }
+
     /// Adds a persistent operator notification and returns its assigned id.
     pub fn add_notification<S: Into<String>>(&self, message: S) -> u64 {
         self.add_notification_with_persistence(message, true)
@@ -825,6 +856,32 @@ impl AppState {
         drop(notifications);
         let _ = self.notifications_tx.send(snapshot);
         true
+    }
+
+    /// Adds a telemetry/backend message and returns its assigned id.
+    pub fn add_backend_message<S: Into<String>>(&self, message: S) -> (u64, bool) {
+        let message = message.into();
+        let mut messages = self.messages.lock().unwrap();
+        if let Some(existing) = messages.iter().find(|n| n.message == message) {
+            return (existing.id, false);
+        }
+        let id = self.next_message_id.fetch_add(1, Ordering::Relaxed) + 1;
+        messages.push(PersistentNotification {
+            id,
+            timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+            message,
+            persistent: false,
+            action_label: None,
+            action_cmd: None,
+        });
+        messages.sort_by_key(|n| -n.timestamp_ms);
+        if messages.len() > 200 {
+            messages.truncate(200);
+        }
+        let snapshot = messages.clone();
+        drop(messages);
+        let _ = self.messages_tx.send(snapshot);
+        (id, true)
     }
 
     /// Returns the latest action-policy snapshot used by the dashboard and command gate.
@@ -890,29 +947,37 @@ impl AppState {
 
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
-        if matches!(cmd, TelemetryCommand::ResetSim) && crate::flight_sim::sim_mode_enabled() {
-            return true;
+        #[cfg(feature = "hitl_mode")]
+        {
+            let _ = cmd;
+            true
         }
-        if matches!(
-            cmd,
-            TelemetryCommand::Abort
-                | TelemetryCommand::NitrogenClose
-                | TelemetryCommand::NitrousClose
-                | TelemetryCommand::ContinueFillSequence
-        ) {
-            return true;
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            if matches!(cmd, TelemetryCommand::ResetSim) && crate::flight_sim::sim_mode_enabled() {
+                return true;
+            }
+            if matches!(
+                cmd,
+                TelemetryCommand::Abort
+                    | TelemetryCommand::NitrogenClose
+                    | TelemetryCommand::NitrousClose
+                    | TelemetryCommand::ContinueFillSequence
+            ) {
+                return true;
+            }
+            let name = command_name(cmd);
+            let policy = self.action_policy.lock().unwrap();
+            if !policy.software_buttons_enabled {
+                return false;
+            }
+            policy
+                .controls
+                .iter()
+                .find(|c| c.cmd == name)
+                .map(|c| c.enabled)
+                .unwrap_or(false)
         }
-        let name = command_name(cmd);
-        let policy = self.action_policy.lock().unwrap();
-        if !policy.software_buttons_enabled {
-            return false;
-        }
-        policy
-            .controls
-            .iter()
-            .find(|c| c.cmd == name)
-            .map(|c| c.enabled)
-            .unwrap_or(false)
     }
 
     /// Records when a command was last accepted by the backend.
@@ -1021,6 +1086,7 @@ impl AppState {
         self.umbilical_valve_states.lock().unwrap().clear();
         for status in self.board_status.lock().unwrap().values_mut() {
             status.last_seen_ms = None;
+            status.last_seen_instant = None;
             status.ema_gap_ms = None;
             status.warned = false;
         }

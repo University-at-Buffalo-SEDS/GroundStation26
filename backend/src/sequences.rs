@@ -63,13 +63,16 @@ fn backend_blink_for(cmd: &str, enabled: bool, recommended: Option<&BlinkMode>) 
     if !enabled {
         return BlinkMode::None;
     }
-    if let Some(blink) = recommended {
+    let illuminated = backend_illuminated_commands().contains(cmd);
+    if let Some(blink) = recommended
+        && (*blink != BlinkMode::None || !illuminated)
+    {
         return blink.clone();
     }
     if is_recording_command(cmd) {
         return BlinkMode::None;
     }
-    if backend_illuminated_commands().contains(cmd) {
+    if illuminated {
         return BlinkMode::Slow;
     }
     BlinkMode::None
@@ -82,12 +85,20 @@ fn is_recording_command(cmd: &str) -> bool {
     )
 }
 
+#[cfg_attr(feature = "hitl_mode", allow(dead_code))]
 fn default_recording_command_actuated(cmd: &str) -> Option<bool> {
     match cmd {
         "StartWritingNow" | "StartWritingLastTwoMinutes" => Some(false),
         "PauseWritingDb" => Some(false),
         "StopWritingDb" => Some(true),
         _ => None,
+    }
+}
+
+fn default_command_actuated(cmd: &str) -> Option<bool> {
+    match cmd {
+        "ResetSim" => Some(true),
+        _ => default_recording_command_actuated(cmd),
     }
 }
 
@@ -557,9 +568,10 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
-        "Postinit",
+        "PostinitSignal",
         "Launch",
-        "Rollback",
+        "LaunchSignal",
+        "RollbackSignal",
         "MonitorAltitude",
         "RevokeMonitorAltitude",
         "ConsecutiveSamples",
@@ -591,9 +603,10 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
-        "Postinit",
+        "PostinitSignal",
         "Launch",
-        "Rollback",
+        "LaunchSignal",
+        "RollbackSignal",
         "MonitorAltitude",
         "RevokeMonitorAltitude",
         "ConsecutiveSamples",
@@ -638,9 +651,10 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
-        "Postinit",
+        "PostinitSignal",
         "Launch",
-        "Rollback",
+        "LaunchSignal",
+        "RollbackSignal",
         "MonitorAltitude",
         "RevokeMonitorAltitude",
         "ConsecutiveSamples",
@@ -653,30 +667,45 @@ pub fn all_command_names() -> Vec<&'static str> {
 }
 
 pub fn default_action_policy() -> ActionPolicyMsg {
-    let controls = all_command_names()
-        .into_iter()
-        .map(|cmd| {
-            let enabled = matches!(
-                cmd,
-                "Abort"
-                    | "ResetSim"
-                    | "StartWritingNow"
-                    | "StartWritingLastTwoMinutes"
-                    | "PauseWritingDb"
-                    | "StopWritingDb"
-            );
-            ActionControl {
-                cmd: cmd.to_string(),
-                enabled,
-                blink: backend_blink_for(cmd, enabled, None),
-                actuated: default_recording_command_actuated(cmd),
-            }
-        })
-        .collect();
-    ActionPolicyMsg {
-        key_enabled: true,
-        software_buttons_enabled: true,
-        controls,
+    #[cfg(feature = "hitl_mode")]
+    {
+        return hitl_action_policy(ValveSnapshot {
+            normally_open: None,
+            dump_open: None,
+            nitrogen_open: None,
+            nitrous_open: None,
+            pilot_open: None,
+            igniter_on: None,
+            retract: None,
+        });
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        let controls = all_command_names()
+            .into_iter()
+            .map(|cmd| {
+                let enabled = matches!(
+                    cmd,
+                    "Abort"
+                        | "ResetSim"
+                        | "StartWritingNow"
+                        | "StartWritingLastTwoMinutes"
+                        | "PauseWritingDb"
+                        | "StopWritingDb"
+                );
+                ActionControl {
+                    cmd: cmd.to_string(),
+                    enabled,
+                    blink: backend_blink_for(cmd, enabled, None),
+                    actuated: default_command_actuated(cmd),
+                }
+            })
+            .collect();
+        ActionPolicyMsg {
+            key_enabled: true,
+            software_buttons_enabled: true,
+            controls,
+        }
     }
 }
 
@@ -711,11 +740,7 @@ fn policy_with_overrides(
                 cmd: cmd.to_string(),
                 enabled,
                 blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
-                actuated: if is_recording_command(cmd) {
-                    Some(true)
-                } else {
-                    valves.actuated_for_cmd(cmd)
-                },
+                actuated: default_command_actuated(cmd).or_else(|| valves.actuated_for_cmd(cmd)),
             }
         })
         .collect();
@@ -1471,15 +1496,10 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
     let controls = all_command_names()
         .into_iter()
         .map(|cmd| {
-            let enabled = cmd != "RetractPlumbing";
-            let actuated = if is_recording_command(cmd) {
-                Some(true)
-            } else {
-                valves.actuated_for_cmd(cmd)
-            };
+            let actuated = default_command_actuated(cmd).or_else(|| valves.actuated_for_cmd(cmd));
             ActionControl {
                 cmd: cmd.to_string(),
-                enabled,
+                enabled: true,
                 blink: BlinkMode::None,
                 actuated,
             }

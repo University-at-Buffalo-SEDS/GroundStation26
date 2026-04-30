@@ -490,6 +490,26 @@ def gui_mode(path: Path) -> int:
     user_calibration_view_var = tk.BooleanVar(value=False)
     user_calibration_edit_var = tk.BooleanVar(value=False)
     user_disabled_var = tk.BooleanVar(value=False)
+    user_all_commands_var = tk.BooleanVar(value=False)
+    anon_all_commands_var = tk.BooleanVar(
+        value=not cfg["anonymous_command_access"]["allowed_commands"]
+    )
+
+    def sync_command_listbox_state(listbox: Any, all_var: Any) -> None:
+        listbox.configure(state=("disabled" if all_var.get() else "normal"))
+
+    def commands_from_widgets(listbox: Any, all_var: Any) -> list[str]:
+        if all_var.get():
+            return []
+        return selected_commands(listbox)
+
+    def set_command_widgets(listbox: Any, all_var: Any, commands: list[str]) -> None:
+        all_var.set(not commands)
+        if commands:
+            set_selected_commands(listbox, commands)
+        else:
+            listbox.selection_clear(0, "end")
+        sync_command_listbox_state(listbox, all_var)
 
     def refresh_user_list() -> None:
         users_var.set([user["username"] for user in cfg["users"]])
@@ -508,7 +528,11 @@ def gui_mode(path: Path) -> int:
         user_calibration_view_var.set(bool(user["calibration_access"]["view"]))
         user_calibration_edit_var.set(bool(user["calibration_access"]["edit"]))
         user_disabled_var.set(bool(user.get("disabled", False)))
-        set_selected_commands(user_commands_listbox, user["command_access"]["allowed_commands"])
+        set_command_widgets(
+            user_commands_listbox,
+            user_all_commands_var,
+            user["command_access"]["allowed_commands"],
+        )
 
     def save_all() -> None:
         try:
@@ -520,7 +544,7 @@ def gui_mode(path: Path) -> int:
             {"view_data": anon_view_var.get(), "send_commands": anon_send_var.get()}
         )
         cfg["anonymous_command_access"] = normalize_command_access(
-            {"allowed_commands": selected_commands(anon_commands_listbox)}
+            {"allowed_commands": commands_from_widgets(anon_commands_listbox, anon_all_commands_var)}
         )
         cfg["anonymous_calibration_access"] = normalize_calibration_access(
             {
@@ -548,7 +572,9 @@ def gui_mode(path: Path) -> int:
                 calibration_view=user_calibration_view_var.get(),
                 calibration_edit=user_calibration_edit_var.get(),
                 disabled=user_disabled_var.get(),
-                allowed_commands=selected_commands(user_commands_listbox),
+                allowed_commands=commands_from_widgets(
+                    user_commands_listbox, user_all_commands_var
+                ),
             )
         except ValueError as exc:
             messagebox.showerror("User Error", str(exc))
@@ -570,7 +596,7 @@ def gui_mode(path: Path) -> int:
         user_calibration_view_var.set(False)
         user_calibration_edit_var.set(False)
         user_disabled_var.set(False)
-        user_commands_listbox.selection_clear(0, tk.END)
+        set_command_widgets(user_commands_listbox, user_all_commands_var, [])
         listbox.selection_clear(0, tk.END)
 
     def delete_user() -> None:
@@ -671,68 +697,102 @@ def gui_mode(path: Path) -> int:
     user_commands_listbox.grid(row=5, column=1, sticky="ew", pady=(0, 8))
     for command in commands_catalog:
         user_commands_listbox.insert(tk.END, command)
+    ttk.Checkbutton(
+        right,
+        text="Grant All Commands (stores empty list)",
+        variable=user_all_commands_var,
+        command=lambda: sync_command_listbox_state(
+            user_commands_listbox, user_all_commands_var
+        ),
+    ).grid(row=6, column=1, sticky="w", pady=(0, 6))
     user_cmd_buttons = ttk.Frame(right)
-    user_cmd_buttons.grid(row=6, column=1, sticky="w", pady=(0, 8))
+    user_cmd_buttons.grid(row=7, column=1, sticky="w", pady=(0, 8))
     ttk.Button(
         user_cmd_buttons,
         text="Select All",
-        command=lambda: select_all_commands(user_commands_listbox),
+        command=lambda: (
+            user_all_commands_var.set(False),
+            sync_command_listbox_state(user_commands_listbox, user_all_commands_var),
+            select_all_commands(user_commands_listbox),
+        ),
     ).pack(side=tk.LEFT)
     ttk.Button(
         user_cmd_buttons,
-        text="Clear",
-        command=lambda: user_commands_listbox.selection_clear(0, tk.END),
+        text="Clear Selection",
+        command=lambda: (
+            user_all_commands_var.set(False),
+            sync_command_listbox_state(user_commands_listbox, user_all_commands_var),
+            user_commands_listbox.selection_clear(0, tk.END),
+        ),
     ).pack(side=tk.LEFT, padx=(8, 0))
     ttk.Button(right, text="Save User", command=save_user).grid(
-        row=7, column=0, columnspan=2, sticky="ew", pady=(0, 18)
+        row=8, column=0, columnspan=2, sticky="ew", pady=(0, 18)
     )
 
     ttk.Separator(right, orient="horizontal").grid(
-        row=8, column=0, columnspan=2, sticky="ew", pady=(0, 12)
+        row=9, column=0, columnspan=2, sticky="ew", pady=(0, 12)
     )
 
-    ttk.Label(right, text="Anonymous Permissions").grid(row=9, column=0, sticky="w")
+    ttk.Label(right, text="Anonymous Permissions").grid(row=10, column=0, sticky="w")
     ttk.Checkbutton(right, text="View Data", variable=anon_view_var).grid(
-        row=10, column=0, sticky="w"
+        row=11, column=0, sticky="w"
     )
     ttk.Checkbutton(right, text="Send Commands", variable=anon_send_var).grid(
-        row=10, column=1, sticky="w"
+        row=11, column=1, sticky="w"
     )
     ttk.Checkbutton(
         right, text="Calibration View", variable=anon_calibration_view_var
-    ).grid(row=11, column=0, sticky="w")
+    ).grid(row=12, column=0, sticky="w")
     ttk.Checkbutton(
         right, text="Calibration Edit", variable=anon_calibration_edit_var
-    ).grid(row=11, column=1, sticky="w")
-    ttk.Label(right, text="Anonymous Allowed Commands").grid(row=12, column=0, sticky="nw")
+    ).grid(row=12, column=1, sticky="w")
+    ttk.Label(right, text="Anonymous Allowed Commands").grid(row=13, column=0, sticky="nw")
     anon_commands_listbox = tk.Listbox(
         right,
         selectmode=tk.MULTIPLE,
         exportselection=False,
         height=min(max(len(commands_catalog), 6), 12),
     )
-    anon_commands_listbox.grid(row=12, column=1, sticky="ew", pady=(0, 8))
+    anon_commands_listbox.grid(row=13, column=1, sticky="ew", pady=(0, 8))
     for command in commands_catalog:
         anon_commands_listbox.insert(tk.END, command)
-    set_selected_commands(
-        anon_commands_listbox, cfg["anonymous_command_access"]["allowed_commands"]
+    set_command_widgets(
+        anon_commands_listbox,
+        anon_all_commands_var,
+        cfg["anonymous_command_access"]["allowed_commands"],
     )
+    ttk.Checkbutton(
+        right,
+        text="Grant All Commands (stores empty list)",
+        variable=anon_all_commands_var,
+        command=lambda: sync_command_listbox_state(
+            anon_commands_listbox, anon_all_commands_var
+        ),
+    ).grid(row=14, column=1, sticky="w", pady=(0, 6))
     anon_cmd_buttons = ttk.Frame(right)
-    anon_cmd_buttons.grid(row=13, column=1, sticky="w", pady=(0, 8))
+    anon_cmd_buttons.grid(row=15, column=1, sticky="w", pady=(0, 8))
     ttk.Button(
         anon_cmd_buttons,
         text="Select All",
-        command=lambda: select_all_commands(anon_commands_listbox),
+        command=lambda: (
+            anon_all_commands_var.set(False),
+            sync_command_listbox_state(anon_commands_listbox, anon_all_commands_var),
+            select_all_commands(anon_commands_listbox),
+        ),
     ).pack(side=tk.LEFT)
     ttk.Button(
         anon_cmd_buttons,
-        text="Clear",
-        command=lambda: anon_commands_listbox.selection_clear(0, tk.END),
+        text="Clear Selection",
+        command=lambda: (
+            anon_all_commands_var.set(False),
+            sync_command_listbox_state(anon_commands_listbox, anon_all_commands_var),
+            anon_commands_listbox.selection_clear(0, tk.END),
+        ),
     ).pack(side=tk.LEFT, padx=(8, 0))
-    ttk.Label(right, text="Session TTL Seconds").grid(row=14, column=0, sticky="w", pady=(10, 0))
-    ttk.Entry(right, textvariable=ttl_var).grid(row=14, column=1, sticky="ew", pady=(10, 0))
+    ttk.Label(right, text="Session TTL Seconds").grid(row=16, column=0, sticky="w", pady=(10, 0))
+    ttk.Entry(right, textvariable=ttl_var).grid(row=16, column=1, sticky="ew", pady=(10, 0))
     ttk.Button(right, text="Save Config", command=save_all).grid(
-        row=15, column=0, columnspan=2, sticky="ew", pady=(16, 0)
+        row=17, column=0, columnspan=2, sticky="ew", pady=(16, 0)
     )
 
     root.bind_all("<Control-s>", save_all_event)
