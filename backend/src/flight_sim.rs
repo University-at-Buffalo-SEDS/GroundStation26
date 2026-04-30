@@ -27,7 +27,9 @@ const BASE_LAT: f32 = 31.7619;
 const BASE_LON: f32 = -106.485;
 
 #[cfg(feature = "testing")]
-const SENSOR_PERIOD_MS: u64 = 25;
+const AV_BAY_SENSOR_PERIOD_MS: u64 = 140;
+#[cfg(feature = "testing")]
+const FILL_SYSTEM_SENSOR_PERIOD_MS: u64 = 40;
 #[cfg(feature = "testing")]
 const FLIGHT_STATE_PERIOD_MS: u64 = 1_000;
 #[cfg(feature = "testing")]
@@ -73,45 +75,138 @@ const NORMALLY_OPEN_PRESSURE_BLEED_PSI_PER_S: f32 = 0.25;
 #[cfg(feature = "testing")]
 const GRAVITY_FPS2: f32 = 32.174;
 #[cfg(feature = "testing")]
-const GROUND_SENSOR_SEQUENCE: &[DataType] = &[
-    DataType::GyroData,
-    DataType::AccelData,
-    DataType::BarometerData,
-    DataType::FuelTankPressure,
-    DataType::FuelFlow,
-    DataType::BatteryVoltage,
-    DataType::BatteryCurrent,
-    DataType::GpsData,
-    DataType::GpsSatelliteNumber,
-    DataType::KG1000,
+#[derive(Clone, Copy)]
+struct SimSensorSpec {
+    dtype: DataType,
+    sender: Board,
+}
+
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy)]
+enum SimLink {
+    AvBay,
+    FillSystem,
+}
+
+#[cfg(feature = "testing")]
+const AV_BAY_GROUND_SENSOR_SEQUENCE: &[SimSensorSpec] = &[
+    SimSensorSpec {
+        dtype: DataType::IMUData,
+        sender: Board::FlightComputer,
+    },
+    SimSensorSpec {
+        dtype: DataType::BarometerData,
+        sender: Board::FlightComputer,
+    },
+    SimSensorSpec {
+        dtype: DataType::BatteryVoltage,
+        sender: Board::PowerBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::BatteryCurrent,
+        sender: Board::PowerBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::GpsData,
+        sender: Board::RFBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::GpsSatelliteNumber,
+        sender: Board::RFBoard,
+    },
 ];
 #[cfg(feature = "testing")]
-const ASCENT_SENSOR_SEQUENCE: &[DataType] = &[
-    DataType::GyroData,
-    DataType::AccelData,
-    DataType::AscentState,
-    DataType::BarometerData,
-    DataType::FuelTankPressure,
-    DataType::FuelFlow,
-    DataType::BatteryVoltage,
-    DataType::BatteryCurrent,
-    DataType::GpsData,
-    DataType::GpsSatelliteNumber,
-    DataType::KG1000,
+const AV_BAY_ASCENT_SENSOR_SEQUENCE: &[SimSensorSpec] = &[
+    SimSensorSpec {
+        dtype: DataType::IMUData,
+        sender: Board::FlightComputer,
+    },
+    SimSensorSpec {
+        dtype: DataType::AscentState,
+        sender: Board::FlightComputer,
+    },
+    SimSensorSpec {
+        dtype: DataType::BarometerData,
+        sender: Board::FlightComputer,
+    },
+    SimSensorSpec {
+        dtype: DataType::BatteryVoltage,
+        sender: Board::PowerBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::BatteryCurrent,
+        sender: Board::PowerBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::GpsData,
+        sender: Board::RFBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::GpsSatelliteNumber,
+        sender: Board::RFBoard,
+    },
 ];
 #[cfg(feature = "testing")]
-const DESCENT_SENSOR_SEQUENCE: &[DataType] = &[
-    DataType::GyroData,
-    DataType::AccelData,
-    DataType::DescentState,
-    DataType::BarometerData,
-    DataType::FuelTankPressure,
-    DataType::FuelFlow,
-    DataType::BatteryVoltage,
-    DataType::BatteryCurrent,
-    DataType::GpsData,
-    DataType::GpsSatelliteNumber,
-    DataType::KG1000,
+const AV_BAY_DESCENT_SENSOR_SEQUENCE: &[SimSensorSpec] = &[
+    SimSensorSpec {
+        dtype: DataType::IMUData,
+        sender: Board::FlightComputer,
+    },
+    SimSensorSpec {
+        dtype: DataType::DescentState,
+        sender: Board::FlightComputer,
+    },
+    SimSensorSpec {
+        dtype: DataType::BarometerData,
+        sender: Board::FlightComputer,
+    },
+    SimSensorSpec {
+        dtype: DataType::BatteryVoltage,
+        sender: Board::PowerBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::BatteryCurrent,
+        sender: Board::PowerBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::GpsData,
+        sender: Board::RFBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::GpsSatelliteNumber,
+        sender: Board::RFBoard,
+    },
+];
+#[cfg(feature = "testing")]
+const FILL_SYSTEM_SENSOR_SEQUENCE: &[SimSensorSpec] = &[
+    SimSensorSpec {
+        dtype: DataType::FuelTankPressure,
+        sender: Board::DaqBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::FuelFlow,
+        sender: Board::DaqBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::KG1000,
+        sender: Board::DaqBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::BatteryVoltage,
+        sender: Board::GatewayBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::BatteryCurrent,
+        sender: Board::GatewayBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::BatteryVoltage,
+        sender: Board::ValveBoard,
+    },
+    SimSensorSpec {
+        dtype: DataType::BatteryCurrent,
+        sender: Board::ValveBoard,
+    },
 ];
 
 #[cfg(feature = "testing")]
@@ -242,9 +337,11 @@ struct FlightSimState {
     launch_sequence_started_ms: Option<u64>,
     launch_time_ms: Option<u64>,
     last_state_emit_ms: u64,
-    last_sensor_emit_ms: u64,
+    last_av_bay_sensor_emit_ms: u64,
+    last_fill_system_sensor_emit_ms: u64,
     last_housekeeping_emit_ms: u64,
-    next_sensor_idx: usize,
+    next_av_bay_sensor_idx: usize,
+    next_fill_system_sensor_idx: usize,
     fuel_tank_pressure_psi: f32,
     fuel_flow_lpm: f32,
     battery_v: f32,
@@ -261,8 +358,6 @@ struct FlightSimState {
     valve_board_battery_a: f32,
     fill_box_power_v: f32,
     fill_box_power_a: f32,
-    next_battery_sender_idx: usize,
-    last_battery_sender: Board,
     loadcell_mass_kg: f32,
     valves: HashMap<u8, bool>,
     saw_dump_open_after_n2: bool,
@@ -301,9 +396,11 @@ impl FlightSimState {
             launch_sequence_started_ms: None,
             launch_time_ms: None,
             last_state_emit_ms: 0,
-            last_sensor_emit_ms: 0,
+            last_av_bay_sensor_emit_ms: 0,
+            last_fill_system_sensor_emit_ms: 0,
             last_housekeeping_emit_ms: 0,
-            next_sensor_idx: 0,
+            next_av_bay_sensor_idx: 0,
+            next_fill_system_sensor_idx: 0,
             fuel_tank_pressure_psi: 5.0,
             fuel_flow_lpm: 0.0,
             battery_v: AV_BAY_BATTERY_MAX_V,
@@ -320,8 +417,6 @@ impl FlightSimState {
             valve_board_battery_a: 0.55,
             fill_box_power_v: FILL_BOX_POWER_MAX_V,
             fill_box_power_a: 0.7,
-            next_battery_sender_idx: 0,
-            last_battery_sender: Board::PowerBoard,
             loadcell_mass_kg: 0.0,
             valves,
             saw_dump_open_after_n2: false,
@@ -767,7 +862,7 @@ impl FlightSimState {
         self.update_launch_sequence(now_ms);
 
         let dt_s = if self.last_physics_ms == 0 {
-            SENSOR_PERIOD_MS as f32 / 1000.0
+            FILL_SYSTEM_SENSOR_PERIOD_MS as f32 / 1000.0
         } else {
             ((now_ms.saturating_sub(self.last_physics_ms)) as f32 / 1000.0).clamp(0.0, 1.0)
         };
@@ -956,30 +1051,28 @@ impl FlightSimState {
         self.yaw_dps = rng.random_range(-6.0..6.0);
     }
 
-    fn next_sensor_packet(&mut self, now_ms: u64) -> TelemetryResult<Packet> {
+    fn next_sensor_packet(
+        &mut self,
+        spec: SimSensorSpec,
+        now_ms: u64,
+    ) -> TelemetryResult<Option<Packet>> {
         self.update_physics(now_ms);
 
-        let seq = sensor_sequence_for_state(self.flight_state);
-        let dtype = seq[self.next_sensor_idx % seq.len()];
-        self.next_sensor_idx = (self.next_sensor_idx + 1) % seq.len();
-
         let mut rng = rand::rng();
-        let mut sender = sender_for_datatype(dtype);
-        let bytes: Vec<u8> = match dtype {
-            DataType::GyroData => vec![
-                self.roll_dps + rng.random_range(-0.15..0.15),
-                self.pitch_dps + rng.random_range(-0.15..0.15),
-                self.yaw_dps + rng.random_range(-0.45..0.45),
-            ]
-            .into_iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-            DataType::AccelData => {
+        if spec.sender == Board::ValveBoard && valve_board_disconnected_for_state(self.flight_state)
+        {
+            return Ok(None);
+        }
+        let bytes: Vec<u8> = match spec.dtype {
+            DataType::IMUData => {
                 let az = self.accel_g * 9.80665 + rng.random_range(-0.25..0.25);
                 vec![
                     rng.random_range(-0.35..0.35),
                     rng.random_range(-0.35..0.35),
                     az,
+                    self.roll_dps + rng.random_range(-0.15..0.15),
+                    self.pitch_dps + rng.random_range(-0.15..0.15),
+                    self.yaw_dps + rng.random_range(-0.45..0.45),
                 ]
                 .into_iter()
                 .flat_map(|v| v.to_le_bytes())
@@ -1032,44 +1125,23 @@ impl FlightSimState {
                 .flat_map(|v| v.to_le_bytes())
                 .collect(),
             DataType::BatteryVoltage => {
-                let valve_board_online = !valve_board_disconnected_for_state(self.flight_state);
-                let battery_sources: &[(Board, f32)] = if valve_board_online {
-                    &[
-                        (Board::PowerBoard, self.av_bay_battery_v),
-                        (Board::ValveBoard, self.valve_board_battery_v),
-                        (Board::GatewayBoard, self.fill_box_power_v),
-                    ]
-                } else {
-                    &[
-                        (Board::PowerBoard, self.av_bay_battery_v),
-                        (Board::GatewayBoard, self.fill_box_power_v),
-                    ]
+                let voltage = match spec.sender {
+                    Board::PowerBoard => self.av_bay_battery_v,
+                    Board::ValveBoard => self.valve_board_battery_v,
+                    Board::GatewayBoard => self.fill_box_power_v,
+                    _ => return Ok(None),
                 };
-                let (board, voltage) =
-                    battery_sources[self.next_battery_sender_idx % battery_sources.len()];
-                self.next_battery_sender_idx =
-                    (self.next_battery_sender_idx + 1) % battery_sources.len();
-                self.last_battery_sender = board;
-                sender = board.sender_id();
                 vec![voltage]
             }
             .into_iter()
             .flat_map(|v| v.to_le_bytes())
             .collect(),
             DataType::BatteryCurrent => {
-                let current = match self.last_battery_sender {
-                    Board::GatewayBoard => {
-                        sender = Board::GatewayBoard.sender_id();
-                        self.fill_box_power_a
-                    }
-                    Board::ValveBoard => {
-                        sender = Board::ValveBoard.sender_id();
-                        self.valve_board_battery_a
-                    }
-                    _ => {
-                        sender = Board::PowerBoard.sender_id();
-                        self.battery_a
-                    }
+                let current = match spec.sender {
+                    Board::PowerBoard => self.battery_a,
+                    Board::ValveBoard => self.valve_board_battery_a,
+                    Board::GatewayBoard => self.fill_box_power_a,
+                    _ => return Ok(None),
                 };
                 vec![current]
             }
@@ -1102,52 +1174,68 @@ impl FlightSimState {
                     .flat_map(|v| v.to_le_bytes())
                     .collect()
             }
-            _ => vec![0.0_f32]
-                .into_iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect(),
+            _ => return Ok(None),
         };
 
         Packet::new(
-            dtype,
-            sim_endpoints_for_datatype(dtype),
-            sender,
+            spec.dtype,
+            sim_endpoints_for_datatype(spec.dtype),
+            spec.sender.sender_id(),
             now_ms,
             Arc::from(bytes.as_slice()),
         )
+        .map(Some)
     }
 }
 
 #[cfg(feature = "testing")]
-fn sensor_sequence_for_state(state: FlightState) -> &'static [DataType] {
-    match state {
-        FlightState::Launch | FlightState::Ascent | FlightState::Coast | FlightState::Apogee => {
-            ASCENT_SENSOR_SEQUENCE
-        }
-        FlightState::ParachuteDeploy
-        | FlightState::Descent
-        | FlightState::Landed
-        | FlightState::Recovery => DESCENT_SENSOR_SEQUENCE,
-        _ => GROUND_SENSOR_SEQUENCE,
+fn sensor_sequence_for_state(state: FlightState, link: SimLink) -> &'static [SimSensorSpec] {
+    match link {
+        SimLink::FillSystem => FILL_SYSTEM_SENSOR_SEQUENCE,
+        SimLink::AvBay => match state {
+            FlightState::Launch
+            | FlightState::Ascent
+            | FlightState::Coast
+            | FlightState::Apogee => AV_BAY_ASCENT_SENSOR_SEQUENCE,
+            FlightState::ParachuteDeploy
+            | FlightState::Descent
+            | FlightState::Landed
+            | FlightState::Recovery => AV_BAY_DESCENT_SENSOR_SEQUENCE,
+            _ => AV_BAY_GROUND_SENSOR_SEQUENCE,
+        },
     }
 }
 
 #[cfg(feature = "testing")]
-fn sender_for_datatype(dtype: DataType) -> &'static str {
-    match dtype {
-        DataType::GyroData
-        | DataType::AccelData
-        | DataType::AscentState
-        | DataType::DescentState
-        | DataType::FlightState => Board::FlightComputer.sender_id(),
-        DataType::BarometerData | DataType::FuelFlow | DataType::FuelTankPressure => {
-            Board::DaqBoard.sender_id()
+fn next_sensor_index(state: &mut FlightSimState, link: SimLink, len: usize) -> usize {
+    match link {
+        SimLink::AvBay => {
+            let idx = state.next_av_bay_sensor_idx % len;
+            state.next_av_bay_sensor_idx = (state.next_av_bay_sensor_idx + 1) % len;
+            idx
         }
-        DataType::KG1000 => Board::DaqBoard.sender_id(),
-        DataType::BatteryVoltage | DataType::BatteryCurrent => Board::PowerBoard.sender_id(),
-        DataType::GpsData | DataType::GpsSatelliteNumber => Board::RFBoard.sender_id(),
-        _ => Board::GroundStation.sender_id(),
+        SimLink::FillSystem => {
+            let idx = state.next_fill_system_sensor_idx % len;
+            state.next_fill_system_sensor_idx = (state.next_fill_system_sensor_idx + 1) % len;
+            idx
+        }
     }
+}
+
+#[cfg(feature = "testing")]
+fn next_scheduled_sensor_packet(
+    state: &mut FlightSimState,
+    link: SimLink,
+    now_ms: u64,
+) -> TelemetryResult<Option<Packet>> {
+    let seq = sensor_sequence_for_state(state.flight_state, link);
+    for _ in 0..seq.len() {
+        let idx = next_sensor_index(state, link, seq.len());
+        if let Some(pkt) = state.next_sensor_packet(seq[idx], now_ms)? {
+            return Ok(Some(pkt));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(feature = "testing")]
@@ -1156,6 +1244,27 @@ fn sim_endpoints_for_datatype(dtype: DataType) -> &'static [DataEndpoint] {
         DataType::GpsData => &[DataEndpoint::GroundStation, DataEndpoint::FlightController],
         DataType::GpsSatelliteNumber => &[DataEndpoint::GroundStation],
         _ => &[DataEndpoint::GroundStation],
+    }
+}
+
+#[cfg(feature = "testing")]
+fn next_due_link(state: &FlightSimState, now_ms: u64) -> Option<SimLink> {
+    let fill_due = now_ms.saturating_sub(state.last_fill_system_sensor_emit_ms)
+        >= FILL_SYSTEM_SENSOR_PERIOD_MS;
+    let av_due = now_ms.saturating_sub(state.last_av_bay_sensor_emit_ms) >= AV_BAY_SENSOR_PERIOD_MS;
+
+    match (fill_due, av_due) {
+        (true, true) | (true, false) => Some(SimLink::FillSystem),
+        (false, true) => Some(SimLink::AvBay),
+        (false, false) => None,
+    }
+}
+
+#[cfg(feature = "testing")]
+fn mark_sensor_link_emitted(state: &mut FlightSimState, link: SimLink, now_ms: u64) {
+    match link {
+        SimLink::AvBay => state.last_av_bay_sensor_emit_ms = now_ms,
+        SimLink::FillSystem => state.last_fill_system_sensor_emit_ms = now_ms,
     }
 }
 
@@ -1267,19 +1376,19 @@ pub fn sync_local_flight_state(next_state: FlightState) {
 pub fn sync_local_flight_state(_next_state: crate::types::FlightState) {}
 
 #[cfg(feature = "testing")]
-pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
+pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
     let now_ms = get_current_timestamp_ms();
     let mut s = sim().lock().expect("flight sim mutex poisoned");
 
     if let Some(pkt) = s.pop_next_queued() {
-        return Ok(pkt);
+        return Ok(Some(pkt));
     }
 
     if now_ms.saturating_sub(s.last_housekeeping_emit_ms) >= HOUSEKEEPING_PERIOD_MS {
         s.last_housekeeping_emit_ms = now_ms;
         s.queue_housekeeping(now_ms);
         if let Some(pkt) = s.pop_next_queued() {
-            return Ok(pkt);
+            return Ok(Some(pkt));
         }
     }
 
@@ -1287,19 +1396,15 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
         s.last_state_emit_ms = now_ms;
         s.queue_flight_state(now_ms);
         if let Some(pkt) = s.pop_next_queued() {
-            return Ok(pkt);
+            return Ok(Some(pkt));
         }
     }
 
-    if now_ms.saturating_sub(s.last_sensor_emit_ms) < SENSOR_PERIOD_MS {
-        // Keep packets flowing even under very fast poll cadence.
-        let pkt = s.next_sensor_packet(now_ms)?;
-        return Ok(s.pop_next_queued().unwrap_or(pkt));
-    }
-
-    s.last_sensor_emit_ms = now_ms;
-    let pkt = s.next_sensor_packet(now_ms)?;
-    Ok(s.pop_next_queued().unwrap_or(pkt))
+    let Some(link) = next_due_link(&s, now_ms) else {
+        return Ok(None);
+    };
+    mark_sensor_link_emitted(&mut s, link, now_ms);
+    next_scheduled_sensor_packet(&mut s, link, now_ms)
 }
 
 #[cfg(not(feature = "testing"))]
@@ -1308,7 +1413,7 @@ pub fn handle_command(_cmd: &TelemetryCommand) -> bool {
 }
 
 #[cfg(not(feature = "testing"))]
-pub fn _next_state_aware_packet() -> TelemetryResult<Packet> {
+pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
     unreachable!("flight sim only available with testing feature")
 }
 
@@ -1388,9 +1493,17 @@ mod tests {
             FlightState::Armed,
             FlightState::Aborted,
         ] {
-            let sequence = super::sensor_sequence_for_state(state);
-            assert!(!sequence.contains(&DataType::AscentState));
-            assert!(!sequence.contains(&DataType::DescentState));
+            let sequence = super::sensor_sequence_for_state(state, super::SimLink::AvBay);
+            assert!(
+                !sequence
+                    .iter()
+                    .any(|spec| spec.dtype == DataType::AscentState)
+            );
+            assert!(
+                !sequence
+                    .iter()
+                    .any(|spec| spec.dtype == DataType::DescentState)
+            );
         }
 
         for state in [
@@ -1399,9 +1512,17 @@ mod tests {
             FlightState::Coast,
             FlightState::Apogee,
         ] {
-            let sequence = super::sensor_sequence_for_state(state);
-            assert!(sequence.contains(&DataType::AscentState));
-            assert!(!sequence.contains(&DataType::DescentState));
+            let sequence = super::sensor_sequence_for_state(state, super::SimLink::AvBay);
+            assert!(
+                sequence
+                    .iter()
+                    .any(|spec| spec.dtype == DataType::AscentState)
+            );
+            assert!(
+                !sequence
+                    .iter()
+                    .any(|spec| spec.dtype == DataType::DescentState)
+            );
         }
 
         for state in [
@@ -1410,9 +1531,49 @@ mod tests {
             FlightState::Landed,
             FlightState::Recovery,
         ] {
-            let sequence = super::sensor_sequence_for_state(state);
-            assert!(sequence.contains(&DataType::DescentState));
-            assert!(!sequence.contains(&DataType::AscentState));
+            let sequence = super::sensor_sequence_for_state(state, super::SimLink::AvBay);
+            assert!(
+                sequence
+                    .iter()
+                    .any(|spec| spec.dtype == DataType::DescentState)
+            );
+            assert!(
+                !sequence
+                    .iter()
+                    .any(|spec| spec.dtype == DataType::AscentState)
+            );
         }
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn fill_system_schedule_is_separate_from_av_bay_schedule() {
+        use crate::types::FlightState;
+        use sedsprintf_rs_2026::config::DataType;
+
+        let av_bay = super::sensor_sequence_for_state(FlightState::Idle, super::SimLink::AvBay);
+        let fill = super::sensor_sequence_for_state(FlightState::Idle, super::SimLink::FillSystem);
+
+        assert!(av_bay.iter().all(|spec| {
+            matches!(
+                spec.sender,
+                crate::types::Board::FlightComputer
+                    | crate::types::Board::PowerBoard
+                    | crate::types::Board::RFBoard
+            )
+        }));
+        assert!(fill.iter().all(|spec| {
+            matches!(
+                spec.sender,
+                crate::types::Board::DaqBoard
+                    | crate::types::Board::GatewayBoard
+                    | crate::types::Board::ValveBoard
+            )
+        }));
+        assert!(
+            fill.iter()
+                .any(|spec| spec.dtype == DataType::FuelTankPressure)
+        );
+        assert!(av_bay.iter().any(|spec| spec.dtype == DataType::IMUData));
     }
 }

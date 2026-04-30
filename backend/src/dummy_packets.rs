@@ -25,8 +25,7 @@ fn random_packet() -> TelemetryResult<Packet> {
         DataType::GpsData,
         DataType::AscentState,
         DataType::DescentState,
-        DataType::GyroData,
-        DataType::AccelData,
+        DataType::IMUData,
         DataType::BatteryVoltage,
         DataType::BatteryCurrent,
         DataType::BarometerData,
@@ -61,17 +60,14 @@ fn random_packet() -> TelemetryResult<Packet> {
             let velocity_mps = rng.random_range(-80.0..10.0);
             vec![lat, lon, altitude_m, velocity_mps]
         }
-        DataType::GyroData => {
-            let gx = rng.random_range(-5.0..5.0);
-            let gy = rng.random_range(-5.0..5.0);
-            let gz = rng.random_range(-180.0..180.0);
-            vec![gx, gy, gz]
-        }
-        DataType::AccelData => {
+        DataType::IMUData => {
             let ax = rng.random_range(-2.0..2.0);
             let ay = rng.random_range(-2.0..2.0);
             let az = rng.random_range(8.0..11.0);
-            vec![ax, ay, az]
+            let gx = rng.random_range(-5.0..5.0);
+            let gy = rng.random_range(-5.0..5.0);
+            let gz = rng.random_range(-180.0..180.0);
+            vec![ax, ay, az, gx, gy, gz]
         }
         DataType::BatteryVoltage => {
             let sources = [
@@ -118,10 +114,10 @@ fn random_packet() -> TelemetryResult<Packet> {
     )
 }
 
-pub fn get_dummy_packet() -> TelemetryResult<Packet> {
+pub fn get_dummy_packet() -> TelemetryResult<Option<Packet>> {
     if sim_mode_enabled() {
         _next_state_aware_packet()
     } else {
-        random_packet()
+        random_packet().map(Some)
     }
 }

@@ -129,6 +129,46 @@ fn battery_voltage_bounds_by_sender() -> &'static HashMap<String, (f32, f32)> {
     })
 }
 
+fn check_accel_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
+    if let Some(accel_x) = values.first()
+        && ((ACCELERATION_X_MIN_THRESHOLD > *accel_x) || (*accel_x > ACCELERATION_X_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Acceleration X threshold exceeded!");
+    }
+
+    if let Some(accel_y) = values.get(1)
+        && ((ACCELERATION_Y_MIN_THRESHOLD > *accel_y) || (*accel_y > ACCELERATION_Y_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Acceleration Y threshold exceeded!");
+    }
+
+    if let Some(accel_z) = values.get(2)
+        && ((ACCELERATION_Z_MIN_THRESHOLD > *accel_z) || (*accel_z > ACCELERATION_Z_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Acceleration Z threshold exceeded!");
+    }
+}
+
+fn check_gyro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
+    if let Some(gyro_x) = values.first()
+        && ((GYRO_X_MIN_THRESHOLD > *gyro_x) || (*gyro_x > GYRO_X_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Gyro X threshold exceeded!");
+    }
+
+    if let Some(gyro_y) = values.get(1)
+        && ((GYRO_Y_MIN_THRESHOLD > *gyro_y) || (*gyro_y > GYRO_Y_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Gyro Y threshold exceeded!");
+    }
+
+    if let Some(gyro_z) = values.get(2)
+        && ((GYRO_Z_MIN_THRESHOLD > *gyro_z) || (*gyro_z > GYRO_Z_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Gyro Z threshold exceeded!");
+    }
+}
+
 async fn insert_flight_state_with_retry(
     db: &SqlitePool,
     timestamp_ms: i64,
@@ -362,54 +402,19 @@ pub async fn safety_task(
             match pkt.data_type() {
                 DataType::AccelData => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
-
-                    // X axis
-                    if let Some(accel_x) = values.first()
-                        && ((ACCELERATION_X_MIN_THRESHOLD > *accel_x)
-                            || (*accel_x > ACCELERATION_X_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Acceleration X threshold exceeded!");
-                    }
-
-                    // Y axis
-                    if let Some(accel_y) = values.get(1)
-                        && ((ACCELERATION_Y_MIN_THRESHOLD > *accel_y)
-                            || (*accel_y > ACCELERATION_Y_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Acceleration Y threshold exceeded!");
-                    }
-
-                    // Z axis
-                    if let Some(accel_z) = values.get(2)
-                        && ((ACCELERATION_Z_MIN_THRESHOLD > *accel_z)
-                            || (*accel_z > ACCELERATION_Z_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Acceleration Z threshold exceeded!");
-                    }
+                    check_accel_thresholds(&values, &mut cycle_warnings);
                 }
 
                 DataType::GyroData => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
+                    check_gyro_thresholds(&values, &mut cycle_warnings);
+                }
 
-                    // X axis
-                    if let Some(gyro_x) = values.first()
-                        && ((GYRO_X_MIN_THRESHOLD > *gyro_x) || (*gyro_x > GYRO_X_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Gyro X threshold exceeded!");
-                    }
-
-                    // Y axis
-                    if let Some(gyro_y) = values.get(1)
-                        && ((GYRO_Y_MIN_THRESHOLD > *gyro_y) || (*gyro_y > GYRO_Y_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Gyro Y threshold exceeded!");
-                    }
-
-                    // Z axis
-                    if let Some(gyro_z) = values.get(2)
-                        && ((GYRO_Z_MIN_THRESHOLD > *gyro_z) || (*gyro_z > GYRO_Z_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Gyro Z threshold exceeded!");
+                DataType::IMUData => {
+                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 6]);
+                    if values.len() >= 6 {
+                        check_accel_thresholds(&values[..3], &mut cycle_warnings);
+                        check_gyro_thresholds(&values[3..6], &mut cycle_warnings);
                     }
                 }
 

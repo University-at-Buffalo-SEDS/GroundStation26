@@ -449,9 +449,9 @@ impl AuthManager {
                 ));
             }
 
-            let config = self.load_users_file().map_err(|e| {
-                AuthFailure::Internal(format!("failed to load users.json: {e}"))
-            })?;
+            let config = self
+                .load_users_file()
+                .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
             let username = row.get::<String, _>("username");
             let (command_access, calibration_access) = configured_user_access(&config, &username);
 
@@ -523,7 +523,6 @@ impl AuthManager {
     }
 }
 
-
 async fn create_session_for_user(
     db: &SqlitePool,
     config: &UsersFile,
@@ -535,11 +534,7 @@ async fn create_session_for_user(
         now_ms + (config.session_ttl_seconds.min(i64::MAX as u64 / 1000) as i64 * 1000);
     let token = generate_token();
     let permissions = user.permissions.normalized();
-    let session_type = if remember_me {
-        "remembered"
-    } else {
-        "session"
-    };
+    let session_type = if remember_me { "remembered" } else { "session" };
     let allowed_commands_json = serde_json::to_string(&user.command_access.allowed_commands)
         .map_err(|e| AuthFailure::Internal(format!("failed to serialize command access: {e}")))?;
 

@@ -298,16 +298,13 @@ fn from_old_format(old: OldCalibrationFile) -> LoadcellCalibrationFile {
         ..LoadcellCalibrationFile::default()
     };
     for s in old.sensors {
-        match s.sensor_id.as_str() {
-            "KG1000" => {
-                cfg.ch1.m = Some(s.slope);
-                cfg.ch1.b = Some(s.intercept);
-                cfg.ch1_zero_raw = s.zero_raw;
-                if let (Some(raw), Some(kg)) = (s.span_raw, s.span_known_kg) {
-                    cfg.points_ch1.push(PointCh1 { kg, ch1_raw: raw });
-                }
+        if s.sensor_id.as_str() == "KG1000" {
+            cfg.ch1.m = Some(s.slope);
+            cfg.ch1.b = Some(s.intercept);
+            cfg.ch1_zero_raw = s.zero_raw;
+            if let (Some(raw), Some(kg)) = (s.span_raw, s.span_known_kg) {
+                cfg.points_ch1.push(PointCh1 { kg, ch1_raw: raw });
             }
-            _ => {}
         }
     }
     cfg

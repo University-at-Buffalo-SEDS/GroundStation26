@@ -449,7 +449,7 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
             .iter()
             .filter_map(|sender_id| fixes.get(*sender_id))
             .chain(fixes.values())
-            .find_map(gps_point_from_values)
+            .find_map(|values| gps_point_from_values(values))
     };
     if live_rocket.is_some() {
         return Json(GpsResponse {
@@ -478,7 +478,7 @@ async fn get_gps(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     Json(GpsResponse { rocket }).into_response()
 }
 
-fn gps_point_from_values(values: &Vec<Option<f32>>) -> Option<GpsPoint> {
+fn gps_point_from_values(values: &[Option<f32>]) -> Option<GpsPoint> {
     match (value_at(values, 0), value_at(values, 1)) {
         (Some(lat), Some(lon)) => Some(GpsPoint {
             lat: lat as f64,
@@ -500,7 +500,11 @@ async fn get_layout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
                 layout.actions_tab.actions.clear();
             } else if !principal.command_access.allowed_commands.is_empty() {
                 layout.actions_tab.actions.retain(|action| {
-                    principal.command_access.allowed_commands.iter().any(|cmd| cmd == &action.cmd)
+                    principal
+                        .command_access
+                        .allowed_commands
+                        .iter()
+                        .any(|cmd| cmd == &action.cmd)
                 });
             }
             Json(layout).into_response()
@@ -1255,10 +1259,7 @@ async fn get_notifications(
 }
 
 /// Returns the current list of telemetry/backend messages.
-async fn get_messages(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn get_messages(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }

@@ -476,11 +476,7 @@ impl UartComms {
     ) -> TelemetryResult<bool> {
         let mut processed_any = false;
 
-        loop {
-            let payload: Vec<u8> = match self.try_take_packet()? {
-                Some(payload) => payload,
-                None => break,
-            };
+        while let Some(payload) = self.try_take_packet()? {
             processed_any = true;
             if !is_valid_serialized_packet_or_ack(&payload) {
                 maybe_log_raw_uart_parse_issue(
@@ -504,11 +500,7 @@ impl UartComms {
     ) -> TelemetryResult<bool> {
         let mut processed_any = false;
 
-        loop {
-            let payload: Vec<u8> = match self.try_take_packet()? {
-                Some(payload) => payload,
-                None => break,
-            };
+        while let Some(payload) = self.try_take_packet()? {
             processed_any = true;
             if !is_valid_serialized_packet_or_ack(&payload) {
                 maybe_log_raw_uart_parse_issue(
@@ -1867,6 +1859,8 @@ pub struct DummyComms {
     #[cfg(feature = "testing")]
     discovery_next_announce_ms: u64,
     #[cfg(feature = "testing")]
+    timesync_next_announce_ms: u64,
+    #[cfg(feature = "testing")]
     pending_rx: std::collections::VecDeque<sedsprintf_rs_2026::packet::Packet>,
 }
 
@@ -1878,6 +1872,8 @@ impl DummyComms {
             side_id: None,
             #[cfg(feature = "testing")]
             discovery_next_announce_ms: 0,
+            #[cfg(feature = "testing")]
+            timesync_next_announce_ms: 0,
             #[cfg(feature = "testing")]
             pending_rx: std::collections::VecDeque::new(),
         }
@@ -1921,6 +1917,15 @@ impl DummyComms {
     }
 
     #[cfg(feature = "testing")]
+    fn simulated_timesync_priority(&self) -> u64 {
+        match self.name {
+            "Rocket Comms" => 60,
+            "Umbilical Comms" => 40,
+            _ => 100,
+        }
+    }
+
+    #[cfg(feature = "testing")]
     fn maybe_queue_discovery(&mut self) -> TelemetryResult<()> {
         let now_ms = crate::telemetry_task::get_current_timestamp_ms();
         if now_ms < self.discovery_next_announce_ms {
@@ -1950,6 +1955,31 @@ impl DummyComms {
             now_ms.saturating_add(sedsprintf_rs_2026::discovery::DISCOVERY_SLOW_INTERVAL_MS);
         Ok(())
     }
+
+    #[cfg(feature = "testing")]
+    fn maybe_queue_timesync(&mut self) -> TelemetryResult<()> {
+        if !crate::telemetry_task::timesync_enabled() {
+            return Ok(());
+        }
+
+        let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+        if now_ms < self.timesync_next_announce_ms {
+            return Ok(());
+        }
+
+        if !self.simulated_timesync_sources().is_empty() {
+            self.pending_rx.push_back(
+                sedsprintf_rs_2026::timesync::build_timesync_announce_with_sender(
+                    self.simulated_discovery_sender(),
+                    self.simulated_timesync_priority(),
+                    now_ms,
+                )?,
+            );
+        }
+
+        self.timesync_next_announce_ms = now_ms.saturating_add(1_000);
+        Ok(())
+    }
 }
 
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
@@ -1965,6 +1995,7 @@ impl CommsDevice for DummyComms {
                 .side_id
                 .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
             self.maybe_queue_discovery()?;
+            self.maybe_queue_timesync()?;
             if let Some(pkt) = self.pending_rx.pop_front() {
                 if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
                     && matches!(
@@ -1976,16 +2007,18 @@ impl CommsDevice for DummyComms {
                 }
                 return _router.rx_queue_from_side(pkt, side_id);
             }
-            let pkt = get_dummy_packet()?;
-            if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
-                && matches!(
-                    pkt.data_type(),
-                    DataType::GpsData | DataType::GpsSatelliteNumber
-                )
-            {
-                packet_tap(&pkt);
+            if let Some(pkt) = get_dummy_packet()? {
+                if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
+                    && matches!(
+                        pkt.data_type(),
+                        DataType::GpsData | DataType::GpsSatelliteNumber
+                    )
+                {
+                    packet_tap(&pkt);
+                }
+                return _router.rx_queue_from_side(pkt, side_id);
             }
-            _router.rx_queue_from_side(pkt, side_id)
+            Ok(())
         }
 
         #[cfg(not(feature = "testing"))]
@@ -1999,9 +2032,32 @@ impl CommsDevice for DummyComms {
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         use sedsprintf_rs_2026::config::DataType;
+        use sedsprintf_rs_2026::serialize::deserialize_packet;
         use sedsprintf_rs_2026::serialize::peek_envelope;
 
         if peek_envelope(payload).unwrap().ty == DataType::Heartbeat {
+            return Ok(());
+        }
+        #[cfg(feature = "testing")]
+        if crate::telemetry_task::timesync_enabled()
+            && let Ok(pkt) = deserialize_packet(payload)
+            && pkt.data_type() == DataType::TimeSyncRequest
+            && !self.simulated_timesync_sources().is_empty()
+        {
+            let req = sedsprintf_rs_2026::timesync::decode_timesync_request(&pkt)?;
+            let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+            let mut response_bytes = Vec::with_capacity(4 * std::mem::size_of::<u64>());
+            for word in [req.seq, req.t1_ms, now_ms, now_ms] {
+                response_bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            self.pending_rx
+                .push_back(sedsprintf_rs_2026::packet::Packet::new(
+                    DataType::TimeSyncResponse,
+                    &[DataEndpoint::TimeSync],
+                    self.simulated_discovery_sender(),
+                    now_ms,
+                    response_bytes.into(),
+                )?);
             return Ok(());
         }
         static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
