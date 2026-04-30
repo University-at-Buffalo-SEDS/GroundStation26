@@ -2032,7 +2032,6 @@ impl CommsDevice for DummyComms {
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         use sedsprintf_rs_2026::config::DataType;
-        use sedsprintf_rs_2026::serialize::deserialize_packet;
         use sedsprintf_rs_2026::serialize::peek_envelope;
 
         if peek_envelope(payload).unwrap().ty == DataType::Heartbeat {
@@ -2040,7 +2039,7 @@ impl CommsDevice for DummyComms {
         }
         #[cfg(feature = "testing")]
         if crate::telemetry_task::timesync_enabled()
-            && let Ok(pkt) = deserialize_packet(payload)
+            && let Ok(pkt) = sedsprintf_rs_2026::serialize::deserialize_packet(payload)
             && pkt.data_type() == DataType::TimeSyncRequest
             && !self.simulated_timesync_sources().is_empty()
         {
