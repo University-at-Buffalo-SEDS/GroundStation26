@@ -333,13 +333,30 @@
                 }
               },
               {
-                "label": "Runtime",
-                "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
+                "label": "Days",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_DAYS",
                 "index": 0,
                 "formatter": {
-                  "kind": "number",
-                  "precision": 0,
-                  "suffix": " min"
+                  "kind": "integer",
+                  "suffix": " d"
+                }
+              },
+              {
+                "label": "Hours",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_HOURS",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " h"
+                }
+              },
+              {
+                "label": "Minutes",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES_PART",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " m"
                 }
               }
             ]
@@ -367,13 +384,30 @@
                 }
               },
               {
-                "label": "Runtime",
-                "data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
+                "label": "Days",
+                "data_type": "FILL_BOX_POWER_REMAINING_DAYS",
                 "index": 0,
                 "formatter": {
-                  "kind": "number",
-                  "precision": 0,
-                  "suffix": " min"
+                  "kind": "integer",
+                  "suffix": " d"
+                }
+              },
+              {
+                "label": "Hours",
+                "data_type": "FILL_BOX_POWER_REMAINING_HOURS",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " h"
+                }
+              },
+              {
+                "label": "Minutes",
+                "data_type": "FILL_BOX_POWER_REMAINING_MINUTES_PART",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " m"
                 }
               }
             ]
@@ -1493,7 +1527,7 @@
   "battery": {
     "estimator": {
       "window_seconds": 300,
-      "min_drop_rate_v_per_min": 0.005
+      "min_drop_rate_v_per_min": 0.0005
     },
     "sources": [
       {

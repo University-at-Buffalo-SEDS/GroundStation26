@@ -959,6 +959,36 @@ fn battery_percent(voltage: f32, empty: f32, full: f32, exponent: f32) -> f32 {
     (linear.powf(exp) * 100.0).clamp(0.0, 100.0)
 }
 
+fn battery_runtime_parts_data_types(base_data_type: &str) -> (String, String, String) {
+    if let Some(prefix) = base_data_type.strip_suffix("_REMAINING_MINUTES") {
+        return (
+            format!("{prefix}_REMAINING_DAYS"),
+            format!("{prefix}_REMAINING_HOURS"),
+            format!("{prefix}_REMAINING_MINUTES_PART"),
+        );
+    }
+
+    (
+        format!("{base_data_type}_DAYS"),
+        format!("{base_data_type}_HOURS"),
+        format!("{base_data_type}_MINUTES_PART"),
+    )
+}
+
+fn battery_runtime_parts(remaining_min: Option<f32>) -> (Option<f32>, Option<f32>, Option<f32>) {
+    let Some(total_minutes_f32) = remaining_min else {
+        return (None, None, None);
+    };
+
+    let mut total_minutes = total_minutes_f32.max(0.0).round() as i64;
+    let days = total_minutes / (24 * 60);
+    total_minutes %= 24 * 60;
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+
+    (Some(days as f32), Some(hours as f32), Some(minutes as f32))
+}
+
 fn update_speed_ema(prev: Option<f32>, sample: f32, alpha: f32) -> f32 {
     prev.map(|v| v + alpha * (sample - v)).unwrap_or(sample)
 }
@@ -1192,22 +1222,35 @@ async fn emit_derived_battery_rows(
             Some(remaining_voltage / rate)
         });
         let remaining_min = smooth_remaining_minutes(&source.id, ts_ms, raw_remaining_min);
+        let (remaining_days, remaining_hours, remaining_minutes_part) =
+            battery_runtime_parts(remaining_min);
+        let (remaining_days_data_type, remaining_hours_data_type, remaining_minutes_part_data_type) =
+            battery_runtime_parts_data_types(&source.remaining_minutes_data_type);
 
-        let rows: [(&str, Vec<Option<f32>>); 3] = [
-            (&source.percent_data_type, vec![Some(pct)]),
-            (&source.drop_rate_data_type, vec![drop_rate_v_per_min]),
-            (&source.remaining_minutes_data_type, vec![remaining_min]),
+        let rows: Vec<(String, Vec<Option<f32>>)> = vec![
+            (source.percent_data_type.clone(), vec![Some(pct)]),
+            (source.drop_rate_data_type.clone(), vec![drop_rate_v_per_min]),
+            (
+                source.remaining_minutes_data_type.clone(),
+                vec![remaining_min],
+            ),
+            (remaining_days_data_type, vec![remaining_days]),
+            (remaining_hours_data_type, vec![remaining_hours]),
+            (
+                remaining_minutes_part_data_type,
+                vec![remaining_minutes_part],
+            ),
         ];
 
         for (data_type, values) in rows {
-            if should_persist_telemetry_sample(data_type, sender_id, ts_ms) {
+            if should_persist_telemetry_sample(&data_type, sender_id, ts_ms) {
                 queue_db_write(
                     state,
                     db_tx,
                     db_overflow,
                     DbWrite::Telemetry {
                         timestamp_ms: ts_ms,
-                        data_type: data_type.to_string(),
+                        data_type: data_type.clone(),
                         sender_id: sender_id.to_string(),
                         values_json: telemetry_values_json(&values),
                         payload_json: payload_json.to_string(),
@@ -1218,7 +1261,7 @@ async fn emit_derived_battery_rows(
 
             let row = TelemetryRow {
                 timestamp_ms: ts_ms,
-                data_type: data_type.to_string(),
+                data_type,
                 sender_id: sender_id.to_string(),
                 values,
             };
