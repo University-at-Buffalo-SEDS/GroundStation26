@@ -562,7 +562,12 @@
               {
                 "label": "Runtime",
                 "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 0,
+                  "suffix": " min"
+                }
               }
             ]
           },
@@ -591,7 +596,12 @@
               {
                 "label": "Runtime",
                 "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 0,
+                  "suffix": " min"
+                }
               }
             ]
           },
@@ -620,7 +630,12 @@
               {
                 "label": "Runtime",
                 "data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 0,
+                  "suffix": " min"
+                }
               }
             ]
           }

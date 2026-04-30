@@ -762,7 +762,12 @@
               {
                 "label": "Runtime",
                 "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 0,
+                  "suffix": " min"
+                }
               }
             ]
           },
@@ -791,7 +796,12 @@
               {
                 "label": "Runtime",
                 "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 0,
+                  "suffix": " min"
+                }
               }
             ]
           },
@@ -820,7 +830,12 @@
               {
                 "label": "Runtime",
                 "data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 0,
+                  "suffix": " min"
+                }
               }
             ]
           }
@@ -1951,7 +1966,7 @@
         "drop_rate_data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
         "empty_voltage": 7.3,
-        "full_voltage": 8.4,
+        "full_voltage": 8.0,
         "curve_exponent": 1.0
       },
       {
@@ -1962,8 +1977,8 @@
         "percent_data_type": "VALVE_BOARD_BATTERY_PERCENT",
         "drop_rate_data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
-        "empty_voltage": 13.6,
-        "full_voltage": 15.2,
+        "empty_voltage": 12.3,
+        "full_voltage": 16.5,
         "curve_exponent": 1.0
       },
       {
@@ -1974,8 +1989,8 @@
         "percent_data_type": "FILL_BOX_POWER_PERCENT",
         "drop_rate_data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
-        "empty_voltage": 13.6,
-        "full_voltage": 15.2,
+        "empty_voltage": 12.6,
+        "full_voltage": 16.5,
         "curve_exponent": 1.0
       }
     ]

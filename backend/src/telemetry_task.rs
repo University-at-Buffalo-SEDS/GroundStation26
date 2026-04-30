@@ -1183,7 +1183,7 @@ async fn emit_derived_battery_rows(
             push_battery_sample_and_compute_drop_rate(&source.id, ts_ms, voltage, window_ms);
 
         let (empty_v, full_v) = battery_bounds_for_source(source);
-        let pct = battery_percent(smoothed_voltage, empty_v, full_v, source.curve_exponent);
+        let pct = battery_percent(voltage, empty_v, full_v, source.curve_exponent);
         let raw_remaining_min = drop_rate_v_per_min.and_then(|rate| {
             if rate < min_drop_rate {
                 return None;
