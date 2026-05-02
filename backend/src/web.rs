@@ -614,7 +614,7 @@ async fn get_loadcell_calibration(
 async fn set_loadcell_calibration(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(cfg): Json<loadcell::LoadcellCalibrationFile>,
+    Json(mut cfg): Json<loadcell::LoadcellCalibrationFile>,
 ) -> impl IntoResponse {
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(principal) => principal,
@@ -623,6 +623,7 @@ async fn set_loadcell_calibration(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    loadcell::normalize_calibration(&mut cfg);
     {
         let mut slot = state.loadcell_calibration.lock().unwrap();
         *slot = cfg.clone();

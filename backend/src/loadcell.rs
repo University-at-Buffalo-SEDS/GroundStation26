@@ -322,7 +322,7 @@ pub fn load_or_default() -> LoadcellCalibrationFile {
                 .map(from_old_format)
         })
         .unwrap_or_default();
-    sync_legacy_channels_into_extra(&mut cfg);
+    normalize_calibration(&mut cfg);
     let _ = save(&cfg);
     cfg
 }
@@ -369,6 +369,42 @@ fn sync_legacy_channels_into_extra(cfg: &mut LoadcellCalibrationFile) {
     if iadc.fit.is_none() {
         iadc.fit = cfg.iadc_fit.clone();
     }
+}
+
+fn sync_extra_channels_into_legacy(cfg: &mut LoadcellCalibrationFile) {
+    if let Some(ch1) = cfg.extra_channels.get("ch1") {
+        cfg.ch1 = ch1.linear.clone();
+        cfg.ch1_zero_raw = ch1.zero_raw;
+        cfg.ch1_fit = ch1.fit.clone();
+        cfg.points_ch1 = ch1
+            .points
+            .iter()
+            .map(|point| PointCh1 {
+                kg: point.expected,
+                ch1_raw: point.raw,
+            })
+            .collect();
+    }
+
+    if let Some(iadc) = cfg.extra_channels.get("iadc") {
+        cfg.iadc = iadc.linear.clone();
+        cfg.iadc_zero_raw = iadc.zero_raw;
+        cfg.iadc_fit = iadc.fit.clone();
+        cfg.points_iadc = iadc
+            .points
+            .iter()
+            .map(|point| PointIadc {
+                expected: point.expected,
+                iadc_raw: point.raw,
+            })
+            .collect();
+    }
+}
+
+pub fn normalize_calibration(cfg: &mut LoadcellCalibrationFile) {
+    sync_legacy_channels_into_extra(cfg);
+    sync_extra_channels_into_legacy(cfg);
+    update_weights_kg(cfg);
 }
 
 pub fn save(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
@@ -473,12 +509,14 @@ pub fn upsert_point(
             }
         }
     }
+    sync_extra_channels_into_legacy(cfg);
     update_weights_kg(cfg);
 }
 
 pub fn capture_zero(cfg: &mut LoadcellCalibrationFile, sensor_id: &str, raw: f32) {
     let channel = CalibrationChannel::from_str(sensor_id);
     *zero_raw_mut(cfg, &channel) = Some(raw);
+    sync_extra_channels_into_legacy(cfg);
 }
 
 pub fn capture_span(cfg: &mut LoadcellCalibrationFile, sensor_id: &str, raw: f32, known_kg: f32) {
@@ -1024,10 +1062,11 @@ pub fn refit_channel(
             });
         }
     }
+    sync_extra_channels_into_legacy(cfg);
     Ok(())
 }
 
-fn eval_channel_with_fit(linear: &ChannelLinear, fit: Option<&FitMeta>, raw: f32) -> Option<f32> {
+fn eval_channel_base(linear: &ChannelLinear, fit: Option<&FitMeta>, raw: f32) -> Option<f32> {
     let fit_type = fit.and_then(|f| f.fit_type.as_deref());
     if let Some(meta) = fit {
         let x = raw - meta.x0.unwrap_or(0.0);
@@ -1037,25 +1076,59 @@ fn eval_channel_with_fit(linear: &ChannelLinear, fit: Option<&FitMeta>, raw: f32
             let c = meta.c.unwrap_or(0.0);
             let d = meta.d.unwrap_or(0.0);
             let e = meta.e.unwrap_or(0.0);
-            return Some((a * x.powi(4) + b * x.powi(3) + c * x * x + d * x + e).max(0.0));
+            return Some(a * x.powi(4) + b * x.powi(3) + c * x * x + d * x + e);
         }
         if fit_type == Some("poly3") {
             let a = meta.a?;
             let b = meta.b?;
             let c = meta.c.unwrap_or(0.0);
             let d = meta.d.unwrap_or(0.0);
-            return Some((a * x * x * x + b * x * x + c * x + d).max(0.0));
+            return Some(a * x * x * x + b * x * x + c * x + d);
         }
         if fit_type == Some("poly2") {
             let a = meta.a?;
             let b = meta.b?;
             let c = meta.c.unwrap_or(0.0);
-            return Some((a * x * x + b * x + c).max(0.0));
+            return Some(a * x * x + b * x + c);
         }
     }
     let m = linear.m?;
     let b = linear.b.unwrap_or(0.0);
-    Some((m * raw + b).max(0.0))
+    Some(m * raw + b)
+}
+
+fn eval_channel_with_zero(
+    linear: &ChannelLinear,
+    fit: Option<&FitMeta>,
+    zero_raw: Option<f32>,
+    raw: f32,
+) -> Option<f32> {
+    let base = eval_channel_base(linear, fit, raw)?;
+    let zero_offset = zero_raw
+        .and_then(|zero| eval_channel_base(linear, fit, zero))
+        .unwrap_or(0.0);
+    Some((base - zero_offset).max(0.0))
+}
+
+fn calibrated_channel_value(
+    cfg: &LoadcellCalibrationFile,
+    channel_key: &str,
+    raw: f32,
+) -> Option<f32> {
+    if let Some(channel) = cfg.extra_channels.get(channel_key) {
+        return eval_channel_with_zero(
+            &channel.linear,
+            channel.fit.as_ref(),
+            channel.zero_raw,
+            raw,
+        );
+    }
+
+    match channel_key {
+        "ch1" => eval_channel_with_zero(&cfg.ch1, cfg.ch1_fit.as_ref(), cfg.ch1_zero_raw, raw),
+        "iadc" => eval_channel_with_zero(&cfg.iadc, cfg.iadc_fit.as_ref(), cfg.iadc_zero_raw, raw),
+        _ => None,
+    }
 }
 
 pub fn calibrated_weight_kg(
@@ -1064,7 +1137,7 @@ pub fn calibrated_weight_kg(
     raw: f32,
 ) -> Option<f32> {
     match sensor_id {
-        "KG1000" => eval_channel_with_fit(&cfg.ch1, cfg.ch1_fit.as_ref(), raw),
+        "KG1000" => calibrated_channel_value(cfg, "ch1", raw),
         _ => None,
     }
 }
@@ -1076,9 +1149,7 @@ pub fn calibrated_sensor_value(
 ) -> Option<f32> {
     match sensor_id {
         RAW_LOADCELL_DATA_TYPE_1000KG => calibrated_weight_kg(cfg, sensor_id, raw),
-        RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
-            eval_channel_with_fit(&cfg.iadc, cfg.iadc_fit.as_ref(), raw)
-        }
+        RAW_PRESSURE_TRANSDUCER_DATA_TYPE => calibrated_channel_value(cfg, "iadc", raw),
         _ => None,
     }
 }
@@ -1086,4 +1157,58 @@ pub fn calibrated_sensor_value(
 pub fn fill_percent(cfg: &LoadcellCalibrationFile, weight_kg: f32) -> f32 {
     let denom = cfg.full_mass_kg.unwrap_or(DEFAULT_FULL_MASS_KG).max(0.0001);
     ((weight_kg / denom) * 100.0).clamp(0.0, 100.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captured_zero_shifts_linear_output_without_refit() {
+        let mut cfg = LoadcellCalibrationFile::default();
+        cfg.extra_channels.insert(
+            "ch1".to_string(),
+            GenericCalibrationChannel {
+                linear: ChannelLinear {
+                    m: Some(2.0),
+                    b: Some(1.0),
+                },
+                ..GenericCalibrationChannel::default()
+            },
+        );
+        sync_extra_channels_into_legacy(&mut cfg);
+
+        assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 10.0), Some(21.0));
+
+        capture_zero(&mut cfg, "ch1", 10.0);
+
+        assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 10.0), Some(0.0));
+        assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 12.0), Some(4.0));
+    }
+
+    #[test]
+    fn captured_zero_shifts_polynomial_output_without_refit() {
+        let mut cfg = LoadcellCalibrationFile::default();
+        cfg.extra_channels.insert(
+            "ch1".to_string(),
+            GenericCalibrationChannel {
+                fit: Some(FitMeta {
+                    fit_type: Some("poly2".to_string()),
+                    a: Some(1.0),
+                    b: Some(0.0),
+                    c: Some(5.0),
+                    ..FitMeta::default()
+                }),
+                ..GenericCalibrationChannel::default()
+            },
+        );
+        sync_extra_channels_into_legacy(&mut cfg);
+
+        assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 3.0), Some(14.0));
+
+        capture_zero(&mut cfg, "ch1", 3.0);
+
+        assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 3.0), Some(0.0));
+        assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 4.0), Some(7.0));
+    }
 }

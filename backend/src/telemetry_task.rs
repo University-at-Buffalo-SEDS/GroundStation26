@@ -1229,7 +1229,10 @@ async fn emit_derived_battery_rows(
 
         let rows: Vec<(String, Vec<Option<f32>>)> = vec![
             (source.percent_data_type.clone(), vec![Some(pct)]),
-            (source.drop_rate_data_type.clone(), vec![drop_rate_v_per_min]),
+            (
+                source.drop_rate_data_type.clone(),
+                vec![drop_rate_v_per_min],
+            ),
             (
                 source.remaining_minutes_data_type.clone(),
                 vec![remaining_min],
