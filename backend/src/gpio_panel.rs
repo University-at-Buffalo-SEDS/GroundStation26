@@ -43,6 +43,8 @@ pub const NITROUS_TANK_VALVE_LED: u8 = 13;
 pub const NORMALLY_OPEN_PIN: u8 = 26;
 pub const NORMALLY_OPEN_LED: u8 = 19;
 
+pub const WARNING_ACK_PIN: u8 = 25;
+
 const LED_FRAME_MS: u64 = 16;
 const LED_DISABLED_BRIGHTNESS: f64 = 0.0;
 const LED_ENABLED_IDLE_BRIGHTNESS: f64 = 0.62;
@@ -74,6 +76,7 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
     gpio.setup_input_pin(NITROGEN_TANK_VALVE_PIN)?;
     gpio.setup_input_pin(NITROUS_TANK_VALVE_PIN)?;
     gpio.setup_input_pin(RETRACT_PIN)?;
+    gpio.setup_input_pin(WARNING_ACK_PIN)?;
 
     // Outputs (LEDs + ignition line)
     gpio.setup_output_pin(IGNITION_PIN)?;
@@ -186,6 +189,21 @@ fn setup_callbacks(
         |a| a.fill_lines,
         TelemetryCommand::RetractPlumbing,
         debounce,
+    )?;
+
+    let state_warning_ack = state.clone();
+    gpio.setup_callback_input_pin(
+        WARNING_ACK_PIN,
+        Trigger::RisingEdge,
+        debounce,
+        move |is_high| {
+            if !is_high {
+                return;
+            }
+            state_warning_ack.acknowledge_warnings_through(
+                crate::telemetry_task::get_current_timestamp_ms() as i64,
+            );
+        },
     )?;
 
     Ok(())

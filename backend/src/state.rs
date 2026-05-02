@@ -13,7 +13,7 @@ use crate::types::{
     NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus, TelemetryCommand,
     TelemetryRow, canonical_sender_id,
 };
-use crate::web::{AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
+use crate::web::{AlertAckStateMsg, AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
 use sedsprintf_rs_2026::config::DataEndpoint;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::Router;
@@ -64,6 +64,12 @@ pub struct AppState {
 
     /// Error messages → frontend
     pub errors_tx: broadcast::Sender<ErrorMsg>,
+
+    /// Shared alert-ack state broadcast to connected frontends.
+    pub alert_ack_state: Arc<Mutex<AlertAckStateMsg>>,
+
+    /// Broadcast whenever shared alert-ack state changes.
+    pub alert_ack_tx: broadcast::Sender<AlertAckStateMsg>,
 
     /// Dashboard reset events → frontend
     pub dashboard_reset_tx: broadcast::Sender<()>,
@@ -227,6 +233,41 @@ impl AppState {
 
     pub fn broadcast_dashboard_reset(&self) {
         let _ = self.dashboard_reset_tx.send(());
+    }
+
+    /// Returns the shared backend-driven alert-ack snapshot.
+    pub fn alert_ack_state_snapshot(&self) -> AlertAckStateMsg {
+        self.alert_ack_state.lock().unwrap().clone()
+    }
+
+    /// Updates the shared warning ack timestamp and broadcasts if it changed.
+    pub fn acknowledge_warnings_through(&self, timestamp_ms: i64) -> AlertAckStateMsg {
+        let mut slot = self.alert_ack_state.lock().unwrap();
+        let next_ts = timestamp_ms.max(slot.warning_ack_timestamp_ms);
+        if next_ts != slot.warning_ack_timestamp_ms {
+            slot.warning_ack_timestamp_ms = next_ts;
+            let snapshot = slot.clone();
+            drop(slot);
+            let _ = self.alert_ack_tx.send(snapshot.clone());
+            snapshot
+        } else {
+            slot.clone()
+        }
+    }
+
+    /// Updates the shared error ack timestamp and broadcasts if it changed.
+    pub fn acknowledge_errors_through(&self, timestamp_ms: i64) -> AlertAckStateMsg {
+        let mut slot = self.alert_ack_state.lock().unwrap();
+        let next_ts = timestamp_ms.max(slot.error_ack_timestamp_ms);
+        if next_ts != slot.error_ack_timestamp_ms {
+            slot.error_ack_timestamp_ms = next_ts;
+            let snapshot = slot.clone();
+            drop(slot);
+            let _ = self.alert_ack_tx.send(snapshot.clone());
+            snapshot
+        } else {
+            slot.clone()
+        }
     }
 
     pub fn launch_clock_snapshot(&self) -> LaunchClockMsg {

@@ -67,6 +67,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::time::Duration;
 
+use crate::web::AlertAckStateMsg;
 use crate::web::emit_error;
 use tokio::sync::{broadcast, mpsc};
 
@@ -285,6 +286,8 @@ async fn main() -> anyhow::Result<()> {
         ws_tx,
         warnings_tx: broadcast::channel(alerts_capacity).0,
         errors_tx: broadcast::channel(alerts_capacity).0,
+        alert_ack_state: Arc::new(Mutex::new(AlertAckStateMsg::default())),
+        alert_ack_tx: broadcast::channel(16).0,
         dashboard_reset_tx,
         db: Arc::new(Mutex::new(db)),
         db_path: Arc::new(Mutex::new(db_path_str.clone())),

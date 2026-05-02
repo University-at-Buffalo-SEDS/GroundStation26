@@ -201,6 +201,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/notifications/{id}/dismiss",
             post(dismiss_notification),
         )
+        .route("/api/alerts/ack", post(post_alert_ack))
         .route("/api/action_policy", get(get_action_policy))
         .route(
             "/api/flight_setup",
@@ -328,6 +329,7 @@ pub enum WsOutMsg {
     FlightState(FlightStateMsg),
     LaunchClock(LaunchClockMsg),
     Error(ErrorMsg),
+    AlertAckState(AlertAckStateMsg),
     BoardStatus(BoardStatusMsg),
     NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
@@ -367,6 +369,12 @@ pub struct WarningMsg {
 pub struct ErrorMsg {
     pub timestamp_ms: i64,
     pub message: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct AlertAckStateMsg {
+    pub warning_ack_timestamp_ms: i64,
+    pub error_ack_timestamp_ms: i64,
 }
 
 /// DTO returned by /api/alerts
@@ -1477,6 +1485,19 @@ struct WsAuthQuery {
     token: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AlertAckSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Deserialize)]
+struct AlertAckRequest {
+    severity: AlertAckSeverity,
+    timestamp_ms: i64,
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -1505,6 +1526,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let mut telemetry_rx = state.ws_tx.subscribe();
     let mut warnings_rx = state.warnings_tx.subscribe();
     let mut errors_rx = state.errors_tx.subscribe();
+    let mut alert_ack_rx = state.alert_ack_tx.subscribe();
     let mut state_rx = state.state_tx.subscribe();
     let mut launch_clock_rx = state.launch_clock_tx.subscribe();
     let mut board_status_rx = state.board_status_tx.subscribe();
@@ -1582,6 +1604,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         if ws_out_tx.send(initial_recording_status).await.is_err() {
             return;
         }
+        let initial_alert_ack_state = serde_json::to_string(&WsOutMsg::AlertAckState(
+            state_for_send.alert_ack_state_snapshot(),
+        ))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_alert_ack_state).await.is_err() {
+            return;
+        }
         let initial_network_topology = serde_json::to_string(&WsOutMsg::NetworkTopology(
             state_for_send
                 .network_topology_snapshot(crate::telemetry_task::get_current_timestamp_ms()),
@@ -1648,6 +1677,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     match recv {
                         Ok(err) => {
                             let msg = WsOutMsg::Error(err);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                recv = alert_ack_rx.recv() => {
+                    match recv {
+                        Ok(ack_state) => {
+                            let msg = WsOutMsg::AlertAckState(ack_state);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;
@@ -2000,6 +2043,22 @@ async fn get_alerts(
     });
 
     Json(alerts).into_response()
+}
+
+async fn post_alert_ack(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AlertAckRequest>,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+
+    let snapshot = match body.severity {
+        AlertAckSeverity::Warning => state.acknowledge_warnings_through(body.timestamp_ms),
+        AlertAckSeverity::Error => state.acknowledge_errors_through(body.timestamp_ms),
+    };
+    Json(snapshot).into_response()
 }
 
 async fn get_boards(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
