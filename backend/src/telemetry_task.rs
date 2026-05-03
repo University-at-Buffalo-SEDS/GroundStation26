@@ -324,6 +324,55 @@ fn spawn_dedicated_radio_io_threads(
                     }
                 }
 
+                let mut comms = comms.lock().expect("failed to get lock");
+                match comms.recv_serialized_packets(&mut |payload| {
+                    let _ = incoming_tx.send(payload);
+                }) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        if !handle_worker_recv_error(
+                            &format!("{worker_name} radio io recv_serialized_packets failed"),
+                            &format!("{e:?}"),
+                            &mut last_recv_error_log_ms,
+                            &mut suppressed_recv_errors,
+                        ) {
+                            break;
+                        }
+                    }
+                }
+                while let Some(update) = comms.take_radio_window_update() {
+                    let deadline =
+                        std::time::Instant::now() + Duration::from_millis(update.duration_ms as u64);
+                    has_seen_window_update = true;
+                    last_window_update_at = Some(std::time::Instant::now());
+                    follow_window_until = Some(deadline);
+                    match update.kind {
+                        RadioWindowKind::DownlinkOpen => {
+                            follow_window_is_uplink = false;
+                            sent_in_current_uplink_window = false;
+                        }
+                        RadioWindowKind::UplinkOpen => {
+                            follow_window_is_uplink = true;
+                            sent_in_current_uplink_window = false;
+                            let uplink_log_now = std::time::Instant::now();
+                            let should_log = !tx_backlog.is_empty()
+                                && last_uplink_log_at
+                                .map(|last| {
+                                    uplink_log_now.saturating_duration_since(last)
+                                        >= Duration::from_millis(500)
+                                })
+                                .unwrap_or(true);
+                            if should_log {
+                                log_radio_uplink_available(
+                                    worker_name,
+                                    update.duration_ms,
+                                    tx_backlog.len(),
+                                );
+                                last_uplink_log_at = Some(uplink_log_now);
+                            }
+                        }
+                    }
+                }
                 let now = std::time::Instant::now();
                 let follow_mode_active = last_window_update_at
                     .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
@@ -360,55 +409,6 @@ fn spawn_dedicated_radio_io_threads(
                     sent_in_current_uplink_window = false;
                     false
                 };
-
-                let mut comms = comms.lock().expect("failed to get lock");
-                match comms.recv_serialized_packets(&mut |payload| {
-                    let _ = incoming_tx.send(payload);
-                }) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        if !handle_worker_recv_error(
-                            &format!("{worker_name} radio io recv_serialized_packets failed"),
-                            &format!("{e:?}"),
-                            &mut last_recv_error_log_ms,
-                            &mut suppressed_recv_errors,
-                        ) {
-                            break;
-                        }
-                    }
-                }
-                while let Some(update) = comms.take_radio_window_update() {
-                    let deadline =
-                        std::time::Instant::now() + Duration::from_millis(update.duration_ms as u64);
-                    has_seen_window_update = true;
-                    last_window_update_at = Some(std::time::Instant::now());
-                    follow_window_until = Some(deadline);
-                    match update.kind {
-                        RadioWindowKind::DownlinkOpen => {
-                            follow_window_is_uplink = false;
-                            sent_in_current_uplink_window = false;
-                        }
-                        RadioWindowKind::UplinkOpen => {
-                            follow_window_is_uplink = true;
-                            sent_in_current_uplink_window = false;
-                            let should_log = !tx_backlog.is_empty()
-                                && last_uplink_log_at
-                                .map(|last| {
-                                    now.saturating_duration_since(last)
-                                        >= Duration::from_millis(500)
-                                })
-                                .unwrap_or(true);
-                            if should_log {
-                                log_radio_uplink_available(
-                                    worker_name,
-                                    update.duration_ms,
-                                    tx_backlog.len(),
-                                );
-                                last_uplink_log_at = Some(now);
-                            }
-                        }
-                    }
-                }
                 if tx_allowed
                     && let Some(payload) = tx_backlog.pop_front()
                 {
