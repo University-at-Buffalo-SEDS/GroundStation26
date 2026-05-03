@@ -104,11 +104,7 @@ fn spawn_comms_worker_threads(
                             match comms.send_data(&payload) {
                                 Ok(()) => {
                                     sent_any = true;
-                                    emit_radio_command_sent_message(
-                                        &tx_worker_state,
-                                        worker_name,
-                                        &payload,
-                                    );
+                                    log_radio_command_event("radio TX sent", worker_name, &payload);
                                     if suppressed_send_errors > 0 {
                                         eprintln!(
                                             "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
@@ -226,7 +222,7 @@ fn spawn_legacy_comms_worker_thread(
                             sent_any = true;
                             match comms.send_data(&payload) {
                                 Ok(()) => {
-                                    emit_radio_command_sent_message(&state, worker_name, &payload);
+                                    log_radio_command_event("radio TX sent", worker_name, &payload);
                                     if suppressed_send_errors > 0 {
                                         eprintln!(
                                             "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
@@ -303,6 +299,7 @@ fn spawn_dedicated_radio_io_threads(
             let mut follow_window_is_uplink = false;
             let mut has_seen_window_update = false;
             let mut sent_in_current_uplink_window = false;
+            let mut last_uplink_log_at: Option<std::time::Instant> = None;
 
             loop {
                 match comms_shutdown_rx.try_recv() {
@@ -315,6 +312,7 @@ fn spawn_dedicated_radio_io_threads(
                 loop {
                     match comms_handle.tx_rx.try_recv() {
                         Ok(payload) => {
+                            log_radio_command_event("radio TX backlog", worker_name, &payload);
                             tx_backlog.push_back(payload);
                             while tx_backlog.len() > radio_tx_backlog_limit {
                                 tx_backlog.pop_front();
@@ -383,6 +381,20 @@ fn spawn_dedicated_radio_io_threads(
                         RadioWindowKind::UplinkOpen => {
                             follow_window_is_uplink = true;
                             sent_in_current_uplink_window = false;
+                            let should_log = last_uplink_log_at
+                                .map(|last| {
+                                    now.saturating_duration_since(last)
+                                        >= Duration::from_millis(500)
+                                })
+                                .unwrap_or(true);
+                            if should_log {
+                                log_radio_uplink_available(
+                                    worker_name,
+                                    update.duration_ms,
+                                    tx_backlog.len(),
+                                );
+                                last_uplink_log_at = Some(now);
+                            }
                         }
                     }
                 }
@@ -392,7 +404,7 @@ fn spawn_dedicated_radio_io_threads(
                     maybe_log_green_radio_command_send(worker_name, &payload);
                     match comms.send_data(&payload) {
                         Ok(()) => {
-                            emit_radio_command_sent_message(&io_state, worker_name, &payload);
+                            log_radio_command_event("radio TX sent", worker_name, &payload);
                             if follow_mode_active && follow_window_is_uplink {
                                 sent_in_current_uplink_window = true;
                             }
@@ -503,7 +515,7 @@ fn spawn_rx_priority_comms_worker_thread(
                         {
                             match comms.send_data(&payload) {
                                 Ok(()) => {
-                                    emit_radio_command_sent_message(&state, worker_name, &payload);
+                                    log_radio_command_event("radio TX sent", worker_name, &payload);
                                     if suppressed_send_errors > 0 {
                                         eprintln!(
                                             "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
@@ -802,7 +814,7 @@ fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
     );
 }
 
-fn radio_command_message(worker_name: &str, payload: &[u8]) -> Option<String> {
+fn radio_command_log_line(event: &str, worker_name: &str, payload: &[u8]) -> Option<String> {
     let Ok(pkt) = serialize::deserialize_packet(payload) else {
         return None;
     };
@@ -825,17 +837,23 @@ fn radio_command_message(worker_name: &str, payload: &[u8]) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
     Some(format!(
-        "{worker_name}: radio TX {:?} sender={} endpoints={:?} payload={payload_preview}",
+        "{worker_name}: {event} {:?} sender={} endpoints={:?} payload={payload_preview}",
         pkt.data_type(),
         pkt.sender(),
         pkt.endpoints(),
     ))
 }
 
-fn emit_radio_command_sent_message(state: &Arc<AppState>, worker_name: &str, payload: &[u8]) {
-    if let Some(message) = radio_command_message(worker_name, payload) {
-        state.add_backend_message_unchecked(message);
+fn log_radio_command_event(event: &str, worker_name: &str, payload: &[u8]) {
+    if let Some(message) = radio_command_log_line(event, worker_name, payload) {
+        eprintln!("{message}");
     }
+}
+
+fn log_radio_uplink_available(worker_name: &str, duration_ms: u16, backlog_len: usize) {
+    eprintln!(
+        "{worker_name}: radio uplink available window_ms={duration_ms} queued_commands={backlog_len}"
+    );
 }
 
 fn drop_db_writes_on_backpressure() -> bool {
@@ -3231,7 +3249,7 @@ mod tests {
     }
 
     #[test]
-    fn radio_command_message_detects_command_packets() {
+    fn radio_command_log_line_detects_command_packets() {
         let pkt = Packet::new(
             DataType::ValveCommand,
             &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
@@ -3241,9 +3259,9 @@ mod tests {
         )
         .expect("failed to build valve command packet");
         let wire = serialize::serialize_packet(&pkt);
-        let msg = radio_command_message("rocket_comms", &wire)
+        let msg = radio_command_log_line("radio TX sent", "rocket_comms", &wire)
             .expect("command packet should emit message");
-        assert!(msg.contains("rocket_comms: radio TX ValveCommand"));
+        assert!(msg.contains("rocket_comms: radio TX sent ValveCommand"));
 
         let telemetry_pkt = Packet::new(
             DataType::KG1000,
@@ -3254,7 +3272,7 @@ mod tests {
         )
         .expect("failed to build kg1000 packet");
         let telemetry_wire = serialize::serialize_packet(&telemetry_pkt);
-        assert!(radio_command_message("rocket_comms", &telemetry_wire).is_none());
+        assert!(radio_command_log_line("radio TX sent", "rocket_comms", &telemetry_wire).is_none());
     }
 
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
