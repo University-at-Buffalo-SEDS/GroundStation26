@@ -788,7 +788,7 @@ fn radio_follow_timeout_ms() -> u64 {
 
 fn radio_tx_backlog_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_BACKLOG_LIMIT", 8, 1, 256))
+    *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_BACKLOG_LIMIT", 256, 1, 256))
 }
 
 fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
