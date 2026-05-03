@@ -1115,19 +1115,12 @@ fn calibrated_channel_value(
     channel_key: &str,
     raw: f32,
 ) -> Option<f32> {
-    if let Some(channel) = cfg.extra_channels.get(channel_key) {
-        return eval_channel_with_zero(
-            &channel.linear,
-            channel.fit.as_ref(),
-            channel.zero_raw,
-            raw,
-        );
-    }
-
     match channel_key {
         "ch1" => eval_channel_with_zero(&cfg.ch1, cfg.ch1_fit.as_ref(), cfg.ch1_zero_raw, raw),
         "iadc" => eval_channel_with_zero(&cfg.iadc, cfg.iadc_fit.as_ref(), cfg.iadc_zero_raw, raw),
-        _ => None,
+        _ => cfg.extra_channels.get(channel_key).and_then(|channel| {
+            eval_channel_with_zero(&channel.linear, channel.fit.as_ref(), channel.zero_raw, raw)
+        }),
     }
 }
 

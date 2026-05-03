@@ -2773,12 +2773,11 @@ async fn handle_packet(
             }
 
             if let Some(first_value) = row_values.first().copied().flatten() {
-                let derived_ts_ms = get_current_timestamp_ms() as i64;
                 emit_derived_battery_rows(
                     state,
                     db_tx,
                     db_overflow,
-                    derived_ts_ms,
+                    ts_ms,
                     &sender_id,
                     &row_data_type,
                     first_value,
@@ -2797,7 +2796,7 @@ async fn handle_packet(
                         db_tx,
                         db_overflow,
                         DerivedLoadcellSample {
-                            ts_ms: derived_ts_ms,
+                            ts_ms,
                             sender_id: &sender_id,
                             sensor_id: &row_data_type,
                             raw_value: first_value,
@@ -3355,6 +3354,8 @@ mod tests {
         assert_eq!(broadcast_rows[1].sender_id, Board::DaqBoard.sender_id());
         assert_eq!(broadcast_rows[0].values, vec![Some(42.5)]);
         assert_eq!(broadcast_rows[1].values, vec![Some(4.25)]);
+        assert_eq!(broadcast_rows[0].timestamp_ms, row.timestamp_ms);
+        assert_eq!(broadcast_rows[1].timestamp_ms, row.timestamp_ms);
 
         let cache = state.recent_telemetry_snapshot();
         assert!(
@@ -3437,6 +3438,7 @@ mod tests {
             loadcell::DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE
         );
         assert_eq!(derived.values, vec![Some(745.0)]);
+        assert_eq!(derived.timestamp_ms, row.timestamp_ms);
         assert_eq!(
             *state.latest_fuel_tank_pressure.lock().unwrap(),
             Some(745.0)
