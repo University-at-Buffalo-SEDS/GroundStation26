@@ -375,10 +375,6 @@ fn spawn_dedicated_radio_io_threads(
                     follow_window_until = Some(deadline);
                     match update.kind {
                         RadioWindowKind::DownlinkOpen => {
-                            follow_window_is_uplink = false;
-                            sent_in_current_uplink_window = false;
-                        }
-                        RadioWindowKind::UplinkOpen => {
                             follow_window_is_uplink = true;
                             sent_in_current_uplink_window = false;
                             let uplink_log_now = std::time::Instant::now();
@@ -410,6 +406,10 @@ fn spawn_dedicated_radio_io_threads(
                                 &mut last_send_error_log_ms,
                                 &mut suppressed_send_errors,
                             );
+                        }
+                        RadioWindowKind::UplinkOpen => {
+                            follow_window_is_uplink = false;
+                            sent_in_current_uplink_window = false;
                         }
                     }
                 }
