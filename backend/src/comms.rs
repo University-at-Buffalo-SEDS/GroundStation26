@@ -6,6 +6,7 @@ use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
 use sedsprintf_rs_2026::{
     TelemetryError, TelemetryResult,
+    config::DataEndpoint,
     packet::Packet,
     router::{Router, RouterSideId},
     serialize,
@@ -182,11 +183,22 @@ pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
     }
 }
 
-fn tap_inbound_payload(payload: &[u8], packet_tap: &mut dyn FnMut(&Packet)) {
+fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(&Packet)) {
     let Ok(pkt) = serialize::deserialize_packet(payload) else {
         return;
     };
-    packet_tap(&pkt);
+    let is_gps = matches!(
+        pkt.data_type(),
+        sedsprintf_rs_2026::config::DataType::GpsData
+            | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
+    );
+    if !is_gps {
+        return;
+    }
+    let has_groundstation = pkt.endpoints().contains(&DataEndpoint::GroundStation);
+    if !has_groundstation {
+        packet_tap(&pkt);
+    }
 }
 
 fn is_valid_serialized_packet_or_ack(payload: &[u8]) -> bool {
@@ -543,7 +555,7 @@ impl UartComms {
             }
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
             maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
-            tap_inbound_payload(&payload, packet_tap);
+            tap_non_groundstation_gps_payload(&payload, packet_tap);
             match router.rx_serialized_queue_from_side(&payload, side_id) {
                 Ok(()) => {
                     maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
@@ -1573,7 +1585,7 @@ impl CommsDevice for I2cComms {
                                 if !is_valid_serialized_packet_or_ack(&packet) {
                                     continue;
                                 }
-                                tap_inbound_payload(&packet, packet_tap);
+                                tap_non_groundstation_gps_payload(&packet, packet_tap);
                                 match router.rx_serialized_queue_from_side(&packet, side_id) {
                                     Ok(()) => {}
                                     Err(err) => {
@@ -1729,7 +1741,7 @@ impl CommsDevice for SpiComms {
             if !is_valid_serialized_packet_or_ack(payload) {
                 return Ok(());
             }
-            tap_inbound_payload(payload, packet_tap);
+            tap_non_groundstation_gps_payload(payload, packet_tap);
             return router.rx_serialized_queue_from_side(payload, side_id);
         }
         #[cfg(not(target_os = "linux"))]
@@ -1890,7 +1902,7 @@ impl CommsDevice for CanComms {
             if !is_valid_serialized_packet_or_ack(&packet) {
                 return Ok(());
             }
-            tap_inbound_payload(&packet, packet_tap);
+            tap_non_groundstation_gps_payload(&packet, packet_tap);
             return router.rx_serialized_queue_from_side(&packet, side_id);
         }
         #[cfg(not(target_os = "linux"))]
@@ -2092,11 +2104,27 @@ impl CommsDevice for DummyComms {
             self.maybe_queue_discovery()?;
             self.maybe_queue_timesync()?;
                 if let Some(pkt) = self.pending_rx.pop_front() {
-                packet_tap(&pkt);
+                    if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
+                        && matches!(
+                            pkt.data_type(),
+                            sedsprintf_rs_2026::config::DataType::GpsData
+                                | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
+                        )
+                    {
+                        packet_tap(&pkt);
+                    }
                     return _router.rx_queue_from_side(pkt, side_id);
                 }
                 if let Some(pkt) = get_dummy_packet()? {
-                packet_tap(&pkt);
+                    if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
+                        && matches!(
+                            pkt.data_type(),
+                            sedsprintf_rs_2026::config::DataType::GpsData
+                                | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
+                        )
+                    {
+                        packet_tap(&pkt);
+                    }
                     return _router.rx_queue_from_side(pkt, side_id);
                 }
             Ok(())
@@ -2371,7 +2399,7 @@ mod raw_uart_tests {
     }
 
     #[test]
-    fn tap_inbound_payload_includes_groundstation_addressed_fill_telemetry() {
+    fn tap_non_groundstation_gps_skips_groundstation_addressed_fill_telemetry() {
         let pkt = Packet::new(
             DataType::FuelTankPressure,
             &[DataEndpoint::GroundStation, DataEndpoint::SdCard],
@@ -2382,22 +2410,22 @@ mod raw_uart_tests {
         .unwrap();
         let wire = serialize::serialize_packet(&pkt);
         let mut mirrored = None;
-        tap_inbound_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
-        assert_eq!(mirrored.unwrap().data_type(), DataType::FuelTankPressure);
+        tap_non_groundstation_gps_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
+        assert!(mirrored.is_none());
     }
 
     #[test]
-    fn tap_inbound_payload_includes_non_groundstation_gps() {
+    fn tap_non_groundstation_gps_includes_non_groundstation_gps() {
         let pkt = Packet::from_f32_slice(DataType::GpsData, &[1.0, 2.0, 3.0], &[DataEndpoint::SdCard], 123)
             .unwrap();
         let wire = serialize::serialize_packet(&pkt);
         let mut mirrored = None;
-        tap_inbound_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
+        tap_non_groundstation_gps_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
         assert_eq!(mirrored.unwrap().data_type(), DataType::GpsData);
     }
 
     #[test]
-    fn tap_inbound_payload_includes_router_local_control_packets() {
+    fn tap_non_groundstation_gps_skips_router_local_control_packets() {
         let pkt = Packet::new(
             DataType::Heartbeat,
             &[DataEndpoint::GroundStation, DataEndpoint::HeartBeat],
@@ -2408,8 +2436,8 @@ mod raw_uart_tests {
         .unwrap();
         let wire = serialize::serialize_packet(&pkt);
         let mut mirrored = None;
-        tap_inbound_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
-        assert_eq!(mirrored.unwrap().data_type(), DataType::Heartbeat);
+        tap_non_groundstation_gps_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
+        assert!(mirrored.is_none());
     }
 }
 
