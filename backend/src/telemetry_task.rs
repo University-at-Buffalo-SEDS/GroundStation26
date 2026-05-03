@@ -381,7 +381,8 @@ fn spawn_dedicated_radio_io_threads(
                         RadioWindowKind::UplinkOpen => {
                             follow_window_is_uplink = true;
                             sent_in_current_uplink_window = false;
-                            let should_log = last_uplink_log_at
+                            let should_log = !tx_backlog.is_empty()
+                                && last_uplink_log_at
                                 .map(|last| {
                                     now.saturating_duration_since(last)
                                         >= Duration::from_millis(500)
