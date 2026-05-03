@@ -295,8 +295,10 @@ fn spawn_dedicated_radio_io_threads(
             let radio_follow_timeout = Duration::from_millis(radio_follow_timeout_ms());
             let radio_rx_idle_poll = Duration::from_millis(radio_rx_poll_idle_ms());
             let radio_rx_uplink_poll = Duration::from_millis(radio_rx_poll_uplink_ms());
+            let radio_rx_downlink_poll = Duration::from_millis(radio_rx_poll_downlink_ms());
             let radio_rx_idle_packets = radio_rx_packets_idle();
             let radio_rx_uplink_packets = radio_rx_packets_uplink();
+            let radio_rx_downlink_packets = radio_rx_packets_downlink();
             let radio_tx_backlog_limit = radio_tx_backlog_limit();
             let mut tx_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             let mut last_window_update_at: Option<std::time::Instant> = None;
@@ -342,13 +344,22 @@ fn spawn_dedicated_radio_io_threads(
                     &mut last_send_error_log_ms,
                     &mut suppressed_send_errors,
                 );
+                let now = std::time::Instant::now();
+                let follow_mode_active = last_window_update_at
+                    .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
+                let in_active_window =
+                    has_seen_window_update && follow_mode_active && follow_window_until.is_some();
                 let rx_poll_timeout = if follow_window_is_uplink {
                     radio_rx_uplink_poll
+                } else if in_active_window {
+                    radio_rx_downlink_poll
                 } else {
                     radio_rx_idle_poll
                 };
                 let rx_packet_budget = if follow_window_is_uplink {
                     radio_rx_uplink_packets
+                } else if in_active_window {
+                    radio_rx_downlink_packets
                 } else {
                     radio_rx_idle_packets
                 };
@@ -375,6 +386,8 @@ fn spawn_dedicated_radio_io_threads(
                     follow_window_until = Some(deadline);
                     match update.kind {
                         RadioWindowKind::DownlinkOpen => {
+                            // Window kinds are emitted from the RF-board perspective.
+                            // RF-board downlink means GS may transmit to the board.
                             follow_window_is_uplink = true;
                             sent_in_current_uplink_window = false;
                             let uplink_log_now = std::time::Instant::now();
@@ -408,6 +421,7 @@ fn spawn_dedicated_radio_io_threads(
                             );
                         }
                         RadioWindowKind::UplinkOpen => {
+                            // RF-board uplink means the board may transmit back to GS.
                             follow_window_is_uplink = false;
                             sent_in_current_uplink_window = false;
                         }
@@ -794,6 +808,11 @@ fn radio_rx_poll_uplink_ms() -> u64 {
     *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_RX_POLL_UPLINK_MS", 0, 0, 10) as u64)
 }
 
+fn radio_rx_poll_downlink_ms() -> u64 {
+    static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
+    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_RX_POLL_DOWNLINK_MS", 5, 0, 20) as u64)
+}
+
 fn radio_rx_packets_idle() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| env_usize("GS_RADIO_RX_PACKETS_IDLE", 4, 1, 128))
@@ -802,6 +821,11 @@ fn radio_rx_packets_idle() -> usize {
 fn radio_rx_packets_uplink() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| env_usize("GS_RADIO_RX_PACKETS_UPLINK", 1, 1, 16))
+}
+
+fn radio_rx_packets_downlink() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| env_usize("GS_RADIO_RX_PACKETS_DOWNLINK", 16, 1, 256))
 }
 
 fn radio_tx_backlog_limit() -> usize {
