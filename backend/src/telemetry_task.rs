@@ -325,6 +325,19 @@ fn spawn_dedicated_radio_io_threads(
                 }
 
                 let mut comms = comms.lock().expect("failed to get lock");
+                let _ = send_while_uplink_window_open(
+                    comms.as_mut(),
+                    worker_name,
+                    &mut tx_backlog,
+                    radio_follow_timeout,
+                    has_seen_window_update,
+                    last_window_update_at,
+                    &mut follow_window_until,
+                    &mut follow_window_is_uplink,
+                    &mut sent_in_current_uplink_window,
+                    &mut last_send_error_log_ms,
+                    &mut suppressed_send_errors,
+                );
                 match comms.recv_serialized_packets(&mut |payload| {
                     let _ = incoming_tx.send(payload);
                 }) {
@@ -373,76 +386,19 @@ fn spawn_dedicated_radio_io_threads(
                         }
                     }
                 }
-                let now = std::time::Instant::now();
-                let follow_mode_active = last_window_update_at
-                    .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
-
-                let tx_allowed = if !has_seen_window_update {
-                    false
-                } else if follow_mode_active {
-                    if follow_window_until.is_some_and(|deadline| now >= deadline) {
-                        if follow_window_is_uplink
-                            && !sent_in_current_uplink_window
-                            && !tx_backlog.is_empty()
-                        {
-                            eprintln!(
-                                "{worker_name}: radio uplink window closed without TX queued_commands={}",
-                                tx_backlog.len()
-                            );
-                        }
-                        follow_window_until = None;
-                        follow_window_is_uplink = false;
-                        sent_in_current_uplink_window = false;
-                        false
-                    } else {
-                        follow_window_is_uplink
-                            && !sent_in_current_uplink_window
-                            && !tx_backlog.is_empty()
-                    }
-                } else {
-                    // Lost rfboard window sync: force radio back to RX-only until
-                    // fresh command frames arrive again. Do not fall back to
-                    // locally-timed TX; that can keep the link in a self-sustaining
-                    // "TX forever, never hear the next window frame" failure mode.
-                    follow_window_until = None;
-                    follow_window_is_uplink = false;
-                    sent_in_current_uplink_window = false;
-                    false
-                };
-                if tx_allowed
-                    && let Some(payload) = tx_backlog.pop_front()
-                {
-                    log_radio_packet_event("radio TX pop", worker_name, &payload);
-                    maybe_log_green_radio_command_send(worker_name, &payload);
-                    match comms.send_data(&payload) {
-                        Ok(()) => {
-                            log_radio_command_event("radio TX sent", worker_name, &payload);
-                            if follow_mode_active && follow_window_is_uplink {
-                                sent_in_current_uplink_window = true;
-                            }
-                            if suppressed_send_errors > 0 {
-                                eprintln!(
-                                    "{worker_name} radio io send_data recovered after suppressing {suppressed_send_errors} repeated errors"
-                                );
-                                suppressed_send_errors = 0;
-                                last_send_error_log_ms = 0;
-                            }
-                        }
-                        Err(e) => {
-                            log_radio_packet_event(
-                                "radio TX send_data failed for",
-                                worker_name,
-                                &payload,
-                            );
-                            log_repeated_worker_error(
-                                &format!("{worker_name} radio io send_data failed"),
-                                &e.to_string(),
-                                &mut last_send_error_log_ms,
-                                &mut suppressed_send_errors,
-                            );
-                        }
-                    }
-                }
+                let _ = send_while_uplink_window_open(
+                    comms.as_mut(),
+                    worker_name,
+                    &mut tx_backlog,
+                    radio_follow_timeout,
+                    has_seen_window_update,
+                    last_window_update_at,
+                    &mut follow_window_until,
+                    &mut follow_window_is_uplink,
+                    &mut sent_in_current_uplink_window,
+                    &mut last_send_error_log_ms,
+                    &mut suppressed_send_errors,
+                );
                 drop(comms);
             }
         })?;
@@ -884,6 +840,85 @@ fn log_radio_uplink_available(worker_name: &str, duration_ms: u16, backlog_len: 
     eprintln!(
         "{worker_name}: radio uplink available window_ms={duration_ms} queued_commands={backlog_len}"
     );
+}
+
+fn send_while_uplink_window_open(
+    comms: &mut dyn CommsDevice,
+    worker_name: &str,
+    tx_backlog: &mut VecDeque<Vec<u8>>,
+    radio_follow_timeout: Duration,
+    has_seen_window_update: bool,
+    last_window_update_at: Option<std::time::Instant>,
+    follow_window_until: &mut Option<std::time::Instant>,
+    follow_window_is_uplink: &mut bool,
+    sent_in_current_uplink_window: &mut bool,
+    last_send_error_log_ms: &mut u64,
+    suppressed_send_errors: &mut u64,
+) -> bool {
+    let mut sent_any = false;
+    loop {
+        let now = std::time::Instant::now();
+        let follow_mode_active =
+            last_window_update_at.is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
+        if !has_seen_window_update {
+            break;
+        }
+        if !follow_mode_active {
+            *follow_window_until = None;
+            *follow_window_is_uplink = false;
+            *sent_in_current_uplink_window = false;
+            break;
+        }
+        let Some(deadline) = *follow_window_until else {
+            break;
+        };
+        if now >= deadline {
+            if *follow_window_is_uplink && !*sent_in_current_uplink_window && !tx_backlog.is_empty() {
+                eprintln!(
+                    "{worker_name}: radio uplink window closed without TX queued_commands={}",
+                    tx_backlog.len()
+                );
+            }
+            *follow_window_until = None;
+            *follow_window_is_uplink = false;
+            *sent_in_current_uplink_window = false;
+            break;
+        }
+        if !*follow_window_is_uplink || tx_backlog.is_empty() {
+            break;
+        }
+
+        let Some(payload) = tx_backlog.pop_front() else {
+            break;
+        };
+        log_radio_packet_event("radio TX pop", worker_name, &payload);
+        maybe_log_green_radio_command_send(worker_name, &payload);
+        match comms.send_data(&payload) {
+            Ok(()) => {
+                log_radio_command_event("radio TX sent", worker_name, &payload);
+                *sent_in_current_uplink_window = true;
+                sent_any = true;
+                if *suppressed_send_errors > 0 {
+                    eprintln!(
+                        "{worker_name} radio io send_data recovered after suppressing {suppressed_send_errors} repeated errors"
+                    );
+                    *suppressed_send_errors = 0;
+                    *last_send_error_log_ms = 0;
+                }
+            }
+            Err(e) => {
+                log_radio_packet_event("radio TX send_data failed for", worker_name, &payload);
+                log_repeated_worker_error(
+                    &format!("{worker_name} radio io send_data failed"),
+                    &e.to_string(),
+                    last_send_error_log_ms,
+                    suppressed_send_errors,
+                );
+                break;
+            }
+        }
+    }
+    sent_any
 }
 
 fn drop_db_writes_on_backpressure() -> bool {
