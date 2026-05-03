@@ -3270,10 +3270,11 @@ async fn handle_packet(
 }
 
 pub fn get_current_timestamp_ms() -> u64 {
-    NETWORK_TIME_ROUTER
-        .get()
-        .and_then(|router| router.network_time_ms())
-        .unwrap_or_else(get_system_timestamp_ms)
+    // Frontend live telemetry freshness is validated against the client's wall clock.
+    // Using router/network time here can make every websocket row look stale if the
+    // synchronized network epoch drifts from host wall time. Keep UI-facing timestamps
+    // on host wall clock.
+    get_system_timestamp_ms()
 }
 
 fn get_system_timestamp_ms() -> u64 {
