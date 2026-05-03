@@ -300,12 +300,13 @@ fn spawn_dedicated_radio_io_threads(
             let radio_rx_uplink_packets = radio_rx_packets_uplink();
             let radio_rx_downlink_packets = radio_rx_packets_downlink();
             let radio_tx_backlog_limit = radio_tx_backlog_limit();
+            let radio_tx_window_packets = radio_tx_packets_per_window();
             let mut tx_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             let mut last_window_update_at: Option<std::time::Instant> = None;
             let mut follow_window_until: Option<std::time::Instant> = None;
             let mut follow_window_is_uplink = false;
             let mut has_seen_window_update = false;
-            let mut sent_in_current_uplink_window = false;
+            let mut sent_in_current_uplink_window = 0usize;
             let mut last_uplink_log_at: Option<std::time::Instant> = None;
 
             loop {
@@ -335,6 +336,7 @@ fn spawn_dedicated_radio_io_threads(
                     comms.as_mut(),
                     worker_name,
                     &mut tx_backlog,
+                    radio_tx_window_packets,
                     radio_follow_timeout,
                     has_seen_window_update,
                     last_window_update_at,
@@ -389,7 +391,7 @@ fn spawn_dedicated_radio_io_threads(
                             // Window kinds are emitted from the RF-board perspective.
                             // RF-board downlink means GS may transmit to the board.
                             follow_window_is_uplink = true;
-                            sent_in_current_uplink_window = false;
+                            sent_in_current_uplink_window = 0;
                             let uplink_log_now = std::time::Instant::now();
                             let should_log = !tx_backlog.is_empty()
                                 && last_uplink_log_at
@@ -410,6 +412,7 @@ fn spawn_dedicated_radio_io_threads(
                                 comms.as_mut(),
                                 worker_name,
                                 &mut tx_backlog,
+                                radio_tx_window_packets,
                                 radio_follow_timeout,
                                 has_seen_window_update,
                                 last_window_update_at,
@@ -423,7 +426,7 @@ fn spawn_dedicated_radio_io_threads(
                         RadioWindowKind::UplinkOpen => {
                             // RF-board uplink means the board may transmit back to GS.
                             follow_window_is_uplink = false;
-                            sent_in_current_uplink_window = false;
+                            sent_in_current_uplink_window = 0;
                         }
                     }
                 }
@@ -431,6 +434,7 @@ fn spawn_dedicated_radio_io_threads(
                     comms.as_mut(),
                     worker_name,
                     &mut tx_backlog,
+                    radio_tx_window_packets,
                     radio_follow_timeout,
                     has_seen_window_update,
                     last_window_update_at,
@@ -833,6 +837,11 @@ fn radio_tx_backlog_limit() -> usize {
     *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_BACKLOG_LIMIT", 256, 1, 256))
 }
 
+fn radio_tx_packets_per_window() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_PACKETS_PER_WINDOW", 16, 1, 128))
+}
+
 fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
     if !crate::debug_prints_enabled() {
         return;
@@ -917,12 +926,13 @@ fn send_while_uplink_window_open(
     comms: &mut dyn CommsDevice,
     worker_name: &str,
     tx_backlog: &mut VecDeque<Vec<u8>>,
+    max_packets_per_window: usize,
     radio_follow_timeout: Duration,
     has_seen_window_update: bool,
     last_window_update_at: Option<std::time::Instant>,
     follow_window_until: &mut Option<std::time::Instant>,
     follow_window_is_uplink: &mut bool,
-    sent_in_current_uplink_window: &mut bool,
+    sent_in_current_uplink_window: &mut usize,
     last_send_error_log_ms: &mut u64,
     suppressed_send_errors: &mut u64,
 ) -> bool {
@@ -937,14 +947,14 @@ fn send_while_uplink_window_open(
         if !follow_mode_active {
             *follow_window_until = None;
             *follow_window_is_uplink = false;
-            *sent_in_current_uplink_window = false;
+            *sent_in_current_uplink_window = 0;
             break;
         }
         let Some(deadline) = *follow_window_until else {
             break;
         };
         if now >= deadline {
-            if *follow_window_is_uplink && !*sent_in_current_uplink_window && !tx_backlog.is_empty() {
+            if *follow_window_is_uplink && *sent_in_current_uplink_window == 0 && !tx_backlog.is_empty() {
                 eprintln!(
                     "{worker_name}: radio uplink window closed without TX queued_commands={}",
                     tx_backlog.len()
@@ -952,10 +962,13 @@ fn send_while_uplink_window_open(
             }
             *follow_window_until = None;
             *follow_window_is_uplink = false;
-            *sent_in_current_uplink_window = false;
+            *sent_in_current_uplink_window = 0;
             break;
         }
-        if !*follow_window_is_uplink || tx_backlog.is_empty() {
+        if !*follow_window_is_uplink
+            || tx_backlog.is_empty()
+            || *sent_in_current_uplink_window >= max_packets_per_window
+        {
             break;
         }
 
@@ -967,7 +980,7 @@ fn send_while_uplink_window_open(
         match comms.send_data(&payload) {
             Ok(()) => {
                 log_radio_command_event("radio TX sent", worker_name, &payload);
-                *sent_in_current_uplink_window = true;
+                *sent_in_current_uplink_window += 1;
                 sent_any = true;
                 if *suppressed_send_errors > 0 {
                     eprintln!(
