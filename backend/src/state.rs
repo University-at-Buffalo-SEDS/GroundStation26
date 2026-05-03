@@ -975,6 +975,11 @@ impl AppState {
         let _ = self.action_policy_tx.send(policy);
     }
 
+    /// Rebroadcasts the current action-policy snapshot without requiring a state change.
+    pub fn broadcast_action_policy_snapshot(&self) {
+        let _ = self.action_policy_tx.send(self.action_policy_snapshot());
+    }
+
     /// Replaces the current fill targets and broadcasts them if they changed.
     pub fn set_fill_targets(&self, targets: FillTargetsConfig) {
         let mut slot = self.fill_targets.lock().unwrap();

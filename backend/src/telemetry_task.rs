@@ -3096,6 +3096,7 @@ async fn handle_packet(
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
                 state.set_umbilical_valve_state(key_cmd_id, key_on);
                 sequences::refresh_action_policy_now(state);
+                state.broadcast_action_policy_snapshot();
 
                 let ts_ms = get_current_timestamp_ms() as i64;
                 let values = valve_state_values(state);
@@ -4038,6 +4039,30 @@ mod tests {
             .find(|control| control.cmd == "Nitrogen")
             .expect("Nitrogen control should exist");
         assert_eq!(after.actuated, Some(true));
+
+        let close_pkt = Packet::new(
+            DataType::UmbilicalStatus,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            Board::ActuatorBoard.sender_id(),
+            111_223,
+            Arc::from([ActuatorBoardCommands::NitrogenClose as u8, 1_u8]),
+        )
+        .expect("failed to build umbilical close status packet");
+
+        let rows = handle_packet(&state, &db_tx, &db_overflow, close_pkt).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            state.get_umbilical_valve_state(ActuatorBoardCommands::NitrogenOpen as u8),
+            Some(false)
+        );
+
+        let closed = state
+            .action_policy_snapshot()
+            .controls
+            .into_iter()
+            .find(|control| control.cmd == "Nitrogen")
+            .expect("Nitrogen control should exist");
+        assert_eq!(closed.actuated, Some(false));
     }
 
     #[tokio::test]
