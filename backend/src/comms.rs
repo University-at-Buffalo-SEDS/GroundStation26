@@ -96,6 +96,14 @@ pub trait CommsDevice: Send {
             "serialized packet receive not supported for this comms device",
         ))
     }
+    fn recv_serialized_packets_with_timeout(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+        timeout: Duration,
+    ) -> TelemetryResult<()> {
+        let _ = timeout;
+        self.recv_serialized_packets(packet_sink)
+    }
     fn take_radio_window_update(&mut self) -> Option<RadioWindowUpdate> {
         None
     }
@@ -317,14 +325,18 @@ impl UartComms {
     }
 
     fn fill_rx_buf(&mut self) -> std::io::Result<()> {
+        let timeout = if self.slow_start_deadline.is_some() {
+            UART_STARTUP_TIMEOUT
+        } else {
+            UART_NORMAL_TIMEOUT
+        };
+        self.fill_rx_buf_with_timeout(timeout)
+    }
+
+    fn fill_rx_buf_with_timeout(&mut self, timeout: Duration) -> std::io::Result<()> {
         self.update_uart_timeout_mode()?;
         #[cfg(target_os = "linux")]
         {
-            let timeout = if self.slow_start_deadline.is_some() {
-                UART_STARTUP_TIMEOUT
-            } else {
-                UART_NORMAL_TIMEOUT
-            };
             let mut scratch = [0u8; 512];
             match read_once_fd_with_poll(self.inner.as_raw_fd(), &mut scratch, timeout) {
                 Ok(0) => {
@@ -367,8 +379,19 @@ impl UartComms {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let original_timeout = if timeout != UART_NORMAL_TIMEOUT {
+                let original = if self.slow_start_deadline.is_some() {
+                    UART_STARTUP_TIMEOUT
+                } else {
+                    UART_NORMAL_TIMEOUT
+                };
+                self.inner.set_timeout(timeout)?;
+                Some(original)
+            } else {
+                None
+            };
             let mut scratch = [0u8; 512];
-            match self.inner.read(&mut scratch) {
+            let result = match self.inner.read(&mut scratch) {
                 Ok(0) => {
                     maybe_log_raw_uart_read_outcome(
                         "read returned 0 bytes",
@@ -405,7 +428,11 @@ impl UartComms {
                     maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
                     Err(err)
                 }
+            };
+            if let Some(original_timeout) = original_timeout {
+                let _ = self.inner.set_timeout(original_timeout);
             }
+            result
         }
     }
 
@@ -1220,8 +1247,16 @@ impl CommsDevice for UartComms {
         &mut self,
         packet_sink: &mut dyn FnMut(Vec<u8>),
     ) -> TelemetryResult<()> {
+        self.recv_serialized_packets_with_timeout(packet_sink, UART_NORMAL_TIMEOUT)
+    }
+
+    fn recv_serialized_packets_with_timeout(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+        timeout: Duration,
+    ) -> TelemetryResult<()> {
         if self.rx_buf.len() < 2
-            && let Err(err) = self.fill_rx_buf()
+            && let Err(err) = self.fill_rx_buf_with_timeout(timeout)
         {
             return Err(err.into());
         }
@@ -1229,7 +1264,7 @@ impl CommsDevice for UartComms {
             return Ok(());
         }
 
-        if let Err(err) = self.fill_rx_buf() {
+        if let Err(err) = self.fill_rx_buf_with_timeout(timeout) {
             return Err(err.into());
         }
 

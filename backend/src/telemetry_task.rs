@@ -293,6 +293,8 @@ fn spawn_dedicated_radio_io_threads(
             let mut last_recv_error_log_ms = 0;
             let mut suppressed_recv_errors = 0;
             let radio_follow_timeout = Duration::from_millis(radio_follow_timeout_ms());
+            let radio_rx_idle_poll = Duration::from_millis(radio_rx_poll_idle_ms());
+            let radio_rx_uplink_poll = Duration::from_millis(radio_rx_poll_uplink_ms());
             let radio_tx_backlog_limit = radio_tx_backlog_limit();
             let mut tx_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             let mut last_window_update_at: Option<std::time::Instant> = None;
@@ -338,9 +340,14 @@ fn spawn_dedicated_radio_io_threads(
                     &mut last_send_error_log_ms,
                     &mut suppressed_send_errors,
                 );
-                match comms.recv_serialized_packets(&mut |payload| {
+                let rx_poll_timeout = if follow_window_is_uplink {
+                    radio_rx_uplink_poll
+                } else {
+                    radio_rx_idle_poll
+                };
+                match comms.recv_serialized_packets_with_timeout(&mut |payload| {
                     let _ = incoming_tx.send(payload);
-                }) {
+                }, rx_poll_timeout) {
                     Ok(()) => {}
                     Err(e) => {
                         if !handle_worker_recv_error(
@@ -755,6 +762,16 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
 fn radio_follow_timeout_ms() -> u64 {
     static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
     *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 1_500, 50, 10_000) as u64)
+}
+
+fn radio_rx_poll_idle_ms() -> u64 {
+    static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
+    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_RX_POLL_IDLE_MS", 2, 0, 50) as u64)
+}
+
+fn radio_rx_poll_uplink_ms() -> u64 {
+    static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
+    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_RX_POLL_UPLINK_MS", 0, 0, 10) as u64)
 }
 
 fn radio_tx_backlog_limit() -> usize {
