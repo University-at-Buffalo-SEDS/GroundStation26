@@ -84,6 +84,8 @@ fn spawn_comms_worker_threads(
             let mut last_send_error_log_ms = 0;
             let mut suppressed_send_errors = 0;
             let mut next_tx_allowed_at = std::time::Instant::now();
+            let mut command_backlog: VecDeque<Vec<u8>> = VecDeque::new();
+            let mut telemetry_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -98,35 +100,49 @@ fn spawn_comms_worker_threads(
                     continue;
                 }
 
-                let mut sent_any = false;
-                for _ in 0..COMMS_TX_BURST {
+                loop {
                     match comms_handle.tx_rx.try_recv() {
                         Ok(payload) => {
-                            let mut comms = tx_worker_comms.lock().expect("failed to get lock");
-                            match comms.send_data(&payload) {
-                                Ok(()) => {
-                                    sent_any = true;
-                                    log_radio_command_event("radio TX sent", worker_name, &payload);
-                                    if suppressed_send_errors > 0 {
-                                        eprintln!(
-                                            "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
-                                        );
-                                        suppressed_send_errors = 0;
-                                        last_send_error_log_ms = 0;
-                                    }
-                                }
-                                Err(e) => {
-                                    log_repeated_worker_error(
-                                        &format!("{worker_name} comms worker send_data failed"),
-                                        &e.to_string(),
-                                        &mut last_send_error_log_ms,
-                                        &mut suppressed_send_errors,
-                                    );
-                                }
+                            if is_command_payload(&payload) {
+                                command_backlog.push_back(payload);
+                            } else {
+                                telemetry_backlog.push_back(payload);
                             }
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => return,
+                    }
+                }
+
+                let mut sent_any = false;
+                for _ in 0..COMMS_TX_BURST {
+                    let Some(payload) = command_backlog
+                        .pop_front()
+                        .or_else(|| telemetry_backlog.pop_front())
+                    else {
+                        break;
+                    };
+                    let mut comms = tx_worker_comms.lock().expect("failed to get lock");
+                    match comms.send_data(&payload) {
+                        Ok(()) => {
+                            sent_any = true;
+                            log_radio_command_event("radio TX sent", worker_name, &payload);
+                            if suppressed_send_errors > 0 {
+                                eprintln!(
+                                    "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
+                                );
+                                suppressed_send_errors = 0;
+                                last_send_error_log_ms = 0;
+                            }
+                        }
+                        Err(e) => {
+                            log_repeated_worker_error(
+                                &format!("{worker_name} comms worker send_data failed"),
+                                &e.to_string(),
+                                &mut last_send_error_log_ms,
+                                &mut suppressed_send_errors,
+                            );
+                        }
                     }
                 }
 
@@ -946,6 +962,19 @@ fn log_radio_uplink_available(worker_name: &str, duration_ms: u16, backlog_len: 
     eprintln!(
         "{worker_name}: radio uplink available window_ms={duration_ms} queued_commands={backlog_len}"
     );
+}
+
+fn is_command_payload(payload: &[u8]) -> bool {
+    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+        return false;
+    };
+    matches!(
+        pkt.data_type(),
+        DataType::ValveCommand
+            | DataType::FlightCommand
+            | DataType::ActuatorCommand
+            | DataType::Abort
+    )
 }
 
 fn is_fill_system_command_payload(payload: &[u8]) -> bool {
