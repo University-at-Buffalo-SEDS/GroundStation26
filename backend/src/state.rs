@@ -906,6 +906,26 @@ impl AppState {
         if let Some(existing) = messages.iter().find(|n| n.message == message) {
             return (existing.id, false);
         }
+        let (id, snapshot) = self.push_backend_message_locked(&mut messages, message);
+        drop(messages);
+        let _ = self.messages_tx.send(snapshot);
+        (id, true)
+    }
+
+    /// Adds a telemetry/backend message without deduplicating identical text.
+    pub fn add_backend_message_unchecked<S: Into<String>>(&self, message: S) -> u64 {
+        let mut messages = self.messages.lock().unwrap();
+        let (id, snapshot) = self.push_backend_message_locked(&mut messages, message.into());
+        drop(messages);
+        let _ = self.messages_tx.send(snapshot);
+        id
+    }
+
+    fn push_backend_message_locked(
+        &self,
+        messages: &mut Vec<PersistentNotification>,
+        message: String,
+    ) -> (u64, Vec<PersistentNotification>) {
         let id = self.next_message_id.fetch_add(1, Ordering::Relaxed) + 1;
         messages.push(PersistentNotification {
             id,
@@ -919,10 +939,7 @@ impl AppState {
         if messages.len() > 200 {
             messages.truncate(200);
         }
-        let snapshot = messages.clone();
-        drop(messages);
-        let _ = self.messages_tx.send(snapshot);
-        (id, true)
+        (id, messages.clone())
     }
 
     /// Returns the latest action-policy snapshot used by the dashboard and command gate.

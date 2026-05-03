@@ -104,6 +104,11 @@ fn spawn_comms_worker_threads(
                             match comms.send_data(&payload) {
                                 Ok(()) => {
                                     sent_any = true;
+                                    emit_radio_command_sent_message(
+                                        &tx_worker_state,
+                                        worker_name,
+                                        &payload,
+                                    );
                                     if suppressed_send_errors > 0 {
                                         eprintln!(
                                             "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
@@ -221,6 +226,7 @@ fn spawn_legacy_comms_worker_thread(
                             sent_any = true;
                             match comms.send_data(&payload) {
                                 Ok(()) => {
+                                    emit_radio_command_sent_message(&state, worker_name, &payload);
                                     if suppressed_send_errors > 0 {
                                         eprintln!(
                                             "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
@@ -386,6 +392,7 @@ fn spawn_dedicated_radio_io_threads(
                     maybe_log_green_radio_command_send(worker_name, &payload);
                     match comms.send_data(&payload) {
                         Ok(()) => {
+                            emit_radio_command_sent_message(&io_state, worker_name, &payload);
                             if follow_mode_active && follow_window_is_uplink {
                                 sent_in_current_uplink_window = true;
                             }
@@ -496,6 +503,7 @@ fn spawn_rx_priority_comms_worker_thread(
                         {
                             match comms.send_data(&payload) {
                                 Ok(()) => {
+                                    emit_radio_command_sent_message(&state, worker_name, &payload);
                                     if suppressed_send_errors > 0 {
                                         eprintln!(
                                             "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
@@ -792,6 +800,42 @@ fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
         pkt.endpoints(),
         cmd_preview
     );
+}
+
+fn radio_command_message(worker_name: &str, payload: &[u8]) -> Option<String> {
+    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+        return None;
+    };
+    let is_command = matches!(
+        pkt.data_type(),
+        DataType::ValveCommand
+            | DataType::FlightCommand
+            | DataType::ActuatorCommand
+            | DataType::Abort
+    );
+    if !is_command {
+        return None;
+    }
+
+    let payload_preview = pkt
+        .payload()
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "{worker_name}: radio TX {:?} sender={} endpoints={:?} payload={payload_preview}",
+        pkt.data_type(),
+        pkt.sender(),
+        pkt.endpoints(),
+    ))
+}
+
+fn emit_radio_command_sent_message(state: &Arc<AppState>, worker_name: &str, payload: &[u8]) {
+    if let Some(message) = radio_command_message(worker_name, payload) {
+        state.add_backend_message_unchecked(message);
+    }
 }
 
 fn drop_db_writes_on_backpressure() -> bool {
@@ -1224,6 +1268,10 @@ fn should_report_parse_error(data_type: &str) -> bool {
             | "TIME_SYNC_ANNOUNCE"
             | "TIME_SYNC_REQUEST"
             | "TIME_SYNC_RESPONSE"
+            | "VALVE_COMMAND"
+            | "FLIGHT_COMMAND"
+            | "ACTUATOR_COMMAND"
+            | "ABORT"
     )
 }
 
@@ -3175,7 +3223,38 @@ mod tests {
         assert!(!should_report_parse_error("TIME_SYNC_ANNOUNCE"));
         assert!(!should_report_parse_error("TIME_SYNC_REQUEST"));
         assert!(!should_report_parse_error("TIME_SYNC_RESPONSE"));
+        assert!(!should_report_parse_error("VALVE_COMMAND"));
+        assert!(!should_report_parse_error("FLIGHT_COMMAND"));
+        assert!(!should_report_parse_error("ACTUATOR_COMMAND"));
+        assert!(!should_report_parse_error("ABORT"));
         assert!(should_report_parse_error("KG1000"));
+    }
+
+    #[test]
+    fn radio_command_message_detects_command_packets() {
+        let pkt = Packet::new(
+            DataType::ValveCommand,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([1_u8]),
+        )
+        .expect("failed to build valve command packet");
+        let wire = serialize::serialize_packet(&pkt);
+        let msg = radio_command_message("rocket_comms", &wire)
+            .expect("command packet should emit message");
+        assert!(msg.contains("rocket_comms: radio TX ValveCommand"));
+
+        let telemetry_pkt = Packet::new(
+            DataType::KG1000,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            Board::DaqBoard.sender_id(),
+            123,
+            f32_payload(&[1.0]),
+        )
+        .expect("failed to build kg1000 packet");
+        let telemetry_wire = serialize::serialize_packet(&telemetry_pkt);
+        assert!(radio_command_message("rocket_comms", &telemetry_wire).is_none());
     }
 
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
