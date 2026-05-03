@@ -183,20 +183,26 @@ pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
     }
 }
 
-fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(&Packet)) {
+fn should_mirror_inbound_packet_to_local_processing(pkt: &Packet) -> bool {
+    let targets_local_endpoint = pkt.endpoints().iter().any(|endpoint| {
+        matches!(
+            endpoint,
+            DataEndpoint::GroundStation
+                | DataEndpoint::Abort
+                | DataEndpoint::FlightState
+                | DataEndpoint::HeartBeat
+                | DataEndpoint::TimeSync
+                | DataEndpoint::Discovery
+        )
+    });
+    !targets_local_endpoint
+}
+
+fn tap_non_local_payload(payload: &[u8], packet_tap: &mut dyn FnMut(&Packet)) {
     let Ok(pkt) = serialize::deserialize_packet(payload) else {
         return;
     };
-    let is_gps = matches!(
-        pkt.data_type(),
-        DataType::GpsData | DataType::GpsSatelliteNumber
-    );
-    if !is_gps {
-        return;
-    }
-
-    let has_groundstation = pkt.endpoints().contains(&DataEndpoint::GroundStation);
-    if !has_groundstation {
+    if should_mirror_inbound_packet_to_local_processing(&pkt) {
         packet_tap(&pkt);
     }
 }
@@ -555,7 +561,7 @@ impl UartComms {
             }
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
             maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
-            tap_non_groundstation_gps_payload(&payload, packet_tap);
+            tap_non_local_payload(&payload, packet_tap);
             match router.rx_serialized_queue_from_side(&payload, side_id) {
                 Ok(()) => {
                     maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
@@ -1585,7 +1591,7 @@ impl CommsDevice for I2cComms {
                                 if !is_valid_serialized_packet_or_ack(&packet) {
                                     continue;
                                 }
-                                tap_non_groundstation_gps_payload(&packet, packet_tap);
+                                tap_non_local_payload(&packet, packet_tap);
                                 match router.rx_serialized_queue_from_side(&packet, side_id) {
                                     Ok(()) => {}
                                     Err(err) => {
@@ -1741,7 +1747,7 @@ impl CommsDevice for SpiComms {
             if !is_valid_serialized_packet_or_ack(payload) {
                 return Ok(());
             }
-            tap_non_groundstation_gps_payload(payload, packet_tap);
+            tap_non_local_payload(payload, packet_tap);
             return router.rx_serialized_queue_from_side(payload, side_id);
         }
         #[cfg(not(target_os = "linux"))]
@@ -1902,7 +1908,7 @@ impl CommsDevice for CanComms {
             if !is_valid_serialized_packet_or_ack(&packet) {
                 return Ok(());
             }
-            tap_non_groundstation_gps_payload(&packet, packet_tap);
+            tap_non_local_payload(&packet, packet_tap);
             return router.rx_serialized_queue_from_side(&packet, side_id);
         }
         #[cfg(not(target_os = "linux"))]
@@ -2104,23 +2110,13 @@ impl CommsDevice for DummyComms {
             self.maybe_queue_discovery()?;
             self.maybe_queue_timesync()?;
             if let Some(pkt) = self.pending_rx.pop_front() {
-                if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
-                    && matches!(
-                        pkt.data_type(),
-                        DataType::GpsData | DataType::GpsSatelliteNumber
-                    )
-                {
+                if should_mirror_inbound_packet_to_local_processing(&pkt) {
                     packet_tap(&pkt);
                 }
                 return _router.rx_queue_from_side(pkt, side_id);
             }
             if let Some(pkt) = get_dummy_packet()? {
-                if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
-                    && matches!(
-                        pkt.data_type(),
-                        DataType::GpsData | DataType::GpsSatelliteNumber
-                    )
-                {
+                if should_mirror_inbound_packet_to_local_processing(&pkt) {
                     packet_tap(&pkt);
                 }
                 return _router.rx_queue_from_side(pkt, side_id);
@@ -2345,6 +2341,7 @@ mod tests {
 #[cfg(test)]
 mod raw_uart_tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn raw_uart_frame_roundtrip() {
@@ -2391,6 +2388,32 @@ mod raw_uart_tests {
             .unwrap();
         assert_eq!(decoded, wire.as_ref());
         assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn mirror_inbound_packet_includes_non_local_fill_telemetry() {
+        let pkt = Packet::new(
+            DataType::FuelTankPressure,
+            &[DataEndpoint::ValveBoard],
+            "GB",
+            123,
+            Arc::from(42.0f32.to_le_bytes().to_vec().into_boxed_slice()),
+        )
+        .unwrap();
+        assert!(should_mirror_inbound_packet_to_local_processing(&pkt));
+    }
+
+    #[test]
+    fn mirror_inbound_packet_skips_local_endpoint_packets() {
+        let pkt = Packet::new(
+            DataType::Heartbeat,
+            &[DataEndpoint::GroundStation, DataEndpoint::HeartBeat],
+            "GB",
+            123,
+            Arc::from([].as_slice()),
+        )
+        .unwrap();
+        assert!(!should_mirror_inbound_packet_to_local_processing(&pkt));
     }
 }
 
