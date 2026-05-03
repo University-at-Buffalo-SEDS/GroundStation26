@@ -1785,7 +1785,7 @@ async fn handle_gps_satellite_count_packet(
     payload_json: &str,
 ) -> Option<TelemetryRow> {
     let count = pkt.data_as_u8().ok().and_then(|v| v.first().copied())?;
-    let ts_ms = pkt.timestamp() as i64;
+    let ts_ms = get_current_timestamp_ms() as i64;
     let sender_id = pkt.sender().to_string();
 
     {
@@ -2987,7 +2987,6 @@ async fn handle_packet(
 ) -> Vec<TelemetryRow> {
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
     let sender_id = canonical_sender_id(pkt.sender()).to_string();
-    let sender_board = Board::from_sender_id(&sender_id);
 
     if pkt.data_type() == DataType::Warning {
         if let Ok(msg) = pkt.data_as_string() {
@@ -3143,19 +3142,7 @@ async fn handle_packet(
     }
 
     let data_type_str = pkt.data_type().as_str().to_string();
-    let use_ingest_timestamp = matches!(
-        pkt.data_type(),
-        DataType::GpsData | DataType::FuelTankPressure
-    ) || (pkt.data_type() == DataType::BatteryVoltage
-        && matches!(
-            sender_board,
-            Some(Board::GatewayBoard | Board::ValveBoard | Board::ActuatorBoard | Board::DaqBoard)
-        ));
-    let ts_ms = if use_ingest_timestamp {
-        get_current_timestamp_ms() as i64
-    } else {
-        pkt.timestamp() as i64
-    };
+    let ts_ms = get_current_timestamp_ms() as i64;
 
     let payload_json = payload_json_from_pkt(&pkt);
 
