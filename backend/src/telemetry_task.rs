@@ -397,6 +397,19 @@ fn spawn_dedicated_radio_io_threads(
                                 );
                                 last_uplink_log_at = Some(uplink_log_now);
                             }
+                            let _ = send_while_uplink_window_open(
+                                comms.as_mut(),
+                                worker_name,
+                                &mut tx_backlog,
+                                radio_follow_timeout,
+                                has_seen_window_update,
+                                last_window_update_at,
+                                &mut follow_window_until,
+                                &mut follow_window_is_uplink,
+                                &mut sent_in_current_uplink_window,
+                                &mut last_send_error_log_ms,
+                                &mut suppressed_send_errors,
+                            );
                         }
                     }
                 }
