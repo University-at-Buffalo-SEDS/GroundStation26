@@ -399,7 +399,7 @@ async fn main() -> anyhow::Result<()> {
     ]);
     if telemetry_task::timesync_enabled() {
         cfg = cfg.with_timesync(TimeSyncConfig {
-            role: TimeSyncRole::Auto,
+            role: TimeSyncRole::Source,
             priority: 50,
             ..TimeSyncConfig::default()
         });
