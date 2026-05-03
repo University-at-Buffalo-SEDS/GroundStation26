@@ -49,6 +49,8 @@ const I2C_FRAME_PAYLOAD_MAX_BYTES: usize = I2C_PACKET_MAX_BYTES - RAW_UART_FRAME
 const UART_STARTUP_TIMEOUT: Duration = Duration::from_millis(500);
 const UART_NORMAL_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(target_os = "linux")]
+const UART_TX_POLL_TIMEOUT: Duration = Duration::from_millis(10);
+#[cfg(target_os = "linux")]
 const I2C_SLOT_SIZE: usize = 32;
 #[cfg(target_os = "linux")]
 const I2C_SLOT_HEADER_SIZE: usize = 18;
@@ -103,6 +105,15 @@ pub trait CommsDevice: Send {
     ) -> TelemetryResult<()> {
         let _ = timeout;
         self.recv_serialized_packets(packet_sink)
+    }
+    fn recv_serialized_packets_with_budget(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+        timeout: Duration,
+        max_packets: usize,
+    ) -> TelemetryResult<()> {
+        let _ = max_packets;
+        self.recv_serialized_packets_with_timeout(packet_sink, timeout)
     }
     fn take_radio_window_update(&mut self) -> Option<RadioWindowUpdate> {
         None
@@ -497,14 +508,20 @@ impl UartComms {
         }
     }
 
-    fn process_buffered_payloads(
+    fn process_buffered_payloads_with_budget(
         &mut self,
         packet_sink: &mut dyn FnMut(Vec<u8>),
+        max_packets: usize,
     ) -> TelemetryResult<bool> {
         let mut processed_any = false;
+        let mut remaining = max_packets.max(1);
 
-        while let Some(payload) = self.try_take_packet()? {
+        while remaining > 0 {
+            let Some(payload) = self.try_take_packet()? else {
+                break;
+            };
             processed_any = true;
+            remaining -= 1;
             if !is_valid_serialized_packet_or_ack(&payload) {
                 maybe_log_raw_uart_parse_issue(
                     "dropping invalid serialized payload from framed raw UART packet",
@@ -620,6 +637,69 @@ fn write_once_fd(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
         return Err(err);
     }
     Ok(written as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn write_all_fd_with_poll(fd: RawFd, bytes: &[u8], timeout: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut written_total = 0usize;
+
+    while written_total < bytes.len() {
+        match write_once_fd(fd, &bytes[written_total..]) {
+            Ok(0) => {}
+            Ok(n) => {
+                written_total += n;
+                continue;
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(err) => return Err(err),
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "short raw UART tx write: wrote {written_total} of {} bytes",
+                    bytes.len()
+                ),
+            ));
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let timeout_ms = remaining.as_millis().clamp(0, i32::MAX as u128) as i32;
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if rc == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "short raw UART tx write: wrote {written_total} of {} bytes",
+                        bytes.len()
+                    ),
+                ));
+            }
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1210,24 +1290,7 @@ impl CommsDevice for UartComms {
                 #[cfg(target_os = "linux")]
                 {
                     let framed = build_raw_uart_frame(payload)?;
-                    let written = write_once_fd(self.inner.as_raw_fd(), &framed)?;
-                    if written == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            "raw UART tx write would block",
-                        )
-                        .into());
-                    }
-                    if written < framed.len() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            format!(
-                                "short raw UART tx write: wrote {written} of {} bytes",
-                                framed.len()
-                            ),
-                        )
-                        .into());
-                    }
+                    write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -1255,12 +1318,21 @@ impl CommsDevice for UartComms {
         packet_sink: &mut dyn FnMut(Vec<u8>),
         timeout: Duration,
     ) -> TelemetryResult<()> {
+        self.recv_serialized_packets_with_budget(packet_sink, timeout, usize::MAX)
+    }
+
+    fn recv_serialized_packets_with_budget(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+        timeout: Duration,
+        max_packets: usize,
+    ) -> TelemetryResult<()> {
         if self.rx_buf.len() < 2
             && let Err(err) = self.fill_rx_buf_with_timeout(timeout)
         {
             return Err(err.into());
         }
-        if self.process_buffered_payloads(packet_sink)? {
+        if self.process_buffered_payloads_with_budget(packet_sink, max_packets)? {
             return Ok(());
         }
 
@@ -1268,7 +1340,7 @@ impl CommsDevice for UartComms {
             return Err(err.into());
         }
 
-        let _ = self.process_buffered_payloads(packet_sink)?;
+        let _ = self.process_buffered_payloads_with_budget(packet_sink, max_packets)?;
         maybe_log_raw_uart_buffer_state(&self.rx_buf, "waiting for complete frame", &self.protocol);
         Ok(())
     }
