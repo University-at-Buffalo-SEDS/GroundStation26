@@ -472,20 +472,8 @@ fn spawn_dedicated_radio_io_threads(
                 if let Ok(pkt) = serialize::deserialize_packet(&payload) {
                     ingress_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     ingress_state.mark_packet_received(get_current_timestamp_ms());
-                    if pkt.endpoints().iter().all(|endpoint| {
-                        !matches!(
-                            endpoint,
-                            DataEndpoint::GroundStation
-                                | DataEndpoint::Abort
-                                | DataEndpoint::FlightState
-                                | DataEndpoint::HeartBeat
-                                | DataEndpoint::TimeSync
-                                | DataEndpoint::Discovery
-                        )
-                    }) {
-                        let mut rb = ingress_state.ring_buffer.lock().unwrap();
-                        rb.push(pkt);
-                    }
+                    let mut rb = ingress_state.ring_buffer.lock().unwrap();
+                    rb.push(pkt);
                 }
 
                 if let Err(err) = router.rx_serialized_queue_from_side(&payload, side_id) {
