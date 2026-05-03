@@ -6,7 +6,7 @@ use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
 use sedsprintf_rs_2026::{
     TelemetryError, TelemetryResult,
-    config::{DataEndpoint, DataType},
+    config::DataEndpoint,
     packet::Packet,
     router::{Router, RouterSideId},
     serialize,
@@ -2341,6 +2341,7 @@ mod tests {
 #[cfg(test)]
 mod raw_uart_tests {
     use super::*;
+    use sedsprintf_rs_2026::config::DataType;
     use std::sync::Arc;
 
     #[test]
