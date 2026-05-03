@@ -332,6 +332,15 @@ fn spawn_dedicated_radio_io_threads(
                     false
                 } else if follow_mode_active {
                     if follow_window_until.is_some_and(|deadline| now >= deadline) {
+                        if follow_window_is_uplink
+                            && !sent_in_current_uplink_window
+                            && !tx_backlog.is_empty()
+                        {
+                            eprintln!(
+                                "{worker_name}: radio uplink window closed without TX queued_commands={}",
+                                tx_backlog.len()
+                            );
+                        }
                         follow_window_until = None;
                         follow_window_is_uplink = false;
                         sent_in_current_uplink_window = false;
@@ -403,6 +412,7 @@ fn spawn_dedicated_radio_io_threads(
                 if tx_allowed
                     && let Some(payload) = tx_backlog.pop_front()
                 {
+                    log_radio_packet_event("radio TX pop", worker_name, &payload);
                     maybe_log_green_radio_command_send(worker_name, &payload);
                     match comms.send_data(&payload) {
                         Ok(()) => {
@@ -419,6 +429,11 @@ fn spawn_dedicated_radio_io_threads(
                             }
                         }
                         Err(e) => {
+                            log_radio_packet_event(
+                                "radio TX send_data failed for",
+                                worker_name,
+                                &payload,
+                            );
                             log_repeated_worker_error(
                                 &format!("{worker_name} radio io send_data failed"),
                                 &e.to_string(),
@@ -850,6 +865,19 @@ fn log_radio_command_event(event: &str, worker_name: &str, payload: &[u8]) {
     if let Some(message) = radio_command_log_line(event, worker_name, payload) {
         eprintln!("{message}");
     }
+}
+
+fn log_radio_packet_event(event: &str, worker_name: &str, payload: &[u8]) {
+    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+        return;
+    };
+    eprintln!(
+        "{worker_name}: {event} {:?} sender={} endpoints={:?} payload_len={}",
+        pkt.data_type(),
+        pkt.sender(),
+        pkt.endpoints(),
+        pkt.payload().len(),
+    );
 }
 
 fn log_radio_uplink_available(worker_name: &str, duration_ms: u16, backlog_len: usize) {
