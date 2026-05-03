@@ -4,6 +4,7 @@ use crate::gpio_panel::IGNITION_PIN;
 use crate::layout;
 use crate::loadcell;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightComputerCommands, ValveBoardCommands};
+use crate::sequences;
 use crate::state::{AppState, launch_countdown_clock};
 use crate::telemetry_db::{
     DbQueueItem, DbWrite, LaunchClockKind, RecordingCommand, RecordingMode, RecordingModeWire,
@@ -472,8 +473,14 @@ fn spawn_dedicated_radio_io_threads(
                 if let Ok(pkt) = serialize::deserialize_packet(&payload) {
                     ingress_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     ingress_state.mark_packet_received(get_current_timestamp_ms());
-                    let mut rb = ingress_state.ring_buffer.lock().unwrap();
-                    rb.push(pkt);
+                    if matches!(
+                        pkt.data_type(),
+                        DataType::GpsData | DataType::GpsSatelliteNumber
+                    ) && !pkt.endpoints().contains(&DataEndpoint::GroundStation)
+                    {
+                        let mut rb = ingress_state.ring_buffer.lock().unwrap();
+                        rb.push(pkt);
+                    }
                 }
 
                 if let Err(err) = router.rx_serialized_queue_from_side(&payload, side_id) {
@@ -2980,6 +2987,7 @@ async fn handle_packet(
 ) -> Vec<TelemetryRow> {
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
     let sender_id = canonical_sender_id(pkt.sender()).to_string();
+    let sender_board = Board::from_sender_id(&sender_id);
 
     if pkt.data_type() == DataType::Warning {
         if let Ok(msg) = pkt.data_as_string() {
@@ -3087,8 +3095,9 @@ async fn handle_packet(
             let on = data[1] != 0;
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
                 state.set_umbilical_valve_state(key_cmd_id, key_on);
+                sequences::refresh_action_policy_now(state);
 
-                let ts_ms = pkt.timestamp() as i64;
+                let ts_ms = get_current_timestamp_ms() as i64;
                 let values = valve_state_values(state);
                 let values_vec: Vec<Option<f32>> = values.into_iter().collect();
                 let values_json = serde_json::to_string(
@@ -3136,7 +3145,11 @@ async fn handle_packet(
     let use_ingest_timestamp = matches!(
         pkt.data_type(),
         DataType::GpsData | DataType::FuelTankPressure
-    );
+    ) || (pkt.data_type() == DataType::BatteryVoltage
+        && matches!(
+            sender_board,
+            Some(Board::GatewayBoard | Board::ValveBoard | Board::ActuatorBoard | Board::DaqBoard)
+        ));
     let ts_ms = if use_ingest_timestamp {
         get_current_timestamp_ms() as i64
     } else {
@@ -3956,6 +3969,10 @@ mod tests {
         assert_eq!(row.data_type, DataType::BatteryVoltage.as_str());
         assert_eq!(row.sender_id, Board::GatewayBoard.sender_id());
         assert_eq!(row.values, vec![Some(14.4)]);
+        assert!(
+            row.timestamp_ms > 678_901,
+            "gateway battery row should use ground-station ingest time, not stale board timestamp"
+        );
 
         let mut derived_rows = Vec::new();
         for _ in 0..3 {
@@ -3980,6 +3997,47 @@ mod tests {
             ]
         );
         assert!(derived_rows.iter().all(|row| row.sender_id == "GB"));
+        assert!(derived_rows.iter().all(|derived| derived.timestamp_ms == row.timestamp_ms));
+    }
+
+    #[tokio::test]
+    async fn umbilical_status_refreshes_action_policy_immediately() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+
+        let before = state
+            .action_policy_snapshot()
+            .controls
+            .into_iter()
+            .find(|control| control.cmd == "Nitrogen")
+            .expect("Nitrogen control should exist");
+        assert_ne!(before.actuated, Some(true));
+
+        let pkt = Packet::new(
+            DataType::UmbilicalStatus,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            Board::ActuatorBoard.sender_id(),
+            111_222,
+            Arc::from([ActuatorBoardCommands::NitrogenOpen as u8, 1_u8]),
+        )
+        .expect("failed to build umbilical status packet");
+
+        let rows = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].data_type, VALVE_STATE_DATA_TYPE);
+        assert_eq!(
+            state.get_umbilical_valve_state(ActuatorBoardCommands::NitrogenOpen as u8),
+            Some(true)
+        );
+
+        let after = state
+            .action_policy_snapshot()
+            .controls
+            .into_iter()
+            .find(|control| control.cmd == "Nitrogen")
+            .expect("Nitrogen control should exist");
+        assert_eq!(after.actuated, Some(true));
     }
 
     #[tokio::test]

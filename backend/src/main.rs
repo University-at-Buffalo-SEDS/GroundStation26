@@ -370,13 +370,11 @@ async fn main() -> anyhow::Result<()> {
             ground_station_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
-            if pkt.sender() == Board::GroundStation.sender_id() {
-                let mut rb = ground_station_handler_state_clone
-                    .ring_buffer
-                    .lock()
-                    .unwrap();
-                rb.push(pkt.clone());
-            }
+            let mut rb = ground_station_handler_state_clone
+                .ring_buffer
+                .lock()
+                .unwrap();
+            rb.push(pkt.clone());
             Ok(())
         });
 
@@ -385,10 +383,8 @@ async fn main() -> anyhow::Result<()> {
             flight_state_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             flight_state_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
-            if pkt.sender() == Board::GroundStation.sender_id() {
-                let mut rb = flight_state_handler_state_clone.ring_buffer.lock().unwrap();
-                rb.push(pkt.clone());
-            }
+            let mut rb = flight_state_handler_state_clone.ring_buffer.lock().unwrap();
+            rb.push(pkt.clone());
             Ok(())
         });
 
@@ -405,10 +401,8 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_handler = EndpointHandler::new_packet_handler(HeartBeat, move |pkt: &Packet| {
         heartbeat_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
         heartbeat_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
-        if pkt.sender() == Board::GroundStation.sender_id() {
-            let mut rb = heartbeat_handler_state_clone.ring_buffer.lock().unwrap();
-            rb.push(pkt.clone());
-        }
+        let mut rb = heartbeat_handler_state_clone.ring_buffer.lock().unwrap();
+        rb.push(pkt.clone());
         Ok(())
     });
 

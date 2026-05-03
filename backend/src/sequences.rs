@@ -1872,3 +1872,46 @@ pub fn start_sequence_task(
         }
     })
 }
+
+pub fn refresh_action_policy_now(state: &Arc<AppState>) {
+    let cfg = SequenceConfig::from_env();
+    if cfg!(feature = "hitl_mode") {
+        let valves = ValveSnapshot::read(state);
+        state.set_action_policy(hitl_action_policy(valves));
+        return;
+    }
+
+    let mut runtime = SequenceRuntime::default();
+    let mut flight_state = *state.state.lock().unwrap();
+    let valves = ValveSnapshot::read(state);
+    let pressure_psi = *state.latest_fuel_tank_pressure.lock().unwrap();
+    let current_mass_kg = *state.latest_fill_mass_kg.lock().unwrap();
+    let now = Instant::now();
+    let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+    let key_enabled = read_key_enabled(state, &cfg);
+    let software_buttons_enabled = read_software_buttons_enabled(state, &cfg);
+
+    update_sequence_runtime(
+        state,
+        &mut runtime,
+        &cfg,
+        valves,
+        pressure_psi,
+        current_mass_kg,
+        now,
+    );
+    flight_state = maybe_drive_local_prelaunch_state(state, &runtime, valves, flight_state);
+    let policy = build_policy(
+        state,
+        &cfg,
+        &runtime,
+        PolicyInputs {
+            flight_state,
+            key_enabled,
+            software_buttons_enabled,
+            valves,
+            now_ms,
+        },
+    );
+    state.set_action_policy(policy);
+}
