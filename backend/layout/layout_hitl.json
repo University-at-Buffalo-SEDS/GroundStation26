@@ -139,13 +139,6 @@
         "spacer_row_after": true
       },
       {
-        "label": "Launch",
-        "cmd": "Launch",
-        "border": "#22c55e",
-        "bg": "#022c22",
-        "fg": "#bbf7d0"
-      },
-      {
         "label": "Dump",
         "cmd": "Dump",
         "border": "#ef4444",
@@ -195,41 +188,6 @@
         "fg": "#fef9c3"
       },
       {
-        "label": "Flight State +1",
-        "cmd": "AdvanceFlightState",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Flight State -1",
-        "cmd": "RewindFlightState",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Deploy Parachute",
-        "cmd": "DeployParachute",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Expand Parachute",
-        "cmd": "ExpandParachute",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Reinit Sensors",
-        "cmd": "ReinitSensors",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
         "label": "Continue Fill Sequence",
         "cmd": "ContinueFillSequence",
         "border": "#38bdf8",
@@ -253,48 +211,6 @@
       {
         "label": "Rollback Signal",
         "cmd": "RollbackSignal",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Evaluation Relax",
-        "cmd": "EvaluationRelax",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Evaluation Focus",
-        "cmd": "EvaluationFocus",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Evaluation Abort",
-        "cmd": "EvaluationAbort",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Reinit Barometer",
-        "cmd": "ReinitBarometer",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Reinit IMU",
-        "cmd": "ReinitIMU",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Disable IMU",
-        "cmd": "DisableIMU",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -351,6 +267,83 @@
       {
         "label": "Revoke Validate",
         "cmd": "RevokeValidateMeasms",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Deploy Parachute",
+        "cmd": "DeployParachute",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Expand Parachute",
+        "cmd": "ExpandParachute",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Evaluation Relax",
+        "cmd": "EvaluationRelax",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Evaluation Focus",
+        "cmd": "EvaluationFocus",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Evaluation Abort",
+        "cmd": "EvaluationAbort",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Reinit Sensors",
+        "cmd": "ReinitSensors",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Reinit Barometer",
+        "cmd": "ReinitBarometer",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Reinit IMU",
+        "cmd": "ReinitIMU",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Disable IMU",
+        "cmd": "DisableIMU",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Flight State +1",
+        "cmd": "AdvanceFlightState",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Flight State -1",
+        "cmd": "RewindFlightState",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -447,6 +440,18 @@
             ],
             "scale_mode": "per_series"
           }
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "EULER_ANGLES",
+        "label": "Euler Angles",
+        "channels": [
+          "Phi",
+          "Theta",
+          "Psi"
         ],
         "chart": {
           "enabled": true

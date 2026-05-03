@@ -241,8 +241,8 @@ pub async fn safety_task(
                 | FlightState::Ascent
                 | FlightState::Coast
                 | FlightState::Apogee
-                | FlightState::ParachuteDeploy
                 | FlightState::Descent
+                | FlightState::Reefing
                 | FlightState::Landed
                 | FlightState::Recovery
                 | FlightState::Aborted
