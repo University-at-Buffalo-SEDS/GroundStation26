@@ -2206,6 +2206,12 @@ pub async fn telemetry_task(
                                     &[FlightComputerCommands::PostinitSignal as u8],
                                 ) {
                                     log_telemetry_error("failed to log PostinitSignal command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "PostinitSignal command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::PostinitSignal as u8],
+                                    );
                                 }
                                 gs_debug_println!("PostinitSignal command sent");
                             }
@@ -2232,6 +2238,12 @@ pub async fn telemetry_task(
                                     &[FlightComputerCommands::LaunchSignal as u8],
                                 ) {
                                     log_telemetry_error("failed to log LaunchSignal command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "LaunchSignal command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::LaunchSignal as u8],
+                                    );
                                 }
                                 gs_debug_println!("LaunchSignal command sent");
                             }
@@ -2241,6 +2253,12 @@ pub async fn telemetry_task(
                                     &[FlightComputerCommands::RollbackSignal as u8],
                                 ) {
                                     log_telemetry_error("failed to log RollbackSignal command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "RollbackSignal command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::RollbackSignal as u8],
+                                    );
                                 }
                                 gs_debug_println!("RollbackSignal command sent");
                             }
@@ -2250,6 +2268,12 @@ pub async fn telemetry_task(
                                     &[FlightComputerCommands::MonitorAltitude as u8],
                                 ) {
                                     log_telemetry_error("failed to log MonitorAltitude command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "MonitorAltitude command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::MonitorAltitude as u8],
+                                    );
                                 }
                                 gs_debug_println!("MonitorAltitude command sent");
                             }
@@ -2259,6 +2283,12 @@ pub async fn telemetry_task(
                                     &[FlightComputerCommands::RevokeMonitorAltitude as u8],
                                 ) {
                                     log_telemetry_error("failed to log RevokeMonitorAltitude command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "RevokeMonitorAltitude command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::RevokeMonitorAltitude as u8],
+                                    );
                                 }
                                 gs_debug_println!("RevokeMonitorAltitude command sent");
                             }
@@ -2268,6 +2298,12 @@ pub async fn telemetry_task(
                                     &[FlightComputerCommands::ConsecutiveSamples as u8],
                                 ) {
                                     log_telemetry_error("failed to log ConsecutiveSamples command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "ConsecutiveSamples command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::ConsecutiveSamples as u8],
+                                    );
                                 }
                                 gs_debug_println!("ConsecutiveSamples command sent");
                             }
@@ -2277,6 +2313,12 @@ pub async fn telemetry_task(
                                     &[FlightComputerCommands::RevokeConsecutiveSamples as u8],
                                 ) {
                                     log_telemetry_error("failed to log RevokeConsecutiveSamples command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "RevokeConsecutiveSamples command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::RevokeConsecutiveSamples as u8],
+                                    );
                                 }
                                 gs_debug_println!("RevokeConsecutiveSamples command sent");
                             }
@@ -2286,6 +2328,12 @@ pub async fn telemetry_task(
                                     &[FlightComputerCommands::ResetFailures as u8],
                                 ) {
                                     log_telemetry_error("failed to log ResetFailures command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "ResetFailures command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::ResetFailures as u8],
+                                    );
                                 }
                                 gs_debug_println!("ResetFailures command sent");
                             }
@@ -2295,6 +2343,12 @@ pub async fn telemetry_task(
                                     &[FlightComputerCommands::RevokeResetFailures as u8],
                                 ) {
                                     log_telemetry_error("failed to log RevokeResetFailures command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "RevokeResetFailures command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::RevokeResetFailures as u8],
+                                    );
                                 }
                                 gs_debug_println!("RevokeResetFailures command sent");
                             }
@@ -2304,6 +2358,12 @@ pub async fn telemetry_task(
                                     &[FlightComputerCommands::ValidateMeasms as u8],
                                 ) {
                                     log_telemetry_error("failed to log ValidateMeasms command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "ValidateMeasms command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::ValidateMeasms as u8],
+                                    );
                                 }
                                 gs_debug_println!("ValidateMeasms command sent");
                             }
@@ -2313,6 +2373,12 @@ pub async fn telemetry_task(
                                     &[FlightComputerCommands::RevokeValidateMeasms as u8],
                                 ) {
                                     log_telemetry_error("failed to log RevokeValidateMeasms command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "RevokeValidateMeasms command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::RevokeValidateMeasms as u8],
+                                    );
                                 }
                                 gs_debug_println!("RevokeValidateMeasms command sent");
                             }
@@ -2349,6 +2415,12 @@ pub async fn telemetry_task(
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
                                 if let Err(e) = router.log_queue(DataType::FlightCommand, &[cmd_id]) {
                                     log_telemetry_error("failed to log HITL flight command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "HITL flight command",
+                                        DataType::FlightCommand,
+                                        &[cmd_id],
+                                    );
                                 }
                                 gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
                             }
