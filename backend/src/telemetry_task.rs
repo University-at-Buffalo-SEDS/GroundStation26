@@ -42,6 +42,16 @@ pub struct CommsWorkerHandle {
 const COMMS_TX_BURST: usize = 1;
 const COMMS_TX_GAP_MS: u64 = 10;
 const COMMS_IDLE_SLEEP_MS: u64 = 1;
+const PARSE_ERROR_REPORT_INTERVAL_MS: u64 = 60_000;
+
+#[derive(Debug, Default)]
+struct ParseErrorReportState {
+    last_emit_ms: Option<u64>,
+    pending_count: u64,
+}
+
+static PARSE_ERROR_REPORTS: OnceLock<Mutex<HashMap<String, ParseErrorReportState>>> =
+    OnceLock::new();
 
 fn spawn_comms_worker_threads(
     router: Arc<Router>,
@@ -1183,6 +1193,46 @@ fn telemetry_values_json(values: &[Option<f32>]) -> Option<String> {
             .collect::<Vec<_>>(),
     )
     .ok()
+}
+
+fn maybe_take_parse_error_report(key: &str, now_ms: u64) -> Option<u64> {
+    let reports = PARSE_ERROR_REPORTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut reports = reports.lock().unwrap();
+    let state = reports.entry(key.to_string()).or_default();
+    state.pending_count = state.pending_count.saturating_add(1);
+
+    let should_emit = state
+        .last_emit_ms
+        .map(|last_emit_ms| now_ms.saturating_sub(last_emit_ms) >= PARSE_ERROR_REPORT_INTERVAL_MS)
+        .unwrap_or(true);
+    if !should_emit {
+        return None;
+    }
+
+    let count = state.pending_count;
+    state.pending_count = 0;
+    state.last_emit_ms = Some(now_ms);
+    Some(count)
+}
+
+fn report_parse_error(state: &Arc<AppState>, sender_id: &str, data_type: &str, detail: &str) {
+    let now_ms = get_current_timestamp_ms();
+    let key = format!("{sender_id}:{data_type}:{detail}");
+    let Some(count) = maybe_take_parse_error_report(&key, now_ms) else {
+        return;
+    };
+    let message = format!(
+        "{sender_id}: {data_type} parse errors: {count} packet(s) in the last {}s ({detail})",
+        PARSE_ERROR_REPORT_INTERVAL_MS / 1000
+    );
+    let _ = state.add_backend_message(message);
+}
+
+#[cfg(test)]
+fn reset_parse_error_reports() {
+    if let Some(reports) = PARSE_ERROR_REPORTS.get() {
+        reports.lock().unwrap().clear();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2621,6 +2671,12 @@ async fn handle_packet(
             emit_warning(state, msg.to_string());
         } else {
             emit_warning(state, "Warning packet with invalid UTF-8 payload");
+            report_parse_error(
+                state,
+                &sender_id,
+                pkt.data_type().as_str(),
+                "invalid UTF-8 payload",
+            );
         }
         return Vec::new();
     }
@@ -2628,7 +2684,15 @@ async fn handle_packet(
     if pkt.data_type() == DataType::MessageData {
         let message = match pkt.data_as_string() {
             Ok(msg) => msg.to_string(),
-            Err(_) => "Telemetry message with invalid UTF-8 payload".to_string(),
+            Err(_) => {
+                report_parse_error(
+                    state,
+                    &sender_id,
+                    pkt.data_type().as_str(),
+                    "invalid UTF-8 payload",
+                );
+                "Telemetry message with invalid UTF-8 payload".to_string()
+            }
         };
         let message = format!("{sender_id}: {message}");
         let (message_id, inserted) = state.add_backend_message(message.clone());
@@ -2654,11 +2718,27 @@ async fn handle_packet(
         }
         let pkt_data = match pkt.data_as_u8() {
             Ok(data) => *data.first().expect("index 0 does not exist"),
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                report_parse_error(
+                    state,
+                    &sender_id,
+                    pkt.data_type().as_str(),
+                    "expected u8 flight-state payload",
+                );
+                return Vec::new();
+            }
         };
         let new_flight_state = match u8_to_flight_state(pkt_data) {
             Some(flight_state) => flight_state,
-            None => return Vec::new(),
+            None => {
+                report_parse_error(
+                    state,
+                    &sender_id,
+                    pkt.data_type().as_str(),
+                    "unknown flight-state code",
+                );
+                return Vec::new();
+            }
         };
         {
             let mut fs = state.state.lock().unwrap();
@@ -2728,6 +2808,12 @@ async fn handle_packet(
                 return vec![row];
             }
         }
+        report_parse_error(
+            state,
+            &sender_id,
+            pkt.data_type().as_str(),
+            "expected 2-byte umbilical status payload",
+        );
         return Vec::new();
     }
 
@@ -2855,6 +2941,13 @@ async fn handle_packet(
                 values: Vec::new(),
             }];
         }
+
+        report_parse_error(
+            state,
+            &sender_id,
+            pkt.data_type().as_str(),
+            "unable to decode telemetry payload as f32 values",
+        );
 
         Vec::new()
     }
@@ -3061,6 +3154,7 @@ mod tests {
     }
 
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
+        reset_parse_error_reports();
         let db = SqlitePool::connect("sqlite::memory:")
             .await
             .expect("failed to open in-memory telemetry db");
@@ -3544,5 +3638,38 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].0, "GB");
         assert_eq!(writes[1].0, "PB");
+    }
+
+    #[tokio::test]
+    async fn unknown_flight_state_code_emits_backend_message() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        for board in Board::ALL {
+            if *board != Board::GroundStation {
+                state.mark_board_seen(board.sender_id(), get_current_timestamp_ms());
+            }
+        }
+        let pkt = Packet::new(
+            DataType::FlightState,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            Board::FlightComputer.sender_id(),
+            789_012,
+            Arc::from([255_u8]),
+        )
+        .expect("failed to build invalid flight-state packet");
+
+        let rows = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
+
+        assert!(rows.is_empty());
+        let messages = state.messages_snapshot();
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .message
+                .contains("FLIGHT_STATE parse errors: 1 packet(s)"),
+            "unexpected backend message: {}",
+            messages[0].message
+        );
     }
 }
