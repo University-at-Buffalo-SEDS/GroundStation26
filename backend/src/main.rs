@@ -94,6 +94,21 @@ pub(crate) fn debug_prints_enabled() -> bool {
     })
 }
 
+pub(crate) fn radio_diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GS_RADIO_DIAGNOSTICS")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
     match link {
         CommsLinkConfig::I2c { .. } => false,

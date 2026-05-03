@@ -855,7 +855,7 @@ fn radio_tx_packets_per_window() -> usize {
 }
 
 fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
-    if !crate::debug_prints_enabled() {
+    if !crate::radio_diagnostics_enabled() {
         return;
     }
     let Ok(pkt) = serialize::deserialize_packet(payload) else {
@@ -910,12 +910,18 @@ fn radio_command_log_line(event: &str, worker_name: &str, payload: &[u8]) -> Opt
 }
 
 fn log_radio_command_event(event: &str, worker_name: &str, payload: &[u8]) {
+    if !crate::radio_diagnostics_enabled() {
+        return;
+    }
     if let Some(message) = radio_command_log_line(event, worker_name, payload) {
         eprintln!("{message}");
     }
 }
 
 fn log_radio_packet_event(event: &str, worker_name: &str, payload: &[u8]) {
+    if !crate::radio_diagnostics_enabled() {
+        return;
+    }
     let Ok(pkt) = serialize::deserialize_packet(payload) else {
         return;
     };
@@ -929,6 +935,9 @@ fn log_radio_packet_event(event: &str, worker_name: &str, payload: &[u8]) {
 }
 
 fn log_radio_uplink_available(worker_name: &str, duration_ms: u16, backlog_len: usize) {
+    if !crate::radio_diagnostics_enabled() {
+        return;
+    }
     eprintln!(
         "{worker_name}: radio uplink available window_ms={duration_ms} queued_commands={backlog_len}"
     );
@@ -966,7 +975,11 @@ fn send_while_uplink_window_open(
             break;
         };
         if now >= deadline {
-            if *follow_window_is_uplink && *sent_in_current_uplink_window == 0 && !tx_backlog.is_empty() {
+            if crate::radio_diagnostics_enabled()
+                && *follow_window_is_uplink
+                && *sent_in_current_uplink_window == 0
+                && !tx_backlog.is_empty()
+            {
                 eprintln!(
                     "{worker_name}: radio uplink window closed without TX queued_commands={}",
                     tx_backlog.len()
