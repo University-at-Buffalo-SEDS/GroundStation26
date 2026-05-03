@@ -321,6 +321,16 @@ fn spawn_dedicated_radio_io_threads(
                 loop {
                     match comms_handle.tx_rx.try_recv() {
                         Ok(payload) => {
+                            if worker_name == "rocket_comms"
+                                && is_fill_system_command_payload(&payload)
+                            {
+                                log_radio_command_event(
+                                    "radio TX dropped fill-system command",
+                                    worker_name,
+                                    &payload,
+                                );
+                                continue;
+                            }
                             log_radio_command_event("radio TX backlog", worker_name, &payload);
                             tx_backlog.push_back(payload);
                             while tx_backlog.len() > radio_tx_backlog_limit {
@@ -936,6 +946,16 @@ fn log_radio_uplink_available(worker_name: &str, duration_ms: u16, backlog_len: 
     eprintln!(
         "{worker_name}: radio uplink available window_ms={duration_ms} queued_commands={backlog_len}"
     );
+}
+
+fn is_fill_system_command_payload(payload: &[u8]) -> bool {
+    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+        return false;
+    };
+    matches!(
+        pkt.data_type(),
+        DataType::ValveCommand | DataType::ActuatorCommand
+    )
 }
 
 fn send_while_uplink_window_open(
@@ -3545,6 +3565,45 @@ mod tests {
         .expect("failed to build kg1000 packet");
         let telemetry_wire = serialize::serialize_packet(&telemetry_pkt);
         assert!(radio_command_log_line("radio TX sent", "rocket_comms", &telemetry_wire).is_none());
+    }
+
+    #[test]
+    fn rocket_drop_filter_matches_fill_system_commands_only() {
+        let actuator_pkt = Packet::new(
+            DataType::ActuatorCommand,
+            &[sedsprintf_rs_2026::config::DataEndpoint::ActuatorBoard],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([9_u8]),
+        )
+        .expect("failed to build actuator command packet");
+        assert!(is_fill_system_command_payload(&serialize::serialize_packet(
+            &actuator_pkt
+        )));
+
+        let valve_pkt = Packet::new(
+            DataType::ValveCommand,
+            &[sedsprintf_rs_2026::config::DataEndpoint::ValveBoard],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([1_u8]),
+        )
+        .expect("failed to build valve command packet");
+        assert!(is_fill_system_command_payload(&serialize::serialize_packet(
+            &valve_pkt
+        )));
+
+        let flight_pkt = Packet::new(
+            DataType::FlightCommand,
+            &[sedsprintf_rs_2026::config::DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([0_u8]),
+        )
+        .expect("failed to build flight command packet");
+        assert!(!is_fill_system_command_payload(&serialize::serialize_packet(
+            &flight_pkt
+        )));
     }
 
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {

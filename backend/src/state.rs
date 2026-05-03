@@ -961,6 +961,15 @@ impl AppState {
     pub fn set_action_policy(&self, policy: ActionPolicyMsg) {
         let recording_mode = self.recording_status_snapshot().mode;
         let mut policy = policy;
+        #[cfg(feature = "hitl_mode")]
+        {
+            policy.key_enabled = true;
+            policy.software_buttons_enabled = true;
+            for control in &mut policy.controls {
+                control.enabled = true;
+                control.blink = crate::sequences::BlinkMode::None;
+            }
+        }
         for control in &mut policy.controls {
             if let Some(actuated) = recording_command_actuated(&control.cmd, recording_mode) {
                 control.actuated = Some(actuated);
