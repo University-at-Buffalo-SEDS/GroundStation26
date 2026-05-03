@@ -1215,7 +1215,22 @@ fn maybe_take_parse_error_report(key: &str, now_ms: u64) -> Option<u64> {
     Some(count)
 }
 
+fn should_report_parse_error(data_type: &str) -> bool {
+    !matches!(
+        data_type,
+        "HEARTBEAT"
+            | "DISCOVERY_ANNOUNCE"
+            | "DISCOVERY_TIMESYNC_SOURCES"
+            | "TIME_SYNC_ANNOUNCE"
+            | "TIME_SYNC_REQUEST"
+            | "TIME_SYNC_RESPONSE"
+    )
+}
+
 fn report_parse_error(state: &Arc<AppState>, sender_id: &str, data_type: &str, detail: &str) {
+    if !should_report_parse_error(data_type) {
+        return;
+    }
     let now_ms = get_current_timestamp_ms();
     let key = format!("{sender_id}:{data_type}:{detail}");
     let Some(count) = maybe_take_parse_error_report(&key, now_ms) else {
@@ -2681,7 +2696,7 @@ async fn handle_packet(
         return Vec::new();
     }
 
-    if pkt.data_type() == DataType::MessageData {
+    if pkt.data_type() == DataType::MessageData || pkt.data_type() == DataType::OrderedMessage {
         let message = match pkt.data_as_string() {
             Ok(msg) => msg.to_string(),
             Err(_) => {
@@ -3151,6 +3166,16 @@ mod tests {
             running: Arc::new(AtomicBool::new(true)),
             max_entries: 16,
         }
+    }
+
+    #[test]
+    fn parse_error_filter_skips_protocol_packets() {
+        assert!(!should_report_parse_error("DISCOVERY_ANNOUNCE"));
+        assert!(!should_report_parse_error("DISCOVERY_TIMESYNC_SOURCES"));
+        assert!(!should_report_parse_error("TIME_SYNC_ANNOUNCE"));
+        assert!(!should_report_parse_error("TIME_SYNC_REQUEST"));
+        assert!(!should_report_parse_error("TIME_SYNC_RESPONSE"));
+        assert!(should_report_parse_error("KG1000"));
     }
 
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
