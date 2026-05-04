@@ -113,6 +113,9 @@ pub struct AppState {
     /// Umbilical valve states keyed by command id (u8)
     pub umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
 
+    /// Pending umbilical valve targets keyed by canonical command id (u8).
+    pub pending_umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
+
     /// Latest fuel tank pressure (psi)
     pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
 
@@ -1063,6 +1066,28 @@ impl AppState {
     /// Looks up the last accepted timestamp for a command name.
     pub fn last_command_timestamp_ms(&self, cmd_name: &str) -> Option<u64> {
         self.last_command_ms.lock().unwrap().get(cmd_name).copied()
+    }
+
+    pub fn set_pending_umbilical_valve_state(&self, cmd_id: u8, value: bool) {
+        self.pending_umbilical_valve_states
+            .lock()
+            .unwrap()
+            .insert(cmd_id, value);
+    }
+
+    pub fn get_pending_umbilical_valve_state(&self, cmd_id: u8) -> Option<bool> {
+        self.pending_umbilical_valve_states
+            .lock()
+            .unwrap()
+            .get(&cmd_id)
+            .copied()
+    }
+
+    pub fn clear_pending_umbilical_valve_state(&self, cmd_id: u8) {
+        self.pending_umbilical_valve_states
+            .lock()
+            .unwrap()
+            .remove(&cmd_id);
     }
 
     /// Appends a telemetry row to the in-memory reseed cache and prunes old entries.

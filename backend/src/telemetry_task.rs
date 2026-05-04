@@ -2251,17 +2251,21 @@ pub async fn telemetry_task(
                     match cmd {
                         TelemetryCommand::Dump => {
                                 let key = ValveBoardCommands::DumpOpen as u8;
-                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                                let is_on = effective_umbilical_valve_state(&state, key).unwrap_or(false);
                                 let cmd = if is_on {
                                     ValveBoardCommands::DumpClose
                                 } else {
                                     ValveBoardCommands::DumpOpen
                                 };
-                                if let Err(err) = router.log_queue(DataType::ValveCommand, &[cmd as u8]) {
-                                    log_telemetry_error("failed to queue Dump command", err);
-                                } else {
-                                    log_command_queue_success("Dump command", DataType::ValveCommand, &[cmd as u8]);
-                                }
+                                queue_guarded_fill_command(
+                                    &state,
+                                    &router,
+                                    DataType::ValveCommand,
+                                    key,
+                                    !is_on,
+                                    cmd as u8,
+                                    "Dump command",
+                                );
                                 {
                                     let gpio = &state.gpio;
                                     gpio.write_output_pin(IGNITION_PIN, false).expect("failed to set gpio output");
@@ -2279,122 +2283,133 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::Igniter => {
                                 let key = ActuatorBoardCommands::IgniterOn as u8;
-                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                                let is_on = effective_umbilical_valve_state(&state, key).unwrap_or(false);
                                 let cmd = if is_on {
                                     ActuatorBoardCommands::IgniterOff
                                 } else {
                                     ActuatorBoardCommands::IgniterOn
                                 };
-                                if let Err(err) = router.log_queue(DataType::ActuatorCommand, &[cmd as u8]) {
-                                    log_telemetry_error("failed to queue Igniter command", err);
-                                } else {
-                                    log_command_queue_success("Igniter command", DataType::ActuatorCommand, &[cmd as u8]);
-                                }
+                                queue_guarded_fill_command(
+                                    &state,
+                                    &router,
+                                    DataType::ActuatorCommand,
+                                    key,
+                                    !is_on,
+                                    cmd as u8,
+                                    "Igniter command",
+                                );
                                 gs_debug_println!("Igniter command sent {:?}", cmd);
                             }
                         TelemetryCommand::Pilot => {
                                 let key = ValveBoardCommands::PilotOpen as u8;
-                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                                let is_on = effective_umbilical_valve_state(&state, key).unwrap_or(false);
                                 let cmd = if is_on {
                                     ValveBoardCommands::PilotClose
                                 } else {
                                     ValveBoardCommands::PilotOpen
                                 };
-                                if let Err(err) = router.log_queue(DataType::ValveCommand, &[cmd as u8]) {
-                                    log_telemetry_error("failed to queue Pilot command", err);
-                                } else {
-                                    log_command_queue_success("Pilot command", DataType::ValveCommand, &[cmd as u8]);
-                                }
+                                queue_guarded_fill_command(
+                                    &state,
+                                    &router,
+                                    DataType::ValveCommand,
+                                    key,
+                                    !is_on,
+                                    cmd as u8,
+                                    "Pilot command",
+                                );
                                 gs_debug_println!("Pilot command sent {:?}", cmd);
                             }
                         TelemetryCommand::NormallyOpen => {
                                 let key = ValveBoardCommands::NormallyOpenOpen as u8;
-                                let is_on = state.get_umbilical_valve_state(key).unwrap_or(false);
+                                let is_on = effective_umbilical_valve_state(&state, key).unwrap_or(false);
                                 let cmd = if is_on {
                                     ValveBoardCommands::NormallyOpenClose
                                 } else {
                                     ValveBoardCommands::NormallyOpenOpen
                                 };
-                                if let Err(err) = router.log_queue(DataType::ValveCommand, &[cmd as u8]) {
-                                    log_telemetry_error("failed to queue NormallyOpen command", err);
-                                } else {
-                                    log_command_queue_success("NormallyOpen command", DataType::ValveCommand, &[cmd as u8]);
-                                }
+                                queue_guarded_fill_command(
+                                    &state,
+                                    &router,
+                                    DataType::ValveCommand,
+                                    key,
+                                    !is_on,
+                                    cmd as u8,
+                                    "NormallyOpen command",
+                                );
                                 gs_debug_println!("Tanks command sent {:?}", cmd);
                             }
                         TelemetryCommand::Nitrogen => {
                                 let cmd_id = ActuatorBoardCommands::NitrogenOpen as u8;
-                                let is_on = state.get_umbilical_valve_state(cmd_id).unwrap_or(false);
+                                let is_on = effective_umbilical_valve_state(&state, cmd_id).unwrap_or(false);
                                 let cmd = if is_on {
                                     ActuatorBoardCommands::NitrogenClose
                                 } else {
                                     ActuatorBoardCommands::NitrogenOpen
                                 };
-                                if let Err(err) = router.log_queue(DataType::ActuatorCommand, &[cmd as u8]) {
-                                    log_telemetry_error("failed to queue Nitrogen command", err);
-                                } else {
-                                    log_command_queue_success("Nitrogen command", DataType::ActuatorCommand, &[cmd as u8]);
-                                }
+                                queue_guarded_fill_command(
+                                    &state,
+                                    &router,
+                                    DataType::ActuatorCommand,
+                                    cmd_id,
+                                    !is_on,
+                                    cmd as u8,
+                                    "Nitrogen command",
+                                );
                                 gs_debug_println!("Nitrogen command sent {:?}", cmd);
                             }
                         TelemetryCommand::NitrogenClose => {
-                                if let Err(err) = router.log_queue(
+                                queue_guarded_fill_command(
+                                    &state,
+                                    &router,
                                     DataType::ActuatorCommand,
-                                    &[ActuatorBoardCommands::NitrogenClose as u8],
-                                ) {
-                                    log_telemetry_error("failed to queue NitrogenClose command", err);
-                                } else {
-                                    log_command_queue_success(
-                                        "NitrogenClose command",
-                                        DataType::ActuatorCommand,
-                                        &[ActuatorBoardCommands::NitrogenClose as u8],
-                                    );
-                                }
+                                    ActuatorBoardCommands::NitrogenOpen as u8,
+                                    false,
+                                    ActuatorBoardCommands::NitrogenClose as u8,
+                                    "NitrogenClose command",
+                                );
                                 gs_debug_println!("Nitrogen explicit close command sent");
                             }
                         TelemetryCommand::RetractPlumbing => {
-                                if let Err(err) = router.log_queue(
+                                queue_guarded_fill_command(
+                                    &state,
+                                    &router,
                                     DataType::ActuatorCommand,
-                                    &[ActuatorBoardCommands::RetractPlumbing as u8],
-                                ) {
-                                    log_telemetry_error("failed to queue RetractPlumbing command", err);
-                                } else {
-                                    log_command_queue_success(
-                                        "RetractPlumbing command",
-                                        DataType::ActuatorCommand,
-                                        &[ActuatorBoardCommands::RetractPlumbing as u8],
-                                    );
-                                }
+                                    ActuatorBoardCommands::RetractPlumbing as u8,
+                                    true,
+                                    ActuatorBoardCommands::RetractPlumbing as u8,
+                                    "RetractPlumbing command",
+                                );
                                 gs_debug_println!("RetractPlumbing command sent");
                             }
                         TelemetryCommand::Nitrous => {
                                 let cmd_id = ActuatorBoardCommands::NitrousOpen as u8;
-                                let is_on = state.get_umbilical_valve_state(cmd_id).unwrap_or(false);
+                                let is_on = effective_umbilical_valve_state(&state, cmd_id).unwrap_or(false);
                                 let cmd = if is_on {
                                     ActuatorBoardCommands::NitrousClose
                                 } else {
                                     ActuatorBoardCommands::NitrousOpen
                                 };
-                                if let Err(err) = router.log_queue(DataType::ActuatorCommand, &[cmd as u8]) {
-                                    log_telemetry_error("failed to queue Nitrous command", err);
-                                } else {
-                                    log_command_queue_success("Nitrous command", DataType::ActuatorCommand, &[cmd as u8]);
-                                }
+                                queue_guarded_fill_command(
+                                    &state,
+                                    &router,
+                                    DataType::ActuatorCommand,
+                                    cmd_id,
+                                    !is_on,
+                                    cmd as u8,
+                                    "Nitrous command",
+                                );
                                 gs_debug_println!("Nitrous command sent: {:?}", cmd);
                             }
                         TelemetryCommand::NitrousClose => {
-                                if let Err(err) = router.log_queue(
+                                queue_guarded_fill_command(
+                                    &state,
+                                    &router,
                                     DataType::ActuatorCommand,
-                                    &[ActuatorBoardCommands::NitrousClose as u8],
-                                ) {
-                                    log_telemetry_error("failed to queue NitrousClose command", err);
-                                } else {
-                                    log_command_queue_success(
-                                        "NitrousClose command",
-                                        DataType::ActuatorCommand,
-                                        &[ActuatorBoardCommands::NitrousClose as u8],
-                                    );
-                                }
+                                    ActuatorBoardCommands::NitrousOpen as u8,
+                                    false,
+                                    ActuatorBoardCommands::NitrousClose as u8,
+                                    "NitrousClose command",
+                                );
                                 gs_debug_println!("Nitrous explicit close command sent");
                             }
                         TelemetryCommand::StartWritingNow => {
@@ -2796,6 +2811,38 @@ fn umbilical_state_key(cmd_id: u8, on: bool) -> Option<(u8, bool)> {
     }
 }
 
+fn effective_umbilical_valve_state(state: &Arc<AppState>, key_cmd_id: u8) -> Option<bool> {
+    state
+        .get_pending_umbilical_valve_state(key_cmd_id)
+        .or_else(|| state.get_umbilical_valve_state(key_cmd_id))
+}
+
+fn queue_guarded_fill_command(
+    state: &Arc<AppState>,
+    router: &Router,
+    data_type: DataType,
+    key_cmd_id: u8,
+    desired_state: bool,
+    cmd_payload: u8,
+    label: &str,
+) {
+    if state.get_pending_umbilical_valve_state(key_cmd_id).is_some() {
+        return;
+    }
+    if effective_umbilical_valve_state(state, key_cmd_id) == Some(desired_state) {
+        return;
+    }
+    if let Err(err) = router.log_queue(data_type, &[cmd_payload]) {
+        log_telemetry_error(&format!("failed to queue {label}"), err);
+        return;
+    }
+    log_command_queue_success(label, data_type, &[cmd_payload]);
+    state.set_pending_umbilical_valve_state(key_cmd_id, desired_state);
+    state.set_umbilical_valve_state(key_cmd_id, desired_state);
+    sequences::refresh_action_policy_now(state);
+    state.broadcast_action_policy_snapshot();
+}
+
 const VALVE_STATE_DATA_TYPE: &str = "VALVE_STATE";
 
 fn bool_to_f32(value: Option<bool>) -> Option<f32> {
@@ -3142,6 +3189,7 @@ async fn handle_packet(
             let cmd_id = data[0];
             let on = data[1] != 0;
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
+                state.clear_pending_umbilical_valve_state(key_cmd_id);
                 state.set_umbilical_valve_state(key_cmd_id, key_on);
                 sequences::refresh_action_policy_now(state);
                 state.broadcast_action_policy_snapshot();
@@ -3691,6 +3739,7 @@ mod tests {
             last_board_status_broadcast_ms: Arc::new(AtomicU64::new(0)),
             last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
             umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
+            pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),

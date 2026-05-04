@@ -317,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
         last_board_status_broadcast_ms: Arc::new(AtomicU64::new(0)),
         last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
         umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
+        pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
