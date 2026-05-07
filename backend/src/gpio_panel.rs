@@ -49,7 +49,6 @@ pub const WARNING_ACK_PIN: u8 = 26;
 
 const LED_FRAME_MS: u64 = 16;
 const LED_DISABLED_BRIGHTNESS: f64 = 0.0;
-const LED_ENABLED_IDLE_BRIGHTNESS: f64 = 0.62;
 
 //####################################################################
 
@@ -383,7 +382,7 @@ fn led_for(policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -> f64 {
     } else if control.actuated.unwrap_or(false) {
         1.0
     } else {
-        LED_ENABLED_IDLE_BRIGHTNESS
+        LED_DISABLED_BRIGHTNESS
     }
 }
 

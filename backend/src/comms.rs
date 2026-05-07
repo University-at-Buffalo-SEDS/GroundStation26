@@ -5,11 +5,11 @@ use crate::comms_config::{
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
 use sedsprintf_rs_2026::{
-    config::DataEndpoint, packet::Packet,
+    TelemetryError, TelemetryResult,
+    config::DataEndpoint,
+    packet::Packet,
     router::{Router, RouterSideId},
     serialize,
-    TelemetryError,
-    TelemetryResult,
 };
 use serialport::SerialPort;
 use std::collections::VecDeque;

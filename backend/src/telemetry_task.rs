@@ -5,16 +5,16 @@ use crate::layout;
 use crate::loadcell;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightComputerCommands, ValveBoardCommands};
 use crate::sequences;
-use crate::state::{launch_countdown_clock, AppState};
+use crate::state::{AppState, launch_countdown_clock};
 use crate::telemetry_db::{
-    close_and_finalize_sqlite, open_telemetry_db, prune_recent_writes, session_db_path, DbQueueItem, DbWrite,
-    LaunchClockKind, RecordingCommand, RecordingMode, RecordingModeWire,
-    RecordingStatusMsg,
+    DbQueueItem, DbWrite, LaunchClockKind, RecordingCommand, RecordingMode, RecordingModeWire,
+    RecordingStatusMsg, close_and_finalize_sqlite, open_telemetry_db, prune_recent_writes,
+    session_db_path,
 };
 use crate::types::{
-    canonical_sender_id, u8_to_flight_state, Board, FlightState, TelemetryCommand, TelemetryRow,
+    Board, FlightState, TelemetryCommand, TelemetryRow, canonical_sender_id, u8_to_flight_state,
 };
-use crate::web::{emit_warning, FlightStateMsg};
+use crate::web::{FlightStateMsg, emit_warning};
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::endpoints_from_datatype;
 use sedsprintf_rs_2026::packet::Packet;
@@ -22,13 +22,13 @@ use sedsprintf_rs_2026::router::{Router, RouterSideId};
 use sedsprintf_rs_2026::serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
-use tokio::sync::{broadcast, mpsc, Notify};
-use tokio::time::{interval, Duration};
+use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::time::{Duration, interval};
 
 pub struct CommsWorkerHandle {
     pub name: &'static str,
@@ -3577,7 +3577,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
     use std::sync::{Mutex, OnceLock};
-    use tokio::sync::{broadcast, mpsc, Notify};
+    use tokio::sync::{Notify, broadcast, mpsc};
 
     fn timesync_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
