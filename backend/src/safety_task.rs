@@ -66,7 +66,7 @@ const KALMAN_STATE_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
 const KALMAN_STATE_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
 
 #[cfg(not(feature = "testing"))]
-const BOARD_TIMEOUT_MS: u64 = 500;
+const BOARD_TIMEOUT_MS: u64 = 3000;
 #[cfg(not(feature = "testing"))]
 const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 3000;
 const FLIGHT_STATE_DB_RETRIES: usize = 5;

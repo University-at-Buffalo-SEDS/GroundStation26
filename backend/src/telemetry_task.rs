@@ -753,7 +753,7 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     })
 }
 
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+#[cfg(feature = "hitl_mode")]
 const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Startup,
     FlightState::Idle,
@@ -773,7 +773,7 @@ const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Aborted,
 ];
 
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+#[cfg(feature = "hitl_mode")]
 fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> FlightState {
     let idx = OPERATOR_MODE_FLIGHT_STATE_ORDER
         .iter()
@@ -784,7 +784,7 @@ fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> Flig
     OPERATOR_MODE_FLIGHT_STATE_ORDER[next_idx]
 }
 
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+#[cfg(feature = "hitl_mode")]
 async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_state: FlightState) {
     {
         let mut fs = state.state.lock().unwrap();

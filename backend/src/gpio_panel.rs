@@ -402,10 +402,10 @@ fn is_input_enabled(gpio: &crate::gpio::GpioPins, pin: u8) -> bool {
 fn blink_brightness(blink: BlinkMode, actuated: Option<bool>, now_ms: u64) -> f64 {
     let (period_ms, dim, bright, invert) = match (blink, actuated.unwrap_or(false)) {
         (BlinkMode::None, _) => return 1.0,
-        (BlinkMode::Slow, false) => (1_800_u64, 0.2, 1.0, false),
-        (BlinkMode::Slow, true) => (1_800_u64, 0.25, 1.0, true),
-        (BlinkMode::Fast, false) => (600_u64, 0.15, 1.0, false),
-        (BlinkMode::Fast, true) => (600_u64, 0.2, 1.0, true),
+        (BlinkMode::Slow, false) => (1_800_u64, 0.16, 0.82, false),
+        (BlinkMode::Slow, true) => (1_800_u64, 0.2, 0.82, true),
+        (BlinkMode::Fast, false) => (600_u64, 0.12, 0.82, false),
+        (BlinkMode::Fast, true) => (600_u64, 0.16, 0.82, true),
     };
     let phase = (now_ms % period_ms) as f64 / period_ms as f64;
     let wave = 0.5 - 0.5 * (std::f64::consts::TAU * phase).cos();

@@ -974,14 +974,11 @@ fn update_sequence_runtime(
             fill_sequence_calibration_issue(state, cfg, pressure_psi, current_mass_kg)
         {
             runtime.calibration_ready = false;
-            if runtime.calibration_block_message.as_deref() != Some(issue.as_str()) {
-                if let Some(id) = runtime.calibration_block_notification_id.take() {
-                    let _ = state.dismiss_notification(id);
-                }
+            if runtime.calibration_block_notification_id.is_none() {
                 let id = state.add_notification(issue.clone());
                 runtime.calibration_block_notification_id = Some(id);
-                runtime.calibration_block_message = Some(issue);
             }
+            runtime.calibration_block_message = Some(issue);
             return;
         }
 
