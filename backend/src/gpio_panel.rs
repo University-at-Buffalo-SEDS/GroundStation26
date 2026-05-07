@@ -14,36 +14,38 @@ use tokio::time::interval;
 //####################################################################
 // The values assigned here are GPIO pin numbers on the Raspberry Pi
 //####################################################################
-// TODO: Set the correct GPIO pin numbers, all current numbers are placeholders.
 pub const IGNITION_PIN: u8 = 5;
+pub const IGNITION_PIN_LED: u8 = 0;
+
+pub const LAUNCH_ARM_PIN: u8 = 8;
 #[allow(dead_code)]
-pub const IGNITION_PIN_LED: u8 = 6;
+pub const ALL_BUTTONS_ENABLE_PIN: u8 = 9;
 
-pub const ABORT_PIN: u8 = 9;
-pub const ABORT_PIN_LED: u8 = 10;
+pub const ABORT_PIN: u8 = 7;
+pub const ABORT_PIN_LED: u8 = 1;
 
-pub const LAUNCH_PIN: u8 = 20;
-pub const LAUNCH_PIN_LED: u8 = 11;
+pub const LAUNCH_PIN: u8 = 11;
+pub const LAUNCH_PIN_LED: u8 = 10;
 
-pub const DUMP_PIN: u8 = 4;
-pub const DUMP_PIN_LED: u8 = 12;
+pub const DUMP_PIN: u8 = 12;
+pub const DUMP_PIN_LED: u8 = 16;
 
-pub const RETRACT_PIN: u8 = 17;
-pub const RETRACT_PIN_LED: u8 = 18;
+pub const RETRACT_PIN: u8 = 22;
+pub const RETRACT_PIN_LED: u8 = 27;
 
-pub const PILOT_VALVE_PIN: u8 = 27;
-pub const PILOT_VALVE_LED: u8 = 16; // was 28 (invalid)
+pub const PILOT_VALVE_PIN: u8 = 13;
+pub const PILOT_VALVE_LED: u8 = 6;
 
-pub const NITROGEN_TANK_VALVE_PIN: u8 = 22;
-pub const NITROGEN_TANK_VALVE_LED: u8 = 23;
+pub const NITROGEN_TANK_VALVE_PIN: u8 = 23;
+pub const NITROGEN_TANK_VALVE_LED: u8 = 18;
 
-pub const NITROUS_TANK_VALVE_PIN: u8 = 24;
-pub const NITROUS_TANK_VALVE_LED: u8 = 13;
+pub const NITROUS_TANK_VALVE_PIN: u8 = 17;
+pub const NITROUS_TANK_VALVE_LED: u8 = 4;
 
-pub const NORMALLY_OPEN_PIN: u8 = 26;
-pub const NORMALLY_OPEN_LED: u8 = 19;
+pub const NORMALLY_OPEN_PIN: u8 = 20;
+pub const NORMALLY_OPEN_LED: u8 = 21;
 
-pub const WARNING_ACK_PIN: u8 = 25;
+pub const WARNING_ACK_PIN: u8 = 26;
 
 const LED_FRAME_MS: u64 = 16;
 const LED_DISABLED_BRIGHTNESS: f64 = 0.0;
@@ -70,6 +72,8 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
     // Inputs (buttons)
     gpio.setup_input_pin(ABORT_PIN)?;
     gpio.setup_input_pin(LAUNCH_PIN)?;
+    gpio.setup_input_pin(LAUNCH_ARM_PIN)?;
+    gpio.setup_input_pin(ALL_BUTTONS_ENABLE_PIN)?;
     gpio.setup_input_pin(DUMP_PIN)?;
     gpio.setup_input_pin(NORMALLY_OPEN_PIN)?;
     gpio.setup_input_pin(PILOT_VALVE_PIN)?;
@@ -80,6 +84,7 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
 
     // Outputs (LEDs + ignition line)
     gpio.setup_output_pin(IGNITION_PIN)?;
+    gpio.setup_led_pin(IGNITION_PIN_LED)?;
     gpio.setup_led_pin(ABORT_PIN_LED)?;
     gpio.setup_led_pin(LAUNCH_PIN_LED)?;
     gpio.setup_led_pin(DUMP_PIN_LED)?;
@@ -120,16 +125,28 @@ fn setup_callbacks(
         emit_error(&state_abort, "Manual abort button pressed!".to_string());
     })?;
 
-    setup_button_callback(
-        state.clone(),
-        gpio.clone(),
-        allowed.clone(),
-        tx.clone(),
-        LAUNCH_PIN,
-        |a| a.launch,
-        TelemetryCommand::LaunchSignal,
-        debounce,
-    )?;
+    let allowed_launch = allowed.clone();
+    let tx_launch = tx.clone();
+    let state_launch = state.clone();
+    let gpio_launch = gpio.clone();
+    gpio.setup_callback_input_pin(LAUNCH_PIN, Trigger::RisingEdge, debounce, move |is_high| {
+        if !is_high {
+            return;
+        }
+        if !allowed_launch.lock().unwrap().launch {
+            return;
+        }
+        if !is_input_enabled(&gpio_launch, LAUNCH_ARM_PIN) {
+            emit_warning(
+                &state_launch,
+                "Ignored LaunchSignal button press: launch arm signal is not enabled".to_string(),
+            );
+            return;
+        }
+        if tx_launch.try_send(TelemetryCommand::LaunchSignal).is_err() {
+            eprintln!("GPIO launch button: failed to send command");
+        }
+    })?;
     setup_button_callback(
         state.clone(),
         gpio.clone(),
@@ -277,6 +294,12 @@ async fn gpio_led_task(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>
         set_led(
             gpio,
             &mut last_levels,
+            IGNITION_PIN_LED,
+            led_for(&policy, "Igniter", now_ms),
+        );
+        set_led(
+            gpio,
+            &mut last_levels,
             ABORT_PIN_LED,
             led_for(&policy, "Abort", now_ms),
         );
@@ -361,6 +384,19 @@ fn led_for(policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -> f64 {
         1.0
     } else {
         LED_ENABLED_IDLE_BRIGHTNESS
+    }
+}
+
+fn is_input_enabled(gpio: &crate::gpio::GpioPins, pin: u8) -> bool {
+    #[cfg(feature = "raspberry_pi")]
+    {
+        return gpio.read_input_pin(pin).unwrap_or(false);
+    }
+
+    #[cfg(not(feature = "raspberry_pi"))]
+    {
+        let _ = (gpio, pin);
+        true
     }
 }
 

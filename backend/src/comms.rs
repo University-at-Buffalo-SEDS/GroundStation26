@@ -5,11 +5,11 @@ use crate::comms_config::{
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
 use sedsprintf_rs_2026::{
-    TelemetryError, TelemetryResult,
-    config::DataEndpoint,
-    packet::Packet,
+    config::DataEndpoint, packet::Packet,
     router::{Router, RouterSideId},
     serialize,
+    TelemetryError,
+    TelemetryResult,
 };
 use serialport::SerialPort;
 use std::collections::VecDeque;
@@ -2103,30 +2103,30 @@ impl CommsDevice for DummyComms {
                 .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
             self.maybe_queue_discovery()?;
             self.maybe_queue_timesync()?;
-                if let Some(pkt) = self.pending_rx.pop_front() {
-                    if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
-                        && matches!(
-                            pkt.data_type(),
-                            sedsprintf_rs_2026::config::DataType::GpsData
-                                | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
-                        )
-                    {
-                        packet_tap(&pkt);
-                    }
-                    return _router.rx_queue_from_side(pkt, side_id);
+            if let Some(pkt) = self.pending_rx.pop_front() {
+                if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
+                    && matches!(
+                        pkt.data_type(),
+                        sedsprintf_rs_2026::config::DataType::GpsData
+                            | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
+                    )
+                {
+                    packet_tap(&pkt);
                 }
-                if let Some(pkt) = get_dummy_packet()? {
-                    if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
-                        && matches!(
-                            pkt.data_type(),
-                            sedsprintf_rs_2026::config::DataType::GpsData
-                                | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
-                        )
-                    {
-                        packet_tap(&pkt);
-                    }
-                    return _router.rx_queue_from_side(pkt, side_id);
+                return _router.rx_queue_from_side(pkt, side_id);
+            }
+            if let Some(pkt) = get_dummy_packet()? {
+                if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
+                    && matches!(
+                        pkt.data_type(),
+                        sedsprintf_rs_2026::config::DataType::GpsData
+                            | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
+                    )
+                {
+                    packet_tap(&pkt);
                 }
+                return _router.rx_queue_from_side(pkt, side_id);
+            }
             Ok(())
         }
 
@@ -2416,8 +2416,13 @@ mod raw_uart_tests {
 
     #[test]
     fn tap_non_groundstation_gps_includes_non_groundstation_gps() {
-        let pkt = Packet::from_f32_slice(DataType::GpsData, &[1.0, 2.0, 3.0], &[DataEndpoint::SdCard], 123)
-            .unwrap();
+        let pkt = Packet::from_f32_slice(
+            DataType::GpsData,
+            &[1.0, 2.0, 3.0],
+            &[DataEndpoint::SdCard],
+            123,
+        )
+        .unwrap();
         let wire = serialize::serialize_packet(&pkt);
         let mut mirrored = None;
         tap_non_groundstation_gps_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));

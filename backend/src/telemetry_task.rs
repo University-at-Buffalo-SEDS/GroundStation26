@@ -5,16 +5,16 @@ use crate::layout;
 use crate::loadcell;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightComputerCommands, ValveBoardCommands};
 use crate::sequences;
-use crate::state::{AppState, launch_countdown_clock};
+use crate::state::{launch_countdown_clock, AppState};
 use crate::telemetry_db::{
-    DbQueueItem, DbWrite, LaunchClockKind, RecordingCommand, RecordingMode, RecordingModeWire,
-    RecordingStatusMsg, close_and_finalize_sqlite, open_telemetry_db, prune_recent_writes,
-    session_db_path,
+    close_and_finalize_sqlite, open_telemetry_db, prune_recent_writes, session_db_path, DbQueueItem, DbWrite,
+    LaunchClockKind, RecordingCommand, RecordingMode, RecordingModeWire,
+    RecordingStatusMsg,
 };
 use crate::types::{
-    Board, FlightState, TelemetryCommand, TelemetryRow, canonical_sender_id, u8_to_flight_state,
+    canonical_sender_id, u8_to_flight_state, Board, FlightState, TelemetryCommand, TelemetryRow,
 };
-use crate::web::{FlightStateMsg, emit_warning};
+use crate::web::{emit_warning, FlightStateMsg};
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::endpoints_from_datatype;
 use sedsprintf_rs_2026::packet::Packet;
@@ -22,13 +22,13 @@ use sedsprintf_rs_2026::router::{Router, RouterSideId};
 use sedsprintf_rs_2026::serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
-use tokio::sync::{Notify, broadcast, mpsc};
-use tokio::time::{Duration, interval};
+use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::time::{interval, Duration};
 
 pub struct CommsWorkerHandle {
     pub name: &'static str,
@@ -392,9 +392,13 @@ fn spawn_dedicated_radio_io_threads(
                 } else {
                     radio_rx_idle_packets
                 };
-                match comms.recv_serialized_packets_with_budget(&mut |payload| {
-                    let _ = incoming_tx.send(payload);
-                }, rx_poll_timeout, rx_packet_budget) {
+                match comms.recv_serialized_packets_with_budget(
+                    &mut |payload| {
+                        let _ = incoming_tx.send(payload);
+                    },
+                    rx_poll_timeout,
+                    rx_packet_budget,
+                ) {
                     Ok(()) => {}
                     Err(e) => {
                         if !handle_worker_recv_error(
@@ -408,8 +412,8 @@ fn spawn_dedicated_radio_io_threads(
                     }
                 }
                 while let Some(update) = comms.take_radio_window_update() {
-                    let deadline =
-                        std::time::Instant::now() + Duration::from_millis(update.duration_ms as u64);
+                    let deadline = std::time::Instant::now()
+                        + Duration::from_millis(update.duration_ms as u64);
                     has_seen_window_update = true;
                     last_window_update_at = Some(std::time::Instant::now());
                     follow_window_until = Some(deadline);
@@ -422,11 +426,11 @@ fn spawn_dedicated_radio_io_threads(
                             let uplink_log_now = std::time::Instant::now();
                             let should_log = !tx_backlog.is_empty()
                                 && last_uplink_log_at
-                                .map(|last| {
-                                    uplink_log_now.saturating_duration_since(last)
-                                        >= Duration::from_millis(500)
-                                })
-                                .unwrap_or(true);
+                                    .map(|last| {
+                                        uplink_log_now.saturating_duration_since(last)
+                                            >= Duration::from_millis(500)
+                                    })
+                                    .unwrap_or(true);
                             if should_log {
                                 log_radio_uplink_available(
                                     worker_name,
@@ -1004,8 +1008,8 @@ fn send_while_uplink_window_open(
     let mut sent_any = false;
     loop {
         let now = std::time::Instant::now();
-        let follow_mode_active =
-            last_window_update_at.is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
+        let follow_mode_active = last_window_update_at
+            .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
         if !has_seen_window_update {
             break;
         }
@@ -1919,7 +1923,7 @@ fn schedule_launch_command_after_delay(state: Arc<AppState>, router: Arc<Router>
     });
 }
 
-fn send_launch_command(state: &AppState, router: &Router) {
+fn send_launch_command(_state: &AppState, router: &Router) {
     #[cfg(feature = "test_fire_mode")]
     {
         let _ = state;
@@ -1954,10 +1958,6 @@ fn send_launch_command(state: &AppState, router: &Router) {
             );
             flush_command_tx(router, "Delayed Launch command tx");
         }
-        state
-            .gpio
-            .write_output_pin(IGNITION_PIN, true)
-            .expect("failed to set gpio output");
         gs_debug_println!("Delayed launch command sent");
     }
 }
@@ -2279,6 +2279,10 @@ pub async fn telemetry_task(
                                 ) {
                                     log_telemetry_error("failed to log Abort command", e);
                                 }
+                                state
+                                    .gpio
+                                    .write_output_pin(IGNITION_PIN, false)
+                                    .expect("failed to set gpio output");
                                 gs_debug_println!("Abort command sent");
                             }
                         TelemetryCommand::Igniter => {
@@ -2298,6 +2302,10 @@ pub async fn telemetry_task(
                                     cmd as u8,
                                     "Igniter command",
                                 );
+                                state
+                                    .gpio
+                                    .write_output_pin(IGNITION_PIN, !is_on)
+                                    .expect("failed to set gpio output");
                                 gs_debug_println!("Igniter command sent {:?}", cmd);
                             }
                         TelemetryCommand::Pilot => {
@@ -2826,7 +2834,10 @@ fn queue_guarded_fill_command(
     cmd_payload: u8,
     label: &str,
 ) {
-    if state.get_pending_umbilical_valve_state(key_cmd_id).is_some() {
+    if state
+        .get_pending_umbilical_valve_state(key_cmd_id)
+        .is_some()
+    {
         return;
     }
     if effective_umbilical_valve_state(state, key_cmd_id) == Some(desired_state) {
@@ -3566,7 +3577,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
     use std::sync::{Mutex, OnceLock};
-    use tokio::sync::{Notify, broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc, Notify};
 
     fn timesync_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3654,9 +3665,9 @@ mod tests {
             Arc::from([9_u8]),
         )
         .expect("failed to build actuator command packet");
-        assert!(is_fill_system_command_payload(&serialize::serialize_packet(
-            &actuator_pkt
-        )));
+        assert!(is_fill_system_command_payload(
+            &serialize::serialize_packet(&actuator_pkt)
+        ));
 
         let valve_pkt = Packet::new(
             DataType::ValveCommand,
@@ -3666,9 +3677,9 @@ mod tests {
             Arc::from([1_u8]),
         )
         .expect("failed to build valve command packet");
-        assert!(is_fill_system_command_payload(&serialize::serialize_packet(
-            &valve_pkt
-        )));
+        assert!(is_fill_system_command_payload(
+            &serialize::serialize_packet(&valve_pkt)
+        ));
 
         let flight_pkt = Packet::new(
             DataType::FlightCommand,
@@ -3678,9 +3689,9 @@ mod tests {
             Arc::from([0_u8]),
         )
         .expect("failed to build flight command packet");
-        assert!(!is_fill_system_command_payload(&serialize::serialize_packet(
-            &flight_pkt
-        )));
+        assert!(!is_fill_system_command_payload(
+            &serialize::serialize_packet(&flight_pkt)
+        ));
     }
 
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
@@ -4123,7 +4134,11 @@ mod tests {
             ]
         );
         assert!(derived_rows.iter().all(|row| row.sender_id == "GB"));
-        assert!(derived_rows.iter().all(|derived| derived.timestamp_ms == row.timestamp_ms));
+        assert!(
+            derived_rows
+                .iter()
+                .all(|derived| derived.timestamp_ms == row.timestamp_ms)
+        );
     }
 
     #[tokio::test]
