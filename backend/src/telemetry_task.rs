@@ -1926,7 +1926,7 @@ fn schedule_launch_command_after_delay(state: Arc<AppState>, router: Arc<Router>
 fn send_launch_command(_state: &AppState, router: &Router) {
     #[cfg(feature = "test_fire_mode")]
     {
-        let _ = state;
+        let _ = _state;
         if let Err(e) = router.log_queue(
             DataType::ActuatorCommand,
             &[ActuatorBoardCommands::IgniterSequence as u8],
@@ -2630,7 +2630,7 @@ pub async fn telemetry_task(
                                 set_local_flight_state_for_operator_mode(&state, next).await;
                                 gs_debug_println!("Operator-mode flight state advanced: {:?} -> {:?}", current, next);
                         }
-                        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                        #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::RewindFlightState => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, -1);
