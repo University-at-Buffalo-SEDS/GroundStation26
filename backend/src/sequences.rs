@@ -566,7 +566,6 @@ pub fn all_command_names() -> Vec<&'static str> {
         "NormallyOpen",
         "Pilot",
         "Igniter",
-        "IgniterSequence",
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
@@ -602,6 +601,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "NormallyOpen",
         "Pilot",
         "Igniter",
+        "IgniterSequence",
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
@@ -1923,4 +1923,24 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
         },
     );
     state.set_action_policy(policy);
+}
+
+#[cfg(all(test, feature = "hitl_mode"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hitl_policy_enables_manual_igniter_sequence() {
+        let policy = default_action_policy();
+        let enabled = |cmd: &str| {
+            policy
+                .controls
+                .iter()
+                .find(|control| control.cmd == cmd)
+                .map(|control| control.enabled)
+        };
+
+        assert_eq!(enabled("GroundStationLaunch"), Some(true));
+        assert_eq!(enabled("IgniterSequence"), Some(true));
+    }
 }
