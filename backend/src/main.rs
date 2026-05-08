@@ -336,6 +336,7 @@ async fn main() -> anyhow::Result<()> {
         fill_targets_tx,
         launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
         launch_clock_tx,
+        launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
         recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
             mode: RecordingModeWire::Idle,
             db_path: Some(db_path_str.clone()),

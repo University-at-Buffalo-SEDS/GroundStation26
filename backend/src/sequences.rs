@@ -472,6 +472,7 @@ impl ValveSnapshot {
             "ContinueFillSequence" => None,
             "Pilot" => self.pilot_open,
             "Igniter" => self.igniter_on,
+            "IgniterSequence" => None,
             "RetractPlumbing" => self.retract,
             _ => None,
         }
@@ -495,6 +496,8 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::NormallyOpen => "NormallyOpen",
         TelemetryCommand::Pilot => "Pilot",
         TelemetryCommand::Igniter => "Igniter",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::IgniterSequence => "IgniterSequence",
         TelemetryCommand::RetractPlumbing => "RetractPlumbing",
         TelemetryCommand::Nitrogen | TelemetryCommand::NitrogenClose => "Nitrogen",
         TelemetryCommand::Nitrous | TelemetryCommand::NitrousClose => "Nitrous",
@@ -513,7 +516,7 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::RevokeResetFailures => "RevokeResetFailures",
         TelemetryCommand::ValidateMeasms => "ValidateMeasms",
         TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
-        #[cfg(feature = "hitl_mode")]
+        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         TelemetryCommand::GroundStationLaunch => "GroundStationLaunch",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
@@ -592,6 +595,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "NormallyOpen",
         "Pilot",
         "Igniter",
+        "IgniterSequence",
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
@@ -651,6 +655,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "ContinueFillSequence",
         "PostinitSignal",
         "Launch",
+        "GroundStationLaunch",
         "LaunchSignal",
         "RollbackSignal",
         "MonitorAltitude",
@@ -1537,6 +1542,7 @@ fn build_policy(
     if inputs.flight_state == FlightState::Armed {
         let mut enabled = HashMap::new();
         enabled.insert("Launch", BlinkMode::Slow);
+        enabled.insert("GroundStationLaunch", BlinkMode::Slow);
         enabled.insert("Dump", BlinkMode::None);
         return policy_with_overrides(
             true,
@@ -1587,6 +1593,7 @@ fn build_policy(
             }
         }
         set_control_enabled(&mut policy, "Launch", false);
+        set_control_enabled(&mut policy, "GroundStationLaunch", false);
         return policy;
     }
 
@@ -1721,6 +1728,7 @@ fn build_policy(
         }
         SequenceStep::ArmedReady => {
             recommended.insert("Launch", BlinkMode::Slow);
+            recommended.insert("GroundStationLaunch", BlinkMode::Slow);
         }
     }
 
@@ -1731,6 +1739,7 @@ fn build_policy(
         recommended,
     );
     set_control_enabled(&mut policy, "Launch", false);
+    set_control_enabled(&mut policy, "GroundStationLaunch", false);
     policy
 }
 
@@ -1908,4 +1917,24 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
         },
     );
     state.set_action_policy(policy);
+}
+
+#[cfg(all(test, feature = "hitl_mode"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hitl_policy_enables_manual_igniter_sequence() {
+        let policy = default_action_policy();
+        let enabled = |cmd: &str| {
+            policy
+                .controls
+                .iter()
+                .find(|control| control.cmd == cmd)
+                .map(|control| control.enabled)
+        };
+
+        assert_eq!(enabled("GroundStationLaunch"), Some(true));
+        assert_eq!(enabled("IgniterSequence"), Some(true));
+    }
 }

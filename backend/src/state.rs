@@ -170,6 +170,10 @@ pub struct AppState {
     /// Broadcast whenever the launch clock changes.
     pub launch_clock_tx: broadcast::Sender<LaunchClockMsg>,
 
+    /// True after a launch command has been queued to the valve board but before
+    /// the valve board confirms that its sequence started.
+    pub launch_sequence_command_pending: Arc<AtomicBool>,
+
     /// Current recording state snapshot.
     pub recording_status: Arc<Mutex<RecordingStatusMsg>>,
 
@@ -289,9 +293,22 @@ impl AppState {
     }
 
     pub fn reset_launch_clock(&self) {
+        self.clear_launch_sequence_command_pending();
         let next = LaunchClockMsg::idle();
         *self.launch_clock.lock().unwrap() = next.clone();
         let _ = self.launch_clock_tx.send(next);
+    }
+
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+    pub fn try_begin_launch_sequence_command(&self) -> bool {
+        self.launch_sequence_command_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub fn clear_launch_sequence_command_pending(&self) {
+        self.launch_sequence_command_pending
+            .store(false, Ordering::SeqCst);
     }
 
     pub fn update_launch_clock_for_state(&self, next_state: FlightState, timestamp_ms: i64) {

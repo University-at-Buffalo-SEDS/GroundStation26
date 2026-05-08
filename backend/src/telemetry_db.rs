@@ -400,8 +400,10 @@ pub fn sqlite_sidecars_present(db_path: &str) -> Vec<String> {
 }
 
 pub async fn close_and_finalize_sqlite(db: SqlitePool, db_path: &str) {
-    flush_sqlite_journals(&db).await;
-    db.close().await;
+    if !db.is_closed() {
+        flush_sqlite_journals(&db).await;
+        db.close().await;
+    }
     finalize_sqlite_after_pool_close(db_path).await;
     remove_sqlite_sidecars(db_path).await;
     let lingering = sqlite_sidecars_present(db_path);

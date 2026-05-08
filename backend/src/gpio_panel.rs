@@ -142,7 +142,12 @@ fn setup_callbacks(
             );
             return;
         }
-        if tx_launch.try_send(TelemetryCommand::LaunchSignal).is_err() {
+        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+        let launch_command = TelemetryCommand::GroundStationLaunch;
+        #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+        let launch_command = TelemetryCommand::Launch;
+
+        if tx_launch.try_send(launch_command).is_err() {
             eprintln!("GPIO launch button: failed to send command");
         }
     })?;
