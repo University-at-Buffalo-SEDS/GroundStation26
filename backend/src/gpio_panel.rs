@@ -136,14 +136,38 @@ fn setup_callbacks(
         if !allowed_launch.lock().unwrap().launch {
             return;
         }
-        if !is_input_enabled(&gpio_launch, LAUNCH_ARM_PIN) {
+        #[cfg(feature = "hitl_mode")]
+        if state_launch.hitl_button_interlock_enabled()
+            && !is_input_enabled(&gpio_launch, ALL_BUTTONS_ENABLE_PIN)
+        {
+            emit_warning(
+                &state_launch,
+                "Ignored launch button press: button interlock is enabled".to_string(),
+            );
+            return;
+        }
+        #[cfg(feature = "hitl_mode")]
+        let launch_interlock_ok = if state_launch.hitl_launch_interlock_enabled() {
+            is_input_enabled(&gpio_launch, LAUNCH_ARM_PIN)
+        } else {
+            true
+        };
+        #[cfg(not(feature = "hitl_mode"))]
+        let launch_interlock_ok = is_input_enabled(&gpio_launch, LAUNCH_ARM_PIN);
+        if !launch_interlock_ok {
             emit_warning(
                 &state_launch,
                 "Ignored launch button press: launch arm signal is not enabled".to_string(),
             );
             return;
         }
-        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+        #[cfg(feature = "hitl_mode")]
+        let launch_command = if state_launch.hitl_physical_launch_uses_ground_station() {
+            TelemetryCommand::GroundStationLaunch
+        } else {
+            TelemetryCommand::Launch
+        };
+        #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
         let launch_command = TelemetryCommand::GroundStationLaunch;
         #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
         let launch_command = TelemetryCommand::Launch;
@@ -257,9 +281,29 @@ where
 {
     static LAST_WARN_MS_BY_CMD: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
     static WARN_INTERVAL_MS: AtomicU64 = AtomicU64::new(3_000);
+    let gpio_for_callback = gpio.clone();
 
     gpio.setup_callback_input_pin(pin, Trigger::RisingEdge, debounce, move |is_high| {
         if !is_high {
+            return;
+        }
+        #[cfg(feature = "hitl_mode")]
+        if state.hitl_button_interlock_enabled()
+            && !is_input_enabled(&gpio_for_callback, ALL_BUTTONS_ENABLE_PIN)
+        {
+            let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+            let warn_map = LAST_WARN_MS_BY_CMD.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut guard = warn_map.lock().unwrap();
+            let cmd_name = format!("{cmd:?}");
+            let last = guard.get(&cmd_name).copied().unwrap_or(0);
+            if now_ms.saturating_sub(last) >= WARN_INTERVAL_MS.load(Ordering::Relaxed) {
+                guard.insert(cmd_name.clone(), now_ms);
+                drop(guard);
+                emit_warning(
+                    &state,
+                    format!("Ignored {cmd_name} button press: button interlock is enabled"),
+                );
+            }
             return;
         }
         if !can_press(&allowed.lock().unwrap()) {
@@ -310,55 +354,55 @@ async fn gpio_led_task(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>
             gpio,
             &mut last_levels,
             IGNITER_PIN_LED,
-            led_for(&policy, "Igniter", now_ms),
+            led_for(&state, &policy, "Igniter", now_ms),
         );
         set_led(
             gpio,
             &mut last_levels,
             ABORT_PIN_LED,
-            led_for(&policy, "Abort", now_ms),
+            led_for(&state, &policy, "Abort", now_ms),
         );
         set_led(
             gpio,
             &mut last_levels,
             LAUNCH_PIN_LED,
-            led_for(&policy, "Launch", now_ms),
+            led_for(&state, &policy, "Launch", now_ms),
         );
         set_led(
             gpio,
             &mut last_levels,
             DUMP_PIN_LED,
-            led_for(&policy, "Dump", now_ms),
+            led_for(&state, &policy, "Dump", now_ms),
         );
         set_led(
             gpio,
             &mut last_levels,
             NORMALLY_OPEN_LED,
-            led_for(&policy, "NormallyOpen", now_ms),
+            led_for(&state, &policy, "NormallyOpen", now_ms),
         );
         set_led(
             gpio,
             &mut last_levels,
             PILOT_VALVE_LED,
-            led_for(&policy, "Pilot", now_ms),
+            led_for(&state, &policy, "Pilot", now_ms),
         );
         set_led(
             gpio,
             &mut last_levels,
             NITROGEN_TANK_VALVE_LED,
-            led_for(&policy, "Nitrogen", now_ms),
+            led_for(&state, &policy, "Nitrogen", now_ms),
         );
         set_led(
             gpio,
             &mut last_levels,
             NITROUS_TANK_VALVE_LED,
-            led_for(&policy, "Nitrous", now_ms),
+            led_for(&state, &policy, "Nitrous", now_ms),
         );
         set_led(
             gpio,
             &mut last_levels,
             RETRACT_PIN_LED,
-            led_for(&policy, "RetractPlumbing", now_ms),
+            led_for(&state, &policy, "RetractPlumbing", now_ms),
         );
     }
 }
@@ -386,10 +430,22 @@ fn allowed_from_policy(policy: &ActionPolicyMsg) -> AllowedActions {
     }
 }
 
-fn led_for(policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -> f64 {
+fn led_for(state: &AppState, policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -> f64 {
+    if cmd == "Launch" && state.launch_indicator_latched() {
+        return 1.0;
+    }
     let Some(control) = policy.controls.iter().find(|c| c.cmd == cmd) else {
         return LED_DISABLED_BRIGHTNESS;
     };
+    #[cfg(feature = "hitl_mode")]
+    if cmd == "Launch"
+        && control.enabled
+        && (state.hitl_button_interlock_enabled() || state.hitl_launch_interlock_enabled())
+        && policy.key_enabled
+        && policy.software_buttons_enabled
+    {
+        return 1.0;
+    }
     if !control.enabled {
         return LED_DISABLED_BRIGHTNESS;
     }

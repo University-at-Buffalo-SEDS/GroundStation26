@@ -36,6 +36,14 @@ pub enum TelemetryCommand {
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     GroundStationLaunch,
     #[cfg(feature = "hitl_mode")]
+    ToggleButtonInterlock,
+    #[cfg(feature = "hitl_mode")]
+    ToggleLaunchInterlock,
+    #[cfg(feature = "hitl_mode")]
+    TogglePhysicalLaunchMode,
+    #[cfg(feature = "hitl_mode")]
+    ResetLaunchLatch,
+    #[cfg(feature = "hitl_mode")]
     DeployParachute,
     #[cfg(feature = "hitl_mode")]
     ExpandParachute,

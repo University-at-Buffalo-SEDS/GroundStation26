@@ -1973,6 +1973,9 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
         state.clear_launch_sequence_command_pending();
         return;
     }
+    state.set_launch_indicator_latched(true);
+    sequences::refresh_action_policy_now(&state);
+    state.broadcast_action_policy_snapshot();
     gs_debug_println!(
         "Ground-station launch sequence command sent; waiting for valve-board clock start"
     );
@@ -2006,6 +2009,9 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
             &[FlightComputerCommands::LaunchSignal as u8],
         );
         flush_command_tx(&router, "Launch command tx");
+        state.set_launch_indicator_latched(true);
+        sequences::refresh_action_policy_now(&state);
+        state.broadcast_action_policy_snapshot();
     }
     gs_debug_println!("Launch command sent to flight computer");
 }
@@ -2665,6 +2671,34 @@ pub async fn telemetry_task(
                                 }
                                 gs_debug_println!("RevokeValidateMeasms command sent");
                             }
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::ToggleButtonInterlock => {
+                                let enabled = state.toggle_hitl_button_interlock();
+                                sequences::refresh_action_policy_now(&state);
+                                state.broadcast_action_policy_snapshot();
+                                gs_debug_println!("HITL button interlock toggled: {enabled}");
+                        }
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::ToggleLaunchInterlock => {
+                                let enabled = state.toggle_hitl_launch_interlock();
+                                sequences::refresh_action_policy_now(&state);
+                                state.broadcast_action_policy_snapshot();
+                                gs_debug_println!("HITL launch interlock toggled: {enabled}");
+                        }
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::TogglePhysicalLaunchMode => {
+                                let uses_gs = state.toggle_hitl_physical_launch_mode();
+                                sequences::refresh_action_policy_now(&state);
+                                state.broadcast_action_policy_snapshot();
+                                gs_debug_println!("HITL physical launch mode toggled: uses_ground_station={uses_gs}");
+                        }
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::ResetLaunchLatch => {
+                                state.set_launch_indicator_latched(false);
+                                sequences::refresh_action_policy_now(&state);
+                                state.broadcast_action_policy_snapshot();
+                                gs_debug_println!("Launch indicator latch reset");
+                        }
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::AdvanceFlightState => {
                                 let current = *state.state.lock().unwrap();
@@ -3821,6 +3855,13 @@ mod tests {
             launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
             launch_clock_tx,
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
+            launch_indicator_latched: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "hitl_mode")]
+            hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "hitl_mode")]
+            hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "hitl_mode")]
+            hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
             recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
                 mode: RecordingModeWire::Idle,
                 db_path: None,

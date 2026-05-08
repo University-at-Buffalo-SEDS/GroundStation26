@@ -174,6 +174,18 @@ pub struct AppState {
     /// the valve board confirms that its sequence started.
     pub launch_sequence_command_pending: Arc<AtomicBool>,
 
+    /// True after a successful launch initiation until explicitly reset or process restart.
+    pub launch_indicator_latched: Arc<AtomicBool>,
+
+    #[cfg(feature = "hitl_mode")]
+    pub hitl_button_interlock_enabled: Arc<AtomicBool>,
+
+    #[cfg(feature = "hitl_mode")]
+    pub hitl_launch_interlock_enabled: Arc<AtomicBool>,
+
+    #[cfg(feature = "hitl_mode")]
+    pub hitl_physical_launch_uses_ground_station: Arc<AtomicBool>,
+
     /// Current recording state snapshot.
     pub recording_status: Arc<Mutex<RecordingStatusMsg>>,
 
@@ -309,6 +321,75 @@ impl AppState {
     pub fn clear_launch_sequence_command_pending(&self) {
         self.launch_sequence_command_pending
             .store(false, Ordering::SeqCst);
+    }
+
+    pub fn launch_indicator_latched(&self) -> bool {
+        self.launch_indicator_latched.load(Ordering::SeqCst)
+    }
+
+    pub fn set_launch_indicator_latched(&self, latched: bool) {
+        self.launch_indicator_latched
+            .store(latched, Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    pub fn hitl_button_interlock_enabled(&self) -> bool {
+        self.hitl_button_interlock_enabled.load(Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    pub fn toggle_hitl_button_interlock(&self) -> bool {
+        let next = !self.hitl_button_interlock_enabled();
+        self.hitl_button_interlock_enabled
+            .store(next, Ordering::SeqCst);
+        next
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    pub fn hitl_launch_interlock_enabled(&self) -> bool {
+        self.hitl_launch_interlock_enabled.load(Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    pub fn toggle_hitl_launch_interlock(&self) -> bool {
+        let next = !self.hitl_launch_interlock_enabled();
+        self.hitl_launch_interlock_enabled
+            .store(next, Ordering::SeqCst);
+        next
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    pub fn hitl_physical_launch_uses_ground_station(&self) -> bool {
+        self.hitl_physical_launch_uses_ground_station
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    pub fn toggle_hitl_physical_launch_mode(&self) -> bool {
+        let next = !self.hitl_physical_launch_uses_ground_station();
+        self.hitl_physical_launch_uses_ground_station
+            .store(next, Ordering::SeqCst);
+        next
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    pub fn hitl_button_interlock_satisfied(&self) -> bool {
+        if !self.hitl_button_interlock_enabled() {
+            return true;
+        }
+        self.gpio
+            .read_input_pin(crate::gpio_panel::ALL_BUTTONS_ENABLE_PIN)
+            .unwrap_or(false)
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    pub fn hitl_launch_interlock_satisfied(&self) -> bool {
+        if !self.hitl_launch_interlock_enabled() {
+            return true;
+        }
+        self.gpio
+            .read_input_pin(crate::gpio_panel::LAUNCH_ARM_PIN)
+            .unwrap_or(false)
     }
 
     pub fn update_launch_clock_for_state(&self, next_state: FlightState, timestamp_ms: i64) {
@@ -983,8 +1064,8 @@ impl AppState {
         let mut policy = policy;
         #[cfg(feature = "hitl_mode")]
         {
-            policy.key_enabled = true;
-            policy.software_buttons_enabled = true;
+            policy.key_enabled = self.hitl_launch_interlock_satisfied();
+            policy.software_buttons_enabled = self.hitl_button_interlock_satisfied();
             for control in &mut policy.controls {
                 control.enabled = true;
                 control.blink = crate::sequences::BlinkMode::None;
@@ -993,6 +1074,25 @@ impl AppState {
         for control in &mut policy.controls {
             if let Some(actuated) = recording_command_actuated(&control.cmd, recording_mode) {
                 control.actuated = Some(actuated);
+            }
+            #[cfg(feature = "hitl_mode")]
+            match control.cmd.as_str() {
+                "ToggleButtonInterlock" => {
+                    control.actuated = Some(self.hitl_button_interlock_enabled())
+                }
+                "ToggleLaunchInterlock" => {
+                    control.actuated = Some(self.hitl_launch_interlock_enabled())
+                }
+                "TogglePhysicalLaunchMode" => {
+                    control.actuated = Some(self.hitl_physical_launch_uses_ground_station())
+                }
+                "ResetLaunchLatch" => control.actuated = Some(self.launch_indicator_latched()),
+                "Launch" | "GroundStationLaunch" => {
+                    if self.launch_indicator_latched() {
+                        control.actuated = Some(true);
+                    }
+                }
+                _ => {}
             }
         }
         let mut slot = self.action_policy.lock().unwrap();
@@ -1024,7 +1124,30 @@ impl AppState {
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
         #[cfg(feature = "hitl_mode")]
         {
-            let _ = cmd;
+            let exempt = matches!(
+                cmd,
+                TelemetryCommand::Abort
+                    | TelemetryCommand::StartWritingNow
+                    | TelemetryCommand::StartWritingLastTwoMinutes
+                    | TelemetryCommand::PauseWritingDb
+                    | TelemetryCommand::StopWritingDb
+                    | TelemetryCommand::ToggleButtonInterlock
+                    | TelemetryCommand::ToggleLaunchInterlock
+                    | TelemetryCommand::TogglePhysicalLaunchMode
+                    | TelemetryCommand::ResetLaunchLatch
+            );
+            if !exempt && !self.hitl_button_interlock_satisfied() {
+                return false;
+            }
+            if matches!(
+                cmd,
+                TelemetryCommand::Launch
+                    | TelemetryCommand::LaunchSignal
+                    | TelemetryCommand::GroundStationLaunch
+            ) && !self.hitl_launch_interlock_satisfied()
+            {
+                return false;
+            }
             true
         }
         #[cfg(not(feature = "hitl_mode"))]

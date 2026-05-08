@@ -522,6 +522,14 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         TelemetryCommand::GroundStationLaunch => "GroundStationLaunch",
         #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ToggleButtonInterlock => "ToggleButtonInterlock",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ToggleLaunchInterlock => "ToggleLaunchInterlock",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::TogglePhysicalLaunchMode => "TogglePhysicalLaunchMode",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ResetLaunchLatch => "ResetLaunchLatch",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ExpandParachute => "ExpandParachute",
@@ -623,6 +631,10 @@ pub fn all_command_names() -> Vec<&'static str> {
         "ValidateMeasms",
         "RevokeValidateMeasms",
         "GroundStationLaunch",
+        "ToggleButtonInterlock",
+        "ToggleLaunchInterlock",
+        "TogglePhysicalLaunchMode",
+        "ResetLaunchLatch",
         "DeployParachute",
         "ExpandParachute",
         "EvaluationRelax",

@@ -153,6 +153,37 @@
         "fg": "#dcfce7"
       },
       {
+        "label": "Button Interlock",
+        "cmd": "ToggleButtonInterlock",
+        "border": "#0ea5e9",
+        "bg": "#082f49",
+        "fg": "#e0f2fe",
+        "illuminated": true
+      },
+      {
+        "label": "Launch Interlock",
+        "cmd": "ToggleLaunchInterlock",
+        "border": "#0284c7",
+        "bg": "#082f49",
+        "fg": "#e0f2fe",
+        "illuminated": true
+      },
+      {
+        "label": "Launch Btn -> GS",
+        "cmd": "TogglePhysicalLaunchMode",
+        "border": "#14b8a6",
+        "bg": "#042f2e",
+        "fg": "#ccfbf1",
+        "illuminated": true
+      },
+      {
+        "label": "Reset Launch LED",
+        "cmd": "ResetLaunchLatch",
+        "border": "#f59e0b",
+        "bg": "#3b2203",
+        "fg": "#fef3c7"
+      },
+      {
         "label": "Dump",
         "cmd": "Dump",
         "border": "#ef4444",

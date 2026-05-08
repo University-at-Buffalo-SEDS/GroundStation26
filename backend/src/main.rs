@@ -337,6 +337,13 @@ async fn main() -> anyhow::Result<()> {
         launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
         launch_clock_tx,
         launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
+        launch_indicator_latched: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "hitl_mode")]
+        hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "hitl_mode")]
+        hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "hitl_mode")]
+        hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
         recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
             mode: RecordingModeWire::Idle,
             db_path: Some(db_path_str.clone()),
