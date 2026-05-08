@@ -129,6 +129,15 @@ mod real {
             }
         }
 
+        pub fn reset_outputs_low(&self) -> Result<(), Box<dyn std::error::Error>> {
+            let mut output_pins = self.output_pins.lock().expect("failed to get lock");
+            for pin in output_pins.values_mut() {
+                pin.clear_pwm()?;
+                pin.set_low();
+            }
+            Ok(())
+        }
+
         fn to_pi_trigger(trigger: Trigger) -> PiTrigger {
             match trigger {
                 Trigger::RisingEdge => PiTrigger::RisingEdge,
@@ -259,6 +268,14 @@ mod dummy {
             brightness: f64,
         ) -> Result<(), Box<dyn std::error::Error>> {
             self.write_output_pin(pin_number, brightness > 0.0)
+        }
+
+        pub fn reset_outputs_low(&self) -> Result<(), Box<dyn std::error::Error>> {
+            let mut output_pins = self.output_pins.lock().expect("failed to get lock");
+            for pin in output_pins.values_mut() {
+                *pin = false;
+            }
+            Ok(())
         }
 
         pub fn setup_callback_input_pin<F>(

@@ -673,5 +673,8 @@ async fn main() -> anyhow::Result<()> {
     close_and_finalize_sqlite(telemetry_db, &telemetry_db_path).await;
 
     close_and_finalize_sqlite(state.auth_db.clone(), &auth_db_path_str).await;
+    if let Err(err) = state.gpio.reset_outputs_low() {
+        eprintln!("Failed to reset GPIO outputs low during shutdown: {err}");
+    }
     Ok(())
 }
