@@ -7,9 +7,9 @@ use crate::rocket_commands::{ActuatorBoardCommands, FlightComputerCommands, Valv
 use crate::sequences;
 use crate::state::{AppState, launch_countdown_clock};
 use crate::telemetry_db::{
-    DbQueueItem, DbWrite, LaunchClockKind, RecordingCommand, RecordingMode, RecordingModeWire,
-    RecordingStatusMsg, close_and_finalize_sqlite, open_telemetry_db, prune_recent_writes,
-    session_db_path,
+    DbQueueItem, DbWrite, LaunchClockKind, LaunchClockMsg, RecordingCommand, RecordingMode,
+    RecordingModeWire, RecordingStatusMsg, close_and_finalize_sqlite, open_telemetry_db,
+    prune_recent_writes, session_db_path,
 };
 use crate::types::{
     Board, FlightState, TelemetryCommand, TelemetryRow, canonical_sender_id, u8_to_flight_state,
@@ -1960,6 +1960,19 @@ fn start_launch_clock_from_valve_sequence_status(state: &Arc<AppState>) {
     );
 }
 
+fn transition_launch_clock_to_t_plus_from_pilot_open(state: &Arc<AppState>) {
+    if state.launch_clock_snapshot().kind != LaunchClockKind::TMinus {
+        return;
+    }
+
+    state.set_launch_clock(LaunchClockMsg {
+        kind: LaunchClockKind::TPlus,
+        anchor_timestamp_ms: Some(get_current_timestamp_ms() as i64),
+        duration_ms: None,
+    });
+    gs_debug_println!("Pilot valve open status received; launch clock switched to T+");
+}
+
 async fn handle_ground_station_launch_command(state: Arc<AppState>, router: Arc<Router>) {
     if matches!(
         state.launch_clock_snapshot().kind,
@@ -3243,6 +3256,9 @@ async fn handle_packet(
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
                 state.clear_pending_umbilical_valve_state(key_cmd_id);
                 state.set_umbilical_valve_state(key_cmd_id, key_on);
+                if key_cmd_id == ValveBoardCommands::PilotOpen as u8 && key_on {
+                    transition_launch_clock_to_t_plus_from_pilot_open(state);
+                }
                 sequences::refresh_action_policy_now(state);
                 state.broadcast_action_policy_snapshot();
 

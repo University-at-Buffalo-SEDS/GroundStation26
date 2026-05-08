@@ -37,6 +37,8 @@ const LAUNCH_COUNTDOWN_DURATION_MS: u64 = 10_000;
 #[cfg(feature = "testing")]
 const LAUNCH_IGNITER_START_DELAY_MS: u64 = 5_000;
 #[cfg(feature = "testing")]
+const LAUNCH_IGNITER_ON_DURATION_MS: u64 = 10_000;
+#[cfg(feature = "testing")]
 const LAUNCH_PILOT_OPEN_DURATION_MS: u64 = 1_500;
 #[cfg(feature = "testing")]
 const HOUSEKEEPING_PERIOD_MS: u64 = 900;
@@ -801,7 +803,9 @@ impl FlightSimState {
             self.set_flight_state(FlightState::Ascent, now_ms);
         }
 
-        if now_ms.saturating_sub(sequence_start_ms) >= LAUNCH_COUNTDOWN_DURATION_MS {
+        if now_ms.saturating_sub(sequence_start_ms)
+            >= LAUNCH_IGNITER_START_DELAY_MS + LAUNCH_IGNITER_ON_DURATION_MS
+        {
             let igniter_key = ActuatorBoardCommands::IgniterOn as u8;
             if self.valve_on(igniter_key) {
                 self.valves.insert(igniter_key, false);
