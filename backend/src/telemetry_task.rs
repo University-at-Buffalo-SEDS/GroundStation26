@@ -723,7 +723,6 @@ const ROUTER_TX_BUDGET_MS: u32 = 3;
 const ROUTER_RX_BUDGET_MS: u32 = ROUTER_QUEUE_BUDGET_MS - ROUTER_TX_BUDGET_MS;
 const COMMS_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 const ROUTER_DECODE_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
-const LAUNCH_COMMAND_DELAY_MS: u64 = crate::state::LAUNCH_COUNTDOWN_DURATION_MS as u64;
 const GPS_SATELLITES_DATA_TYPE: &str = "GPS_SATELLITE_NUMBER";
 const VEHICLE_SPEED_DATA_TYPE: &str = "VEHICLE_SPEED";
 const GRAVITY_MPS2: f32 = 9.80665;
@@ -1923,36 +1922,6 @@ fn start_launch_clock_from_valve_sequence_status(state: &Arc<AppState>) {
 
     let now_ms = get_current_timestamp_ms() as i64;
     state.set_launch_clock(launch_countdown_clock(now_ms));
-
-    let state = state.clone();
-    tokio::spawn(async move {
-        let mut shutdown_rx = state.shutdown_subscribe();
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(LAUNCH_COMMAND_DELAY_MS)) => {}
-            recv = shutdown_rx.recv() => {
-                match recv {
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {}
-                }
-                gs_debug_println!("Valve-board launch countdown canceled by shutdown");
-                return;
-            }
-        }
-
-        let current_state = { *state.state.lock().unwrap() };
-        if current_state == FlightState::Aborted {
-            gs_debug_println!(
-                "Valve-board launch countdown canceled because flight state is Aborted"
-            );
-            return;
-        }
-
-        if let Err(err) = state.cmd_tx.try_send(TelemetryCommand::LaunchSignal) {
-            emit_warning(
-                &state,
-                format!("Failed to queue T-0 LaunchSignal from valve-board sequence: {err}"),
-            );
-        }
-    });
 
     gs_debug_println!(
         "Valve-board sequence started launch clock; T-0 in {} ms",
