@@ -517,6 +517,8 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::ValidateMeasms => "ValidateMeasms",
         TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
         #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::GroundStationLaunch => "GroundStationLaunch",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ExpandParachute => "ExpandParachute",
@@ -616,6 +618,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RevokeResetFailures",
         "ValidateMeasms",
         "RevokeValidateMeasms",
+        "GroundStationLaunch",
         "DeployParachute",
         "ExpandParachute",
         "EvaluationRelax",

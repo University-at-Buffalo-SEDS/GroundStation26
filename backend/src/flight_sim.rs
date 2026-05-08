@@ -33,7 +33,8 @@ const FILL_SYSTEM_SENSOR_PERIOD_MS: u64 = 40;
 #[cfg(feature = "testing")]
 const FLIGHT_STATE_PERIOD_MS: u64 = 1_000;
 #[cfg(feature = "testing")]
-const LAUNCH_COUNTDOWN_DURATION_MS: u64 = 10_000;
+const LAUNCH_COUNTDOWN_DURATION_MS: u64 = 5_000;
+const LAUNCH_PILOT_OPEN_DURATION_MS: u64 = 1_500;
 #[cfg(feature = "testing")]
 const HOUSEKEEPING_PERIOD_MS: u64 = 900;
 #[cfg(feature = "testing")]
@@ -737,7 +738,8 @@ impl FlightSimState {
                 // Flight-computer commands are backend-forwarded and do not affect fill simulation.
             }
             #[cfg(feature = "hitl_mode")]
-            TelemetryCommand::DeployParachute
+            TelemetryCommand::GroundStationLaunch
+            | TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
             | TelemetryCommand::ReinitSensors
             | TelemetryCommand::EvaluationRelax
@@ -798,6 +800,16 @@ impl FlightSimState {
             if self.valve_on(igniter_key) {
                 self.valves.insert(igniter_key, false);
                 self.queue_umbilical_status(igniter_key, false, now_ms);
+            }
+        }
+
+        if now_ms.saturating_sub(sequence_start_ms)
+            >= LAUNCH_COUNTDOWN_DURATION_MS + LAUNCH_PILOT_OPEN_DURATION_MS
+        {
+            let pilot_key = ValveBoardCommands::PilotOpen as u8;
+            if self.valve_on(pilot_key) {
+                self.valves.insert(pilot_key, false);
+                self.queue_umbilical_status(pilot_key, false, now_ms);
             }
             self.launch_sequence_started_ms = None;
         }

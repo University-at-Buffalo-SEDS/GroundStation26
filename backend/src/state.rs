@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 
-pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
+pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 5_000;
 const NETWORK_TOPOLOGY_BOARD_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
 
@@ -1349,7 +1349,7 @@ mod tests {
             .expect("ascent transition should produce a launch clock");
 
         assert_eq!(next.kind, LaunchClockKind::TPlus);
-        assert_eq!(next.anchor_timestamp_ms, Some(20_000));
+        assert_eq!(next.anchor_timestamp_ms, Some(15_000));
         assert_eq!(next.duration_ms, None);
     }
 

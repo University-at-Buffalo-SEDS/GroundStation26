@@ -1962,6 +1962,47 @@ fn send_launch_command(_state: &AppState, router: &Router) {
     }
 }
 
+fn send_valve_launch_sequence_command(router: &Router) {
+    let payload = [ValveBoardCommands::Sequence as u8];
+    if let Err(e) = router.log_queue(DataType::ValveCommand, &payload) {
+        log_telemetry_error("failed to log valve launch sequence command", e);
+    } else {
+        log_command_queue_success(
+            "Valve launch sequence command",
+            DataType::ValveCommand,
+            &payload,
+        );
+        flush_command_tx(router, "Valve launch sequence command tx");
+    }
+}
+
+async fn handle_ground_station_launch_command(state: Arc<AppState>, router: Arc<Router>) {
+    if matches!(
+        state.launch_clock_snapshot().kind,
+        LaunchClockKind::TMinus | LaunchClockKind::TPlus
+    ) {
+        gs_debug_println!(
+            "Ground-station launch command ignored because launch clock is already running"
+        );
+        return;
+    }
+    if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
+        let _ = state
+            .db_queue_tx
+            .send(DbQueueItem::Control(RecordingCommand::StartNow))
+            .await;
+        gs_debug_println!("Ground-station launch auto-started DB recording");
+    }
+    let now_ms = get_current_timestamp_ms() as i64;
+    state.set_launch_clock(launch_countdown_clock(now_ms));
+    send_valve_launch_sequence_command(&router);
+    #[cfg(not(feature = "test_fire_mode"))]
+    schedule_launch_command_after_delay(state.clone(), router.clone());
+    gs_debug_println!(
+        "Ground-station launch sequence command sent; T-0 in {LAUNCH_COMMAND_DELAY_MS} ms"
+    );
+}
+
 pub async fn telemetry_task(
     state: Arc<AppState>,
     router: Arc<Router>,
@@ -2457,21 +2498,11 @@ pub async fn telemetry_task(
                                 gs_debug_println!("PostinitSignal command sent");
                             }
                         TelemetryCommand::Launch => {
-                                if matches!(
-                                    state.launch_clock_snapshot().kind,
-                                    LaunchClockKind::TMinus | LaunchClockKind::TPlus
-                                ) {
-                                    gs_debug_println!("Launch command ignored because launch clock is already running");
-                                    continue;
-                                }
-                                if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
-                                    let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartNow)).await;
-                                    gs_debug_println!("Launch auto-started DB recording");
-                                }
-                                let now_ms = get_current_timestamp_ms() as i64;
-                                state.set_launch_clock(launch_countdown_clock(now_ms));
-                                schedule_launch_command_after_delay(state.clone(), router.clone());
-                                gs_debug_println!("Launch command scheduled after {LAUNCH_COMMAND_DELAY_MS} ms");
+                                handle_ground_station_launch_command(state.clone(), router.clone()).await;
+                            }
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::GroundStationLaunch => {
+                                handle_ground_station_launch_command(state.clone(), router.clone()).await;
                             }
                         TelemetryCommand::LaunchSignal => {
                                 if let Err(e) = queue_locally_routed_flight_command(

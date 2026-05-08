@@ -146,6 +146,13 @@
         "fg": "#bbf7d0"
       },
       {
+        "label": "GS Launch",
+        "cmd": "GroundStationLaunch",
+        "border": "#16a34a",
+        "bg": "#052e16",
+        "fg": "#dcfce7"
+      },
+      {
         "label": "Dump",
         "cmd": "Dump",
         "border": "#ef4444",

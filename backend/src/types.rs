@@ -32,6 +32,8 @@ pub enum TelemetryCommand {
     ValidateMeasms,
     RevokeValidateMeasms,
     #[cfg(feature = "hitl_mode")]
+    GroundStationLaunch,
+    #[cfg(feature = "hitl_mode")]
     DeployParachute,
     #[cfg(feature = "hitl_mode")]
     ExpandParachute,
