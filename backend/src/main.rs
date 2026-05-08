@@ -67,6 +67,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::time::Duration;
 
+use crate::web::AlertAckStateMsg;
 use crate::web::emit_error;
 use tokio::sync::{broadcast, mpsc};
 
@@ -82,6 +83,21 @@ pub(crate) fn debug_prints_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("GS_DEBUG_PRINTS")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+pub(crate) fn radio_diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GS_RADIO_DIAGNOSTICS")
             .ok()
             .map(|value| {
                 matches!(
@@ -285,6 +301,8 @@ async fn main() -> anyhow::Result<()> {
         ws_tx,
         warnings_tx: broadcast::channel(alerts_capacity).0,
         errors_tx: broadcast::channel(alerts_capacity).0,
+        alert_ack_state: Arc::new(Mutex::new(AlertAckStateMsg::default())),
+        alert_ack_tx: broadcast::channel(16).0,
         dashboard_reset_tx,
         db: Arc::new(Mutex::new(db)),
         db_path: Arc::new(Mutex::new(db_path_str.clone())),
@@ -299,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
         last_board_status_broadcast_ms: Arc::new(AtomicU64::new(0)),
         last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
         umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
+        pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
@@ -396,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
     ]);
     if telemetry_task::timesync_enabled() {
         cfg = cfg.with_timesync(TimeSyncConfig {
-            role: TimeSyncRole::Auto,
+            role: TimeSyncRole::Source,
             priority: 50,
             ..TimeSyncConfig::default()
         });

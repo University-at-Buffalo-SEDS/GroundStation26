@@ -35,6 +35,12 @@ const FLIGHT_STATE_PERIOD_MS: u64 = 1_000;
 #[cfg(feature = "testing")]
 const LAUNCH_COUNTDOWN_DURATION_MS: u64 = 10_000;
 #[cfg(feature = "testing")]
+const LAUNCH_IGNITER_START_DELAY_MS: u64 = 5_000;
+#[cfg(feature = "testing")]
+const LAUNCH_IGNITER_ON_DURATION_MS: u64 = 10_000;
+#[cfg(feature = "testing")]
+const LAUNCH_PILOT_OPEN_DURATION_MS: u64 = 1_500;
+#[cfg(feature = "testing")]
 const HOUSEKEEPING_PERIOD_MS: u64 = 900;
 #[cfg(feature = "testing")]
 const AV_BAY_BATTERY_CUTOFF_V: f32 = 7.3;
@@ -624,13 +630,6 @@ impl FlightSimState {
                     && self.launch_sequence_started_ms.is_none()
                 {
                     self.launch_sequence_started_ms = Some(now_ms);
-                    self.valves
-                        .insert(ActuatorBoardCommands::IgniterOn as u8, true);
-                    self.queue_umbilical_status(
-                        ActuatorBoardCommands::IgniterOn as u8,
-                        true,
-                        now_ms,
-                    );
                     self.set_flight_state(FlightState::Launch, now_ms);
                 }
             }
@@ -737,7 +736,8 @@ impl FlightSimState {
                 // Flight-computer commands are backend-forwarded and do not affect fill simulation.
             }
             #[cfg(feature = "hitl_mode")]
-            TelemetryCommand::DeployParachute
+            TelemetryCommand::GroundStationLaunch
+            | TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
             | TelemetryCommand::ReinitSensors
             | TelemetryCommand::EvaluationRelax
@@ -782,6 +782,16 @@ impl FlightSimState {
         }
 
         if self.launch_time_ms.is_none()
+            && now_ms.saturating_sub(sequence_start_ms) >= LAUNCH_IGNITER_START_DELAY_MS
+        {
+            let igniter_key = ActuatorBoardCommands::IgniterOn as u8;
+            if !self.valve_on(igniter_key) {
+                self.valves.insert(igniter_key, true);
+                self.queue_umbilical_status(igniter_key, true, now_ms);
+            }
+        }
+
+        if self.launch_time_ms.is_none()
             && now_ms.saturating_sub(sequence_start_ms) >= LAUNCH_COUNTDOWN_DURATION_MS
         {
             let pilot_key = ValveBoardCommands::PilotOpen as u8;
@@ -793,11 +803,23 @@ impl FlightSimState {
             self.set_flight_state(FlightState::Ascent, now_ms);
         }
 
-        if now_ms.saturating_sub(sequence_start_ms) >= LAUNCH_COUNTDOWN_DURATION_MS {
+        if now_ms.saturating_sub(sequence_start_ms)
+            >= LAUNCH_IGNITER_START_DELAY_MS + LAUNCH_IGNITER_ON_DURATION_MS
+        {
             let igniter_key = ActuatorBoardCommands::IgniterOn as u8;
             if self.valve_on(igniter_key) {
                 self.valves.insert(igniter_key, false);
                 self.queue_umbilical_status(igniter_key, false, now_ms);
+            }
+        }
+
+        if now_ms.saturating_sub(sequence_start_ms)
+            >= LAUNCH_COUNTDOWN_DURATION_MS + LAUNCH_PILOT_OPEN_DURATION_MS
+        {
+            let pilot_key = ValveBoardCommands::PilotOpen as u8;
+            if self.valve_on(pilot_key) {
+                self.valves.insert(pilot_key, false);
+                self.queue_umbilical_status(pilot_key, false, now_ms);
             }
             self.launch_sequence_started_ms = None;
         }

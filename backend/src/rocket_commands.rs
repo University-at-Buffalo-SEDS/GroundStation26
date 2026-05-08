@@ -2,17 +2,15 @@
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum FlightComputerCommands {
-    PostinitSignal = 0,
-    LaunchSignal = 1,
-    RollbackSignal = 2,
-    MonitorAltitude = 3,
-    RevokeMonitorAltitude = 4,
-    ConsecutiveSamples = 5,
-    RevokeConsecutiveSamples = 6,
-    ResetFailures = 7,
-    RevokeResetFailures = 8,
-    ValidateMeasms = 9,
-    RevokeValidateMeasms = 10,
+    LaunchSignal = 0,
+    MonitorAltitude = 1,
+    RevokeMonitorAltitude = 2,
+    ConsecutiveSamples = 3,
+    RevokeConsecutiveSamples = 4,
+    ResetFailures = 5,
+    RevokeResetFailures = 6,
+    ValidateMeasms = 7,
+    RevokeValidateMeasms = 8,
     #[cfg(feature = "hitl_mode")]
     DeployParachute = 11,
     #[cfg(feature = "hitl_mode")]

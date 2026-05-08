@@ -6,7 +6,7 @@ use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
 use sedsprintf_rs_2026::{
     TelemetryError, TelemetryResult,
-    config::{DataEndpoint, DataType},
+    config::DataEndpoint,
     packet::Packet,
     router::{Router, RouterSideId},
     serialize,
@@ -48,6 +48,8 @@ const I2C_PACKET_MAX_BYTES: usize = 4_096;
 const I2C_FRAME_PAYLOAD_MAX_BYTES: usize = I2C_PACKET_MAX_BYTES - RAW_UART_FRAME_HEADER_SIZE;
 const UART_STARTUP_TIMEOUT: Duration = Duration::from_millis(500);
 const UART_NORMAL_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(target_os = "linux")]
+const UART_TX_POLL_TIMEOUT: Duration = Duration::from_millis(10);
 #[cfg(target_os = "linux")]
 const I2C_SLOT_SIZE: usize = 32;
 #[cfg(target_os = "linux")]
@@ -95,6 +97,23 @@ pub trait CommsDevice: Send {
         Err(TelemetryError::HandlerError(
             "serialized packet receive not supported for this comms device",
         ))
+    }
+    fn recv_serialized_packets_with_timeout(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+        timeout: Duration,
+    ) -> TelemetryResult<()> {
+        let _ = timeout;
+        self.recv_serialized_packets(packet_sink)
+    }
+    fn recv_serialized_packets_with_budget(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+        timeout: Duration,
+        max_packets: usize,
+    ) -> TelemetryResult<()> {
+        let _ = max_packets;
+        self.recv_serialized_packets_with_timeout(packet_sink, timeout)
     }
     fn take_radio_window_update(&mut self) -> Option<RadioWindowUpdate> {
         None
@@ -170,12 +189,12 @@ fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(
     };
     let is_gps = matches!(
         pkt.data_type(),
-        DataType::GpsData | DataType::GpsSatelliteNumber
+        sedsprintf_rs_2026::config::DataType::GpsData
+            | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
     );
     if !is_gps {
         return;
     }
-
     let has_groundstation = pkt.endpoints().contains(&DataEndpoint::GroundStation);
     if !has_groundstation {
         packet_tap(&pkt);
@@ -317,14 +336,18 @@ impl UartComms {
     }
 
     fn fill_rx_buf(&mut self) -> std::io::Result<()> {
+        let timeout = if self.slow_start_deadline.is_some() {
+            UART_STARTUP_TIMEOUT
+        } else {
+            UART_NORMAL_TIMEOUT
+        };
+        self.fill_rx_buf_with_timeout(timeout)
+    }
+
+    fn fill_rx_buf_with_timeout(&mut self, timeout: Duration) -> std::io::Result<()> {
         self.update_uart_timeout_mode()?;
         #[cfg(target_os = "linux")]
         {
-            let timeout = if self.slow_start_deadline.is_some() {
-                UART_STARTUP_TIMEOUT
-            } else {
-                UART_NORMAL_TIMEOUT
-            };
             let mut scratch = [0u8; 512];
             match read_once_fd_with_poll(self.inner.as_raw_fd(), &mut scratch, timeout) {
                 Ok(0) => {
@@ -367,8 +390,19 @@ impl UartComms {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let original_timeout = if timeout != UART_NORMAL_TIMEOUT {
+                let original = if self.slow_start_deadline.is_some() {
+                    UART_STARTUP_TIMEOUT
+                } else {
+                    UART_NORMAL_TIMEOUT
+                };
+                self.inner.set_timeout(timeout)?;
+                Some(original)
+            } else {
+                None
+            };
             let mut scratch = [0u8; 512];
-            match self.inner.read(&mut scratch) {
+            let result = match self.inner.read(&mut scratch) {
                 Ok(0) => {
                     maybe_log_raw_uart_read_outcome(
                         "read returned 0 bytes",
@@ -405,7 +439,11 @@ impl UartComms {
                     maybe_log_raw_uart_read_error(&err, self.rx_buf.len(), &self.protocol);
                     Err(err)
                 }
+            };
+            if let Some(original_timeout) = original_timeout {
+                let _ = self.inner.set_timeout(original_timeout);
             }
+            result
         }
     }
 
@@ -470,14 +508,20 @@ impl UartComms {
         }
     }
 
-    fn process_buffered_payloads(
+    fn process_buffered_payloads_with_budget(
         &mut self,
         packet_sink: &mut dyn FnMut(Vec<u8>),
+        max_packets: usize,
     ) -> TelemetryResult<bool> {
         let mut processed_any = false;
+        let mut remaining = max_packets.max(1);
 
-        while let Some(payload) = self.try_take_packet()? {
+        while remaining > 0 {
+            let Some(payload) = self.try_take_packet()? else {
+                break;
+            };
             processed_any = true;
+            remaining -= 1;
             if !is_valid_serialized_packet_or_ack(&payload) {
                 maybe_log_raw_uart_parse_issue(
                     "dropping invalid serialized payload from framed raw UART packet",
@@ -593,6 +637,69 @@ fn write_once_fd(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
         return Err(err);
     }
     Ok(written as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn write_all_fd_with_poll(fd: RawFd, bytes: &[u8], timeout: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut written_total = 0usize;
+
+    while written_total < bytes.len() {
+        match write_once_fd(fd, &bytes[written_total..]) {
+            Ok(0) => {}
+            Ok(n) => {
+                written_total += n;
+                continue;
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(err) => return Err(err),
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "short raw UART tx write: wrote {written_total} of {} bytes",
+                    bytes.len()
+                ),
+            ));
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let timeout_ms = remaining.as_millis().clamp(0, i32::MAX as u128) as i32;
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if rc == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "short raw UART tx write: wrote {written_total} of {} bytes",
+                        bytes.len()
+                    ),
+                ));
+            }
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1183,24 +1290,7 @@ impl CommsDevice for UartComms {
                 #[cfg(target_os = "linux")]
                 {
                     let framed = build_raw_uart_frame(payload)?;
-                    let written = write_once_fd(self.inner.as_raw_fd(), &framed)?;
-                    if written == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            "raw UART tx write would block",
-                        )
-                        .into());
-                    }
-                    if written < framed.len() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            format!(
-                                "short raw UART tx write: wrote {written} of {} bytes",
-                                framed.len()
-                            ),
-                        )
-                        .into());
-                    }
+                    write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -1220,20 +1310,37 @@ impl CommsDevice for UartComms {
         &mut self,
         packet_sink: &mut dyn FnMut(Vec<u8>),
     ) -> TelemetryResult<()> {
+        self.recv_serialized_packets_with_timeout(packet_sink, UART_NORMAL_TIMEOUT)
+    }
+
+    fn recv_serialized_packets_with_timeout(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+        timeout: Duration,
+    ) -> TelemetryResult<()> {
+        self.recv_serialized_packets_with_budget(packet_sink, timeout, usize::MAX)
+    }
+
+    fn recv_serialized_packets_with_budget(
+        &mut self,
+        packet_sink: &mut dyn FnMut(Vec<u8>),
+        timeout: Duration,
+        max_packets: usize,
+    ) -> TelemetryResult<()> {
         if self.rx_buf.len() < 2
-            && let Err(err) = self.fill_rx_buf()
+            && let Err(err) = self.fill_rx_buf_with_timeout(timeout)
         {
             return Err(err.into());
         }
-        if self.process_buffered_payloads(packet_sink)? {
+        if self.process_buffered_payloads_with_budget(packet_sink, max_packets)? {
             return Ok(());
         }
 
-        if let Err(err) = self.fill_rx_buf() {
+        if let Err(err) = self.fill_rx_buf_with_timeout(timeout) {
             return Err(err.into());
         }
 
-        let _ = self.process_buffered_payloads(packet_sink)?;
+        let _ = self.process_buffered_payloads_with_budget(packet_sink, max_packets)?;
         maybe_log_raw_uart_buffer_state(&self.rx_buf, "waiting for complete frame", &self.protocol);
         Ok(())
     }
@@ -2000,7 +2107,8 @@ impl CommsDevice for DummyComms {
                 if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
                     && matches!(
                         pkt.data_type(),
-                        DataType::GpsData | DataType::GpsSatelliteNumber
+                        sedsprintf_rs_2026::config::DataType::GpsData
+                            | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
                     )
                 {
                     packet_tap(&pkt);
@@ -2011,7 +2119,8 @@ impl CommsDevice for DummyComms {
                 if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
                     && matches!(
                         pkt.data_type(),
-                        DataType::GpsData | DataType::GpsSatelliteNumber
+                        sedsprintf_rs_2026::config::DataType::GpsData
+                            | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
                     )
                 {
                     packet_tap(&pkt);
@@ -2238,6 +2347,9 @@ mod tests {
 #[cfg(test)]
 mod raw_uart_tests {
     use super::*;
+    use sedsprintf_rs_2026::config::DataEndpoint;
+    use sedsprintf_rs_2026::config::DataType;
+    use std::sync::Arc;
 
     #[test]
     fn raw_uart_frame_roundtrip() {
@@ -2284,6 +2396,53 @@ mod raw_uart_tests {
             .unwrap();
         assert_eq!(decoded, wire.as_ref());
         assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn tap_non_groundstation_gps_skips_groundstation_addressed_fill_telemetry() {
+        let pkt = Packet::new(
+            DataType::FuelTankPressure,
+            &[DataEndpoint::GroundStation, DataEndpoint::SdCard],
+            "GB",
+            123,
+            Arc::from(42.0f32.to_le_bytes().to_vec().into_boxed_slice()),
+        )
+        .unwrap();
+        let wire = serialize::serialize_packet(&pkt);
+        let mut mirrored = None;
+        tap_non_groundstation_gps_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
+        assert!(mirrored.is_none());
+    }
+
+    #[test]
+    fn tap_non_groundstation_gps_includes_non_groundstation_gps() {
+        let pkt = Packet::from_f32_slice(
+            DataType::GpsData,
+            &[1.0, 2.0, 3.0],
+            &[DataEndpoint::SdCard],
+            123,
+        )
+        .unwrap();
+        let wire = serialize::serialize_packet(&pkt);
+        let mut mirrored = None;
+        tap_non_groundstation_gps_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
+        assert_eq!(mirrored.unwrap().data_type(), DataType::GpsData);
+    }
+
+    #[test]
+    fn tap_non_groundstation_gps_skips_router_local_control_packets() {
+        let pkt = Packet::new(
+            DataType::Heartbeat,
+            &[DataEndpoint::GroundStation, DataEndpoint::HeartBeat],
+            "GB",
+            123,
+            Arc::from([].as_slice()),
+        )
+        .unwrap();
+        let wire = serialize::serialize_packet(&pkt);
+        let mut mirrored = None;
+        tap_non_groundstation_gps_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
+        assert!(mirrored.is_none());
     }
 }
 

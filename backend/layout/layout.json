@@ -188,22 +188,8 @@
         "fg": "#fef9c3"
       },
       {
-        "label": "Postinit Signal",
-        "cmd": "PostinitSignal",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Launch Signal",
+        "label": "Launch",
         "cmd": "LaunchSignal",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Rollback Signal",
-        "cmd": "RollbackSignal",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -642,9 +628,31 @@
                 }
               },
               {
-                "label": "Runtime",
-                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-                "index": 0
+                "label": "Days",
+                "data_type": "AV_BAY_BATTERY_REMAINING_DAYS",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " d"
+                }
+              },
+              {
+                "label": "Hours",
+                "data_type": "AV_BAY_BATTERY_REMAINING_HOURS",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " h"
+                }
+              },
+              {
+                "label": "Minutes",
+                "data_type": "AV_BAY_BATTERY_REMAINING_MINUTES_PART",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " m"
+                }
               }
             ]
           },
@@ -671,9 +679,31 @@
                 }
               },
               {
-                "label": "Runtime",
-                "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
-                "index": 0
+                "label": "Days",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_DAYS",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " d"
+                }
+              },
+              {
+                "label": "Hours",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_HOURS",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " h"
+                }
+              },
+              {
+                "label": "Minutes",
+                "data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES_PART",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " m"
+                }
               }
             ]
           },
@@ -700,9 +730,31 @@
                 }
               },
               {
-                "label": "Runtime",
-                "data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
-                "index": 0
+                "label": "Days",
+                "data_type": "FILL_BOX_POWER_REMAINING_DAYS",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " d"
+                }
+              },
+              {
+                "label": "Hours",
+                "data_type": "FILL_BOX_POWER_REMAINING_HOURS",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " h"
+                }
+              },
+              {
+                "label": "Minutes",
+                "data_type": "FILL_BOX_POWER_REMAINING_MINUTES_PART",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer",
+                  "suffix": " m"
+                }
               }
             ]
           }
@@ -2380,7 +2432,7 @@
   "battery": {
     "estimator": {
       "window_seconds": 300,
-      "min_drop_rate_v_per_min": 0.000001
+      "min_drop_rate_v_per_min": 0.0005
     },
     "sources": [
       {
@@ -2391,7 +2443,7 @@
         "percent_data_type": "AV_BAY_BATTERY_PERCENT",
         "drop_rate_data_type": "AV_BAY_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "AV_BAY_BATTERY_REMAINING_MINUTES",
-        "empty_voltage": 7.3,
+        "empty_voltage": 6.3,
         "full_voltage": 8.4,
         "curve_exponent": 1.0
       },

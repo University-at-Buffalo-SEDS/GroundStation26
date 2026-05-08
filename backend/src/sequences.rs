@@ -504,9 +504,7 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::StopWritingDb => "StopWritingDb",
         TelemetryCommand::ResetSim => "ResetSim",
         TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
-        TelemetryCommand::PostinitSignal => "PostinitSignal",
-        TelemetryCommand::LaunchSignal => "LaunchSignal",
-        TelemetryCommand::RollbackSignal => "RollbackSignal",
+        TelemetryCommand::LaunchSignal => "Launch",
         TelemetryCommand::MonitorAltitude => "MonitorAltitude",
         TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
         TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
@@ -515,6 +513,8 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::RevokeResetFailures => "RevokeResetFailures",
         TelemetryCommand::ValidateMeasms => "ValidateMeasms",
         TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::GroundStationLaunch => "GroundStationLaunch",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
         #[cfg(feature = "hitl_mode")]
@@ -568,10 +568,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
-        "PostinitSignal",
         "Launch",
-        "LaunchSignal",
-        "RollbackSignal",
         "MonitorAltitude",
         "RevokeMonitorAltitude",
         "ConsecutiveSamples",
@@ -615,6 +612,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RevokeResetFailures",
         "ValidateMeasms",
         "RevokeValidateMeasms",
+        "GroundStationLaunch",
         "DeployParachute",
         "ExpandParachute",
         "EvaluationRelax",
@@ -973,14 +971,11 @@ fn update_sequence_runtime(
             fill_sequence_calibration_issue(state, cfg, pressure_psi, current_mass_kg)
         {
             runtime.calibration_ready = false;
-            if runtime.calibration_block_message.as_deref() != Some(issue.as_str()) {
-                if let Some(id) = runtime.calibration_block_notification_id.take() {
-                    let _ = state.dismiss_notification(id);
-                }
+            if runtime.calibration_block_notification_id.is_none() {
                 let id = state.add_notification(issue.clone());
                 runtime.calibration_block_notification_id = Some(id);
-                runtime.calibration_block_message = Some(issue);
             }
+            runtime.calibration_block_message = Some(issue);
             return;
         }
 
@@ -1870,4 +1865,47 @@ pub fn start_sequence_task(
             state.set_action_policy(policy);
         }
     })
+}
+
+pub fn refresh_action_policy_now(state: &Arc<AppState>) {
+    let cfg = SequenceConfig::from_env();
+    if cfg!(feature = "hitl_mode") {
+        let valves = ValveSnapshot::read(state);
+        state.set_action_policy(hitl_action_policy(valves));
+        return;
+    }
+
+    let mut runtime = SequenceRuntime::default();
+    let mut flight_state = *state.state.lock().unwrap();
+    let valves = ValveSnapshot::read(state);
+    let pressure_psi = *state.latest_fuel_tank_pressure.lock().unwrap();
+    let current_mass_kg = *state.latest_fill_mass_kg.lock().unwrap();
+    let now = Instant::now();
+    let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+    let key_enabled = read_key_enabled(state, &cfg);
+    let software_buttons_enabled = read_software_buttons_enabled(state, &cfg);
+
+    update_sequence_runtime(
+        state,
+        &mut runtime,
+        &cfg,
+        valves,
+        pressure_psi,
+        current_mass_kg,
+        now,
+    );
+    flight_state = maybe_drive_local_prelaunch_state(state, &runtime, valves, flight_state);
+    let policy = build_policy(
+        state,
+        &cfg,
+        &runtime,
+        PolicyInputs {
+            flight_state,
+            key_enabled,
+            software_buttons_enabled,
+            valves,
+            now_ms,
+        },
+    );
+    state.set_action_policy(policy);
 }

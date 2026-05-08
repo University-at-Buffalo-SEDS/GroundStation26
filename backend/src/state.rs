@@ -13,7 +13,7 @@ use crate::types::{
     NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus, TelemetryCommand,
     TelemetryRow, canonical_sender_id,
 };
-use crate::web::{AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
+use crate::web::{AlertAckStateMsg, AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
 use sedsprintf_rs_2026::config::DataEndpoint;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::Router;
@@ -65,6 +65,12 @@ pub struct AppState {
     /// Error messages → frontend
     pub errors_tx: broadcast::Sender<ErrorMsg>,
 
+    /// Shared alert-ack state broadcast to connected frontends.
+    pub alert_ack_state: Arc<Mutex<AlertAckStateMsg>>,
+
+    /// Broadcast whenever shared alert-ack state changes.
+    pub alert_ack_tx: broadcast::Sender<AlertAckStateMsg>,
+
     /// Dashboard reset events → frontend
     pub dashboard_reset_tx: broadcast::Sender<()>,
 
@@ -106,6 +112,9 @@ pub struct AppState {
 
     /// Umbilical valve states keyed by command id (u8)
     pub umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
+
+    /// Pending umbilical valve targets keyed by canonical command id (u8).
+    pub pending_umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
 
     /// Latest fuel tank pressure (psi)
     pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
@@ -227,6 +236,41 @@ impl AppState {
 
     pub fn broadcast_dashboard_reset(&self) {
         let _ = self.dashboard_reset_tx.send(());
+    }
+
+    /// Returns the shared backend-driven alert-ack snapshot.
+    pub fn alert_ack_state_snapshot(&self) -> AlertAckStateMsg {
+        self.alert_ack_state.lock().unwrap().clone()
+    }
+
+    /// Updates the shared warning ack timestamp and broadcasts if it changed.
+    pub fn acknowledge_warnings_through(&self, timestamp_ms: i64) -> AlertAckStateMsg {
+        let mut slot = self.alert_ack_state.lock().unwrap();
+        let next_ts = timestamp_ms.max(slot.warning_ack_timestamp_ms);
+        if next_ts != slot.warning_ack_timestamp_ms {
+            slot.warning_ack_timestamp_ms = next_ts;
+            let snapshot = slot.clone();
+            drop(slot);
+            let _ = self.alert_ack_tx.send(snapshot.clone());
+            snapshot
+        } else {
+            slot.clone()
+        }
+    }
+
+    /// Updates the shared error ack timestamp and broadcasts if it changed.
+    pub fn acknowledge_errors_through(&self, timestamp_ms: i64) -> AlertAckStateMsg {
+        let mut slot = self.alert_ack_state.lock().unwrap();
+        let next_ts = timestamp_ms.max(slot.error_ack_timestamp_ms);
+        if next_ts != slot.error_ack_timestamp_ms {
+            slot.error_ack_timestamp_ms = next_ts;
+            let snapshot = slot.clone();
+            drop(slot);
+            let _ = self.alert_ack_tx.send(snapshot.clone());
+            snapshot
+        } else {
+            slot.clone()
+        }
     }
 
     pub fn launch_clock_snapshot(&self) -> LaunchClockMsg {
@@ -920,6 +964,15 @@ impl AppState {
     pub fn set_action_policy(&self, policy: ActionPolicyMsg) {
         let recording_mode = self.recording_status_snapshot().mode;
         let mut policy = policy;
+        #[cfg(feature = "hitl_mode")]
+        {
+            policy.key_enabled = true;
+            policy.software_buttons_enabled = true;
+            for control in &mut policy.controls {
+                control.enabled = true;
+                control.blink = crate::sequences::BlinkMode::None;
+            }
+        }
         for control in &mut policy.controls {
             if let Some(actuated) = recording_command_actuated(&control.cmd, recording_mode) {
                 control.actuated = Some(actuated);
@@ -932,6 +985,11 @@ impl AppState {
         *slot = policy.clone();
         drop(slot);
         let _ = self.action_policy_tx.send(policy);
+    }
+
+    /// Rebroadcasts the current action-policy snapshot without requiring a state change.
+    pub fn broadcast_action_policy_snapshot(&self) {
+        let _ = self.action_policy_tx.send(self.action_policy_snapshot());
     }
 
     /// Replaces the current fill targets and broadcasts them if they changed.
@@ -1008,6 +1066,28 @@ impl AppState {
     /// Looks up the last accepted timestamp for a command name.
     pub fn last_command_timestamp_ms(&self, cmd_name: &str) -> Option<u64> {
         self.last_command_ms.lock().unwrap().get(cmd_name).copied()
+    }
+
+    pub fn set_pending_umbilical_valve_state(&self, cmd_id: u8, value: bool) {
+        self.pending_umbilical_valve_states
+            .lock()
+            .unwrap()
+            .insert(cmd_id, value);
+    }
+
+    pub fn get_pending_umbilical_valve_state(&self, cmd_id: u8) -> Option<bool> {
+        self.pending_umbilical_valve_states
+            .lock()
+            .unwrap()
+            .get(&cmd_id)
+            .copied()
+    }
+
+    pub fn clear_pending_umbilical_valve_state(&self, cmd_id: u8) {
+        self.pending_umbilical_valve_states
+            .lock()
+            .unwrap()
+            .remove(&cmd_id);
     }
 
     /// Appends a telemetry row to the in-memory reseed cache and prunes old entries.

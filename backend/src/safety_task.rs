@@ -47,11 +47,11 @@ const GPS_LONGITUDE_MAX_THRESHOLD: f32 = -93.5; // degrees
 
 // Default battery voltage thresholds (V), used as fallback sender ranges.
 const BATTERY_VOLTAGE_AV_BAY_MIN_THRESHOLD: f32 = 6.3; // V
-const BATTERY_VOLTAGE_AV_BAY_MAX_THRESHOLD: f32 = 8.4; // V
-const BATTERY_VOLTAGE_VALVE_BOARD_MIN_THRESHOLD: f32 = 6.3; // V
-const BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD: f32 = 8.4; // V
-const BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD: f32 = 13.3; // V
-const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 15.5; // V
+const BATTERY_VOLTAGE_AV_BAY_MAX_THRESHOLD: f32 = 8.0; // V
+const BATTERY_VOLTAGE_VALVE_BOARD_MIN_THRESHOLD: f32 = 12.3; // V
+const BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD: f32 = 16.5; // V
+const BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD: f32 = 12.3; // V
+const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 16.5; // V
 
 // Battery current thresholds (A)
 const BATTERY_CURRENT_MIN_THRESHOLD: f32 = 0.0; // A
@@ -66,7 +66,7 @@ const KALMAN_STATE_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
 const KALMAN_STATE_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
 
 #[cfg(not(feature = "testing"))]
-const BOARD_TIMEOUT_MS: u64 = 500;
+const BOARD_TIMEOUT_MS: u64 = 3000;
 #[cfg(not(feature = "testing"))]
 const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 3000;
 const FLIGHT_STATE_DB_RETRIES: usize = 5;
