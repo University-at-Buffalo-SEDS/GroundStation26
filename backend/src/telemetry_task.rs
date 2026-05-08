@@ -1,6 +1,5 @@
 use crate::comms::{CommsDevice, RadioWindowKind};
 use crate::flight_sim;
-use crate::gpio_panel::IGNITION_PIN;
 use crate::layout;
 use crate::loadcell;
 use crate::rocket_commands::{ActuatorBoardCommands, FlightComputerCommands, ValveBoardCommands};
@@ -2315,10 +2314,6 @@ pub async fn telemetry_task(
                                     cmd as u8,
                                     "Dump command",
                                 );
-                                {
-                                    let gpio = &state.gpio;
-                                    gpio.write_output_pin(IGNITION_PIN, false).expect("failed to set gpio output");
-                                }
                                 gs_debug_println!("Dump command sent {:?}", cmd);
                             }
                         TelemetryCommand::Abort => {
@@ -2329,10 +2324,6 @@ pub async fn telemetry_task(
                                 ) {
                                     log_telemetry_error("failed to log Abort command", e);
                                 }
-                                state
-                                    .gpio
-                                    .write_output_pin(IGNITION_PIN, false)
-                                    .expect("failed to set gpio output");
                                 gs_debug_println!("Abort command sent");
                             }
                         TelemetryCommand::Igniter => {
@@ -2352,10 +2343,6 @@ pub async fn telemetry_task(
                                     cmd as u8,
                                     "Igniter command",
                                 );
-                                state
-                                    .gpio
-                                    .write_output_pin(IGNITION_PIN, !is_on)
-                                    .expect("failed to set gpio output");
                                 gs_debug_println!("Igniter command sent {:?}", cmd);
                             }
                         #[cfg(feature = "hitl_mode")]

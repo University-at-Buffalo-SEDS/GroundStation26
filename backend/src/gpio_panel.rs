@@ -14,8 +14,8 @@ use tokio::time::interval;
 //####################################################################
 // The values assigned here are GPIO pin numbers on the Raspberry Pi
 //####################################################################
-pub const IGNITION_PIN: u8 = 5;
-pub const IGNITION_PIN_LED: u8 = 0;
+pub const IGNITER_PIN: u8 = 5;
+pub const IGNITER_PIN_LED: u8 = 0;
 
 pub const LAUNCH_ARM_PIN: u8 = 8;
 #[allow(dead_code)]
@@ -57,6 +57,7 @@ struct AllowedActions {
     abort: bool,
     launch: bool,
     dump: bool,
+    igniter: bool,
     normally_open: bool,
     pilot: bool,
     nitrogen: bool,
@@ -71,6 +72,7 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
     // Inputs (buttons)
     gpio.setup_input_pin(ABORT_PIN)?;
     gpio.setup_input_pin(LAUNCH_PIN)?;
+    gpio.setup_input_pin(IGNITER_PIN)?;
     gpio.setup_input_pin(LAUNCH_ARM_PIN)?;
     gpio.setup_input_pin(ALL_BUTTONS_ENABLE_PIN)?;
     gpio.setup_input_pin(DUMP_PIN)?;
@@ -81,9 +83,8 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
     gpio.setup_input_pin(RETRACT_PIN)?;
     gpio.setup_input_pin(WARNING_ACK_PIN)?;
 
-    // Outputs (LEDs + ignition line)
-    gpio.setup_output_pin(IGNITION_PIN)?;
-    gpio.setup_led_pin(IGNITION_PIN_LED)?;
+    // Outputs (LEDs only)
+    gpio.setup_led_pin(IGNITER_PIN_LED)?;
     gpio.setup_led_pin(ABORT_PIN_LED)?;
     gpio.setup_led_pin(LAUNCH_PIN_LED)?;
     gpio.setup_led_pin(DUMP_PIN_LED)?;
@@ -151,6 +152,16 @@ fn setup_callbacks(
             eprintln!("GPIO launch button: failed to send command");
         }
     })?;
+    setup_button_callback(
+        state.clone(),
+        gpio.clone(),
+        allowed.clone(),
+        tx.clone(),
+        IGNITER_PIN,
+        |a| a.igniter,
+        TelemetryCommand::Igniter,
+        debounce,
+    )?;
     setup_button_callback(
         state.clone(),
         gpio.clone(),
@@ -298,7 +309,7 @@ async fn gpio_led_task(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>
         set_led(
             gpio,
             &mut last_levels,
-            IGNITION_PIN_LED,
+            IGNITER_PIN_LED,
             led_for(&policy, "Igniter", now_ms),
         );
         set_led(
@@ -366,6 +377,7 @@ fn allowed_from_policy(policy: &ActionPolicyMsg) -> AllowedActions {
         abort: enabled("Abort"),
         launch: enabled("Launch"),
         dump: enabled("Dump"),
+        igniter: enabled("Igniter"),
         normally_open: enabled("NormallyOpen"),
         pilot: enabled("Pilot"),
         nitrogen: enabled("Nitrogen"),
