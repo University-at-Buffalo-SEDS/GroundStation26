@@ -21,7 +21,7 @@ pub enum TelemetryCommand {
     StopWritingDb,
     ResetSim,
     ContinueFillSequence,
-    LaunchSignal,
+    Launch,
     MonitorAltitude,
     RevokeMonitorAltitude,
     ConsecutiveSamples,

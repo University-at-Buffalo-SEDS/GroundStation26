@@ -381,7 +381,7 @@ fn valve_board_disconnected_for_state(state: FlightState) -> bool {
             | FlightState::Ascent
             | FlightState::Coast
             | FlightState::Apogee
-            | FlightState::ParachuteDeploy
+            | FlightState::Reefing
             | FlightState::Descent
             | FlightState::Landed
             | FlightState::Recovery
@@ -732,9 +732,7 @@ impl FlightSimState {
             | TelemetryCommand::ResetSim => {
                 // Backend-local controls are handled outside the simulator command stream.
             }
-            TelemetryCommand::PostinitSignal
-            | TelemetryCommand::LaunchSignal
-            | TelemetryCommand::RollbackSignal
+            TelemetryCommand::Launch
             | TelemetryCommand::MonitorAltitude
             | TelemetryCommand::RevokeMonitorAltitude
             | TelemetryCommand::ConsecutiveSamples
@@ -1062,7 +1060,7 @@ impl FlightSimState {
         } else if t < 54.0 {
             let chute_terminal_fps = -55.0;
             (
-                FlightState::ParachuteDeploy,
+                FlightState::Reefing,
                 (chute_terminal_fps - self.velocity_fps) * 1.4,
                 0.0,
             )
@@ -1251,7 +1249,7 @@ fn sensor_sequence_for_state(state: FlightState, link: SimLink) -> &'static [Sim
             | FlightState::Ascent
             | FlightState::Coast
             | FlightState::Apogee => AV_BAY_ASCENT_SENSOR_SEQUENCE,
-            FlightState::ParachuteDeploy
+            FlightState::Reefing
             | FlightState::Descent
             | FlightState::Landed
             | FlightState::Recovery => AV_BAY_DESCENT_SENSOR_SEQUENCE,
@@ -1580,7 +1578,7 @@ mod tests {
         }
 
         for state in [
-            FlightState::ParachuteDeploy,
+            FlightState::Reefing,
             FlightState::Descent,
             FlightState::Landed,
             FlightState::Recovery,
