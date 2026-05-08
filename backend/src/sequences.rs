@@ -566,6 +566,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "NormallyOpen",
         "Pilot",
         "Igniter",
+        "IgniterSequence",
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
