@@ -34,7 +34,7 @@ const FILL_SYSTEM_SENSOR_PERIOD_MS: u64 = 40;
 const FLIGHT_STATE_PERIOD_MS: u64 = 1_000;
 #[cfg(feature = "testing")]
 const LAUNCH_COUNTDOWN_DURATION_MS: u64 = 5_000;
-const LAUNCH_PILOT_OPEN_DURATION_MS: u64 = 1_500;
+const _LAUNCH_PILOT_OPEN_DURATION_MS: u64 = 1_500;
 #[cfg(feature = "testing")]
 const HOUSEKEEPING_PERIOD_MS: u64 = 900;
 #[cfg(feature = "testing")]
@@ -804,7 +804,7 @@ impl FlightSimState {
         }
 
         if now_ms.saturating_sub(sequence_start_ms)
-            >= LAUNCH_COUNTDOWN_DURATION_MS + LAUNCH_PILOT_OPEN_DURATION_MS
+            >= LAUNCH_COUNTDOWN_DURATION_MS + _LAUNCH_PILOT_OPEN_DURATION_MS
         {
             let pilot_key = ValveBoardCommands::PilotOpen as u8;
             if self.valve_on(pilot_key) {
