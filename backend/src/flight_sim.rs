@@ -918,7 +918,7 @@ impl FlightSimState {
         let dt_s = if self.last_physics_ms == 0 {
             FILL_SYSTEM_SENSOR_PERIOD_MS as f32 / 1000.0
         } else {
-            ((now_ms.saturating_sub(self.last_physics_ms)) as f32 / 1000.0).clamp(0.0, 1.0)
+            (now_ms.saturating_sub(self.last_physics_ms) as f32 / 1000.0).clamp(0.0, 1.0)
         };
         self.last_physics_ms = now_ms;
 
