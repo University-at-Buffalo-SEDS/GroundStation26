@@ -268,7 +268,7 @@ Expected response:
 {
   "kind": "t_minus",
   "anchor_timestamp_ms": 1742400000000,
-  "duration_ms": 5000
+  "duration_ms": 10000
 }
 ```
 

@@ -723,7 +723,7 @@ const ROUTER_TX_BUDGET_MS: u32 = 3;
 const ROUTER_RX_BUDGET_MS: u32 = ROUTER_QUEUE_BUDGET_MS - ROUTER_TX_BUDGET_MS;
 const COMMS_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 const ROUTER_DECODE_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
-const LAUNCH_COMMAND_DELAY_MS: u64 = 5_000;
+const LAUNCH_COMMAND_DELAY_MS: u64 = crate::state::LAUNCH_COUNTDOWN_DURATION_MS as u64;
 const GPS_SATELLITES_DATA_TYPE: &str = "GPS_SATELLITE_NUMBER";
 const VEHICLE_SPEED_DATA_TYPE: &str = "VEHICLE_SPEED";
 const GRAVITY_MPS2: f32 = 9.80665;
@@ -1899,69 +1899,6 @@ pub fn set_network_time_router(router: Arc<Router>) {
     let _ = NETWORK_TIME_ROUTER.set(router);
 }
 
-fn schedule_launch_command_after_delay(state: Arc<AppState>, router: Arc<Router>) {
-    tokio::spawn(async move {
-        let mut shutdown_rx = state.shutdown_subscribe();
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(LAUNCH_COMMAND_DELAY_MS)) => {}
-            recv = shutdown_rx.recv() => {
-                match recv {
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {}
-                }
-                gs_debug_println!("Delayed launch command canceled by shutdown");
-                return;
-            }
-        }
-
-        let current_state = { *state.state.lock().unwrap() };
-        if current_state == FlightState::Aborted {
-            gs_debug_println!("Delayed launch command canceled because flight state is Aborted");
-            return;
-        }
-
-        send_launch_command(&state, &router);
-    });
-}
-
-fn send_launch_command(_state: &AppState, router: &Router) {
-    #[cfg(feature = "test_fire_mode")]
-    {
-        let _ = _state;
-        if let Err(e) = router.log_queue(
-            DataType::ActuatorCommand,
-            &[ActuatorBoardCommands::IgniterSequence as u8],
-        ) {
-            log_telemetry_error("failed to log delayed test-fire Launch command", e);
-        } else {
-            log_command_queue_success(
-                "Delayed test-fire Launch command",
-                DataType::ActuatorCommand,
-                &[ActuatorBoardCommands::IgniterSequence as u8],
-            );
-            flush_command_tx(router, "Delayed test-fire Launch command tx");
-        }
-        gs_debug_println!("Delayed test-fire launch command sent to actuator board");
-    }
-
-    #[cfg(not(feature = "test_fire_mode"))]
-    {
-        if let Err(e) = queue_locally_routed_flight_command(
-            router,
-            &[FlightComputerCommands::LaunchSignal as u8],
-        ) {
-            log_telemetry_error("failed to log delayed Launch command", e);
-        } else {
-            log_command_queue_success(
-                "Delayed Launch command",
-                DataType::FlightCommand,
-                &[FlightComputerCommands::LaunchSignal as u8],
-            );
-            flush_command_tx(router, "Delayed Launch command tx");
-        }
-        gs_debug_println!("Delayed launch command sent");
-    }
-}
-
 fn send_valve_launch_sequence_command(router: &Router) {
     let payload = [ValveBoardCommands::Sequence as u8];
     if let Err(e) = router.log_queue(DataType::ValveCommand, &payload) {
@@ -1974,6 +1911,53 @@ fn send_valve_launch_sequence_command(router: &Router) {
         );
         flush_command_tx(router, "Valve launch sequence command tx");
     }
+}
+
+fn start_launch_clock_from_valve_sequence_status(state: &Arc<AppState>) {
+    if matches!(
+        state.launch_clock_snapshot().kind,
+        LaunchClockKind::TMinus | LaunchClockKind::TPlus
+    ) {
+        return;
+    }
+
+    let now_ms = get_current_timestamp_ms() as i64;
+    state.set_launch_clock(launch_countdown_clock(now_ms));
+
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut shutdown_rx = state.shutdown_subscribe();
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(LAUNCH_COMMAND_DELAY_MS)) => {}
+            recv = shutdown_rx.recv() => {
+                match recv {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {}
+                }
+                gs_debug_println!("Valve-board launch countdown canceled by shutdown");
+                return;
+            }
+        }
+
+        let current_state = { *state.state.lock().unwrap() };
+        if current_state == FlightState::Aborted {
+            gs_debug_println!(
+                "Valve-board launch countdown canceled because flight state is Aborted"
+            );
+            return;
+        }
+
+        if let Err(err) = state.cmd_tx.try_send(TelemetryCommand::LaunchSignal) {
+            emit_warning(
+                &state,
+                format!("Failed to queue T-0 LaunchSignal from valve-board sequence: {err}"),
+            );
+        }
+    });
+
+    gs_debug_println!(
+        "Valve-board sequence started launch clock; T-0 in {} ms",
+        crate::state::LAUNCH_COUNTDOWN_DURATION_MS
+    );
 }
 
 async fn handle_ground_station_launch_command(state: Arc<AppState>, router: Arc<Router>) {
@@ -1993,13 +1977,33 @@ async fn handle_ground_station_launch_command(state: Arc<AppState>, router: Arc<
             .await;
         gs_debug_println!("Ground-station launch auto-started DB recording");
     }
-    let now_ms = get_current_timestamp_ms() as i64;
-    state.set_launch_clock(launch_countdown_clock(now_ms));
     send_valve_launch_sequence_command(&router);
-    #[cfg(not(feature = "test_fire_mode"))]
-    schedule_launch_command_after_delay(state.clone(), router.clone());
     gs_debug_println!(
-        "Ground-station launch sequence command sent; T-0 in {LAUNCH_COMMAND_DELAY_MS} ms"
+        "Ground-station launch sequence command sent; waiting for valve-board clock start"
+    );
+}
+
+#[cfg(feature = "hitl_mode")]
+async fn handle_hitl_ground_station_launch_command(state: Arc<AppState>, router: Arc<Router>) {
+    if matches!(
+        state.launch_clock_snapshot().kind,
+        LaunchClockKind::TMinus | LaunchClockKind::TPlus
+    ) {
+        gs_debug_println!(
+            "HITL ground-station launch command ignored because launch clock is already running"
+        );
+        return;
+    }
+    if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
+        let _ = state
+            .db_queue_tx
+            .send(DbQueueItem::Control(RecordingCommand::StartNow))
+            .await;
+        gs_debug_println!("HITL ground-station launch auto-started DB recording");
+    }
+    send_valve_launch_sequence_command(&router);
+    gs_debug_println!(
+        "HITL ground-station launch sequence command sent; waiting for valve-board clock start"
     );
 }
 
@@ -2502,7 +2506,7 @@ pub async fn telemetry_task(
                             }
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::GroundStationLaunch => {
-                                handle_ground_station_launch_command(state.clone(), router.clone()).await;
+                                handle_hitl_ground_station_launch_command(state.clone(), router.clone()).await;
                             }
                         TelemetryCommand::LaunchSignal => {
                                 if let Err(e) = queue_locally_routed_flight_command(
@@ -3230,6 +3234,12 @@ async fn handle_packet(
         {
             let cmd_id = data[0];
             let on = data[1] != 0;
+            if cmd_id == ValveBoardCommands::Sequence as u8 {
+                if on {
+                    start_launch_clock_from_valve_sequence_status(state);
+                }
+                return Vec::new();
+            }
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
                 state.clear_pending_umbilical_valve_state(key_cmd_id);
                 state.set_umbilical_valve_state(key_cmd_id, key_on);
