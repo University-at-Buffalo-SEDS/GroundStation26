@@ -299,6 +299,7 @@ impl AppState {
         let _ = self.launch_clock_tx.send(next);
     }
 
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     pub fn try_begin_launch_sequence_command(&self) -> bool {
         self.launch_sequence_command_pending
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)

@@ -1898,6 +1898,7 @@ pub fn set_network_time_router(router: Arc<Router>) {
     let _ = NETWORK_TIME_ROUTER.set(router);
 }
 
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 fn send_valve_launch_sequence_command(router: &Router) -> bool {
     let payload = [ValveBoardCommands::Sequence as u8];
     if let Err(e) = router.log_queue(DataType::ValveCommand, &payload) {
@@ -1945,38 +1946,6 @@ fn transition_launch_clock_to_t_plus_from_pilot_open(state: &Arc<AppState>) {
     gs_debug_println!("Pilot valve open status received; launch clock switched to T+");
 }
 
-async fn handle_ground_station_launch_command(state: Arc<AppState>, router: Arc<Router>) {
-    if matches!(
-        state.launch_clock_snapshot().kind,
-        LaunchClockKind::TMinus | LaunchClockKind::TPlus
-    ) {
-        gs_debug_println!(
-            "Ground-station launch command ignored because launch clock is already running"
-        );
-        return;
-    }
-    if !state.try_begin_launch_sequence_command() {
-        gs_debug_println!(
-            "Ground-station launch command ignored because valve-board launch sequence command is already pending"
-        );
-        return;
-    }
-    if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
-        let _ = state
-            .db_queue_tx
-            .send(DbQueueItem::Control(RecordingCommand::StartNow))
-            .await;
-        gs_debug_println!("Ground-station launch auto-started DB recording");
-    }
-    if !send_valve_launch_sequence_command(&router) {
-        state.clear_launch_sequence_command_pending();
-        return;
-    }
-    gs_debug_println!(
-        "Ground-station launch sequence command sent; waiting for valve-board clock start"
-    );
-}
-
 #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router: Arc<Router>) {
     if matches!(
@@ -2008,6 +1977,38 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
     gs_debug_println!(
         "Ground-station launch sequence command sent; waiting for valve-board clock start"
     );
+}
+
+async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc<Router>) {
+    if matches!(
+        state.launch_clock_snapshot().kind,
+        LaunchClockKind::TMinus | LaunchClockKind::TPlus
+    ) {
+        gs_debug_println!("Launch command ignored because launch clock is already running");
+        return;
+    }
+    if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
+        let _ = state
+            .db_queue_tx
+            .send(DbQueueItem::Control(RecordingCommand::StartNow))
+            .await;
+        gs_debug_println!("Launch auto-started DB recording");
+    }
+    let now_ms = get_current_timestamp_ms() as i64;
+    state.set_launch_clock(launch_countdown_clock(now_ms));
+    if let Err(e) =
+        queue_locally_routed_flight_command(&router, &[FlightComputerCommands::LaunchSignal as u8])
+    {
+        log_telemetry_error("failed to log Launch command", e);
+    } else {
+        log_command_queue_success(
+            "Launch command",
+            DataType::FlightCommand,
+            &[FlightComputerCommands::LaunchSignal as u8],
+        );
+        flush_command_tx(&router, "Launch command tx");
+    }
+    gs_debug_println!("Launch command sent to flight computer");
 }
 
 pub async fn telemetry_task(
@@ -2521,20 +2522,26 @@ pub async fn telemetry_task(
                                 gs_debug_println!("PostinitSignal command sent");
                             }
                         TelemetryCommand::Launch => {
-                                handle_ground_station_launch_command(state.clone(), router.clone()).await;
+                                handle_flight_computer_launch_command(state.clone(), router.clone()).await;
                             }
                         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
                         TelemetryCommand::GroundStationLaunch => {
                                 handle_local_ground_station_launch_command(state.clone(), router.clone()).await;
                             }
                         TelemetryCommand::LaunchSignal => {
-                                emit_warning(
-                                    &state,
-                                    "Ignored LaunchSignal command: launch is owned by the valve-board sequence".to_string(),
-                                );
-                                gs_debug_println!(
-                                    "LaunchSignal command ignored; valve-board sequence owns launch"
-                                );
+                                if let Err(e) = queue_locally_routed_flight_command(
+                                    &router,
+                                    &[FlightComputerCommands::LaunchSignal as u8],
+                                ) {
+                                    log_telemetry_error("failed to log LaunchSignal command", e);
+                                } else {
+                                    log_command_queue_success(
+                                        "LaunchSignal command",
+                                        DataType::FlightCommand,
+                                        &[FlightComputerCommands::LaunchSignal as u8],
+                                    );
+                                }
+                                gs_debug_println!("LaunchSignal command sent");
                             }
                         TelemetryCommand::RollbackSignal => {
                                 if let Err(e) = queue_locally_routed_flight_command(
