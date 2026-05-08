@@ -9,6 +9,8 @@ pub enum TelemetryCommand {
     NormallyOpen,
     Pilot,
     Igniter,
+    #[cfg(feature = "hitl_mode")]
+    IgniterSequence,
     RetractPlumbing,
     Nitrogen,
     NitrogenClose,
@@ -31,7 +33,7 @@ pub enum TelemetryCommand {
     RevokeResetFailures,
     ValidateMeasms,
     RevokeValidateMeasms,
-    #[cfg(feature = "hitl_mode")]
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     GroundStationLaunch,
     #[cfg(feature = "hitl_mode")]
     DeployParachute,

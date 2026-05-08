@@ -138,11 +138,16 @@ fn setup_callbacks(
         if !is_input_enabled(&gpio_launch, LAUNCH_ARM_PIN) {
             emit_warning(
                 &state_launch,
-                "Ignored LaunchSignal button press: launch arm signal is not enabled".to_string(),
+                "Ignored launch button press: launch arm signal is not enabled".to_string(),
             );
             return;
         }
-        if tx_launch.try_send(TelemetryCommand::LaunchSignal).is_err() {
+        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+        let launch_command = TelemetryCommand::GroundStationLaunch;
+        #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+        let launch_command = TelemetryCommand::Launch;
+
+        if tx_launch.try_send(launch_command).is_err() {
             eprintln!("GPIO launch button: failed to send command");
         }
     })?;

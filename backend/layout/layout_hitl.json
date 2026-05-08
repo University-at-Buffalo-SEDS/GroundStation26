@@ -167,6 +167,13 @@
         "fg": "#bfdbfe"
       },
       {
+        "label": "Igniter Seq",
+        "cmd": "IgniterSequence",
+        "border": "#38bdf8",
+        "bg": "#082f49",
+        "fg": "#e0f2fe"
+      },
+      {
         "label": "Pilot",
         "cmd": "Pilot",
         "border": "#a78bfa",

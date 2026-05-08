@@ -136,7 +136,7 @@
       },
       {
         "label": "Launch",
-        "cmd": "Launch",
+        "cmd": "GroundStationLaunch",
         "border": "#22c55e",
         "bg": "#022c22",
         "fg": "#bbf7d0"

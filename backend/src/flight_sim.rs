@@ -341,6 +341,7 @@ fn vented_pressure_target_psi(_loadcell_mass_kg: f32, _nitrous_loaded: bool) -> 
 struct FlightSimState {
     flight_state: FlightState,
     launch_sequence_started_ms: Option<u64>,
+    actuator_igniter_sequence_started_ms: Option<u64>,
     launch_time_ms: Option<u64>,
     last_state_emit_ms: u64,
     last_av_bay_sensor_emit_ms: u64,
@@ -400,6 +401,7 @@ impl FlightSimState {
         Self {
             flight_state: FlightState::Idle,
             launch_sequence_started_ms: None,
+            actuator_igniter_sequence_started_ms: None,
             launch_time_ms: None,
             last_state_emit_ms: 0,
             last_av_bay_sensor_emit_ms: 0,
@@ -610,6 +612,7 @@ impl FlightSimState {
         match cmd {
             TelemetryCommand::Abort => {
                 self.launch_sequence_started_ms = None;
+                self.actuator_igniter_sequence_started_ms = None;
                 self.launch_time_ms = None;
                 self.valves
                     .insert(ActuatorBoardCommands::IgniterOn as u8, false);
@@ -673,6 +676,13 @@ impl FlightSimState {
                 self.valves.insert(key, next);
                 self.queue_umbilical_status(key, next, now_ms);
             }
+            #[cfg(feature = "hitl_mode")]
+            TelemetryCommand::IgniterSequence => {
+                let key = ActuatorBoardCommands::IgniterOn as u8;
+                self.valves.insert(key, true);
+                self.queue_umbilical_status(key, true, now_ms);
+                self.actuator_igniter_sequence_started_ms = Some(now_ms);
+            }
             TelemetryCommand::RetractPlumbing => {
                 let key = ActuatorBoardCommands::RetractPlumbing as u8;
                 self.valves.insert(key, true);
@@ -735,9 +745,12 @@ impl FlightSimState {
             | TelemetryCommand::RevokeValidateMeasms => {
                 // Flight-computer commands are backend-forwarded and do not affect fill simulation.
             }
+            #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+            TelemetryCommand::GroundStationLaunch => {
+                // Valve-board-owned launch commands are forwarded by telemetry_task.
+            }
             #[cfg(feature = "hitl_mode")]
-            TelemetryCommand::GroundStationLaunch
-            | TelemetryCommand::DeployParachute
+            TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
             | TelemetryCommand::ReinitSensors
             | TelemetryCommand::EvaluationRelax
@@ -767,7 +780,25 @@ impl FlightSimState {
         }
 
         self.update_launch_sequence(now_ms);
+        self.update_actuator_igniter_sequence(now_ms);
         self.update_ground_sequence(now_ms);
+    }
+
+    fn update_actuator_igniter_sequence(&mut self, now_ms: u64) {
+        let Some(sequence_start_ms) = self.actuator_igniter_sequence_started_ms else {
+            return;
+        };
+
+        if now_ms.saturating_sub(sequence_start_ms) < LAUNCH_IGNITER_ON_DURATION_MS {
+            return;
+        }
+
+        let igniter_key = ActuatorBoardCommands::IgniterOn as u8;
+        if self.valve_on(igniter_key) {
+            self.valves.insert(igniter_key, false);
+            self.queue_umbilical_status(igniter_key, false, now_ms);
+        }
+        self.actuator_igniter_sequence_started_ms = None;
     }
 
     fn update_launch_sequence(&mut self, now_ms: u64) {
@@ -882,6 +913,7 @@ impl FlightSimState {
 
     fn update_physics(&mut self, now_ms: u64) {
         self.update_launch_sequence(now_ms);
+        self.update_actuator_igniter_sequence(now_ms);
 
         let dt_s = if self.last_physics_ms == 0 {
             FILL_SYSTEM_SENSOR_PERIOD_MS as f32 / 1000.0
