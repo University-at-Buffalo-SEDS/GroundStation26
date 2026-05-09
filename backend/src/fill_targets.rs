@@ -58,11 +58,22 @@ fn load_from_path(path: &Path) -> Result<FillTargetsConfig, String> {
 }
 
 fn normalize(mut cfg: FillTargetsConfig) -> FillTargetsConfig {
-    cfg.nitrogen.target_mass_kg = cfg.nitrogen.target_mass_kg.max(0.01);
-    cfg.nitrous.target_mass_kg = cfg.nitrous.target_mass_kg.max(0.01);
+    cfg.nitrogen.target_mass_kg = normalize_mass_target(cfg.nitrogen.target_mass_kg);
+    cfg.nitrous.target_mass_kg = normalize_mass_target(cfg.nitrous.target_mass_kg);
     cfg.nitrogen.target_pressure_psi = cfg.nitrogen.target_pressure_psi.max(0.0);
     cfg.nitrous.target_pressure_psi = cfg.nitrous.target_pressure_psi.max(0.0);
     cfg
+}
+
+fn normalize_mass_target(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.01;
+    }
+    if value.abs() < 0.01 {
+        if value.is_sign_negative() { -0.01 } else { 0.01 }
+    } else {
+        value
+    }
 }
 
 pub fn load_or_default() -> FillTargetsConfig {
@@ -125,10 +136,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_positive() {
+    fn defaults_are_nonzero() {
         let cfg = FillTargetsConfig::default();
-        assert!(cfg.nitrogen.target_mass_kg > 0.0);
-        assert!(cfg.nitrous.target_mass_kg > 0.0);
+        assert!(cfg.nitrogen.target_mass_kg.abs() > 0.0);
+        assert!(cfg.nitrous.target_mass_kg.abs() > 0.0);
     }
 
     #[test]

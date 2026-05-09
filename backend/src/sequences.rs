@@ -189,8 +189,8 @@ impl SequenceConfig {
         let nitrogen_target_mass_kg = std::env::var("GS_SEQUENCE_NITROGEN_TARGET_MASS_KG")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v > 0.0)
-            .or(Some(fill_cfg.nitrogen.target_mass_kg.max(0.01)));
+            .filter(|v| v.abs() >= 0.01)
+            .or(Some(fill_cfg.nitrogen.target_mass_kg));
 
         let nitrogen_autoclose_mode = std::env::var("GS_SEQUENCE_NITROGEN_AUTOCLOSE_MODE")
             .ok()
@@ -941,9 +941,29 @@ fn fill_sequence_calibration_issue(
 
 fn nitrous_fill_status(_state: &AppState, current_mass_kg: f32) -> (f32, f32) {
     let fill_target_mass_kg = fill_targets::load_or_default().nitrous.target_mass_kg;
-    let target_mass_kg = fill_target_mass_kg.max(0.0001);
+    let target_mass_kg = normalized_mass_target(fill_target_mass_kg, 0.0001);
     let percent = loadcell::fill_percent(target_mass_kg, current_mass_kg);
     (target_mass_kg, percent)
+}
+
+fn normalized_mass_target(target_mass_kg: f32, epsilon_kg: f32) -> f32 {
+    if target_mass_kg.abs() < epsilon_kg {
+        if target_mass_kg.is_sign_negative() {
+            -epsilon_kg
+        } else {
+            epsilon_kg
+        }
+    } else {
+        target_mass_kg
+    }
+}
+
+fn mass_target_reached(current_mass_kg: f32, target_mass_kg: f32, epsilon_kg: f32) -> bool {
+    if target_mass_kg >= 0.0 {
+        current_mass_kg + epsilon_kg >= target_mass_kg
+    } else {
+        current_mass_kg - epsilon_kg <= target_mass_kg
+    }
 }
 
 fn update_sequence_runtime(
@@ -1047,7 +1067,11 @@ fn update_sequence_runtime(
             let pressure_ready = at_or_above(pressure_psi, cfg.nitrogen_pressure_target_psi);
             let weight_ready = cfg
                 .nitrogen_target_mass_kg
-                .is_some_and(|target_mass_kg| current_mass_kg.is_some_and(|m| m >= target_mass_kg));
+                .is_some_and(|target_mass_kg| {
+                    current_mass_kg.is_some_and(|m| {
+                        mass_target_reached(m, target_mass_kg, cfg.nitrous_weight_rise_epsilon_kg)
+                    })
+                });
             let should_close = match cfg.nitrogen_autoclose_mode {
                 NitrogenAutocloseMode::Pressure => pressure_ready,
                 NitrogenAutocloseMode::Weight => weight_ready,
@@ -1309,7 +1333,7 @@ fn update_sequence_runtime(
                 (
                     target_mass_kg,
                     fill_percent,
-                    m + cfg.nitrous_weight_rise_epsilon_kg >= target_mass_kg
+                    mass_target_reached(m, target_mass_kg, cfg.nitrous_weight_rise_epsilon_kg)
                         || fill_percent >= 99.5,
                 )
             });

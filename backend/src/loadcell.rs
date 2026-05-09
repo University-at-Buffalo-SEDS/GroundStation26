@@ -1177,11 +1177,23 @@ pub fn active_fill_target_mass_kg(cfg: &FillTargetsConfig, flight_state: FlightS
     } else {
         cfg.nitrous.target_mass_kg
     };
-    target_mass_kg.max(0.0001)
+    normalized_mass_target(target_mass_kg)
 }
 
 pub fn fill_percent(target_mass_kg: f32, weight_kg: f32) -> f32 {
-    ((weight_kg / target_mass_kg.max(0.0001)) * 100.0).clamp(0.0, 100.0)
+    ((weight_kg / normalized_mass_target(target_mass_kg)) * 100.0).clamp(0.0, 100.0)
+}
+
+fn normalized_mass_target(target_mass_kg: f32) -> f32 {
+    if target_mass_kg.abs() < 0.0001 {
+        if target_mass_kg.is_sign_negative() {
+            -0.0001
+        } else {
+            0.0001
+        }
+    } else {
+        target_mass_kg
+    }
 }
 
 #[cfg(test)]
