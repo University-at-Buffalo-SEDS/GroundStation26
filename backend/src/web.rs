@@ -1487,16 +1487,9 @@ struct WsAuthQuery {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum AlertAckSeverity {
-    Warning,
-    Error,
-}
-
-#[derive(Deserialize)]
 struct AlertAckRequest {
-    severity: AlertAckSeverity,
-    timestamp_ms: i64,
+    warning_timestamp_ms: i64,
+    error_timestamp_ms: i64,
 }
 
 async fn ws_handler(
@@ -2055,10 +2048,8 @@ async fn post_alert_ack(
         return response;
     }
 
-    let snapshot = match body.severity {
-        AlertAckSeverity::Warning => state.acknowledge_warnings_through(body.timestamp_ms),
-        AlertAckSeverity::Error => state.acknowledge_errors_through(body.timestamp_ms),
-    };
+    let snapshot =
+        state.acknowledge_alerts_through(body.warning_timestamp_ms, body.error_timestamp_ms);
     Json(snapshot).into_response()
 }
 
