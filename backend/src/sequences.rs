@@ -831,35 +831,18 @@ fn policy_with_overrides(
     }
 }
 
-fn pending_mode(
-    state: &AppState,
-    cmd: &'static str,
-    now_ms: u64,
-    cfg: &SequenceConfig,
-) -> BlinkMode {
-    if let Some(last_ms) = state.last_command_timestamp_ms(cmd)
-        && now_ms.saturating_sub(last_ms) <= cfg.pending_fast_window.as_millis() as u64
-    {
-        return BlinkMode::Fast;
-    }
-    BlinkMode::Slow
-}
-
 fn command_prompt_blink(
-    state: &AppState,
-    cfg: &SequenceConfig,
+    _state: &AppState,
+    _cfg: &SequenceConfig,
     valves: ValveSnapshot,
     cmd: &'static str,
     desired: bool,
-    now_ms: u64,
+    _now_ms: u64,
 ) -> Option<BlinkMode> {
     if valves.actual_for_cmd(cmd) == Some(desired) {
         return None;
     }
-    if valves.pending_for_cmd(cmd) == Some(desired) {
-        return Some(BlinkMode::Fast);
-    }
-    Some(pending_mode(state, cmd, now_ms, cfg))
+    Some(BlinkMode::Slow)
 }
 
 fn set_control_enabled(policy: &mut ActionPolicyMsg, cmd: &str, enabled: bool) {
