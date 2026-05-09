@@ -551,24 +551,43 @@ fn alarm_active_window(severity: AlarmSeverity, now_ms: u64) -> bool {
 }
 
 fn alarm_led_brightness(severity: AlarmSeverity, now_ms: u64) -> f64 {
-    let (cycle_ms, on_ms, pulse_ms, edge_ms, dim, bright) = match severity {
-        AlarmSeverity::Error => (8_000_u64, 5_000_u64, 160_u64, 120_u64, 0.18, 1.0),
-        AlarmSeverity::Warning => (3_500_u64, 500_u64, 140_u64, 90_u64, 0.16, 0.95),
-    };
-    let phase_ms = now_ms % cycle_ms;
-    if phase_ms >= on_ms {
-        return 0.0;
+    match severity {
+        AlarmSeverity::Warning => {
+            let period_ms = 1_000_u64;
+            let phase = (now_ms % period_ms) as f64 / period_ms as f64;
+            0.5 - 0.5 * (std::f64::consts::TAU * phase).cos()
+        }
+        AlarmSeverity::Error => {
+            let cycle_ms = 1_500_u64;
+            let phase_ms = now_ms % cycle_ms;
+            if let Some(pulse) = double_blink_pulse(phase_ms, 0) {
+                return pulse;
+            }
+            if let Some(pulse) = double_blink_pulse(phase_ms, 220) {
+                return pulse;
+            }
+            0.0
+        }
     }
+}
 
-    let pulse_phase = (phase_ms % pulse_ms) as f64 / pulse_ms as f64;
-    let pulse_wave = 0.5 - 0.5 * (std::f64::consts::TAU * pulse_phase).cos();
-    let base = dim + (bright - dim) * pulse_wave;
-
-    let edge = edge_ms.min(on_ms / 2).max(1);
-    let ramp_in = (phase_ms.min(edge) as f64) / edge as f64;
-    let ramp_out = ((on_ms - phase_ms).min(edge) as f64) / edge as f64;
-    let envelope = ramp_in.min(ramp_out).clamp(0.0, 1.0);
-    base * envelope
+fn double_blink_pulse(phase_ms: u64, offset_ms: u64) -> Option<f64> {
+    let rise_ms = 60_u64;
+    let hold_ms = 70_u64;
+    let fall_ms = 60_u64;
+    let pulse_ms = rise_ms + hold_ms + fall_ms;
+    if phase_ms < offset_ms || phase_ms >= offset_ms + pulse_ms {
+        return None;
+    }
+    let local_ms = phase_ms - offset_ms;
+    if local_ms < rise_ms {
+        Some(local_ms as f64 / rise_ms as f64)
+    } else if local_ms < rise_ms + hold_ms {
+        Some(1.0)
+    } else {
+        let fade_ms = local_ms - rise_ms - hold_ms;
+        Some(1.0 - (fade_ms as f64 / fall_ms as f64))
+    }
 }
 
 fn is_input_enabled(gpio: &crate::gpio::GpioPins, pin: u8) -> bool {

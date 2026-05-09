@@ -442,11 +442,15 @@ fn points_for_channel(
             .extra_channels
             .get(key)
             .map(|channel| {
-                channel
+                let mut points: Vec<(f64, f64)> = channel
                     .points
                     .iter()
                     .map(|p| (p.raw as f64, p.expected as f64))
-                    .collect()
+                    .collect();
+                if let Some(zero_raw) = channel.zero_raw {
+                    points.push((zero_raw as f64, 0.0));
+                }
+                points
             })
             .unwrap_or_default(),
     }
