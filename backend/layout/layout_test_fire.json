@@ -1143,7 +1143,7 @@
                   }
                 ],
                 "actions": [
-                  "Launch",
+                  "GroundStationLaunch",
                   "Dump",
                   "Pilot",
                   "AdvanceFlightState",
