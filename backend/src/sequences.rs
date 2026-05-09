@@ -547,9 +547,9 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::ReinitIMU => "ReinitIMU",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DisableIMU => "DisableIMU",
-        #[cfg(feature = "hitl_mode")]
+        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
-        #[cfg(feature = "hitl_mode")]
+        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         TelemetryCommand::RewindFlightState => "RewindFlightState",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter40 => "AbortAfter40",
@@ -684,6 +684,8 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RevokeResetFailures",
         "ValidateMeasms",
         "RevokeValidateMeasms",
+        "AdvanceFlightState",
+        "RewindFlightState",
     ]
 }
 
@@ -1460,6 +1462,10 @@ fn maybe_drive_local_prelaunch_state(
     valves: ValveSnapshot,
     current_state: FlightState,
 ) -> FlightState {
+    if cfg!(feature = "hitl_mode") || cfg!(feature = "test_fire_mode") {
+        return current_state;
+    }
+
     if (current_state as u8) > (FlightState::Armed as u8) {
         return current_state;
     }
@@ -1583,13 +1589,19 @@ fn build_policy(
         }
         // In Idle, make the first fill-transition action the only illuminated action.
         // All other controls remain available (dimmed client-side when not blinking).
-        if inputs.flight_state == FlightState::Idle && inputs.valves.normally_open != Some(true) {
+        if !cfg!(feature = "test_fire_mode")
+            && inputs.flight_state == FlightState::Idle
+            && inputs.valves.normally_open != Some(true)
+        {
             enabled.insert(
                 "NormallyOpen",
                 pending_mode(state, "NormallyOpen", inputs.now_ms, cfg),
             );
         }
-        if inputs.flight_state == FlightState::Idle && inputs.valves.dump_open != Some(false) {
+        if !cfg!(feature = "test_fire_mode")
+            && inputs.flight_state == FlightState::Idle
+            && inputs.valves.dump_open != Some(false)
+        {
             enabled.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
         }
         let mut policy = policy_with_overrides(
@@ -1846,6 +1858,7 @@ pub fn start_sequence_task(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(200));
         let mut runtime = SequenceRuntime::default();
+        let mut last_flight_state: Option<FlightState> = None;
 
         loop {
             tokio::select! {
@@ -1865,6 +1878,19 @@ pub fn start_sequence_task(
             let now_ms = crate::telemetry_task::get_current_timestamp_ms();
             let key_enabled = read_key_enabled(&state, &cfg);
             let software_buttons_enabled = read_software_buttons_enabled(&state, &cfg);
+
+            if cfg!(feature = "test_fire_mode") {
+                if flight_state == FlightState::Idle {
+                    runtime = SequenceRuntime::default();
+                } else if last_flight_state != Some(FlightState::NitrogenFill)
+                    && flight_state == FlightState::NitrogenFill
+                {
+                    runtime = SequenceRuntime::default();
+                    state.add_temporary_notification(
+                        "Test-fire sequence started. Use the sequencing LEDs to move valves into the required starting positions.",
+                    );
+                }
+            }
 
             update_sequence_runtime(
                 &state,
@@ -1890,6 +1916,7 @@ pub fn start_sequence_task(
                 },
             );
             state.set_action_policy(policy);
+            last_flight_state = Some(flight_state);
         }
     })
 }

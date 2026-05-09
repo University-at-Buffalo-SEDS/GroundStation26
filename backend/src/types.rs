@@ -61,9 +61,9 @@ pub enum TelemetryCommand {
     ReinitIMU,
     #[cfg(feature = "hitl_mode")]
     DisableIMU,
-    #[cfg(feature = "hitl_mode")]
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     AdvanceFlightState,
-    #[cfg(feature = "hitl_mode")]
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     RewindFlightState,
     #[cfg(feature = "hitl_mode")]
     AbortAfter40,
