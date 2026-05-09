@@ -361,6 +361,8 @@ struct SequenceRuntime {
     notified_armed: bool,
     warned_rapid_drop: bool,
     warned_mass_shift: bool,
+    rapid_drop_notification_id: Option<u64>,
+    mass_shift_notification_id: Option<u64>,
     leak_fail_notification_id: Option<u64>,
     notified_close_nitrous: bool,
     notified_close_normally_open: bool,
@@ -394,6 +396,8 @@ impl Default for SequenceRuntime {
             notified_armed: false,
             warned_rapid_drop: false,
             warned_mass_shift: false,
+            rapid_drop_notification_id: None,
+            mass_shift_notification_id: None,
             leak_fail_notification_id: None,
             notified_close_nitrous: false,
             notified_close_normally_open: false,
@@ -987,9 +991,18 @@ fn update_sequence_runtime(
             let _ = state.dismiss_notification(id);
         }
     };
+    let dismiss_fill_test_warning_notifications = |state: &AppState, runtime: &mut SequenceRuntime| {
+        if let Some(id) = runtime.rapid_drop_notification_id.take() {
+            let _ = state.dismiss_notification(id);
+        }
+        if let Some(id) = runtime.mass_shift_notification_id.take() {
+            let _ = state.dismiss_notification(id);
+        }
+    };
 
     if valves.dump_open == Some(true) && dump_open_fails_nitrogen_step(runtime.step) {
         dismiss_leak_fail_notification(state, runtime);
+        dismiss_fill_test_warning_notifications(state, runtime);
         runtime.step = SequenceStep::RecoverNitrogenClose;
         runtime.step_started_at = None;
         runtime.pressure_at_close_psi = None;
@@ -1004,6 +1017,7 @@ fn update_sequence_runtime(
 
     if valves.dump_open == Some(true) && dump_open_fails_nitrous_step(runtime.step) {
         dismiss_leak_fail_notification(state, runtime);
+        dismiss_fill_test_warning_notifications(state, runtime);
         runtime.step = SequenceStep::RecoverNitrousClose;
         runtime.step_started_at = None;
         runtime.nitrous_level_since = None;
@@ -1125,6 +1139,7 @@ fn update_sequence_runtime(
                 runtime.step_started_at = Some(now);
                 runtime.warned_rapid_drop = false;
                 runtime.warned_mass_shift = false;
+                dismiss_fill_test_warning_notifications(state, runtime);
                 if valves.normally_open == Some(true) {
                     state.add_temporary_notification(format!(
                         "Nitrogen fill test started. Vent valve is open, so a controlled pressure bleed is expected while loadcell hold is monitored for {}s.",
@@ -1161,33 +1176,47 @@ fn update_sequence_runtime(
                     };
             let allowed_mass_shift =
                 cfg.max_leak_mass_delta_kg + elapsed_min * cfg.allowed_hold_mass_drop_kg_per_min;
-            if !runtime.warned_rapid_drop && drop_psi > allowed_pressure_drop {
+            let pressure_warning_active = drop_psi > allowed_pressure_drop;
+            if pressure_warning_active && !runtime.warned_rapid_drop {
                 runtime.warned_rapid_drop = true;
-                emit_warning(
-                    state,
-                    format!(
-                        "Pressure drop exceeded fill-test allowance: -{drop_psi:.2} psi from hold baseline"
-                    ),
-                );
+                if runtime.rapid_drop_notification_id.is_none() {
+                    runtime.rapid_drop_notification_id = Some(state.add_notification(
+                        "Pressure drop exceeded the fill-test allowance. Investigate before continuing.",
+                    ));
+                }
+            } else if !pressure_warning_active {
+                runtime.warned_rapid_drop = false;
+                if let Some(id) = runtime.rapid_drop_notification_id.take() {
+                    let _ = state.dismiss_notification(id);
+                }
             }
-            if !runtime.warned_mass_shift && mass_shift_kg > cfg.max_leak_mass_delta_kg {
+            let mass_warning_active = !cfg!(feature = "test_fire_mode")
+                && mass_shift_kg > cfg.max_leak_mass_delta_kg;
+            if mass_warning_active && !runtime.warned_mass_shift {
                 runtime.warned_mass_shift = true;
-                emit_warning(
-                    state,
-                    format!(
-                        "Unexpected loadcell change detected during fill test: {mass_shift_kg:.2} kg from hold baseline"
-                    ),
-                );
+                if runtime.mass_shift_notification_id.is_none() {
+                    runtime.mass_shift_notification_id = Some(state.add_notification(
+                        "Unexpected loadcell change detected during fill test. Investigate before continuing.",
+                    ));
+                }
+            } else if !mass_warning_active {
+                runtime.warned_mass_shift = false;
+                if let Some(id) = runtime.mass_shift_notification_id.take() {
+                    let _ = state.dismiss_notification(id);
+                }
             }
             if now.saturating_duration_since(started) < cfg.leak_check_duration {
                 return;
             }
 
             let pressure_ok = current >= baseline - allowed_pressure_drop;
-            let mass_ok = current_mass_kg.is_none() || mass_shift_kg <= allowed_mass_shift;
+            let mass_ok = cfg!(feature = "test_fire_mode")
+                || current_mass_kg.is_none()
+                || mass_shift_kg <= allowed_mass_shift;
 
             if pressure_ok && mass_ok {
                 dismiss_leak_fail_notification(state, runtime);
+                dismiss_fill_test_warning_notifications(state, runtime);
                 if !runtime.notified_leak_pass {
                     if valves.normally_open == Some(true) {
                         state.add_notification(
@@ -1204,6 +1233,7 @@ fn update_sequence_runtime(
                 runtime.step = SequenceStep::DumpNitrogen;
                 runtime.step_started_at = None;
             } else {
+                dismiss_fill_test_warning_notifications(state, runtime);
                 runtime.leak_fail_notification_id = Some(state.add_notification_action(
                     "Nitrogen hold check failed: pressure exceeded allowance or loadcell drifted. Dumping and awaiting operator decision.",
                     true,
@@ -1232,6 +1262,7 @@ fn update_sequence_runtime(
         SequenceStep::AwaitFillTestDecision => {
             if state.consume_fill_sequence_continue_requests() {
                 dismiss_leak_fail_notification(state, runtime);
+                dismiss_fill_test_warning_notifications(state, runtime);
                 state.add_notification(
                     "Operator override accepted. Continuing fill sequence to nitrous fill.",
                 );
@@ -1241,6 +1272,7 @@ fn update_sequence_runtime(
 
             if valves.nitrogen_open == Some(true) {
                 dismiss_leak_fail_notification(state, runtime);
+                dismiss_fill_test_warning_notifications(state, runtime);
                 runtime.auto_close_nitrogen_sent = false;
                 runtime.step = SequenceStep::NitrogenFill;
             }
@@ -1288,6 +1320,7 @@ fn update_sequence_runtime(
                 runtime.notified_leak_pass = false;
                 runtime.warned_rapid_drop = false;
                 runtime.warned_mass_shift = false;
+                dismiss_fill_test_warning_notifications(state, runtime);
                 runtime.step = SequenceStep::NitrogenFill;
             }
         }

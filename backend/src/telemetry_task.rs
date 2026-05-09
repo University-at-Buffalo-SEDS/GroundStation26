@@ -2927,7 +2927,6 @@ fn queue_guarded_fill_command(
     }
     log_command_queue_success(label, data_type, &[cmd_payload]);
     state.set_pending_umbilical_valve_state(key_cmd_id, desired_state);
-    state.set_umbilical_valve_state(key_cmd_id, desired_state);
     sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
 }
