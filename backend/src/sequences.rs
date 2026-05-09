@@ -500,19 +500,6 @@ impl ValveSnapshot {
         }
     }
 
-    fn actual_for_cmd(&self, cmd: &str) -> Option<bool> {
-        match cmd {
-            "Dump" => self.dump_open,
-            "NormallyOpen" => self.normally_open,
-            "Nitrogen" => self.nitrogen_open,
-            "Nitrous" => self.nitrous_open,
-            "Pilot" => self.pilot_open,
-            "Igniter" => self.igniter_on,
-            "RetractPlumbing" => self.retract,
-            _ => None,
-        }
-    }
-
 }
 
 fn is_fill_state(state: FlightState) -> bool {
@@ -819,7 +806,7 @@ fn command_prompt_blink(
     desired: bool,
     _now_ms: u64,
 ) -> Option<BlinkMode> {
-    if valves.actual_for_cmd(cmd) == Some(desired) {
+    if valves.actuated_for_cmd(cmd) == Some(desired) {
         return None;
     }
     Some(BlinkMode::Slow)
