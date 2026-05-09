@@ -195,29 +195,29 @@
         "fg": "#e0f2fe"
       },
       {
-        "label": "Monitor Altitude",
-        "cmd": "MonitorAltitude",
+        "label": "Vigilant Mode",
+        "cmd": "VigilantMode",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Revoke Monitor Alt",
-        "cmd": "RevokeMonitorAltitude",
+        "label": "Vigilant Mode",
+        "cmd": "RevokeVigilantMode",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Consecutive Samples",
-        "cmd": "ConsecutiveSamples",
+        "label": "Eval Successive",
+        "cmd": "EvalSuccessive",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Revoke Consecutive",
-        "cmd": "RevokeConsecutiveSamples",
+        "label": "Revoke Eval Successive",
+        "cmd": "RevokeEvalSuccessive",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -237,15 +237,29 @@
         "fg": "#e0f2fe"
       },
       {
-        "label": "Validate Measms",
-        "cmd": "ValidateMeasms",
+        "label": "Measm Reports",
+        "cmd": "MeasmReports",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Revoke Validate",
-        "cmd": "RevokeValidateMeasms",
+        "label": "Revoke Measm Reports",
+        "cmd": "RevokeMeasmReports",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Velocity Checks",
+        "cmd": "VelocityChecks",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
+        "label": "Revoke Velocity Checks",
+        "cmd": "RevokeVelocityChecks",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"

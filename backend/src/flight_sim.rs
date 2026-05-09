@@ -733,14 +733,16 @@ impl FlightSimState {
                 // Backend-local controls are handled outside the simulator command stream.
             }
             TelemetryCommand::Launch
-            | TelemetryCommand::MonitorAltitude
-            | TelemetryCommand::RevokeMonitorAltitude
-            | TelemetryCommand::ConsecutiveSamples
-            | TelemetryCommand::RevokeConsecutiveSamples
+            | TelemetryCommand::VigilantMode
+            | TelemetryCommand::RevokeVigilantMode
+            | TelemetryCommand::EvalSuccessive
+            | TelemetryCommand::RevokeEvalSuccessive
             | TelemetryCommand::ResetFailures
             | TelemetryCommand::RevokeResetFailures
-            | TelemetryCommand::ValidateMeasms
-            | TelemetryCommand::RevokeValidateMeasms => {
+            | TelemetryCommand::MeasmReports
+            | TelemetryCommand::RevokeMeasmReports
+            | TelemetryCommand::VelocityChecks 
+            | TelemetryCommand::RevokeVelocityChecks => {
                 // Flight-computer commands are backend-forwarded and do not affect fill simulation.
             }
             #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
@@ -761,14 +763,16 @@ impl FlightSimState {
             | TelemetryCommand::ReinitBarometer
             | TelemetryCommand::ReinitIMU
             | TelemetryCommand::DisableIMU
-            | TelemetryCommand::MonitorAltitude
-            | TelemetryCommand::RevokeMonitorAltitude
-            | TelemetryCommand::ConsecutiveSamples
-            | TelemetryCommand::RevokeConsecutiveSamples
+            | TelemetryCommand::VigilantMode
+            | TelemetryCommand::RevokeVigilantMode
+            | TelemetryCommand::EvalSuccessive
+            | TelemetryCommand::RevokeEvalSuccessive
             | TelemetryCommand::ResetFailures
             | TelemetryCommand::RevokeResetFailures
-            | TelemetryCommand::ValidateMeasms
-            | TelemetryCommand::RevokeValidateMeasms
+            | TelemetryCommand::MeasmReports
+            | TelemetryCommand::RevokeMeasmReports
+            | TelemetryCommand::VelocityChecks 
+            | TelemetryCommand::RevokeVelocityChecks
             | TelemetryCommand::AbortAfter40
             | TelemetryCommand::AbortAfter100
             | TelemetryCommand::AbortAfter250
