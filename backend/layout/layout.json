@@ -327,6 +327,7 @@
       {
         "id": "GPS_DATA",
         "label": "GPS Data",
+        "show_min_max": false,
         "channels": [
           "Lat",
           "Lon",
@@ -525,6 +526,7 @@
       {
         "id": "BATTERY_RUNTIME",
         "label": "Battery Runtime",
+        "show_min_max": false,
         "channels": [
           "AV Bay %",
           "AV Bay Drop",
@@ -698,6 +700,7 @@
       {
         "id": "VALVE_STATE",
         "label": "Valve State",
+        "show_min_max": false,
         "channels": [
           "Pilot",
           "NormallyOpen",

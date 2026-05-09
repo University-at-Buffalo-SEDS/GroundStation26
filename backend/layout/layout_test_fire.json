@@ -301,6 +301,7 @@
       {
         "id": "BATTERY_RUNTIME",
         "label": "Battery Runtime",
+        "show_min_max": false,
         "channels": [
           "Valve Board %",
           "Valve Board Drop",
@@ -420,6 +421,7 @@
       {
         "id": "VALVE_STATE",
         "label": "Valve State",
+        "show_min_max": false,
         "channels": [
           "Pilot",
           "NormallyOpen",

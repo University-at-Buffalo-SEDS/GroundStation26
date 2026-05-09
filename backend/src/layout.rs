@@ -300,6 +300,7 @@ pub struct DataTabSpec {
     pub boolean_labels: Option<BooleanLabels>,
     pub channel_boolean_labels: Option<Vec<BooleanLabels>>,
     pub channel_formatters: Option<Vec<ValueFormatter>>,
+    pub show_min_max: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +316,7 @@ pub struct DataSubtabSpec {
     pub boolean_labels: Option<BooleanLabels>,
     pub channel_boolean_labels: Option<Vec<BooleanLabels>>,
     pub channel_formatters: Option<Vec<ValueFormatter>>,
+    pub show_min_max: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +344,7 @@ pub struct DataSummaryItem {
     pub sender_id: Option<String>,
     pub formatter: Option<ValueFormatter>,
     pub boolean_labels: Option<BooleanLabels>,
+    pub show_min_max: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
