@@ -153,7 +153,6 @@ struct SequenceConfig {
     calibration_pressure_max_psi: f32,
     calibration_mass_min_kg: f32,
     calibration_mass_max_kg: f32,
-    pending_fast_window: Duration,
     key_required: bool,
     key_enable_pin: u8,
     software_disable_pin: u8,
@@ -306,12 +305,6 @@ impl SequenceConfig {
             })
             .max(calibration_mass_min_kg);
 
-        let pending_fast_window = std::env::var("GS_SEQUENCE_PENDING_FAST_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_millis(4_000));
-
         let key_required = if cfg!(feature = "raspberry_pi") {
             std::env::var("GS_KEY_REQUIRED")
                 .ok()
@@ -357,7 +350,6 @@ impl SequenceConfig {
             calibration_pressure_max_psi,
             calibration_mass_min_kg,
             calibration_mass_max_kg,
-            pending_fast_window,
             key_required,
             key_enable_pin,
             software_disable_pin,
@@ -521,18 +513,6 @@ impl ValveSnapshot {
         }
     }
 
-    fn pending_for_cmd(&self, cmd: &str) -> Option<bool> {
-        match cmd {
-            "Dump" => self.pending_dump_open,
-            "NormallyOpen" => self.pending_normally_open,
-            "Nitrogen" => self.pending_nitrogen_open,
-            "Nitrous" => self.pending_nitrous_open,
-            "Pilot" => self.pending_pilot_open,
-            "Igniter" => self.pending_igniter_on,
-            "RetractPlumbing" => self.pending_retract,
-            _ => None,
-        }
-    }
 }
 
 fn is_fill_state(state: FlightState) -> bool {

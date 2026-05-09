@@ -1276,11 +1276,6 @@ impl AppState {
         true
     }
 
-    /// Looks up the last accepted timestamp for a command name.
-    pub fn last_command_timestamp_ms(&self, cmd_name: &str) -> Option<u64> {
-        self.last_command_ms.lock().unwrap().get(cmd_name).copied()
-    }
-
     pub fn set_pending_umbilical_valve_state(&self, cmd_id: u8, value: bool) {
         self.pending_umbilical_valve_states
             .lock()
