@@ -1628,18 +1628,23 @@ fn build_policy(
         // All other controls remain available (dimmed client-side when not blinking).
         if !cfg!(feature = "test_fire_mode")
             && inputs.flight_state == FlightState::Idle
-            && inputs.valves.normally_open != Some(true)
-        {
-            enabled.insert(
+            && let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
                 "NormallyOpen",
-                pending_mode(state, "NormallyOpen", inputs.now_ms, cfg),
-            );
+                true,
+                inputs.now_ms,
+            )
+        {
+            enabled.insert("NormallyOpen", blink);
         }
         if !cfg!(feature = "test_fire_mode")
             && inputs.flight_state == FlightState::Idle
-            && inputs.valves.dump_open != Some(false)
+            && let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Dump", false, inputs.now_ms)
         {
-            enabled.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            enabled.insert("Dump", blink);
         }
         let mut policy = policy_with_overrides(
             true,
@@ -1666,131 +1671,195 @@ fn build_policy(
 
     let mut recommended: HashMap<&'static str, BlinkMode> = HashMap::new();
 
-    if sequence_expects_normally_open(runtime.step) && inputs.valves.normally_open != Some(true) {
-        recommended.insert(
+    if sequence_expects_normally_open(runtime.step)
+        && let Some(blink) = command_prompt_blink(
+            state,
+            cfg,
+            inputs.valves,
             "NormallyOpen",
-            pending_mode(state, "NormallyOpen", inputs.now_ms, cfg),
-        );
+            true,
+            inputs.now_ms,
+        )
+    {
+        recommended.insert("NormallyOpen", blink);
     }
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if inputs.valves.normally_open != Some(true) {
-                recommended.insert(
-                    "NormallyOpen",
-                    pending_mode(state, "NormallyOpen", inputs.now_ms, cfg),
-                );
+            if let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
+                "NormallyOpen",
+                true,
+                inputs.now_ms,
+            ) {
+                recommended.insert("NormallyOpen", blink);
             }
-            if inputs.valves.dump_open != Some(false) {
-                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Dump", false, inputs.now_ms)
+            {
+                recommended.insert("Dump", blink);
             }
         }
         SequenceStep::NitrogenFill => {
-            if inputs.valves.nitrogen_open != Some(true) {
-                recommended.insert(
-                    "Nitrogen",
-                    pending_mode(state, "Nitrogen", inputs.now_ms, cfg),
-                );
+            if let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
+                "Nitrogen",
+                true,
+                inputs.now_ms,
+            ) {
+                recommended.insert("Nitrogen", blink);
             }
         }
         SequenceStep::CloseNitrogen => {
-            if inputs.valves.nitrogen_open != Some(false) {
-                recommended.insert(
-                    "Nitrogen",
-                    pending_mode(state, "Nitrogen", inputs.now_ms, cfg),
-                );
+            if let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
+                "Nitrogen",
+                false,
+                inputs.now_ms,
+            ) {
+                recommended.insert("Nitrogen", blink);
             }
         }
         SequenceStep::NitrogenLeakCheck => {}
         SequenceStep::RecoverNitrogenClose => {
-            if inputs.valves.nitrogen_open != Some(false) {
-                recommended.insert(
-                    "Nitrogen",
-                    pending_mode(state, "Nitrogen", inputs.now_ms, cfg),
-                );
-            } else if inputs.valves.dump_open != Some(true) {
-                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            if let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
+                "Nitrogen",
+                false,
+                inputs.now_ms,
+            ) {
+                recommended.insert("Nitrogen", blink);
+            } else if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Dump", true, inputs.now_ms)
+            {
+                recommended.insert("Dump", blink);
             }
         }
         SequenceStep::RecoverNitrogenVent => {
-            if inputs.valves.dump_open != Some(true) {
-                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Dump", true, inputs.now_ms)
+            {
+                recommended.insert("Dump", blink);
             }
         }
         SequenceStep::RecoverNitrogenCloseDump => {
-            if inputs.valves.dump_open != Some(false) {
-                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Dump", false, inputs.now_ms)
+            {
+                recommended.insert("Dump", blink);
             }
         }
         SequenceStep::DumpNitrogen => {
-            if inputs.valves.dump_open != Some(true) {
-                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Dump", true, inputs.now_ms)
+            {
+                recommended.insert("Dump", blink);
             }
         }
         SequenceStep::CloseDump => {
-            if inputs.valves.dump_open != Some(false) {
-                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Dump", false, inputs.now_ms)
+            {
+                recommended.insert("Dump", blink);
             }
         }
         SequenceStep::AwaitFillTestDecision => {
-            if inputs.valves.nitrogen_open != Some(true) {
-                recommended.insert(
-                    "Nitrogen",
-                    pending_mode(state, "Nitrogen", inputs.now_ms, cfg),
-                );
+            if let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
+                "Nitrogen",
+                true,
+                inputs.now_ms,
+            ) {
+                recommended.insert("Nitrogen", blink);
             }
         }
         SequenceStep::OpenNitrous => {
-            if inputs.valves.nitrous_open != Some(true) {
-                recommended.insert(
-                    "Nitrous",
-                    pending_mode(state, "Nitrous", inputs.now_ms, cfg),
-                );
+            if let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
+                "Nitrous",
+                true,
+                inputs.now_ms,
+            ) {
+                recommended.insert("Nitrous", blink);
             }
         }
         SequenceStep::CloseNitrous => {
-            if inputs.valves.nitrous_open != Some(false) {
-                recommended.insert(
-                    "Nitrous",
-                    pending_mode(state, "Nitrous", inputs.now_ms, cfg),
-                );
+            if let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
+                "Nitrous",
+                false,
+                inputs.now_ms,
+            ) {
+                recommended.insert("Nitrous", blink);
             }
         }
         SequenceStep::NitrousSoak => {}
         SequenceStep::RecoverNitrousClose => {
-            if inputs.valves.nitrous_open != Some(false) {
-                recommended.insert(
-                    "Nitrous",
-                    pending_mode(state, "Nitrous", inputs.now_ms, cfg),
-                );
-            } else if inputs.valves.dump_open != Some(true) {
-                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            if let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
+                "Nitrous",
+                false,
+                inputs.now_ms,
+            ) {
+                recommended.insert("Nitrous", blink);
+            } else if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Dump", true, inputs.now_ms)
+            {
+                recommended.insert("Dump", blink);
             }
         }
         SequenceStep::RecoverNitrousVent => {
-            if inputs.valves.dump_open != Some(true) {
-                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Dump", true, inputs.now_ms)
+            {
+                recommended.insert("Dump", blink);
             }
         }
         SequenceStep::RecoverNitrousCloseDump => {
-            if inputs.valves.dump_open != Some(false) {
-                recommended.insert("Dump", pending_mode(state, "Dump", inputs.now_ms, cfg));
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Dump", false, inputs.now_ms)
+            {
+                recommended.insert("Dump", blink);
             }
         }
         SequenceStep::CloseNormallyOpen => {
-            if inputs.valves.normally_open != Some(false) {
-                recommended.insert(
-                    "NormallyOpen",
-                    pending_mode(state, "NormallyOpen", inputs.now_ms, cfg),
-                );
+            if let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
+                "NormallyOpen",
+                false,
+                inputs.now_ms,
+            ) {
+                recommended.insert("NormallyOpen", blink);
             }
         }
         SequenceStep::RetractFillLines => {
-            if inputs.valves.retract != Some(true) {
-                recommended.insert(
-                    "RetractPlumbing",
-                    pending_mode(state, "RetractPlumbing", inputs.now_ms, cfg),
-                );
+            if let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
+                "RetractPlumbing",
+                true,
+                inputs.now_ms,
+            ) {
+                recommended.insert("RetractPlumbing", blink);
             }
         }
         SequenceStep::ArmedReady => {
