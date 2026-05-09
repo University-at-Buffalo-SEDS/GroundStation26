@@ -13,7 +13,7 @@ use crate::telemetry_db::{
 use crate::types::{
     Board, FlightState, TelemetryCommand, TelemetryRow, canonical_sender_id, u8_to_flight_state,
 };
-use crate::web::{FlightStateMsg, emit_warning};
+use crate::web::{FlightStateMsg, emit_notification_warning, emit_warning};
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::endpoints_from_datatype;
 use sedsprintf_rs_2026::packet::Packet;
@@ -2292,7 +2292,7 @@ pub async fn telemetry_task(
                         continue;
                     }
                     if !state.is_command_allowed(&cmd) {
-                        emit_warning(
+                        emit_notification_warning(
                             &state,
                             format!("Command {cmd:?} blocked by sequence/key interlock"),
                         );

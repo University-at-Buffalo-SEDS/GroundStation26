@@ -2,7 +2,7 @@ use crate::gpio::Trigger;
 use crate::sequences::{ActionPolicyMsg, BlinkMode};
 use crate::state::AppState;
 use crate::types::TelemetryCommand;
-use crate::web::{emit_error, emit_warning};
+use crate::web::{emit_error, emit_notification_warning};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,7 +140,7 @@ fn setup_callbacks(
         if state_launch.hitl_button_interlock_enabled()
             && !is_input_enabled(&gpio_launch, ALL_BUTTONS_ENABLE_PIN)
         {
-            emit_warning(
+            emit_notification_warning(
                 &state_launch,
                 "Ignored launch button press: button interlock is enabled".to_string(),
             );
@@ -155,7 +155,7 @@ fn setup_callbacks(
         #[cfg(not(feature = "hitl_mode"))]
         let launch_interlock_ok = is_input_enabled(&gpio_launch, LAUNCH_ARM_PIN);
         if !launch_interlock_ok {
-            emit_warning(
+            emit_notification_warning(
                 &state_launch,
                 "Ignored launch button press: launch arm signal is not enabled".to_string(),
             );
@@ -299,7 +299,7 @@ where
             if now_ms.saturating_sub(last) >= WARN_INTERVAL_MS.load(Ordering::Relaxed) {
                 guard.insert(cmd_name.clone(), now_ms);
                 drop(guard);
-                emit_warning(
+                emit_notification_warning(
                     &state,
                     format!("Ignored {cmd_name} button press: button interlock is enabled"),
                 );
@@ -317,7 +317,7 @@ where
                 if now_ms.saturating_sub(last) >= WARN_INTERVAL_MS.load(Ordering::Relaxed) {
                     guard.insert(cmd_name.clone(), now_ms);
                     drop(guard);
-                    emit_warning(
+                    emit_notification_warning(
                         &state,
                         format!(
                             "Ignored {cmd_name} button press: safety key is not installed/enabled"

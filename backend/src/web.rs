@@ -1464,7 +1464,7 @@ async fn send_command(
         return (StatusCode::FORBIDDEN, "command not allowed");
     }
     if !state.is_command_allowed(&cmd) {
-        emit_warning(
+        emit_notification_warning(
             &state,
             format!("Ignored software command {cmd:?}: command is currently disabled"),
         );
@@ -1930,7 +1930,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             continue;
                         }
                         if !state_for_recv.is_command_allowed(&cmd.cmd) {
-                            emit_warning(
+                            emit_notification_warning(
                                 &state_for_recv,
                                 format!(
                                     "Ignored software command {:?}: command is currently disabled",
@@ -2127,6 +2127,13 @@ pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
 
     // Insert into DB asynchronously (tracked for graceful shutdown)
     spawn_alert_insert(state, timestamp, "warning", msg_string);
+}
+
+/// Sends a frontend notification while persisting the event as a warning in the DB.
+pub fn emit_notification_warning<S: Into<String>>(state: &AppState, message: S) {
+    let msg_string = message.into();
+    state.add_temporary_notification(msg_string.clone());
+    emit_warning_db_only(state, msg_string);
 }
 
 pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
