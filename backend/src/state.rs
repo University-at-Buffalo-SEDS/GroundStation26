@@ -845,6 +845,7 @@ impl AppState {
     }
 
     /// Returns the timestamp of the most recent telemetry packet seen by the backend.
+    #[allow(dead_code)]
     pub fn last_packet_received_ms(&self) -> u64 {
         self.last_packet_rx_ms.load(Ordering::Relaxed)
     }

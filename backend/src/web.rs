@@ -2122,6 +2122,7 @@ pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
 }
 
 /// Log a warning to the DB without sending it to the frontend.
+#[allow(dead_code)]
 pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
     let msg_string = message.into();
     let timestamp = now_ms_i64();
