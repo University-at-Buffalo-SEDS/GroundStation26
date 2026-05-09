@@ -32,6 +32,7 @@ use std::convert::Infallible;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::{OnceCell, mpsc};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -2129,11 +2130,28 @@ pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
     spawn_alert_insert(state, timestamp, "warning", msg_string);
 }
 
-/// Sends a frontend notification while persisting the event as a warning in the DB.
+fn persist_message_db_only(state: &AppState, message: String) {
+    let timestamp_ms = now_ms_i64();
+    let id = state.next_message_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let tx = state.db_queue_tx.clone();
+    tokio::spawn(async move {
+        let _ = tx
+            .send(DbQueueItem::Write(DbWrite::Message {
+                id,
+                timestamp_ms,
+                message,
+                action_label: None,
+                action_cmd: None,
+            }))
+            .await;
+    });
+}
+
+/// Sends a frontend notification while persisting the event in the DB without creating a warning alert.
 pub fn emit_notification_warning<S: Into<String>>(state: &AppState, message: S) {
     let msg_string = message.into();
     state.add_temporary_notification(msg_string.clone());
-    emit_warning_db_only(state, msg_string);
+    persist_message_db_only(state, msg_string);
 }
 
 pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
