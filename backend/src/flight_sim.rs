@@ -748,7 +748,11 @@ impl FlightSimState {
                 // Valve-board-owned launch commands are forwarded by telemetry_task.
             }
             #[cfg(feature = "hitl_mode")]
-            TelemetryCommand::DeployParachute
+            TelemetryCommand::ToggleButtonInterlock
+            | TelemetryCommand::ToggleLaunchInterlock
+            | TelemetryCommand::TogglePhysicalLaunchMode
+            | TelemetryCommand::ResetLaunchLatch
+            | TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
             | TelemetryCommand::ReinitSensors
             | TelemetryCommand::EvaluationRelax

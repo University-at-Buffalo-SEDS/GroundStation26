@@ -199,10 +199,12 @@ Expected response:
 - The response includes `capture_target_samples`, top-level backend-supported `fit_modes`, and
   `sensors`.
 - Each sensor provides `id`, `label`, `data_type`, `channel`, `fit_color`, `raw_label`,
-  `expected_label`, and optional per-sensor `fit_modes`.
+  `expected_label`, optional `formatter`, and optional per-sensor `fit_modes`.
 - The frontend must render calibration channels, labels, colors, and regression choices from this
   response. These values are intentionally not hard-coded in the frontend so future sensors can be
   added by backend config.
+- When present, `formatter` uses the same shape as the data-tab formatter payload so calibration
+  raw values can match the backend-defined display precision.
 
 Supported regression ids:
 
