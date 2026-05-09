@@ -2100,14 +2100,9 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
     let mut runtime = SequenceRuntime::from_policy_state(state.sequence_policy_state_snapshot());
     let mut flight_state = *state.state.lock().unwrap();
     let valves = ValveSnapshot::read(state);
-    let pressure_psi = *state.latest_fuel_tank_pressure.lock().unwrap();
-    let current_mass_kg = *state.latest_fill_mass_kg.lock().unwrap();
-    let now = Instant::now();
     let now_ms = crate::telemetry_task::get_current_timestamp_ms();
     let key_enabled = read_key_enabled(state, &cfg);
     let software_buttons_enabled = read_software_buttons_enabled(state, &cfg);
-    let sequence_active =
-        !cfg!(feature = "test_fire_mode") || !matches!(flight_state, FlightState::Startup | FlightState::Idle);
 
     if cfg!(feature = "test_fire_mode")
         && flight_state == FlightState::Startup
@@ -2117,18 +2112,6 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
         flight_state = FlightState::Idle;
         runtime = SequenceRuntime::default();
         state.set_sequence_policy_state(runtime.policy_state());
-    }
-
-    if sequence_active {
-        update_sequence_runtime(
-            state,
-            &mut runtime,
-            &cfg,
-            valves,
-            pressure_psi,
-            current_mass_kg,
-            now,
-        );
     }
     flight_state = maybe_drive_local_prelaunch_state(state, &runtime, valves, flight_state);
     state.set_sequence_policy_state(runtime.policy_state());
