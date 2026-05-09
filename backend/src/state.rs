@@ -3,7 +3,7 @@ use crate::fill_targets::FillTargetsConfig;
 use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
-use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
+use crate::sequences::{ActionPolicyMsg, PersistentNotification, SequencePolicyState, command_name};
 use crate::telemetry_db::{
     DbQueueItem, LaunchClockKind, LaunchClockMsg, RecordingModeWire, RecordingStatusMsg,
 };
@@ -155,6 +155,9 @@ pub struct AppState {
     /// Current action policy (enabled/disabled/blink hints) for UI + command gating.
     pub action_policy: Arc<Mutex<ActionPolicyMsg>>,
 
+    /// Latest live sequence step snapshot used to rebuild action policy outside the main loop.
+    pub sequence_policy_state: Arc<Mutex<SequencePolicyState>>,
+
     /// Broadcast whenever action policy changes.
     pub action_policy_tx: broadcast::Sender<ActionPolicyMsg>,
 
@@ -224,6 +227,14 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn sequence_policy_state_snapshot(&self) -> SequencePolicyState {
+        *self.sequence_policy_state.lock().unwrap()
+    }
+
+    pub fn set_sequence_policy_state(&self, snapshot: SequencePolicyState) {
+        *self.sequence_policy_state.lock().unwrap() = snapshot;
+    }
+
     pub fn telemetry_db_pool(&self) -> SqlitePool {
         self.db.lock().unwrap().clone()
     }
@@ -603,10 +614,15 @@ impl AppState {
     /// Builds the board-health payload sent to the dashboard.
     pub fn board_status_snapshot(&self, now_ms: u64) -> BoardStatusMsg {
         let map = self.board_status.lock().unwrap();
-        let mut boards = Vec::with_capacity(Board::ALL.len());
+        let visible_boards: Vec<Board> = if cfg!(feature = "test_fire_mode") {
+            vec![Board::ValveBoard, Board::GatewayBoard, Board::ActuatorBoard]
+        } else {
+            Board::ALL.iter().copied().collect()
+        };
+        let mut boards = Vec::with_capacity(visible_boards.len());
 
-        for board in Board::ALL {
-            let status = map.get(board);
+        for board in visible_boards {
+            let status = map.get(&board);
             let last_seen_ms = status.and_then(|s| s.last_seen_ms);
             let packet_count = status.map(|s| s.packet_count).unwrap_or(0);
             let seen = last_seen_ms.is_some();
@@ -616,7 +632,7 @@ impl AppState {
                 .or_else(|| last_seen_ms.map(|ts| now_ms.saturating_sub(ts)));
 
             boards.push(BoardStatusEntry {
-                board: *board,
+                board,
                 board_label: board.as_str().to_string(),
                 sender_id: board.sender_id().to_string(),
                 seen,

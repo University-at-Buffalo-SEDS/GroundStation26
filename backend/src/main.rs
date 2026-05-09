@@ -333,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
         messages_tx,
         next_message_id: Arc::new(AtomicU64::new(0)),
         action_policy: Arc::new(Mutex::new(default_action_policy())),
+        sequence_policy_state: Arc::new(Mutex::new(crate::sequences::SequencePolicyState::default())),
         action_policy_tx,
         fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
         fill_targets_tx,

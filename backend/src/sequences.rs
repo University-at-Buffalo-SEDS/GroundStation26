@@ -94,7 +94,7 @@ pub struct PersistentNotification {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SequenceStep {
+pub(crate) enum SequenceStep {
     SetupValves,
     NitrogenFill,
     CloseNitrogen,
@@ -114,6 +114,21 @@ enum SequenceStep {
     CloseNormallyOpen,
     RetractFillLines,
     ArmedReady,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SequencePolicyState {
+    pub step: SequenceStep,
+    pub calibration_ready: bool,
+}
+
+impl Default for SequencePolicyState {
+    fn default() -> Self {
+        Self {
+            step: SequenceStep::SetupValves,
+            calibration_ready: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -417,6 +432,23 @@ impl Default for SequenceRuntime {
             calibration_ready: false,
             calibration_block_notification_id: None,
             calibration_block_message: None,
+        }
+    }
+}
+
+impl SequenceRuntime {
+    fn policy_state(&self) -> SequencePolicyState {
+        SequencePolicyState {
+            step: self.step,
+            calibration_ready: self.calibration_ready,
+        }
+    }
+
+    fn from_policy_state(policy: SequencePolicyState) -> Self {
+        Self {
+            step: policy.step,
+            calibration_ready: policy.calibration_ready,
+            ..Self::default()
         }
     }
 }
@@ -2019,14 +2051,18 @@ pub fn start_sequence_task(
                 if flight_state == FlightState::Startup && state.all_required_boards_seen() {
                     state.set_local_flight_state(FlightState::Idle);
                     flight_state = FlightState::Idle;
+                    runtime = SequenceRuntime::default();
+                    state.set_sequence_policy_state(runtime.policy_state());
                 }
 
                 if flight_state == FlightState::Idle {
                     runtime = SequenceRuntime::default();
+                    state.set_sequence_policy_state(runtime.policy_state());
                 } else if last_flight_state != Some(FlightState::PreFill)
                     && flight_state == FlightState::PreFill
                 {
                     runtime = SequenceRuntime::default();
+                    state.set_sequence_policy_state(runtime.policy_state());
                     state.add_temporary_notification(
                         "Test-fire sequence started. Use the sequencing LEDs to move valves into the required starting positions.",
                     );
@@ -2046,6 +2082,7 @@ pub fn start_sequence_task(
             }
             flight_state =
                 maybe_drive_local_prelaunch_state(&state, &runtime, valves, flight_state);
+            state.set_sequence_policy_state(runtime.policy_state());
             let policy = build_policy(
                 &state,
                 &cfg,
@@ -2072,7 +2109,7 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
         return;
     }
 
-    let mut runtime = SequenceRuntime::default();
+    let mut runtime = SequenceRuntime::from_policy_state(state.sequence_policy_state_snapshot());
     let mut flight_state = *state.state.lock().unwrap();
     let valves = ValveSnapshot::read(state);
     let pressure_psi = *state.latest_fuel_tank_pressure.lock().unwrap();
@@ -2090,6 +2127,8 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
     {
         state.set_local_flight_state(FlightState::Idle);
         flight_state = FlightState::Idle;
+        runtime = SequenceRuntime::default();
+        state.set_sequence_policy_state(runtime.policy_state());
     }
 
     if sequence_active {
@@ -2104,6 +2143,7 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
         );
     }
     flight_state = maybe_drive_local_prelaunch_state(state, &runtime, valves, flight_state);
+    state.set_sequence_policy_state(runtime.policy_state());
     let policy = build_policy(
         state,
         &cfg,

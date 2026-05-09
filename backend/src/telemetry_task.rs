@@ -3197,6 +3197,7 @@ async fn handle_packet(
         && state.all_required_boards_seen()
     {
         state.set_local_flight_state(FlightState::Idle);
+        state.set_sequence_policy_state(crate::sequences::SequencePolicyState::default());
         sequences::refresh_action_policy_now(state);
         state.broadcast_action_policy_snapshot();
     }
@@ -3892,6 +3893,7 @@ mod tests {
             messages_tx,
             next_message_id: Arc::new(AtomicU64::new(0)),
             action_policy: Arc::new(Mutex::new(default_action_policy())),
+            sequence_policy_state: Arc::new(Mutex::new(crate::sequences::SequencePolicyState::default())),
             action_policy_tx,
             fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
             fill_targets_tx,
