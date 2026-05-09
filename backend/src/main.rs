@@ -24,6 +24,7 @@ mod loadcell;
 mod map;
 mod ring_buffer;
 mod rocket_commands;
+#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 mod safety_task;
 mod sequences;
 mod state;
@@ -34,6 +35,7 @@ mod web;
 
 use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
+#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
@@ -610,11 +612,16 @@ async fn main() -> anyhow::Result<()> {
         db_queue_rx,
         telemetry_shutdown_rx,
     ));
+    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
     let mut st = tokio::spawn(safety_task(
         state.clone(),
         router.clone(),
         safety_shutdown_rx,
     ));
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+    let mut st = tokio::spawn(async move {
+        let _ = safety_shutdown_rx;
+    });
 
     // --- Webserver ---
     let app: Router = web::router(state.clone());
