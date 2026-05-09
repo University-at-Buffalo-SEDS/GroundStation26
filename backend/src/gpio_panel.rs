@@ -46,6 +46,8 @@ pub const NORMALLY_OPEN_PIN: u8 = 20;
 pub const NORMALLY_OPEN_LED: u8 = 21;
 
 pub const WARNING_ACK_PIN: u8 = 26;
+pub const MASTER_ALARM_LED: u8 = 19;
+pub const MASTER_ALARM_BUZZER: u8 = 24;
 
 const LED_FRAME_MS: u64 = 16;
 const LED_DISABLED_BRIGHTNESS: f64 = 0.0;
@@ -63,6 +65,12 @@ struct AllowedActions {
     nitrogen: bool,
     nitrous: bool,
     fill_lines: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlarmSeverity {
+    Warning,
+    Error,
 }
 
 pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
@@ -93,6 +101,8 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
     gpio.setup_led_pin(PILOT_VALVE_LED)?;
     gpio.setup_led_pin(NITROGEN_TANK_VALVE_LED)?;
     gpio.setup_led_pin(NITROUS_TANK_VALVE_LED)?;
+    gpio.setup_led_pin(MASTER_ALARM_LED)?;
+    gpio.setup_output_pin(MASTER_ALARM_BUZZER)?;
 
     setup_callbacks(&state, allowed.clone())?;
 
@@ -419,6 +429,18 @@ fn gpio_led_task(
             RETRACT_PIN_LED,
             led_for(&state, &policy, "RetractPlumbing", now_ms),
         );
+        set_led(
+            gpio,
+            &mut last_levels,
+            MASTER_ALARM_LED,
+            master_alarm_led_for(&state, now_ms),
+        );
+        set_binary_output(
+            gpio,
+            &mut last_levels,
+            MASTER_ALARM_BUZZER,
+            master_alarm_buzzer_for(&state, now_ms),
+        );
 
         let frame_budget = Duration::from_millis(LED_FRAME_MS);
         let elapsed = frame_started.elapsed();
@@ -480,6 +502,75 @@ fn led_for(state: &AppState, policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -
     }
 }
 
+fn current_unacked_alarm_severity(state: &AppState) -> Option<AlarmSeverity> {
+    let ack = state.alert_ack_state_snapshot();
+    let mut has_warning = false;
+    let mut has_error = false;
+
+    for alert in state.recent_alerts_snapshot() {
+        match alert.severity.as_str() {
+            "warning" if alert.timestamp_ms > ack.warning_ack_timestamp_ms => {
+                has_warning = true;
+            }
+            "error" if alert.timestamp_ms > ack.error_ack_timestamp_ms => {
+                has_error = true;
+            }
+            _ => {}
+        }
+    }
+
+    if has_error {
+        Some(AlarmSeverity::Error)
+    } else if has_warning {
+        Some(AlarmSeverity::Warning)
+    } else {
+        None
+    }
+}
+
+fn master_alarm_led_for(state: &AppState, now_ms: u64) -> f64 {
+    let Some(severity) = current_unacked_alarm_severity(state) else {
+        return 0.0;
+    };
+    alarm_led_brightness(severity, now_ms)
+}
+
+fn master_alarm_buzzer_for(state: &AppState, now_ms: u64) -> bool {
+    let Some(severity) = current_unacked_alarm_severity(state) else {
+        return false;
+    };
+    alarm_active_window(severity, now_ms)
+}
+
+fn alarm_active_window(severity: AlarmSeverity, now_ms: u64) -> bool {
+    let (cycle_ms, on_ms) = match severity {
+        AlarmSeverity::Error => (8_000_u64, 5_000_u64),
+        AlarmSeverity::Warning => (3_500_u64, 500_u64),
+    };
+    now_ms % cycle_ms < on_ms
+}
+
+fn alarm_led_brightness(severity: AlarmSeverity, now_ms: u64) -> f64 {
+    let (cycle_ms, on_ms, pulse_ms, edge_ms, dim, bright) = match severity {
+        AlarmSeverity::Error => (8_000_u64, 5_000_u64, 160_u64, 120_u64, 0.18, 1.0),
+        AlarmSeverity::Warning => (3_500_u64, 500_u64, 140_u64, 90_u64, 0.16, 0.95),
+    };
+    let phase_ms = now_ms % cycle_ms;
+    if phase_ms >= on_ms {
+        return 0.0;
+    }
+
+    let pulse_phase = (phase_ms % pulse_ms) as f64 / pulse_ms as f64;
+    let pulse_wave = 0.5 - 0.5 * (std::f64::consts::TAU * pulse_phase).cos();
+    let base = dim + (bright - dim) * pulse_wave;
+
+    let edge = edge_ms.min(on_ms / 2).max(1);
+    let ramp_in = (phase_ms.min(edge) as f64) / edge as f64;
+    let ramp_out = ((on_ms - phase_ms).min(edge) as f64) / edge as f64;
+    let envelope = ramp_in.min(ramp_out).clamp(0.0, 1.0);
+    base * envelope
+}
+
 fn is_input_enabled(gpio: &crate::gpio::GpioPins, pin: u8) -> bool {
     #[cfg(feature = "raspberry_pi")]
     {
@@ -520,5 +611,21 @@ fn set_led(
     last_levels.insert(pin, quantized);
     if let Err(e) = gpio.write_led_brightness(pin, f64::from(quantized) / 255.0) {
         eprintln!("GPIO LED pin {pin} PWM write failed: {e}");
+    }
+}
+
+fn set_binary_output(
+    gpio: &crate::gpio::GpioPins,
+    last_levels: &mut HashMap<u8, u8>,
+    pin: u8,
+    enabled: bool,
+) {
+    let next = if enabled { 255 } else { 0 };
+    if last_levels.get(&pin).copied() == Some(next) {
+        return;
+    }
+    last_levels.insert(pin, next);
+    if let Err(e) = gpio.write_output_pin(pin, enabled) {
+        eprintln!("GPIO output pin {pin} write failed: {e}");
     }
 }

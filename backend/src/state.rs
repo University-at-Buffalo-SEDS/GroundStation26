@@ -1238,6 +1238,9 @@ impl AppState {
         ts_ms: u64,
         duplicate_window_ms: u64,
     ) -> bool {
+        if matches!(cmd, TelemetryCommand::Abort) {
+            return true;
+        }
         let mut map = self.last_command_ms.lock().unwrap();
         let key = command_dedup_key(cmd);
         if map
