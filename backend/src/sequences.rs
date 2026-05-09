@@ -926,6 +926,9 @@ fn dump_open_fails_nitrous_step(step: SequenceStep) -> bool {
 }
 
 fn mass_is_vented(current_mass_kg: Option<f32>, cfg: &SequenceConfig) -> bool {
+    if cfg!(feature = "test_fire_mode") {
+        return true;
+    }
     current_mass_kg
         .map(|m| m <= cfg.empty_mass_noise_allowance_kg)
         .unwrap_or(true)
