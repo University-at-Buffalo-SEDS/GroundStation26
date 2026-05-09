@@ -202,7 +202,7 @@ const KNOWN_TRANSLATIONS: &[(&str, &str, &str)] = &[
     ("Temperature", "Temperatura", "Température"),
     ("Altitude", "Altitud", "Altitude"),
     ("Dump", "Vaciado", "Purge"),
-    ("NormallyOpen", "Válvula de venteo", "Vanne d'évent"),
+    ("NormallyOpen", "Venteo", "Évent"),
     ("Igniter", "Ignitor", "Allumeur"),
     ("Nitrogen", "Nitrógeno", "Azote"),
     ("Nitrous", "Óxido nitroso", "Protoxyde d'azote"),

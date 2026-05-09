@@ -420,39 +420,80 @@ impl Default for SequenceRuntime {
 #[derive(Clone, Copy, Debug)]
 struct ValveSnapshot {
     normally_open: Option<bool>,
+    pending_normally_open: Option<bool>,
     dump_open: Option<bool>,
+    pending_dump_open: Option<bool>,
     nitrogen_open: Option<bool>,
+    pending_nitrogen_open: Option<bool>,
     nitrous_open: Option<bool>,
+    pending_nitrous_open: Option<bool>,
     pilot_open: Option<bool>,
+    pending_pilot_open: Option<bool>,
     igniter_on: Option<bool>,
+    pending_igniter_on: Option<bool>,
     retract: Option<bool>,
+    pending_retract: Option<bool>,
 }
 
 impl ValveSnapshot {
     fn read(state: &AppState) -> Self {
         let valve = |cmd| state.get_umbilical_valve_state(cmd);
+        let pending = |cmd| state.get_pending_umbilical_valve_state(cmd);
         Self {
             pilot_open: valve(ValveBoardCommands::PilotOpen as u8),
+            pending_pilot_open: pending(ValveBoardCommands::PilotOpen as u8),
             normally_open: valve(ValveBoardCommands::NormallyOpenOpen as u8),
+            pending_normally_open: pending(ValveBoardCommands::NormallyOpenOpen as u8),
             dump_open: valve(ValveBoardCommands::DumpOpen as u8),
+            pending_dump_open: pending(ValveBoardCommands::DumpOpen as u8),
             igniter_on: valve(ActuatorBoardCommands::IgniterOn as u8),
+            pending_igniter_on: pending(ActuatorBoardCommands::IgniterOn as u8),
             nitrogen_open: valve(ActuatorBoardCommands::NitrogenOpen as u8),
+            pending_nitrogen_open: pending(ActuatorBoardCommands::NitrogenOpen as u8),
             nitrous_open: valve(ActuatorBoardCommands::NitrousOpen as u8),
+            pending_nitrous_open: pending(ActuatorBoardCommands::NitrousOpen as u8),
             retract: valve(ActuatorBoardCommands::RetractPlumbing as u8),
+            pending_retract: pending(ActuatorBoardCommands::RetractPlumbing as u8),
         }
     }
 
     fn actuated_for_cmd(&self, cmd: &str) -> Option<bool> {
         match cmd {
+            "Dump" => self.pending_dump_open.or(self.dump_open),
+            "NormallyOpen" => self.pending_normally_open.or(self.normally_open),
+            "Nitrogen" => self.pending_nitrogen_open.or(self.nitrogen_open),
+            "Nitrous" => self.pending_nitrous_open.or(self.nitrous_open),
+            "ContinueFillSequence" => None,
+            "Pilot" => self.pending_pilot_open.or(self.pilot_open),
+            "Igniter" => self.pending_igniter_on.or(self.igniter_on),
+            "IgniterSequence" => None,
+            "RetractPlumbing" => self.pending_retract.or(self.retract),
+            _ => None,
+        }
+    }
+
+    fn actual_for_cmd(&self, cmd: &str) -> Option<bool> {
+        match cmd {
             "Dump" => self.dump_open,
             "NormallyOpen" => self.normally_open,
             "Nitrogen" => self.nitrogen_open,
             "Nitrous" => self.nitrous_open,
-            "ContinueFillSequence" => None,
             "Pilot" => self.pilot_open,
             "Igniter" => self.igniter_on,
-            "IgniterSequence" => None,
             "RetractPlumbing" => self.retract,
+            _ => None,
+        }
+    }
+
+    fn pending_for_cmd(&self, cmd: &str) -> Option<bool> {
+        match cmd {
+            "Dump" => self.pending_dump_open,
+            "NormallyOpen" => self.pending_normally_open,
+            "Nitrogen" => self.pending_nitrogen_open,
+            "Nitrous" => self.pending_nitrous_open,
+            "Pilot" => self.pending_pilot_open,
+            "Igniter" => self.pending_igniter_on,
+            "RetractPlumbing" => self.pending_retract,
             _ => None,
         }
     }
@@ -766,6 +807,23 @@ fn pending_mode(
         return BlinkMode::Fast;
     }
     BlinkMode::Slow
+}
+
+fn command_prompt_blink(
+    state: &AppState,
+    cfg: &SequenceConfig,
+    valves: ValveSnapshot,
+    cmd: &'static str,
+    desired: bool,
+    now_ms: u64,
+) -> Option<BlinkMode> {
+    if valves.actual_for_cmd(cmd) == Some(desired) {
+        return None;
+    }
+    if valves.pending_for_cmd(cmd) == Some(desired) {
+        return Some(BlinkMode::Fast);
+    }
+    Some(pending_mode(state, cmd, now_ms, cfg))
 }
 
 fn set_control_enabled(policy: &mut ActionPolicyMsg, cmd: &str, enabled: bool) {
@@ -1857,6 +1915,8 @@ pub fn start_sequence_task(
             let now_ms = crate::telemetry_task::get_current_timestamp_ms();
             let key_enabled = read_key_enabled(&state, &cfg);
             let software_buttons_enabled = read_software_buttons_enabled(&state, &cfg);
+            let sequence_active = !cfg!(feature = "test_fire_mode")
+                || !matches!(flight_state, FlightState::Startup | FlightState::Idle);
 
             if cfg!(feature = "test_fire_mode") {
                 if flight_state == FlightState::Startup && state.all_required_boards_seen() {
@@ -1876,15 +1936,17 @@ pub fn start_sequence_task(
                 }
             }
 
-            update_sequence_runtime(
-                &state,
-                &mut runtime,
-                &cfg,
-                valves,
-                pressure_psi,
-                current_mass_kg,
-                now,
-            );
+            if sequence_active {
+                update_sequence_runtime(
+                    &state,
+                    &mut runtime,
+                    &cfg,
+                    valves,
+                    pressure_psi,
+                    current_mass_kg,
+                    now,
+                );
+            }
             flight_state =
                 maybe_drive_local_prelaunch_state(&state, &runtime, valves, flight_state);
             let policy = build_policy(
@@ -1922,16 +1984,28 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
     let now_ms = crate::telemetry_task::get_current_timestamp_ms();
     let key_enabled = read_key_enabled(state, &cfg);
     let software_buttons_enabled = read_software_buttons_enabled(state, &cfg);
+    let sequence_active =
+        !cfg!(feature = "test_fire_mode") || !matches!(flight_state, FlightState::Startup | FlightState::Idle);
 
-    update_sequence_runtime(
-        state,
-        &mut runtime,
-        &cfg,
-        valves,
-        pressure_psi,
-        current_mass_kg,
-        now,
-    );
+    if cfg!(feature = "test_fire_mode")
+        && flight_state == FlightState::Startup
+        && state.all_required_boards_seen()
+    {
+        state.set_local_flight_state(FlightState::Idle);
+        flight_state = FlightState::Idle;
+    }
+
+    if sequence_active {
+        update_sequence_runtime(
+            state,
+            &mut runtime,
+            &cfg,
+            valves,
+            pressure_psi,
+            current_mass_kg,
+            now,
+        );
+    }
     flight_state = maybe_drive_local_prelaunch_state(state, &runtime, valves, flight_state);
     let policy = build_policy(
         state,
