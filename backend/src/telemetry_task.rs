@@ -2324,11 +2324,13 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::Abort => {
                                 state.clear_launch_sequence_command_pending();
-                                if let Err(e) = router.log(
+                                if let Err(e) = router.log_queue(
                                     DataType::Abort,
                                     "Manual Abort Command Issued".as_ref(),
                                 ) {
                                     log_telemetry_error("failed to log Abort command", e);
+                                } else {
+                                    flush_command_tx(&router, "Abort command tx");
                                 }
                                 gs_debug_println!("Abort command sent");
                             }

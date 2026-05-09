@@ -548,13 +548,16 @@ pub async fn safety_task(
 
         if abort {
             router
-                .log::<u8>(
+                .log_queue::<u8>(
                     DataType::Abort,
                     "Safety Task Abort Command Issued".as_bytes(),
                 )
                 .unwrap_or_else(|e| {
                     eprintln!("failed to log Abort command: {:?}", e);
                 });
+            if let Err(e) = router.process_all_queues_with_timeout(3) {
+                eprintln!("failed to flush Abort command: {:?}", e);
+            }
             gs_debug_println!("Safety task: Abort command sent");
             break;
         }

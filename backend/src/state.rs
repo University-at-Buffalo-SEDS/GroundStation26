@@ -289,6 +289,29 @@ impl AppState {
         }
     }
 
+    /// Updates both warning/error ack timestamps and broadcasts a single combined snapshot.
+    pub fn acknowledge_alerts_through(
+        &self,
+        warning_timestamp_ms: i64,
+        error_timestamp_ms: i64,
+    ) -> AlertAckStateMsg {
+        let mut slot = self.alert_ack_state.lock().unwrap();
+        let next_warning_ts = warning_timestamp_ms.max(slot.warning_ack_timestamp_ms);
+        let next_error_ts = error_timestamp_ms.max(slot.error_ack_timestamp_ms);
+        if next_warning_ts != slot.warning_ack_timestamp_ms
+            || next_error_ts != slot.error_ack_timestamp_ms
+        {
+            slot.warning_ack_timestamp_ms = next_warning_ts;
+            slot.error_ack_timestamp_ms = next_error_ts;
+            let snapshot = slot.clone();
+            drop(slot);
+            let _ = self.alert_ack_tx.send(snapshot.clone());
+            snapshot
+        } else {
+            slot.clone()
+        }
+    }
+
     pub fn launch_clock_snapshot(&self) -> LaunchClockMsg {
         self.launch_clock.lock().unwrap().clone()
     }

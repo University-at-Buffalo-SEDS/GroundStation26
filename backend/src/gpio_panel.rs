@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::time::interval;
 
 //####################################################################
 // The values assigned here are GPIO pin numbers on the Raspberry Pi
@@ -96,7 +96,7 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
 
     setup_callbacks(&state, allowed.clone())?;
 
-    tokio::spawn(gpio_led_task(state, allowed));
+    spawn_gpio_led_thread(state, allowed);
 
     Ok(())
 }
@@ -256,9 +256,9 @@ fn setup_callbacks(
             if !is_high {
                 return;
             }
-            state_warning_ack.acknowledge_warnings_through(
-                crate::telemetry_task::get_current_timestamp_ms() as i64,
-            );
+            let now_ms = crate::telemetry_task::get_current_timestamp_ms() as i64;
+            state_warning_ack.acknowledge_warnings_through(now_ms);
+            state_warning_ack.acknowledge_errors_through(now_ms);
         },
     )?;
 
@@ -334,11 +334,26 @@ where
     Ok(())
 }
 
-async fn gpio_led_task(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>) {
-    let mut tick = interval(Duration::from_millis(LED_FRAME_MS));
+fn spawn_gpio_led_thread(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>) {
+    let mut shutdown_rx = state.shutdown_subscribe();
+    thread::spawn(move || {
+        gpio_led_task(state, allowed, &mut shutdown_rx);
+    });
+}
+
+fn gpio_led_task(
+    state: Arc<AppState>,
+    allowed: Arc<Mutex<AllowedActions>>,
+    shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+) {
     let mut last_levels: HashMap<u8, u8> = HashMap::new();
     loop {
-        tick.tick().await;
+        match shutdown_rx.try_recv() {
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+            | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+        }
+        let frame_started = Instant::now();
         let now_ms = crate::telemetry_task::get_current_timestamp_ms();
 
         let policy = state.action_policy_snapshot();
@@ -404,6 +419,12 @@ async fn gpio_led_task(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>
             RETRACT_PIN_LED,
             led_for(&state, &policy, "RetractPlumbing", now_ms),
         );
+
+        let frame_budget = Duration::from_millis(LED_FRAME_MS);
+        let elapsed = frame_started.elapsed();
+        if elapsed < frame_budget {
+            thread::sleep(frame_budget - elapsed);
+        }
     }
 }
 
