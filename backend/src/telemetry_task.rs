@@ -2324,9 +2324,9 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::Abort => {
                                 state.clear_launch_sequence_command_pending();
-                                if let Err(e) = router.log_queue(
-                                    DataType::Abort,
-                                    "Manual Abort Command Issued".as_ref(),
+                                if let Err(e) = queue_abort_packet(
+                                    &router,
+                                    "Manual Abort Command Issued",
                                 ) {
                                     log_telemetry_error("failed to log Abort command", e);
                                 } else {
@@ -2930,6 +2930,28 @@ fn queue_guarded_fill_command(
     state.set_umbilical_valve_state(key_cmd_id, desired_state);
     sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
+}
+
+pub(crate) fn queue_abort_packet(
+    router: &Router,
+    reason: &str,
+) -> sedsprintf_rs_2026::TelemetryResult<()> {
+    let pkt = Packet::new(
+        DataType::Abort,
+        &[
+            DataEndpoint::GroundStation,
+            DataEndpoint::FlightController,
+            DataEndpoint::ValveBoard,
+            DataEndpoint::ActuatorBoard,
+            DataEndpoint::Abort,
+            DataEndpoint::FlightState,
+            DataEndpoint::SdCard,
+        ],
+        Board::GroundStation.sender_id(),
+        get_current_timestamp_ms(),
+        Arc::from(reason.as_bytes()),
+    )?;
+    router.rx_queue(pkt)
 }
 
 const VALVE_STATE_DATA_TYPE: &str = "VALVE_STATE";

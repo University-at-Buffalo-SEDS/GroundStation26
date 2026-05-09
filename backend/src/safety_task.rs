@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use crate::telemetry_task::get_current_timestamp_ms;
+use crate::telemetry_task::{get_current_timestamp_ms, queue_abort_packet};
 use crate::types::{Board, FlightState};
 use crate::web::{emit_warning, emit_warning_db_only};
 use sedsprintf_rs_2026::config::DataType;
@@ -547,14 +547,9 @@ pub async fn safety_task(
         }
 
         if abort {
-            router
-                .log_queue::<u8>(
-                    DataType::Abort,
-                    "Safety Task Abort Command Issued".as_bytes(),
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("failed to log Abort command: {:?}", e);
-                });
+            queue_abort_packet(&router, "Safety Task Abort Command Issued").unwrap_or_else(|e| {
+                eprintln!("failed to log Abort command: {:?}", e);
+            });
             if let Err(e) = router.process_all_queues_with_timeout(3) {
                 eprintln!("failed to flush Abort command: {:?}", e);
             }
