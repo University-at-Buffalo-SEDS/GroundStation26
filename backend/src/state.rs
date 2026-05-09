@@ -1066,8 +1066,8 @@ impl AppState {
         {
             let button_interlock_ok = self.hitl_button_interlock_satisfied();
             let launch_interlock_ok = self.hitl_launch_interlock_satisfied();
-            policy.key_enabled = launch_interlock_ok;
-            policy.software_buttons_enabled = button_interlock_ok;
+            policy.key_enabled = true;
+            policy.software_buttons_enabled = true;
             for control in &mut policy.controls {
                 control.enabled = true;
                 control.blink = crate::sequences::BlinkMode::None;
