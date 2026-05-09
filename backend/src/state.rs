@@ -550,6 +550,13 @@ impl AppState {
     /// Returns whether a board should be required for startup/state gating in the current mode.
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     pub fn board_required_for_progression(&self, board: Board) -> bool {
+        if cfg!(feature = "test_fire_mode") {
+            return matches!(
+                board,
+                Board::ValveBoard | Board::GatewayBoard | Board::ActuatorBoard
+            );
+        }
+
         if !self.layout_expected_boards().contains(&board) {
             return false;
         }

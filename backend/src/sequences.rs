@@ -1499,7 +1499,13 @@ fn maybe_drive_local_prelaunch_state(
     valves: ValveSnapshot,
     current_state: FlightState,
 ) -> FlightState {
-    if cfg!(feature = "hitl_mode") || cfg!(feature = "test_fire_mode") {
+    if cfg!(feature = "hitl_mode") {
+        return current_state;
+    }
+
+    if cfg!(feature = "test_fire_mode")
+        && matches!(current_state, FlightState::Startup | FlightState::Idle)
+    {
         return current_state;
     }
 
@@ -1615,7 +1621,6 @@ fn build_policy(
 
     if !is_fill_state(inputs.flight_state) {
         // Idle/other non-fill states: keep controls available with no highlight.
-        // Launch is kept disabled outside the armed state.
         // RetractPlumbing is one-way: once actuated, keep it disabled.
         let mut enabled: HashMap<&'static str, BlinkMode> = HashMap::new();
         for cmd in all_command_names() {
@@ -1652,20 +1657,10 @@ fn build_policy(
             inputs.valves,
             enabled,
         );
-        if inputs.flight_state == FlightState::Idle && !runtime.calibration_ready {
-            for cmd in [
-                "NormallyOpen",
-                "Nitrogen",
-                "Nitrous",
-                "Pilot",
-                "Igniter",
-                "RetractPlumbing",
-            ] {
-                set_control_enabled(&mut policy, cmd, false);
-            }
+        if inputs.flight_state != FlightState::Idle {
+            set_control_enabled(&mut policy, "Launch", false);
+            set_control_enabled(&mut policy, "GroundStationLaunch", false);
         }
-        set_control_enabled(&mut policy, "Launch", false);
-        set_control_enabled(&mut policy, "GroundStationLaunch", false);
         return policy;
     }
 
