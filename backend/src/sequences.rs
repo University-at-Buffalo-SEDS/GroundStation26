@@ -136,6 +136,7 @@ struct SequenceConfig {
     leak_check_duration: Duration,
     nitrous_soak_duration: Duration,
     nitrous_level_duration: Duration,
+    manual_close_target_tolerance_kg: f32,
     nitrogen_pressure_target_psi: f32,
     nitrogen_target_mass_kg: Option<f32>,
     nitrogen_autoclose_mode: NitrogenAutocloseMode,
@@ -171,6 +172,13 @@ impl SequenceConfig {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(10.0);
+
+        let manual_close_target_tolerance_kg =
+            std::env::var("GS_SEQUENCE_MANUAL_CLOSE_TARGET_TOLERANCE_KG")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(5.0)
+                .max(0.0);
 
         let nitrogen_pressure_target_psi =
             std::env::var("GS_SEQUENCE_NITROGEN_PRESSURE_TARGET_PSI")
@@ -333,6 +341,7 @@ impl SequenceConfig {
             leak_check_duration,
             nitrous_soak_duration,
             nitrous_level_duration,
+            manual_close_target_tolerance_kg,
             nitrogen_pressure_target_psi,
             nitrogen_target_mass_kg,
             nitrogen_autoclose_mode,
@@ -966,6 +975,14 @@ fn mass_target_reached(current_mass_kg: f32, target_mass_kg: f32, epsilon_kg: f3
     }
 }
 
+fn mass_target_within_tolerance(
+    current_mass_kg: f32,
+    target_mass_kg: f32,
+    tolerance_kg: f32,
+) -> bool {
+    (current_mass_kg - target_mass_kg).abs() <= tolerance_kg.max(0.0)
+}
+
 fn update_sequence_runtime(
     state: &AppState,
     runtime: &mut SequenceRuntime,
@@ -1060,6 +1077,25 @@ fn update_sequence_runtime(
         }
         SequenceStep::NitrogenFill => {
             if valves.nitrogen_open != Some(true) {
+                let manually_closed_near_target = valves.nitrogen_open == Some(false)
+                    && cfg.nitrogen_target_mass_kg.is_some_and(|target_mass_kg| {
+                        current_mass_kg.is_some_and(|m| {
+                            mass_target_within_tolerance(
+                                m,
+                                target_mass_kg,
+                                cfg.manual_close_target_tolerance_kg,
+                            )
+                        })
+                    });
+                if manually_closed_near_target {
+                    runtime.auto_close_nitrogen_sent = false;
+                    state.add_notification(format!(
+                        "Nitrogen valve was manually closed within {:.1} kg of target. Continuing fill sequence.",
+                        cfg.manual_close_target_tolerance_kg
+                    ));
+                    runtime.step = SequenceStep::CloseNitrogen;
+                    return;
+                }
                 runtime.auto_close_nitrogen_sent = false;
                 return;
             }
@@ -1321,6 +1357,28 @@ fn update_sequence_runtime(
         SequenceStep::OpenNitrous => {
             dismiss_leak_fail_notification(state, runtime);
             if valves.nitrous_open != Some(true) {
+                let manually_closed_near_target = valves.nitrous_open == Some(false)
+                    && current_mass_kg.is_some_and(|m| {
+                        let (target_mass_kg, _) = nitrous_fill_status(state, m);
+                        mass_target_within_tolerance(
+                            m,
+                            target_mass_kg,
+                            cfg.manual_close_target_tolerance_kg,
+                        )
+                    });
+                if manually_closed_near_target {
+                    runtime.nitrous_level_since = None;
+                    runtime.last_nitrous_pressure_psi = None;
+                    runtime.last_nitrous_mass_kg = None;
+                    runtime.auto_close_nitrous_sent = false;
+                    runtime.notified_close_nitrous = false;
+                    state.add_notification(format!(
+                        "Nitrous valve was manually closed within {:.1} kg of target. Continuing fill sequence.",
+                        cfg.manual_close_target_tolerance_kg
+                    ));
+                    runtime.step = SequenceStep::CloseNitrous;
+                    return;
+                }
                 runtime.nitrous_level_since = None;
                 runtime.last_nitrous_pressure_psi = None;
                 runtime.last_nitrous_mass_kg = None;

@@ -1735,7 +1735,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::FlightState(FlightStateMsg {
+                                state: state_for_send.local_flight_state_snapshot(),
+                            });
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1749,7 +1757,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::LaunchClock(state_for_send.launch_clock_snapshot());
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1772,7 +1786,21 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+                            let msg = WsOutMsg::BoardStatus(state_for_send.board_status_snapshot(now_ms));
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                            let topology = WsOutMsg::NetworkTopology(
+                                state_for_send.network_topology_snapshot(now_ms),
+                            );
+                            let text = serde_json::to_string(&topology).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1786,7 +1814,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::Notifications(state_for_send.notifications_snapshot());
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1800,7 +1834,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::Messages(state_for_send.messages_snapshot());
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1814,7 +1854,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            crate::sequences::refresh_action_policy_now(&state_for_send);
+                            let msg = WsOutMsg::ActionPolicy(state_for_send.action_policy_snapshot());
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1828,7 +1875,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::FillTargets(state_for_send.fill_targets_snapshot());
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1842,7 +1895,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::RecordingStatus(
+                                state_for_send.recording_status_snapshot(),
+                            );
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
