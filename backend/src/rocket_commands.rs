@@ -2,49 +2,49 @@
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum FlightComputerCommands {
-    LaunchSignal = 2,
-    MonitorAltitude = 3,
-    RevokeMonitorAltitude = 4,
-    ConsecutiveSamples = 5,
-    RevokeConsecutiveSamples = 6,
-    ResetFailures = 7,
-    RevokeResetFailures = 8,
-    ValidateMeasms = 9,
-    RevokeValidateMeasms = 10,
+    LaunchSignal = 1,
+    MonitorAltitude = 2,
+    RevokeMonitorAltitude = 3,
+    ConsecutiveSamples = 4,
+    RevokeConsecutiveSamples = 5,
+    ResetFailures = 6,
+    RevokeResetFailures = 7,
+    ValidateMeasms = 8,
+    RevokeValidateMeasms = 9,
     #[cfg(feature = "hitl_mode")]
-    DeployParachute = 11,
+    DeployParachute = 10,
     #[cfg(feature = "hitl_mode")]
-    ExpandParachute = 12,
+    ExpandParachute = 11,
     #[cfg(feature = "hitl_mode")]
-    EvaluationRelax = 13,
+    EvaluationRelax = 12,
     #[cfg(feature = "hitl_mode")]
-    EvaluationFocus = 14,
+    EvaluationFocus = 13,
     #[cfg(feature = "hitl_mode")]
-    EvaluationAbort = 15,
+    EvaluationAbort = 14,
     #[cfg(feature = "hitl_mode")]
-    ReinitSensors = 16,
+    ReinitSensors = 15,
     #[cfg(feature = "hitl_mode")]
-    ReinitBarometer = 17,
+    ReinitBarometer = 16,
     #[cfg(feature = "hitl_mode")]
-    ReinitIMU = 18,
+    ReinitIMU = 17,
     #[cfg(feature = "hitl_mode")]
-    DisableIMU = 19,
+    DisableIMU = 18,
     #[cfg(feature = "hitl_mode")]
-    AdvanceFlightState = 20,
+    AdvanceFlightState = 19,
     #[cfg(feature = "hitl_mode")]
-    RewindFlightState = 21,
+    RewindFlightState = 20,
     #[cfg(feature = "hitl_mode")]
-    AbortAfter40 = 22,
+    AbortAfter40 = 21,
     #[cfg(feature = "hitl_mode")]
-    AbortAfter100 = 23,
+    AbortAfter100 = 22,
     #[cfg(feature = "hitl_mode")]
-    AbortAfter250 = 24,
+    AbortAfter250 = 23,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter15 = 25,
+    ReinitAfter15 = 24,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter30 = 26,
+    ReinitAfter30 = 25,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter50 = 27,
+    ReinitAfter50 = 26,
 }
 
 #[repr(u8)]
