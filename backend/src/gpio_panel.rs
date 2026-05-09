@@ -441,8 +441,8 @@ fn led_for(state: &AppState, policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -
     if cmd == "Launch"
         && control.enabled
         && (state.hitl_button_interlock_enabled() || state.hitl_launch_interlock_enabled())
-        && policy.key_enabled
-        && policy.software_buttons_enabled
+        && state.hitl_button_interlock_satisfied()
+        && state.hitl_launch_interlock_satisfied()
     {
         return 1.0;
     }

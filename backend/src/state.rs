@@ -1064,8 +1064,8 @@ impl AppState {
         let mut policy = policy;
         #[cfg(feature = "hitl_mode")]
         {
-            policy.key_enabled = self.hitl_launch_interlock_satisfied();
-            policy.software_buttons_enabled = self.hitl_button_interlock_satisfied();
+            policy.key_enabled = true;
+            policy.software_buttons_enabled = true;
             for control in &mut policy.controls {
                 control.enabled = true;
                 control.blink = crate::sequences::BlinkMode::None;
