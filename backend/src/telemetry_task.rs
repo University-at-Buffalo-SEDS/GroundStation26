@@ -1663,7 +1663,10 @@ async fn emit_derived_loadcell_rows(
     };
     let rows: Vec<(&str, Vec<Option<f32>>)> = match calibration_sensor_id {
         loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
-            let percent = loadcell::fill_percent(&cfg, calibrated_value);
+            let fill_targets = state.fill_targets_snapshot();
+            let flight_state = *state.state.lock().unwrap();
+            let target_mass_kg = loadcell::active_fill_target_mass_kg(&fill_targets, flight_state);
+            let percent = loadcell::fill_percent(target_mass_kg, calibrated_value);
             {
                 let mut latest = state.latest_fill_mass_kg.lock().unwrap();
                 *latest = Some(calibrated_value);

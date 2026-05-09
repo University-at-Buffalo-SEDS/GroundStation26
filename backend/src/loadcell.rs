@@ -1,4 +1,6 @@
+use crate::fill_targets::FillTargetsConfig;
 use crate::layout::ValueFormatter;
+use crate::types::FlightState;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1166,9 +1168,20 @@ pub fn calibrated_sensor_value(
     }
 }
 
-pub fn fill_percent(cfg: &LoadcellCalibrationFile, weight_kg: f32) -> f32 {
-    let denom = cfg.full_mass_kg.unwrap_or(DEFAULT_FULL_MASS_KG).max(0.0001);
-    ((weight_kg / denom) * 100.0).clamp(0.0, 100.0)
+pub fn active_fill_target_mass_kg(cfg: &FillTargetsConfig, flight_state: FlightState) -> f32 {
+    let target_mass_kg = if matches!(
+        flight_state,
+        FlightState::PreFill | FlightState::FillTest | FlightState::NitrogenFill
+    ) {
+        cfg.nitrogen.target_mass_kg
+    } else {
+        cfg.nitrous.target_mass_kg
+    };
+    target_mass_kg.max(0.0001)
+}
+
+pub fn fill_percent(target_mass_kg: f32, weight_kg: f32) -> f32 {
+    ((weight_kg / target_mass_kg.max(0.0001)) * 100.0).clamp(0.0, 100.0)
 }
 
 #[cfg(test)]

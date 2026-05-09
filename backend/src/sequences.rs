@@ -989,14 +989,10 @@ fn fill_sequence_calibration_issue(
     }
 }
 
-fn nitrous_fill_status(state: &AppState, current_mass_kg: f32) -> (f32, f32) {
+fn nitrous_fill_status(_state: &AppState, current_mass_kg: f32) -> (f32, f32) {
     let fill_target_mass_kg = fill_targets::load_or_default().nitrous.target_mass_kg;
-    let loadcell_cfg = state.loadcell_calibration.lock().unwrap().clone();
-    let target_mass_kg = loadcell_cfg
-        .full_mass_kg
-        .unwrap_or(fill_target_mass_kg)
-        .max(0.0001);
-    let percent = loadcell::fill_percent(&loadcell_cfg, current_mass_kg);
+    let target_mass_kg = fill_target_mass_kg.max(0.0001);
+    let percent = loadcell::fill_percent(target_mass_kg, current_mass_kg);
     (target_mass_kg, percent)
 }
 
