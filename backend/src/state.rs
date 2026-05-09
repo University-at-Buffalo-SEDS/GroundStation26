@@ -1064,11 +1064,34 @@ impl AppState {
         let mut policy = policy;
         #[cfg(feature = "hitl_mode")]
         {
-            policy.key_enabled = true;
-            policy.software_buttons_enabled = true;
+            let button_interlock_ok = self.hitl_button_interlock_satisfied();
+            let launch_interlock_ok = self.hitl_launch_interlock_satisfied();
+            policy.key_enabled = launch_interlock_ok;
+            policy.software_buttons_enabled = button_interlock_ok;
             for control in &mut policy.controls {
                 control.enabled = true;
                 control.blink = crate::sequences::BlinkMode::None;
+                let cmd = control.cmd.as_str();
+                let button_interlock_exempt = matches!(
+                    cmd,
+                    "Abort"
+                        | "StartWritingNow"
+                        | "StartWritingLastTwoMinutes"
+                        | "PauseWritingDb"
+                        | "StopWritingDb"
+                        | "ToggleButtonInterlock"
+                        | "ToggleLaunchInterlock"
+                        | "TogglePhysicalLaunchMode"
+                        | "ResetLaunchLatch"
+                );
+                if !button_interlock_ok && !button_interlock_exempt {
+                    control.enabled = false;
+                }
+                if !launch_interlock_ok
+                    && matches!(cmd, "Launch" | "GroundStationLaunch" | "LaunchSignal")
+                {
+                    control.enabled = false;
+                }
             }
         }
         for control in &mut policy.controls {
