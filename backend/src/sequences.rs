@@ -1693,8 +1693,13 @@ fn build_policy(
 
     if inputs.flight_state == FlightState::Armed {
         let mut enabled = HashMap::new();
-        enabled.insert("Launch", BlinkMode::Slow);
-        enabled.insert("GroundStationLaunch", BlinkMode::Slow);
+        if !state.launch_indicator_latched() {
+            enabled.insert("Launch", BlinkMode::Slow);
+            enabled.insert("GroundStationLaunch", BlinkMode::Slow);
+        } else {
+            enabled.insert("Launch", BlinkMode::None);
+            enabled.insert("GroundStationLaunch", BlinkMode::None);
+        }
         enabled.insert("Dump", BlinkMode::None);
         return policy_with_overrides(
             true,
@@ -1943,8 +1948,10 @@ fn build_policy(
             }
         }
         SequenceStep::ArmedReady => {
-            recommended.insert("Launch", BlinkMode::Slow);
-            recommended.insert("GroundStationLaunch", BlinkMode::Slow);
+            if !state.launch_indicator_latched() {
+                recommended.insert("Launch", BlinkMode::Slow);
+                recommended.insert("GroundStationLaunch", BlinkMode::Slow);
+            }
         }
     }
 
