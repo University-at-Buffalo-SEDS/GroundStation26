@@ -1300,6 +1300,7 @@ async fn get_action_policy(
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
+    crate::sequences::refresh_action_policy_now(&state);
     Json(state.action_policy_snapshot()).into_response()
 }
 
@@ -1570,6 +1571,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         if ws_out_tx.send(initial_messages).await.is_err() {
             return;
         }
+        crate::sequences::refresh_action_policy_now(&state_for_send);
         let initial_action_policy = serde_json::to_string(&WsOutMsg::ActionPolicy(
             state_for_send.action_policy_snapshot(),
         ))
