@@ -167,7 +167,7 @@
         "fg": "#ddd6fe"
       },
       {
-        "label": "NormallyOpen",
+        "label": "VentValve",
         "cmd": "NormallyOpen",
         "border": "#f97316",
         "bg": "#1f2937",
@@ -1176,7 +1176,7 @@
                     "index": 0
                   },
                   {
-                    "label": "NormallyOpen",
+                    "label": "VentValve",
                     "index": 1
                   },
                   {
@@ -1455,7 +1455,7 @@
                     "index": 0
                   },
                   {
-                    "label": "NormallyOpen",
+                    "label": "VentValve",
                     "index": 1
                   },
                   {

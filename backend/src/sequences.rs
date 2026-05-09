@@ -1,11 +1,10 @@
-use crate::layout;
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 use crate::state::AppState;
 use crate::types::{FlightState, TelemetryCommand};
 use crate::web::emit_warning;
 use crate::{fill_targets, loadcell};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -45,35 +44,15 @@ pub struct ActionPolicyMsg {
     pub controls: Vec<ActionControl>,
 }
 
-fn backend_illuminated_commands() -> HashSet<String> {
-    layout::load_layout()
-        .map(|layout| {
-            layout
-                .actions_tab
-                .actions
-                .into_iter()
-                .filter(|action| action.illuminated)
-                .map(|action| action.cmd)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn backend_blink_for(cmd: &str, enabled: bool, recommended: Option<&BlinkMode>) -> BlinkMode {
     if !enabled {
         return BlinkMode::None;
     }
-    let illuminated = backend_illuminated_commands().contains(cmd);
-    if let Some(blink) = recommended
-        && (*blink != BlinkMode::None || !illuminated)
-    {
+    if let Some(blink) = recommended {
         return blink.clone();
     }
     if is_recording_command(cmd) {
         return BlinkMode::None;
-    }
-    if illuminated {
-        return BlinkMode::Slow;
     }
     BlinkMode::None
 }
@@ -172,7 +151,7 @@ impl SequenceConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(60));
+            .unwrap_or_else(|| Duration::from_secs(30));
 
         let pressure_min_psi = std::env::var("GS_SEQUENCE_PRESSURE_MIN_PSI")
             .ok()
@@ -981,7 +960,7 @@ fn update_sequence_runtime(
     if sequence_blocks_until_normally_open(runtime.step) && valves.normally_open == Some(false) {
         if !runtime.notified_reopen_normally_open {
             state.add_notification(
-                "Normally open valve is closed early. Open N/O before continuing the fill sequence.",
+                "Vent valve is closed early. Open the vent valve before continuing the fill sequence.",
             );
             runtime.notified_reopen_normally_open = true;
         }
@@ -1090,7 +1069,7 @@ fn update_sequence_runtime(
                 runtime.warned_mass_shift = false;
                 if valves.normally_open == Some(true) {
                     state.add_temporary_notification(format!(
-                        "Nitrogen fill test started. N/O is open, so a controlled pressure bleed is expected while loadcell hold is monitored for {}s.",
+                        "Nitrogen fill test started. Vent valve is open, so a controlled pressure bleed is expected while loadcell hold is monitored for {}s.",
                         cfg.leak_check_duration.as_secs()
                     ));
                 } else {
@@ -1154,7 +1133,7 @@ fn update_sequence_runtime(
                 if !runtime.notified_leak_pass {
                     if valves.normally_open == Some(true) {
                         state.add_notification(
-                            "Nitrogen hold check passed. N/O bleed stayed within allowance and loadcell is stable.",
+                            "Nitrogen hold check passed. Vent-valve bleed stayed within allowance and loadcell is stable.",
                         );
                     } else {
                         state.add_notification(
@@ -1427,7 +1406,7 @@ fn update_sequence_runtime(
         SequenceStep::CloseNormallyOpen => {
             if !runtime.notified_close_normally_open {
                 state.add_notification(
-                    "Nitrous settle complete. Close normally open valve before retracting fill lines.",
+                    "Nitrous settle complete. Close vent valve before retracting fill lines.",
                 );
                 runtime.notified_close_normally_open = true;
             }
@@ -1438,7 +1417,7 @@ fn update_sequence_runtime(
         }
         SequenceStep::RetractFillLines => {
             if !runtime.notified_retract_fill_lines {
-                state.add_notification("Normally open valve closed. Retract fill lines.");
+                state.add_notification("Vent valve closed. Retract fill lines.");
                 runtime.notified_retract_fill_lines = true;
             }
             if valves.retract == Some(true) {
@@ -1448,7 +1427,7 @@ fn update_sequence_runtime(
         SequenceStep::ArmedReady => {
             if !runtime.notified_armed {
                 state.add_notification(
-                    "Fill sequence complete: nitrous closed, normally open closed, fill lines removed. Launch state is ready.",
+                    "Fill sequence complete: nitrous closed, vent valve closed, fill lines removed. Launch state is ready.",
                 );
                 runtime.notified_armed = true;
             }
@@ -1880,10 +1859,15 @@ pub fn start_sequence_task(
             let software_buttons_enabled = read_software_buttons_enabled(&state, &cfg);
 
             if cfg!(feature = "test_fire_mode") {
+                if flight_state == FlightState::Startup && state.all_required_boards_seen() {
+                    state.set_local_flight_state(FlightState::Idle);
+                    flight_state = FlightState::Idle;
+                }
+
                 if flight_state == FlightState::Idle {
                     runtime = SequenceRuntime::default();
-                } else if last_flight_state != Some(FlightState::NitrogenFill)
-                    && flight_state == FlightState::NitrogenFill
+                } else if last_flight_state != Some(FlightState::PreFill)
+                    && flight_state == FlightState::PreFill
                 {
                     runtime = SequenceRuntime::default();
                     state.add_temporary_notification(
