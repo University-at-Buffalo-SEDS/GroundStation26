@@ -804,7 +804,11 @@
               {
                 "label": "Raw",
                 "data_type": "KG1000",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 7
+                }
               },
               {
                 "label": "Calibrated",
@@ -854,7 +858,11 @@
               {
                 "label": "Raw",
                 "data_type": "FUEL_TANK_PRESSURE",
-                "index": 0
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 7
+                }
               },
               {
                 "label": "Calibrated",

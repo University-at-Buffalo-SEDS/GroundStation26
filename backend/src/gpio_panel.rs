@@ -281,7 +281,7 @@ where
 {
     static LAST_WARN_MS_BY_CMD: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
     static WARN_INTERVAL_MS: AtomicU64 = AtomicU64::new(3_000);
-    let gpio_for_callback = gpio.clone();
+    let _gpio_for_callback = gpio.clone();
 
     gpio.setup_callback_input_pin(pin, Trigger::RisingEdge, debounce, move |is_high| {
         if !is_high {
@@ -289,7 +289,7 @@ where
         }
         #[cfg(feature = "hitl_mode")]
         if state.hitl_button_interlock_enabled()
-            && !is_input_enabled(&gpio_for_callback, ALL_BUTTONS_ENABLE_PIN)
+            && !is_input_enabled(&_gpio_for_callback, ALL_BUTTONS_ENABLE_PIN)
         {
             let now_ms = crate::telemetry_task::get_current_timestamp_ms();
             let warn_map = LAST_WARN_MS_BY_CMD.get_or_init(|| Mutex::new(HashMap::new()));

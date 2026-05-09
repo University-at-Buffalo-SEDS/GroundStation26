@@ -20,6 +20,9 @@
       "fit_color": "#22d3ee",
       "raw_label": "Raw",
       "expected_label": "kg",
+      "formatter": {
+        "precision": 7
+      },
       "fit_modes": [
         "best",
         "linear",
@@ -40,6 +43,9 @@
       "fit_color": "#a78bfa",
       "raw_label": "Raw",
       "expected_label": "psi",
+      "formatter": {
+        "precision": 7
+      },
       "fit_modes": [
         "best",
         "linear",

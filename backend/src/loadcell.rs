@@ -1,3 +1,4 @@
+use crate::layout::ValueFormatter;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -195,6 +196,8 @@ pub struct CalibrationSensorSpec {
     pub raw_label: String,
     pub expected_label: String,
     pub fit_modes: Vec<String>,
+    #[serde(default)]
+    pub formatter: Option<ValueFormatter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +228,12 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                 raw_label: "Raw".to_string(),
                 expected_label: "kg".to_string(),
                 fit_modes: fit_modes.clone(),
+                formatter: Some(ValueFormatter {
+                    kind: None,
+                    precision: Some(7),
+                    prefix: None,
+                    suffix: None,
+                }),
             },
             CalibrationSensorSpec {
                 id: "IADC".to_string(),
@@ -235,6 +244,12 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                 raw_label: "Raw".to_string(),
                 expected_label: "psi".to_string(),
                 fit_modes,
+                formatter: Some(ValueFormatter {
+                    kind: None,
+                    precision: Some(7),
+                    prefix: None,
+                    suffix: None,
+                }),
             },
         ],
     }
