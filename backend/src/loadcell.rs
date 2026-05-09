@@ -1128,7 +1128,7 @@ fn eval_channel_with_zero(
     let zero_offset = zero_raw
         .and_then(|zero| eval_channel_base(linear, fit, zero))
         .unwrap_or(0.0);
-    Some((base - zero_offset).max(0.0))
+    Some(base - zero_offset)
 }
 
 fn calibrated_channel_value(
@@ -1220,6 +1220,7 @@ mod tests {
         capture_zero(&mut cfg, "ch1", 10.0);
 
         assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 10.0), Some(0.0));
+        assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 9.0), Some(-2.0));
         assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 12.0), Some(4.0));
     }
 
@@ -1246,6 +1247,7 @@ mod tests {
         capture_zero(&mut cfg, "ch1", 3.0);
 
         assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 3.0), Some(0.0));
+        assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 2.0), Some(-5.0));
         assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 4.0), Some(7.0));
     }
 }
