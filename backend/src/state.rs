@@ -1072,6 +1072,7 @@ impl AppState {
                 control.enabled = true;
                 control.blink = crate::sequences::BlinkMode::None;
                 let cmd = control.cmd.as_str();
+                let is_actuated = control.actuated.unwrap_or(false);
                 let button_interlock_exempt = matches!(
                     cmd,
                     "Abort"
@@ -1084,11 +1085,12 @@ impl AppState {
                         | "TogglePhysicalLaunchMode"
                         | "ResetLaunchLatch"
                 );
-                if !button_interlock_ok && !button_interlock_exempt {
+                if !button_interlock_ok && !button_interlock_exempt && !is_actuated {
                     control.enabled = false;
                 }
                 if !launch_interlock_ok
                     && matches!(cmd, "Launch" | "GroundStationLaunch" | "LaunchSignal")
+                    && !is_actuated
                 {
                     control.enabled = false;
                 }
