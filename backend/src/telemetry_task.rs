@@ -3193,6 +3193,14 @@ async fn handle_packet(
     pkt: Packet,
 ) -> Vec<TelemetryRow> {
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+    if cfg!(feature = "test_fire_mode")
+        && *state.state.lock().unwrap() == FlightState::Startup
+        && state.all_required_boards_seen()
+    {
+        state.set_local_flight_state(FlightState::Idle);
+        sequences::refresh_action_policy_now(state);
+        state.broadcast_action_policy_snapshot();
+    }
     let sender_id = canonical_sender_id(pkt.sender()).to_string();
 
     if pkt.data_type() == DataType::Warning {

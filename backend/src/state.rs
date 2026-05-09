@@ -476,12 +476,6 @@ impl AppState {
         }
         drop(map);
         self.broadcast_board_status_snapshot(timestamp_ms, force_broadcast);
-        if cfg!(feature = "test_fire_mode")
-            && *self.state.lock().unwrap() == FlightState::Startup
-            && self.all_required_boards_seen()
-        {
-            self.set_local_flight_state(FlightState::Idle);
-        }
     }
 
     /// Marks side-relay boards as seen when the router has an active discovery route for that side.
