@@ -1088,10 +1088,7 @@ impl AppState {
                 if !button_interlock_ok && !button_interlock_exempt && !is_actuated {
                     control.enabled = false;
                 }
-                if !launch_interlock_ok
-                    && matches!(cmd, "Launch" | "GroundStationLaunch" | "LaunchSignal")
-                    && !is_actuated
-                {
+                if !launch_interlock_ok && matches!(cmd, "Launch") && !is_actuated {
                     control.enabled = false;
                 }
             }
@@ -1164,13 +1161,7 @@ impl AppState {
             if !exempt && !self.hitl_button_interlock_satisfied() {
                 return false;
             }
-            if matches!(
-                cmd,
-                TelemetryCommand::Launch
-                    | TelemetryCommand::LaunchSignal
-                    | TelemetryCommand::GroundStationLaunch
-            ) && !self.hitl_launch_interlock_satisfied()
-            {
+            if matches!(cmd, TelemetryCommand::Launch) && !self.hitl_launch_interlock_satisfied() {
                 return false;
             }
             true
