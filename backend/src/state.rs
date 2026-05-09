@@ -940,6 +940,11 @@ impl AppState {
         });
     }
 
+    /// Returns the current locally tracked flight state.
+    pub fn local_flight_state_snapshot(&self) -> FlightState {
+        *self.state.lock().unwrap()
+    }
+
     /// Returns the number of async database writes still in progress.
     pub fn pending_db_write_count(&self) -> usize {
         self.pending_db_writes.load(Ordering::SeqCst)

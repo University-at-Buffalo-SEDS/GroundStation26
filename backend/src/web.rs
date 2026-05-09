@@ -1579,6 +1579,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         if ws_out_tx.send(initial_action_policy).await.is_err() {
             return;
         }
+        let initial_flight_state = serde_json::to_string(&WsOutMsg::FlightState(FlightStateMsg {
+            state: state_for_send.local_flight_state_snapshot(),
+        }))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_flight_state).await.is_err() {
+            return;
+        }
         let initial_fill_targets = serde_json::to_string(&WsOutMsg::FillTargets(
             state_for_send.fill_targets_snapshot(),
         ))
@@ -1591,6 +1598,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_launch_clock).await.is_err() {
+            return;
+        }
+        let initial_board_status = serde_json::to_string(&WsOutMsg::BoardStatus(
+            state_for_send
+                .board_status_snapshot(crate::telemetry_task::get_current_timestamp_ms()),
+        ))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_board_status).await.is_err() {
             return;
         }
         let initial_recording_status = serde_json::to_string(&WsOutMsg::RecordingStatus(
