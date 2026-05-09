@@ -985,7 +985,7 @@ fn is_fill_system_command_payload(payload: &[u8]) -> bool {
     };
     matches!(
         pkt.data_type(),
-        DataType::ValveCommand | DataType::ActuatorCommand
+        DataType::ValveCommand | DataType::ActuatorCommand | DataType::Abort
     )
 }
 
@@ -3766,6 +3766,18 @@ mod tests {
         .expect("failed to build valve command packet");
         assert!(is_fill_system_command_payload(
             &serialize::serialize_packet(&valve_pkt)
+        ));
+
+        let abort_pkt = Packet::new(
+            DataType::Abort,
+            &[sedsprintf_rs_2026::config::DataEndpoint::Abort],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from("Manual Abort Command Issued".as_bytes()),
+        )
+        .expect("failed to build abort packet");
+        assert!(is_fill_system_command_payload(
+            &serialize::serialize_packet(&abort_pkt)
         ));
 
         let flight_pkt = Packet::new(
