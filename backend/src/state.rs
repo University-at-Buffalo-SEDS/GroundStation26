@@ -615,7 +615,12 @@ impl AppState {
     pub fn board_status_snapshot(&self, now_ms: u64) -> BoardStatusMsg {
         let map = self.board_status.lock().unwrap();
         let visible_boards: Vec<Board> = if cfg!(feature = "test_fire_mode") {
-            vec![Board::ValveBoard, Board::GatewayBoard, Board::ActuatorBoard]
+            vec![
+                Board::ValveBoard,
+                Board::GatewayBoard,
+                Board::ActuatorBoard,
+                Board::DaqBoard,
+            ]
         } else {
             Board::ALL.iter().copied().collect()
         };

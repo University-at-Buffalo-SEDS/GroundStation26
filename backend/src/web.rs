@@ -33,6 +33,7 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration as StdDuration, Instant};
 use tokio::sync::{OnceCell, mpsc};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -1665,10 +1666,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         let mut telemetry_pending: VecDeque<TelemetryRow> = VecDeque::new();
         let mut telemetry_flush =
             tokio::time::interval(std::time::Duration::from_millis(telemetry_flush_ms));
+        let ws_diagnostics = crate::ws_diagnostics_enabled();
+        let mut last_ws_diag_log = Instant::now();
+        let ws_diag_interval = StdDuration::from_secs(2);
 
         loop {
             tokio::select! {
-                biased;
 
                 recv = warnings_rx.recv() => {
                     match recv {
@@ -1925,9 +1928,32 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             while telemetry_pending.len() > telemetry_pending_cap {
                                 telemetry_pending.pop_front();
                             }
+                            if ws_diagnostics && last_ws_diag_log.elapsed() >= ws_diag_interval {
+                                eprintln!(
+                                    "ws telemetry enqueue: pending={} dynamic_max_per_flush={} out_queue_cap={}",
+                                    telemetry_pending.len(),
+                                    dynamic_max_per_flush,
+                                    ws_out_queue_cap,
+                                );
+                                last_ws_diag_log = Instant::now();
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            // On lag, keep going and flush what we already have.
+                            if ws_diagnostics {
+                                eprintln!(
+                                    "ws telemetry broadcast lagged; pending_before_reseed={}",
+                                    telemetry_pending.len()
+                                );
+                            }
+                            let mut snapshot = state_for_send.recent_telemetry_snapshot();
+                            let snapshot_cap =
+                                telemetry_pending_cap.min(max_telemetry_per_flush_cap.saturating_mul(4));
+                            if snapshot.len() > snapshot_cap {
+                                let drop_n = snapshot.len() - snapshot_cap;
+                                snapshot.drain(0..drop_n);
+                            }
+                            snapshot.sort_by_key(|row| row.timestamp_ms);
+                            telemetry_pending = snapshot.into_iter().collect();
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -1951,14 +1977,32 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     }
                     let mut rows: Vec<TelemetryRow> = telemetry_pending.drain(..).collect();
                     rows.sort_by_key(|r| r.timestamp_ms);
+                    let row_count = rows.len();
 
                     let msg = WsOutMsg::TelemetryBatch(rows);
                     let text = serde_json::to_string(&msg).unwrap_or_default();
-                    let queue_was_full = match ws_out_tx.try_send(text) {
-                        Ok(()) => false,
-                        Err(mpsc::error::TrySendError::Full(_)) => true,
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
-                    };
+                    if ws_diagnostics && last_ws_diag_log.elapsed() >= ws_diag_interval {
+                        eprintln!(
+                            "ws telemetry flush: rows={} pending_before={} dynamic_max_per_flush={}",
+                            row_count,
+                            pending_before,
+                            dynamic_max_per_flush,
+                        );
+                        last_ws_diag_log = Instant::now();
+                    }
+                    let send_started = Instant::now();
+                    if ws_out_tx.send(text).await.is_err() {
+                        break;
+                    }
+                    let send_wait = send_started.elapsed();
+                    let queue_was_full = send_wait >= StdDuration::from_millis(5);
+                    if ws_diagnostics && queue_was_full {
+                        eprintln!(
+                            "ws telemetry backpressure: rows={} send_wait_ms={}",
+                            row_count,
+                            send_wait.as_millis()
+                        );
+                    }
 
                     if adaptive_rate {
                         let congested = queue_was_full && pending_before >= max_this_flush;

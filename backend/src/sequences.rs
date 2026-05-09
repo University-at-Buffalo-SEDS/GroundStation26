@@ -1747,7 +1747,7 @@ fn build_policy(
             inputs.valves,
             enabled,
         );
-        if inputs.flight_state != FlightState::Idle {
+        if !cfg!(feature = "test_fire_mode") && inputs.flight_state != FlightState::Idle {
             set_control_enabled(&mut policy, "Launch", false);
             set_control_enabled(&mut policy, "GroundStationLaunch", false);
         }
