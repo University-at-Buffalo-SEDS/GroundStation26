@@ -3314,8 +3314,8 @@ async fn handle_packet(
                 return Vec::new();
             }
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
-                state.clear_pending_umbilical_valve_state(key_cmd_id);
                 state.set_umbilical_valve_state(key_cmd_id, key_on);
+                state.reconcile_pending_umbilical_valve_state(key_cmd_id, key_on);
                 if key_cmd_id == ValveBoardCommands::PilotOpen as u8 && key_on {
                     transition_launch_clock_to_t_plus_from_pilot_open(state);
                 }

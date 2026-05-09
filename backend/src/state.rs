@@ -1296,11 +1296,11 @@ impl AppState {
             .copied()
     }
 
-    pub fn clear_pending_umbilical_valve_state(&self, cmd_id: u8) {
-        self.pending_umbilical_valve_states
-            .lock()
-            .unwrap()
-            .remove(&cmd_id);
+    pub fn reconcile_pending_umbilical_valve_state(&self, cmd_id: u8, actual: bool) {
+        let mut pending = self.pending_umbilical_valve_states.lock().unwrap();
+        if pending.get(&cmd_id).copied() == Some(actual) {
+            pending.remove(&cmd_id);
+        }
     }
 
     /// Appends a telemetry row to the in-memory reseed cache and prunes old entries.

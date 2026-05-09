@@ -940,24 +940,6 @@ fn tank_is_vented(
         && mass_is_vented(current_mass_kg, cfg)
 }
 
-fn calibrated_value_in_range(
-    label: &str,
-    value: Option<f32>,
-    min: f32,
-    max: f32,
-) -> Result<(), String> {
-    let value = value.ok_or_else(|| format!("{label} has no calibrated telemetry yet"))?;
-    if !value.is_finite() {
-        return Err(format!("{label} calibrated value is not finite"));
-    }
-    if value < min || value > max {
-        return Err(format!(
-            "{label} calibrated value {value:.2} is outside {min:.2}..{max:.2}"
-        ));
-    }
-    Ok(())
-}
-
 fn fill_sequence_calibration_issue(
     _state: &AppState,
     cfg: &SequenceConfig,
@@ -970,21 +952,28 @@ fn fill_sequence_calibration_issue(
 
     let mut issues = Vec::new();
 
-    if let Err(issue) = calibrated_value_in_range(
-        "Fill mass",
-        current_mass_kg,
-        cfg.calibration_mass_min_kg,
-        cfg.calibration_mass_max_kg,
-    ) {
-        issues.push(issue);
+    match current_mass_kg {
+        None => issues.push("fill mass has no calibrated telemetry yet"),
+        Some(value) if !value.is_finite() => issues.push("fill mass calibrated value is invalid"),
+        Some(value)
+            if value < cfg.calibration_mass_min_kg || value > cfg.calibration_mass_max_kg =>
+        {
+            issues.push("fill mass is outside the configured calibration range")
+        }
+        Some(_) => {}
     }
-    if let Err(issue) = calibrated_value_in_range(
-        "Tank pressure",
-        pressure_psi,
-        cfg.calibration_pressure_min_psi,
-        cfg.calibration_pressure_max_psi,
-    ) {
-        issues.push(issue);
+    match pressure_psi {
+        None => issues.push("tank pressure has no calibrated telemetry yet"),
+        Some(value) if !value.is_finite() => {
+            issues.push("tank pressure calibrated value is invalid")
+        }
+        Some(value)
+            if value < cfg.calibration_pressure_min_psi
+                || value > cfg.calibration_pressure_max_psi =>
+        {
+            issues.push("tank pressure is outside the configured calibration range")
+        }
+        Some(_) => {}
     }
 
     if issues.is_empty() {
