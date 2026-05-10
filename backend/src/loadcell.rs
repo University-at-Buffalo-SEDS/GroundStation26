@@ -60,23 +60,6 @@ pub enum FitMode {
     Poly4Zero,
 }
 
-impl FitMode {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "best" => Some(Self::Best),
-            "linear" => Some(Self::Linear),
-            "linear_zero" => Some(Self::LinearZero),
-            "poly2" | "parabolic" | "quadratic" => Some(Self::Poly2),
-            "poly2_zero" | "parabolic_zero" | "quadratic_zero" => Some(Self::Poly2Zero),
-            "poly3" | "cubic" => Some(Self::Poly3),
-            "poly3_zero" | "cubic_zero" => Some(Self::Poly3Zero),
-            "poly4" | "quartic" => Some(Self::Poly4),
-            "poly4_zero" | "quartic_zero" => Some(Self::Poly4Zero),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChannelLinear {
     pub m: Option<f32>,
@@ -515,7 +498,6 @@ pub fn upsert_point(
     expected: f32,
     raw: f32,
 ) {
-    let expected = expected.max(0.0);
     match &channel {
         CalibrationChannel::Custom(key) => {
             let channel = cfg.extra_channels.entry(key.clone()).or_default();
@@ -533,6 +515,7 @@ pub fn upsert_point(
     sync_extra_channels_into_legacy(cfg);
     update_weights_kg(cfg);
 }
+
 
 pub fn capture_zero(cfg: &mut LoadcellCalibrationFile, sensor_id: &str, raw: f32) {
     let channel = CalibrationChannel::from_str(sensor_id);

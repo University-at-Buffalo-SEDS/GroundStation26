@@ -607,10 +607,7 @@ struct CaptureLoadcellSpanReq {
 }
 
 #[derive(Deserialize)]
-struct RefitLoadcellReq {
-    channel: String,
-    mode: String,
-}
+struct RefitLoadcellReq {}
 
 /// Returns the in-memory loadcell calibration file.
 async fn get_loadcell_calibration(
@@ -708,24 +705,8 @@ async fn refit_loadcell_channel(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
-    let channel = loadcell::CalibrationChannel::from_str(req.channel.trim());
-    let Some(mode) = loadcell::FitMode::from_str(req.mode.trim()) else {
-        return (StatusCode::BAD_REQUEST, "invalid fit mode".to_string()).into_response();
-    };
-
-    let updated = {
-        let mut cfg = state.loadcell_calibration.lock().unwrap();
-        if let Err(err) = loadcell::refit_channel(&mut cfg, channel, mode) {
-            return (StatusCode::BAD_REQUEST, err).into_response();
-        }
-        cfg.clone()
-    };
-
-    if let Err(err) = loadcell::save(&updated) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
-    }
-    state.broadcast_fill_targets_snapshot();
-    Json(updated).into_response()
+    let _ = req;
+    Json(state.loadcell_calibration.lock().unwrap().clone()).into_response()
 }
 
 /// Serves a map tile or a synthesized ancestor fallback when the exact tile is missing.
