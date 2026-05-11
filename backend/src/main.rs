@@ -452,8 +452,8 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 gs_debug_println!("Rocket comms missing, using DummyComms: {}", e);
-                eprintln!(
-                    "AV bay link setup hint: {}",
+                log::warn!(
+                    "AV bay link unavailable: {e}. Setup hint: {}",
                     startup_failure_hint(&comms_links.av_bay)
                 );
                 #[cfg(feature = "testing")]
@@ -488,8 +488,8 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 gs_debug_println!("Umbilical comms missing, using DummyComms: {}", e);
-                eprintln!(
-                    "Fill box link setup hint: {}",
+                log::warn!(
+                    "Fill box link unavailable: {e}. Setup hint: {}",
                     startup_failure_hint(&comms_links.fill_box)
                 );
                 #[cfg(feature = "testing")]

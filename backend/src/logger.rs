@@ -3,9 +3,11 @@ use flexi_logger::{
     Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, Logger, Naming, Record, WriteMode,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const LOG_BASENAME: &str = "groundstation";
 const LOG_ROTATE_BYTES: u64 = 100 * 1024 * 1024;
+static LOG_ENTRY_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn init() -> Result<()> {
     let log_dir = log_dir();
@@ -50,13 +52,15 @@ fn format_record(
     now: &mut DeferredNow,
     record: &Record<'_>,
 ) -> std::io::Result<()> {
+    let entry_id = LOG_ENTRY_ID.fetch_add(1, Ordering::Relaxed);
     let thread = std::thread::current();
     let thread_name = thread.name().unwrap_or("unnamed");
     let file = record.file().unwrap_or("unknown");
     let line = record.line().unwrap_or(0);
     write!(
         writer,
-        "{} {:<5} [{} {:?}] {}:{} {}",
+        "==========({:010})============= {} {:<5} [{} {:?}] {}:{} {}",
+        entry_id,
         now.now().format("%Y-%m-%d %H:%M:%S%.3f%:z"),
         record.level(),
         thread_name,

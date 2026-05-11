@@ -24,11 +24,11 @@ use sedsprintf_rs_2026::serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::{Duration, interval};
 
 pub struct CommsWorkerHandle {
@@ -803,7 +803,6 @@ async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_st
         .await;
 }
 
-static DB_OVERFLOW_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static BATTERY_ESTIMATOR_STATE: OnceLock<Mutex<HashMap<String, BatteryEstimatorState>>> =
     OnceLock::new();
 static SPEED_ESTIMATOR_STATE: OnceLock<Mutex<SpeedEstimatorState>> = OnceLock::new();
@@ -815,13 +814,8 @@ const BATTERY_MAX_VOLTAGE_SLEW_V_PER_SEC: f32 = 0.035;
 const BATTERY_MIN_VOLTAGE_DEFAULT: f32 = 6.3;
 const BATTERY_MAX_VOLTAGE_DEFAULT: f32 = 8.4;
 
-#[derive(Clone)]
-struct DbOverflow {
-    queue: Arc<Mutex<VecDeque<DbWrite>>>,
-    notify: Arc<Notify>,
-    running: Arc<AtomicBool>,
-    max_entries: usize,
-}
+#[derive(Clone, Default)]
+struct DbOverflow;
 
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
@@ -2002,12 +1996,7 @@ pub async fn telemetry_task(
     );
     let packet_enqueue_burst = env_usize("GS_PACKET_ENQUEUE_BURST", PACKET_ENQUEUE_BURST, 32, 4096);
     let (packet_tx, mut packet_rx) = mpsc::channel::<Packet>(packet_work_queue_size);
-    let db_overflow = DbOverflow {
-        queue: Arc::new(Mutex::new(VecDeque::new())),
-        notify: Arc::new(Notify::new()),
-        running: Arc::new(AtomicBool::new(true)),
-        max_entries: env_usize("GS_DB_OVERFLOW_MAX", 250_000, 1024, 5_000_000),
-    };
+    let db_overflow = DbOverflow;
 
     let db_worker = {
         let state = state.clone();
@@ -2223,30 +2212,6 @@ pub async fn telemetry_task(
                 }
             }
             log::info!("telemetry db worker stopped");
-        })
-    };
-
-    let db_overflow_worker = {
-        let db_tx = state.db_queue_tx.clone();
-        let db_overflow = db_overflow.clone();
-        tokio::spawn(async move {
-            log::info!("db overflow worker started");
-            while db_overflow.running.load(Ordering::Relaxed) {
-                db_overflow.notify.notified().await;
-                loop {
-                    let next = {
-                        let mut q = db_overflow.queue.lock().unwrap();
-                        q.pop_front()
-                    };
-                    let Some(write) = next else {
-                        break;
-                    };
-                    if db_tx.send(DbQueueItem::Write(write)).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            log::info!("db overflow worker stopped");
         })
     };
 
@@ -2856,17 +2821,6 @@ pub async fn telemetry_task(
         ),
     }
 
-    db_overflow.running.store(false, Ordering::Relaxed);
-    db_overflow.notify.notify_waiters();
-    match tokio::time::timeout(worker_shutdown_timeout, db_overflow_worker).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("DB overflow worker ended with error: {e}"),
-        Err(_) => eprintln!(
-            "DB overflow worker did not shut down within {:?}",
-            worker_shutdown_timeout
-        ),
-    }
-
     match tokio::time::timeout(worker_shutdown_timeout, db_worker).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("DB worker ended with error: {e}"),
@@ -3167,36 +3121,11 @@ async fn queue_db_write(
     db_overflow: &DbOverflow,
     write: DbWrite,
 ) {
+    let _ = db_overflow;
     match db_tx.try_send(DbQueueItem::Write(write)) {
         Ok(()) => {}
         Err(TrySendError::Full(DbQueueItem::Write(write))) => {
-            let mut write_opt = Some(write);
-            let mut queued_len = 0usize;
-            let mut pushed = false;
-            {
-                let mut q = db_overflow.queue.lock().unwrap();
-                if q.len() < db_overflow.max_entries {
-                    q.push_back(write_opt.take().unwrap());
-                    queued_len = q.len();
-                    pushed = true;
-                }
-            }
-            if pushed {
-                db_overflow.notify.notify_one();
-                let now_ms = get_current_timestamp_ms();
-                let prev = DB_OVERFLOW_LAST_LOG_MS.load(Ordering::Relaxed);
-                if now_ms.saturating_sub(prev) >= 60_000 {
-                    DB_OVERFLOW_LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
-                    eprintln!(
-                        "Telemetry DB overflow queue buffered {} pending rows (no drop mode)",
-                        queued_len
-                    );
-                }
-            } else if db_tx
-                .send(DbQueueItem::Write(write_opt.take().unwrap()))
-                .await
-                .is_err()
-            {
+            if db_tx.send(DbQueueItem::Write(write)).await.is_err() {
                 emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
             }
         }
@@ -3750,12 +3679,7 @@ mod tests {
     }
 
     fn test_db_overflow() -> DbOverflow {
-        DbOverflow {
-            queue: Arc::new(Mutex::new(VecDeque::new())),
-            notify: Arc::new(Notify::new()),
-            running: Arc::new(AtomicBool::new(true)),
-            max_entries: 16,
-        }
+        DbOverflow
     }
 
     #[test]
