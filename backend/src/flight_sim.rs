@@ -31,6 +31,8 @@ const AV_BAY_SENSOR_PERIOD_MS: u64 = 140;
 #[cfg(feature = "testing")]
 const FILL_SYSTEM_SENSOR_PERIOD_MS: u64 = 40;
 #[cfg(feature = "testing")]
+const DAQ_FAST_SENSOR_PERIOD_MS: u64 = 20;
+#[cfg(feature = "testing")]
 const FLIGHT_STATE_PERIOD_MS: u64 = 1_000;
 #[cfg(feature = "testing")]
 const LAUNCH_COUNTDOWN_DURATION_MS: u64 = 10_000;
@@ -186,15 +188,7 @@ const AV_BAY_DESCENT_SENSOR_SEQUENCE: &[SimSensorSpec] = &[
 #[cfg(feature = "testing")]
 const FILL_SYSTEM_SENSOR_SEQUENCE: &[SimSensorSpec] = &[
     SimSensorSpec {
-        dtype: DataType::FuelTankPressure,
-        sender: Board::DaqBoard,
-    },
-    SimSensorSpec {
         dtype: DataType::FuelFlow,
-        sender: Board::DaqBoard,
-    },
-    SimSensorSpec {
-        dtype: DataType::KG1000,
         sender: Board::DaqBoard,
     },
     SimSensorSpec {
@@ -346,6 +340,8 @@ struct FlightSimState {
     last_state_emit_ms: u64,
     last_av_bay_sensor_emit_ms: u64,
     last_fill_system_sensor_emit_ms: u64,
+    last_pressure_transducer_emit_ms: u64,
+    last_loadcell_emit_ms: u64,
     last_housekeeping_emit_ms: u64,
     next_av_bay_sensor_idx: usize,
     next_fill_system_sensor_idx: usize,
@@ -406,6 +402,8 @@ impl FlightSimState {
             last_state_emit_ms: 0,
             last_av_bay_sensor_emit_ms: 0,
             last_fill_system_sensor_emit_ms: 0,
+            last_pressure_transducer_emit_ms: 0,
+            last_loadcell_emit_ms: 0,
             last_housekeeping_emit_ms: 0,
             next_av_bay_sensor_idx: 0,
             next_fill_system_sensor_idx: 0,
@@ -1297,6 +1295,34 @@ fn next_scheduled_sensor_packet(
 }
 
 #[cfg(feature = "testing")]
+fn next_scheduled_loadcell_packet(
+    state: &mut FlightSimState,
+    now_ms: u64,
+) -> TelemetryResult<Option<Packet>> {
+    state.next_sensor_packet(
+        SimSensorSpec {
+            dtype: DataType::KG1000,
+            sender: Board::DaqBoard,
+        },
+        now_ms,
+    )
+}
+
+#[cfg(feature = "testing")]
+fn next_scheduled_pressure_transducer_packet(
+    state: &mut FlightSimState,
+    now_ms: u64,
+) -> TelemetryResult<Option<Packet>> {
+    state.next_sensor_packet(
+        SimSensorSpec {
+            dtype: DataType::FuelTankPressure,
+            sender: Board::DaqBoard,
+        },
+        now_ms,
+    )
+}
+
+#[cfg(feature = "testing")]
 fn sim_endpoints_for_datatype(dtype: DataType) -> &'static [DataEndpoint] {
     match dtype {
         DataType::GpsData => &[DataEndpoint::GroundStation, DataEndpoint::FlightController],
@@ -1454,6 +1480,20 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
         s.last_state_emit_ms = now_ms;
         s.queue_flight_state(now_ms);
         if let Some(pkt) = s.pop_next_queued() {
+            return Ok(Some(pkt));
+        }
+    }
+
+    if now_ms.saturating_sub(s.last_pressure_transducer_emit_ms) >= DAQ_FAST_SENSOR_PERIOD_MS {
+        s.last_pressure_transducer_emit_ms = now_ms;
+        if let Some(pkt) = next_scheduled_pressure_transducer_packet(&mut s, now_ms)? {
+            return Ok(Some(pkt));
+        }
+    }
+
+    if now_ms.saturating_sub(s.last_loadcell_emit_ms) >= DAQ_FAST_SENSOR_PERIOD_MS {
+        s.last_loadcell_emit_ms = now_ms;
+        if let Some(pkt) = next_scheduled_loadcell_packet(&mut s, now_ms)? {
             return Ok(Some(pkt));
         }
     }
