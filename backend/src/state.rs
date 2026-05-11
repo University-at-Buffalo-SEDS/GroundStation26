@@ -130,6 +130,9 @@ pub struct AppState {
     /// Broadcast shutdown notifications to long-running background tasks.
     pub shutdown_tx: broadcast::Sender<()>,
 
+    /// True once app-wide shutdown has been requested.
+    pub shutdown_requested: Arc<AtomicBool>,
+
     /// Number of in-flight async DB writes (alerts/warnings/errors).
     pub pending_db_writes: Arc<AtomicUsize>,
 
@@ -915,8 +918,15 @@ impl AppState {
     }
 
     /// Broadcasts a shutdown request to all long-running tasks.
-    pub fn request_shutdown(&self) {
-        let _ = self.shutdown_tx.send(());
+    pub fn request_shutdown(&self) -> bool {
+        let first = self
+            .shutdown_requested
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if first {
+            let _ = self.shutdown_tx.send(());
+        }
+        first
     }
 
     /// Updates local flight state, notifies subscribers, and persists the transition asynchronously.

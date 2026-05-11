@@ -207,7 +207,9 @@ async fn shutdown_signal(state: Arc<AppState>) {
     #[cfg(not(unix))]
     ctrl_c.await;
 
-    state.request_shutdown();
+    if state.request_shutdown() {
+        log::info!("shutdown requested from signal handler");
+    }
 }
 
 #[tokio::main]
@@ -325,6 +327,7 @@ async fn main() -> anyhow::Result<()> {
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
         shutdown_tx,
+        shutdown_requested: Arc::new(AtomicBool::new(false)),
         pending_db_writes: Arc::new(AtomicUsize::new(0)),
         db_write_notify: Arc::new(Notify::new()),
         notifications: Arc::new(Mutex::new(Vec::new())),
@@ -637,8 +640,11 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // Ensure background tasks are signaled even if server exits unexpectedly.
-    state.request_shutdown();
-    log::info!("shutdown requested; draining background tasks");
+    if state.request_shutdown() {
+        log::info!("shutdown requested; draining background tasks");
+    } else {
+        log::info!("shutdown already in progress; draining background tasks");
+    }
 
     let telemetry_shutdown_timeout = Duration::from_secs(20);
     let task_shutdown_timeout = Duration::from_secs(5);

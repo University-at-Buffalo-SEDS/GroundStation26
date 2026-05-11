@@ -3911,6 +3911,7 @@ mod tests {
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
             shutdown_tx,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             pending_db_writes: Arc::new(AtomicUsize::new(0)),
             db_write_notify: Arc::new(Notify::new()),
             notifications: Arc::new(Mutex::new(Vec::new())),
