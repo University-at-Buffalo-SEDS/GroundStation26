@@ -57,10 +57,10 @@ fn format_record(
     let thread_name = thread.name().unwrap_or("unnamed");
     let file = record.file().unwrap_or("unknown");
     let line = record.line().unwrap_or(0);
+    writeln!(writer, "==========({:010})=============", entry_id)?;
     write!(
         writer,
-        "==========({:010})============= {} {:<5} [{} {:?}] {}:{} {}",
-        entry_id,
+        "{} {:<5} [{} {:?}] {}:{} {}",
         now.now().format("%Y-%m-%d %H:%M:%S%.3f%:z"),
         record.level(),
         thread_name,
