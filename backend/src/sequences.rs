@@ -146,7 +146,6 @@ struct SequenceConfig {
     max_leak_drop_psi: f32,
     max_leak_mass_delta_kg: f32,
     allowed_hold_drop_psi_per_min: f32,
-    normally_open_hold_drop_psi_per_min: f32,
     allowed_hold_mass_drop_kg_per_min: f32,
     nitrous_weight_rise_epsilon_kg: f32,
     empty_mass_noise_allowance_kg: f32,
@@ -258,12 +257,6 @@ impl SequenceConfig {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(0.2);
 
-        let normally_open_hold_drop_psi_per_min =
-            std::env::var("GS_SEQUENCE_NO_HOLD_DROP_PSI_PER_MIN")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(20.0);
-
         let allowed_hold_mass_drop_kg_per_min =
             std::env::var("GS_SEQUENCE_ALLOWED_HOLD_MASS_DROP_KG_PER_MIN")
                 .ok()
@@ -351,7 +344,6 @@ impl SequenceConfig {
             max_leak_drop_psi,
             max_leak_mass_delta_kg,
             allowed_hold_drop_psi_per_min,
-            normally_open_hold_drop_psi_per_min,
             allowed_hold_mass_drop_kg_per_min,
             nitrous_weight_rise_epsilon_kg,
             empty_mass_noise_allowance_kg,
@@ -836,17 +828,13 @@ fn set_control_enabled(policy: &mut ActionPolicyMsg, cmd: &str, enabled: bool) {
 fn sequence_expects_normally_open(step: SequenceStep) -> bool {
     matches!(
         step,
-        SequenceStep::NitrogenFill
-            | SequenceStep::CloseNitrogen
-            | SequenceStep::NitrogenLeakCheck
-            | SequenceStep::DumpNitrogen
+        SequenceStep::DumpNitrogen
             | SequenceStep::CloseDump
             | SequenceStep::AwaitFillTestDecision
             | SequenceStep::RecoverNitrogenClose
             | SequenceStep::RecoverNitrogenVent
             | SequenceStep::RecoverNitrogenCloseDump
             | SequenceStep::OpenNitrous
-            | SequenceStep::NitrousSoak
             | SequenceStep::CloseNitrous
             | SequenceStep::RecoverNitrousClose
             | SequenceStep::RecoverNitrousVent
@@ -854,18 +842,37 @@ fn sequence_expects_normally_open(step: SequenceStep) -> bool {
     )
 }
 
+fn sequence_expects_normally_closed(step: SequenceStep) -> bool {
+    matches!(
+        step,
+        SequenceStep::SetupValves
+            | SequenceStep::NitrogenFill
+            | SequenceStep::CloseNitrogen
+            | SequenceStep::NitrogenLeakCheck
+            | SequenceStep::NitrousSoak
+            | SequenceStep::CloseNormallyOpen
+    )
+}
+
 fn sequence_blocks_until_normally_open(step: SequenceStep) -> bool {
     matches!(
         step,
-        SequenceStep::NitrogenFill
-            | SequenceStep::CloseNitrogen
-            | SequenceStep::NitrogenLeakCheck
-            | SequenceStep::DumpNitrogen
+        SequenceStep::DumpNitrogen
             | SequenceStep::CloseDump
             | SequenceStep::AwaitFillTestDecision
             | SequenceStep::OpenNitrous
-            | SequenceStep::NitrousSoak
             | SequenceStep::CloseNitrous
+    )
+}
+
+fn sequence_blocks_until_normally_closed(step: SequenceStep) -> bool {
+    matches!(
+        step,
+        SequenceStep::SetupValves
+            | SequenceStep::NitrogenFill
+            | SequenceStep::CloseNitrogen
+            | SequenceStep::NitrogenLeakCheck
+            | SequenceStep::NitrousSoak
     )
 }
 
@@ -1045,7 +1052,19 @@ fn update_sequence_runtime(
         }
         return;
     }
-    if valves.normally_open == Some(true) {
+    if sequence_blocks_until_normally_closed(runtime.step) && valves.normally_open == Some(true) {
+        if !runtime.notified_reopen_normally_open {
+            state.add_notification(
+                "Vent valve must be closed for this step. Close the vent valve before continuing the fill sequence.",
+            );
+            runtime.notified_reopen_normally_open = true;
+        }
+        return;
+    }
+    if (sequence_blocks_until_normally_open(runtime.step) && valves.normally_open == Some(true))
+        || (sequence_blocks_until_normally_closed(runtime.step)
+            && valves.normally_open == Some(false))
+    {
         runtime.notified_reopen_normally_open = false;
     }
 
@@ -1071,7 +1090,7 @@ fn update_sequence_runtime(
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if valves.normally_open == Some(true) && valves.dump_open == Some(false) {
+            if valves.normally_open == Some(false) && valves.dump_open == Some(false) {
                 runtime.step = SequenceStep::NitrogenFill;
             }
         }
@@ -1168,17 +1187,10 @@ fn update_sequence_runtime(
                 runtime.warned_rapid_drop = false;
                 runtime.warned_mass_shift = false;
                 dismiss_fill_test_warning_notifications(state, runtime);
-                if valves.normally_open == Some(true) {
-                    state.add_temporary_notification(format!(
-                        "Nitrogen fill test started. Vent valve is open, so a controlled pressure bleed is expected while loadcell hold is monitored for {}s.",
-                        cfg.leak_check_duration.as_secs()
-                    ));
-                } else {
-                    state.add_temporary_notification(format!(
-                        "Nitrogen fill test started. Monitoring pressure and loadcell hold for {}s.",
-                        cfg.leak_check_duration.as_secs()
-                    ));
-                }
+                state.add_temporary_notification(format!(
+                    "Nitrogen fill test started with vent valve closed. Monitoring pressure and loadcell hold for {}s with only small noise tolerance.",
+                    cfg.leak_check_duration.as_secs()
+                ));
                 runtime.step = SequenceStep::NitrogenLeakCheck;
             }
         }
@@ -1195,13 +1207,8 @@ fn update_sequence_runtime(
                 .map(|m| (m - mass_baseline).abs())
                 .unwrap_or(0.0);
             let elapsed_min = now.saturating_duration_since(started).as_secs_f32() / 60.0;
-            let allowed_pressure_drop = cfg.max_leak_drop_psi
-                + elapsed_min
-                    * if valves.normally_open == Some(true) {
-                        cfg.normally_open_hold_drop_psi_per_min
-                    } else {
-                        cfg.allowed_hold_drop_psi_per_min
-                    };
+            let allowed_pressure_drop =
+                cfg.max_leak_drop_psi + elapsed_min * cfg.allowed_hold_drop_psi_per_min;
             let allowed_mass_shift =
                 cfg.max_leak_mass_delta_kg + elapsed_min * cfg.allowed_hold_mass_drop_kg_per_min;
             let pressure_warning_active = drop_psi > allowed_pressure_drop;
@@ -1246,15 +1253,9 @@ fn update_sequence_runtime(
                 dismiss_leak_fail_notification(state, runtime);
                 dismiss_fill_test_warning_notifications(state, runtime);
                 if !runtime.notified_leak_pass {
-                    if valves.normally_open == Some(true) {
-                        state.add_notification(
-                            "Nitrogen hold check passed. Vent-valve bleed stayed within allowance and loadcell is stable.",
-                        );
-                    } else {
-                        state.add_notification(
-                            "Nitrogen hold check passed. Pressure and loadcell are stable.",
-                        );
-                    }
+                    state.add_notification(
+                        "Nitrogen hold check passed. Pressure drop stayed within the closed-vent allowance and loadcell is stable.",
+                    );
                     runtime.notified_leak_pass = true;
                 }
                 runtime.next_step_after_dump = Some(SequenceStep::OpenNitrous);
@@ -1766,6 +1767,18 @@ fn build_policy(
     {
         recommended.insert("NormallyOpen", blink);
     }
+    if sequence_expects_normally_closed(runtime.step)
+        && let Some(blink) = command_prompt_blink(
+            state,
+            cfg,
+            inputs.valves,
+            "NormallyOpen",
+            false,
+            inputs.now_ms,
+        )
+    {
+        recommended.insert("NormallyOpen", blink);
+    }
 
     match runtime.step {
         SequenceStep::SetupValves => {
@@ -1774,7 +1787,7 @@ fn build_policy(
                 cfg,
                 inputs.valves,
                 "NormallyOpen",
-                true,
+                false,
                 inputs.now_ms,
             ) {
                 recommended.insert("NormallyOpen", blink);
