@@ -2,6 +2,7 @@ use anyhow::Result;
 use flexi_logger::{
     Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, Logger, Naming, Record, WriteMode,
 };
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -31,7 +32,8 @@ pub fn init() -> Result<()> {
             Cleanup::Never,
         )
         .write_mode(WriteMode::Direct)
-        .format(format_record)
+        .format_for_files(format_record)
+        .format_for_stderr(format_record)
         .start()?;
 
     install_panic_hook();
@@ -57,9 +59,10 @@ fn format_record(
     let thread_name = thread.name().unwrap_or("unnamed");
     let file = record.file().unwrap_or("unknown");
     let line = record.line().unwrap_or(0);
-    writeln!(writer, "==========({:010})=============", entry_id)?;
-    write!(
-        writer,
+
+    let mut log_line = String::new();
+    let _ = write!(
+        &mut log_line,
         "{} {:<5} [{} {:?}] {}:{} {}",
         now.now().format("%Y-%m-%d %H:%M:%S%.3f%:z"),
         record.level(),
@@ -68,8 +71,10 @@ fn format_record(
         file,
         line,
         record.args()
-    )?;
-    writeln!(writer)
+    );
+
+    writer.write_all(format!("==========({entry_id:010})=============\n").as_bytes())?;
+    writer.write_all(log_line.as_bytes())
 }
 
 fn install_panic_hook() {
