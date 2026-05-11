@@ -139,7 +139,8 @@
         "cmd": "GroundStationLaunch",
         "border": "#22c55e",
         "bg": "#022c22",
-        "fg": "#bbf7d0"
+        "fg": "#bbf7d0",
+        "spacer_row_before": true
       },
       {
         "label": "Dump",
@@ -153,7 +154,8 @@
         "cmd": "Igniter",
         "border": "#60a5fa",
         "bg": "#0b1220",
-        "fg": "#bfdbfe"
+        "fg": "#bfdbfe",
+        "spacer_after": true
       },
       {
         "label": "Pilot",
