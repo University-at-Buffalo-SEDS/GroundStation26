@@ -70,7 +70,11 @@ fn normalize_mass_target(value: f32) -> f32 {
         return 0.01;
     }
     if value.abs() < 0.01 {
-        if value.is_sign_negative() { -0.01 } else { 0.01 }
+        if value.is_sign_negative() {
+            -0.01
+        } else {
+            0.01
+        }
     } else {
         value
     }

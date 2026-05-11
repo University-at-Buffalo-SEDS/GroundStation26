@@ -21,6 +21,7 @@ mod gpio_panel;
 mod i18n;
 mod layout;
 mod loadcell;
+mod logger;
 mod map;
 mod ring_buffer;
 mod rocket_commands;
@@ -30,6 +31,8 @@ mod sequences;
 mod state;
 mod telemetry_db;
 mod telemetry_task;
+#[cfg(feature = "test_fire_mode")]
+mod test_fire_csv;
 mod types;
 mod web;
 
@@ -41,8 +44,8 @@ use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
 use crate::telemetry_db::{
     DEFAULT_TELEMETRY_DB_FILENAME, DbQueueItem, LaunchClockMsg, RecordingModeWire,
-    RecordingStatusMsg, apply_sqlite_pragmas, close_and_finalize_sqlite, ensure_sqlite_db_file,
-    open_telemetry_db,
+    RecordingStatusMsg, apply_sqlite_pragmas, close_and_finalize_sqlite, delete_sqlite_if_empty,
+    ensure_sqlite_db_file, open_in_memory_telemetry_db, recover_sqlite_sidecars_in_dir,
 };
 use crate::telemetry_task::{
     CommsWorkerHandle, get_current_timestamp_ms, set_network_time_router, telemetry_task,
@@ -63,7 +66,7 @@ use sedsprintf_rs_2026::timesync::{TimeSyncConfig, TimeSyncRole};
 use sqlx::Row;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -175,38 +178,11 @@ async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn load_persisted_messages(
-    db: &sqlx::SqlitePool,
-) -> anyhow::Result<Vec<crate::sequences::PersistentNotification>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT id, timestamp_ms, message, action_label, action_cmd
-        FROM messages
-        ORDER BY timestamp_ms DESC, id DESC
-        LIMIT 200
-        "#,
-    )
-    .fetch_all(db)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| crate::sequences::PersistentNotification {
-            id: row.get::<i64, _>("id") as u64,
-            timestamp_ms: row.get("timestamp_ms"),
-            message: row.get("message"),
-            persistent: false,
-            action_label: row.get("action_label"),
-            action_cmd: row.get("action_cmd"),
-        })
-        .collect())
-}
-
 /// Waits for process termination signals and then fan-outs the app-wide shutdown request.
 async fn shutdown_signal(state: Arc<AppState>) {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
-            eprintln!("Failed to install Ctrl+C handler: {err}");
+            log::error!("failed to install Ctrl+C handler: {err}");
         }
     };
 
@@ -217,7 +193,7 @@ async fn shutdown_signal(state: Arc<AppState>) {
                 stream.recv().await;
             }
             Err(err) => {
-                eprintln!("Failed to install SIGTERM handler: {err}");
+                log::error!("failed to install SIGTERM handler: {err}");
             }
         }
     };
@@ -236,22 +212,32 @@ async fn shutdown_signal(state: Arc<AppState>) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    logger::init()?;
+    log::info!(
+        "groundstation backend starting features testing={} hitl_mode={} test_fire_mode={}",
+        cfg!(feature = "testing"),
+        cfg!(feature = "hitl_mode"),
+        cfg!(feature = "test_fire_mode")
+    );
+
     // Initialize GPIO
     let gpio = gpio::GpioPins::new();
 
     // Ensure offline map tiles
     if let Err(e) = ensure_map_data(DEFAULT_MAP_REGION).await {
-        eprintln!("WARNING: failed to ensure map tiles: {e:#}");
+        log::warn!("failed to ensure map tiles: {e:#}");
         // you can choose to return Err(e) instead if tiles are mandatory
     }
 
     // --- DB path ---
-    let db_path = PathBuf::from("./data").join(DEFAULT_TELEMETRY_DB_FILENAME);
-    let (db, db_path_str) = open_telemetry_db(&db_path).await?;
-    let auth_db_path = db_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("users.db");
+    let recordings_dir = PathBuf::from("./data");
+    let placeholder_db_path = recordings_dir.join(DEFAULT_TELEMETRY_DB_FILENAME);
+    recover_sqlite_sidecars_in_dir(&recordings_dir).await?;
+    if placeholder_db_path.exists() {
+        let _ = delete_sqlite_if_empty(&placeholder_db_path.to_string_lossy()).await;
+    }
+    let db = open_in_memory_telemetry_db().await?;
+    let auth_db_path = recordings_dir.join("users.db");
     let auth_db_path_str = ensure_sqlite_db_file(&auth_db_path)?;
     let auth_db = sqlx::SqlitePool::connect(&format!("sqlite://{}", auth_db_path_str)).await?;
     apply_sqlite_pragmas(&auth_db).await;
@@ -322,8 +308,8 @@ async fn main() -> anyhow::Result<()> {
         alert_ack_tx: broadcast::channel(16).0,
         dashboard_reset_tx,
         db: Arc::new(Mutex::new(db)),
-        db_path: Arc::new(Mutex::new(db_path_str.clone())),
-        placeholder_db_path: db_path_str.clone(),
+        db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
+        placeholder_db_path: placeholder_db_path.to_string_lossy().to_string(),
         db_queue_tx,
         auth_db,
         state: Arc::new(Mutex::new(FlightStateMode::Startup)),
@@ -348,7 +334,9 @@ async fn main() -> anyhow::Result<()> {
         messages_tx,
         next_message_id: Arc::new(AtomicU64::new(0)),
         action_policy: Arc::new(Mutex::new(default_action_policy())),
-        sequence_policy_state: Arc::new(Mutex::new(crate::sequences::SequencePolicyState::default())),
+        sequence_policy_state: Arc::new(Mutex::new(
+            crate::sequences::SequencePolicyState::default(),
+        )),
         action_policy_tx,
         fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
         fill_targets_tx,
@@ -364,7 +352,7 @@ async fn main() -> anyhow::Result<()> {
         hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
         recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
             mode: RecordingModeWire::Idle,
-            db_path: Some(db_path_str.clone()),
+            db_path: None,
         })),
         recording_status_tx,
         last_command_ms: Arc::new(Mutex::new(HashMap::new())),
@@ -379,8 +367,7 @@ async fn main() -> anyhow::Result<()> {
         auth,
     });
 
-    let persisted_messages = load_persisted_messages(&state.telemetry_db_pool()).await?;
-    state.set_messages_snapshot(persisted_messages);
+    state.set_messages_snapshot(Vec::new());
 
     gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
     let sequence_shutdown_rx = state.shutdown_subscribe();
@@ -644,20 +631,22 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = "0.0.0.0:3000";
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    log::info!("web server listening on {addr}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(state.clone()))
         .await?;
 
     // Ensure background tasks are signaled even if server exits unexpectedly.
     state.request_shutdown();
+    log::info!("shutdown requested; draining background tasks");
 
     let telemetry_shutdown_timeout = Duration::from_secs(20);
     let task_shutdown_timeout = Duration::from_secs(5);
     match tokio::time::timeout(telemetry_shutdown_timeout, &mut tt).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("Telemetry task ended with error: {e}"),
-        Err(_) => eprintln!(
-            "Telemetry task did not shut down within {:?}",
+        Ok(Err(e)) => log::error!("telemetry task ended with error: {e}"),
+        Err(_) => log::error!(
+            "telemetry task did not shut down within {:?}",
             telemetry_shutdown_timeout
         ),
     }
@@ -667,9 +656,9 @@ async fn main() -> anyhow::Result<()> {
     }
     match tokio::time::timeout(task_shutdown_timeout, &mut st).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("Safety task ended with error: {e}"),
-        Err(_) => eprintln!(
-            "Safety task did not shut down within {:?}",
+        Ok(Err(e)) => log::error!("safety task ended with error: {e}"),
+        Err(_) => log::error!(
+            "safety task did not shut down within {:?}",
             task_shutdown_timeout
         ),
     }
@@ -679,9 +668,9 @@ async fn main() -> anyhow::Result<()> {
     }
     match tokio::time::timeout(task_shutdown_timeout, &mut sequence_task).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("Sequence task ended with error: {e}"),
-        Err(_) => eprintln!(
-            "Sequence task did not shut down within {:?}",
+        Ok(Err(e)) => log::error!("sequence task ended with error: {e}"),
+        Err(_) => log::error!(
+            "sequence task did not shut down within {:?}",
             task_shutdown_timeout
         ),
     }
@@ -692,7 +681,7 @@ async fn main() -> anyhow::Result<()> {
 
     let db_drain_timeout = Duration::from_secs(10);
     if !state.wait_for_db_writes(db_drain_timeout).await {
-        eprintln!(
+        log::error!(
             "Timed out waiting for DB writes. Pending writes remaining: {}",
             state.pending_db_write_count()
         );
@@ -700,11 +689,16 @@ async fn main() -> anyhow::Result<()> {
 
     let telemetry_db = state.telemetry_db_pool();
     let telemetry_db_path = state.telemetry_db_path();
-    close_and_finalize_sqlite(telemetry_db, &telemetry_db_path).await;
+    if telemetry_db_path == "sqlite::memory:" {
+        telemetry_db.close().await;
+    } else {
+        close_and_finalize_sqlite(telemetry_db, &telemetry_db_path).await;
+    }
 
     close_and_finalize_sqlite(state.auth_db.clone(), &auth_db_path_str).await;
     if let Err(err) = state.gpio.reset_outputs_low() {
-        eprintln!("Failed to reset GPIO outputs low during shutdown: {err}");
+        log::error!("failed to reset GPIO outputs low during shutdown: {err}");
     }
+    log::info!("groundstation backend shutdown complete");
     Ok(())
 }

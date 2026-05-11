@@ -1,10 +1,10 @@
 use crate::state::AppState;
+use crate::telemetry_db::{DbQueueItem, DbWrite};
 use crate::telemetry_task::{get_current_timestamp_ms, queue_abort_packet};
 use crate::types::{Board, FlightState};
 use crate::web::{emit_warning, emit_warning_db_only};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
-use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
@@ -69,8 +69,6 @@ const KALMAN_STATE_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
 const BOARD_TIMEOUT_MS: u64 = 3000;
 #[cfg(not(feature = "testing"))]
 const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 3000;
-const FLIGHT_STATE_DB_RETRIES: usize = 5;
-const FLIGHT_STATE_DB_RETRY_DELAY_MS: u64 = 50;
 const SAFETY_WARNING_COOLDOWN_MS_DEFAULT: u64 = 5_000;
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -169,32 +167,6 @@ fn check_gyro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
     }
 }
 
-async fn insert_flight_state_with_retry(
-    db: &SqlitePool,
-    timestamp_ms: i64,
-    state_code: i64,
-) -> Result<(), sqlx::Error> {
-    let mut delay = FLIGHT_STATE_DB_RETRY_DELAY_MS;
-    let mut last_err: Option<sqlx::Error> = None;
-
-    for _ in 0..=FLIGHT_STATE_DB_RETRIES {
-        match sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
-            .bind(timestamp_ms)
-            .bind(state_code)
-            .execute(db)
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(delay)).await;
-                delay = (delay * 2).min(1000);
-            }
-        }
-    }
-
-    Err(last_err.unwrap())
-}
 #[cfg(feature = "testing")]
 const BOARD_TIMEOUT_MS: u64 = 3000;
 #[cfg(feature = "testing")]
@@ -351,14 +323,15 @@ pub async fn safety_task(
             if should_advance {
                 let ts_ms = get_current_timestamp_ms() as i64;
                 state.update_launch_clock_for_state(FlightState::Idle, ts_ms);
-                if let Err(e) = insert_flight_state_with_retry(
-                    &state.telemetry_db_pool(),
-                    ts_ms,
-                    FlightState::Idle as i64,
-                )
-                .await
+                if let Err(err) = state
+                    .db_queue_tx
+                    .send(DbQueueItem::Write(DbWrite::FlightState {
+                        timestamp_ms: ts_ms,
+                        state_code: FlightState::Idle as i64,
+                    }))
+                    .await
                 {
-                    eprintln!("DB insert into flight_state failed after retry: {e}");
+                    eprintln!("Failed to enqueue startup->idle flight_state write: {err}");
                 }
                 let _ = state.state_tx.send(crate::web::FlightStateMsg {
                     state: FlightState::Idle,

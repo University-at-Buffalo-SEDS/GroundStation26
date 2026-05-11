@@ -516,7 +516,6 @@ pub fn upsert_point(
     update_weights_kg(cfg);
 }
 
-
 pub fn capture_zero(cfg: &mut LoadcellCalibrationFile, sensor_id: &str, raw: f32) {
     let channel = CalibrationChannel::from_str(sensor_id);
     *zero_raw_mut(cfg, &channel) = Some(raw);

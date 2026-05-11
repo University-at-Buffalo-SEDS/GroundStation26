@@ -3,7 +3,9 @@ use crate::fill_targets::FillTargetsConfig;
 use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
-use crate::sequences::{ActionPolicyMsg, PersistentNotification, SequencePolicyState, command_name};
+use crate::sequences::{
+    ActionPolicyMsg, PersistentNotification, SequencePolicyState, command_name,
+};
 use crate::telemetry_db::{
     DbQueueItem, LaunchClockKind, LaunchClockMsg, RecordingModeWire, RecordingStatusMsg,
 };
@@ -1144,9 +1146,7 @@ impl AppState {
                 if !button_interlock_ok && !button_interlock_exempt {
                     control.enabled = false;
                 }
-                if !launch_interlock_ok
-                    && matches!(cmd, "Launch" | "GroundStationLaunch")
-                {
+                if !launch_interlock_ok && matches!(cmd, "Launch" | "GroundStationLaunch") {
                     control.enabled = false;
                 }
             }

@@ -1583,8 +1583,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
             return;
         }
         let initial_board_status = serde_json::to_string(&WsOutMsg::BoardStatus(
-            state_for_send
-                .board_status_snapshot(crate::telemetry_task::get_current_timestamp_ms()),
+            state_for_send.board_status_snapshot(crate::telemetry_task::get_current_timestamp_ms()),
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_board_status).await.is_err() {

@@ -508,7 +508,6 @@ impl ValveSnapshot {
             _ => None,
         }
     }
-
 }
 
 fn is_fill_state(state: FlightState) -> bool {
@@ -998,14 +997,15 @@ fn update_sequence_runtime(
             let _ = state.dismiss_notification(id);
         }
     };
-    let dismiss_fill_test_warning_notifications = |state: &AppState, runtime: &mut SequenceRuntime| {
-        if let Some(id) = runtime.rapid_drop_notification_id.take() {
-            let _ = state.dismiss_notification(id);
-        }
-        if let Some(id) = runtime.mass_shift_notification_id.take() {
-            let _ = state.dismiss_notification(id);
-        }
-    };
+    let dismiss_fill_test_warning_notifications =
+        |state: &AppState, runtime: &mut SequenceRuntime| {
+            if let Some(id) = runtime.rapid_drop_notification_id.take() {
+                let _ = state.dismiss_notification(id);
+            }
+            if let Some(id) = runtime.mass_shift_notification_id.take() {
+                let _ = state.dismiss_notification(id);
+            }
+        };
 
     if valves.dump_open == Some(true) && dump_open_fails_nitrogen_step(runtime.step) {
         dismiss_leak_fail_notification(state, runtime);
@@ -1101,13 +1101,11 @@ fn update_sequence_runtime(
             }
 
             let pressure_ready = at_or_above(pressure_psi, cfg.nitrogen_pressure_target_psi);
-            let weight_ready = cfg
-                .nitrogen_target_mass_kg
-                .is_some_and(|target_mass_kg| {
-                    current_mass_kg.is_some_and(|m| {
-                        mass_target_reached(m, target_mass_kg, cfg.nitrous_weight_rise_epsilon_kg)
-                    })
-                });
+            let weight_ready = cfg.nitrogen_target_mass_kg.is_some_and(|target_mass_kg| {
+                current_mass_kg.is_some_and(|m| {
+                    mass_target_reached(m, target_mass_kg, cfg.nitrous_weight_rise_epsilon_kg)
+                })
+            });
             let should_close = match cfg.nitrogen_autoclose_mode {
                 NitrogenAutocloseMode::Pressure => pressure_ready,
                 NitrogenAutocloseMode::Weight => weight_ready,
@@ -1220,8 +1218,8 @@ fn update_sequence_runtime(
                     let _ = state.dismiss_notification(id);
                 }
             }
-            let mass_warning_active = !cfg!(feature = "test_fire_mode")
-                && mass_shift_kg > cfg.max_leak_mass_delta_kg;
+            let mass_warning_active =
+                !cfg!(feature = "test_fire_mode") && mass_shift_kg > cfg.max_leak_mass_delta_kg;
             if mass_warning_active && !runtime.warned_mass_shift {
                 runtime.warned_mass_shift = true;
                 if runtime.mass_shift_notification_id.is_none() {
@@ -1788,39 +1786,24 @@ fn build_policy(
             }
         }
         SequenceStep::NitrogenFill => {
-            if let Some(blink) = command_prompt_blink(
-                state,
-                cfg,
-                inputs.valves,
-                "Nitrogen",
-                true,
-                inputs.now_ms,
-            ) {
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Nitrogen", true, inputs.now_ms)
+            {
                 recommended.insert("Nitrogen", blink);
             }
         }
         SequenceStep::CloseNitrogen => {
-            if let Some(blink) = command_prompt_blink(
-                state,
-                cfg,
-                inputs.valves,
-                "Nitrogen",
-                false,
-                inputs.now_ms,
-            ) {
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Nitrogen", false, inputs.now_ms)
+            {
                 recommended.insert("Nitrogen", blink);
             }
         }
         SequenceStep::NitrogenLeakCheck => {}
         SequenceStep::RecoverNitrogenClose => {
-            if let Some(blink) = command_prompt_blink(
-                state,
-                cfg,
-                inputs.valves,
-                "Nitrogen",
-                false,
-                inputs.now_ms,
-            ) {
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Nitrogen", false, inputs.now_ms)
+            {
                 recommended.insert("Nitrogen", blink);
             } else if let Some(blink) =
                 command_prompt_blink(state, cfg, inputs.valves, "Dump", true, inputs.now_ms)
@@ -1857,51 +1840,31 @@ fn build_policy(
             }
         }
         SequenceStep::AwaitFillTestDecision => {
-            if let Some(blink) = command_prompt_blink(
-                state,
-                cfg,
-                inputs.valves,
-                "Nitrogen",
-                true,
-                inputs.now_ms,
-            ) {
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Nitrogen", true, inputs.now_ms)
+            {
                 recommended.insert("Nitrogen", blink);
             }
         }
         SequenceStep::OpenNitrous => {
-            if let Some(blink) = command_prompt_blink(
-                state,
-                cfg,
-                inputs.valves,
-                "Nitrous",
-                true,
-                inputs.now_ms,
-            ) {
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Nitrous", true, inputs.now_ms)
+            {
                 recommended.insert("Nitrous", blink);
             }
         }
         SequenceStep::CloseNitrous => {
-            if let Some(blink) = command_prompt_blink(
-                state,
-                cfg,
-                inputs.valves,
-                "Nitrous",
-                false,
-                inputs.now_ms,
-            ) {
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Nitrous", false, inputs.now_ms)
+            {
                 recommended.insert("Nitrous", blink);
             }
         }
         SequenceStep::NitrousSoak => {}
         SequenceStep::RecoverNitrousClose => {
-            if let Some(blink) = command_prompt_blink(
-                state,
-                cfg,
-                inputs.valves,
-                "Nitrous",
-                false,
-                inputs.now_ms,
-            ) {
+            if let Some(blink) =
+                command_prompt_blink(state, cfg, inputs.valves, "Nitrous", false, inputs.now_ms)
+            {
                 recommended.insert("Nitrous", blink);
             } else if let Some(blink) =
                 command_prompt_blink(state, cfg, inputs.valves, "Dump", true, inputs.now_ms)
