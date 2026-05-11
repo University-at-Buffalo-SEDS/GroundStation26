@@ -2,7 +2,6 @@ use anyhow::Result;
 use flexi_logger::{
     Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, Logger, Naming, Record, WriteMode,
 };
-use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -13,6 +12,7 @@ static LOG_ENTRY_ID: AtomicU64 = AtomicU64::new(1);
 pub fn init() -> Result<()> {
     let log_dir = log_dir();
     std::fs::create_dir_all(&log_dir)?;
+    write_file_open_separator(&log_dir)?;
 
     let spec = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| "info,sqlx=warn,hyper=warn,h2=warn,tower_http=warn".to_string());
@@ -32,8 +32,8 @@ pub fn init() -> Result<()> {
             Cleanup::Never,
         )
         .write_mode(WriteMode::Direct)
-        .format_for_files(format_record)
-        .format_for_stderr(format_record)
+        .format_for_files(format_console_record)
+        .format_for_stderr(format_console_record)
         .start()?;
 
     install_panic_hook();
@@ -49,20 +49,30 @@ fn log_dir() -> PathBuf {
         .join("logs")
 }
 
-fn format_record(
+fn write_file_open_separator(log_dir: &std::path::Path) -> Result<()> {
+    let entry_id = LOG_ENTRY_ID.fetch_add(1, Ordering::Relaxed);
+    let log_path = log_dir.join(format!("{LOG_BASENAME}.log"));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    use std::io::Write as _;
+    writeln!(file, "==========({entry_id:010})=============")?;
+    file.flush()?;
+    Ok(())
+}
+
+fn format_console_record(
     writer: &mut dyn std::io::Write,
     now: &mut DeferredNow,
     record: &Record<'_>,
 ) -> std::io::Result<()> {
-    let entry_id = LOG_ENTRY_ID.fetch_add(1, Ordering::Relaxed);
     let thread = std::thread::current();
     let thread_name = thread.name().unwrap_or("unnamed");
     let file = record.file().unwrap_or("unknown");
     let line = record.line().unwrap_or(0);
-
-    let mut log_line = String::new();
-    let _ = write!(
-        &mut log_line,
+    write!(
+        writer,
         "{} {:<5} [{} {:?}] {}:{} {}",
         now.now().format("%Y-%m-%d %H:%M:%S%.3f%:z"),
         record.level(),
@@ -71,10 +81,7 @@ fn format_record(
         file,
         line,
         record.args()
-    );
-
-    writer.write_all(format!("==========({entry_id:010})=============\n").as_bytes())?;
-    writer.write_all(log_line.as_bytes())
+    )
 }
 
 fn install_panic_hook() {
