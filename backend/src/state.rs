@@ -188,6 +188,9 @@ pub struct AppState {
     /// True after a successful launch initiation until explicitly reset or process restart.
     pub launch_indicator_latched: Arc<AtomicBool>,
 
+    /// True after any abort path has triggered until process restart.
+    pub abort_indicator_latched: Arc<AtomicBool>,
+
     #[cfg(feature = "hitl_mode")]
     pub hitl_button_interlock_enabled: Arc<AtomicBool>,
 
@@ -383,6 +386,30 @@ impl AppState {
         }
     }
 
+    /// Updates warning and error ack timestamps together and broadcasts once if either changed.
+    pub fn acknowledge_alerts_through(
+        &self,
+        warning_timestamp_ms: i64,
+        error_timestamp_ms: i64,
+    ) -> AlertAckStateMsg {
+        let mut slot = self.alert_ack_state.lock().unwrap();
+        let next_warning_ts = warning_timestamp_ms.max(slot.warning_ack_timestamp_ms);
+        let next_error_ts = error_timestamp_ms.max(slot.error_ack_timestamp_ms);
+        let changed = next_warning_ts != slot.warning_ack_timestamp_ms
+            || next_error_ts != slot.error_ack_timestamp_ms;
+
+        slot.warning_ack_timestamp_ms = next_warning_ts;
+        slot.error_ack_timestamp_ms = next_error_ts;
+        let snapshot = slot.clone();
+        drop(slot);
+
+        if changed {
+            let _ = self.alert_ack_tx.send(snapshot.clone());
+        }
+
+        snapshot
+    }
+
     pub fn launch_clock_snapshot(&self) -> LaunchClockMsg {
         self.launch_clock.lock().unwrap().clone()
     }
@@ -423,6 +450,15 @@ impl AppState {
 
     pub fn set_launch_indicator_latched(&self, latched: bool) {
         self.launch_indicator_latched
+            .store(latched, Ordering::SeqCst);
+    }
+
+    pub fn abort_indicator_latched(&self) -> bool {
+        self.abort_indicator_latched.load(Ordering::SeqCst)
+    }
+
+    pub fn set_abort_indicator_latched(&self, latched: bool) {
+        self.abort_indicator_latched
             .store(latched, Ordering::SeqCst);
     }
 
@@ -1220,6 +1256,9 @@ impl AppState {
             if let Some(actuated) = recording_command_actuated(&control.cmd, recording_mode) {
                 control.actuated = Some(actuated);
             }
+            if control.cmd == "Abort" && self.abort_indicator_latched() {
+                control.actuated = Some(true);
+            }
             #[cfg(feature = "hitl_mode")]
             match control.cmd.as_str() {
                 "ToggleButtonInterlock" => {
@@ -1799,6 +1838,7 @@ mod tests {
             launch_clock_tx,
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
             launch_indicator_latched: Arc::new(AtomicBool::new(false)),
+            abort_indicator_latched: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "hitl_mode")]
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "hitl_mode")]
@@ -1823,6 +1863,24 @@ mod tests {
                 "/tmp/groundstation-state-test-users.json",
             ))),
         })
+    }
+
+    #[tokio::test]
+    async fn acknowledge_alerts_updates_warning_and_error_ack_state() {
+        let state = test_app_state().await;
+        let mut ack_rx = state.alert_ack_tx.subscribe();
+
+        let ack = state.acknowledge_alerts_through(1_000, 2_000);
+
+        assert_eq!(ack.warning_ack_timestamp_ms, 1_000);
+        assert_eq!(ack.error_ack_timestamp_ms, 2_000);
+        assert_eq!(state.alert_ack_state_snapshot(), ack);
+
+        let broadcast = ack_rx
+            .recv()
+            .await
+            .expect("alert ack update should broadcast");
+        assert_eq!(broadcast, ack);
     }
 
     #[tokio::test]

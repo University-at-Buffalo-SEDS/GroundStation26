@@ -52,6 +52,8 @@ const BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD: f32 = 16.5; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD: f32 = 12.3; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 16.5; // V
 const BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD: f32 = 13.0; // V
+const BATTERY_LOW_VOLTAGE_RELATCH_THRESHOLD: f32 = 15.0; // V
+const FILL_SYSTEM_LOW_VOLTAGE_WARNING: &str = "Critical: Fill system battery voltage below 13V!";
 
 // Battery current thresholds (A)
 const BATTERY_CURRENT_MIN_THRESHOLD: f32 = 0.0; // A
@@ -127,12 +129,15 @@ fn battery_voltage_bounds_by_sender() -> &'static HashMap<String, (f32, f32)> {
     })
 }
 
-fn battery_low_voltage_always_warns(sender_id: &str, voltage: f32) -> bool {
+fn is_fill_system_battery_sender(sender_id: &str) -> bool {
     matches!(
         canonical_sender_id(sender_id),
-        sender if sender == Board::ValveBoard.sender_id()
-            || sender == Board::GatewayBoard.sender_id()
-    ) && voltage <= BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD
+        sender if sender == Board::GatewayBoard.sender_id()
+    )
+}
+
+fn battery_low_voltage_always_warns(sender_id: &str, voltage: f32) -> bool {
+    is_fill_system_battery_sender(sender_id) && voltage <= BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD
 }
 
 fn battery_voltage_out_of_range(sender_id: &str, voltage: f32) -> bool {
@@ -147,6 +152,24 @@ fn battery_voltage_out_of_range(sender_id: &str, voltage: f32) -> bool {
         .is_some_and(|(min_v, max_v)| voltage < min_v || voltage > max_v);
 
     outside_configured_range || battery_low_voltage_always_warns(sender_id, voltage)
+}
+
+fn update_fill_system_low_voltage_latch(latched: &mut bool, voltage: f32) -> bool {
+    if !voltage.is_finite() {
+        return false;
+    }
+
+    if voltage > BATTERY_LOW_VOLTAGE_RELATCH_THRESHOLD {
+        *latched = false;
+        return false;
+    }
+
+    if voltage <= BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD && !*latched {
+        *latched = true;
+        return true;
+    }
+
+    false
 }
 
 fn check_accel_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
@@ -206,6 +229,7 @@ pub async fn safety_task(
         SAFETY_WARNING_COOLDOWN_MS_DEFAULT,
     );
     let mut last_warning_emit_ms: HashMap<&'static str, u64> = HashMap::new();
+    let mut fill_system_low_voltage_latched = false;
     loop {
         tokio::select! {
             _ = sleep(Duration::from_millis(500)) => {}
@@ -367,6 +391,7 @@ pub async fn safety_task(
         }
 
         let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
+        let mut latest_fill_system_battery_voltage = None;
 
         for pkt in packets {
             match pkt.data_type() {
@@ -459,10 +484,14 @@ pub async fn safety_task(
                 DataType::BatteryVoltage => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
                     // Voltage
-                    if let Some(voltage) = values.first()
-                        && battery_voltage_out_of_range(pkt.sender(), *voltage)
-                    {
-                        cycle_warnings.insert("Critical: Battery voltage out of range!");
+                    if let Some(voltage) = values.first() {
+                        if is_fill_system_battery_sender(pkt.sender()) {
+                            if latest_fill_system_battery_voltage.is_none() {
+                                latest_fill_system_battery_voltage = Some(*voltage);
+                            }
+                        } else if battery_voltage_out_of_range(pkt.sender(), *voltage) {
+                            cycle_warnings.insert("Critical: Battery voltage out of range!");
+                        }
                     }
                 }
 
@@ -501,6 +530,12 @@ pub async fn safety_task(
             }
         }
 
+        if let Some(voltage) = latest_fill_system_battery_voltage
+            && update_fill_system_low_voltage_latch(&mut fill_system_low_voltage_latched, voltage)
+        {
+            emit_warning(&state, FILL_SYSTEM_LOW_VOLTAGE_WARNING);
+        }
+
         if !cycle_warnings.is_empty() {
             let mut emitted = cycle_warnings.into_iter().collect::<Vec<_>>();
             emitted.sort_unstable();
@@ -514,6 +549,9 @@ pub async fn safety_task(
         }
 
         if abort {
+            state.set_abort_indicator_latched(true);
+            crate::sequences::refresh_action_policy_now(&state);
+            state.broadcast_action_policy_snapshot();
             queue_abort_packet(&router, "Safety Task Abort Command Issued").unwrap_or_else(|e| {
                 eprintln!("failed to log Abort command: {:?}", e);
             });
@@ -531,23 +569,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn low_voltage_floor_always_warns_for_twelve_volt_batteries() {
-        assert!(battery_low_voltage_always_warns("VB", 13.0));
+    fn low_voltage_floor_always_warns_for_fill_system_battery() {
         assert!(battery_low_voltage_always_warns("GB", 13.0));
         assert!(battery_low_voltage_always_warns("GW", 13.0));
-        assert!(battery_low_voltage_always_warns("VB", 12.99));
+        assert!(battery_low_voltage_always_warns("GB", 12.99));
     }
 
     #[test]
-    fn low_voltage_floor_does_not_apply_to_av_bay_battery() {
+    fn low_voltage_floor_does_not_apply_to_non_fill_system_batteries() {
         assert!(!battery_low_voltage_always_warns("PB", 7.4));
         assert!(!battery_low_voltage_always_warns("PB", 13.0));
+        assert!(!battery_low_voltage_always_warns("VB", 13.0));
     }
 
     #[test]
-    fn battery_voltage_range_check_includes_non_configurable_low_voltage_floor() {
-        assert!(battery_voltage_out_of_range("VB", 13.0));
+    fn battery_voltage_range_check_includes_non_configurable_fill_system_floor() {
         assert!(battery_voltage_out_of_range("GB", 13.0));
         assert!(battery_voltage_out_of_range("GW", 13.0));
+    }
+
+    #[test]
+    fn fill_system_low_voltage_warning_latches_until_voltage_recovers() {
+        let mut latched = false;
+
+        assert!(update_fill_system_low_voltage_latch(&mut latched, 12.99));
+        assert!(latched);
+        assert!(!update_fill_system_low_voltage_latch(&mut latched, 12.5));
+        assert!(latched);
+        assert!(!update_fill_system_low_voltage_latch(&mut latched, 15.0));
+        assert!(latched);
+        assert!(!update_fill_system_low_voltage_latch(&mut latched, 15.01));
+        assert!(!latched);
+        assert!(update_fill_system_low_voltage_latch(&mut latched, 13.0));
     }
 }

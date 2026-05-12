@@ -373,7 +373,7 @@ pub struct ErrorMsg {
     pub message: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 pub struct AlertAckStateMsg {
     pub warning_ack_timestamp_ms: i64,
     pub error_ack_timestamp_ms: i64,
@@ -1592,8 +1592,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         if ws_out_tx.send(initial_recording_status).await.is_err() {
             return;
         }
-        let initial_alert_ack_state =
-            serde_json::to_string(&WsOutMsg::AlertAckState(AlertAckStateMsg::default()))
+        let initial_alert_ack_state = serde_json::to_string(&WsOutMsg::AlertAckState(
+            state_for_send.alert_ack_state_snapshot(),
+        ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_alert_ack_state).await.is_err() {
             return;
@@ -2130,12 +2131,8 @@ async fn post_alert_ack(
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-    let _ = state;
-    Json(AlertAckStateMsg {
-        warning_ack_timestamp_ms: body.warning_timestamp_ms,
-        error_ack_timestamp_ms: body.error_timestamp_ms,
-    })
-    .into_response()
+    Json(state.acknowledge_alerts_through(body.warning_timestamp_ms, body.error_timestamp_ms))
+        .into_response()
 }
 
 async fn get_boards(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {

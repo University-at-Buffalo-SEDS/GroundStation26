@@ -56,7 +56,6 @@ const LED_DISABLED_BRIGHTNESS: f64 = 0.0;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct AllowedActions {
-    abort: bool,
     launch: bool,
     dump: bool,
     igniter: bool,
@@ -119,19 +118,18 @@ fn setup_callbacks(
     let gpio = state.gpio.clone();
     let debounce = Duration::from_millis(50);
 
-    let allowed_abort = allowed.clone();
     let tx_abort = tx.clone();
     let state_abort = state.clone();
     gpio.setup_callback_input_pin(ABORT_PIN, Trigger::RisingEdge, debounce, move |is_high| {
         if !is_high {
             return;
         }
-        if !allowed_abort.lock().unwrap().abort {
-            return;
-        }
         if tx_abort.try_send(TelemetryCommand::Abort).is_err() {
             eprintln!("GPIO abort button: failed to send command");
         }
+        state_abort.set_abort_indicator_latched(true);
+        crate::sequences::refresh_action_policy_now(&state_abort);
+        state_abort.broadcast_action_policy_snapshot();
         emit_error(&state_abort, "Manual abort button pressed!".to_string());
     })?;
 
@@ -461,7 +459,6 @@ fn allowed_from_policy(policy: &ActionPolicyMsg) -> AllowedActions {
     };
 
     AllowedActions {
-        abort: enabled("Abort"),
         launch: enabled("Launch"),
         dump: enabled("Dump"),
         igniter: enabled("Igniter"),
@@ -475,6 +472,9 @@ fn allowed_from_policy(policy: &ActionPolicyMsg) -> AllowedActions {
 
 fn led_for(state: &AppState, policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -> f64 {
     if cmd == "Launch" && state.launch_indicator_latched() {
+        return 1.0;
+    }
+    if cmd == "Abort" && state.abort_indicator_latched() {
         return 1.0;
     }
     let Some(control) = policy.controls.iter().find(|c| c.cmd == cmd) else {

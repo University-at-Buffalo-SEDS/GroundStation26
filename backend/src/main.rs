@@ -348,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
         launch_clock_tx,
         launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
         launch_indicator_latched: Arc::new(AtomicBool::new(false)),
+        abort_indicator_latched: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "hitl_mode")]
         hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "hitl_mode")]
@@ -409,6 +410,9 @@ async fn main() -> anyhow::Result<()> {
     let abort_handler = EndpointHandler::new_packet_handler(Abort, move |pkt: &Packet| {
         abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
         abort_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
+        abort_handler_state_clone.set_abort_indicator_latched(true);
+        crate::sequences::refresh_action_policy_now(&abort_handler_state_clone);
+        abort_handler_state_clone.broadcast_action_policy_snapshot();
         let error_msg = pkt
             .data_as_string()
             .expect("Abort packet with invalid UTF-8");

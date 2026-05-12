@@ -2278,6 +2278,11 @@ pub async fn telemetry_task(
                         continue;
                     }
                     state.record_command_accepted(&cmd, get_current_timestamp_ms());
+                    if matches!(cmd, TelemetryCommand::Abort) {
+                        state.set_abort_indicator_latched(true);
+                        sequences::refresh_action_policy_now(&state);
+                        state.broadcast_action_policy_snapshot();
+                    }
                     if flight_sim::handle_command(&cmd) {
                         continue;
                     }
@@ -3990,6 +3995,7 @@ mod tests {
             launch_clock_tx,
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
             launch_indicator_latched: Arc::new(AtomicBool::new(false)),
+            abort_indicator_latched: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "hitl_mode")]
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "hitl_mode")]
