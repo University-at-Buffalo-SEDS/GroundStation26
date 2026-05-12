@@ -723,6 +723,7 @@ impl AppState {
         let mut links = Vec::new();
         let mut endpoint_ids = std::collections::BTreeSet::new();
         let mut side_ids = std::collections::BTreeMap::<String, String>::new();
+        let mut side_endpoints = std::collections::BTreeMap::<String, Vec<String>>::new();
 
         if let Some(snapshot) = route_snapshot {
             for route in &snapshot.routes {
@@ -737,6 +738,7 @@ impl AppState {
                     .collect::<Vec<_>>();
                 endpoints.sort();
                 endpoints.dedup();
+                side_endpoints.insert(route.side_name.to_string(), endpoints.clone());
                 let status = if simulated {
                     NetworkTopologyStatus::Simulated
                 } else {
@@ -860,11 +862,15 @@ impl AppState {
                 status,
                 group: "board".to_string(),
                 sender_id: Some(entry.sender_id.clone()),
-                endpoints: modeled_board_endpoints(
-                    entry.board,
-                    simulated,
-                    &local_visible_endpoint_list,
-                ),
+                endpoints: board_side(entry.board)
+                    .and_then(|side_name| side_endpoints.get(side_name).cloned())
+                    .unwrap_or_else(|| {
+                        modeled_board_endpoints(
+                            entry.board,
+                            simulated,
+                            &local_visible_endpoint_list,
+                        )
+                    }),
                 show_in_details: true,
                 detail: Some(match entry.age_ms {
                     Some(age_ms) => format!(
