@@ -3748,6 +3748,147 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn advance_flight_state_command_reaches_remote_router_end_to_end() {
+        let (db_tx, db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let remote_states = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let remote_states_handler = remote_states.clone();
+        let mut policy = state.action_policy_snapshot();
+        if let Some(control) = policy
+            .controls
+            .iter_mut()
+            .find(|control| control.cmd == "AdvanceFlightState")
+        {
+            control.enabled = true;
+        }
+        state.set_action_policy(policy);
+
+        let remote_router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([sedsprintf_rs_2026::router::EndpointHandler::new_packet_handler(
+                DataEndpoint::FlightState,
+                move |pkt: &Packet| {
+                    if let Some(state_code) = pkt.payload().first().copied() {
+                        remote_states_handler
+                            .lock()
+                            .expect("failed to lock remote states")
+                            .push(state_code);
+                    }
+                    Ok(())
+                },
+            )]),
+        ));
+        let gs_router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+
+        let gs_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+        let remote_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+
+        let gs_side = {
+            let gs_peer = gs_peer.clone();
+            gs_router.add_side_serialized_with_options(
+                "umbilical_comms",
+                move |bytes| {
+                    let (peer, ingress) = gs_peer
+                        .lock()
+                        .expect("failed to lock gs peer")
+                        .clone()
+                        .expect("gs peer not initialized");
+                    peer.rx_serialized_from_side(bytes, ingress)
+                },
+                sedsprintf_rs_2026::router::RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: true,
+                },
+            )
+        };
+        let remote_side = {
+            let remote_peer = remote_peer.clone();
+            remote_router.add_side_serialized_with_options(
+                "gs_link",
+                move |bytes| {
+                    let (peer, ingress) = remote_peer
+                        .lock()
+                        .expect("failed to lock remote peer")
+                        .clone()
+                        .expect("remote peer not initialized");
+                    peer.rx_serialized_from_side(bytes, ingress)
+                },
+                sedsprintf_rs_2026::router::RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: true,
+                },
+            )
+        };
+        *gs_peer.lock().expect("failed to lock gs peer") =
+            Some((remote_router.clone(), remote_side));
+        *remote_peer
+            .lock()
+            .expect("failed to lock remote peer") = Some((gs_router.clone(), gs_side));
+
+        remote_router
+            .announce_discovery()
+            .expect("failed to queue remote discovery");
+        remote_router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process remote discovery");
+
+        state
+            .topology_router
+            .set(gs_router.clone())
+            .expect("failed to set topology router");
+
+        let shutdown_rx = state.shutdown_subscribe();
+        let telemetry = tokio::spawn(telemetry_task(
+            state.clone(),
+            gs_router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            shutdown_rx,
+        ));
+
+        cmd_tx
+            .send(TelemetryCommand::AdvanceFlightState)
+            .await
+            .expect("failed to send advance command");
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if state.local_flight_state_snapshot() == FlightState::Idle {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for local flight state transition");
+
+        let remote_result = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                let states = remote_states.lock().expect("failed to lock remote states");
+                if !states.is_empty() {
+                    break;
+                }
+                drop(states);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+
+        state.request_shutdown();
+        telemetry.await.expect("telemetry task join failed");
+
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+        remote_result.expect("timed out waiting for remote flight state");
+        let states = remote_states.lock().expect("failed to lock remote states");
+        assert_eq!(states.as_slice(), &[FlightState::Idle as u8]);
+    }
+
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
         reset_parse_error_reports();
         let db = SqlitePool::connect("sqlite::memory:")

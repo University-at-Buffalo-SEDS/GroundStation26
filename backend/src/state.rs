@@ -252,8 +252,22 @@ impl AppState {
                     .reachable_endpoints
                     .contains(&DataEndpoint::FlightState)
         });
-        if let Err(err) = router.log_queue(DataType::FlightState, &[next_state as u8]) {
-            log::warn!("failed to queue flight-state broadcast for router delivery: {err}");
+
+        let pkt = match Packet::new(
+            DataType::FlightState,
+            &[DataEndpoint::FlightState],
+            Board::GroundStation.sender_id(),
+            crate::telemetry_task::get_current_timestamp_ms(),
+            Arc::from([next_state as u8]),
+        ) {
+            Ok(pkt) => pkt,
+            Err(err) => {
+                log::warn!("failed to build flight-state packet for router delivery: {err}");
+                return;
+            }
+        };
+        if let Err(err) = router.rx_queue(pkt) {
+            log::warn!("failed to queue flight-state packet on router rx path: {err}");
             return;
         }
 
@@ -269,8 +283,8 @@ impl AppState {
         log::info!(
             "flight-state dispatched side={dispatch_side} state={next_state:?} rocket_has_flight_state={rocket_has_flight_state} umbilical_has_flight_state={umbilical_has_flight_state}"
         );
-        if let Err(err) = router.process_tx_queue_with_timeout(0) {
-            log::warn!("failed to flush flight-state broadcast for router delivery: {err}");
+        if let Err(err) = router.process_all_queues_with_timeout(0) {
+            log::warn!("failed to process flight-state packet through router delivery path: {err}");
         }
         if !umbilical_has_flight_state {
             log::warn!(
@@ -1552,6 +1566,19 @@ fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthManager;
+    use crate::fill_targets;
+    use crate::gpio::GpioPins;
+    use crate::loadcell;
+    use crate::ring_buffer::RingBuffer;
+    use crate::telemetry_db::{DbQueueItem, RecordingModeWire, RecordingStatusMsg};
+    use sedsprintf_rs_2026::router::{
+        EndpointHandler, RouterConfig, RouterMode, RouterSideId, RouterSideOptions,
+    };
+    use sqlx::SqlitePool;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::{Notify, broadcast, mpsc};
 
     #[test]
     fn flight_computer_modeled_endpoints_include_sd_card() {
@@ -1671,6 +1698,244 @@ mod tests {
 
             assert_eq!(next, current);
         }
+    }
+
+    async fn test_app_state() -> Arc<AppState> {
+        let db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory telemetry db");
+        let auth_db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory auth db");
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (db_queue_tx, _db_queue_rx) = mpsc::channel::<DbQueueItem>(4);
+        let (ws_tx, _ws_rx) = broadcast::channel(16);
+        let (state_tx, _state_rx) = broadcast::channel(4);
+        let (board_status_tx, _board_status_rx) = broadcast::channel(4);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
+        let (notifications_tx, _notifications_rx) = broadcast::channel(4);
+        let (messages_tx, _messages_rx) = broadcast::channel(4);
+        let (action_policy_tx, _action_policy_rx) = broadcast::channel(4);
+        let (fill_targets_tx, _fill_targets_rx) = broadcast::channel(4);
+        let (launch_clock_tx, _launch_clock_rx) = broadcast::channel(4);
+        let (recording_status_tx, _recording_status_rx) = broadcast::channel(4);
+
+        let mut board_status = HashMap::new();
+        for board in Board::ALL {
+            board_status.insert(
+                *board,
+                BoardStatus {
+                    packet_count: 0,
+                    last_seen_ms: None,
+                    last_seen_instant: None,
+                    ema_gap_ms: None,
+                    warned: false,
+                },
+            );
+        }
+
+        Arc::new(AppState {
+            ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
+            cmd_tx,
+            ws_tx,
+            warnings_tx: broadcast::channel(4).0,
+            errors_tx: broadcast::channel(4).0,
+            alert_ack_state: Arc::new(Mutex::new(AlertAckStateMsg::default())),
+            alert_ack_tx: broadcast::channel(4).0,
+            dashboard_reset_tx: broadcast::channel(4).0,
+            db: Arc::new(Mutex::new(db)),
+            db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
+            placeholder_db_path: "sqlite::memory:".to_string(),
+            db_queue_tx,
+            auth_db,
+            state: Arc::new(Mutex::new(FlightState::Startup)),
+            state_tx,
+            gpio: GpioPins::new(),
+            board_status: Arc::new(Mutex::new(board_status)),
+            board_status_tx,
+            last_board_status_broadcast_ms: Arc::new(AtomicU64::new(0)),
+            last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
+            umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
+            pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
+            latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+            latest_fill_mass_kg: Arc::new(Mutex::new(None)),
+            loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
+            shutdown_tx,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            pending_db_writes: Arc::new(AtomicUsize::new(0)),
+            db_write_notify: Arc::new(Notify::new()),
+            notifications: Arc::new(Mutex::new(Vec::new())),
+            notifications_tx,
+            next_notification_id: Arc::new(AtomicU64::new(0)),
+            messages: Arc::new(Mutex::new(Vec::new())),
+            messages_tx,
+            next_message_id: Arc::new(AtomicU64::new(0)),
+            action_policy: Arc::new(Mutex::new(crate::sequences::default_action_policy())),
+            sequence_policy_state: Arc::new(Mutex::new(
+                crate::sequences::SequencePolicyState::default(),
+            )),
+            action_policy_tx,
+            fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
+            fill_targets_tx,
+            launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
+            launch_clock_tx,
+            launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
+            launch_indicator_latched: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "hitl_mode")]
+            hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "hitl_mode")]
+            hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "hitl_mode")]
+            hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
+            recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
+                mode: RecordingModeWire::Idle,
+                db_path: None,
+            })),
+            recording_status_tx,
+            last_command_ms: Arc::new(Mutex::new(HashMap::new())),
+            fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
+            recent_telemetry_cache: Arc::new(Mutex::new(VecDeque::new())),
+            latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
+            latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),
+            recent_alerts_cache: Arc::new(Mutex::new(VecDeque::new())),
+            av_bay_comms_connected: Arc::new(AtomicBool::new(false)),
+            fill_comms_connected: Arc::new(AtomicBool::new(false)),
+            topology_router: Arc::new(OnceLock::new()),
+            auth: Arc::new(AuthManager::new(PathBuf::from(
+                "/tmp/groundstation-state-test-users.json",
+            ))),
+        })
+    }
+
+    #[tokio::test]
+    async fn repeated_groundstation_flight_state_changes_emit_multiple_packets() {
+        let state = test_app_state().await;
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sent_clone = sent.clone();
+        let router = Arc::new(Router::new(RouterMode::Relay, RouterConfig::new([])));
+        router.add_side_serialized_with_options(
+            "umbilical_comms",
+            move |bytes| {
+                sent_clone.lock().expect("failed to lock sends").push(bytes.to_vec());
+                Ok(())
+            },
+            RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        state
+            .topology_router
+            .set(router)
+            .expect("failed to set topology router");
+
+        state.queue_router_flight_state_update(FlightState::Idle);
+        state.queue_router_flight_state_update(FlightState::PreFill);
+
+        let sent = sent.lock().expect("failed to lock sends");
+        let flight_state_packets = sent
+            .iter()
+            .filter_map(|wire| sedsprintf_rs_2026::serialize::deserialize_packet(wire).ok())
+            .filter(|pkt| pkt.data_type() == DataType::FlightState)
+            .count();
+        assert_eq!(flight_state_packets, 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_groundstation_flight_state_changes_reach_remote_router_with_ack_path() {
+        let state = test_app_state().await;
+        let remote_states = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let remote_states_handler = remote_states.clone();
+        let remote_deliveries = Arc::new(AtomicUsize::new(0));
+        let remote_deliveries_handler = remote_deliveries.clone();
+
+        let remote_router = Arc::new(sedsprintf_rs_2026::router::Router::new(
+            RouterMode::Relay,
+            RouterConfig::new([EndpointHandler::new_packet_handler(
+                DataEndpoint::FlightState,
+                move |pkt: &Packet| {
+                    let payload = pkt.payload();
+                    if let Some(state_code) = payload.first().copied() {
+                        remote_states_handler
+                            .lock()
+                            .expect("failed to lock remote states")
+                            .push(state_code);
+                        remote_deliveries_handler.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(())
+                },
+            )]),
+        ));
+        let gs_router = Arc::new(sedsprintf_rs_2026::router::Router::new(
+            RouterMode::Relay,
+            RouterConfig::new([]),
+        ));
+
+        let gs_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+        let remote_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+
+        let gs_side = {
+            let gs_peer = gs_peer.clone();
+            gs_router.add_side_serialized_with_options(
+                "umbilical_comms",
+                move |bytes| {
+                    let (peer, ingress) = gs_peer
+                        .lock()
+                        .expect("failed to lock gs peer")
+                        .clone()
+                        .expect("gs peer not initialized");
+                    peer.rx_serialized_from_side(bytes, ingress)
+                },
+                RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: true,
+                },
+            )
+        };
+
+        let remote_side = {
+            let remote_peer = remote_peer.clone();
+            remote_router.add_side_serialized_with_options(
+                "gs_link",
+                move |bytes| {
+                    let (peer, ingress) = remote_peer
+                        .lock()
+                        .expect("failed to lock remote peer")
+                        .clone()
+                        .expect("remote peer not initialized");
+                    peer.rx_serialized_from_side(bytes, ingress)
+                },
+                RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: true,
+                },
+            )
+        };
+
+        *gs_peer.lock().expect("failed to lock gs peer") =
+            Some((remote_router.clone(), remote_side));
+        *remote_peer
+            .lock()
+            .expect("failed to lock remote peer") = Some((gs_router.clone(), gs_side));
+
+        remote_router
+            .announce_discovery()
+            .expect("failed to queue remote discovery announce");
+        remote_router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process remote discovery announce");
+
+        state
+            .topology_router
+            .set(gs_router.clone())
+            .expect("failed to set topology router");
+
+        state.queue_router_flight_state_update(FlightState::Idle);
+        state.queue_router_flight_state_update(FlightState::PreFill);
+
+        let states = remote_states.lock().expect("failed to lock remote states");
+        assert_eq!(states.as_slice(), &[FlightState::Idle as u8, FlightState::PreFill as u8]);
+        assert_eq!(remote_deliveries.load(Ordering::Relaxed), 2);
     }
 
     #[test]
