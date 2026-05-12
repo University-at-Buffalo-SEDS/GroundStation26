@@ -19,7 +19,6 @@ use crate::web::{AlertAckStateMsg, AlertDto, ErrorMsg, FlightStateMsg, WarningMs
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::Router;
-use sedsprintf_rs_2026::serialize;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -58,12 +57,6 @@ pub struct AppState {
 
     /// Commands from frontend → server (Arm, Disarm, Abort, etc.)
     pub cmd_tx: mpsc::Sender<TelemetryCommand>,
-
-    /// Direct serialized TX path to the rocket-side comms worker.
-    pub rocket_link_tx: Arc<OnceLock<mpsc::UnboundedSender<Vec<u8>>>>,
-
-    /// Direct serialized TX path to the fill-side comms worker.
-    pub umbilical_link_tx: Arc<OnceLock<mpsc::UnboundedSender<Vec<u8>>>>,
 
     /// Telemetry stream → frontend
     pub ws_tx: broadcast::Sender<TelemetryRow>,
@@ -259,6 +252,10 @@ impl AppState {
                     .reachable_endpoints
                     .contains(&DataEndpoint::FlightState)
         });
+        if let Err(err) = router.log_queue(DataType::FlightState, &[next_state as u8]) {
+            log::warn!("failed to queue flight-state broadcast for router delivery: {err}");
+            return;
+        }
 
         let dispatch_side = if rocket_has_flight_state && umbilical_has_flight_state {
             "rocket_comms,umbilical_comms"
@@ -272,34 +269,8 @@ impl AppState {
         log::info!(
             "flight-state dispatched side={dispatch_side} state={next_state:?} rocket_has_flight_state={rocket_has_flight_state} umbilical_has_flight_state={umbilical_has_flight_state}"
         );
-
-        let payload = Arc::from([next_state as u8]);
-        let pkt = match Packet::new(
-            DataType::FlightState,
-            &[DataEndpoint::FlightState],
-            Board::GroundStation.sender_id(),
-            crate::telemetry_task::get_current_timestamp_ms(),
-            payload,
-        ) {
-            Ok(pkt) => pkt,
-            Err(err) => {
-                log::warn!("failed to build flight-state packet for direct link delivery: {err}");
-                return;
-            }
-        };
-        let wire = serialize::serialize_packet(&pkt);
-
-        if rocket_has_flight_state
-            && let Some(tx) = self.rocket_link_tx.get()
-            && let Err(err) = tx.send(wire.to_vec())
-        {
-            log::warn!("failed to enqueue flight-state for rocket_comms delivery: {err}");
-        }
-        if umbilical_has_flight_state
-            && let Some(tx) = self.umbilical_link_tx.get()
-            && let Err(err) = tx.send(wire.to_vec())
-        {
-            log::warn!("failed to enqueue flight-state for umbilical_comms delivery: {err}");
+        if let Err(err) = router.process_tx_queue_with_timeout(0) {
+            log::warn!("failed to flush flight-state broadcast for router delivery: {err}");
         }
         if !umbilical_has_flight_state {
             log::warn!(

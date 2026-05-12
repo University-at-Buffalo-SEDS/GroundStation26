@@ -303,8 +303,6 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
-        rocket_link_tx: Arc::new(std::sync::OnceLock::new()),
-        umbilical_link_tx: Arc::new(std::sync::OnceLock::new()),
         ws_tx,
         warnings_tx: broadcast::channel(alerts_capacity).0,
         errors_tx: broadcast::channel(alerts_capacity).0,
@@ -533,8 +531,6 @@ async fn main() -> anyhow::Result<()> {
 
     let (rocket_tx, rocket_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let _ = state.rocket_link_tx.set(rocket_tx.clone());
-    let _ = state.umbilical_link_tx.set(umbilical_tx.clone());
 
     let rocket_side = {
         let rocket_tx = rocket_tx.clone();
