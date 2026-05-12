@@ -82,6 +82,7 @@ def _enum_value(enum_cls: object, *names: str) -> int:
 
 
 FLIGHT_COMMAND_TYPE = _enum_value(DT, "FLIGHT_COMMAND", "FlightCommand")
+FLIGHT_STATE_TYPE = _enum_value(DT, "FLIGHT_STATE", "FlightState")
 VALVE_COMMAND_TYPE = _enum_value(DT, "VALVE_COMMAND", "ValveCommand")
 ACTUATOR_COMMAND_TYPE = _enum_value(DT, "ACTUATOR_COMMAND", "ActuatorCommand")
 GROUNDSTATION_ENDPOINT = _enum_value(EP, "GROUND_STATION", "GroundStation")
@@ -268,6 +269,25 @@ def build_command_groups(include_hitl: bool) -> list[tuple[str, list[CommandSpec
             ]
         )
 
+    flight_state = [
+        CommandSpec("Startup", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 0, "FlightState"),
+        CommandSpec("Idle", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 1, "FlightState"),
+        CommandSpec("PreFill", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 2, "FlightState"),
+        CommandSpec("FillTest", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 3, "FlightState"),
+        CommandSpec("NitrogenFill", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 4, "FlightState"),
+        CommandSpec("NitrousFill", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 5, "FlightState"),
+        CommandSpec("Armed", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 6, "FlightState"),
+        CommandSpec("LaunchState", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 7, "FlightState"),
+        CommandSpec("Ascent", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 8, "FlightState"),
+        CommandSpec("Coast", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 9, "FlightState"),
+        CommandSpec("Apogee", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 10, "FlightState"),
+        CommandSpec("ParachuteDeploy", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 11, "FlightState"),
+        CommandSpec("Descent", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 12, "FlightState"),
+        CommandSpec("Landed", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 13, "FlightState"),
+        CommandSpec("Recovery", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 14, "FlightState"),
+        CommandSpec("Aborted", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 15, "FlightState"),
+    ]
+
     valve = [
         CommandSpec("PilotOpen", VALVE_COMMAND_TYPE, VALVE_BOARD_ENDPOINT, 0, "ValveBoardCommands"),
         CommandSpec("NormallyOpenOpen", VALVE_COMMAND_TYPE, VALVE_BOARD_ENDPOINT, 1, "ValveBoardCommands"),
@@ -287,7 +307,7 @@ def build_command_groups(include_hitl: bool) -> list[tuple[str, list[CommandSpec
         CommandSpec("NitrousClose", ACTUATOR_COMMAND_TYPE, ACTUATOR_BOARD_ENDPOINT, 13, "ActuatorBoardCommands"),
         CommandSpec("IgniterSequence", ACTUATOR_COMMAND_TYPE, ACTUATOR_BOARD_ENDPOINT, 14, "ActuatorBoardCommands"),
     ]
-    return [("Rocket", rocket), ("Valve", valve), ("Actuator", actuator)]
+    return [("Rocket", rocket), ("FlightState", flight_state), ("Valve", valve), ("Actuator", actuator)]
 
 
 def backend_root_from_script(script_path: Path) -> Path:
