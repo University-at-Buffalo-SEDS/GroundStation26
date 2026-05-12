@@ -236,8 +236,24 @@ impl AppState {
         let Some(router) = self.topology_router.get() else {
             return;
         };
+        let topology = router.export_topology();
+        let umbilical_has_flight_state = topology.routes.iter().any(|route| {
+            route.side_name == "umbilical_comms"
+                && route
+                    .reachable_endpoints
+                    .contains(&DataEndpoint::FlightState)
+        });
         if let Err(err) = router.log_queue(DataType::FlightState, &[next_state as u8]) {
             log::warn!("failed to queue flight-state broadcast for router delivery: {err}");
+            return;
+        }
+        if let Err(err) = router.process_tx_queue_with_timeout(0) {
+            log::warn!("failed to flush flight-state broadcast for router delivery: {err}");
+        }
+        if !umbilical_has_flight_state {
+            log::warn!(
+                "flight-state change queued but umbilical_comms is not currently discovered with FlightState; fill-side delivery may not occur"
+            );
         }
     }
 
@@ -645,17 +661,10 @@ impl AppState {
     pub fn network_topology_snapshot(&self, now_ms: u64) -> NetworkTopologyMsg {
         let simulated = crate::flight_sim::sim_mode_enabled();
         let topology_board_timeout_ms = network_topology_board_timeout_ms();
-        let exported = if cfg!(feature = "test_fire_mode") {
-            // In test-fire mode the AV-bay side is intentionally absent and both comms links may
-            // be dummy placeholders. Avoid router topology export here; that path has proven
-            // fragile with disconnected-link operator setups, while the dashboard can still render
-            // a useful topology from board visibility and known side mappings alone.
-            None
-        } else {
-            self.topology_router
-                .get()
-                .map(|router| router.export_topology())
-        };
+        let exported = self
+            .topology_router
+            .get()
+            .map(|router| router.export_topology());
         let board_snapshot = self.board_status_snapshot(now_ms);
         let route_snapshot = exported.as_ref();
         let mut local_endpoint_list = vec![
