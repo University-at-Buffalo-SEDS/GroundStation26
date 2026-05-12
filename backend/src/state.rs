@@ -1453,30 +1453,10 @@ fn modeled_board_endpoints(
         };
     }
 
-    let mut endpoints = match board {
+    match board {
         Board::GroundStation => local_endpoint_list.to_vec(),
-        Board::FlightComputer => vec![
-            DataEndpoint::FlightController.as_str().to_string(),
-            DataEndpoint::FlightState.as_str().to_string(),
-            DataEndpoint::SdCard.as_str().to_string(),
-        ],
-        Board::RFBoard => Vec::new(),
-        Board::PowerBoard => Vec::new(),
-        Board::ValveBoard => vec![
-            DataEndpoint::ValveBoard.as_str().to_string(),
-            DataEndpoint::Abort.as_str().to_string(),
-        ],
-        Board::GatewayBoard => Vec::new(),
-        Board::ActuatorBoard => vec![
-            DataEndpoint::ActuatorBoard.as_str().to_string(),
-            DataEndpoint::Abort.as_str().to_string(),
-        ],
-        Board::DaqBoard => Vec::new(),
-    };
-
-    endpoints.sort();
-    endpoints.dedup();
-    endpoints
+        _ => Vec::new(),
+    }
 }
 
 fn launch_clock_for_transition(
