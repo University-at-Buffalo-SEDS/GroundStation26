@@ -316,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
         auth_db,
         state: Arc::new(Mutex::new(FlightStateMode::Startup)),
         state_tx: broadcast::channel(16).0,
+        last_flight_state_packet_ts_ms: Arc::new(AtomicU64::new(0)),
         gpio,
         board_status: Arc::new(Mutex::new(board_status)),
         board_status_tx,

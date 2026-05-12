@@ -3757,12 +3757,10 @@ mod tests {
         let remote_states = Arc::new(Mutex::new(Vec::<u8>::new()));
         let remote_states_handler = remote_states.clone();
         let mut policy = state.action_policy_snapshot();
-        if let Some(control) = policy
-            .controls
-            .iter_mut()
-            .find(|control| control.cmd == "AdvanceFlightState")
-        {
-            control.enabled = true;
+        for control in policy.controls.iter_mut() {
+            if matches!(control.cmd.as_str(), "AdvanceFlightState" | "RewindFlightState") {
+                control.enabled = true;
+            }
         }
         state.set_action_policy(policy);
 
@@ -3853,26 +3851,43 @@ mod tests {
             shutdown_rx,
         ));
 
-        cmd_tx
-            .send(TelemetryCommand::AdvanceFlightState)
-            .await
-            .expect("failed to send advance command");
-
-        tokio::time::timeout(Duration::from_millis(250), async {
-            loop {
-                if state.local_flight_state_snapshot() == FlightState::Idle {
-                    break;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let start_state = state.local_flight_state_snapshot();
+        let commands = (0..16)
+            .map(|idx| {
+                if idx % 8 >= 4 {
+                    TelemetryCommand::RewindFlightState
+                } else {
+                    TelemetryCommand::AdvanceFlightState
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("timed out waiting for local flight state transition");
+            })
+            .collect::<Vec<_>>();
+        let mut expected_states = Vec::with_capacity(commands.len());
+        let mut current = start_state;
+        for cmd in &commands {
+            current = match cmd {
+                TelemetryCommand::AdvanceFlightState => {
+                    operator_mode_adjacent_flight_state(current, 1)
+                }
+                TelemetryCommand::RewindFlightState => {
+                    operator_mode_adjacent_flight_state(current, -1)
+                }
+                _ => current,
+            };
+            expected_states.push(current as u8);
+        }
 
-        let remote_result = tokio::time::timeout(Duration::from_millis(250), async {
+        for cmd in commands {
+            cmd_tx
+                .send(cmd)
+                .await
+                .expect("failed to send flight state command");
+        }
+
+        let remote_result = tokio::time::timeout(Duration::from_millis(1500), async {
             loop {
                 let states = remote_states.lock().expect("failed to lock remote states");
-                if !states.is_empty() {
+                if states.len() >= expected_states.len() {
                     break;
                 }
                 drop(states);
@@ -3884,10 +3899,13 @@ mod tests {
         state.request_shutdown();
         telemetry.await.expect("telemetry task join failed");
 
-        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+        assert_eq!(
+            state.local_flight_state_snapshot() as u8,
+            *expected_states.last().expect("expected states missing")
+        );
         remote_result.expect("timed out waiting for remote flight state");
         let states = remote_states.lock().expect("failed to lock remote states");
-        assert_eq!(states.as_slice(), &[FlightState::Idle as u8]);
+        assert_eq!(states.as_slice(), expected_states.as_slice());
     }
 
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
@@ -3940,6 +3958,7 @@ mod tests {
             auth_db,
             state: Arc::new(Mutex::new(FlightState::Startup)),
             state_tx,
+            last_flight_state_packet_ts_ms: Arc::new(AtomicU64::new(0)),
             gpio: GpioPins::new(),
             board_status: Arc::new(Mutex::new(board_status)),
             board_status_tx,

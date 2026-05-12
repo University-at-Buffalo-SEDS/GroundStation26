@@ -97,6 +97,9 @@ pub struct AppState {
     /// Flight state updates → frontend
     pub state_tx: broadcast::Sender<FlightStateMsg>,
 
+    /// Monotonic packet timestamp anchor for GS-originated flight-state packets.
+    pub last_flight_state_packet_ts_ms: Arc<AtomicU64>,
+
     /// GPIO interface
     pub gpio: Arc<GpioPins>,
 
@@ -253,11 +256,25 @@ impl AppState {
                     .contains(&DataEndpoint::FlightState)
         });
 
+        let timestamp_ms = {
+            let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+            loop {
+                let prev = self.last_flight_state_packet_ts_ms.load(Ordering::Relaxed);
+                let next = now_ms.max(prev.saturating_add(1));
+                if self
+                    .last_flight_state_packet_ts_ms
+                    .compare_exchange(prev, next, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break next;
+                }
+            }
+        };
         let pkt = match Packet::new(
             DataType::FlightState,
             &[DataEndpoint::FlightState],
             Board::GroundStation.sender_id(),
-            crate::telemetry_task::get_current_timestamp_ms(),
+            timestamp_ms,
             Arc::from([next_state as u8]),
         ) {
             Ok(pkt) => pkt,
@@ -1750,6 +1767,7 @@ mod tests {
             auth_db,
             state: Arc::new(Mutex::new(FlightState::Startup)),
             state_tx,
+            last_flight_state_packet_ts_ms: Arc::new(AtomicU64::new(0)),
             gpio: GpioPins::new(),
             board_status: Arc::new(Mutex::new(board_status)),
             board_status_tx,
@@ -1829,8 +1847,27 @@ mod tests {
             .set(router)
             .expect("failed to set topology router");
 
-        state.queue_router_flight_state_update(FlightState::Idle);
-        state.queue_router_flight_state_update(FlightState::PreFill);
+        let sequence = [
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::FillTest,
+            FlightState::PreFill,
+            FlightState::Idle,
+            FlightState::Startup,
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::FillTest,
+            FlightState::PreFill,
+            FlightState::Idle,
+            FlightState::Startup,
+        ];
+        for state_code in sequence {
+            state.queue_router_flight_state_update(state_code);
+        }
 
         let sent = sent.lock().expect("failed to lock sends");
         let flight_state_packets = sent
@@ -1838,7 +1875,7 @@ mod tests {
             .filter_map(|wire| sedsprintf_rs_2026::serialize::deserialize_packet(wire).ok())
             .filter(|pkt| pkt.data_type() == DataType::FlightState)
             .count();
-        assert_eq!(flight_state_packets, 2);
+        assert_eq!(flight_state_packets, sequence.len());
     }
 
     #[tokio::test]
@@ -1930,12 +1967,32 @@ mod tests {
             .set(gs_router.clone())
             .expect("failed to set topology router");
 
-        state.queue_router_flight_state_update(FlightState::Idle);
-        state.queue_router_flight_state_update(FlightState::PreFill);
+        let sequence = [
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::FillTest,
+            FlightState::PreFill,
+            FlightState::Idle,
+            FlightState::Startup,
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::FillTest,
+            FlightState::PreFill,
+            FlightState::Idle,
+            FlightState::Startup,
+        ];
+        for state_code in sequence {
+            state.queue_router_flight_state_update(state_code);
+        }
 
         let states = remote_states.lock().expect("failed to lock remote states");
-        assert_eq!(states.as_slice(), &[FlightState::Idle as u8, FlightState::PreFill as u8]);
-        assert_eq!(remote_deliveries.load(Ordering::Relaxed), 2);
+        let expected = sequence.iter().map(|state| *state as u8).collect::<Vec<_>>();
+        assert_eq!(states.as_slice(), expected.as_slice());
+        assert_eq!(remote_deliveries.load(Ordering::Relaxed), sequence.len());
     }
 
     #[test]
