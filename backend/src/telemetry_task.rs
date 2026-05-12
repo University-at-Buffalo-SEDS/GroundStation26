@@ -3748,6 +3748,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     #[tokio::test]
     async fn advance_flight_state_command_reaches_remote_router_end_to_end() {
         let (db_tx, db_rx) = mpsc::channel(8);
