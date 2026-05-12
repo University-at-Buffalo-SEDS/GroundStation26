@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use crate::telemetry_task::{get_current_timestamp_ms, queue_abort_packet};
-use crate::types::{Board, FlightState};
+use crate::types::{Board, FlightState, canonical_sender_id};
 use crate::web::{emit_warning, emit_warning_db_only};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
@@ -51,6 +51,7 @@ const BATTERY_VOLTAGE_VALVE_BOARD_MIN_THRESHOLD: f32 = 12.3; // V
 const BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD: f32 = 16.5; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD: f32 = 12.3; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 16.5; // V
+const BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD: f32 = 13.0; // V
 
 // Battery current thresholds (A)
 const BATTERY_CURRENT_MIN_THRESHOLD: f32 = 0.0; // A
@@ -124,6 +125,28 @@ fn battery_voltage_bounds_by_sender() -> &'static HashMap<String, (f32, f32)> {
 
         out
     })
+}
+
+fn battery_low_voltage_always_warns(sender_id: &str, voltage: f32) -> bool {
+    matches!(
+        canonical_sender_id(sender_id),
+        sender if sender == Board::ValveBoard.sender_id()
+            || sender == Board::GatewayBoard.sender_id()
+    ) && voltage <= BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD
+}
+
+fn battery_voltage_out_of_range(sender_id: &str, voltage: f32) -> bool {
+    if !voltage.is_finite() {
+        return false;
+    }
+
+    let sender_id = canonical_sender_id(sender_id);
+    let outside_configured_range = battery_voltage_bounds_by_sender()
+        .get(sender_id)
+        .copied()
+        .is_some_and(|(min_v, max_v)| voltage < min_v || voltage > max_v);
+
+    outside_configured_range || battery_low_voltage_always_warns(sender_id, voltage)
 }
 
 fn check_accel_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
@@ -437,10 +460,7 @@ pub async fn safety_task(
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
                     // Voltage
                     if let Some(voltage) = values.first()
-                        && let Some((min_v, max_v)) = battery_voltage_bounds_by_sender()
-                            .get(pkt.sender())
-                            .copied()
-                        && ((*voltage < min_v) || (*voltage > max_v))
+                        && battery_voltage_out_of_range(pkt.sender(), *voltage)
                     {
                         cycle_warnings.insert("Critical: Battery voltage out of range!");
                     }
@@ -503,5 +523,31 @@ pub async fn safety_task(
             gs_debug_println!("Safety task: Abort command sent");
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_voltage_floor_always_warns_for_twelve_volt_batteries() {
+        assert!(battery_low_voltage_always_warns("VB", 13.0));
+        assert!(battery_low_voltage_always_warns("GB", 13.0));
+        assert!(battery_low_voltage_always_warns("GW", 13.0));
+        assert!(battery_low_voltage_always_warns("VB", 12.99));
+    }
+
+    #[test]
+    fn low_voltage_floor_does_not_apply_to_av_bay_battery() {
+        assert!(!battery_low_voltage_always_warns("PB", 7.4));
+        assert!(!battery_low_voltage_always_warns("PB", 13.0));
+    }
+
+    #[test]
+    fn battery_voltage_range_check_includes_non_configurable_low_voltage_floor() {
+        assert!(battery_voltage_out_of_range("VB", 13.0));
+        assert!(battery_voltage_out_of_range("GB", 13.0));
+        assert!(battery_voltage_out_of_range("GW", 13.0));
     }
 }
