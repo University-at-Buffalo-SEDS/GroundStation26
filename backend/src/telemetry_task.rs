@@ -127,6 +127,7 @@ fn spawn_comms_worker_threads(
                     match comms.send_data(&payload) {
                         Ok(()) => {
                             sent_any = true;
+                            log_link_control_send(worker_name, &payload);
                             log_radio_command_event("radio TX sent", worker_name, &payload);
                             if suppressed_send_errors > 0 {
                                 eprintln!(
@@ -241,6 +242,7 @@ fn spawn_legacy_comms_worker_thread(
                             sent_any = true;
                             match comms.send_data(&payload) {
                                 Ok(()) => {
+                                    log_link_control_send(worker_name, &payload);
                                     log_radio_command_event("radio TX sent", worker_name, &payload);
                                     if suppressed_send_errors > 0 {
                                         eprintln!(
@@ -890,6 +892,7 @@ fn radio_command_log_line(event: &str, worker_name: &str, payload: &[u8]) -> Opt
         DataType::ValveCommand
             | DataType::FlightCommand
             | DataType::ActuatorCommand
+            | DataType::FlightState
             | DataType::Abort
     );
     if !is_command {
@@ -918,6 +921,28 @@ fn log_radio_command_event(event: &str, worker_name: &str, payload: &[u8]) {
     if let Some(message) = radio_command_log_line(event, worker_name, payload) {
         eprintln!("{message}");
     }
+}
+
+fn log_link_control_send(worker_name: &str, payload: &[u8]) {
+    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+        return;
+    };
+    if !matches!(pkt.data_type(), DataType::FlightState) {
+        return;
+    }
+    let payload_preview = pkt
+        .payload()
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    log::info!(
+        "link tx sent side={worker_name} ty={:?} sender={} endpoints={:?} payload={payload_preview}",
+        pkt.data_type(),
+        pkt.sender(),
+        pkt.endpoints(),
+    );
 }
 
 fn log_radio_packet_event(event: &str, worker_name: &str, payload: &[u8]) {
@@ -954,6 +979,7 @@ fn is_command_payload(payload: &[u8]) -> bool {
         DataType::ValveCommand
             | DataType::FlightCommand
             | DataType::ActuatorCommand
+            | DataType::FlightState
             | DataType::Abort
     )
 }
