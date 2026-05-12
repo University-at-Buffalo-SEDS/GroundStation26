@@ -1,6 +1,7 @@
 use crate::gpio::Trigger;
 use crate::sequences::{ActionPolicyMsg, BlinkMode};
 use crate::state::AppState;
+use crate::telemetry_task::queue_abort_packet;
 use crate::types::TelemetryCommand;
 use crate::web::{emit_error, emit_notification_warning};
 use std::collections::HashMap;
@@ -121,12 +122,23 @@ fn setup_callbacks(
     let tx_abort = tx.clone();
     let state_abort = state.clone();
     gpio.setup_callback_input_pin(ABORT_PIN, Trigger::Both, debounce, move |_is_high| {
-        if tx_abort.blocking_send(TelemetryCommand::Abort).is_err() {
-            eprintln!("GPIO abort button: failed to send command");
-        }
         state_abort.set_abort_indicator_latched(true);
         crate::sequences::refresh_action_policy_now(&state_abort);
         state_abort.broadcast_action_policy_snapshot();
+
+        if let Some(router) = state_abort.topology_router.get() {
+            if let Err(err) = queue_abort_packet(router, "Manual GPIO Abort Button Pressed") {
+                eprintln!("GPIO abort button: failed to queue abort packet: {err}");
+            } else if let Err(err) = router.process_all_queues_with_timeout(3) {
+                eprintln!("GPIO abort button: failed to flush abort packet: {err}");
+            }
+        } else {
+            eprintln!("GPIO abort button: router unavailable, falling back to command queue");
+        }
+
+        if tx_abort.try_send(TelemetryCommand::Abort).is_err() {
+            eprintln!("GPIO abort button: failed to send command");
+        }
         emit_error(&state_abort, "Manual abort button pressed!".to_string());
     })?;
 
@@ -549,28 +561,27 @@ fn alarm_active_window(severity: AlarmSeverity, now_ms: u64) -> bool {
 fn alarm_led_brightness(severity: AlarmSeverity, now_ms: u64) -> f64 {
     match severity {
         AlarmSeverity::Warning => {
-            let period_ms = 1_000_u64;
+            let period_ms = 3_000_u64;
             let phase = (now_ms % period_ms) as f64 / period_ms as f64;
             0.5 - 0.5 * (std::f64::consts::TAU * phase).cos()
         }
         AlarmSeverity::Error => {
-            let cycle_ms = 1_500_u64;
+            let cycle_ms = 900_u64;
             let phase_ms = now_ms % cycle_ms;
-            if let Some(pulse) = double_blink_pulse(phase_ms, 0) {
-                return pulse;
-            }
-            if let Some(pulse) = double_blink_pulse(phase_ms, 220) {
-                return pulse;
+            for offset_ms in [0_u64, 180, 360] {
+                if let Some(pulse) = error_blink_pulse(phase_ms, offset_ms) {
+                    return pulse;
+                }
             }
             0.0
         }
     }
 }
 
-fn double_blink_pulse(phase_ms: u64, offset_ms: u64) -> Option<f64> {
-    let rise_ms = 60_u64;
-    let hold_ms = 70_u64;
-    let fall_ms = 60_u64;
+fn error_blink_pulse(phase_ms: u64, offset_ms: u64) -> Option<f64> {
+    let rise_ms = 35_u64;
+    let hold_ms = 100_u64;
+    let fall_ms = 35_u64;
     let pulse_ms = rise_ms + hold_ms + fall_ms;
     if phase_ms < offset_ms || phase_ms >= offset_ms + pulse_ms {
         return None;
