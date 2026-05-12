@@ -1,5 +1,4 @@
 use crate::state::AppState;
-use crate::telemetry_db::{DbQueueItem, DbWrite};
 use crate::telemetry_task::{get_current_timestamp_ms, queue_abort_packet};
 use crate::types::{Board, FlightState};
 use crate::web::{emit_warning, emit_warning_db_only};

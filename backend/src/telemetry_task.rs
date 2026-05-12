@@ -1848,8 +1848,9 @@ fn send_valve_launch_sequence_command(router: &Router) -> bool {
         log_telemetry_error("failed to log valve launch sequence command", e);
         false
     } else {
-        log_command_queue_success(
+        log_command_dispatch(
             "Valve launch sequence command",
+            "umbilical_comms",
             DataType::ValveCommand,
             &payload,
         );
@@ -1943,15 +1944,14 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
     let now_ms = get_current_timestamp_ms() as i64;
     state.set_launch_clock(launch_countdown_clock(now_ms));
     if let Err(e) =
-        queue_locally_routed_flight_command(&router, &[FlightComputerCommands::LaunchSignal as u8])
+        queue_locally_routed_flight_command(
+            &router,
+            "Launch command",
+            &[FlightComputerCommands::LaunchSignal as u8],
+        )
     {
         log_telemetry_error("failed to log Launch command", e);
     } else {
-        log_command_queue_success(
-            "Launch command",
-            DataType::FlightCommand,
-            &[FlightComputerCommands::LaunchSignal as u8],
-        );
         flush_command_tx(&router, "Launch command tx");
         state.set_launch_indicator_latched(true);
         sequences::refresh_action_policy_now(&state);
@@ -2312,8 +2312,9 @@ pub async fn telemetry_task(
                                 if let Err(e) = router.log_queue(DataType::ActuatorCommand, &payload) {
                                     log_telemetry_error("failed to log IgniterSequence command", e);
                                 } else {
-                                    log_command_queue_success(
+                                    log_command_dispatch(
                                         "IgniterSequence command",
+                                        "umbilical_comms",
                                         DataType::ActuatorCommand,
                                         &payload,
                                     );
@@ -2457,15 +2458,10 @@ pub async fn telemetry_task(
                         TelemetryCommand::PostinitSignal => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "PostinitSignal command",
                                     &[FlightComputerCommands::PostinitSignal as u8],
                                 ) {
                                     log_telemetry_error("failed to log PostinitSignal command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "PostinitSignal command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::PostinitSignal as u8],
-                                    );
                                 }
                                 gs_debug_println!("PostinitSignal command sent");
                             }
@@ -2479,150 +2475,100 @@ pub async fn telemetry_task(
                         TelemetryCommand::LaunchSignal => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "LaunchSignal command",
                                     &[FlightComputerCommands::LaunchSignal as u8],
                                 ) {
                                     log_telemetry_error("failed to log LaunchSignal command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "LaunchSignal command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::LaunchSignal as u8],
-                                    );
                                 }
                                 gs_debug_println!("LaunchSignal command sent");
                             }
                         TelemetryCommand::RollbackSignal => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "RollbackSignal command",
                                     &[FlightComputerCommands::RollbackSignal as u8],
                                 ) {
                                     log_telemetry_error("failed to log RollbackSignal command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "RollbackSignal command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::RollbackSignal as u8],
-                                    );
                                 }
                                 gs_debug_println!("RollbackSignal command sent");
                             }
                         TelemetryCommand::MonitorAltitude => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "MonitorAltitude command",
                                     &[FlightComputerCommands::MonitorAltitude as u8],
                                 ) {
                                     log_telemetry_error("failed to log MonitorAltitude command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "MonitorAltitude command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::MonitorAltitude as u8],
-                                    );
                                 }
                                 gs_debug_println!("MonitorAltitude command sent");
                             }
                         TelemetryCommand::RevokeMonitorAltitude => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "RevokeMonitorAltitude command",
                                     &[FlightComputerCommands::RevokeMonitorAltitude as u8],
                                 ) {
                                     log_telemetry_error("failed to log RevokeMonitorAltitude command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "RevokeMonitorAltitude command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::RevokeMonitorAltitude as u8],
-                                    );
                                 }
                                 gs_debug_println!("RevokeMonitorAltitude command sent");
                             }
                         TelemetryCommand::ConsecutiveSamples => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "ConsecutiveSamples command",
                                     &[FlightComputerCommands::ConsecutiveSamples as u8],
                                 ) {
                                     log_telemetry_error("failed to log ConsecutiveSamples command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "ConsecutiveSamples command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::ConsecutiveSamples as u8],
-                                    );
                                 }
                                 gs_debug_println!("ConsecutiveSamples command sent");
                             }
                         TelemetryCommand::RevokeConsecutiveSamples => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "RevokeConsecutiveSamples command",
                                     &[FlightComputerCommands::RevokeConsecutiveSamples as u8],
                                 ) {
                                     log_telemetry_error("failed to log RevokeConsecutiveSamples command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "RevokeConsecutiveSamples command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::RevokeConsecutiveSamples as u8],
-                                    );
                                 }
                                 gs_debug_println!("RevokeConsecutiveSamples command sent");
                             }
                         TelemetryCommand::ResetFailures => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "ResetFailures command",
                                     &[FlightComputerCommands::ResetFailures as u8],
                                 ) {
                                     log_telemetry_error("failed to log ResetFailures command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "ResetFailures command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::ResetFailures as u8],
-                                    );
                                 }
                                 gs_debug_println!("ResetFailures command sent");
                             }
                         TelemetryCommand::RevokeResetFailures => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "RevokeResetFailures command",
                                     &[FlightComputerCommands::RevokeResetFailures as u8],
                                 ) {
                                     log_telemetry_error("failed to log RevokeResetFailures command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "RevokeResetFailures command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::RevokeResetFailures as u8],
-                                    );
                                 }
                                 gs_debug_println!("RevokeResetFailures command sent");
                             }
                         TelemetryCommand::ValidateMeasms => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "ValidateMeasms command",
                                     &[FlightComputerCommands::ValidateMeasms as u8],
                                 ) {
                                     log_telemetry_error("failed to log ValidateMeasms command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "ValidateMeasms command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::ValidateMeasms as u8],
-                                    );
                                 }
                                 gs_debug_println!("ValidateMeasms command sent");
                             }
                         TelemetryCommand::RevokeValidateMeasms => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "RevokeValidateMeasms command",
                                     &[FlightComputerCommands::RevokeValidateMeasms as u8],
                                 ) {
                                     log_telemetry_error("failed to log RevokeValidateMeasms command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "RevokeValidateMeasms command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::RevokeValidateMeasms as u8],
-                                    );
                                 }
                                 gs_debug_println!("RevokeValidateMeasms command sent");
                             }
@@ -2685,14 +2631,12 @@ pub async fn telemetry_task(
                         | TelemetryCommand::ReinitAfter30
                         | TelemetryCommand::ReinitAfter50 => {
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
-                                if let Err(e) = queue_locally_routed_flight_command(&router, &[cmd_id]) {
+                                if let Err(e) = queue_locally_routed_flight_command(
+                                    &router,
+                                    "HITL flight command",
+                                    &[cmd_id],
+                                ) {
                                     log_telemetry_error("failed to log HITL flight command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "HITL flight command",
-                                        DataType::FlightCommand,
-                                        &[cmd_id],
-                                    );
                                 }
                                 gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
                             }
@@ -2867,7 +2811,7 @@ fn queue_guarded_fill_command(
         log_telemetry_error(&format!("failed to queue {label}"), err);
         return;
     }
-    log_command_queue_success(label, data_type, &[cmd_payload]);
+    log_command_dispatch(label, "umbilical_comms", data_type, &[cmd_payload]);
     state.set_pending_umbilical_valve_state(key_cmd_id, desired_state);
     sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
@@ -3493,14 +3437,14 @@ fn log_router_decode_error(err: sedsprintf_rs_2026::TelemetryError) {
     }
 }
 
-fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
-    eprintln!(
-        "{context}: queued ty={ty:?} payload={}",
-        payload
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<Vec<_>>()
-            .join(" ")
+fn log_command_dispatch(context: &str, side: &str, ty: DataType, payload: &[u8]) {
+    let payload_preview = payload
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    log::info!(
+        "command dispatched side={side} context=\"{context}\" ty={ty:?} payload={payload_preview}"
     );
 }
 
@@ -3517,6 +3461,7 @@ fn queue_locally_routed_command<T: Copy + 'static>(
 
 fn queue_locally_routed_flight_command(
     router: &Router,
+    context: &str,
     payload: &[u8],
 ) -> sedsprintf_rs_2026::TelemetryResult<()> {
     let topology = router.export_topology();
@@ -3534,10 +3479,27 @@ fn queue_locally_routed_flight_command(
     });
 
     if rocket_has_fc && !umbilical_has_fc {
-        return queue_locally_routed_command(router, DataType::FlightCommand, payload);
+        queue_locally_routed_command(router, DataType::FlightCommand, payload)?;
+        log_command_dispatch(context, "rocket_comms", DataType::FlightCommand, payload);
+        return Ok(());
     }
 
-    router.log_queue(DataType::FlightCommand, payload)
+    router.log_queue(DataType::FlightCommand, payload)?;
+    log_command_dispatch(
+        context,
+        if rocket_has_fc && umbilical_has_fc {
+            "rocket_comms,umbilical_comms"
+        } else if rocket_has_fc {
+            "rocket_comms"
+        } else if umbilical_has_fc {
+            "umbilical_comms"
+        } else {
+            "broadcast"
+        },
+        DataType::FlightCommand,
+        payload,
+    );
+    Ok(())
 }
 
 fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::TelemetryError> {

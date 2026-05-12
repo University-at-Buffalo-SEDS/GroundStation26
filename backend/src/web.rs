@@ -1267,11 +1267,8 @@ async fn dismiss_notification(
     if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
         return response;
     }
-    if state.dismiss_notification(id) {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
-    }
+    let _ = id;
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Returns the current command gating policy for the actions UI.
@@ -1503,7 +1500,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let mut telemetry_rx = state.ws_tx.subscribe();
     let mut warnings_rx = state.warnings_tx.subscribe();
     let mut errors_rx = state.errors_tx.subscribe();
-    let mut alert_ack_rx = state.alert_ack_tx.subscribe();
     let mut state_rx = state.state_tx.subscribe();
     let mut launch_clock_rx = state.launch_clock_tx.subscribe();
     let mut board_status_rx = state.board_status_tx.subscribe();
@@ -1596,9 +1592,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         if ws_out_tx.send(initial_recording_status).await.is_err() {
             return;
         }
-        let initial_alert_ack_state = serde_json::to_string(&WsOutMsg::AlertAckState(
-            state_for_send.alert_ack_state_snapshot(),
-        ))
+        let initial_alert_ack_state =
+            serde_json::to_string(&WsOutMsg::AlertAckState(AlertAckStateMsg::default()))
         .unwrap_or_default();
         if ws_out_tx.send(initial_alert_ack_state).await.is_err() {
             return;
@@ -1671,20 +1666,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     match recv {
                         Ok(err) => {
                             let msg = WsOutMsg::Error(err);
-                            let text = serde_json::to_string(&msg).unwrap_or_default();
-                            if ws_out_tx.send(text).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-
-                recv = alert_ack_rx.recv() => {
-                    match recv {
-                        Ok(ack_state) => {
-                            let msg = WsOutMsg::AlertAckState(ack_state);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;
@@ -2149,10 +2130,12 @@ async fn post_alert_ack(
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-
-    let snapshot =
-        state.acknowledge_alerts_through(body.warning_timestamp_ms, body.error_timestamp_ms);
-    Json(snapshot).into_response()
+    let _ = state;
+    Json(AlertAckStateMsg {
+        warning_ack_timestamp_ms: body.warning_timestamp_ms,
+        error_ack_timestamp_ms: body.error_timestamp_ms,
+    })
+    .into_response()
 }
 
 async fn get_boards(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
