@@ -120,11 +120,8 @@ fn setup_callbacks(
 
     let tx_abort = tx.clone();
     let state_abort = state.clone();
-    gpio.setup_callback_input_pin(ABORT_PIN, Trigger::RisingEdge, debounce, move |is_high| {
-        if !is_high {
-            return;
-        }
-        if tx_abort.try_send(TelemetryCommand::Abort).is_err() {
+    gpio.setup_callback_input_pin(ABORT_PIN, Trigger::Both, debounce, move |_is_high| {
+        if tx_abort.blocking_send(TelemetryCommand::Abort).is_err() {
             eprintln!("GPIO abort button: failed to send command");
         }
         state_abort.set_abort_indicator_latched(true);
@@ -265,8 +262,7 @@ fn setup_callbacks(
                 return;
             }
             let now_ms = crate::telemetry_task::get_current_timestamp_ms() as i64;
-            state_warning_ack.acknowledge_warnings_through(now_ms);
-            state_warning_ack.acknowledge_errors_through(now_ms);
+            state_warning_ack.acknowledge_alerts_through(now_ms, now_ms);
         },
     )?;
 
