@@ -786,21 +786,7 @@ fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> Flig
 
 #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_state: FlightState) {
-    {
-        let mut fs = state.state.lock().unwrap();
-        *fs = next_state;
-    }
-    let _ = state.state_tx.send(FlightStateMsg { state: next_state });
-    state.broadcast_fill_targets_snapshot();
-    let ts_ms = get_current_timestamp_ms() as i64;
-    state.update_launch_clock_for_state(next_state, ts_ms);
-    let _ = state
-        .db_queue_tx
-        .send(DbQueueItem::Write(DbWrite::FlightState {
-            timestamp_ms: ts_ms,
-            state_code: next_state as i64,
-        }))
-        .await;
+    state.set_local_flight_state(next_state);
 }
 
 static BATTERY_ESTIMATOR_STATE: OnceLock<Mutex<HashMap<String, BatteryEstimatorState>>> =

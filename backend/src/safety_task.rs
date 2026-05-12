@@ -310,33 +310,8 @@ pub async fn safety_task(
             && !cfg!(feature = "hitl_mode")
             && !cfg!(feature = "test_fire_mode")
         {
-            let should_advance = {
-                let mut fs = state.state.lock().unwrap();
-                if *fs == FlightState::Startup {
-                    *fs = FlightState::Idle;
-                    true
-                } else {
-                    false
-                }
-            };
-
-            if should_advance {
-                let ts_ms = get_current_timestamp_ms() as i64;
-                state.update_launch_clock_for_state(FlightState::Idle, ts_ms);
-                if let Err(err) = state
-                    .db_queue_tx
-                    .send(DbQueueItem::Write(DbWrite::FlightState {
-                        timestamp_ms: ts_ms,
-                        state_code: FlightState::Idle as i64,
-                    }))
-                    .await
-                {
-                    eprintln!("Failed to enqueue startup->idle flight_state write: {err}");
-                }
-                let _ = state.state_tx.send(crate::web::FlightStateMsg {
-                    state: FlightState::Idle,
-                });
-                state.broadcast_fill_targets_snapshot();
+            if *state.state.lock().unwrap() == FlightState::Startup {
+                state.set_local_flight_state(FlightState::Idle);
             }
         }
 

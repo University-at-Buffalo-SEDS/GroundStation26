@@ -16,7 +16,7 @@ use crate::types::{
     TelemetryRow, canonical_sender_id,
 };
 use crate::web::{AlertAckStateMsg, AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
-use sedsprintf_rs_2026::config::DataEndpoint;
+use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::Router;
 use sqlx::SqlitePool;
@@ -232,6 +232,15 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn queue_router_flight_state_update(&self, next_state: FlightState) {
+        let Some(router) = self.topology_router.get() else {
+            return;
+        };
+        if let Err(err) = router.log_queue(DataType::FlightState, &[next_state as u8]) {
+            log::warn!("failed to queue flight-state broadcast for router delivery: {err}");
+        }
+    }
+
     pub fn sequence_policy_state_snapshot(&self) -> SequencePolicyState {
         *self.sequence_policy_state.lock().unwrap()
     }
@@ -939,6 +948,7 @@ impl AppState {
         drop(slot);
         // Keep the simulator in lock-step with the real backend state machine.
         crate::flight_sim::sync_local_flight_state(next_state);
+        self.queue_router_flight_state_update(next_state);
 
         let _ = self.state_tx.send(FlightStateMsg { state: next_state });
         self.broadcast_fill_targets_snapshot();

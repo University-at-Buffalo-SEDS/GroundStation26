@@ -2009,6 +2009,7 @@ impl DummyComms {
                 DataEndpoint::ValveBoard,
                 DataEndpoint::ActuatorBoard,
                 DataEndpoint::Abort,
+                DataEndpoint::FlightState,
             ],
             _ => &[],
         }
