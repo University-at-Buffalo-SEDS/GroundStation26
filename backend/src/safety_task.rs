@@ -52,8 +52,6 @@ const BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD: f32 = 16.5; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD: f32 = 12.3; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 16.5; // V
 const BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD: f32 = 13.0; // V
-const BATTERY_LOW_VOLTAGE_RELATCH_THRESHOLD: f32 = 15.0; // V
-const FILL_SYSTEM_LOW_VOLTAGE_WARNING: &str = "Critical: Fill system battery voltage below 13V!";
 
 // Battery current thresholds (A)
 const BATTERY_CURRENT_MIN_THRESHOLD: f32 = 0.0; // A
@@ -154,24 +152,6 @@ fn battery_voltage_out_of_range(sender_id: &str, voltage: f32) -> bool {
     outside_configured_range || battery_low_voltage_always_warns(sender_id, voltage)
 }
 
-fn update_fill_system_low_voltage_latch(latched: &mut bool, voltage: f32) -> bool {
-    if !voltage.is_finite() {
-        return false;
-    }
-
-    if voltage > BATTERY_LOW_VOLTAGE_RELATCH_THRESHOLD {
-        *latched = false;
-        return false;
-    }
-
-    if voltage <= BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD && !*latched {
-        *latched = true;
-        return true;
-    }
-
-    false
-}
-
 fn check_accel_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
     if let Some(accel_x) = values.first()
         && ((ACCELERATION_X_MIN_THRESHOLD > *accel_x) || (*accel_x > ACCELERATION_X_MAX_THRESHOLD))
@@ -229,7 +209,6 @@ pub async fn safety_task(
         SAFETY_WARNING_COOLDOWN_MS_DEFAULT,
     );
     let mut last_warning_emit_ms: HashMap<&'static str, u64> = HashMap::new();
-    let mut fill_system_low_voltage_latched = false;
     loop {
         tokio::select! {
             _ = sleep(Duration::from_millis(500)) => {}
@@ -391,8 +370,6 @@ pub async fn safety_task(
         }
 
         let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
-        let mut latest_fill_system_battery_voltage = None;
-
         for pkt in packets {
             match pkt.data_type() {
                 DataType::AccelData => {
@@ -486,9 +463,7 @@ pub async fn safety_task(
                     // Voltage
                     if let Some(voltage) = values.first() {
                         if is_fill_system_battery_sender(pkt.sender()) {
-                            if latest_fill_system_battery_voltage.is_none() {
-                                latest_fill_system_battery_voltage = Some(*voltage);
-                            }
+                            continue;
                         } else if battery_voltage_out_of_range(pkt.sender(), *voltage) {
                             cycle_warnings.insert("Critical: Battery voltage out of range!");
                         }
@@ -528,12 +503,6 @@ pub async fn safety_task(
 
                 _ => {}
             }
-        }
-
-        if let Some(voltage) = latest_fill_system_battery_voltage
-            && update_fill_system_low_voltage_latch(&mut fill_system_low_voltage_latched, voltage)
-        {
-            emit_warning(&state, FILL_SYSTEM_LOW_VOLTAGE_WARNING);
         }
 
         if !cycle_warnings.is_empty() {
@@ -588,18 +557,4 @@ mod tests {
         assert!(battery_voltage_out_of_range("GW", 13.0));
     }
 
-    #[test]
-    fn fill_system_low_voltage_warning_latches_until_voltage_recovers() {
-        let mut latched = false;
-
-        assert!(update_fill_system_low_voltage_latch(&mut latched, 12.99));
-        assert!(latched);
-        assert!(!update_fill_system_low_voltage_latch(&mut latched, 12.5));
-        assert!(latched);
-        assert!(!update_fill_system_low_voltage_latch(&mut latched, 15.0));
-        assert!(latched);
-        assert!(!update_fill_system_low_voltage_latch(&mut latched, 15.01));
-        assert!(!latched);
-        assert!(update_fill_system_low_voltage_latch(&mut latched, 13.0));
-    }
 }

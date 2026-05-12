@@ -31,6 +31,11 @@ use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{Duration, interval};
 
+const FILL_SYSTEM_LOW_VOLTAGE_WARN_THRESHOLD: f32 = 13.0;
+const FILL_SYSTEM_LOW_VOLTAGE_RELATCH_THRESHOLD: f32 = 15.0;
+const FILL_SYSTEM_LOW_VOLTAGE_WARNING: &str = "Critical: Fill system battery voltage below 13V!";
+static FILL_SYSTEM_LOW_VOLTAGE_LATCHED: OnceLock<Mutex<bool>> = OnceLock::new();
+
 pub struct CommsWorkerHandle {
     pub name: &'static str,
     pub comms: Arc<Mutex<Box<dyn CommsDevice>>>,
@@ -1797,6 +1802,42 @@ fn telemetry_rows_from_packet_values(
     }
 }
 
+fn is_fill_system_battery_sender(sender_id: &str) -> bool {
+    matches!(
+        canonical_sender_id(sender_id),
+        sender if sender == Board::GatewayBoard.sender_id()
+    )
+}
+
+fn update_fill_system_low_voltage_latch(voltage: f32) -> bool {
+    if !voltage.is_finite() {
+        return false;
+    }
+
+    let mut latched = FILL_SYSTEM_LOW_VOLTAGE_LATCHED
+        .get_or_init(|| Mutex::new(false))
+        .lock()
+        .unwrap();
+    if voltage > FILL_SYSTEM_LOW_VOLTAGE_RELATCH_THRESHOLD {
+        *latched = false;
+        return false;
+    }
+
+    if voltage <= FILL_SYSTEM_LOW_VOLTAGE_WARN_THRESHOLD && !*latched {
+        *latched = true;
+        return true;
+    }
+
+    false
+}
+
+#[cfg(test)]
+fn reset_fill_system_low_voltage_latch_for_tests() {
+    if let Some(latched) = FILL_SYSTEM_LOW_VOLTAGE_LATCHED.get() {
+        *latched.lock().unwrap() = false;
+    }
+}
+
 async fn handle_gps_satellite_count_packet(
     state: &Arc<AppState>,
     db_tx: &mpsc::Sender<DbQueueItem>,
@@ -3319,6 +3360,13 @@ async fn handle_packet(
             }
 
             if let Some(first_value) = row_values.first().copied().flatten() {
+                if row_data_type == DataType::BatteryVoltage.as_str()
+                    && is_fill_system_battery_sender(&sender_id)
+                    && update_fill_system_low_voltage_latch(first_value)
+                {
+                    emit_warning(state, FILL_SYSTEM_LOW_VOLTAGE_WARNING);
+                }
+
                 emit_derived_battery_rows(
                     state,
                     db_tx,
@@ -4264,7 +4312,7 @@ mod tests {
 
     #[tokio::test]
     async fn fuel_tank_pressure_updates_latest_with_calibrated_value() {
-        let (db_tx, _db_rx) = mpsc::channel(8);
+        let (db_tx, _db_rx) = mpsc::channel(32);
         let state = test_app_state(db_tx.clone()).await;
         let db_overflow = test_db_overflow();
         let mut ws_rx = state.ws_tx.subscribe();
@@ -4371,6 +4419,50 @@ mod tests {
             derived_rows
                 .iter()
                 .all(|derived| derived.timestamp_ms == row.timestamp_ms)
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_box_battery_voltage_below_thirteen_emits_latched_warning() {
+        reset_fill_system_low_voltage_latch_for_tests();
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        let mut warnings_rx = state.warnings_tx.subscribe();
+
+        let pkt = Packet::new(
+            DataType::BatteryVoltage,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            "GB",
+            678_902,
+            f32_payload(&[12.9]),
+        )
+        .expect("failed to build gateway low BATTERY_VOLTAGE packet");
+
+        let rows = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
+        assert_eq!(rows[0].data_type, DataType::BatteryVoltage.as_str());
+
+        let warning = tokio::time::timeout(Duration::from_millis(100), warnings_rx.recv())
+            .await
+            .expect("low fill-box voltage should emit a warning")
+            .expect("warnings channel should remain open");
+        assert_eq!(warning.message, FILL_SYSTEM_LOW_VOLTAGE_WARNING);
+
+        let pkt = Packet::new(
+            DataType::BatteryVoltage,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            "GW",
+            678_903,
+            f32_payload(&[12.8]),
+        )
+        .expect("failed to build gateway repeated low BATTERY_VOLTAGE packet");
+
+        let _ = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), warnings_rx.recv())
+                .await
+                .is_err(),
+            "low fill-box voltage warning should stay latched until voltage recovers"
         );
     }
 

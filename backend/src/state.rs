@@ -356,36 +356,6 @@ impl AppState {
         self.alert_ack_state.lock().unwrap().clone()
     }
 
-    /// Updates the shared warning ack timestamp and broadcasts if it changed.
-    pub fn acknowledge_warnings_through(&self, timestamp_ms: i64) -> AlertAckStateMsg {
-        let mut slot = self.alert_ack_state.lock().unwrap();
-        let next_ts = timestamp_ms.max(slot.warning_ack_timestamp_ms);
-        if next_ts != slot.warning_ack_timestamp_ms {
-            slot.warning_ack_timestamp_ms = next_ts;
-            let snapshot = slot.clone();
-            drop(slot);
-            let _ = self.alert_ack_tx.send(snapshot.clone());
-            snapshot
-        } else {
-            slot.clone()
-        }
-    }
-
-    /// Updates the shared error ack timestamp and broadcasts if it changed.
-    pub fn acknowledge_errors_through(&self, timestamp_ms: i64) -> AlertAckStateMsg {
-        let mut slot = self.alert_ack_state.lock().unwrap();
-        let next_ts = timestamp_ms.max(slot.error_ack_timestamp_ms);
-        if next_ts != slot.error_ack_timestamp_ms {
-            slot.error_ack_timestamp_ms = next_ts;
-            let snapshot = slot.clone();
-            drop(slot);
-            let _ = self.alert_ack_tx.send(snapshot.clone());
-            snapshot
-        } else {
-            slot.clone()
-        }
-    }
-
     /// Updates warning and error ack timestamps together and broadcasts once if either changed.
     pub fn acknowledge_alerts_through(
         &self,

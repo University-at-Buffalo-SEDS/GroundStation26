@@ -77,7 +77,7 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
     let allowed = Arc::new(Mutex::new(AllowedActions::default()));
 
     // Inputs (buttons)
-    gpio.setup_input_pin(ABORT_PIN)?;
+    gpio.setup_input_pulldown_pin(ABORT_PIN)?;
     gpio.setup_input_pin(LAUNCH_PIN)?;
     gpio.setup_input_pin(IGNITER_PIN)?;
     gpio.setup_input_pin(LAUNCH_ARM_PIN)?;
