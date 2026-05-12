@@ -234,9 +234,18 @@ pub struct AppState {
 impl AppState {
     fn queue_router_flight_state_update(&self, next_state: FlightState) {
         let Some(router) = self.topology_router.get() else {
+            log::warn!(
+                "flight-state change not dispatched because topology router is not initialized state={next_state:?}"
+            );
             return;
         };
         let topology = router.export_topology();
+        let rocket_has_flight_state = topology.routes.iter().any(|route| {
+            route.side_name == "rocket_comms"
+                && route
+                    .reachable_endpoints
+                    .contains(&DataEndpoint::FlightState)
+        });
         let umbilical_has_flight_state = topology.routes.iter().any(|route| {
             route.side_name == "umbilical_comms"
                 && route
@@ -247,6 +256,18 @@ impl AppState {
             log::warn!("failed to queue flight-state broadcast for router delivery: {err}");
             return;
         }
+        let dispatch_side = if rocket_has_flight_state && umbilical_has_flight_state {
+            "rocket_comms,umbilical_comms"
+        } else if rocket_has_flight_state {
+            "rocket_comms"
+        } else if umbilical_has_flight_state {
+            "umbilical_comms"
+        } else {
+            "broadcast"
+        };
+        log::info!(
+            "flight-state dispatched side={dispatch_side} state={next_state:?} rocket_has_flight_state={rocket_has_flight_state} umbilical_has_flight_state={umbilical_has_flight_state}"
+        );
         if let Err(err) = router.process_tx_queue_with_timeout(0) {
             log::warn!("failed to flush flight-state broadcast for router delivery: {err}");
         }
