@@ -304,6 +304,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
             let mut follow_window_is_uplink = false;
             let mut has_seen_window_update = false;
             let mut sent_in_current_uplink_window = 0usize;
+            let mut uplink_air_busy_until: Option<std::time::Instant> = None;
             let mut last_uplink_log_at: Option<std::time::Instant> = None;
 
             loop {
@@ -399,11 +400,13 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                             // RF-board downlink means the board is transmitting to GS.
                             follow_window_is_uplink = false;
                             sent_in_current_uplink_window = 0;
+                            uplink_air_busy_until = None;
                         }
                         RadioWindowKind::UplinkOpen => {
                             // RF-board uplink means GS may transmit to the board.
                             follow_window_is_uplink = true;
                             sent_in_current_uplink_window = 0;
+                            uplink_air_busy_until = None;
                             let uplink_log_now = std::time::Instant::now();
                             let should_log = !tx_backlog.is_empty()
                                 && last_uplink_log_at
@@ -435,6 +438,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                                 &mut follow_window_until,
                                 &mut follow_window_is_uplink,
                                 &mut sent_in_current_uplink_window,
+                                &mut uplink_air_busy_until,
                                 &mut last_send_error_log_ms,
                                 &mut suppressed_send_errors,
                             );
@@ -456,6 +460,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     &mut follow_window_until,
                     &mut follow_window_is_uplink,
                     &mut sent_in_current_uplink_window,
+                    &mut uplink_air_busy_until,
                     &mut last_send_error_log_ms,
                     &mut suppressed_send_errors,
                 );
@@ -754,17 +759,17 @@ fn radio_tx_without_window() -> bool {
 
 fn radio_uplink_turnaround_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 250, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 50, 0, 1_000) as u64)
 }
 
 fn radio_uplink_tx_guard_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 100, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 50, 0, 1_000) as u64)
 }
 
 fn radio_air_bit_rate_bps() -> u64 {
     static BPS: OnceLock<u64> = OnceLock::new();
-    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 4_800, 1_200, 921_600) as u64)
+    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 2_400, 1_200, 921_600) as u64)
 }
 
 fn radio_air_frame_overhead_bytes() -> usize {
@@ -943,6 +948,7 @@ fn send_while_uplink_window_open(
     follow_window_until: &mut Option<std::time::Instant>,
     follow_window_is_uplink: &mut bool,
     sent_in_current_uplink_window: &mut usize,
+    uplink_air_busy_until: &mut Option<std::time::Instant>,
     last_send_error_log_ms: &mut u64,
     suppressed_send_errors: &mut u64,
 ) -> bool {
@@ -991,6 +997,7 @@ fn send_while_uplink_window_open(
             *follow_window_until = None;
             *follow_window_is_uplink = false;
             *sent_in_current_uplink_window = 0;
+            *uplink_air_busy_until = None;
             break;
         }
         let Some(deadline) = *follow_window_until else {
@@ -1010,6 +1017,7 @@ fn send_while_uplink_window_open(
             *follow_window_until = None;
             *follow_window_is_uplink = false;
             *sent_in_current_uplink_window = 0;
+            *uplink_air_busy_until = None;
             break;
         }
         if !*follow_window_is_uplink
@@ -1018,18 +1026,27 @@ fn send_while_uplink_window_open(
         {
             break;
         }
+        let mut tx_start = now;
         if let Some(opened_at) = follow_window_opened_at {
             let earliest_tx_at = opened_at + uplink_turnaround;
-            if now < earliest_tx_at {
-                break;
+            if earliest_tx_at > tx_start {
+                tx_start = earliest_tx_at;
             }
+        }
+        if let Some(air_busy_until) = *uplink_air_busy_until
+            && air_busy_until > tx_start
+        {
+            tx_start = air_busy_until;
+        }
+        if now < tx_start {
+            break;
         }
 
         let Some(payload) = tx_backlog.front() else {
             break;
         };
         let latest_finish = deadline.checked_sub(uplink_tx_guard).unwrap_or(deadline);
-        let air_done_at = now + raw_uart_air_duration(payload.len());
+        let air_done_at = tx_start + raw_uart_air_duration(payload.len());
         if air_done_at > latest_finish {
             break;
         }
@@ -1042,6 +1059,7 @@ fn send_while_uplink_window_open(
             Ok(()) => {
                 log_radio_command_event("radio TX sent", worker_name, &payload);
                 *sent_in_current_uplink_window += 1;
+                *uplink_air_busy_until = Some(air_done_at);
                 sent_any = true;
                 if *suppressed_send_errors > 0 {
                     eprintln!(
