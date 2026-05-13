@@ -918,6 +918,14 @@ fn first_fill_step_after_setup() -> SequenceStep {
     }
 }
 
+fn step_after_nitrous_valve_closed() -> SequenceStep {
+    if cfg!(feature = "test_fire_mode") {
+        SequenceStep::NitrousSoak
+    } else {
+        SequenceStep::CloseNormallyOpen
+    }
+}
+
 fn setup_valves_ready(valves: ValveSnapshot) -> bool {
     valves.dump_open == Some(false)
         && (cfg!(feature = "test_fire_mode") || valves.normally_open == Some(false))
@@ -1507,18 +1515,23 @@ fn update_sequence_runtime(
                 if runtime.auto_close_nitrous_sent {
                     state.add_notification("Waiting for nitrous valve to report closed.");
                 } else {
-                    state.add_notification("Close Nitrous valve to start the settle timer.");
+                    state.add_notification("Close Nitrous valve before closing the vent valve.");
                 }
                 runtime.notified_close_nitrous = true;
             }
             if valves.nitrous_open == Some(false) {
                 runtime.auto_close_nitrous_sent = false;
-                runtime.step_started_at = Some(now);
-                state.add_temporary_notification(format!(
-                    "Nitrous settle started. Waiting {}s before fill line removal.",
-                    cfg.nitrous_soak_duration.as_secs()
-                ));
-                runtime.step = SequenceStep::NitrousSoak;
+                runtime.notified_close_normally_open = false;
+                runtime.step = step_after_nitrous_valve_closed();
+                if runtime.step == SequenceStep::NitrousSoak {
+                    runtime.step_started_at = Some(now);
+                    state.add_temporary_notification(format!(
+                        "Nitrous settle started. Waiting {}s before fill line removal.",
+                        cfg.nitrous_soak_duration.as_secs()
+                    ));
+                } else {
+                    runtime.step_started_at = None;
+                }
             }
         }
         SequenceStep::NitrousSoak => {
@@ -1586,13 +1599,17 @@ fn update_sequence_runtime(
         SequenceStep::CloseNormallyOpen => {
             if !runtime.notified_close_normally_open {
                 state.add_notification(
-                    "Nitrous settle complete. Close vent valve before retracting fill lines.",
+                    "Nitrous fill complete. Close vent valve to start the 30 second settle.",
                 );
                 runtime.notified_close_normally_open = true;
             }
             if valves.normally_open == Some(false) {
-                runtime.notified_retract_fill_lines = false;
-                runtime.step = SequenceStep::RetractFillLines;
+                runtime.step_started_at = Some(now);
+                state.add_temporary_notification(format!(
+                    "Vent valve closed. Nitrous settle started. Waiting {}s before fill line removal.",
+                    cfg.nitrous_soak_duration.as_secs()
+                ));
+                runtime.step = SequenceStep::NitrousSoak;
             }
         }
         SequenceStep::RetractFillLines => {
@@ -2234,6 +2251,12 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "test_fire_mode")]
+    #[test]
+    fn test_fire_starts_settle_after_nitrous_closes() {
+        assert_eq!(step_after_nitrous_valve_closed(), SequenceStep::NitrousSoak);
+    }
+
     #[test]
     fn armed_launch_requires_closed_vent_valve() {
         assert!(!vent_closed_for_launch(ValveSnapshot {
@@ -2256,6 +2279,15 @@ mod tests {
     #[test]
     fn normal_sequence_starts_with_nitrogen_fill_after_setup() {
         assert_eq!(first_fill_step_after_setup(), SequenceStep::NitrogenFill);
+    }
+
+    #[cfg(not(feature = "test_fire_mode"))]
+    #[test]
+    fn normal_sequence_prompts_vent_close_after_nitrous_closes() {
+        assert_eq!(
+            step_after_nitrous_valve_closed(),
+            SequenceStep::CloseNormallyOpen
+        );
     }
 
     #[cfg(feature = "hitl_mode")]
