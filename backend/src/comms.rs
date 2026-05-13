@@ -288,6 +288,8 @@ pub struct UartComms {
     rx_buf: Vec<u8>,
     radio_window_updates: VecDeque<RadioWindowUpdate>,
     protocol: SerialProtocol,
+    #[cfg(target_os = "linux")]
+    baud_rate: u32,
     slow_start_deadline: Option<Instant>,
 }
 
@@ -320,6 +322,8 @@ impl UartComms {
             rx_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
             radio_window_updates: VecDeque::with_capacity(8),
             protocol: cfg.protocol.clone(),
+            #[cfg(target_os = "linux")]
+            baud_rate: cfg.baud_rate as u32,
             slow_start_deadline: Some(Instant::now() + UART_STARTUP_TIMEOUT),
         })
     }
@@ -703,6 +707,33 @@ fn write_all_fd_with_poll(fd: RawFd, bytes: &[u8], timeout: Duration) -> std::io
 }
 
 #[cfg(target_os = "linux")]
+fn drain_fd_with_timeout(fd: RawFd, timeout: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if unsafe { libc::tcdrain(fd) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out draining raw UART tx",
+            ));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn uart_wire_timeout(len: usize, baud_rate: u32) -> Duration {
+    let baud = u64::from(baud_rate.max(1));
+    let wire_ms = ((len as u64 * 10 * 1_000) + baud - 1) / baud;
+    Duration::from_millis(wire_ms.saturating_add(50).max(100))
+}
+
+#[cfg(target_os = "linux")]
 fn read_once_fd_with_poll(fd: RawFd, buf: &mut [u8], timeout: Duration) -> std::io::Result<usize> {
     let timeout_ms = timeout.as_millis().clamp(0, i32::MAX as u128) as i32;
     let mut pollfd = libc::pollfd {
@@ -934,6 +965,17 @@ fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
     }
     eprintln!(
         "raw_uart rx {} bytes: {}",
+        bytes.len(),
+        hex_preview(bytes, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
+fn maybe_log_raw_uart_tx(bytes: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    eprintln!(
+        "raw_uart tx {} bytes: {}",
         bytes.len(),
         hex_preview(bytes, RAW_UART_DEBUG_PREVIEW_BYTES)
     );
@@ -1290,11 +1332,18 @@ impl CommsDevice for UartComms {
                 #[cfg(target_os = "linux")]
                 {
                     let framed = build_raw_uart_frame(payload)?;
+                    maybe_log_raw_uart_tx(&framed, &self.protocol);
                     write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
+                    drain_fd_with_timeout(
+                        self.inner.as_raw_fd(),
+                        uart_wire_timeout(framed.len(), self.baud_rate),
+                    )?;
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    self.inner.write_all(&build_raw_uart_frame(payload)?)?;
+                    let framed = build_raw_uart_frame(payload)?;
+                    maybe_log_raw_uart_tx(&framed, &self.protocol);
+                    self.inner.write_all(&framed)?;
                     self.inner.flush()?;
                 }
             }

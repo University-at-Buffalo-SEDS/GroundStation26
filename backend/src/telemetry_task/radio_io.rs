@@ -325,7 +325,16 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                                 continue;
                             }
                             log_radio_command_event("radio TX backlog", worker_name, &payload);
-                            tx_backlog.push_back(payload);
+                            let repeats = if worker_name == "rocket_comms"
+                                && is_flight_command_payload(&payload)
+                            {
+                                radio_flight_command_repeats()
+                            } else {
+                                1
+                            };
+                            for _ in 0..repeats {
+                                tx_backlog.push_back(payload.clone());
+                            }
                             while tx_backlog.len() > radio_tx_backlog_limit {
                                 tx_backlog.pop_front();
                             }
@@ -722,6 +731,11 @@ fn radio_tx_packets_per_window() -> usize {
     *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_PACKETS_PER_WINDOW", 16, 1, 128))
 }
 
+fn radio_flight_command_repeats() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| env_usize("GS_RADIO_FLIGHT_COMMAND_REPEATS", 3, 1, 8))
+}
+
 fn radio_tx_without_window() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
@@ -866,6 +880,13 @@ pub(super) fn is_fill_system_command_payload(payload: &[u8]) -> bool {
         pkt.data_type(),
         DataType::ValveCommand | DataType::ActuatorCommand | DataType::Abort
     )
+}
+
+fn is_flight_command_payload(payload: &[u8]) -> bool {
+    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+        return false;
+    };
+    matches!(pkt.data_type(), DataType::FlightCommand)
 }
 
 fn send_while_uplink_window_open(
