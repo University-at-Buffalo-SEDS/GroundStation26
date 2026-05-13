@@ -410,12 +410,18 @@ async fn main() -> anyhow::Result<()> {
     let abort_handler = EndpointHandler::new_packet_handler(Abort, move |pkt: &Packet| {
         abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
         abort_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
+        abort_handler_state_clone.clear_launch_sequence_command_pending();
         abort_handler_state_clone.set_abort_indicator_latched(true);
         crate::sequences::refresh_action_policy_now(&abort_handler_state_clone);
         abort_handler_state_clone.broadcast_action_policy_snapshot();
         let error_msg = pkt
             .data_as_string()
-            .expect("Abort packet with invalid UTF-8");
+            .unwrap_or_else(|_| String::from_utf8_lossy(pkt.payload()).into_owned());
+        log::error!(
+            "abort packet received sender={} endpoints={:?} message={error_msg}",
+            pkt.sender(),
+            pkt.endpoints()
+        );
         emit_error(&abort_handler_state_clone, error_msg);
         Ok(())
     });
