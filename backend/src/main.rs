@@ -542,6 +542,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (rocket_tx, rocket_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    telemetry_task::register_flight_command_tx_side("rocket_comms", rocket_tx.clone());
 
     let rocket_side = {
         let rocket_tx = rocket_tx.clone();
