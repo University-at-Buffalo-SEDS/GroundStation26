@@ -1041,6 +1041,8 @@ fn queue_guarded_fill_command(
 }
 
 const VALVE_STATE_DATA_TYPE: &str = "VALVE_STATE";
+const UMBILICAL_PENDING_VALVE_MISMATCH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
 
 fn bool_to_f32(value: Option<bool>) -> Option<f32> {
     value.map(|v| if v { 1.0 } else { 0.0 })
@@ -1402,7 +1404,11 @@ async fn handle_packet(
             }
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
                 state.set_umbilical_valve_state(key_cmd_id, key_on);
-                state.reconcile_pending_umbilical_valve_state(key_cmd_id, key_on);
+                state.reconcile_pending_umbilical_valve_state(
+                    key_cmd_id,
+                    key_on,
+                    UMBILICAL_PENDING_VALVE_MISMATCH_TIMEOUT,
+                );
                 if key_cmd_id == ValveBoardCommands::PilotOpen as u8 && key_on {
                     transition_launch_clock_to_t_plus_from_pilot_open(state);
                 }

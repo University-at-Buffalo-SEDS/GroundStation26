@@ -30,6 +30,12 @@ pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
 const NETWORK_TOPOLOGY_BOARD_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
 
+#[derive(Debug, Clone, Copy)]
+pub struct PendingUmbilicalValveState {
+    pub target: bool,
+    pub set_at: std::time::Instant,
+}
+
 fn recording_command_actuated(cmd: &str, mode: RecordingModeWire) -> Option<bool> {
     match cmd {
         "StartWritingNow" | "StartWritingLastTwoMinutes" => {
@@ -119,7 +125,7 @@ pub struct AppState {
     pub umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
 
     /// Pending umbilical valve targets keyed by canonical command id (u8).
-    pub pending_umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
+    pub pending_umbilical_valve_states: Arc<Mutex<HashMap<u8, PendingUmbilicalValveState>>>,
 
     /// Latest fuel tank pressure (psi)
     pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
@@ -1359,10 +1365,13 @@ impl AppState {
     }
 
     pub fn set_pending_umbilical_valve_state(&self, cmd_id: u8, value: bool) {
-        self.pending_umbilical_valve_states
-            .lock()
-            .unwrap()
-            .insert(cmd_id, value);
+        self.pending_umbilical_valve_states.lock().unwrap().insert(
+            cmd_id,
+            PendingUmbilicalValveState {
+                target: value,
+                set_at: std::time::Instant::now(),
+            },
+        );
     }
 
     pub fn get_pending_umbilical_valve_state(&self, cmd_id: u8) -> Option<bool> {
@@ -1370,14 +1379,24 @@ impl AppState {
             .lock()
             .unwrap()
             .get(&cmd_id)
-            .copied()
+            .map(|pending| pending.target)
     }
 
-    pub fn reconcile_pending_umbilical_valve_state(&self, cmd_id: u8, actual: bool) {
+    pub fn reconcile_pending_umbilical_valve_state(
+        &self,
+        cmd_id: u8,
+        actual: bool,
+        mismatch_timeout: std::time::Duration,
+    ) -> bool {
         let mut pending = self.pending_umbilical_valve_states.lock().unwrap();
-        if pending.get(&cmd_id).copied() == Some(actual) {
+        let Some(entry) = pending.get(&cmd_id).copied() else {
+            return false;
+        };
+        if entry.target == actual || entry.set_at.elapsed() >= mismatch_timeout {
             pending.remove(&cmd_id);
+            return true;
         }
+        false
     }
 
     /// Appends a telemetry row to the in-memory reseed cache and prunes old entries.
@@ -1618,6 +1637,27 @@ mod tests {
     fn relay_boards_do_not_model_endpoints() {
         assert!(modeled_board_endpoints(Board::RFBoard, false, &[]).is_empty());
         assert!(modeled_board_endpoints(Board::GatewayBoard, false, &[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_umbilical_valve_state_clears_after_mismatch_timeout() {
+        let state = test_app_state().await;
+        state.set_pending_umbilical_valve_state(42, true);
+
+        assert_eq!(state.get_pending_umbilical_valve_state(42), Some(true));
+        assert!(!state.reconcile_pending_umbilical_valve_state(
+            42,
+            false,
+            std::time::Duration::from_secs(2),
+        ));
+        assert_eq!(state.get_pending_umbilical_valve_state(42), Some(true));
+
+        assert!(state.reconcile_pending_umbilical_valve_state(
+            42,
+            false,
+            std::time::Duration::ZERO,
+        ));
+        assert_eq!(state.get_pending_umbilical_valve_state(42), None);
     }
 
     #[test]
