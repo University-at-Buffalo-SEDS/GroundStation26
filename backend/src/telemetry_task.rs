@@ -3770,6 +3770,45 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn queue_abort_packet_transmits_to_router_side() {
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sent_clone = sent.clone();
+        let router = Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        );
+        router.add_side_serialized_with_options(
+            "umbilical_comms",
+            move |bytes| {
+                sent_clone
+                    .lock()
+                    .expect("failed to lock sent packets")
+                    .push(bytes.to_vec());
+                Ok(())
+            },
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+
+        queue_abort_packet(&router, "Manual Abort Command Issued")
+            .expect("failed to queue abort packet");
+        router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process router queues");
+
+        let sent = sent.lock().expect("failed to lock sent packets");
+        let abort_packets = sent
+            .iter()
+            .filter_map(|wire| serialize::deserialize_packet(wire).ok())
+            .filter(|pkt| pkt.data_type() == DataType::Abort)
+            .collect::<Vec<_>>();
+        assert_eq!(abort_packets.len(), 1);
+        assert_eq!(abort_packets[0].payload(), b"Manual Abort Command Issued");
+    }
+
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     #[tokio::test]
     async fn advance_flight_state_command_reaches_remote_router_end_to_end() {

@@ -125,7 +125,6 @@ fn setup_callbacks(
     let debounce = Duration::from_millis(50);
 
     let tx_abort = tx.clone();
-    let state_abort = state.clone();
     gpio.setup_callback_input_pin(ABORT_PIN, Trigger::RisingEdge, debounce, move |is_high| {
         log::info!("GPIO abort button interrupt on BCM GPIO {ABORT_PIN}: is_high={is_high}");
         if !is_high {
@@ -133,7 +132,7 @@ fn setup_callbacks(
             return;
         }
 
-        dispatch_gpio_abort(&state_abort, &tx_abort, "interrupt");
+        dispatch_gpio_abort(&tx_abort, "interrupt");
     })?;
     spawn_abort_poll_thread(state.clone(), tx.clone());
 
@@ -300,7 +299,7 @@ fn spawn_abort_poll_thread(state: Arc<AppState>, tx: mpsc::Sender<TelemetryComma
                                 "GPIO abort poll level changed on BCM GPIO {ABORT_PIN}: is_high={is_high}"
                             );
                             if is_high {
-                                dispatch_gpio_abort(&state, &tx, "polling fallback");
+                                dispatch_gpio_abort(&tx, "polling fallback");
                             }
                             last_level = Some(is_high);
                         }
@@ -316,11 +315,7 @@ fn spawn_abort_poll_thread(state: Arc<AppState>, tx: mpsc::Sender<TelemetryComma
         });
 }
 
-fn dispatch_gpio_abort(
-    state: &Arc<AppState>,
-    tx: &mpsc::Sender<TelemetryCommand>,
-    source: &'static str,
-) {
+fn dispatch_gpio_abort(tx: &mpsc::Sender<TelemetryCommand>, source: &'static str) {
     let now_ms = crate::telemetry_task::get_current_timestamp_ms();
     let last_ms = LAST_ABORT_DISPATCH_MS.swap(now_ms, Ordering::Relaxed);
     if now_ms.saturating_sub(last_ms) < ABORT_DISPATCH_DEBOUNCE_MS {
@@ -328,11 +323,7 @@ fn dispatch_gpio_abort(
         return;
     }
 
-    log::info!("GPIO abort button {source}: latching abort indicator and queueing abort command");
-    state.set_abort_indicator_latched(true);
-    crate::sequences::refresh_action_policy_now(state);
-    state.broadcast_action_policy_snapshot();
-
+    log::info!("GPIO abort button {source}: queueing abort command");
     match tx.try_send(TelemetryCommand::Abort) {
         Ok(()) => log::info!("GPIO abort button {source}: Abort command queued to telemetry task"),
         Err(err) => log::error!("GPIO abort button {source}: failed to send command: {err}"),
