@@ -853,7 +853,7 @@ fn sequence_expects_normally_open(step: SequenceStep) -> bool {
 }
 
 fn sequence_expects_normally_closed(step: SequenceStep) -> bool {
-    if cfg!(feature = "test_fire_mode") && matches!(step, SequenceStep::SetupValves) {
+    if cfg!(feature = "test_fire_mode") {
         return false;
     }
     matches!(
@@ -879,7 +879,7 @@ fn sequence_blocks_until_normally_open(step: SequenceStep) -> bool {
 }
 
 fn sequence_blocks_until_normally_closed(step: SequenceStep) -> bool {
-    if cfg!(feature = "test_fire_mode") && matches!(step, SequenceStep::SetupValves) {
+    if cfg!(feature = "test_fire_mode") {
         return false;
     }
     matches!(
@@ -1523,8 +1523,13 @@ fn update_sequence_runtime(
                 return;
             };
             if now.saturating_duration_since(started) >= cfg.nitrous_soak_duration {
-                runtime.notified_close_normally_open = false;
-                runtime.step = SequenceStep::CloseNormallyOpen;
+                if cfg!(feature = "test_fire_mode") {
+                    runtime.notified_retract_fill_lines = false;
+                    runtime.step = SequenceStep::RetractFillLines;
+                } else {
+                    runtime.notified_close_normally_open = false;
+                    runtime.step = SequenceStep::CloseNormallyOpen;
+                }
             }
         }
         SequenceStep::RecoverNitrousClose => {
@@ -1588,7 +1593,11 @@ fn update_sequence_runtime(
         }
         SequenceStep::RetractFillLines => {
             if !runtime.notified_retract_fill_lines {
-                state.add_notification("Vent valve closed. Retract fill lines.");
+                if cfg!(feature = "test_fire_mode") {
+                    state.add_notification("Retract fill lines.");
+                } else {
+                    state.add_notification("Vent valve closed. Retract fill lines.");
+                }
                 runtime.notified_retract_fill_lines = true;
             }
             if valves.retract == Some(true) {
@@ -1597,9 +1606,15 @@ fn update_sequence_runtime(
         }
         SequenceStep::ArmedReady => {
             if !runtime.notified_armed {
-                state.add_notification(
-                    "Fill sequence complete: nitrous closed, vent valve closed, fill lines removed. Launch state is ready.",
-                );
+                if cfg!(feature = "test_fire_mode") {
+                    state.add_notification(
+                        "Fill sequence complete: nitrous closed and fill lines removed. Launch state is ready.",
+                    );
+                } else {
+                    state.add_notification(
+                        "Fill sequence complete: nitrous closed, vent valve closed, fill lines removed. Launch state is ready.",
+                    );
+                }
                 runtime.notified_armed = true;
             }
         }
@@ -2192,6 +2207,10 @@ mod tests {
         assert!(!sequence_expects_normally_closed(SequenceStep::SetupValves));
         assert!(!sequence_blocks_until_normally_closed(
             SequenceStep::SetupValves
+        ));
+        assert!(!sequence_expects_normally_closed(SequenceStep::NitrousSoak));
+        assert!(!sequence_blocks_until_normally_closed(
+            SequenceStep::NitrousSoak
         ));
         assert!(setup_valves_ready(ValveSnapshot {
             normally_open: Some(true),
