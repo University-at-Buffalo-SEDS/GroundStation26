@@ -369,6 +369,12 @@ pub struct DataDisplayFilter {
     pub window_ms: Option<u64>,
     #[serde(default)]
     pub cutoff_hz: Option<f32>,
+    #[serde(default)]
+    pub alpha: Option<f32>,
+    #[serde(default)]
+    pub deadband: Option<f32>,
+    #[serde(default)]
+    pub max_rate_per_sec: Option<f32>,
 }
 
 fn default_data_display_filter_enabled() -> bool {
@@ -382,6 +388,11 @@ pub enum DataDisplayFilterKind {
     TimeAverage,
     LowPass,
     HighPass,
+    ExponentialAverage,
+    Median,
+    MinMax,
+    Deadband,
+    RateLimit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
