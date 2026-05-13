@@ -294,6 +294,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
             let radio_rx_downlink_packets = radio_rx_packets_downlink();
             let radio_tx_backlog_limit = radio_tx_backlog_limit();
             let radio_tx_window_packets = radio_tx_packets_per_window();
+            let radio_tx_without_window = radio_tx_without_window();
             let mut tx_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             let mut last_window_update_at: Option<std::time::Instant> = None;
             let mut follow_window_until: Option<std::time::Instant> = None;
@@ -335,20 +336,6 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                 }
 
                 let mut comms = comms.lock().expect("failed to get lock");
-                let _ = send_while_uplink_window_open(
-                    comms.as_mut(),
-                    worker_name,
-                    &mut tx_backlog,
-                    radio_tx_window_packets,
-                    radio_follow_timeout,
-                    has_seen_window_update,
-                    last_window_update_at,
-                    &mut follow_window_until,
-                    &mut follow_window_is_uplink,
-                    &mut sent_in_current_uplink_window,
-                    &mut last_send_error_log_ms,
-                    &mut suppressed_send_errors,
-                );
                 let now = std::time::Instant::now();
                 let follow_mode_active = last_window_update_at
                     .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
@@ -425,6 +412,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                                 worker_name,
                                 &mut tx_backlog,
                                 radio_tx_window_packets,
+                                radio_tx_without_window,
                                 radio_follow_timeout,
                                 has_seen_window_update,
                                 last_window_update_at,
@@ -442,6 +430,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     worker_name,
                     &mut tx_backlog,
                     radio_tx_window_packets,
+                    radio_tx_without_window,
                     radio_follow_timeout,
                     has_seen_window_update,
                     last_window_update_at,
@@ -733,6 +722,12 @@ fn radio_tx_packets_per_window() -> usize {
     *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_PACKETS_PER_WINDOW", 16, 1, 128))
 }
 
+fn radio_tx_without_window() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("GS_RADIO_TX_WITHOUT_WINDOW").ok().as_deref() != Some("0"))
+}
+
 fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
     if !crate::radio_diagnostics_enabled() {
         return;
@@ -878,6 +873,7 @@ fn send_while_uplink_window_open(
     worker_name: &str,
     tx_backlog: &mut VecDeque<Vec<u8>>,
     max_packets_per_window: usize,
+    allow_without_window: bool,
     radio_follow_timeout: Duration,
     has_seen_window_update: bool,
     last_window_update_at: Option<std::time::Instant>,
@@ -893,6 +889,39 @@ fn send_while_uplink_window_open(
         let follow_mode_active = last_window_update_at
             .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
         if !has_seen_window_update {
+            if allow_without_window
+                && let Some(payload) = tx_backlog.front()
+                && is_command_payload(payload)
+            {
+                let payload = tx_backlog
+                    .pop_front()
+                    .expect("front payload should still exist");
+                log_radio_packet_event("radio TX pop without window", worker_name, &payload);
+                maybe_log_green_radio_command_send(worker_name, &payload);
+                match comms.send_data(&payload) {
+                    Ok(()) => {
+                        log_radio_command_event(
+                            "radio TX sent without window",
+                            worker_name,
+                            &payload,
+                        );
+                        sent_any = true;
+                    }
+                    Err(e) => {
+                        log_radio_packet_event(
+                            "radio TX send_data without window failed for",
+                            worker_name,
+                            &payload,
+                        );
+                        log_repeated_worker_error(
+                            &format!("{worker_name} radio io send_data without window failed"),
+                            &e.to_string(),
+                            last_send_error_log_ms,
+                            suppressed_send_errors,
+                        );
+                    }
+                }
+            }
             break;
         }
         if !follow_mode_active {

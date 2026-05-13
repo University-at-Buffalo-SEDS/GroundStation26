@@ -2094,6 +2094,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dedicated_radio_worker_sends_flight_command_before_window_updates() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                windows: VecDeque::new(),
+            })));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tx.send(wire.clone())
+            .expect("failed to queue flight command to radio worker");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+                if sent_guard.iter().any(|payload| payload == &wire) {
+                    break;
+                }
+                drop(sent_guard);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for radio worker send_data before window update");
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+    }
+
+    #[tokio::test]
     async fn dedicated_radio_worker_does_not_send_flight_command_during_downlink_window() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;

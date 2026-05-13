@@ -287,6 +287,10 @@ pub enum ConnectionSectionKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataTabLayout {
     pub tabs: Vec<DataTabSpec>,
+    #[serde(default)]
+    pub sender_split_data_types: Vec<String>,
+    #[serde(default)]
+    pub default_display_filter: Option<DataDisplayFilter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +305,8 @@ pub struct DataTabSpec {
     pub channel_boolean_labels: Option<Vec<BooleanLabels>>,
     pub channel_formatters: Option<Vec<ValueFormatter>>,
     pub show_min_max: Option<bool>,
+    #[serde(default)]
+    pub display_filter: Option<DataDisplayFilter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +323,8 @@ pub struct DataSubtabSpec {
     pub channel_boolean_labels: Option<Vec<BooleanLabels>>,
     pub channel_formatters: Option<Vec<ValueFormatter>>,
     pub show_min_max: Option<bool>,
+    #[serde(default)]
+    pub display_filter: Option<DataDisplayFilter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,7 +334,10 @@ pub struct DataChartGroup {
     pub sender_id: Option<String>,
     pub labels: Option<Vec<String>>,
     pub channels: Vec<usize>,
+    pub chart_series: Option<Vec<ChartSeriesSpec>>,
     pub scale_mode: Option<DataChartScaleMode>,
+    #[serde(default)]
+    pub display_filter: Option<DataDisplayFilter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,6 +356,32 @@ pub struct DataSummaryItem {
     pub formatter: Option<ValueFormatter>,
     pub boolean_labels: Option<BooleanLabels>,
     pub show_min_max: Option<bool>,
+    #[serde(default)]
+    pub display_filter: Option<DataDisplayFilter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataDisplayFilter {
+    #[serde(default = "default_data_display_filter_enabled")]
+    pub enabled: bool,
+    pub kind: DataDisplayFilterKind,
+    #[serde(default)]
+    pub window_ms: Option<u64>,
+    #[serde(default)]
+    pub cutoff_hz: Option<f32>,
+}
+
+fn default_data_display_filter_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataDisplayFilterKind {
+    Raw,
+    TimeAverage,
+    LowPass,
+    HighPass,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -511,7 +548,10 @@ pub struct StateWidget {
 pub struct ChartSeriesSpec {
     pub data_type: String,
     pub index: usize,
+    pub sender_id: Option<String>,
     pub label: Option<String>,
+    #[serde(default)]
+    pub display_filter: Option<DataDisplayFilter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
