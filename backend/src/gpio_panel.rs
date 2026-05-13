@@ -79,7 +79,9 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
 
     // Inputs (buttons)
     gpio.setup_input_pulldown_pin(ABORT_PIN)?;
-    eprintln!("GPIO abort button configured on BCM GPIO {ABORT_PIN} as active-high pulldown input");
+    log::info!(
+        "GPIO abort button configured on BCM GPIO {ABORT_PIN} as active-high pulldown input"
+    );
     gpio.setup_input_pin(LAUNCH_PIN)?;
     gpio.setup_input_pin(IGNITER_PIN)?;
     gpio.setup_input_pin(LAUNCH_ARM_PIN)?;
@@ -123,32 +125,32 @@ fn setup_callbacks(
     let tx_abort = tx.clone();
     let state_abort = state.clone();
     gpio.setup_callback_input_pin(ABORT_PIN, Trigger::RisingEdge, debounce, move |is_high| {
-        eprintln!("GPIO abort button interrupt on BCM GPIO {ABORT_PIN}: is_high={is_high}");
+        log::info!("GPIO abort button interrupt on BCM GPIO {ABORT_PIN}: is_high={is_high}");
         if !is_high {
-            eprintln!("GPIO abort button interrupt ignored because active-high input is low");
+            log::warn!("GPIO abort button interrupt ignored because active-high input is low");
             return;
         }
 
-        eprintln!("GPIO abort button pressed: latching abort indicator and dispatching abort");
+        log::info!("GPIO abort button pressed: latching abort indicator and dispatching abort");
         state_abort.set_abort_indicator_latched(true);
         crate::sequences::refresh_action_policy_now(&state_abort);
         state_abort.broadcast_action_policy_snapshot();
 
         if let Some(router) = state_abort.topology_router.get() {
             if let Err(err) = queue_abort_packet(router, "Manual GPIO Abort Button Pressed") {
-                eprintln!("GPIO abort button: failed to queue abort packet: {err}");
+                log::error!("GPIO abort button: failed to queue abort packet: {err}");
             } else if let Err(err) = router.process_all_queues_with_timeout(3) {
-                eprintln!("GPIO abort button: failed to flush abort packet: {err}");
+                log::error!("GPIO abort button: failed to flush abort packet: {err}");
             } else {
-                eprintln!("GPIO abort button: abort packet queued and flushed");
+                log::info!("GPIO abort button: abort packet queued and flushed");
             }
         } else {
-            eprintln!("GPIO abort button: router unavailable, falling back to command queue");
+            log::warn!("GPIO abort button: router unavailable, falling back to command queue");
         }
 
         match tx_abort.try_send(TelemetryCommand::Abort) {
-            Ok(()) => eprintln!("GPIO abort button: Abort command queued to telemetry task"),
-            Err(err) => eprintln!("GPIO abort button: failed to send command: {err}"),
+            Ok(()) => log::info!("GPIO abort button: Abort command queued to telemetry task"),
+            Err(err) => log::error!("GPIO abort button: failed to send command: {err}"),
         }
         emit_error(&state_abort, "Manual abort button pressed!".to_string());
     })?;
