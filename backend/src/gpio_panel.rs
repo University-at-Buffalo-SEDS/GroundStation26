@@ -52,6 +52,9 @@ pub const MASTER_ALARM_BUZZER: u8 = 24;
 
 const LED_FRAME_MS: u64 = 16;
 const LED_DISABLED_BRIGHTNESS: f64 = 0.0;
+const ABORT_POLL_INTERVAL_MS: u64 = 10;
+const ABORT_DISPATCH_DEBOUNCE_MS: u64 = 250;
+static LAST_ABORT_DISPATCH_MS: AtomicU64 = AtomicU64::new(0);
 
 //####################################################################
 
@@ -131,29 +134,9 @@ fn setup_callbacks(
             return;
         }
 
-        log::info!("GPIO abort button pressed: latching abort indicator and dispatching abort");
-        state_abort.set_abort_indicator_latched(true);
-        crate::sequences::refresh_action_policy_now(&state_abort);
-        state_abort.broadcast_action_policy_snapshot();
-
-        if let Some(router) = state_abort.topology_router.get() {
-            if let Err(err) = queue_abort_packet(router, "Manual GPIO Abort Button Pressed") {
-                log::error!("GPIO abort button: failed to queue abort packet: {err}");
-            } else if let Err(err) = router.process_all_queues_with_timeout(3) {
-                log::error!("GPIO abort button: failed to flush abort packet: {err}");
-            } else {
-                log::info!("GPIO abort button: abort packet queued and flushed");
-            }
-        } else {
-            log::warn!("GPIO abort button: router unavailable, falling back to command queue");
-        }
-
-        match tx_abort.try_send(TelemetryCommand::Abort) {
-            Ok(()) => log::info!("GPIO abort button: Abort command queued to telemetry task"),
-            Err(err) => log::error!("GPIO abort button: failed to send command: {err}"),
-        }
-        emit_error(&state_abort, "Manual abort button pressed!".to_string());
+        dispatch_gpio_abort(&state_abort, &tx_abort, "interrupt");
     })?;
+    spawn_abort_poll_thread(state.clone(), tx.clone());
 
     let allowed_launch = allowed.clone();
     let tx_launch = tx.clone();
@@ -292,6 +275,82 @@ fn setup_callbacks(
     )?;
 
     Ok(())
+}
+
+fn spawn_abort_poll_thread(state: Arc<AppState>, tx: mpsc::Sender<TelemetryCommand>) {
+    let gpio = state.gpio.clone();
+    let mut shutdown_rx = state.shutdown_subscribe();
+    let _ = thread::Builder::new()
+        .name("gpio_abort_poll".to_string())
+        .spawn(move || {
+            log::info!(
+                "GPIO abort polling fallback started on BCM GPIO {ABORT_PIN}; active-high"
+            );
+            let mut last_level: Option<bool> = None;
+            loop {
+                match shutdown_rx.try_recv() {
+                    Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                }
+
+                match gpio.read_input_pin(ABORT_PIN) {
+                    Ok(is_high) => {
+                        if last_level != Some(is_high) {
+                            log::info!(
+                                "GPIO abort poll level changed on BCM GPIO {ABORT_PIN}: is_high={is_high}"
+                            );
+                            if is_high {
+                                dispatch_gpio_abort(&state, &tx, "polling fallback");
+                            }
+                            last_level = Some(is_high);
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("GPIO abort poll failed to read BCM GPIO {ABORT_PIN}: {err}");
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(ABORT_POLL_INTERVAL_MS));
+            }
+            log::info!("GPIO abort polling fallback stopped");
+        });
+}
+
+fn dispatch_gpio_abort(
+    state: &Arc<AppState>,
+    tx: &mpsc::Sender<TelemetryCommand>,
+    source: &'static str,
+) {
+    let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+    let last_ms = LAST_ABORT_DISPATCH_MS.swap(now_ms, Ordering::Relaxed);
+    if now_ms.saturating_sub(last_ms) < ABORT_DISPATCH_DEBOUNCE_MS {
+        log::info!("GPIO abort button {source}: duplicate dispatch ignored by debounce");
+        return;
+    }
+
+    log::info!("GPIO abort button {source}: latching abort indicator and dispatching abort");
+    state.set_abort_indicator_latched(true);
+    crate::sequences::refresh_action_policy_now(state);
+    state.broadcast_action_policy_snapshot();
+
+    if let Some(router) = state.topology_router.get() {
+        if let Err(err) = queue_abort_packet(router, "Manual GPIO Abort Button Pressed") {
+            log::error!("GPIO abort button {source}: failed to queue abort packet: {err}");
+        } else if let Err(err) = router.process_all_queues_with_timeout(3) {
+            log::error!("GPIO abort button {source}: failed to flush abort packet: {err}");
+        } else {
+            log::info!("GPIO abort button {source}: abort packet queued and flushed");
+        }
+    } else {
+        log::warn!("GPIO abort button {source}: router unavailable, falling back to command queue");
+    }
+
+    match tx.try_send(TelemetryCommand::Abort) {
+        Ok(()) => log::info!("GPIO abort button {source}: Abort command queued to telemetry task"),
+        Err(err) => log::error!("GPIO abort button {source}: failed to send command: {err}"),
+    }
+    emit_error(state, "Manual abort button pressed!".to_string());
 }
 
 #[allow(clippy::too_many_arguments)]
