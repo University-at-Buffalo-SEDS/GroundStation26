@@ -2362,6 +2362,23 @@ mod raw_uart_tests {
     }
 
     #[test]
+    fn flight_command_packets_use_raw_uart_data_frame() {
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            "GS",
+            123,
+            Arc::from([0x0a_u8]),
+        )
+        .unwrap();
+        let wire = serialize::serialize_packet(&pkt);
+
+        let mut framed = build_raw_uart_frame(&wire).unwrap();
+        let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
+        assert_eq!(decoded, (RawUartFrameKind::Data, wire.to_vec()));
+    }
+
+    #[test]
     fn raw_uart_frame_resyncs_after_garbage() {
         let payload = vec![9, 8, 7];
         let mut framed = vec![0x00, 0x11, 0x22];
