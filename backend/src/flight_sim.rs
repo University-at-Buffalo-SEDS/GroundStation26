@@ -730,10 +730,7 @@ impl FlightSimState {
             | TelemetryCommand::ResetSim => {
                 // Backend-local controls are handled outside the simulator command stream.
             }
-            TelemetryCommand::PostinitSignal
-            | TelemetryCommand::LaunchSignal
-            | TelemetryCommand::RollbackSignal
-            | TelemetryCommand::MonitorAltitude
+            TelemetryCommand::MonitorAltitude
             | TelemetryCommand::RevokeMonitorAltitude
             | TelemetryCommand::ConsecutiveSamples
             | TelemetryCommand::RevokeConsecutiveSamples
@@ -759,7 +756,7 @@ impl FlightSimState {
             | TelemetryCommand::EvaluationFocus
             | TelemetryCommand::EvaluationAbort
             | TelemetryCommand::ReinitBarometer
-            | TelemetryCommand::ReinitIMU
+            | TelemetryCommand::EnableIMU
             | TelemetryCommand::DisableIMU
             | TelemetryCommand::MonitorAltitude
             | TelemetryCommand::RevokeMonitorAltitude
@@ -769,12 +766,12 @@ impl FlightSimState {
             | TelemetryCommand::RevokeResetFailures
             | TelemetryCommand::ValidateMeasms
             | TelemetryCommand::RevokeValidateMeasms
+            | TelemetryCommand::AbortAfter15
             | TelemetryCommand::AbortAfter40
-            | TelemetryCommand::AbortAfter100
-            | TelemetryCommand::AbortAfter250
-            | TelemetryCommand::ReinitAfter15
-            | TelemetryCommand::ReinitAfter30
-            | TelemetryCommand::ReinitAfter50
+            | TelemetryCommand::AbortAfter70
+            | TelemetryCommand::ReinitAfter12
+            | TelemetryCommand::ReinitAfter26
+            | TelemetryCommand::ReinitAfter44
             | TelemetryCommand::AdvanceFlightState
             | TelemetryCommand::RewindFlightState => {
                 // No-op in simulator mode; these commands are forwarded by telemetry_task.

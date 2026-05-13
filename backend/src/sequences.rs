@@ -552,9 +552,6 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::StopWritingDb => "StopWritingDb",
         TelemetryCommand::ResetSim => "ResetSim",
         TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
-        TelemetryCommand::PostinitSignal => "PostinitSignal",
-        TelemetryCommand::LaunchSignal => "LaunchSignal",
-        TelemetryCommand::RollbackSignal => "RollbackSignal",
         TelemetryCommand::MonitorAltitude => "MonitorAltitude",
         TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
         TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
@@ -588,7 +585,7 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitBarometer => "ReinitBarometer",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitIMU => "ReinitIMU",
+        TelemetryCommand::EnableIMU => "EnableIMU",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DisableIMU => "DisableIMU",
         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
@@ -596,17 +593,17 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         TelemetryCommand::RewindFlightState => "RewindFlightState",
         #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::AbortAfter15 => "AbortAfter15",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter40 => "AbortAfter40",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::AbortAfter100 => "AbortAfter100",
+        TelemetryCommand::AbortAfter70 => "AbortAfter70",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::AbortAfter250 => "AbortAfter250",
+        TelemetryCommand::ReinitAfter12 => "ReinitAfter12",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter15 => "ReinitAfter15",
+        TelemetryCommand::ReinitAfter26 => "ReinitAfter26",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter30 => "ReinitAfter30",
-        #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter50 => "ReinitAfter50",
+        TelemetryCommand::ReinitAfter44 => "ReinitAfter44",
     }
 }
 
@@ -626,10 +623,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
-        "PostinitSignal",
         "Launch",
-        "LaunchSignal",
-        "RollbackSignal",
         "MonitorAltitude",
         "RevokeMonitorAltitude",
         "ConsecutiveSamples",
@@ -662,10 +656,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
-        "PostinitSignal",
         "Launch",
-        "LaunchSignal",
-        "RollbackSignal",
         "MonitorAltitude",
         "RevokeMonitorAltitude",
         "ConsecutiveSamples",
@@ -686,16 +677,16 @@ pub fn all_command_names() -> Vec<&'static str> {
         "EvaluationAbort",
         "ReinitSensors",
         "ReinitBarometer",
-        "ReinitIMU",
+        "EnableIMU",
         "DisableIMU",
         "AdvanceFlightState",
         "RewindFlightState",
+        "AbortAfter15",
         "AbortAfter40",
-        "AbortAfter100",
-        "AbortAfter250",
-        "ReinitAfter15",
-        "ReinitAfter30",
-        "ReinitAfter50",
+        "AbortAfter70",
+        "ReinitAfter12",
+        "ReinitAfter26",
+        "ReinitAfter44",
     ]
 }
 
@@ -715,11 +706,8 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
-        "PostinitSignal",
         "Launch",
         "GroundStationLaunch",
-        "LaunchSignal",
-        "RollbackSignal",
         "MonitorAltitude",
         "RevokeMonitorAltitude",
         "ConsecutiveSamples",

@@ -215,7 +215,8 @@ class TxMetadata:
 
 def build_command_groups(include_hitl: bool) -> list[tuple[str, list[CommandSpec]]]:
     rocket = [
-        CommandSpec("Launch", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 3, "FlightCommands::Launch"),
+        CommandSpec("Launch", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 3,
+                    "FlightComputerCommands::Launch"),
     ]
     if include_hitl:
         rocket.extend(
@@ -225,8 +226,6 @@ def build_command_groups(include_hitl: bool) -> list[tuple[str, list[CommandSpec
                 CommandSpec("ExpandParachute", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 1,
                             "FlightComputerCommands"),
                 CommandSpec("ReinitSensors", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 2,
-                            "FlightComputerCommands"),
-                CommandSpec("LaunchSignal", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 3,
                             "FlightComputerCommands"),
                 CommandSpec("EvaluationRelax", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 4,
                             "FlightComputerCommands"),

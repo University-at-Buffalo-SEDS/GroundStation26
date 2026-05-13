@@ -221,6 +221,18 @@
         }
       },
       {
+        "id": "EULER_ANGLES",
+        "label": "Euler Angles",
+        "channels": [
+          "Roll",
+          "Pitch",
+          "Yaw"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
         "id": "ACCEL_DATA",
         "label": "Accel Data",
         "channels": [

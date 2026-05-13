@@ -5,8 +5,8 @@ use flexi_logger::{
 use std::fs::File;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 const LOG_BASENAME: &str = "groundstation";
 const LOG_CURRENT_INFIX: &str = "rCURRENT";

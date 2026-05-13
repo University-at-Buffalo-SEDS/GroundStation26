@@ -284,27 +284,6 @@
         "fg": "#e0f2fe"
       },
       {
-        "label": "Postinit Signal",
-        "cmd": "PostinitSignal",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Launch Signal",
-        "cmd": "LaunchSignal",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Rollback Signal",
-        "cmd": "RollbackSignal",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
         "label": "Evaluation Relax",
         "cmd": "EvaluationRelax",
         "border": "#38bdf8",
@@ -333,8 +312,8 @@
         "fg": "#e0f2fe"
       },
       {
-        "label": "Reinit IMU",
-        "cmd": "ReinitIMU",
+        "label": "Enable IMU",
+        "cmd": "EnableIMU",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -403,6 +382,13 @@
         "fg": "#e0f2fe"
       },
       {
+        "label": "Abort After 15",
+        "cmd": "AbortAfter15",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
         "label": "Abort After 40",
         "cmd": "AbortAfter40",
         "border": "#38bdf8",
@@ -410,36 +396,29 @@
         "fg": "#e0f2fe"
       },
       {
-        "label": "Abort After 100",
-        "cmd": "AbortAfter100",
+        "label": "Abort After 70",
+        "cmd": "AbortAfter70",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Abort After 250",
-        "cmd": "AbortAfter250",
+        "label": "Reinit After 12",
+        "cmd": "ReinitAfter12",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Reinit After 15",
-        "cmd": "ReinitAfter15",
+        "label": "Reinit After 26",
+        "cmd": "ReinitAfter26",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Reinit After 30",
-        "cmd": "ReinitAfter30",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Reinit After 50",
-        "cmd": "ReinitAfter50",
+        "label": "Reinit After 44",
+        "cmd": "ReinitAfter44",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -456,6 +435,18 @@
       {
         "id": "GYRO_DATA",
         "label": "Gyro Data",
+        "channels": [
+          "Roll",
+          "Pitch",
+          "Yaw"
+        ],
+        "chart": {
+          "enabled": true
+        }
+      },
+      {
+        "id": "EULER_ANGLES",
+        "label": "Euler Angles",
         "channels": [
           "Roll",
           "Pitch",

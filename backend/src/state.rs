@@ -1295,9 +1295,7 @@ impl AppState {
             }
             if matches!(
                 cmd,
-                TelemetryCommand::Launch
-                    | TelemetryCommand::GroundStationLaunch
-                    | TelemetryCommand::LaunchSignal
+                TelemetryCommand::Launch | TelemetryCommand::GroundStationLaunch
             ) && !self.hitl_launch_interlock_satisfied()
             {
                 return false;
@@ -1862,7 +1860,10 @@ mod tests {
         router.add_side_serialized_with_options(
             "umbilical_comms",
             move |bytes| {
-                sent_clone.lock().expect("failed to lock sends").push(bytes.to_vec());
+                sent_clone
+                    .lock()
+                    .expect("failed to lock sends")
+                    .push(bytes.to_vec());
                 Ok(())
             },
             RouterSideOptions {
@@ -1979,9 +1980,8 @@ mod tests {
 
         *gs_peer.lock().expect("failed to lock gs peer") =
             Some((remote_router.clone(), remote_side));
-        *remote_peer
-            .lock()
-            .expect("failed to lock remote peer") = Some((gs_router.clone(), gs_side));
+        *remote_peer.lock().expect("failed to lock remote peer") =
+            Some((gs_router.clone(), gs_side));
 
         remote_router
             .announce_discovery()
@@ -2018,7 +2018,10 @@ mod tests {
         }
 
         let states = remote_states.lock().expect("failed to lock remote states");
-        let expected = sequence.iter().map(|state| *state as u8).collect::<Vec<_>>();
+        let expected = sequence
+            .iter()
+            .map(|state| *state as u8)
+            .collect::<Vec<_>>();
         assert_eq!(states.as_slice(), expected.as_slice());
         assert_eq!(remote_deliveries.load(Ordering::Relaxed), sequence.len());
     }

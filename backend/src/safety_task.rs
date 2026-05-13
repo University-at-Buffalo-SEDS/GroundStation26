@@ -556,5 +556,4 @@ mod tests {
         assert!(battery_voltage_out_of_range("GB", 13.0));
         assert!(battery_voltage_out_of_range("GW", 13.0));
     }
-
 }

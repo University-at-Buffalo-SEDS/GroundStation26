@@ -748,14 +748,14 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
         TelemetryCommand::EvaluationAbort => FlightComputerCommands::EvaluationAbort as u8,
         TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
         TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
-        TelemetryCommand::ReinitIMU => FlightComputerCommands::ReinitIMU as u8,
+        TelemetryCommand::EnableIMU => FlightComputerCommands::EnableIMU as u8,
         TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
+        TelemetryCommand::AbortAfter15 => FlightComputerCommands::AbortAfter15 as u8,
         TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
-        TelemetryCommand::AbortAfter100 => FlightComputerCommands::AbortAfter100 as u8,
-        TelemetryCommand::AbortAfter250 => FlightComputerCommands::AbortAfter250 as u8,
-        TelemetryCommand::ReinitAfter15 => FlightComputerCommands::ReinitAfter15 as u8,
-        TelemetryCommand::ReinitAfter30 => FlightComputerCommands::ReinitAfter30 as u8,
-        TelemetryCommand::ReinitAfter50 => FlightComputerCommands::ReinitAfter50 as u8,
+        TelemetryCommand::AbortAfter70 => FlightComputerCommands::AbortAfter70 as u8,
+        TelemetryCommand::ReinitAfter12 => FlightComputerCommands::ReinitAfter12 as u8,
+        TelemetryCommand::ReinitAfter26 => FlightComputerCommands::ReinitAfter26 as u8,
+        TelemetryCommand::ReinitAfter44 => FlightComputerCommands::ReinitAfter44 as u8,
         _ => return None,
     })
 }
@@ -2010,13 +2010,11 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
     }
     let now_ms = get_current_timestamp_ms() as i64;
     state.set_launch_clock(launch_countdown_clock(now_ms));
-    if let Err(e) =
-        queue_locally_routed_flight_command(
-            &router,
-            "Launch command",
-            &[FlightComputerCommands::LaunchSignal as u8],
-        )
-    {
+    if let Err(e) = queue_locally_routed_flight_command(
+        &router,
+        "Launch command",
+        &[FlightComputerCommands::Launch as u8],
+    ) {
         log_telemetry_error("failed to log Launch command", e);
     } else {
         flush_command_tx(&router, "Launch command tx");
@@ -2527,42 +2525,12 @@ pub async fn telemetry_task(
                                 state.request_fill_sequence_continue();
                                 gs_debug_println!("ContinueFillSequence command accepted");
                             }
-                        TelemetryCommand::PostinitSignal => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &router,
-                                    "PostinitSignal command",
-                                    &[FlightComputerCommands::PostinitSignal as u8],
-                                ) {
-                                    log_telemetry_error("failed to log PostinitSignal command", e);
-                                }
-                                gs_debug_println!("PostinitSignal command sent");
-                            }
                         TelemetryCommand::Launch => {
                                 handle_flight_computer_launch_command(state.clone(), router.clone()).await;
                             }
                         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
                         TelemetryCommand::GroundStationLaunch => {
                                 handle_local_ground_station_launch_command(state.clone(), router.clone()).await;
-                            }
-                        TelemetryCommand::LaunchSignal => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &router,
-                                    "LaunchSignal command",
-                                    &[FlightComputerCommands::LaunchSignal as u8],
-                                ) {
-                                    log_telemetry_error("failed to log LaunchSignal command", e);
-                                }
-                                gs_debug_println!("LaunchSignal command sent");
-                            }
-                        TelemetryCommand::RollbackSignal => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &router,
-                                    "RollbackSignal command",
-                                    &[FlightComputerCommands::RollbackSignal as u8],
-                                ) {
-                                    log_telemetry_error("failed to log RollbackSignal command", e);
-                                }
-                                gs_debug_println!("RollbackSignal command sent");
                             }
                         TelemetryCommand::MonitorAltitude => {
                                 if let Err(e) = queue_locally_routed_flight_command(
@@ -2694,14 +2662,14 @@ pub async fn telemetry_task(
                         | TelemetryCommand::EvaluationAbort
                         | TelemetryCommand::ReinitSensors
                         | TelemetryCommand::ReinitBarometer
-                        | TelemetryCommand::ReinitIMU
+                        | TelemetryCommand::EnableIMU
                         | TelemetryCommand::DisableIMU
+                        | TelemetryCommand::AbortAfter15
                         | TelemetryCommand::AbortAfter40
-                        | TelemetryCommand::AbortAfter100
-                        | TelemetryCommand::AbortAfter250
-                        | TelemetryCommand::ReinitAfter15
-                        | TelemetryCommand::ReinitAfter30
-                        | TelemetryCommand::ReinitAfter50 => {
+                        | TelemetryCommand::AbortAfter70
+                        | TelemetryCommand::ReinitAfter12
+                        | TelemetryCommand::ReinitAfter26
+                        | TelemetryCommand::ReinitAfter44 => {
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
@@ -3811,7 +3779,10 @@ mod tests {
         let remote_states_handler = remote_states.clone();
         let mut policy = state.action_policy_snapshot();
         for control in policy.controls.iter_mut() {
-            if matches!(control.cmd.as_str(), "AdvanceFlightState" | "RewindFlightState") {
+            if matches!(
+                control.cmd.as_str(),
+                "AdvanceFlightState" | "RewindFlightState"
+            ) {
                 control.enabled = true;
             }
         }
@@ -3819,18 +3790,20 @@ mod tests {
 
         let remote_router = Arc::new(Router::new(
             sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([sedsprintf_rs_2026::router::EndpointHandler::new_packet_handler(
-                DataEndpoint::FlightState,
-                move |pkt: &Packet| {
-                    if let Some(state_code) = pkt.payload().first().copied() {
-                        remote_states_handler
-                            .lock()
-                            .expect("failed to lock remote states")
-                            .push(state_code);
-                    }
-                    Ok(())
-                },
-            )]),
+            sedsprintf_rs_2026::router::RouterConfig::new([
+                sedsprintf_rs_2026::router::EndpointHandler::new_packet_handler(
+                    DataEndpoint::FlightState,
+                    move |pkt: &Packet| {
+                        if let Some(state_code) = pkt.payload().first().copied() {
+                            remote_states_handler
+                                .lock()
+                                .expect("failed to lock remote states")
+                                .push(state_code);
+                        }
+                        Ok(())
+                    },
+                ),
+            ]),
         ));
         let gs_router = Arc::new(Router::new(
             sedsprintf_rs_2026::router::RouterMode::Relay,
@@ -3878,9 +3851,8 @@ mod tests {
         };
         *gs_peer.lock().expect("failed to lock gs peer") =
             Some((remote_router.clone(), remote_side));
-        *remote_peer
-            .lock()
-            .expect("failed to lock remote peer") = Some((gs_router.clone(), gs_side));
+        *remote_peer.lock().expect("failed to lock remote peer") =
+            Some((gs_router.clone(), gs_side));
 
         remote_router
             .announce_discovery()

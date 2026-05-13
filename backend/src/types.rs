@@ -22,9 +22,6 @@ pub enum TelemetryCommand {
     StopWritingDb,
     ResetSim,
     ContinueFillSequence,
-    PostinitSignal,
-    LaunchSignal,
-    RollbackSignal,
     MonitorAltitude,
     RevokeMonitorAltitude,
     ConsecutiveSamples,
@@ -58,7 +55,7 @@ pub enum TelemetryCommand {
     #[cfg(feature = "hitl_mode")]
     ReinitBarometer,
     #[cfg(feature = "hitl_mode")]
-    ReinitIMU,
+    EnableIMU,
     #[cfg(feature = "hitl_mode")]
     DisableIMU,
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
@@ -66,17 +63,17 @@ pub enum TelemetryCommand {
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     RewindFlightState,
     #[cfg(feature = "hitl_mode")]
+    AbortAfter15,
+    #[cfg(feature = "hitl_mode")]
     AbortAfter40,
     #[cfg(feature = "hitl_mode")]
-    AbortAfter100,
+    AbortAfter70,
     #[cfg(feature = "hitl_mode")]
-    AbortAfter250,
+    ReinitAfter12,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter15,
+    ReinitAfter26,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter30,
-    #[cfg(feature = "hitl_mode")]
-    ReinitAfter50,
+    ReinitAfter44,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
