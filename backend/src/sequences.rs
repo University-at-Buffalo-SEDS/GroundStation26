@@ -464,6 +464,27 @@ struct ValveSnapshot {
     pending_retract: Option<bool>,
 }
 
+impl Default for ValveSnapshot {
+    fn default() -> Self {
+        Self {
+            normally_open: None,
+            pending_normally_open: None,
+            dump_open: None,
+            pending_dump_open: None,
+            nitrogen_open: None,
+            pending_nitrogen_open: None,
+            nitrous_open: None,
+            pending_nitrous_open: None,
+            pilot_open: None,
+            pending_pilot_open: None,
+            igniter_on: None,
+            pending_igniter_on: None,
+            retract: None,
+            pending_retract: None,
+        }
+    }
+}
+
 impl ValveSnapshot {
     fn read(state: &AppState) -> Self {
         let valve = |cmd| state.get_umbilical_valve_state(cmd);
@@ -723,6 +744,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
             pilot_open: None,
             igniter_on: None,
             retract: None,
+            ..ValveSnapshot::default()
         });
     }
     #[cfg(not(feature = "hitl_mode"))]
