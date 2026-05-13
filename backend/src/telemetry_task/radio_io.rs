@@ -296,6 +296,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
             let radio_tx_window_packets = radio_tx_packets_per_window();
             let radio_tx_without_window = radio_tx_without_window();
             let radio_uplink_turnaround = Duration::from_millis(radio_uplink_turnaround_ms());
+            let radio_uplink_tx_guard = Duration::from_millis(radio_uplink_tx_guard_ms());
             let mut tx_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             let mut last_window_update_at: Option<std::time::Instant> = None;
             let mut follow_window_opened_at: Option<std::time::Instant> = None;
@@ -430,6 +431,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                                 last_window_update_at,
                                 follow_window_opened_at,
                                 radio_uplink_turnaround,
+                                radio_uplink_tx_guard,
                                 &mut follow_window_until,
                                 &mut follow_window_is_uplink,
                                 &mut sent_in_current_uplink_window,
@@ -450,6 +452,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     last_window_update_at,
                     follow_window_opened_at,
                     radio_uplink_turnaround,
+                    radio_uplink_tx_guard,
                     &mut follow_window_until,
                     &mut follow_window_is_uplink,
                     &mut sent_in_current_uplink_window,
@@ -735,7 +738,7 @@ fn radio_tx_backlog_limit() -> usize {
 
 fn radio_tx_packets_per_window() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_PACKETS_PER_WINDOW", 1, 1, 128))
+    *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_PACKETS_PER_WINDOW", 16, 1, 128))
 }
 
 fn radio_flight_command_repeats() -> usize {
@@ -751,7 +754,24 @@ fn radio_tx_without_window() -> bool {
 
 fn radio_uplink_turnaround_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 200, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 50, 0, 1_000) as u64)
+}
+
+fn radio_uplink_tx_guard_ms() -> u64 {
+    static DELAY_MS: OnceLock<u64> = OnceLock::new();
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 50, 0, 1_000) as u64)
+}
+
+fn radio_uart_baud() -> u64 {
+    static BAUD: OnceLock<u64> = OnceLock::new();
+    *BAUD.get_or_init(|| env_usize("GS_RADIO_UART_BAUD", 9_600, 1_200, 921_600) as u64)
+}
+
+fn raw_uart_wire_duration(payload_len: usize) -> Duration {
+    let frame_len = payload_len.saturating_add(4);
+    let baud = radio_uart_baud();
+    let wire_ms = (((frame_len as u64) * 10 * 1_000) + baud - 1) / baud;
+    Duration::from_millis(wire_ms)
 }
 
 fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
@@ -912,6 +932,7 @@ fn send_while_uplink_window_open(
     last_window_update_at: Option<std::time::Instant>,
     follow_window_opened_at: Option<std::time::Instant>,
     uplink_turnaround: Duration,
+    uplink_tx_guard: Duration,
     follow_window_until: &mut Option<std::time::Instant>,
     follow_window_is_uplink: &mut bool,
     sent_in_current_uplink_window: &mut usize,
@@ -997,9 +1018,17 @@ fn send_while_uplink_window_open(
             }
         }
 
-        let Some(payload) = tx_backlog.pop_front() else {
+        let Some(payload) = tx_backlog.front() else {
             break;
         };
+        let latest_finish = deadline.checked_sub(uplink_tx_guard).unwrap_or(deadline);
+        let wire_done_at = now + raw_uart_wire_duration(payload.len());
+        if wire_done_at > latest_finish {
+            break;
+        }
+        let payload = tx_backlog
+            .pop_front()
+            .expect("front payload should still exist after budget check");
         log_radio_packet_event("radio TX pop", worker_name, &payload);
         maybe_log_green_radio_command_send(worker_name, &payload);
         match comms.send_data(&payload) {
