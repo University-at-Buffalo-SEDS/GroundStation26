@@ -3855,6 +3855,137 @@ mod tests {
         );
     }
 
+    struct TestRadioComms {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        windows: VecDeque<crate::comms::RadioWindowUpdate>,
+    }
+
+    impl CommsDevice for TestRadioComms {
+        fn recv_packet(
+            &mut self,
+            _router: &Router,
+            _packet_tap: &mut dyn FnMut(&Packet),
+        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+            Ok(())
+        }
+
+        fn send_data(
+            &mut self,
+            payload: &[u8],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.sent
+                .lock()
+                .expect("failed to lock sent radio payloads")
+                .push(payload.to_vec());
+            Ok(())
+        }
+
+        fn set_side_id(&mut self, _side_id: RouterSideId) {}
+
+        fn recv_serialized_packets_with_budget(
+            &mut self,
+            _packet_sink: &mut dyn FnMut(Vec<u8>),
+            _timeout: Duration,
+            _max_packets: usize,
+        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+            Ok(())
+        }
+
+        fn take_radio_window_update(&mut self) -> Option<crate::comms::RadioWindowUpdate> {
+            self.windows.pop_front()
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_radio_worker_sends_flight_command_during_downlink_window() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                windows: VecDeque::from([crate::comms::RadioWindowUpdate {
+                    kind: crate::comms::RadioWindowKind::DownlinkOpen,
+                    duration_ms: 250,
+                }]),
+            })));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tx.send(wire.clone())
+            .expect("failed to queue flight command to radio worker");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+                if sent_guard.iter().any(|payload| payload == &wire) {
+                    break;
+                }
+                drop(sent_guard);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for radio worker send_data");
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        let flight_packets = sent_guard
+            .iter()
+            .filter_map(|payload| serialize::deserialize_packet(payload).ok())
+            .filter(|pkt| pkt.data_type() == DataType::FlightCommand)
+            .collect::<Vec<_>>();
+        assert_eq!(flight_packets.len(), 1);
+        assert_eq!(
+            flight_packets[0].payload(),
+            &[FlightComputerCommands::MonitorAltitude as u8]
+        );
+        assert!(
+            flight_packets[0]
+                .endpoints()
+                .contains(&DataEndpoint::FlightController)
+        );
+    }
+
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     #[tokio::test]
     async fn advance_flight_state_command_reaches_remote_router_end_to_end() {
