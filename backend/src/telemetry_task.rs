@@ -1403,7 +1403,12 @@ async fn handle_packet(
             *fs = new_flight_state;
         }
         let ts_ms = pkt.timestamp() as i64;
-        state.update_launch_clock_for_state(new_flight_state, ts_ms);
+        let launch_clock_ts_ms = if sender_id == Board::GroundStation.sender_id() {
+            ts_ms
+        } else {
+            get_current_timestamp_ms() as i64
+        };
+        state.update_launch_clock_for_state(new_flight_state, launch_clock_ts_ms);
         queue_db_write(
             state,
             db_tx,
