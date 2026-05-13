@@ -427,7 +427,12 @@ fn spawn_dedicated_radio_io_threads(
                     match update.kind {
                         RadioWindowKind::DownlinkOpen => {
                             // Window kinds are emitted from the RF-board perspective.
-                            // RF-board downlink means GS may transmit to the board.
+                            // RF-board downlink means the board is transmitting to GS.
+                            follow_window_is_uplink = false;
+                            sent_in_current_uplink_window = 0;
+                        }
+                        RadioWindowKind::UplinkOpen => {
+                            // RF-board uplink means GS may transmit to the board.
                             follow_window_is_uplink = true;
                             sent_in_current_uplink_window = 0;
                             let uplink_log_now = std::time::Instant::now();
@@ -460,11 +465,6 @@ fn spawn_dedicated_radio_io_threads(
                                 &mut last_send_error_log_ms,
                                 &mut suppressed_send_errors,
                             );
-                        }
-                        RadioWindowKind::UplinkOpen => {
-                            // RF-board uplink means the board may transmit back to GS.
-                            follow_window_is_uplink = false;
-                            sent_in_current_uplink_window = 0;
                         }
                     }
                 }
@@ -3897,7 +3897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_radio_worker_sends_flight_command_during_downlink_window() {
+    async fn dedicated_radio_worker_sends_flight_command_during_uplink_window() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
         let router = Arc::new(Router::new(
@@ -3917,7 +3917,7 @@ mod tests {
             Arc::new(Mutex::new(Box::new(TestRadioComms {
                 sent: sent.clone(),
                 windows: VecDeque::from([crate::comms::RadioWindowUpdate {
-                    kind: crate::comms::RadioWindowKind::DownlinkOpen,
+                    kind: crate::comms::RadioWindowKind::UplinkOpen,
                     duration_ms: 250,
                 }]),
             })));
@@ -3984,6 +3984,70 @@ mod tests {
                 .endpoints()
                 .contains(&DataEndpoint::FlightController)
         );
+    }
+
+    #[tokio::test]
+    async fn dedicated_radio_worker_does_not_send_flight_command_during_downlink_window() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                windows: VecDeque::from([crate::comms::RadioWindowUpdate {
+                    kind: crate::comms::RadioWindowKind::DownlinkOpen,
+                    duration_ms: 250,
+                }]),
+            })));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tx.send(wire)
+            .expect("failed to queue flight command to radio worker");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        assert!(sent_guard.is_empty());
     }
 
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
