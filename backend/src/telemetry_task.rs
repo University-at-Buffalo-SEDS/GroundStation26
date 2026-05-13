@@ -109,8 +109,7 @@ fn send_valve_launch_sequence_command(router: &Router) -> bool {
 }
 
 fn vent_valve_known_open_for_launch(state: &Arc<AppState>) -> bool {
-    effective_umbilical_valve_state(state, ValveBoardCommands::NormallyOpenOpen as u8)
-        == Some(true)
+    effective_umbilical_valve_state(state, ValveBoardCommands::NormallyOpenOpen as u8) == Some(true)
 }
 
 fn warn_launch_blocked_by_vent_valve(state: &Arc<AppState>) {
