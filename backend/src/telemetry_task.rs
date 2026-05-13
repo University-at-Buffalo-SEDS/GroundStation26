@@ -15,7 +15,7 @@ use crate::test_fire_csv;
 use crate::types::{
     Board, FlightState, TelemetryCommand, TelemetryRow, canonical_sender_id, u8_to_flight_state,
 };
-use crate::web::{FlightStateMsg, emit_notification_warning, emit_warning};
+use crate::web::{FlightStateMsg, emit_error, emit_notification_warning, emit_warning};
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::endpoints_from_datatype;
 use sedsprintf_rs_2026::packet::Packet;
@@ -2355,6 +2355,7 @@ pub async fn telemetry_task(
                                 } else {
                                     flush_command_tx(&router, "Abort command tx");
                                 }
+                                emit_error(&state, "Manual abort triggered!".to_string());
                                 gs_debug_println!("Abort command sent");
                             }
                         TelemetryCommand::Igniter => {

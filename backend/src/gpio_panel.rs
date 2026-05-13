@@ -1,9 +1,8 @@
 use crate::gpio::Trigger;
 use crate::sequences::{ActionPolicyMsg, BlinkMode};
 use crate::state::AppState;
-use crate::telemetry_task::queue_abort_packet;
 use crate::types::TelemetryCommand;
-use crate::web::{emit_error, emit_notification_warning};
+use crate::web::emit_notification_warning;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -329,28 +328,15 @@ fn dispatch_gpio_abort(
         return;
     }
 
-    log::info!("GPIO abort button {source}: latching abort indicator and dispatching abort");
+    log::info!("GPIO abort button {source}: latching abort indicator and queueing abort command");
     state.set_abort_indicator_latched(true);
     crate::sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
-
-    if let Some(router) = state.topology_router.get() {
-        if let Err(err) = queue_abort_packet(router, "Manual GPIO Abort Button Pressed") {
-            log::error!("GPIO abort button {source}: failed to queue abort packet: {err}");
-        } else if let Err(err) = router.process_all_queues_with_timeout(3) {
-            log::error!("GPIO abort button {source}: failed to flush abort packet: {err}");
-        } else {
-            log::info!("GPIO abort button {source}: abort packet queued and flushed");
-        }
-    } else {
-        log::warn!("GPIO abort button {source}: router unavailable, falling back to command queue");
-    }
 
     match tx.try_send(TelemetryCommand::Abort) {
         Ok(()) => log::info!("GPIO abort button {source}: Abort command queued to telemetry task"),
         Err(err) => log::error!("GPIO abort button {source}: failed to send command: {err}"),
     }
-    emit_error(state, "Manual abort button pressed!".to_string());
 }
 
 #[allow(clippy::too_many_arguments)]
