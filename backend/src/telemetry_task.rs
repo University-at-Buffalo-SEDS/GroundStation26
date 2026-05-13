@@ -17,7 +17,6 @@ use crate::types::{
 };
 use crate::web::{FlightStateMsg, emit_error, emit_notification_warning, emit_warning};
 use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
-use sedsprintf_rs_2026::endpoints_from_datatype;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{Router, RouterSideId};
 use sedsprintf_rs_2026::serialize;
@@ -3496,17 +3495,6 @@ fn log_command_dispatch(context: &str, side: &str, ty: DataType, payload: &[u8])
     );
 }
 
-fn queue_locally_routed_command<T: Copy + 'static>(
-    router: &Router,
-    ty: DataType,
-    payload: &[T],
-) -> sedsprintf_rs_2026::TelemetryResult<()> {
-    let timestamp_ms = get_current_timestamp_ms();
-    let endpoints = endpoints_from_datatype(ty);
-    let pkt = Packet::from_prim_le_slice(ty, payload, endpoints, timestamp_ms)?;
-    router.rx_queue(pkt)
-}
-
 fn queue_locally_routed_flight_command(
     router: &Router,
     context: &str,
@@ -3525,12 +3513,6 @@ fn queue_locally_routed_flight_command(
                 .reachable_endpoints
                 .contains(&DataEndpoint::FlightController)
     });
-
-    if rocket_has_fc && !umbilical_has_fc {
-        queue_locally_routed_command(router, DataType::FlightCommand, payload)?;
-        log_command_dispatch(context, "rocket_comms", DataType::FlightCommand, payload);
-        return Ok(());
-    }
 
     router.log_queue(DataType::FlightCommand, payload)?;
     log_command_dispatch(
@@ -3807,6 +3789,70 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(abort_packets.len(), 1);
         assert_eq!(abort_packets[0].payload(), b"Manual Abort Command Issued");
+    }
+
+    #[test]
+    fn flight_command_transmits_to_rocket_side_when_fc_is_discovered_there() {
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sent_clone = sent.clone();
+        let router = Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        );
+        let rocket_side = router.add_side_serialized_with_options(
+            "rocket_comms",
+            move |bytes| {
+                sent_clone
+                    .lock()
+                    .expect("failed to lock sent packets")
+                    .push(bytes.to_vec());
+                Ok(())
+            },
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let discovery = sedsprintf_rs_2026::discovery::build_discovery_announce(
+            Board::RFBoard.sender_id(),
+            123,
+            &[DataEndpoint::FlightController],
+        )
+        .expect("failed to build RF discovery");
+        let discovery_wire = serialize::serialize_packet(&discovery);
+        router
+            .rx_serialized_from_side(&discovery_wire, rocket_side)
+            .expect("failed to queue RF discovery");
+        router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process RF discovery");
+
+        queue_locally_routed_flight_command(
+            &router,
+            "test flight command",
+            &[FlightComputerCommands::MonitorAltitude as u8],
+        )
+        .expect("failed to queue flight command");
+        router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process router queues");
+
+        let sent = sent.lock().expect("failed to lock sent packets");
+        let flight_packets = sent
+            .iter()
+            .filter_map(|wire| serialize::deserialize_packet(wire).ok())
+            .filter(|pkt| pkt.data_type() == DataType::FlightCommand)
+            .collect::<Vec<_>>();
+        assert_eq!(flight_packets.len(), 1);
+        assert_eq!(
+            flight_packets[0].payload(),
+            &[FlightComputerCommands::MonitorAltitude as u8]
+        );
+        assert!(
+            flight_packets[0]
+                .endpoints()
+                .contains(&DataEndpoint::FlightController)
+        );
     }
 
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
