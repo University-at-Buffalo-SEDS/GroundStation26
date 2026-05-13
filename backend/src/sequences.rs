@@ -822,6 +822,10 @@ fn command_prompt_blink(
     Some(BlinkMode::Slow)
 }
 
+fn vent_closed_for_launch(valves: ValveSnapshot) -> bool {
+    valves.actuated_for_cmd("NormallyOpen") == Some(false)
+}
+
 fn set_control_enabled(policy: &mut ActionPolicyMsg, cmd: &str, enabled: bool) {
     if let Some(control) = policy
         .controls
@@ -1736,7 +1740,18 @@ fn build_policy(
 
     if inputs.flight_state == FlightState::Armed {
         let mut enabled = HashMap::new();
-        if !state.launch_indicator_latched() {
+        if !vent_closed_for_launch(inputs.valves) {
+            if let Some(blink) = command_prompt_blink(
+                state,
+                cfg,
+                inputs.valves,
+                "NormallyOpen",
+                false,
+                inputs.now_ms,
+            ) {
+                enabled.insert("NormallyOpen", blink);
+            }
+        } else if !state.launch_indicator_latched() {
             enabled.insert("Launch", BlinkMode::Slow);
             enabled.insert("GroundStationLaunch", BlinkMode::Slow);
         } else {
@@ -2215,6 +2230,24 @@ mod tests {
         assert!(setup_valves_ready(ValveSnapshot {
             normally_open: Some(true),
             dump_open: Some(false),
+            ..ValveSnapshot::default()
+        }));
+    }
+
+    #[test]
+    fn armed_launch_requires_closed_vent_valve() {
+        assert!(!vent_closed_for_launch(ValveSnapshot {
+            normally_open: Some(true),
+            ..ValveSnapshot::default()
+        }));
+        assert!(!vent_closed_for_launch(ValveSnapshot::default()));
+        assert!(vent_closed_for_launch(ValveSnapshot {
+            normally_open: Some(false),
+            ..ValveSnapshot::default()
+        }));
+        assert!(vent_closed_for_launch(ValveSnapshot {
+            normally_open: Some(true),
+            pending_normally_open: Some(false),
             ..ValveSnapshot::default()
         }));
     }

@@ -108,6 +108,18 @@ fn send_valve_launch_sequence_command(router: &Router) -> bool {
     }
 }
 
+fn vent_valve_closed_for_launch(state: &Arc<AppState>) -> bool {
+    effective_umbilical_valve_state(state, ValveBoardCommands::NormallyOpenOpen as u8)
+        == Some(false)
+}
+
+fn warn_launch_blocked_by_vent_valve(state: &Arc<AppState>) {
+    emit_notification_warning(
+        state,
+        "Close the vent valve before initiating the launch sequence.",
+    );
+}
+
 fn start_launch_clock_from_valve_sequence_status(state: &Arc<AppState>) {
     if matches!(
         state.launch_clock_snapshot().kind,
@@ -141,6 +153,15 @@ fn transition_launch_clock_to_t_plus_from_pilot_open(state: &Arc<AppState>) {
 
 #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router: Arc<Router>) {
+    if !vent_valve_closed_for_launch(&state) {
+        warn_launch_blocked_by_vent_valve(&state);
+        sequences::refresh_action_policy_now(&state);
+        state.broadcast_action_policy_snapshot();
+        gs_debug_println!(
+            "Ground-station launch command ignored because vent valve is not confirmed closed"
+        );
+        return;
+    }
     if matches!(
         state.launch_clock_snapshot().kind,
         LaunchClockKind::TMinus | LaunchClockKind::TPlus
@@ -176,6 +197,13 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
 }
 
 async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc<Router>) {
+    if !vent_valve_closed_for_launch(&state) {
+        warn_launch_blocked_by_vent_valve(&state);
+        sequences::refresh_action_policy_now(&state);
+        state.broadcast_action_policy_snapshot();
+        gs_debug_println!("Launch command ignored because vent valve is not confirmed closed");
+        return;
+    }
     if matches!(
         state.launch_clock_snapshot().kind,
         LaunchClockKind::TMinus | LaunchClockKind::TPlus
@@ -596,18 +624,22 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::NormallyOpen => {
                                 let key = ValveBoardCommands::NormallyOpenOpen as u8;
-                                let is_on = effective_umbilical_valve_state(&state, key).unwrap_or(false);
-                                let cmd = if is_on {
-                                    ValveBoardCommands::NormallyOpenClose
-                                } else {
+                                let effective_state = effective_umbilical_valve_state(&state, key);
+                                let should_close_for_armed_launch = effective_state.is_none()
+                                    && state.local_flight_state_snapshot() == FlightState::Armed;
+                                let is_on = effective_state.unwrap_or(false);
+                                let target = !(is_on || should_close_for_armed_launch);
+                                let cmd = if target {
                                     ValveBoardCommands::NormallyOpenOpen
+                                } else {
+                                    ValveBoardCommands::NormallyOpenClose
                                 };
                                 queue_guarded_fill_command(
                                     &state,
                                     &router,
                                     DataType::ValveCommand,
                                     key,
-                                    !is_on,
+                                    target,
                                     cmd as u8,
                                     "NormallyOpen command",
                                 );
