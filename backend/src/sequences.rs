@@ -900,6 +900,14 @@ fn dump_open_fails_nitrous_step(step: SequenceStep) -> bool {
     )
 }
 
+fn first_fill_step_after_setup() -> SequenceStep {
+    if cfg!(feature = "test_fire_mode") {
+        SequenceStep::OpenNitrous
+    } else {
+        SequenceStep::NitrogenFill
+    }
+}
+
 fn mass_is_vented(current_mass_kg: Option<f32>, cfg: &SequenceConfig) -> bool {
     if cfg!(feature = "test_fire_mode") {
         return true;
@@ -1101,7 +1109,7 @@ fn update_sequence_runtime(
     match runtime.step {
         SequenceStep::SetupValves => {
             if valves.normally_open == Some(false) && valves.dump_open == Some(false) {
-                runtime.step = SequenceStep::NitrogenFill;
+                runtime.step = first_fill_step_after_setup();
             }
         }
         SequenceStep::NitrogenFill => {
@@ -2155,10 +2163,23 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
     state.set_action_policy(policy);
 }
 
-#[cfg(all(test, feature = "hitl_mode"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "test_fire_mode")]
+    #[test]
+    fn test_fire_sequence_starts_with_nitrous_fill_after_setup() {
+        assert_eq!(first_fill_step_after_setup(), SequenceStep::OpenNitrous);
+    }
+
+    #[cfg(not(feature = "test_fire_mode"))]
+    #[test]
+    fn normal_sequence_starts_with_nitrogen_fill_after_setup() {
+        assert_eq!(first_fill_step_after_setup(), SequenceStep::NitrogenFill);
+    }
+
+    #[cfg(feature = "hitl_mode")]
     #[test]
     fn hitl_policy_enables_manual_igniter_sequence() {
         let policy = default_action_policy();

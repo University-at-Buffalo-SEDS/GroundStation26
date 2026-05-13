@@ -711,7 +711,6 @@
         "states": [
           "PreFill",
           "FillTest",
-          "NitrogenFill",
           "NitrousFill"
         ],
         "sections": [
