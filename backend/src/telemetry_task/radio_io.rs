@@ -754,24 +754,31 @@ fn radio_tx_without_window() -> bool {
 
 fn radio_uplink_turnaround_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 50, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 250, 0, 1_000) as u64)
 }
 
 fn radio_uplink_tx_guard_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 50, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 100, 0, 1_000) as u64)
 }
 
-fn radio_uart_baud() -> u64 {
-    static BAUD: OnceLock<u64> = OnceLock::new();
-    *BAUD.get_or_init(|| env_usize("GS_RADIO_UART_BAUD", 9_600, 1_200, 921_600) as u64)
+fn radio_air_bit_rate_bps() -> u64 {
+    static BPS: OnceLock<u64> = OnceLock::new();
+    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 4_800, 1_200, 921_600) as u64)
 }
 
-fn raw_uart_wire_duration(payload_len: usize) -> Duration {
-    let frame_len = payload_len.saturating_add(4);
-    let baud = radio_uart_baud();
-    let wire_ms = (((frame_len as u64) * 10 * 1_000) + baud - 1) / baud;
-    Duration::from_millis(wire_ms)
+fn radio_air_frame_overhead_bytes() -> usize {
+    static OVERHEAD: OnceLock<usize> = OnceLock::new();
+    *OVERHEAD.get_or_init(|| env_usize("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", 16, 0, 256))
+}
+
+fn raw_uart_air_duration(payload_len: usize) -> Duration {
+    let frame_len = payload_len
+        .saturating_add(4)
+        .saturating_add(radio_air_frame_overhead_bytes());
+    let air_bps = radio_air_bit_rate_bps();
+    let air_ms = (((frame_len as u64) * 10 * 1_000) + air_bps - 1) / air_bps;
+    Duration::from_millis(air_ms)
 }
 
 fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
@@ -1022,8 +1029,8 @@ fn send_while_uplink_window_open(
             break;
         };
         let latest_finish = deadline.checked_sub(uplink_tx_guard).unwrap_or(deadline);
-        let wire_done_at = now + raw_uart_wire_duration(payload.len());
-        if wire_done_at > latest_finish {
+        let air_done_at = now + raw_uart_air_duration(payload.len());
+        if air_done_at > latest_finish {
             break;
         }
         let payload = tx_backlog

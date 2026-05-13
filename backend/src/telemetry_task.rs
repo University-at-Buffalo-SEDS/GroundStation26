@@ -2025,7 +2025,7 @@ mod tests {
                 sent: sent.clone(),
                 windows: VecDeque::from([crate::comms::RadioWindowUpdate {
                     kind: crate::comms::RadioWindowKind::UplinkOpen,
-                    duration_ms: 250,
+                    duration_ms: 500,
                 }]),
             })));
         let (tx, rx) = mpsc::unbounded_channel();
