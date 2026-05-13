@@ -108,15 +108,15 @@ fn send_valve_launch_sequence_command(router: &Router) -> bool {
     }
 }
 
-fn vent_valve_closed_for_launch(state: &Arc<AppState>) -> bool {
+fn vent_valve_known_open_for_launch(state: &Arc<AppState>) -> bool {
     effective_umbilical_valve_state(state, ValveBoardCommands::NormallyOpenOpen as u8)
-        == Some(false)
+        == Some(true)
 }
 
 fn warn_launch_blocked_by_vent_valve(state: &Arc<AppState>) {
     emit_notification_warning(
         state,
-        "Close the vent valve before initiating the launch sequence.",
+        "Vent valve is still reported open. Close it before initiating the launch sequence.",
     );
 }
 
@@ -153,12 +153,12 @@ fn transition_launch_clock_to_t_plus_from_pilot_open(state: &Arc<AppState>) {
 
 #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router: Arc<Router>) {
-    if !vent_valve_closed_for_launch(&state) {
+    if vent_valve_known_open_for_launch(&state) {
         warn_launch_blocked_by_vent_valve(&state);
         sequences::refresh_action_policy_now(&state);
         state.broadcast_action_policy_snapshot();
         gs_debug_println!(
-            "Ground-station launch command ignored because vent valve is not confirmed closed"
+            "Ground-station launch command ignored because vent valve is reported open"
         );
         return;
     }
@@ -197,11 +197,11 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
 }
 
 async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc<Router>) {
-    if !vent_valve_closed_for_launch(&state) {
+    if vent_valve_known_open_for_launch(&state) {
         warn_launch_blocked_by_vent_valve(&state);
         sequences::refresh_action_policy_now(&state);
         state.broadcast_action_policy_snapshot();
-        gs_debug_println!("Launch command ignored because vent valve is not confirmed closed");
+        gs_debug_println!("Launch command ignored because vent valve is reported open");
         return;
     }
     if matches!(
