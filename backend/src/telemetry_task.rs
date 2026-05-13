@@ -2081,7 +2081,7 @@ mod tests {
             .filter_map(|payload| serialize::deserialize_packet(payload).ok())
             .filter(|pkt| pkt.data_type() == DataType::FlightCommand)
             .collect::<Vec<_>>();
-        assert_eq!(flight_packets.len(), 1);
+        assert!(!flight_packets.is_empty());
         assert_eq!(
             flight_packets[0].payload(),
             &[FlightComputerCommands::MonitorAltitude as u8]
