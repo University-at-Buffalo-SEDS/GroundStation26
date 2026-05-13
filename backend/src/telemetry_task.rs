@@ -2094,7 +2094,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_radio_worker_sends_flight_command_before_window_updates() {
+    async fn dedicated_radio_worker_waits_for_window_before_flight_command() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
         let router = Arc::new(Router::new(
@@ -2144,23 +2144,15 @@ mod tests {
         tx.send(wire.clone())
             .expect("failed to queue flight command to radio worker");
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
-                if sent_guard.iter().any(|payload| payload == &wire) {
-                    break;
-                }
-                drop(sent_guard);
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("timed out waiting for radio worker send_data before window update");
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         state.request_shutdown();
         for worker in workers {
             worker.join().expect("radio worker panicked");
         }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        assert!(sent_guard.is_empty());
     }
 
     #[tokio::test]
