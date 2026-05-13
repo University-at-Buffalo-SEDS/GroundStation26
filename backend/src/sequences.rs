@@ -853,6 +853,9 @@ fn sequence_expects_normally_open(step: SequenceStep) -> bool {
 }
 
 fn sequence_expects_normally_closed(step: SequenceStep) -> bool {
+    if cfg!(feature = "test_fire_mode") && matches!(step, SequenceStep::SetupValves) {
+        return false;
+    }
     matches!(
         step,
         SequenceStep::SetupValves
@@ -876,6 +879,9 @@ fn sequence_blocks_until_normally_open(step: SequenceStep) -> bool {
 }
 
 fn sequence_blocks_until_normally_closed(step: SequenceStep) -> bool {
+    if cfg!(feature = "test_fire_mode") && matches!(step, SequenceStep::SetupValves) {
+        return false;
+    }
     matches!(
         step,
         SequenceStep::SetupValves
@@ -906,6 +912,11 @@ fn first_fill_step_after_setup() -> SequenceStep {
     } else {
         SequenceStep::NitrogenFill
     }
+}
+
+fn setup_valves_ready(valves: ValveSnapshot) -> bool {
+    valves.dump_open == Some(false)
+        && (cfg!(feature = "test_fire_mode") || valves.normally_open == Some(false))
 }
 
 fn mass_is_vented(current_mass_kg: Option<f32>, cfg: &SequenceConfig) -> bool {
@@ -1108,7 +1119,7 @@ fn update_sequence_runtime(
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if valves.normally_open == Some(false) && valves.dump_open == Some(false) {
+            if setup_valves_ready(valves) {
                 runtime.step = first_fill_step_after_setup();
             }
         }
@@ -1800,15 +1811,17 @@ fn build_policy(
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if let Some(blink) = command_prompt_blink(
-                state,
-                cfg,
-                inputs.valves,
-                "NormallyOpen",
-                false,
-                inputs.now_ms,
-            ) {
-                recommended.insert("NormallyOpen", blink);
+            if !cfg!(feature = "test_fire_mode") {
+                if let Some(blink) = command_prompt_blink(
+                    state,
+                    cfg,
+                    inputs.valves,
+                    "NormallyOpen",
+                    false,
+                    inputs.now_ms,
+                ) {
+                    recommended.insert("NormallyOpen", blink);
+                }
             }
             if let Some(blink) =
                 command_prompt_blink(state, cfg, inputs.valves, "Dump", false, inputs.now_ms)
@@ -2171,6 +2184,20 @@ mod tests {
     #[test]
     fn test_fire_sequence_starts_with_nitrous_fill_after_setup() {
         assert_eq!(first_fill_step_after_setup(), SequenceStep::OpenNitrous);
+    }
+
+    #[cfg(feature = "test_fire_mode")]
+    #[test]
+    fn test_fire_setup_does_not_require_closing_vent_valve() {
+        assert!(!sequence_expects_normally_closed(SequenceStep::SetupValves));
+        assert!(!sequence_blocks_until_normally_closed(
+            SequenceStep::SetupValves
+        ));
+        assert!(setup_valves_ready(ValveSnapshot {
+            normally_open: Some(true),
+            dump_open: Some(false),
+            ..ValveSnapshot::default()
+        }));
     }
 
     #[cfg(not(feature = "test_fire_mode"))]
