@@ -29,6 +29,7 @@ RADIO_SCHED_FLAG_HAS_MORE = 0x01
 RADIO_SCHED_FLAG_YIELD = 0x02
 RADIO_UPLINK_TURNAROUND_S = float(os.environ.get("GS_RADIO_UPLINK_TURNAROUND_MS", "500")) / 1000.0
 RADIO_UPLINK_INTERFRAME_S = float(os.environ.get("GS_RADIO_UPLINK_INTERFRAME_MS", "250")) / 1000.0
+RADIO_FLIGHT_COMMAND_REPEATS = max(1, int(os.environ.get("GS_RADIO_FLIGHT_COMMAND_REPEATS", "3")))
 
 FLIGHT_COMMANDS = {
     "Launch": 1,
@@ -113,6 +114,15 @@ class TxEvent:
     packet_len: int
     frame_len: int
     seq: int | None
+
+
+@dataclass
+class PendingTx:
+    label: str
+    packet: bytes
+    frame: bytes
+    remaining: int
+    last_seq: int | None = None
 
 
 def backend_root_from_script(script_path: Path) -> Path:
@@ -361,7 +371,7 @@ class AvBayRadioApp:
         self.stop_event = threading.Event()
         self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self.rx_buffer = bytearray()
-        self.pending: deque[tuple[str, bytes, bytes]] = deque()
+        self.pending: deque[PendingTx] = deque()
         self.rx_events: deque[RxEvent] = deque(maxlen=200)
         self.tx_events: deque[TxEvent] = deque(maxlen=100)
         self.packet_counts: Counter[str] = Counter()
@@ -407,9 +417,11 @@ class AvBayRadioApp:
         spec = self.selected()
         packet = self.builder.build(spec)
         frame = build_raw_frame(RAW_DATA_SYNC, packet)
+        repeats = RADIO_FLIGHT_COMMAND_REPEATS if spec.kind == "flight-command" else 1
         with self.lock:
-            self.pending.append((spec.label, packet, frame))
-            self.status = f"Queued {spec.label}"
+            self.pending.append(PendingTx(spec.label, packet, frame, repeats))
+            suffix = f" x{repeats}" if repeats > 1 else ""
+            self.status = f"Queued {spec.label}{suffix}"
 
     def force_send_selected(self) -> None:
         spec = self.selected()
@@ -457,12 +469,25 @@ class AvBayRadioApp:
             with self.lock:
                 if not self.pending:
                     break
-                label, packet, frame = self.pending.popleft()
-            self._write_frame(frame)
+                item: PendingTx | None = None
+                for _ in range(len(self.pending)):
+                    candidate = self.pending.popleft()
+                    if candidate.last_seq == window.seq:
+                        self.pending.append(candidate)
+                        continue
+                    item = candidate
+                    break
+                if item is None:
+                    break
+            self._write_frame(item.frame)
             sent_this_window += 1
+            item.remaining -= 1
+            item.last_seq = window.seq
             with self.lock:
-                self._record_tx(label, "uplink", len(packet), len(frame), window.seq)
-                self.status = f"TX {label} during uplink seq={window.seq}"
+                self._record_tx(item.label, "uplink", len(item.packet), len(item.frame), window.seq)
+                if item.remaining > 0:
+                    self.pending.append(item)
+                self.status = f"TX {item.label} during uplink seq={window.seq}"
             if RADIO_UPLINK_INTERFRAME_S > 0:
                 time.sleep(RADIO_UPLINK_INTERFRAME_S)
         if not self.no_yield:

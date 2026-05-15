@@ -747,7 +747,7 @@ pub(super) fn spawn_router_worker_thread(
 }
 fn radio_follow_timeout_ms() -> u64 {
     static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 1_500, 50, 10_000) as u64)
+    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 8_000, 50, 20_000) as u64)
 }
 
 fn radio_rx_poll_idle_ms() -> u64 {
@@ -792,7 +792,7 @@ fn radio_tx_packets_per_window() -> usize {
 
 fn radio_flight_command_repeats() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| env_usize("GS_RADIO_FLIGHT_COMMAND_REPEATS", 1, 1, 8))
+    *LIMIT.get_or_init(|| env_usize("GS_RADIO_FLIGHT_COMMAND_REPEATS", 3, 1, 8))
 }
 
 fn radio_tx_without_window() -> bool {
@@ -803,7 +803,7 @@ fn radio_tx_without_window() -> bool {
 
 fn radio_uplink_turnaround_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 500, 0, 2_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 500, 0, 5_000) as u64)
 }
 
 fn radio_uplink_tx_guard_ms() -> u64 {
