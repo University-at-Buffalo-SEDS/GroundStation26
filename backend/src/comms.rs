@@ -41,7 +41,11 @@ const RAW_UART_ASCII_SYNC_1: u8 = 0x7A;
 const RAW_UART_FRAME_HEADER_SIZE: usize = 4;
 const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
-const RADIO_WINDOW_CONTROL_KIND: u8 = 0x01;
+const RADIO_SCHED_MAGIC_0: u8 = 0x52;
+const RADIO_SCHED_MAGIC_1: u8 = 0x53;
+const RADIO_SCHED_VERSION: u8 = 1;
+const RADIO_SCHED_FLAG_HAS_MORE: u8 = 0x01;
+const RADIO_SCHED_FLAG_YIELD: u8 = 0x02;
 #[cfg(target_os = "linux")]
 const I2C_PACKET_MAX_BYTES: usize = 4_096;
 #[cfg(target_os = "linux")]
@@ -118,6 +122,15 @@ pub trait CommsDevice: Send {
     fn take_radio_window_update(&mut self) -> Option<RadioWindowUpdate> {
         None
     }
+    fn send_radio_scheduler_status(
+        &mut self,
+        seq: u8,
+        has_more: bool,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let _ = seq;
+        let _ = has_more;
+        Err("radio scheduler status is only supported by raw UART links".into())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,7 +142,8 @@ pub enum RadioWindowKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RadioWindowUpdate {
     pub kind: RadioWindowKind,
-    pub duration_ms: u16,
+    pub seq: u8,
+    pub credit: usize,
 }
 
 pub fn link_description(cfg: &CommsLinkConfig) -> String {
@@ -790,6 +804,10 @@ fn build_raw_uart_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send 
     build_link_frame(RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1, payload)
 }
 
+fn build_raw_uart_command_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    build_link_frame(RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1, payload)
+}
+
 #[cfg(target_os = "linux")]
 fn build_i2c_data_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
     if payload.len() > I2C_FRAME_PAYLOAD_MAX_BYTES {
@@ -858,17 +876,22 @@ fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
 }
 
 fn parse_radio_window_update(payload: &[u8]) -> Option<RadioWindowUpdate> {
-    if payload.len() < 4 || payload[0] != RADIO_WINDOW_CONTROL_KIND {
+    if payload.len() < 7
+        || payload[0] != RADIO_SCHED_MAGIC_0
+        || payload[1] != RADIO_SCHED_MAGIC_1
+        || payload[2] != RADIO_SCHED_VERSION
+    {
         return None;
     }
-    let kind = match payload[1] {
+    let kind = match payload[3] {
         0 => RadioWindowKind::DownlinkOpen,
         1 => RadioWindowKind::UplinkOpen,
         _ => return None,
     };
     Some(RadioWindowUpdate {
         kind,
-        duration_ms: u16::from_le_bytes([payload[2], payload[3]]),
+        seq: payload[4],
+        credit: payload[5].max(1) as usize,
     })
 }
 
@@ -1072,9 +1095,10 @@ fn maybe_log_raw_uart_command_frame(
     }
     match update {
         Some(update) => eprintln!(
-            "{context}: kind={:?} duration_ms={} payload={}",
+            "{context}: kind={:?} seq={} credit={} payload={}",
             update.kind,
-            update.duration_ms,
+            update.seq,
+            update.credit,
             hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
         ),
         None => eprintln!(
@@ -1347,6 +1371,48 @@ impl CommsDevice for UartComms {
                     self.inner.flush()?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn send_radio_scheduler_status(
+        &mut self,
+        seq: u8,
+        has_more: bool,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !matches!(self.protocol, SerialProtocol::RawUart) {
+            return Err("radio scheduler status requires raw_uart protocol".into());
+        }
+
+        let flags = RADIO_SCHED_FLAG_YIELD
+            | if has_more {
+                RADIO_SCHED_FLAG_HAS_MORE
+            } else {
+                0
+            };
+        let payload = [
+            RADIO_SCHED_MAGIC_0,
+            RADIO_SCHED_MAGIC_1,
+            RADIO_SCHED_VERSION,
+            1,
+            seq,
+            0,
+            flags,
+        ];
+        let framed = build_raw_uart_command_frame(&payload)?;
+        maybe_log_raw_uart_tx(&framed, &self.protocol);
+        #[cfg(target_os = "linux")]
+        {
+            write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
+            drain_fd_with_timeout(
+                self.inner.as_raw_fd(),
+                uart_wire_timeout(framed.len(), self.baud_rate),
+            )?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.inner.write_all(&framed)?;
+            self.inner.flush()?;
         }
         Ok(())
     }

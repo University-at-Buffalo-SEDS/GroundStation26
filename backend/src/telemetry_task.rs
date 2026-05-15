@@ -2038,6 +2038,14 @@ mod tests {
         fn take_radio_window_update(&mut self) -> Option<crate::comms::RadioWindowUpdate> {
             self.windows.pop_front()
         }
+
+        fn send_radio_scheduler_status(
+            &mut self,
+            _seq: u8,
+            _has_more: bool,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -2062,7 +2070,8 @@ mod tests {
                 sent: sent.clone(),
                 windows: VecDeque::from([crate::comms::RadioWindowUpdate {
                     kind: crate::comms::RadioWindowKind::UplinkOpen,
-                    duration_ms: 500,
+                    seq: 1,
+                    credit: 5,
                 }]),
             })));
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2214,7 +2223,8 @@ mod tests {
                 sent: sent.clone(),
                 windows: VecDeque::from([crate::comms::RadioWindowUpdate {
                     kind: crate::comms::RadioWindowKind::DownlinkOpen,
-                    duration_ms: 250,
+                    seq: 1,
+                    credit: 5,
                 }]),
             })));
         let (tx, rx) = mpsc::unbounded_channel();
