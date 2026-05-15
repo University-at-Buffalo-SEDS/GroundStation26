@@ -93,6 +93,7 @@ class RadioWindow:
     seq: int
     credit: int
     flags: int
+    turnaround_ms: int
 
 
 @dataclass
@@ -254,7 +255,18 @@ def parse_radio_window(payload: bytes) -> RadioWindow | None:
         kind = "uplink"
     else:
         return None
-    return RadioWindow(kind=kind, seq=payload[4], credit=max(payload[5], 1), flags=payload[6])
+    turnaround_ms = (
+        int.from_bytes(payload[7:9], "little")
+        if len(payload) >= 9
+        else int(RADIO_UPLINK_TURNAROUND_S * 1000)
+    )
+    return RadioWindow(
+        kind=kind,
+        seq=payload[4],
+        credit=max(payload[5], 1),
+        flags=payload[6],
+        turnaround_ms=turnaround_ms,
+    )
 
 
 def build_scheduler_yield(seq: int, has_more: bool) -> bytes:
@@ -438,8 +450,9 @@ class AvBayRadioApp:
 
     def _send_pending_for_window(self, window: RadioWindow) -> None:
         sent_this_window = 0
-        if RADIO_UPLINK_TURNAROUND_S > 0:
-            time.sleep(RADIO_UPLINK_TURNAROUND_S)
+        turnaround_s = max(RADIO_UPLINK_TURNAROUND_S, window.turnaround_ms / 1000.0)
+        if turnaround_s > 0:
+            time.sleep(turnaround_s)
         while sent_this_window < window.credit:
             with self.lock:
                 if not self.pending:
@@ -504,7 +517,7 @@ class AvBayRadioApp:
                             self.last_window = window
                             self._record_rx(
                                 "window",
-                                f"{window.kind} seq={window.seq} credit={window.credit} flags=0x{window.flags:02x}",
+                                f"{window.kind} seq={window.seq} credit={window.credit} flags=0x{window.flags:02x} turn_ms={window.turnaround_ms}",
                                 payload,
                             )
                             self.status = f"RX {window.kind} window seq={window.seq}"
@@ -636,7 +649,7 @@ def draw_tui(stdscr: curses.window, app: AvBayRadioApp) -> None:
         ]
         if last_window is not None:
             status_lines.append(
-                f"Last window: {last_window.kind} seq={last_window.seq} credit={last_window.credit} flags=0x{last_window.flags:02x}"
+                f"Last window: {last_window.kind} seq={last_window.seq} credit={last_window.credit} flags=0x{last_window.flags:02x} turn_ms={last_window.turnaround_ms}"
             )
         if counts:
             status_lines.append(

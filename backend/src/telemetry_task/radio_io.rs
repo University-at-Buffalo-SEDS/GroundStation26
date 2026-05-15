@@ -304,6 +304,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
             let mut follow_window_is_uplink = false;
             let mut follow_window_seq = 0u8;
             let mut follow_window_credit = radio_tx_window_packets;
+            let mut follow_window_turnaround = radio_uplink_turnaround;
             let mut has_seen_window_update = false;
             let mut sent_in_current_uplink_window = 0usize;
             let mut sent_uplink_yield = false;
@@ -399,6 +400,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     follow_window_until = Some(deadline);
                     follow_window_seq = update.seq;
                     follow_window_credit = update.credit.min(radio_tx_window_packets).max(1);
+                    follow_window_turnaround =
+                        radio_uplink_turnaround.max(Duration::from_millis(update.turnaround_ms));
                     sent_uplink_yield = false;
                     match update.kind {
                         RadioWindowKind::DownlinkOpen => {
@@ -440,7 +443,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                                 has_seen_window_update,
                                 last_window_update_at,
                                 follow_window_opened_at,
-                                radio_uplink_turnaround,
+                                follow_window_turnaround,
                                 radio_uplink_tx_guard,
                                 &mut follow_window_until,
                                 &mut follow_window_is_uplink,
@@ -462,7 +465,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     has_seen_window_update,
                     last_window_update_at,
                     follow_window_opened_at,
-                    radio_uplink_turnaround,
+                    follow_window_turnaround,
                     radio_uplink_tx_guard,
                     &mut follow_window_until,
                     &mut follow_window_is_uplink,
@@ -475,7 +478,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     .map(|opened_at| {
                         std::time::Instant::now()
                             >= opened_at
-                                .checked_add(radio_uplink_turnaround)
+                                .checked_add(follow_window_turnaround)
                                 .unwrap_or(opened_at)
                     })
                     .unwrap_or(true);

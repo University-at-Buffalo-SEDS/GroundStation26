@@ -2072,6 +2072,7 @@ mod tests {
                     kind: crate::comms::RadioWindowKind::UplinkOpen,
                     seq: 1,
                     credit: 5,
+                    turnaround_ms: 0,
                 }]),
             })));
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2225,6 +2226,7 @@ mod tests {
                     kind: crate::comms::RadioWindowKind::DownlinkOpen,
                     seq: 1,
                     credit: 5,
+                    turnaround_ms: 0,
                 }]),
             })));
         let (tx, rx) = mpsc::unbounded_channel();

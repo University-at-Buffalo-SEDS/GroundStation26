@@ -144,6 +144,7 @@ pub struct RadioWindowUpdate {
     pub kind: RadioWindowKind,
     pub seq: u8,
     pub credit: usize,
+    pub turnaround_ms: u64,
 }
 
 pub fn link_description(cfg: &CommsLinkConfig) -> String {
@@ -892,6 +893,11 @@ fn parse_radio_window_update(payload: &[u8]) -> Option<RadioWindowUpdate> {
         kind,
         seq: payload[4],
         credit: payload[5].max(1) as usize,
+        turnaround_ms: if payload.len() >= 9 {
+            u16::from_le_bytes([payload[7], payload[8]]) as u64
+        } else {
+            0
+        },
     })
 }
 
