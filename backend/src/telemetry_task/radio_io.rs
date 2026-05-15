@@ -501,8 +501,9 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     ) {
                         Ok(()) => {
                             sent_uplink_yield = true;
-                            follow_window_until = None;
                             follow_window_is_uplink = false;
+                            follow_window_until =
+                                Some(std::time::Instant::now() + radio_follow_timeout);
                             sent_in_current_uplink_window = 0;
                         }
                         Err(e) => {
@@ -769,12 +770,12 @@ fn radio_rx_poll_uplink_ms() -> u64 {
 
 fn radio_rx_poll_downlink_ms() -> u64 {
     static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_RX_POLL_DOWNLINK_MS", 5, 0, 20) as u64)
+    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_RX_POLL_DOWNLINK_MS", 1, 0, 20) as u64)
 }
 
 fn radio_rx_packets_idle() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| env_usize("GS_RADIO_RX_PACKETS_IDLE", 4, 1, 128))
+    *LIMIT.get_or_init(|| env_usize("GS_RADIO_RX_PACKETS_IDLE", 16, 1, 128))
 }
 
 fn radio_rx_packets_uplink() -> usize {
