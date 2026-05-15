@@ -744,7 +744,7 @@ pub(super) fn spawn_router_worker_thread(
 }
 fn radio_follow_timeout_ms() -> u64 {
     static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 3_000, 50, 10_000) as u64)
+    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 1_500, 50, 10_000) as u64)
 }
 
 fn radio_rx_poll_idle_ms() -> u64 {
@@ -789,7 +789,7 @@ fn radio_tx_packets_per_window() -> usize {
 
 fn radio_flight_command_repeats() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| env_usize("GS_RADIO_FLIGHT_COMMAND_REPEATS", 3, 1, 8))
+    *LIMIT.get_or_init(|| env_usize("GS_RADIO_FLIGHT_COMMAND_REPEATS", 1, 1, 8))
 }
 
 fn radio_tx_without_window() -> bool {
@@ -800,22 +800,22 @@ fn radio_tx_without_window() -> bool {
 
 fn radio_uplink_turnaround_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 50, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 0, 0, 1_000) as u64)
 }
 
 fn radio_uplink_tx_guard_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 50, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 0, 0, 1_000) as u64)
 }
 
 fn radio_air_bit_rate_bps() -> u64 {
     static BPS: OnceLock<u64> = OnceLock::new();
-    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 2_400, 1_200, 921_600) as u64)
+    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 921_600, 1_200, 921_600) as u64)
 }
 
 fn radio_air_frame_overhead_bytes() -> usize {
     static OVERHEAD: OnceLock<usize> = OnceLock::new();
-    *OVERHEAD.get_or_init(|| env_usize("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", 16, 0, 256))
+    *OVERHEAD.get_or_init(|| env_usize("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", 0, 0, 256))
 }
 
 fn raw_uart_air_duration(payload_len: usize) -> Duration {
