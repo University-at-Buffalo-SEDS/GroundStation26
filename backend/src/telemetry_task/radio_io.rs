@@ -792,7 +792,7 @@ fn radio_tx_packets_per_window() -> usize {
 
 fn radio_flight_command_repeats() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| env_usize("GS_RADIO_FLIGHT_COMMAND_REPEATS", 3, 1, 8))
+    *LIMIT.get_or_init(|| env_usize("GS_RADIO_FLIGHT_COMMAND_REPEATS", 1, 1, 8))
 }
 
 fn radio_tx_without_window() -> bool {
@@ -808,7 +808,7 @@ fn radio_uplink_turnaround_ms() -> u64 {
 
 fn radio_uplink_tx_guard_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 250, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 0, 0, 1_000) as u64)
 }
 
 fn radio_air_bit_rate_bps() -> u64 {
