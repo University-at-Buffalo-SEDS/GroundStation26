@@ -2141,7 +2141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_radio_worker_waits_for_window_before_flight_command() {
+    async fn dedicated_radio_worker_sends_flight_command_without_window() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
         let router = Arc::new(Router::new(
@@ -2191,7 +2191,18 @@ mod tests {
         tx.send(wire.clone())
             .expect("failed to queue flight command to radio worker");
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+                if sent_guard.iter().any(|payload| payload == &wire) {
+                    break;
+                }
+                drop(sent_guard);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for immediate radio worker send_data");
 
         state.request_shutdown();
         for worker in workers {
@@ -2199,11 +2210,11 @@ mod tests {
         }
 
         let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
-        assert!(sent_guard.is_empty());
+        assert!(sent_guard.iter().any(|payload| payload == &wire));
     }
 
     #[tokio::test]
-    async fn dedicated_radio_worker_does_not_send_flight_command_during_downlink_window() {
+    async fn dedicated_radio_worker_sends_flight_command_during_downlink_window() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
         let router = Arc::new(Router::new(
@@ -2255,9 +2266,20 @@ mod tests {
         )
         .expect("failed to spawn radio workers");
 
-        tx.send(wire)
+        tx.send(wire.clone())
             .expect("failed to queue flight command to radio worker");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+                if sent_guard.iter().any(|payload| payload == &wire) {
+                    break;
+                }
+                drop(sent_guard);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for immediate radio worker send_data");
 
         state.request_shutdown();
         for worker in workers {
@@ -2265,7 +2287,7 @@ mod tests {
         }
 
         let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
-        assert!(sent_guard.is_empty());
+        assert!(sent_guard.iter().any(|payload| payload == &wire));
     }
 
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]

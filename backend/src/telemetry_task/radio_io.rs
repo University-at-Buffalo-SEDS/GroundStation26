@@ -357,6 +357,13 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                 }
 
                 let mut comms = comms.lock().expect("failed to get lock");
+                let sent_immediate_command = send_immediate_command_backlog(
+                    comms.as_mut(),
+                    worker_name,
+                    &mut command_backlog,
+                    &mut last_send_error_log_ms,
+                    &mut suppressed_send_errors,
+                );
                 let now = std::time::Instant::now();
                 let follow_mode_active = last_window_update_at
                     .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
@@ -513,6 +520,9 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     }
                 }
                 drop(comms);
+                if sent_immediate_command {
+                    thread::yield_now();
+                }
             }
         })?;
 
@@ -976,6 +986,44 @@ fn is_flight_command_payload(payload: &[u8]) -> bool {
         return false;
     };
     matches!(pkt.data_type(), DataType::FlightCommand)
+}
+
+fn send_immediate_command_backlog(
+    comms: &mut dyn CommsDevice,
+    worker_name: &str,
+    command_backlog: &mut VecDeque<Vec<u8>>,
+    last_send_error_log_ms: &mut u64,
+    suppressed_send_errors: &mut u64,
+) -> bool {
+    let mut sent_any = false;
+    while let Some(payload) = command_backlog.pop_front() {
+        log_radio_packet_event("radio TX immediate pop", worker_name, &payload);
+        maybe_log_green_radio_command_send(worker_name, &payload);
+        match comms.send_data(&payload) {
+            Ok(()) => {
+                log_radio_command_event("radio TX immediate sent", worker_name, &payload);
+                sent_any = true;
+                if *suppressed_send_errors > 0 {
+                    eprintln!(
+                        "{worker_name} radio io send_data recovered after suppressing {suppressed_send_errors} repeated errors"
+                    );
+                    *suppressed_send_errors = 0;
+                    *last_send_error_log_ms = 0;
+                }
+            }
+            Err(e) => {
+                command_backlog.push_front(payload);
+                log_repeated_worker_error(
+                    &format!("{worker_name} radio io immediate send_data failed"),
+                    &e.to_string(),
+                    last_send_error_log_ms,
+                    suppressed_send_errors,
+                );
+                break;
+            }
+        }
+    }
+    sent_any
 }
 
 fn send_while_uplink_window_open(
