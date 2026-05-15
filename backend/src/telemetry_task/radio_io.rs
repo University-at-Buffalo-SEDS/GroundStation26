@@ -347,12 +347,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                                     telemetry_backlog.push_back(payload.clone());
                                 }
                             }
-                            while command_backlog.len() + telemetry_backlog.len()
-                                > radio_tx_backlog_limit
-                            {
-                                if telemetry_backlog.pop_front().is_none() {
-                                    command_backlog.pop_front();
-                                }
+                            while telemetry_backlog.len() > radio_tx_backlog_limit {
+                                telemetry_backlog.pop_front();
                             }
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
@@ -1084,10 +1080,12 @@ fn send_while_uplink_window_open(
             break;
         }
 
-        let Some(payload) = command_backlog
-            .front()
-            .or_else(|| telemetry_backlog.front())
-        else {
+        let sending_command = !command_backlog.is_empty();
+        let Some(payload) = (if sending_command {
+            command_backlog.front()
+        } else {
+            telemetry_backlog.front()
+        }) else {
             break;
         };
         let latest_finish = deadline.checked_sub(uplink_tx_guard).unwrap_or(deadline);
@@ -1095,10 +1093,12 @@ fn send_while_uplink_window_open(
         if air_done_at > latest_finish {
             break;
         }
-        let payload = command_backlog
-            .pop_front()
-            .or_else(|| telemetry_backlog.pop_front())
-            .expect("front payload should still exist after budget check");
+        let payload = if sending_command {
+            command_backlog.pop_front()
+        } else {
+            telemetry_backlog.pop_front()
+        }
+        .expect("front payload should still exist after budget check");
         log_radio_packet_event("radio TX pop", worker_name, &payload);
         maybe_log_green_radio_command_send(worker_name, &payload);
         match comms.send_data(&payload) {
