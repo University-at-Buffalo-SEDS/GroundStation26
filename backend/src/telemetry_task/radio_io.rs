@@ -800,7 +800,7 @@ fn radio_tx_without_window() -> bool {
 
 fn radio_uplink_turnaround_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 150, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 500, 0, 2_000) as u64)
 }
 
 fn radio_uplink_tx_guard_ms() -> u64 {
@@ -810,12 +810,12 @@ fn radio_uplink_tx_guard_ms() -> u64 {
 
 fn radio_air_bit_rate_bps() -> u64 {
     static BPS: OnceLock<u64> = OnceLock::new();
-    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 921_600, 1_200, 921_600) as u64)
+    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 9_600, 1_200, 921_600) as u64)
 }
 
 fn radio_air_frame_overhead_bytes() -> usize {
     static OVERHEAD: OnceLock<usize> = OnceLock::new();
-    *OVERHEAD.get_or_init(|| env_usize("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", 0, 0, 256))
+    *OVERHEAD.get_or_init(|| env_usize("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", 16, 0, 256))
 }
 
 fn raw_uart_air_duration(payload_len: usize) -> Duration {

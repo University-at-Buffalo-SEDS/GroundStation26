@@ -27,7 +27,8 @@ RADIO_SCHED_MAGIC = (0x52, 0x53)
 RADIO_SCHED_VERSION = 1
 RADIO_SCHED_FLAG_HAS_MORE = 0x01
 RADIO_SCHED_FLAG_YIELD = 0x02
-RADIO_UPLINK_TURNAROUND_S = float(os.environ.get("GS_RADIO_UPLINK_TURNAROUND_MS", "150")) / 1000.0
+RADIO_UPLINK_TURNAROUND_S = float(os.environ.get("GS_RADIO_UPLINK_TURNAROUND_MS", "500")) / 1000.0
+RADIO_UPLINK_INTERFRAME_S = float(os.environ.get("GS_RADIO_UPLINK_INTERFRAME_MS", "75")) / 1000.0
 
 FLIGHT_COMMANDS = {
     "Launch": 1,
@@ -449,9 +450,13 @@ class AvBayRadioApp:
             with self.lock:
                 self._record_tx(label, "uplink", len(packet), len(frame), window.seq)
                 self.status = f"TX {label} during uplink seq={window.seq}"
+            if RADIO_UPLINK_INTERFRAME_S > 0:
+                time.sleep(RADIO_UPLINK_INTERFRAME_S)
         if not self.no_yield:
             with self.lock:
                 has_more = bool(self.pending)
+            if RADIO_UPLINK_INTERFRAME_S > 0:
+                time.sleep(RADIO_UPLINK_INTERFRAME_S)
             self._write_frame(build_scheduler_yield(window.seq, has_more))
             with self.lock:
                 self.sent_yields += 1
