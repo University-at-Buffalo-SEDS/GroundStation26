@@ -989,12 +989,12 @@ fn drain_radio_tx_queue(
                     continue;
                 }
                 log_radio_command_event("radio TX backlog", worker_name, &payload);
-                let repeats = if worker_name == "rocket_comms" && is_flight_command_payload(&payload)
-                {
-                    radio_flight_command_repeats()
-                } else {
-                    1
-                };
+                let repeats =
+                    if worker_name == "rocket_comms" && is_flight_command_payload(&payload) {
+                        radio_flight_command_repeats()
+                    } else {
+                        1
+                    };
                 for _ in 0..repeats {
                     if is_command_payload(&payload) {
                         command_backlog.push_back(payload.clone());
