@@ -805,7 +805,7 @@ fn radio_uplink_turnaround_ms() -> u64 {
 
 fn radio_uplink_tx_guard_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 0, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 250, 0, 1_000) as u64)
 }
 
 fn radio_air_bit_rate_bps() -> u64 {
