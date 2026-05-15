@@ -37,12 +37,7 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
         TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
         TelemetryCommand::EnableIMU => FlightComputerCommands::EnableIMU as u8,
         TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
-        TelemetryCommand::AbortAfter15 => FlightComputerCommands::AbortAfter15 as u8,
         TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
-        TelemetryCommand::AbortAfter70 => FlightComputerCommands::AbortAfter70 as u8,
-        TelemetryCommand::ReinitAfter12 => FlightComputerCommands::ReinitAfter12 as u8,
-        TelemetryCommand::ReinitAfter26 => FlightComputerCommands::ReinitAfter26 as u8,
-        TelemetryCommand::ReinitAfter44 => FlightComputerCommands::ReinitAfter44 as u8,
         _ => return None,
     })
 }
