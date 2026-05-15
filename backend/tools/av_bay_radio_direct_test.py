@@ -27,6 +27,7 @@ RADIO_SCHED_MAGIC = (0x52, 0x53)
 RADIO_SCHED_VERSION = 1
 RADIO_SCHED_FLAG_HAS_MORE = 0x01
 RADIO_SCHED_FLAG_YIELD = 0x02
+RADIO_UPLINK_TURNAROUND_S = float(os.environ.get("GS_RADIO_UPLINK_TURNAROUND_MS", "150")) / 1000.0
 
 FLIGHT_COMMANDS = {
     "Launch": 1,
@@ -436,6 +437,8 @@ class AvBayRadioApp:
 
     def _send_pending_for_window(self, window: RadioWindow) -> None:
         sent_this_window = 0
+        if RADIO_UPLINK_TURNAROUND_S > 0:
+            time.sleep(RADIO_UPLINK_TURNAROUND_S)
         while sent_this_window < window.credit:
             with self.lock:
                 if not self.pending:
