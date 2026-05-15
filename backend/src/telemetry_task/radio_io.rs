@@ -297,7 +297,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
             let radio_tx_without_window = radio_tx_without_window();
             let radio_uplink_turnaround = Duration::from_millis(radio_uplink_turnaround_ms());
             let radio_uplink_tx_guard = Duration::from_millis(radio_uplink_tx_guard_ms());
-            let mut tx_backlog: VecDeque<Vec<u8>> = VecDeque::new();
+            let mut command_backlog: VecDeque<Vec<u8>> = VecDeque::new();
+            let mut telemetry_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             let mut last_window_update_at: Option<std::time::Instant> = None;
             let mut follow_window_opened_at: Option<std::time::Instant> = None;
             let mut follow_window_until: Option<std::time::Instant> = None;
@@ -340,10 +341,18 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                                 1
                             };
                             for _ in 0..repeats {
-                                tx_backlog.push_back(payload.clone());
+                                if is_command_payload(&payload) {
+                                    command_backlog.push_back(payload.clone());
+                                } else {
+                                    telemetry_backlog.push_back(payload.clone());
+                                }
                             }
-                            while tx_backlog.len() > radio_tx_backlog_limit {
-                                tx_backlog.pop_front();
+                            while command_backlog.len() + telemetry_backlog.len()
+                                > radio_tx_backlog_limit
+                            {
+                                if telemetry_backlog.pop_front().is_none() {
+                                    command_backlog.pop_front();
+                                }
                             }
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
@@ -415,7 +424,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                             follow_window_is_uplink = true;
                             sent_in_current_uplink_window = 0;
                             let uplink_log_now = std::time::Instant::now();
-                            let should_log = !tx_backlog.is_empty()
+                            let should_log = !(command_backlog.is_empty()
+                                && telemetry_backlog.is_empty())
                                 && last_uplink_log_at
                                     .map(|last| {
                                         uplink_log_now.saturating_duration_since(last)
@@ -426,14 +436,15 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                                 log_radio_uplink_available(
                                     worker_name,
                                     update.credit,
-                                    tx_backlog.len(),
+                                    command_backlog.len() + telemetry_backlog.len(),
                                 );
                                 last_uplink_log_at = Some(uplink_log_now);
                             }
                             let _ = send_while_uplink_window_open(
                                 comms.as_mut(),
                                 worker_name,
-                                &mut tx_backlog,
+                                &mut command_backlog,
+                                &mut telemetry_backlog,
                                 follow_window_credit,
                                 radio_tx_without_window,
                                 radio_follow_timeout,
@@ -454,7 +465,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                 let _ = send_while_uplink_window_open(
                     comms.as_mut(),
                     worker_name,
-                    &mut tx_backlog,
+                    &mut command_backlog,
+                    &mut telemetry_backlog,
                     follow_window_credit,
                     radio_tx_without_window,
                     radio_follow_timeout,
@@ -480,12 +492,13 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                 if follow_window_is_uplink
                     && !sent_uplink_yield
                     && uplink_turnaround_elapsed
-                    && (tx_backlog.is_empty()
+                    && (command_backlog.is_empty() && telemetry_backlog.is_empty()
                         || sent_in_current_uplink_window >= follow_window_credit)
                 {
-                    match comms
-                        .send_radio_scheduler_status(follow_window_seq, !tx_backlog.is_empty())
-                    {
+                    match comms.send_radio_scheduler_status(
+                        follow_window_seq,
+                        !(command_backlog.is_empty() && telemetry_backlog.is_empty()),
+                    ) {
                         Ok(()) => {
                             sent_uplink_yield = true;
                             follow_window_until = None;
@@ -971,7 +984,8 @@ fn is_flight_command_payload(payload: &[u8]) -> bool {
 fn send_while_uplink_window_open(
     comms: &mut dyn CommsDevice,
     worker_name: &str,
-    tx_backlog: &mut VecDeque<Vec<u8>>,
+    command_backlog: &mut VecDeque<Vec<u8>>,
+    telemetry_backlog: &mut VecDeque<Vec<u8>>,
     max_packets_per_window: usize,
     allow_without_window: bool,
     radio_follow_timeout: Duration,
@@ -993,10 +1007,10 @@ fn send_while_uplink_window_open(
             .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
         if !has_seen_window_update {
             if allow_without_window
-                && let Some(payload) = tx_backlog.front()
+                && let Some(payload) = command_backlog.front()
                 && is_command_payload(payload)
             {
-                let payload = tx_backlog
+                let payload = command_backlog
                     .pop_front()
                     .expect("front payload should still exist");
                 log_radio_packet_event("radio TX pop without window", worker_name, &payload);
@@ -1040,11 +1054,11 @@ fn send_while_uplink_window_open(
             if crate::radio_diagnostics_enabled()
                 && *follow_window_is_uplink
                 && *sent_in_current_uplink_window == 0
-                && !tx_backlog.is_empty()
+                && !(command_backlog.is_empty() && telemetry_backlog.is_empty())
             {
                 eprintln!(
                     "{worker_name}: radio uplink window closed without TX queued_commands={}",
-                    tx_backlog.len()
+                    command_backlog.len() + telemetry_backlog.len()
                 );
             }
             *follow_window_until = None;
@@ -1053,7 +1067,7 @@ fn send_while_uplink_window_open(
             break;
         }
         if !*follow_window_is_uplink
-            || tx_backlog.is_empty()
+            || (command_backlog.is_empty() && telemetry_backlog.is_empty())
             || *sent_in_current_uplink_window >= max_packets_per_window
         {
             break;
@@ -1069,7 +1083,10 @@ fn send_while_uplink_window_open(
             break;
         }
 
-        let Some(payload) = tx_backlog.front() else {
+        let Some(payload) = command_backlog
+            .front()
+            .or_else(|| telemetry_backlog.front())
+        else {
             break;
         };
         let latest_finish = deadline.checked_sub(uplink_tx_guard).unwrap_or(deadline);
@@ -1077,8 +1094,9 @@ fn send_while_uplink_window_open(
         if air_done_at > latest_finish {
             break;
         }
-        let payload = tx_backlog
+        let payload = command_backlog
             .pop_front()
+            .or_else(|| telemetry_backlog.pop_front())
             .expect("front payload should still exist after budget check");
         log_radio_packet_event("radio TX pop", worker_name, &payload);
         maybe_log_green_radio_command_send(worker_name, &payload);
