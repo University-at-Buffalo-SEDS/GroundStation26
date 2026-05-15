@@ -375,6 +375,26 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                 } else {
                     radio_rx_idle_packets
                 };
+                if follow_window_is_uplink && !command_backlog.is_empty() {
+                    let _ = send_while_uplink_window_open(
+                        comms.as_mut(),
+                        worker_name,
+                        &mut command_backlog,
+                        &mut telemetry_backlog,
+                        follow_window_credit,
+                        radio_follow_timeout,
+                        has_seen_window_update,
+                        last_window_update_at,
+                        follow_window_opened_at,
+                        follow_window_turnaround,
+                        radio_uplink_tx_guard,
+                        &mut follow_window_until,
+                        &mut follow_window_is_uplink,
+                        &mut sent_in_current_uplink_window,
+                        &mut last_send_error_log_ms,
+                        &mut suppressed_send_errors,
+                    );
+                }
                 match comms.recv_serialized_packets_with_budget(
                     &mut |payload| {
                         let _ = incoming_tx.send(payload);

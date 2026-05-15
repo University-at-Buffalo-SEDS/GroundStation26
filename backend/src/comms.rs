@@ -1453,14 +1453,6 @@ impl CommsDevice for UartComms {
         {
             return Err(err.into());
         }
-        if self.process_buffered_payloads_with_budget(packet_sink, max_packets)? {
-            return Ok(());
-        }
-
-        if let Err(err) = self.fill_rx_buf_with_timeout(timeout) {
-            return Err(err.into());
-        }
-
         let _ = self.process_buffered_payloads_with_budget(packet_sink, max_packets)?;
         maybe_log_raw_uart_buffer_state(&self.rx_buf, "waiting for complete frame", &self.protocol);
         Ok(())
