@@ -805,25 +805,6 @@ fn radio_uplink_tx_guard_ms() -> u64 {
     *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 0, 0, 1_000) as u64)
 }
 
-fn radio_air_bit_rate_bps() -> u64 {
-    static BPS: OnceLock<u64> = OnceLock::new();
-    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 9_600, 1_200, 921_600) as u64)
-}
-
-fn radio_air_frame_overhead_bytes() -> usize {
-    static OVERHEAD: OnceLock<usize> = OnceLock::new();
-    *OVERHEAD.get_or_init(|| env_usize("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", 16, 0, 256))
-}
-
-fn raw_uart_air_duration(payload_len: usize) -> Duration {
-    let frame_len = payload_len
-        .saturating_add(4)
-        .saturating_add(radio_air_frame_overhead_bytes());
-    let air_bps = radio_air_bit_rate_bps();
-    let air_ms = (((frame_len as u64) * 10 * 1_000) + air_bps - 1) / air_bps;
-    Duration::from_millis(air_ms)
-}
-
 fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
     if !crate::radio_diagnostics_enabled() {
         return;
@@ -1038,24 +1019,20 @@ fn send_while_uplink_window_open(
         }
 
         let sending_command = !command_backlog.is_empty();
-        let Some(payload) = (if sending_command {
-            command_backlog.front()
-        } else {
-            telemetry_backlog.front()
-        }) else {
-            break;
-        };
-        let latest_finish = deadline.checked_sub(uplink_tx_guard).unwrap_or(deadline);
-        let air_done_at = tx_start + raw_uart_air_duration(payload.len());
-        if air_done_at > latest_finish {
-            break;
+        if !sending_command {
+            let latest_finish = deadline.checked_sub(uplink_tx_guard).unwrap_or(deadline);
+            if now >= latest_finish {
+                break;
+            }
         }
-        let payload = if sending_command {
+
+        let Some(payload) = (if sending_command {
             command_backlog.pop_front()
         } else {
             telemetry_backlog.pop_front()
-        }
-        .expect("front payload should still exist after budget check");
+        }) else {
+            break;
+        };
         log_radio_packet_event("radio TX pop", worker_name, &payload);
         maybe_log_green_radio_command_send(worker_name, &payload);
         match comms.send_data(&payload) {
@@ -1073,6 +1050,9 @@ fn send_while_uplink_window_open(
             }
             Err(e) => {
                 log_radio_packet_event("radio TX send_data failed for", worker_name, &payload);
+                if sending_command {
+                    command_backlog.push_front(payload);
+                }
                 log_repeated_worker_error(
                     &format!("{worker_name} radio io send_data failed"),
                     &e.to_string(),
