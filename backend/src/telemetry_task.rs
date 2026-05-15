@@ -2606,6 +2606,11 @@ mod tests {
         .expect("failed to build flight command packet");
         let wire = serialize::serialize_packet(&pkt).to_vec();
         let expected_window_sends = 5usize;
+        for _ in 0..(expected_window_sends + 1) {
+            tx.send(wire.clone())
+                .expect("failed to queue flight command to radio worker");
+        }
+
         let workers = spawn_dedicated_radio_io_threads(
             router,
             state.clone(),
@@ -2621,11 +2626,6 @@ mod tests {
             },
         )
         .expect("failed to spawn radio workers");
-
-        for _ in 0..(expected_window_sends + 1) {
-            tx.send(wire.clone())
-                .expect("failed to queue flight command to radio worker");
-        }
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
