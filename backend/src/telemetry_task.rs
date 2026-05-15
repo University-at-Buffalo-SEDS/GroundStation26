@@ -2154,7 +2154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_radio_worker_waits_for_window_before_flight_command() {
+    async fn dedicated_radio_worker_blind_sends_flight_command_without_window() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
         let router = Arc::new(Router::new(
@@ -2206,7 +2206,18 @@ mod tests {
         tx.send(wire.clone())
             .expect("failed to queue flight command to radio worker");
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+                if sent_guard.iter().any(|payload| payload == &wire) {
+                    break;
+                }
+                drop(sent_guard);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for blind radio command fallback");
 
         state.request_shutdown();
         for worker in workers {
@@ -2214,7 +2225,7 @@ mod tests {
         }
 
         let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
-        assert!(sent_guard.is_empty());
+        assert_eq!(sent_guard.as_slice(), &[wire]);
     }
 
     #[tokio::test]
@@ -2333,6 +2344,10 @@ mod tests {
         )
         .expect("failed to build flight command packet");
         let command_wire = serialize::serialize_packet(&command_pkt).to_vec();
+        tx.send(telemetry_wire)
+            .expect("failed to queue telemetry to radio worker");
+        tx.send(command_wire.clone())
+            .expect("failed to queue flight command to radio worker");
         let workers = spawn_dedicated_radio_io_threads(
             router,
             state.clone(),
@@ -2348,11 +2363,6 @@ mod tests {
             },
         )
         .expect("failed to spawn radio workers");
-
-        tx.send(telemetry_wire)
-            .expect("failed to queue telemetry to radio worker");
-        tx.send(command_wire.clone())
-            .expect("failed to queue flight command to radio worker");
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {

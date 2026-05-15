@@ -296,8 +296,11 @@ pub(super) fn spawn_dedicated_radio_io_threads(
             let radio_tx_window_packets = radio_tx_packets_per_window();
             let radio_uplink_turnaround = Duration::from_millis(radio_uplink_turnaround_ms());
             let radio_uplink_tx_guard = Duration::from_millis(radio_uplink_tx_guard_ms());
+            let radio_command_blind_fallback =
+                Duration::from_millis(radio_command_blind_fallback_ms());
             let mut command_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             let mut telemetry_backlog: VecDeque<Vec<u8>> = VecDeque::new();
+            let mut command_backlog_since: Option<std::time::Instant> = None;
             let mut last_window_update_at: Option<std::time::Instant> = None;
             let mut follow_window_opened_at: Option<std::time::Instant> = None;
             let mut follow_window_until: Option<std::time::Instant> = None;
@@ -341,6 +344,9 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                             };
                             for _ in 0..repeats {
                                 if is_command_payload(&payload) {
+                                    if command_backlog.is_empty() {
+                                        command_backlog_since = Some(std::time::Instant::now());
+                                    }
                                     command_backlog.push_back(payload.clone());
                                 } else {
                                     telemetry_backlog.push_back(payload.clone());
@@ -494,6 +500,27 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     &mut last_send_error_log_ms,
                     &mut suppressed_send_errors,
                 );
+                if !command_backlog.is_empty()
+                    && !follow_window_is_uplink
+                    && !has_seen_window_update
+                    && command_backlog_since
+                        .map(|queued_at| {
+                            std::time::Instant::now().saturating_duration_since(queued_at)
+                                >= radio_command_blind_fallback
+                        })
+                        .unwrap_or(true)
+                {
+                    let _ = send_blind_command_fallback(
+                        comms.as_mut(),
+                        worker_name,
+                        &mut command_backlog,
+                        &mut last_send_error_log_ms,
+                        &mut suppressed_send_errors,
+                    );
+                }
+                if command_backlog.is_empty() {
+                    command_backlog_since = None;
+                }
                 let uplink_turnaround_elapsed = follow_window_opened_at
                     .map(|opened_at| {
                         std::time::Instant::now()
@@ -815,6 +842,11 @@ fn radio_flight_command_repeats() -> usize {
     1
 }
 
+fn radio_command_blind_fallback_ms() -> u64 {
+    static DELAY_MS: OnceLock<u64> = OnceLock::new();
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_COMMAND_BLIND_FALLBACK_MS", 100, 0, 3_000) as u64)
+}
+
 fn radio_uplink_turnaround_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
     *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TURNAROUND_MS", 0, 0, 5_000) as u64)
@@ -1084,4 +1116,41 @@ fn send_while_uplink_window_open(
         }
     }
     sent_any
+}
+
+fn send_blind_command_fallback(
+    comms: &mut dyn CommsDevice,
+    worker_name: &str,
+    command_backlog: &mut VecDeque<Vec<u8>>,
+    last_send_error_log_ms: &mut u64,
+    suppressed_send_errors: &mut u64,
+) -> bool {
+    let Some(payload) = command_backlog.pop_front() else {
+        return false;
+    };
+    log_radio_packet_event("radio TX blind command pop", worker_name, &payload);
+    maybe_log_green_radio_command_send(worker_name, &payload);
+    match comms.send_data(&payload) {
+        Ok(()) => {
+            log_radio_command_event("radio TX blind command sent", worker_name, &payload);
+            if *suppressed_send_errors > 0 {
+                eprintln!(
+                    "{worker_name} radio io send_data recovered after suppressing {suppressed_send_errors} repeated errors"
+                );
+                *suppressed_send_errors = 0;
+                *last_send_error_log_ms = 0;
+            }
+            true
+        }
+        Err(e) => {
+            command_backlog.push_front(payload);
+            log_repeated_worker_error(
+                &format!("{worker_name} radio io blind command send_data failed"),
+                &e.to_string(),
+                last_send_error_log_ms,
+                suppressed_send_errors,
+            );
+            false
+        }
+    }
 }

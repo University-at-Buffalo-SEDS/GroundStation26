@@ -1454,6 +1454,12 @@ impl CommsDevice for UartComms {
             return Err(err.into());
         }
         let _ = self.process_buffered_payloads_with_budget(packet_sink, max_packets)?;
+        if !self.rx_buf.is_empty() {
+            if let Err(err) = self.fill_rx_buf_with_timeout(timeout) {
+                return Err(err.into());
+            }
+            let _ = self.process_buffered_payloads_with_budget(packet_sink, max_packets)?;
+        }
         maybe_log_raw_uart_buffer_state(&self.rx_buf, "waiting for complete frame", &self.protocol);
         Ok(())
     }
@@ -2499,6 +2505,25 @@ mod raw_uart_tests {
         let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
         assert_eq!(decoded, (RawUartFrameKind::Data, payload));
         assert!(framed.is_empty());
+    }
+
+    #[test]
+    fn raw_uart_command_frame_waits_for_split_rfboard_grant() {
+        let payload = [0x52, 0x53, 1, 1, 7, 5, 0, 100, 0];
+        let framed = build_raw_uart_command_frame(&payload).unwrap();
+        let mut partial = framed[..2].to_vec();
+
+        assert!(
+            take_raw_uart_framed_payload(&mut partial)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(partial, framed[..2]);
+
+        partial.extend_from_slice(&framed[2..]);
+        let decoded = take_raw_uart_framed_payload(&mut partial).unwrap().unwrap();
+        assert_eq!(decoded, (RawUartFrameKind::Command, payload.to_vec()));
+        assert!(partial.is_empty());
     }
 
     #[test]
