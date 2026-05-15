@@ -2003,6 +2003,7 @@ mod tests {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
         scheduler_status: Option<Arc<Mutex<Vec<(u8, bool)>>>>,
         windows: VecDeque<crate::comms::RadioWindowUpdate>,
+        inject_tx_on_recv: Option<(mpsc::UnboundedSender<Vec<u8>>, Vec<u8>)>,
         fail_sends: usize,
     }
 
@@ -2038,6 +2039,10 @@ mod tests {
             _timeout: Duration,
             _max_packets: usize,
         ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+            if let Some((tx, payload)) = self.inject_tx_on_recv.take() {
+                tx.send(payload)
+                    .expect("failed to inject radio worker tx during recv");
+            }
             Ok(())
         }
 
@@ -2087,6 +2092,7 @@ mod tests {
                     credit: 5,
                     turnaround_ms: 0,
                 }]),
+                inject_tx_on_recv: None,
                 fail_sends: 0,
             })));
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2154,7 +2160,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_radio_worker_blind_sends_flight_command_without_window() {
+    async fn dedicated_radio_worker_drains_command_arriving_during_window_poll_before_yield() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let scheduler_status = Arc::new(Mutex::new(Vec::<(u8, bool)>::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                scheduler_status: Some(scheduler_status.clone()),
+                windows: VecDeque::from([crate::comms::RadioWindowUpdate {
+                    kind: crate::comms::RadioWindowKind::UplinkOpen,
+                    seq: 9,
+                    credit: 5,
+                    turnaround_ms: 0,
+                }]),
+                inject_tx_on_recv: Some((tx.clone(), wire.clone())),
+                fail_sends: 0,
+            })));
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+                let statuses = scheduler_status
+                    .lock()
+                    .expect("failed to lock scheduler statuses");
+                if sent_guard.iter().any(|payload| payload == &wire)
+                    && statuses.iter().any(|status| *status == (9, false))
+                {
+                    break;
+                }
+                drop(statuses);
+                drop(sent_guard);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for command injected during radio poll");
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        assert_eq!(sent_guard.as_slice(), &[wire]);
+        drop(sent_guard);
+
+        let statuses = scheduler_status
+            .lock()
+            .expect("failed to lock scheduler statuses");
+        assert!(statuses.iter().any(|status| *status == (9, false)));
+    }
+
+    #[tokio::test]
+    async fn dedicated_radio_worker_waits_for_uplink_window_before_flight_command() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
         let router = Arc::new(Router::new(
@@ -2175,6 +2272,7 @@ mod tests {
                 sent: sent.clone(),
                 scheduler_status: None,
                 windows: VecDeque::new(),
+                inject_tx_on_recv: None,
                 fail_sends: 0,
             })));
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2206,18 +2304,7 @@ mod tests {
         tx.send(wire.clone())
             .expect("failed to queue flight command to radio worker");
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
-                if sent_guard.iter().any(|payload| payload == &wire) {
-                    break;
-                }
-                drop(sent_guard);
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("timed out waiting for blind radio command fallback");
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         state.request_shutdown();
         for worker in workers {
@@ -2225,7 +2312,7 @@ mod tests {
         }
 
         let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
-        assert_eq!(sent_guard.as_slice(), &[wire]);
+        assert!(sent_guard.is_empty());
     }
 
     #[tokio::test]
@@ -2255,6 +2342,7 @@ mod tests {
                     credit: 5,
                     turnaround_ms: 0,
                 }]),
+                inject_tx_on_recv: None,
                 fail_sends: 0,
             })));
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2323,6 +2411,7 @@ mod tests {
                     credit: 1,
                     turnaround_ms: 0,
                 }]),
+                inject_tx_on_recv: None,
                 fail_sends: 0,
             })));
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2421,6 +2510,7 @@ mod tests {
                         turnaround_ms: 0,
                     },
                 ]),
+                inject_tx_on_recv: None,
                 fail_sends: 1,
             })));
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2502,6 +2592,7 @@ mod tests {
                     credit: 5,
                     turnaround_ms: 0,
                 }]),
+                inject_tx_on_recv: None,
                 fail_sends: 0,
             })));
         let (tx, rx) = mpsc::unbounded_channel();
