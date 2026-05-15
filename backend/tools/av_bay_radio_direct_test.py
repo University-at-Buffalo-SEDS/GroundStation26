@@ -27,9 +27,8 @@ RADIO_SCHED_MAGIC = (0x52, 0x53)
 RADIO_SCHED_VERSION = 1
 RADIO_SCHED_FLAG_HAS_MORE = 0x01
 RADIO_SCHED_FLAG_YIELD = 0x02
-RADIO_UPLINK_TURNAROUND_S = float(os.environ.get("GS_RADIO_UPLINK_TURNAROUND_MS", "500")) / 1000.0
+RADIO_UPLINK_TURNAROUND_S = float(os.environ.get("GS_RADIO_UPLINK_TURNAROUND_MS", "0")) / 1000.0
 RADIO_UPLINK_INTERFRAME_S = float(os.environ.get("GS_RADIO_UPLINK_INTERFRAME_MS", "0")) / 1000.0
-RADIO_FLIGHT_COMMAND_REPEATS = max(1, int(os.environ.get("GS_RADIO_FLIGHT_COMMAND_REPEATS", "1")))
 
 FLIGHT_COMMANDS = {
     "Launch": 1,
@@ -417,11 +416,9 @@ class AvBayRadioApp:
         spec = self.selected()
         packet = self.builder.build(spec)
         frame = build_raw_frame(RAW_DATA_SYNC, packet)
-        repeats = RADIO_FLIGHT_COMMAND_REPEATS if spec.kind == "flight-command" else 1
         with self.lock:
-            self.pending.append(PendingTx(spec.label, packet, frame, repeats))
-            suffix = f" x{repeats}" if repeats > 1 else ""
-            self.status = f"Queued {spec.label}{suffix}"
+            self.pending.append(PendingTx(spec.label, packet, frame, 1))
+            self.status = f"Queued {spec.label}"
 
     def force_send_selected(self) -> None:
         spec = self.selected()
