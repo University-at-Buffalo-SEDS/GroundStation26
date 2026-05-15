@@ -741,7 +741,7 @@ pub(super) fn spawn_router_worker_thread(
 }
 fn radio_follow_timeout_ms() -> u64 {
     static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 2_000, 50, 20_000) as u64)
+    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 3_000, 50, 20_000) as u64)
 }
 
 fn radio_rx_poll_idle_ms() -> u64 {
