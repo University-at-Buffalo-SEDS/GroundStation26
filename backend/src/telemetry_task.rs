@@ -2241,6 +2241,7 @@ mod tests {
 
     struct RfBoardSchedulerComms {
         sent_from_ground: Arc<Mutex<Vec<Vec<u8>>>>,
+        ground_tx_turns: Arc<Mutex<Vec<u8>>>,
         scheduler_status: Arc<Mutex<Vec<(u8, bool)>>>,
         rf_tx_queue: VecDeque<Vec<u8>>,
         updates: VecDeque<crate::comms::RadioWindowUpdate>,
@@ -2264,6 +2265,10 @@ mod tests {
                 .lock()
                 .expect("failed to lock ground tx packets")
                 .push(payload.to_vec());
+            self.ground_tx_turns
+                .lock()
+                .expect("failed to lock ground tx turns")
+                .push(self.scheduler.radio_turn);
             Ok(())
         }
 
@@ -2371,10 +2376,12 @@ mod tests {
         )
         .expect("failed to build RF GPS packet");
         let sent_from_ground = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let ground_tx_turns = Arc::new(Mutex::new(Vec::<u8>::new()));
         let scheduler_status = Arc::new(Mutex::new(Vec::<(u8, bool)>::new()));
         let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
             Arc::new(Mutex::new(Box::new(RfBoardSchedulerComms {
                 sent_from_ground: sent_from_ground.clone(),
+                ground_tx_turns: ground_tx_turns.clone(),
                 scheduler_status: scheduler_status.clone(),
                 rf_tx_queue: VecDeque::from([serialize::serialize_packet(&gps_pkt).to_vec()]),
                 updates: VecDeque::new(),
@@ -2468,6 +2475,14 @@ mod tests {
                 .get(Board::RFBoard.sender_id())
                 .cloned(),
             Some(gps_values.map(Some).to_vec())
+        );
+        assert!(
+            ground_tx_turns
+                .lock()
+                .expect("failed to lock ground tx turns")
+                .iter()
+                .all(|turn| *turn == RFBOARD_SCHED_UPLINK),
+            "ground station must only transmit during RF-board uplink turns"
         );
         assert!(
             scheduler_status
