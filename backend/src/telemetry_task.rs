@@ -2065,6 +2065,420 @@ mod tests {
         }
     }
 
+    const RFBOARD_SCHED_DOWNLINK: u8 = 0;
+    const RFBOARD_SCHED_UPLINK: u8 = 1;
+    const RFBOARD_SCHED_FLAG_HAS_MORE: u8 = 0x01;
+    const RFBOARD_SCHED_FLAG_YIELD: u8 = 0x02;
+    const RFBOARD_SCHED_BURST_MESSAGES: usize = 5;
+    const RFBOARD_SCHED_DOWNLINK_TIMEOUT_MS: u64 = 500;
+    const RFBOARD_SCHED_UPLINK_TIMEOUT_MS: u64 = 3000;
+    const RFBOARD_SCHED_IDLE_UPLINK_POLL_MS: u64 = 50;
+    const RFBOARD_SCHED_GRANT_RETRY_MS: u64 = 50;
+    const RFBOARD_SCHED_GRANT_REANNOUNCE_MS: u64 = 5000;
+    const RFBOARD_SCHED_TURNAROUND_MS: u64 = 75;
+    const RFBOARD_SCHED_UPLINK_TO_DOWNLINK_TURNAROUND_MS: u64 = 150;
+    const RFBOARD_SCHED_GS_TX_TURNAROUND_MS: u64 = 100;
+
+    struct RfBoardScheduler {
+        radio_turn: u8,
+        radio_turn_seq: u8,
+        radio_turn_sent: usize,
+        radio_turn_grant_sent: bool,
+        radio_turn_started_ms: u64,
+        next_control_retry_ms: u64,
+        next_grant_reannounce_ms: u64,
+        next_idle_uplink_poll_ms: u64,
+        now_ms: u64,
+        started_at: std::time::Instant,
+        gs_seq: u8,
+        gs_flags: u8,
+        gs_seen: bool,
+    }
+
+    impl RfBoardScheduler {
+        fn new() -> Self {
+            Self {
+                radio_turn: RFBOARD_SCHED_DOWNLINK,
+                radio_turn_seq: 0,
+                radio_turn_sent: 0,
+                radio_turn_grant_sent: false,
+                radio_turn_started_ms: 0,
+                next_control_retry_ms: 0,
+                next_grant_reannounce_ms: 0,
+                next_idle_uplink_poll_ms: 0,
+                now_ms: 0,
+                started_at: std::time::Instant::now(),
+                gs_seq: 0,
+                gs_flags: 0,
+                gs_seen: false,
+            }
+        }
+
+        fn handle_ground_station_status(&mut self, seq: u8, has_more: bool) {
+            self.gs_seq = seq;
+            self.gs_flags = RFBOARD_SCHED_FLAG_YIELD
+                | if has_more {
+                    RFBOARD_SCHED_FLAG_HAS_MORE
+                } else {
+                    0
+                };
+            self.gs_seen = true;
+        }
+
+        fn step(
+            &mut self,
+            rf_tx_queue: &mut VecDeque<Vec<u8>>,
+            updates: &mut VecDeque<crate::comms::RadioWindowUpdate>,
+            packet_sink: &mut dyn FnMut(Vec<u8>),
+            max_packets: usize,
+        ) {
+            self.now_ms = self.started_at.elapsed().as_millis().max(1) as u64;
+
+            // Copied from rfboard26/Core/Src/telemetry_thread.c:
+            // emit an initial downlink grant, alternate downlink/uplink turns,
+            // retry/reannounce grants, and leave uplink when GS yields or times out.
+            if self.radio_turn_started_ms == 0 {
+                self.radio_turn_started_ms = self.now_ms;
+                self.radio_turn_seq = self.radio_turn_seq.wrapping_add(1);
+                if self.emit_radio_grant(rf_tx_queue, updates) {
+                    self.radio_turn_grant_sent = true;
+                    self.next_grant_reannounce_ms = self.now_ms + RFBOARD_SCHED_GRANT_REANNOUNCE_MS;
+                } else {
+                    self.radio_turn_grant_sent = false;
+                    self.next_control_retry_ms = self.now_ms + RFBOARD_SCHED_GRANT_RETRY_MS;
+                }
+            }
+
+            if self.radio_turn == RFBOARD_SCHED_DOWNLINK {
+                let downlink_timeout = self.now_ms.saturating_sub(self.radio_turn_started_ms)
+                    >= RFBOARD_SCHED_DOWNLINK_TIMEOUT_MS;
+                if self.radio_turn_sent >= RFBOARD_SCHED_BURST_MESSAGES
+                    || downlink_timeout
+                    || (rf_tx_queue.is_empty() && self.now_ms >= self.next_idle_uplink_poll_ms)
+                {
+                    self.radio_turn = RFBOARD_SCHED_UPLINK;
+                    self.radio_turn_sent = 0;
+                    self.radio_turn_seq = self.radio_turn_seq.wrapping_add(1);
+                    self.radio_turn_grant_sent = false;
+                    self.radio_turn_started_ms = self.now_ms;
+                    self.next_control_retry_ms = self.now_ms + RFBOARD_SCHED_TURNAROUND_MS;
+                    self.next_grant_reannounce_ms = self.now_ms
+                        + RFBOARD_SCHED_TURNAROUND_MS
+                        + RFBOARD_SCHED_GRANT_REANNOUNCE_MS;
+                    self.next_idle_uplink_poll_ms = self.now_ms + RFBOARD_SCHED_IDLE_UPLINK_POLL_MS;
+                    self.gs_seen = false;
+                } else if self.radio_turn_grant_sent && max_packets > 0 {
+                    if let Some(payload) = rf_tx_queue.pop_front() {
+                        packet_sink(payload);
+                        self.radio_turn_sent += 1;
+                    }
+                }
+            } else {
+                let gs_done = self.gs_seen
+                    && self.gs_seq == self.radio_turn_seq
+                    && (self.gs_flags & RFBOARD_SCHED_FLAG_YIELD) != 0;
+                let uplink_timeout = self.now_ms.saturating_sub(self.radio_turn_started_ms)
+                    >= RFBOARD_SCHED_UPLINK_TIMEOUT_MS;
+                if gs_done || uplink_timeout {
+                    self.radio_turn = RFBOARD_SCHED_DOWNLINK;
+                    self.radio_turn_sent = 0;
+                    self.radio_turn_seq = self.radio_turn_seq.wrapping_add(1);
+                    self.radio_turn_grant_sent = false;
+                    self.radio_turn_started_ms = self.now_ms;
+                    self.next_control_retry_ms =
+                        self.now_ms + RFBOARD_SCHED_UPLINK_TO_DOWNLINK_TURNAROUND_MS;
+                    self.next_grant_reannounce_ms = self.now_ms
+                        + RFBOARD_SCHED_UPLINK_TO_DOWNLINK_TURNAROUND_MS
+                        + RFBOARD_SCHED_GRANT_REANNOUNCE_MS;
+                    self.gs_seen = false;
+                }
+            }
+
+            if !self.radio_turn_grant_sent && self.now_ms >= self.next_control_retry_ms {
+                if self.emit_radio_grant(rf_tx_queue, updates) {
+                    self.radio_turn_grant_sent = true;
+                    self.next_grant_reannounce_ms = self.now_ms + RFBOARD_SCHED_GRANT_REANNOUNCE_MS;
+                } else {
+                    self.radio_turn_grant_sent = false;
+                    self.next_control_retry_ms = self.now_ms + RFBOARD_SCHED_GRANT_RETRY_MS;
+                }
+            } else if self.radio_turn_grant_sent
+                && self.now_ms >= self.next_grant_reannounce_ms
+                && (self.radio_turn == RFBOARD_SCHED_UPLINK
+                    || (self.radio_turn == RFBOARD_SCHED_DOWNLINK && rf_tx_queue.is_empty()))
+            {
+                if self.emit_radio_grant(rf_tx_queue, updates) {
+                    self.next_grant_reannounce_ms = self.now_ms + RFBOARD_SCHED_GRANT_REANNOUNCE_MS;
+                } else {
+                    self.next_grant_reannounce_ms = self.now_ms + RFBOARD_SCHED_GRANT_RETRY_MS;
+                }
+            }
+        }
+
+        fn emit_radio_grant(
+            &self,
+            rf_tx_queue: &VecDeque<Vec<u8>>,
+            updates: &mut VecDeque<crate::comms::RadioWindowUpdate>,
+        ) -> bool {
+            let _flags = if rf_tx_queue.is_empty() {
+                0
+            } else {
+                RFBOARD_SCHED_FLAG_HAS_MORE
+            };
+            updates.push_back(crate::comms::RadioWindowUpdate {
+                kind: if self.radio_turn == RFBOARD_SCHED_UPLINK {
+                    crate::comms::RadioWindowKind::UplinkOpen
+                } else {
+                    crate::comms::RadioWindowKind::DownlinkOpen
+                },
+                seq: self.radio_turn_seq,
+                credit: RFBOARD_SCHED_BURST_MESSAGES,
+                turnaround_ms: RFBOARD_SCHED_GS_TX_TURNAROUND_MS,
+            });
+            true
+        }
+    }
+
+    struct RfBoardSchedulerComms {
+        sent_from_ground: Arc<Mutex<Vec<Vec<u8>>>>,
+        scheduler_status: Arc<Mutex<Vec<(u8, bool)>>>,
+        rf_tx_queue: VecDeque<Vec<u8>>,
+        updates: VecDeque<crate::comms::RadioWindowUpdate>,
+        scheduler: RfBoardScheduler,
+    }
+
+    impl CommsDevice for RfBoardSchedulerComms {
+        fn recv_packet(
+            &mut self,
+            _router: &Router,
+            _packet_tap: &mut dyn FnMut(&Packet),
+        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+            Ok(())
+        }
+
+        fn send_data(
+            &mut self,
+            payload: &[u8],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.sent_from_ground
+                .lock()
+                .expect("failed to lock ground tx packets")
+                .push(payload.to_vec());
+            Ok(())
+        }
+
+        fn set_side_id(&mut self, _side_id: RouterSideId) {}
+
+        fn recv_serialized_packets_with_budget(
+            &mut self,
+            packet_sink: &mut dyn FnMut(Vec<u8>),
+            _timeout: Duration,
+            max_packets: usize,
+        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+            self.scheduler.step(
+                &mut self.rf_tx_queue,
+                &mut self.updates,
+                packet_sink,
+                max_packets,
+            );
+            Ok(())
+        }
+
+        fn take_radio_window_update(&mut self) -> Option<crate::comms::RadioWindowUpdate> {
+            self.updates.pop_front()
+        }
+
+        fn send_radio_scheduler_status(
+            &mut self,
+            seq: u8,
+            has_more: bool,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.scheduler.handle_ground_station_status(seq, has_more);
+            self.scheduler_status
+                .lock()
+                .expect("failed to lock scheduler statuses")
+                .push((seq, has_more));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn rfboard_scheduler_drives_web_button_command_and_rf_data_paths() {
+        let (db_tx, db_rx) = mpsc::channel(32);
+        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        let mut policy = state.action_policy_snapshot();
+        for control in policy.controls.iter_mut() {
+            if control.cmd == "MonitorAltitude" {
+                control.enabled = true;
+            }
+        }
+        state.set_action_policy(policy);
+        let mut ws_rx = state.ws_tx.subscribe();
+
+        let handler_state = state.clone();
+        let ground_station_handler =
+            sedsprintf_rs_2026::router::EndpointHandler::new_packet_handler(
+                DataEndpoint::GroundStation,
+                move |pkt: &Packet| {
+                    handler_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+                    handler_state.mark_packet_received(get_current_timestamp_ms());
+                    handler_state.ring_buffer.lock().unwrap().push(pkt.clone());
+                    Ok(())
+                },
+            );
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([ground_station_handler]),
+        ));
+        let (radio_tx, radio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        register_flight_command_tx_side("rocket_comms", radio_tx.clone());
+        let side_id = {
+            let radio_tx = radio_tx.clone();
+            router.add_side_serialized_with_options(
+                "rocket_comms",
+                move |bytes| {
+                    radio_tx.send(bytes.to_vec()).map_err(|_| {
+                        sedsprintf_rs_2026::TelemetryError::HandlerError("radio tx closed")
+                    })?;
+                    Ok(())
+                },
+                sedsprintf_rs_2026::router::RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: true,
+                },
+            )
+        };
+        let rf_discovery = sedsprintf_rs_2026::discovery::build_discovery_announce(
+            Board::RFBoard.sender_id(),
+            1,
+            &[DataEndpoint::FlightController],
+        )
+        .expect("failed to build RF discovery");
+        router
+            .rx_serialized_from_side(&serialize::serialize_packet(&rf_discovery), side_id)
+            .expect("failed to queue RF discovery");
+        router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process RF discovery");
+
+        let gps_values = [31.7619_f32, -106.485_f32, 1412.5_f32];
+        let gps_pkt = Packet::new(
+            DataType::GpsData,
+            &[DataEndpoint::GroundStation],
+            Board::RFBoard.sender_id(),
+            123_456,
+            f32_payload(&gps_values),
+        )
+        .expect("failed to build RF GPS packet");
+        let sent_from_ground = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let scheduler_status = Arc::new(Mutex::new(Vec::<(u8, bool)>::new()));
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(RfBoardSchedulerComms {
+                sent_from_ground: sent_from_ground.clone(),
+                scheduler_status: scheduler_status.clone(),
+                rf_tx_queue: VecDeque::from([serialize::serialize_packet(&gps_pkt).to_vec()]),
+                updates: VecDeque::new(),
+                scheduler: RfBoardScheduler::new(),
+            })));
+        let shutdown_rx = state.shutdown_subscribe();
+        let telemetry = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            vec![CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: radio_rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            }],
+            cmd_rx,
+            db_rx,
+            shutdown_rx,
+        ));
+
+        state
+            .cmd_tx
+            .send(TelemetryCommand::MonitorAltitude)
+            .await
+            .expect("failed to send command through AppState command channel");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .last_command_ms
+                    .lock()
+                    .expect("failed to lock last command map")
+                    .contains_key("MonitorAltitude")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for telemetry task to accept MonitorAltitude command");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row = ws_rx.recv().await.expect("telemetry websocket closed");
+                if row.sender_id == Board::RFBoard.sender_id()
+                    && row.data_type == DataType::GpsData.as_str()
+                {
+                    assert_eq!(row.values, gps_values.map(Some).to_vec());
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for RF-board downlink telemetry");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let sent = sent_from_ground
+                    .lock()
+                    .expect("failed to lock ground tx packets");
+                let flight_command_seen = sent
+                    .iter()
+                    .filter_map(|payload| serialize::deserialize_packet(payload).ok())
+                    .any(|pkt| {
+                        pkt.data_type() == DataType::FlightCommand
+                            && pkt.payload() == &[FlightComputerCommands::MonitorAltitude as u8]
+                            && pkt.endpoints().contains(&DataEndpoint::FlightController)
+                    });
+                if flight_command_seen {
+                    break;
+                }
+                drop(sent);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for GS command during RF-board uplink");
+
+        state.request_shutdown();
+        telemetry.await.expect("telemetry task join failed");
+
+        assert_eq!(
+            state
+                .latest_gps_fix_by_sender
+                .lock()
+                .unwrap()
+                .get(Board::RFBoard.sender_id())
+                .cloned(),
+            Some(gps_values.map(Some).to_vec())
+        );
+        assert!(
+            scheduler_status
+                .lock()
+                .expect("failed to lock scheduler statuses")
+                .iter()
+                .any(|(_, has_more)| !*has_more),
+            "GS should yield the RF-board uplink window after sending the command"
+        );
+    }
+
     #[tokio::test]
     async fn dedicated_radio_worker_sends_flight_command_during_uplink_window() {
         let (db_tx, _db_rx) = mpsc::channel(8);
@@ -2827,6 +3241,12 @@ mod tests {
     }
 
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
+        test_app_state_with_cmd_rx(db_tx).await.0
+    }
+
+    async fn test_app_state_with_cmd_rx(
+        db_tx: mpsc::Sender<DbQueueItem>,
+    ) -> (Arc<AppState>, mpsc::Receiver<TelemetryCommand>) {
         reset_parse_error_reports();
         let db = SqlitePool::connect("sqlite::memory:")
             .await
@@ -2834,7 +3254,7 @@ mod tests {
         let auth_db = SqlitePool::connect("sqlite::memory:")
             .await
             .expect("failed to open in-memory auth db");
-        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
         let (ws_tx, _ws_rx) = broadcast::channel(16);
         let (state_tx, _state_rx) = broadcast::channel(4);
         let (board_status_tx, _board_status_rx) = broadcast::channel(4);
@@ -2860,7 +3280,7 @@ mod tests {
             );
         }
 
-        Arc::new(AppState {
+        let state = Arc::new(AppState {
             ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
             cmd_tx,
             ws_tx,
@@ -2932,7 +3352,9 @@ mod tests {
             auth: Arc::new(AuthManager::new(PathBuf::from(
                 "/tmp/groundstation-test-users.json",
             ))),
-        })
+        });
+
+        (state, cmd_rx)
     }
 
     fn f32_payload(values: &[f32]) -> Arc<[u8]> {

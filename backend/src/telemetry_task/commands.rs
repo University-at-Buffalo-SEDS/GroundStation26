@@ -17,7 +17,8 @@ pub(crate) fn register_flight_command_tx_side(
     let mut sides = sides
         .lock()
         .expect("failed to lock flight command tx sides");
-    if sides.iter().any(|side| side.name == name) {
+    if let Some(side) = sides.iter_mut().find(|side| side.name == name) {
+        side.tx = tx;
         return;
     }
     sides.push(FlightCommandTxSide { name, tx });
