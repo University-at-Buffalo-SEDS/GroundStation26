@@ -139,6 +139,14 @@
         "spacer_row_after": true
       },
       {
+        "label": "Launch",
+        "cmd": "Launch",
+        "border": "#22c55e",
+        "bg": "#022c22",
+        "fg": "#bbf7d0",
+        "spacer_row_before": true
+      },
+      {
         "label": "Dump",
         "cmd": "Dump",
         "border": "#ef4444",
@@ -150,7 +158,8 @@
         "cmd": "Igniter",
         "border": "#60a5fa",
         "bg": "#0b1220",
-        "fg": "#bfdbfe"
+        "fg": "#bfdbfe",
+        "spacer_after": true
       },
       {
         "label": "Pilot",
@@ -160,7 +169,7 @@
         "fg": "#ddd6fe"
       },
       {
-        "label": "NormallyOpen",
+        "label": "Vent",
         "cmd": "NormallyOpen",
         "border": "#f97316",
         "bg": "#1f2937",
@@ -188,13 +197,6 @@
         "fg": "#fef9c3"
       },
       {
-        "label": "Launch",
-        "cmd": "LaunchSignal",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
         "label": "Vigilant Mode",
         "cmd": "VigilantMode",
         "border": "#38bdf8",
@@ -204,34 +206,6 @@
       {
         "label": "Vigilant Mode",
         "cmd": "RevokeVigilantMode",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Eval Successive",
-        "cmd": "EvalSuccessive",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Revoke Eval Successive",
-        "cmd": "RevokeEvalSuccessive",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Reset Failures",
-        "cmd": "ResetFailures",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Revoke Reset Fail",
-        "cmd": "RevokeResetFailures",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -286,6 +260,28 @@
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
+        }
+      },
+      {
+        "id": "EULER_ANGLES",
+        "label": "Euler Angles",
+        "channels": [
+          "Roll",
+          "Pitch",
+          "Yaw"
+        ],
+        "chart": {
+          "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -298,6 +294,11 @@
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -315,11 +316,21 @@
               1,
               2
             ],
-            "scale_mode": "per_series"
+            "scale_mode": "per_series",
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
+            }
           }
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -409,6 +420,7 @@
       {
         "id": "GPS_DATA",
         "label": "GPS Data",
+        "show_min_max": false,
         "channels": [
           "Lat",
           "Lon",
@@ -452,6 +464,10 @@
                 "index": 0,
                 "formatter": {
                   "precision": 7
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
                 }
               },
               {
@@ -460,12 +476,20 @@
                 "index": 1,
                 "formatter": {
                   "precision": 7
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
                 }
               },
               {
                 "label": "Altitude",
                 "data_type": "GPS_DATA",
-                "index": 2
+                "index": 2,
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
+                }
               },
               {
                 "label": "Satellites",
@@ -473,13 +497,25 @@
                 "index": 0,
                 "formatter": {
                   "kind": "integer"
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
                 }
               }
-            ]
+            ],
+            "display_filter": {
+              "enabled": false,
+              "kind": "raw"
+            }
           }
         ],
         "chart": {
           "enabled": false
+        },
+        "display_filter": {
+          "enabled": false,
+          "kind": "raw"
         }
       },
       {
@@ -496,6 +532,11 @@
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -506,6 +547,11 @@
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -525,6 +571,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           },
           {
@@ -537,6 +588,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           },
           {
@@ -549,11 +605,21 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           }
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -573,6 +639,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           },
           {
@@ -585,6 +656,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           },
           {
@@ -597,16 +673,27 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           }
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
         "id": "BATTERY_RUNTIME",
         "label": "Battery Runtime",
+        "show_min_max": false,
         "channels": [
           "AV Bay %",
           "AV Bay Drop",
@@ -780,6 +867,7 @@
       {
         "id": "VALVE_STATE",
         "label": "Valve State",
+        "show_min_max": false,
         "channels": [
           "Pilot",
           "NormallyOpen",
@@ -833,7 +921,11 @@
             "false_label": "Installed",
             "unknown_label": "Unknown"
           }
-        ]
+        ],
+        "display_filter": {
+          "enabled": false,
+          "kind": "raw"
+        }
       },
       {
         "id": "LOADCELL",
@@ -859,7 +951,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               },
               {
                 "title": "Calibrated",
@@ -869,7 +966,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               },
               {
                 "title": "Fill %",
@@ -879,7 +981,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               }
             ],
             "summary_items": [
@@ -890,21 +997,41 @@
                 "formatter": {
                   "kind": "number",
                   "precision": 7
+                },
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
                 }
               },
               {
                 "label": "Calibrated",
                 "data_type": "LOADCELL_WEIGHT_KG",
-                "index": 0
+                "index": 0,
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               },
               {
                 "label": "Fill %",
                 "data_type": "LOADCELL_FILL_PERCENT",
-                "index": 0
+                "index": 0,
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               }
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "time_average",
+              "window_ms": 500
             }
           },
           {
@@ -923,7 +1050,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "low_pass",
+                  "cutoff_hz": 8.0
+                }
               },
               {
                 "title": "Calibrated",
@@ -944,6 +1076,11 @@
                 "formatter": {
                   "kind": "number",
                   "precision": 7
+                },
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "low_pass",
+                  "cutoff_hz": 8.0
                 }
               },
               {
@@ -954,6 +1091,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           }
         ],
@@ -961,7 +1103,11 @@
           "enabled": false
         }
       }
-    ]
+    ],
+    "default_display_filter": {
+      "enabled": false,
+      "kind": "raw"
+    }
   },
   "state_tab": {
     "states": [
@@ -1151,7 +1297,7 @@
                     "index": 0,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -1166,7 +1312,8 @@
           "PreFill",
           "FillTest",
           "NitrogenFill",
-          "NitrousFill"
+          "NitrousFill",
+          "Aborted"
         ],
         "sections": [
           {
@@ -1223,17 +1370,32 @@
                   {
                     "data_type": "FUEL_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure"
+                    "label": "Tank Pressure",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "low_pass",
+                      "cutoff_hz": 8.0
+                    }
                   },
                   {
                     "data_type": "LOADCELL_WEIGHT_KG",
                     "index": 0,
-                    "label": "Mass (kg)"
+                    "label": "Mass (kg)",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   },
                   {
                     "data_type": "LOADCELL_FILL_PERCENT",
                     "index": 0,
-                    "label": "Fill Percent"
+                    "label": "Fill Percent",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   }
                 ],
                 "width": 1200.0,
@@ -1255,7 +1417,7 @@
                     "index": 0
                   },
                   {
-                    "label": "NormallyOpen",
+                    "label": "Vent",
                     "index": 1
                   },
                   {
@@ -1483,7 +1645,7 @@
                     "index": 0,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -1534,7 +1696,7 @@
                     "index": 0
                   },
                   {
-                    "label": "NormallyOpen",
+                    "label": "Vent",
                     "index": 1
                   },
                   {
@@ -1766,7 +1928,7 @@
                     "index": 0,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -1834,7 +1996,7 @@
                     "index": 0,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -1846,7 +2008,12 @@
                   {
                     "data_type": "BAROMETER_DATA",
                     "index": 2,
-                    "label": "Barometer"
+                    "label": "Barometer",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "low_pass",
+                      "cutoff_hz": 8.0
+                    }
                   },
                   {
                     "data_type": "ASCENT_STATE",
@@ -1865,7 +2032,12 @@
                   {
                     "data_type": "VEHICLE_SPEED",
                     "index": 0,
-                    "label": "Fused"
+                    "label": "Fused",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "low_pass",
+                      "cutoff_hz": 8.0
+                    }
                   },
                   {
                     "data_type": "ASCENT_STATE",
@@ -2000,7 +2172,7 @@
                     "index": 0,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -2012,7 +2184,12 @@
                   {
                     "data_type": "BAROMETER_DATA",
                     "index": 2,
-                    "label": "Barometer"
+                    "label": "Barometer",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "low_pass",
+                      "cutoff_hz": 8.0
+                    }
                   },
                   {
                     "data_type": "DESCENT_STATE",
@@ -2031,7 +2208,12 @@
                   {
                     "data_type": "VEHICLE_SPEED",
                     "index": 0,
-                    "label": "Fused"
+                    "label": "Fused",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "low_pass",
+                      "cutoff_hz": 8.0
+                    }
                   },
                   {
                     "data_type": "DESCENT_STATE",
@@ -2244,7 +2426,7 @@
                     "index": 0,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]
@@ -2439,7 +2621,7 @@
                     "index": 0,
                     "formatter": {
                       "kind": "integer",
-                      "prefix": "🛰 "
+                      "prefix": "\ud83d\udef0 "
                     }
                   }
                 ]

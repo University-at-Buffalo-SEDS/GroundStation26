@@ -1,716 +1,16 @@
-use crate::comms::{CommsDevice, RadioWindowKind};
-use crate::flight_sim;
-use crate::layout;
-use crate::loadcell;
-use crate::rocket_commands::{ActuatorBoardCommands, FlightComputerCommands, ValveBoardCommands};
-use crate::sequences;
-use crate::state::{AppState, launch_countdown_clock};
-use crate::telemetry_db::{
-    DbQueueItem, DbWrite, LaunchClockKind, LaunchClockMsg, RecordingCommand, RecordingMode,
-    RecordingModeWire, RecordingStatusMsg, close_and_finalize_sqlite, open_telemetry_db,
-    prune_recent_writes, session_db_path,
+mod prelude;
+use prelude::*;
+
+mod commands;
+use commands::{flush_command_tx, log_command_dispatch, queue_locally_routed_flight_command};
+pub(crate) use commands::{queue_abort_packet, register_flight_command_tx_side};
+mod radio_io;
+pub use radio_io::CommsWorkerHandle;
+#[cfg(test)]
+use radio_io::{
+    is_fill_system_command_payload, radio_command_log_line, spawn_dedicated_radio_io_threads,
 };
-use crate::types::{
-    Board, FlightState, TelemetryCommand, TelemetryRow, canonical_sender_id, u8_to_flight_state,
-};
-use crate::web::{FlightStateMsg, emit_warning};
-use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
-use sedsprintf_rs_2026::endpoints_from_datatype;
-use sedsprintf_rs_2026::packet::Packet;
-use sedsprintf_rs_2026::router::{Router, RouterSideId};
-use sedsprintf_rs_2026::serialize;
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use tokio::sync::mpsc::error::{TryRecvError as MpscTryRecvError, TrySendError};
-use tokio::sync::{Notify, broadcast, mpsc};
-use tokio::time::{Duration, interval};
-
-pub struct CommsWorkerHandle {
-    pub name: &'static str,
-    pub comms: Arc<Mutex<Box<dyn CommsDevice>>>,
-    pub tx_comms: Option<Arc<Mutex<Box<dyn CommsDevice>>>>,
-    pub side_id: RouterSideId,
-    pub tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    pub legacy_single_worker: bool,
-    pub prioritize_rx: bool,
-    pub dedicated_radio_io: bool,
-}
-
-const COMMS_TX_BURST: usize = 1;
-const COMMS_TX_GAP_MS: u64 = 10;
-const COMMS_IDLE_SLEEP_MS: u64 = 1;
-const PARSE_ERROR_REPORT_INTERVAL_MS: u64 = 60_000;
-
-#[derive(Debug, Default)]
-struct ParseErrorReportState {
-    last_emit_ms: Option<u64>,
-    pending_count: u64,
-}
-
-static PARSE_ERROR_REPORTS: OnceLock<Mutex<HashMap<String, ParseErrorReportState>>> =
-    OnceLock::new();
-
-fn spawn_comms_worker_threads(
-    router: Arc<Router>,
-    state: Arc<AppState>,
-    mut comms_handle: CommsWorkerHandle,
-) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
-    if comms_handle.dedicated_radio_io {
-        return spawn_dedicated_radio_io_threads(router, state, comms_handle);
-    }
-    if comms_handle.legacy_single_worker {
-        return spawn_legacy_comms_worker_thread(router, state, comms_handle);
-    }
-    if comms_handle.prioritize_rx {
-        return spawn_rx_priority_comms_worker_thread(router, state, comms_handle);
-    }
-
-    let worker_name = comms_handle.name;
-    let comms = comms_handle.comms;
-    let tx_worker_state = state.clone();
-    let tx_worker_comms = comms_handle
-        .tx_comms
-        .clone()
-        .unwrap_or_else(|| comms.clone());
-    let tx_worker = thread::Builder::new()
-        .name(format!("{}_comms_tx", worker_name))
-        .spawn(move || {
-            let mut comms_shutdown_rx = tx_worker_state.shutdown_subscribe();
-            let mut last_send_error_log_ms = 0;
-            let mut suppressed_send_errors = 0;
-            let mut next_tx_allowed_at = std::time::Instant::now();
-            let mut command_backlog: VecDeque<Vec<u8>> = VecDeque::new();
-            let mut telemetry_backlog: VecDeque<Vec<u8>> = VecDeque::new();
-            loop {
-                match comms_shutdown_rx.try_recv() {
-                    Ok(_)
-                    | Err(broadcast::error::TryRecvError::Closed)
-                    | Err(broadcast::error::TryRecvError::Lagged(_)) => break,
-                    Err(broadcast::error::TryRecvError::Empty) => {}
-                }
-
-                let now = std::time::Instant::now();
-                if now < next_tx_allowed_at {
-                    thread::sleep(next_tx_allowed_at.saturating_duration_since(now));
-                    continue;
-                }
-
-                loop {
-                    match comms_handle.tx_rx.try_recv() {
-                        Ok(payload) => {
-                            if is_command_payload(&payload) {
-                                command_backlog.push_back(payload);
-                            } else {
-                                telemetry_backlog.push_back(payload);
-                            }
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => return,
-                    }
-                }
-
-                let mut sent_any = false;
-                for _ in 0..COMMS_TX_BURST {
-                    let Some(payload) = command_backlog
-                        .pop_front()
-                        .or_else(|| telemetry_backlog.pop_front())
-                    else {
-                        break;
-                    };
-                    let mut comms = tx_worker_comms.lock().expect("failed to get lock");
-                    match comms.send_data(&payload) {
-                        Ok(()) => {
-                            sent_any = true;
-                            log_radio_command_event("radio TX sent", worker_name, &payload);
-                            if suppressed_send_errors > 0 {
-                                eprintln!(
-                                    "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
-                                );
-                                suppressed_send_errors = 0;
-                                last_send_error_log_ms = 0;
-                            }
-                        }
-                        Err(e) => {
-                            log_repeated_worker_error(
-                                &format!("{worker_name} comms worker send_data failed"),
-                                &e.to_string(),
-                                &mut last_send_error_log_ms,
-                                &mut suppressed_send_errors,
-                            );
-                        }
-                    }
-                }
-
-                if sent_any {
-                    next_tx_allowed_at =
-                        std::time::Instant::now() + Duration::from_millis(COMMS_TX_GAP_MS);
-                    thread::yield_now();
-                } else {
-                    thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
-                }
-            }
-        })?;
-
-    let rx_worker_state = state.clone();
-    let rx_worker_router = router.clone();
-    let rx_worker = thread::Builder::new()
-        .name(format!("{}_comms_rx", worker_name))
-        .spawn(move || {
-            let mut comms_shutdown_rx = rx_worker_state.shutdown_subscribe();
-            let mut last_recv_error_log_ms = 0;
-            let mut suppressed_recv_errors = 0;
-            loop {
-                match comms_shutdown_rx.try_recv() {
-                    Ok(_)
-                    | Err(broadcast::error::TryRecvError::Closed)
-                    | Err(broadcast::error::TryRecvError::Lagged(_)) => break,
-                    Err(broadcast::error::TryRecvError::Empty) => {}
-                }
-
-                let tap_state = rx_worker_state.clone();
-                let mut packet_tap = |pkt: &Packet| {
-                    tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
-                    tap_state.mark_packet_received(get_current_timestamp_ms());
-                    let mut rb = tap_state.ring_buffer.lock().unwrap();
-                    rb.push(pkt.clone());
-                };
-
-                let mut comms = comms.lock().expect("failed to get lock");
-                match comms.recv_packet(&rx_worker_router, &mut packet_tap) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if !handle_worker_recv_error(
-                            &format!("{worker_name} comms worker recv_packet failed"),
-                            &format!("{e:?}"),
-                            &mut last_recv_error_log_ms,
-                            &mut suppressed_recv_errors,
-                        ) {
-                            break;
-                        }
-                    }
-                }
-                drop(comms);
-                thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
-            }
-        })?;
-
-    Ok(vec![tx_worker, rx_worker])
-}
-
-fn spawn_legacy_comms_worker_thread(
-    router: Arc<Router>,
-    state: Arc<AppState>,
-    mut comms_handle: CommsWorkerHandle,
-) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
-    let worker_name = comms_handle.name;
-    let comms = comms_handle.comms;
-    let worker = thread::Builder::new()
-        .name(format!("{}_comms_worker", worker_name))
-        .spawn(move || {
-            let mut comms_shutdown_rx = state.shutdown_subscribe();
-            let mut last_send_error_log_ms = 0;
-            let mut suppressed_send_errors = 0;
-            let mut last_recv_error_log_ms = 0;
-            let mut suppressed_recv_errors = 0;
-            loop {
-                match comms_shutdown_rx.try_recv() {
-                    Ok(_)
-                    | Err(broadcast::error::TryRecvError::Closed)
-                    | Err(broadcast::error::TryRecvError::Lagged(_)) => break,
-                    Err(broadcast::error::TryRecvError::Empty) => {}
-                }
-
-                let mut sent_any = false;
-                let tap_state = state.clone();
-                let mut packet_tap = |pkt: &Packet| {
-                    tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
-                    tap_state.mark_packet_received(get_current_timestamp_ms());
-                    let mut rb = tap_state.ring_buffer.lock().unwrap();
-                    rb.push(pkt.clone());
-                };
-                let mut comms = comms.lock().expect("failed to get lock");
-                for _ in 0..COMMS_TX_BURST {
-                    match comms_handle.tx_rx.try_recv() {
-                        Ok(payload) => {
-                            sent_any = true;
-                            match comms.send_data(&payload) {
-                                Ok(()) => {
-                                    log_radio_command_event("radio TX sent", worker_name, &payload);
-                                    if suppressed_send_errors > 0 {
-                                        eprintln!(
-                                            "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
-                                        );
-                                        suppressed_send_errors = 0;
-                                        last_send_error_log_ms = 0;
-                                    }
-                                }
-                                Err(e) => {
-                                    log_repeated_worker_error(
-                                        &format!("{worker_name} comms worker send_data failed"),
-                                        &e.to_string(),
-                                        &mut last_send_error_log_ms,
-                                        &mut suppressed_send_errors,
-                                    );
-                                }
-                            }
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => return,
-                    }
-                }
-
-                match comms.recv_packet(&router, &mut packet_tap) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if !handle_worker_recv_error(
-                            &format!("{worker_name} comms worker recv_packet failed"),
-                            &format!("{e:?}"),
-                            &mut last_recv_error_log_ms,
-                            &mut suppressed_recv_errors,
-                        ) {
-                            break;
-                        }
-                    }
-                }
-                drop(comms);
-
-                if sent_any {
-                    thread::yield_now();
-                } else {
-                    thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
-                }
-            }
-        })?;
-
-    Ok(vec![worker])
-}
-
-fn spawn_dedicated_radio_io_threads(
-    router: Arc<Router>,
-    state: Arc<AppState>,
-    mut comms_handle: CommsWorkerHandle,
-) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
-    let worker_name = comms_handle.name;
-    let side_id = comms_handle.side_id;
-    let comms = comms_handle.comms;
-    let (incoming_tx, incoming_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let io_state = state.clone();
-
-    let io_thread = thread::Builder::new()
-        .name(format!("{}_radio_io", worker_name))
-        .spawn(move || {
-            let mut comms_shutdown_rx = io_state.shutdown_subscribe();
-            let mut last_send_error_log_ms = 0;
-            let mut suppressed_send_errors = 0;
-            let mut last_recv_error_log_ms = 0;
-            let mut suppressed_recv_errors = 0;
-            let radio_follow_timeout = Duration::from_millis(radio_follow_timeout_ms());
-            let radio_rx_idle_poll = Duration::from_millis(radio_rx_poll_idle_ms());
-            let radio_rx_uplink_poll = Duration::from_millis(radio_rx_poll_uplink_ms());
-            let radio_rx_downlink_poll = Duration::from_millis(radio_rx_poll_downlink_ms());
-            let radio_rx_idle_packets = radio_rx_packets_idle();
-            let radio_rx_uplink_packets = radio_rx_packets_uplink();
-            let radio_rx_downlink_packets = radio_rx_packets_downlink();
-            let radio_tx_backlog_limit = radio_tx_backlog_limit();
-            let radio_tx_window_packets = radio_tx_packets_per_window();
-            let mut tx_backlog: VecDeque<Vec<u8>> = VecDeque::new();
-            let mut last_window_update_at: Option<std::time::Instant> = None;
-            let mut follow_window_until: Option<std::time::Instant> = None;
-            let mut follow_window_is_uplink = false;
-            let mut has_seen_window_update = false;
-            let mut sent_in_current_uplink_window = 0usize;
-            let mut last_uplink_log_at: Option<std::time::Instant> = None;
-
-            loop {
-                match comms_shutdown_rx.try_recv() {
-                    Ok(_)
-                    | Err(broadcast::error::TryRecvError::Closed)
-                    | Err(broadcast::error::TryRecvError::Lagged(_)) => break,
-                    Err(broadcast::error::TryRecvError::Empty) => {}
-                }
-
-                loop {
-                    match comms_handle.tx_rx.try_recv() {
-                        Ok(payload) => {
-                            if worker_name == "rocket_comms"
-                                && is_fill_system_command_payload(&payload)
-                            {
-                                log_radio_command_event(
-                                    "radio TX dropped fill-system command",
-                                    worker_name,
-                                    &payload,
-                                );
-                                continue;
-                            }
-                            log_radio_command_event("radio TX backlog", worker_name, &payload);
-                            tx_backlog.push_back(payload);
-                            while tx_backlog.len() > radio_tx_backlog_limit {
-                                tx_backlog.pop_front();
-                            }
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => return,
-                    }
-                }
-
-                let mut comms = comms.lock().expect("failed to get lock");
-                let _ = send_while_uplink_window_open(
-                    comms.as_mut(),
-                    worker_name,
-                    &mut tx_backlog,
-                    radio_tx_window_packets,
-                    radio_follow_timeout,
-                    has_seen_window_update,
-                    last_window_update_at,
-                    &mut follow_window_until,
-                    &mut follow_window_is_uplink,
-                    &mut sent_in_current_uplink_window,
-                    &mut last_send_error_log_ms,
-                    &mut suppressed_send_errors,
-                );
-                let now = std::time::Instant::now();
-                let follow_mode_active = last_window_update_at
-                    .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
-                let in_active_window =
-                    has_seen_window_update && follow_mode_active && follow_window_until.is_some();
-                let rx_poll_timeout = if follow_window_is_uplink {
-                    radio_rx_uplink_poll
-                } else if in_active_window {
-                    radio_rx_downlink_poll
-                } else {
-                    radio_rx_idle_poll
-                };
-                let rx_packet_budget = if follow_window_is_uplink {
-                    radio_rx_uplink_packets
-                } else if in_active_window {
-                    radio_rx_downlink_packets
-                } else {
-                    radio_rx_idle_packets
-                };
-                match comms.recv_serialized_packets_with_budget(
-                    &mut |payload| {
-                        let _ = incoming_tx.send(payload);
-                    },
-                    rx_poll_timeout,
-                    rx_packet_budget,
-                ) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        if !handle_worker_recv_error(
-                            &format!("{worker_name} radio io recv_serialized_packets failed"),
-                            &format!("{e:?}"),
-                            &mut last_recv_error_log_ms,
-                            &mut suppressed_recv_errors,
-                        ) {
-                            break;
-                        }
-                    }
-                }
-                while let Some(update) = comms.take_radio_window_update() {
-                    let deadline = std::time::Instant::now()
-                        + Duration::from_millis(update.duration_ms as u64);
-                    has_seen_window_update = true;
-                    last_window_update_at = Some(std::time::Instant::now());
-                    follow_window_until = Some(deadline);
-                    match update.kind {
-                        RadioWindowKind::DownlinkOpen => {
-                            // Window kinds are emitted from the RF-board perspective.
-                            // RF-board downlink means GS may transmit to the board.
-                            follow_window_is_uplink = true;
-                            sent_in_current_uplink_window = 0;
-                            let uplink_log_now = std::time::Instant::now();
-                            let should_log = !tx_backlog.is_empty()
-                                && last_uplink_log_at
-                                    .map(|last| {
-                                        uplink_log_now.saturating_duration_since(last)
-                                            >= Duration::from_millis(500)
-                                    })
-                                    .unwrap_or(true);
-                            if should_log {
-                                log_radio_uplink_available(
-                                    worker_name,
-                                    update.duration_ms,
-                                    tx_backlog.len(),
-                                );
-                                last_uplink_log_at = Some(uplink_log_now);
-                            }
-                            let _ = send_while_uplink_window_open(
-                                comms.as_mut(),
-                                worker_name,
-                                &mut tx_backlog,
-                                radio_tx_window_packets,
-                                radio_follow_timeout,
-                                has_seen_window_update,
-                                last_window_update_at,
-                                &mut follow_window_until,
-                                &mut follow_window_is_uplink,
-                                &mut sent_in_current_uplink_window,
-                                &mut last_send_error_log_ms,
-                                &mut suppressed_send_errors,
-                            );
-                        }
-                        RadioWindowKind::UplinkOpen => {
-                            // RF-board uplink means the board may transmit back to GS.
-                            follow_window_is_uplink = false;
-                            sent_in_current_uplink_window = 0;
-                        }
-                    }
-                }
-                let _ = send_while_uplink_window_open(
-                    comms.as_mut(),
-                    worker_name,
-                    &mut tx_backlog,
-                    radio_tx_window_packets,
-                    radio_follow_timeout,
-                    has_seen_window_update,
-                    last_window_update_at,
-                    &mut follow_window_until,
-                    &mut follow_window_is_uplink,
-                    &mut sent_in_current_uplink_window,
-                    &mut last_send_error_log_ms,
-                    &mut suppressed_send_errors,
-                );
-                drop(comms);
-            }
-        })?;
-
-    let ingress_state = state.clone();
-    let ingress_thread = thread::Builder::new()
-        .name(format!("{}_radio_ingress", worker_name))
-        .spawn(move || {
-            let mut shutdown_rx = ingress_state.shutdown_subscribe();
-            let mut last_ingress_error_log_ms = 0;
-            let mut suppressed_ingress_errors = 0;
-            loop {
-                match shutdown_rx.try_recv() {
-                    Ok(_)
-                    | Err(broadcast::error::TryRecvError::Closed)
-                    | Err(broadcast::error::TryRecvError::Lagged(_)) => break,
-                    Err(broadcast::error::TryRecvError::Empty) => {}
-                }
-
-                let payload = match incoming_rx.recv_timeout(Duration::from_millis(20)) {
-                    Ok(payload) => payload,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                };
-
-                if let Ok(pkt) = serialize::deserialize_packet(&payload) {
-                    ingress_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
-                    ingress_state.mark_packet_received(get_current_timestamp_ms());
-                    if matches!(
-                        pkt.data_type(),
-                        DataType::GpsData | DataType::GpsSatelliteNumber
-                    ) && !pkt.endpoints().contains(&DataEndpoint::GroundStation)
-                    {
-                        let mut rb = ingress_state.ring_buffer.lock().unwrap();
-                        rb.push(pkt);
-                    }
-                }
-
-                if let Err(err) = router.rx_serialized_queue_from_side(&payload, side_id) {
-                    log_repeated_worker_error(
-                        &format!("{worker_name} radio ingress queue failed"),
-                        &format!("{err:?}"),
-                        &mut last_ingress_error_log_ms,
-                        &mut suppressed_ingress_errors,
-                    );
-                }
-            }
-        })?;
-
-    Ok(vec![io_thread, ingress_thread])
-}
-
-fn spawn_rx_priority_comms_worker_thread(
-    router: Arc<Router>,
-    state: Arc<AppState>,
-    mut comms_handle: CommsWorkerHandle,
-) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
-    let worker_name = comms_handle.name;
-    let comms = comms_handle.comms;
-    let worker = thread::Builder::new()
-        .name(format!("{}_comms_worker", worker_name))
-        .spawn(move || {
-            let mut comms_shutdown_rx = state.shutdown_subscribe();
-            let mut last_send_error_log_ms = 0;
-            let mut suppressed_send_errors = 0;
-            let mut last_recv_error_log_ms = 0;
-            let mut suppressed_recv_errors = 0;
-            let mut next_tx_allowed_at = std::time::Instant::now();
-
-            loop {
-                match comms_shutdown_rx.try_recv() {
-                    Ok(_)
-                    | Err(broadcast::error::TryRecvError::Closed)
-                    | Err(broadcast::error::TryRecvError::Lagged(_)) => break,
-                    Err(broadcast::error::TryRecvError::Empty) => {}
-                }
-
-                let tap_state = state.clone();
-                let mut packet_tap = |pkt: &Packet| {
-                    tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
-                    tap_state.mark_packet_received(get_current_timestamp_ms());
-                    let mut rb = tap_state.ring_buffer.lock().unwrap();
-                    rb.push(pkt.clone());
-                };
-
-                let mut comms = comms.lock().expect("failed to get lock");
-                let recv_result = comms.recv_packet(&router, &mut packet_tap);
-                match recv_result {
-                    Ok(()) => {
-                        let now = std::time::Instant::now();
-                        if now >= next_tx_allowed_at
-                            && let Ok(payload) = comms_handle.tx_rx.try_recv()
-                        {
-                            match comms.send_data(&payload) {
-                                Ok(()) => {
-                                    log_radio_command_event("radio TX sent", worker_name, &payload);
-                                    if suppressed_send_errors > 0 {
-                                        eprintln!(
-                                            "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
-                                        );
-                                        suppressed_send_errors = 0;
-                                        last_send_error_log_ms = 0;
-                                    }
-                                    next_tx_allowed_at = std::time::Instant::now()
-                                        + Duration::from_millis(COMMS_TX_GAP_MS);
-                                }
-                                Err(e) => {
-                                    log_repeated_worker_error(
-                                        &format!("{worker_name} comms worker send_data failed"),
-                                        &e.to_string(),
-                                        &mut last_send_error_log_ms,
-                                        &mut suppressed_send_errors,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if !handle_worker_recv_error(
-                            &format!("{worker_name} comms worker recv_packet failed"),
-                            &format!("{e:?}"),
-                            &mut last_recv_error_log_ms,
-                            &mut suppressed_recv_errors,
-                        ) {
-                            break;
-                        }
-                    }
-                }
-                drop(comms);
-                thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
-            }
-        })?;
-
-    Ok(vec![worker])
-}
-
-fn log_repeated_worker_error(
-    context: &str,
-    detail: &str,
-    last_log_ms: &mut u64,
-    suppressed_count: &mut u64,
-) {
-    let now_ms = get_current_timestamp_ms();
-    if *last_log_ms == 0 || now_ms.saturating_sub(*last_log_ms) >= COMMS_ERROR_LOG_INTERVAL_MS {
-        if *suppressed_count > 0 {
-            eprintln!("{context}: {detail} (suppressed {suppressed_count} repeated errors)");
-        } else {
-            eprintln!("{context}: {detail}");
-        }
-        *last_log_ms = now_ms;
-        *suppressed_count = 0;
-    } else {
-        *suppressed_count += 1;
-    }
-}
-
-#[cfg(feature = "testing")]
-fn testing_should_disable_rx_loop(detail: &str) -> bool {
-    let detail = detail.to_ascii_lowercase();
-    [
-        "no such file",
-        "not found",
-        "device not configured",
-        "input/output error",
-        "broken pipe",
-        "disconnected",
-        "timed out waiting",
-    ]
-    .iter()
-    .any(|needle| detail.contains(needle))
-}
-
-fn handle_worker_recv_error(
-    context: &str,
-    detail: &str,
-    last_log_ms: &mut u64,
-    suppressed_count: &mut u64,
-) -> bool {
-    #[cfg(feature = "testing")]
-    {
-        if testing_should_disable_rx_loop(detail) {
-            gs_debug_println!("{context}: disabling RX loop in testing mode after {detail}");
-            return false;
-        }
-        let _ = (context, detail, last_log_ms, suppressed_count);
-        true
-    }
-
-    #[cfg(not(feature = "testing"))]
-    {
-        log_repeated_worker_error(context, detail, last_log_ms, suppressed_count);
-        true
-    }
-}
-
-fn spawn_router_worker_thread(
-    router: Arc<Router>,
-    state: Arc<AppState>,
-) -> std::io::Result<thread::JoinHandle<()>> {
-    thread::Builder::new()
-        .name("router_worker".to_string())
-        .spawn(move || {
-            let mut shutdown_rx = state.shutdown_subscribe();
-            loop {
-                match shutdown_rx.try_recv() {
-                    Ok(_)
-                    | Err(broadcast::error::TryRecvError::Closed)
-                    | Err(broadcast::error::TryRecvError::Lagged(_)) => break,
-                    Err(broadcast::error::TryRecvError::Empty) => {}
-                }
-
-                let mut did_work = false;
-                match router.poll_discovery() {
-                    Ok(queued) => {
-                        did_work |= queued;
-                    }
-                    Err(e) => {
-                        log_telemetry_error("router discovery polling failed", e);
-                    }
-                }
-                if timesync_enabled()
-                    && let Ok(queued) = router.poll_timesync()
-                {
-                    did_work |= queued;
-                }
-                if let Err(e) = process_router_queues(&router) {
-                    log_telemetry_error("router queue processing failed", e);
-                }
-                state.mark_discovered_relays_seen();
-                if !did_work {
-                    thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
-                } else {
-                    thread::yield_now();
-                }
-            }
-        })
-}
+use radio_io::{spawn_comms_worker_threads, spawn_router_worker_thread};
 
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
 const PACKET_ENQUEUE_BURST: usize = 256;
@@ -722,10 +22,6 @@ const ROUTER_TX_BUDGET_MS: u32 = 3;
 const ROUTER_RX_BUDGET_MS: u32 = ROUTER_QUEUE_BUDGET_MS - ROUTER_TX_BUDGET_MS;
 const COMMS_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 const ROUTER_DECODE_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
-const GPS_SATELLITES_DATA_TYPE: &str = "GPS_SATELLITE_NUMBER";
-const VEHICLE_SPEED_DATA_TYPE: &str = "VEHICLE_SPEED";
-const GRAVITY_MPS2: f32 = 9.80665;
-
 static ROUTER_DECODE_ERROR_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static ROUTER_DECODE_ERROR_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
@@ -739,19 +35,14 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
         TelemetryCommand::EvaluationAbort => FlightComputerCommands::EvaluationAbort as u8,
         TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
         TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
-        TelemetryCommand::ReinitIMU => FlightComputerCommands::ReinitIMU as u8,
+        TelemetryCommand::EnableIMU => FlightComputerCommands::EnableIMU as u8,
         TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
         TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
-        TelemetryCommand::AbortAfter100 => FlightComputerCommands::AbortAfter100 as u8,
-        TelemetryCommand::AbortAfter250 => FlightComputerCommands::AbortAfter250 as u8,
-        TelemetryCommand::ReinitAfter15 => FlightComputerCommands::ReinitAfter15 as u8,
-        TelemetryCommand::ReinitAfter30 => FlightComputerCommands::ReinitAfter30 as u8,
-        TelemetryCommand::ReinitAfter50 => FlightComputerCommands::ReinitAfter50 as u8,
         _ => return None,
     })
 }
 
-#[cfg(feature = "hitl_mode")]
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Startup,
     FlightState::Idle,
@@ -771,7 +62,7 @@ const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Aborted,
 ];
 
-#[cfg(feature = "hitl_mode")]
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> FlightState {
     let idx = OPERATOR_MODE_FLIGHT_STATE_ORDER
         .iter()
@@ -782,1116 +73,13 @@ fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> Flig
     OPERATOR_MODE_FLIGHT_STATE_ORDER[next_idx]
 }
 
-#[cfg(feature = "hitl_mode")]
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_state: FlightState) {
-    {
-        let mut fs = state.state.lock().unwrap();
-        *fs = next_state;
-    }
-    let _ = state.state_tx.send(FlightStateMsg { state: next_state });
-    state.broadcast_fill_targets_snapshot();
-    let ts_ms = get_current_timestamp_ms() as i64;
-    state.update_launch_clock_for_state(next_state, ts_ms);
-    let _ = state
-        .db_queue_tx
-        .send(DbQueueItem::Write(DbWrite::FlightState {
-            timestamp_ms: ts_ms,
-            state_code: next_state as i64,
-        }))
-        .await;
+    state.set_local_flight_state(next_state);
 }
 
-static DB_BACKPRESSURE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
-static DB_BACKPRESSURE_DROPPED: AtomicU64 = AtomicU64::new(0);
-static DB_LAST_BUCKET_BY_TYPE: OnceLock<Mutex<HashMap<(String, String), i64>>> = OnceLock::new();
-static DB_OVERFLOW_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
-static BATTERY_ESTIMATOR_STATE: OnceLock<Mutex<HashMap<String, BatteryEstimatorState>>> =
-    OnceLock::new();
-static SPEED_ESTIMATOR_STATE: OnceLock<Mutex<SpeedEstimatorState>> = OnceLock::new();
-static BATTERY_LAYOUT_CFG: OnceLock<layout::BatteryLayoutConfig> = OnceLock::new();
-static NETWORK_TIME_ROUTER: OnceLock<Arc<Router>> = OnceLock::new();
-const BATTERY_VOLTAGE_EMA_ALPHA: f32 = 0.06;
-const BATTERY_DROP_RATE_EMA_ALPHA: f32 = 0.10;
-const BATTERY_MAX_VOLTAGE_SLEW_V_PER_SEC: f32 = 0.035;
-const BATTERY_MIN_VOLTAGE_DEFAULT: f32 = 6.3;
-const BATTERY_MAX_VOLTAGE_DEFAULT: f32 = 8.4;
-
-#[derive(Clone)]
-struct DbOverflow {
-    queue: Arc<Mutex<VecDeque<DbWrite>>>,
-    notify: Arc<Notify>,
-    running: Arc<AtomicBool>,
-    max_entries: usize,
-}
-
-fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default)
-        .clamp(min, max)
-}
-
-fn radio_follow_timeout_ms() -> u64 {
-    static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 1_500, 50, 10_000) as u64)
-}
-
-fn radio_rx_poll_idle_ms() -> u64 {
-    static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_RX_POLL_IDLE_MS", 2, 0, 50) as u64)
-}
-
-fn radio_rx_poll_uplink_ms() -> u64 {
-    static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_RX_POLL_UPLINK_MS", 0, 0, 10) as u64)
-}
-
-fn radio_rx_poll_downlink_ms() -> u64 {
-    static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_RX_POLL_DOWNLINK_MS", 5, 0, 20) as u64)
-}
-
-fn radio_rx_packets_idle() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| env_usize("GS_RADIO_RX_PACKETS_IDLE", 4, 1, 128))
-}
-
-fn radio_rx_packets_uplink() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| env_usize("GS_RADIO_RX_PACKETS_UPLINK", 1, 1, 16))
-}
-
-fn radio_rx_packets_downlink() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| env_usize("GS_RADIO_RX_PACKETS_DOWNLINK", 16, 1, 256))
-}
-
-fn radio_tx_backlog_limit() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_BACKLOG_LIMIT", 256, 1, 256))
-}
-
-fn radio_tx_packets_per_window() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_PACKETS_PER_WINDOW", 16, 1, 128))
-}
-
-fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
-    if !crate::radio_diagnostics_enabled() {
-        return;
-    }
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
-        return;
-    };
-    if !matches!(pkt.data_type(), DataType::FlightCommand) {
-        return;
-    }
-    let cmd_bytes = pkt.payload();
-    let cmd_preview = cmd_bytes
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    eprintln!(
-        "\x1b[32m{worker_name} radio TX FlightCommand sender={} endpoints={:?} payload={}\x1b[0m",
-        pkt.sender(),
-        pkt.endpoints(),
-        cmd_preview
-    );
-}
-
-fn radio_command_log_line(event: &str, worker_name: &str, payload: &[u8]) -> Option<String> {
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
-        return None;
-    };
-    let is_command = matches!(
-        pkt.data_type(),
-        DataType::ValveCommand
-            | DataType::FlightCommand
-            | DataType::ActuatorCommand
-            | DataType::Abort
-    );
-    if !is_command {
-        return None;
-    }
-
-    let payload_preview = pkt
-        .payload()
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some(format!(
-        "{worker_name}: {event} {:?} sender={} endpoints={:?} payload={payload_preview}",
-        pkt.data_type(),
-        pkt.sender(),
-        pkt.endpoints(),
-    ))
-}
-
-fn log_radio_command_event(event: &str, worker_name: &str, payload: &[u8]) {
-    if !crate::radio_diagnostics_enabled() {
-        return;
-    }
-    if let Some(message) = radio_command_log_line(event, worker_name, payload) {
-        eprintln!("{message}");
-    }
-}
-
-fn log_radio_packet_event(event: &str, worker_name: &str, payload: &[u8]) {
-    if !crate::radio_diagnostics_enabled() {
-        return;
-    }
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
-        return;
-    };
-    eprintln!(
-        "{worker_name}: {event} {:?} sender={} endpoints={:?} payload_len={}",
-        pkt.data_type(),
-        pkt.sender(),
-        pkt.endpoints(),
-        pkt.payload().len(),
-    );
-}
-
-fn log_radio_uplink_available(worker_name: &str, duration_ms: u16, backlog_len: usize) {
-    if !crate::radio_diagnostics_enabled() {
-        return;
-    }
-    eprintln!(
-        "{worker_name}: radio uplink available window_ms={duration_ms} queued_commands={backlog_len}"
-    );
-}
-
-fn is_command_payload(payload: &[u8]) -> bool {
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
-        return false;
-    };
-    matches!(
-        pkt.data_type(),
-        DataType::ValveCommand
-            | DataType::FlightCommand
-            | DataType::ActuatorCommand
-            | DataType::Abort
-    )
-}
-
-fn is_fill_system_command_payload(payload: &[u8]) -> bool {
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
-        return false;
-    };
-    matches!(
-        pkt.data_type(),
-        DataType::ValveCommand | DataType::ActuatorCommand
-    )
-}
-
-fn send_while_uplink_window_open(
-    comms: &mut dyn CommsDevice,
-    worker_name: &str,
-    tx_backlog: &mut VecDeque<Vec<u8>>,
-    max_packets_per_window: usize,
-    radio_follow_timeout: Duration,
-    has_seen_window_update: bool,
-    last_window_update_at: Option<std::time::Instant>,
-    follow_window_until: &mut Option<std::time::Instant>,
-    follow_window_is_uplink: &mut bool,
-    sent_in_current_uplink_window: &mut usize,
-    last_send_error_log_ms: &mut u64,
-    suppressed_send_errors: &mut u64,
-) -> bool {
-    let mut sent_any = false;
-    loop {
-        let now = std::time::Instant::now();
-        let follow_mode_active = last_window_update_at
-            .is_some_and(|t| now.saturating_duration_since(t) <= radio_follow_timeout);
-        if !has_seen_window_update {
-            break;
-        }
-        if !follow_mode_active {
-            *follow_window_until = None;
-            *follow_window_is_uplink = false;
-            *sent_in_current_uplink_window = 0;
-            break;
-        }
-        let Some(deadline) = *follow_window_until else {
-            break;
-        };
-        if now >= deadline {
-            if crate::radio_diagnostics_enabled()
-                && *follow_window_is_uplink
-                && *sent_in_current_uplink_window == 0
-                && !tx_backlog.is_empty()
-            {
-                eprintln!(
-                    "{worker_name}: radio uplink window closed without TX queued_commands={}",
-                    tx_backlog.len()
-                );
-            }
-            *follow_window_until = None;
-            *follow_window_is_uplink = false;
-            *sent_in_current_uplink_window = 0;
-            break;
-        }
-        if !*follow_window_is_uplink
-            || tx_backlog.is_empty()
-            || *sent_in_current_uplink_window >= max_packets_per_window
-        {
-            break;
-        }
-
-        let Some(payload) = tx_backlog.pop_front() else {
-            break;
-        };
-        log_radio_packet_event("radio TX pop", worker_name, &payload);
-        maybe_log_green_radio_command_send(worker_name, &payload);
-        match comms.send_data(&payload) {
-            Ok(()) => {
-                log_radio_command_event("radio TX sent", worker_name, &payload);
-                *sent_in_current_uplink_window += 1;
-                sent_any = true;
-                if *suppressed_send_errors > 0 {
-                    eprintln!(
-                        "{worker_name} radio io send_data recovered after suppressing {suppressed_send_errors} repeated errors"
-                    );
-                    *suppressed_send_errors = 0;
-                    *last_send_error_log_ms = 0;
-                }
-            }
-            Err(e) => {
-                log_radio_packet_event("radio TX send_data failed for", worker_name, &payload);
-                log_repeated_worker_error(
-                    &format!("{worker_name} radio io send_data failed"),
-                    &e.to_string(),
-                    last_send_error_log_ms,
-                    suppressed_send_errors,
-                );
-                break;
-            }
-        }
-    }
-    sent_any
-}
-
-fn drop_db_writes_on_backpressure() -> bool {
-    static DROP: OnceLock<bool> = OnceLock::new();
-    *DROP.get_or_init(|| std::env::var("GS_DB_DROP_ON_BACKPRESSURE").ok().as_deref() == Some("1"))
-}
-
-fn db_backpressure_log_interval_ms() -> u64 {
-    static INTERVAL: OnceLock<u64> = OnceLock::new();
-    *INTERVAL.get_or_init(|| {
-        std::env::var("GS_DB_BACKPRESSURE_LOG_INTERVAL_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60_000)
-            .clamp(1_000, 3_600_000)
-    })
-}
-
-fn db_backpressure_log_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("GS_DB_BACKPRESSURE_LOG").ok().as_deref() != Some("0"))
-}
-
-fn db_bucket_ms() -> i64 {
-    static BUCKET_MS: OnceLock<i64> = OnceLock::new();
-    *BUCKET_MS.get_or_init(|| {
-        std::env::var("GS_DB_BUCKET_MS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(20)
-            .clamp(1, 1_000)
-    })
-}
-
-fn should_persist_telemetry_sample(data_type: &str, sender_id: &str, ts_ms: i64) -> bool {
-    let bucket_ms = db_bucket_ms();
-    if bucket_ms <= 1 {
-        return true;
-    }
-    let bucket_id = ts_ms.div_euclid(bucket_ms);
-    let map = DB_LAST_BUCKET_BY_TYPE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut by_type = map.lock().unwrap();
-    let key = (data_type.to_string(), sender_id.to_string());
-    match by_type.get(&key).copied() {
-        Some(prev) if prev == bucket_id => false,
-        _ => {
-            by_type.insert(key, bucket_id);
-            true
-        }
-    }
-}
-
-#[derive(Default)]
-struct BatteryEstimatorState {
-    samples: VecDeque<(i64, f32)>,
-    ema_voltage: Option<f32>,
-    ema_drop_rate_v_per_min: Option<f32>,
-    ema_remaining_min: Option<f32>,
-    last_ts_ms: Option<i64>,
-    last_remaining_ts_ms: Option<i64>,
-}
-
-#[derive(Default)]
-struct SpeedEstimatorState {
-    speed_mps: Option<f32>,
-    last_update_ts_ms: Option<i64>,
-    accel_mps2: Option<f32>,
-    accel_ts_ms: Option<i64>,
-    last_baro_alt_sample: Option<(i64, f32)>,
-    baro_speed_mps: Option<f32>,
-    baro_speed_ts_ms: Option<i64>,
-    last_gps_alt_sample: Option<(i64, f32)>,
-    gps_speed_mps: Option<f32>,
-    gps_speed_ts_ms: Option<i64>,
-}
-
-fn battery_layout_cfg() -> &'static layout::BatteryLayoutConfig {
-    BATTERY_LAYOUT_CFG.get_or_init(|| match layout::load_layout() {
-        Ok(cfg) => cfg.battery,
-        Err(err) => {
-            eprintln!("WARNING: failed to load battery layout config: {err}");
-            layout::BatteryLayoutConfig::default()
-        }
-    })
-}
-
-fn push_battery_sample_and_compute_drop_rate(
-    source_id: &str,
-    ts_ms: i64,
-    voltage: f32,
-    window_ms: i64,
-) -> (f32, Option<f32>) {
-    let by_source = BATTERY_ESTIMATOR_STATE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = by_source.lock().unwrap();
-    let state = map.entry(source_id.to_string()).or_default();
-
-    let dt_s = state
-        .last_remaining_ts_ms
-        .map(|t0| (ts_ms.saturating_sub(t0) as f32 / 1000.0).clamp(0.0, 10.0))
-        .unwrap_or(0.0);
-    state.last_remaining_ts_ms = Some(ts_ms);
-    state.last_ts_ms = Some(ts_ms);
-
-    // Clamp abrupt jumps first, then apply low-alpha EMA for heavy smoothing.
-    let slewed = if let Some(prev) = state.ema_voltage {
-        let max_step = BATTERY_MAX_VOLTAGE_SLEW_V_PER_SEC * dt_s.max(0.02);
-        voltage.clamp(prev - max_step, prev + max_step)
-    } else {
-        voltage
-    };
-    let smoothed_voltage = state
-        .ema_voltage
-        .map(|prev| prev + BATTERY_VOLTAGE_EMA_ALPHA * (slewed - prev))
-        .unwrap_or(slewed);
-    state.ema_voltage = Some(smoothed_voltage);
-
-    state.samples.push_back((ts_ms, smoothed_voltage));
-    while let Some((old_ts, _)) = state.samples.front().copied() {
-        if ts_ms.saturating_sub(old_ts) <= window_ms {
-            break;
-        }
-        state.samples.pop_front();
-    }
-
-    if state.samples.len() < 2 {
-        return (smoothed_voltage, None);
-    }
-
-    let t0 = state.samples.front().map(|(t, _)| *t).unwrap_or(ts_ms);
-    let n = state.samples.len() as f64;
-    let mut sum_x = 0.0f64;
-    let mut sum_y = 0.0f64;
-    let mut sum_xy = 0.0f64;
-    let mut sum_x2 = 0.0f64;
-
-    for (t, v) in state.samples.iter() {
-        let x = ((*t - t0) as f64) / 1000.0;
-        let y = *v as f64;
-        sum_x += x;
-        sum_y += y;
-        sum_xy += x * y;
-        sum_x2 += x * x;
-    }
-
-    let denom = n * sum_x2 - (sum_x * sum_x);
-    if denom.abs() < f64::EPSILON {
-        return (smoothed_voltage, None);
-    }
-
-    let slope_v_per_sec = (n * sum_xy - (sum_x * sum_y)) / denom;
-    if slope_v_per_sec >= 0.0 {
-        let dr = state
-            .ema_drop_rate_v_per_min
-            .map(|prev| prev + BATTERY_DROP_RATE_EMA_ALPHA * (0.0 - prev))
-            .unwrap_or(0.0);
-        state.ema_drop_rate_v_per_min = Some(dr);
-        return (smoothed_voltage, Some(dr));
-    }
-
-    let raw_drop = (-slope_v_per_sec * 60.0) as f32;
-    let smoothed_drop = state
-        .ema_drop_rate_v_per_min
-        .map(|prev| prev + BATTERY_DROP_RATE_EMA_ALPHA * (raw_drop - prev))
-        .unwrap_or(raw_drop);
-    state.ema_drop_rate_v_per_min = Some(smoothed_drop);
-    (smoothed_voltage, Some(smoothed_drop))
-}
-
-fn battery_percent(voltage: f32, empty: f32, full: f32, exponent: f32) -> f32 {
-    if full <= empty {
-        return 0.0;
-    }
-    let linear = ((voltage - empty) / (full - empty)).clamp(0.0, 1.0);
-    let exp = exponent.max(0.1);
-    (linear.powf(exp) * 100.0).clamp(0.0, 100.0)
-}
-
-fn battery_runtime_parts_data_types(base_data_type: &str) -> (String, String, String) {
-    if let Some(prefix) = base_data_type.strip_suffix("_REMAINING_MINUTES") {
-        return (
-            format!("{prefix}_REMAINING_DAYS"),
-            format!("{prefix}_REMAINING_HOURS"),
-            format!("{prefix}_REMAINING_MINUTES_PART"),
-        );
-    }
-
-    (
-        format!("{base_data_type}_DAYS"),
-        format!("{base_data_type}_HOURS"),
-        format!("{base_data_type}_MINUTES_PART"),
-    )
-}
-
-fn battery_runtime_parts(remaining_min: Option<f32>) -> (Option<f32>, Option<f32>, Option<f32>) {
-    let Some(total_minutes_f32) = remaining_min else {
-        return (None, None, None);
-    };
-
-    let mut total_minutes = total_minutes_f32.max(0.0).round() as i64;
-    let days = total_minutes / (24 * 60);
-    total_minutes %= 24 * 60;
-    let hours = total_minutes / 60;
-    let minutes = total_minutes % 60;
-
-    (Some(days as f32), Some(hours as f32), Some(minutes as f32))
-}
-
-fn update_speed_ema(prev: Option<f32>, sample: f32, alpha: f32) -> f32 {
-    prev.map(|v| v + alpha * (sample - v)).unwrap_or(sample)
-}
-
-fn ingest_altitude_velocity_sample(
-    prev_sample: Option<(i64, f32)>,
-    prev_speed: Option<f32>,
-    ts_ms: i64,
-    altitude_m: f32,
-    min_dt_ms: i64,
-    max_dt_ms: i64,
-    alpha: f32,
-) -> (Option<(i64, f32)>, Option<f32>, Option<i64>) {
-    let next_sample = Some((ts_ms, altitude_m));
-    let Some((prev_ts_ms, prev_altitude_m)) = prev_sample else {
-        return (next_sample, prev_speed, None);
-    };
-    let dt_ms = ts_ms.saturating_sub(prev_ts_ms);
-    if dt_ms < min_dt_ms || dt_ms > max_dt_ms {
-        return (next_sample, prev_speed, None);
-    }
-    let dt_s = dt_ms as f32 / 1000.0;
-    if dt_s <= 0.0 {
-        return (next_sample, prev_speed, None);
-    }
-    let raw_speed_mps = ((altitude_m - prev_altitude_m) / dt_s).clamp(-800.0, 800.0);
-    (
-        next_sample,
-        Some(update_speed_ema(prev_speed, raw_speed_mps, alpha)),
-        Some(ts_ms),
-    )
-}
-
-fn fresh_sensor_value(
-    sample: Option<f32>,
-    sample_ts_ms: Option<i64>,
-    now_ms: i64,
-    max_age_ms: i64,
-) -> Option<f32> {
-    let value = sample?;
-    let sample_ts_ms = sample_ts_ms?;
-    (now_ms.saturating_sub(sample_ts_ms) <= max_age_ms).then_some(value)
-}
-
-fn update_vehicle_speed_estimate(
-    data_type: &str,
-    ts_ms: i64,
-    values: &[Option<f32>],
-) -> Option<f32> {
-    let state_cell =
-        SPEED_ESTIMATOR_STATE.get_or_init(|| Mutex::new(SpeedEstimatorState::default()));
-    let mut state = state_cell.lock().unwrap();
-
-    match data_type {
-        dt if dt == DataType::AccelData.as_str() || dt == DataType::IMUData.as_str() => {
-            if let Some(accel_z_mps2) = values.get(2).copied().flatten()
-                && accel_z_mps2.is_finite()
-            {
-                state.accel_mps2 = Some((accel_z_mps2 - GRAVITY_MPS2).clamp(-200.0, 200.0));
-                state.accel_ts_ms = Some(ts_ms);
-            }
-        }
-        dt if dt == DataType::BarometerData.as_str() => {
-            if let Some(altitude_m) = values.get(2).copied().flatten()
-                && altitude_m.is_finite()
-            {
-                (
-                    state.last_baro_alt_sample,
-                    state.baro_speed_mps,
-                    state.baro_speed_ts_ms,
-                ) = ingest_altitude_velocity_sample(
-                    state.last_baro_alt_sample,
-                    state.baro_speed_mps,
-                    ts_ms,
-                    altitude_m,
-                    10,
-                    2_000,
-                    0.22,
-                );
-            }
-        }
-        dt if dt == DataType::GpsData.as_str() => {
-            if let Some(altitude_m) = values.get(2).copied().flatten()
-                && altitude_m.is_finite()
-            {
-                (
-                    state.last_gps_alt_sample,
-                    state.gps_speed_mps,
-                    state.gps_speed_ts_ms,
-                ) = ingest_altitude_velocity_sample(
-                    state.last_gps_alt_sample,
-                    state.gps_speed_mps,
-                    ts_ms,
-                    altitude_m,
-                    100,
-                    10_000,
-                    0.15,
-                );
-            }
-        }
-        _ => return None,
-    }
-
-    let accel_mps2 = fresh_sensor_value(state.accel_mps2, state.accel_ts_ms, ts_ms, 600);
-    let baro_speed_mps =
-        fresh_sensor_value(state.baro_speed_mps, state.baro_speed_ts_ms, ts_ms, 1_500);
-    let gps_speed_mps =
-        fresh_sensor_value(state.gps_speed_mps, state.gps_speed_ts_ms, ts_ms, 4_500);
-
-    let dt_s = state
-        .last_update_ts_ms
-        .map(|last_ts_ms| (ts_ms.saturating_sub(last_ts_ms) as f32 / 1000.0).clamp(0.0, 0.25))
-        .unwrap_or(0.0);
-
-    let mut fused_speed_mps = state.speed_mps.unwrap_or_else(|| {
-        let mut seed = 0.0;
-        let mut weight = 0.0;
-        if let Some(v) = baro_speed_mps {
-            seed += v * 0.75;
-            weight += 0.75;
-        }
-        if let Some(v) = gps_speed_mps {
-            seed += v * 0.25;
-            weight += 0.25;
-        }
-        if weight > 0.0 { seed / weight } else { 0.0 }
-    });
-
-    if let Some(a) = accel_mps2
-        && dt_s > 0.0
-    {
-        fused_speed_mps += a * dt_s;
-    }
-
-    let mut has_measurement = false;
-    if let Some(v_baro) = baro_speed_mps {
-        fused_speed_mps += 0.35 * (v_baro - fused_speed_mps);
-        has_measurement = true;
-    }
-    if let Some(v_gps) = gps_speed_mps {
-        fused_speed_mps += 0.18 * (v_gps - fused_speed_mps);
-        has_measurement = true;
-    }
-
-    if !has_measurement && state.speed_mps.is_none() {
-        return None;
-    }
-
-    if let Some(prev_speed_mps) = state.speed_mps {
-        let smooth_alpha = if dt_s <= 0.0 {
-            1.0
-        } else {
-            (dt_s / 0.12).clamp(0.15, 1.0)
-        };
-        fused_speed_mps = prev_speed_mps + smooth_alpha * (fused_speed_mps - prev_speed_mps);
-    }
-
-    if fused_speed_mps.abs() < 0.02 {
-        fused_speed_mps = 0.0;
-    }
-
-    fused_speed_mps = fused_speed_mps.clamp(-800.0, 800.0);
-    state.speed_mps = Some(fused_speed_mps);
-    state.last_update_ts_ms = Some(ts_ms);
-    Some(fused_speed_mps)
-}
-
-fn battery_bounds_for_source(source: &layout::BatterySourceConfig) -> (f32, f32) {
-    let mut empty = if source.empty_voltage.is_finite() {
-        source.empty_voltage
-    } else {
-        BATTERY_MIN_VOLTAGE_DEFAULT
-    };
-    let mut full = if source.full_voltage.is_finite() {
-        source.full_voltage
-    } else {
-        BATTERY_MAX_VOLTAGE_DEFAULT
-    };
-
-    if full <= empty {
-        empty = BATTERY_MIN_VOLTAGE_DEFAULT;
-        full = BATTERY_MAX_VOLTAGE_DEFAULT;
-    }
-    (empty, full)
-}
-
-fn telemetry_values_json(values: &[Option<f32>]) -> Option<String> {
-    serde_json::to_string(
-        &values
-            .iter()
-            .map(|v| v.map(|n| n as f64))
-            .collect::<Vec<_>>(),
-    )
-    .ok()
-}
-
-fn maybe_take_parse_error_report(key: &str, now_ms: u64) -> Option<u64> {
-    let reports = PARSE_ERROR_REPORTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut reports = reports.lock().unwrap();
-    let state = reports.entry(key.to_string()).or_default();
-    state.pending_count = state.pending_count.saturating_add(1);
-
-    let should_emit = state
-        .last_emit_ms
-        .map(|last_emit_ms| now_ms.saturating_sub(last_emit_ms) >= PARSE_ERROR_REPORT_INTERVAL_MS)
-        .unwrap_or(true);
-    if !should_emit {
-        return None;
-    }
-
-    let count = state.pending_count;
-    state.pending_count = 0;
-    state.last_emit_ms = Some(now_ms);
-    Some(count)
-}
-
-fn should_report_parse_error(data_type: &str) -> bool {
-    !matches!(
-        data_type,
-        "HEARTBEAT"
-            | "DISCOVERY_ANNOUNCE"
-            | "DISCOVERY_TIMESYNC_SOURCES"
-            | "TIME_SYNC_ANNOUNCE"
-            | "TIME_SYNC_REQUEST"
-            | "TIME_SYNC_RESPONSE"
-            | "VALVE_COMMAND"
-            | "FLIGHT_COMMAND"
-            | "ACTUATOR_COMMAND"
-            | "ABORT"
-    )
-}
-
-fn report_parse_error(state: &Arc<AppState>, sender_id: &str, data_type: &str, detail: &str) {
-    if !should_report_parse_error(data_type) {
-        return;
-    }
-    let now_ms = get_current_timestamp_ms();
-    let key = format!("{sender_id}:{data_type}:{detail}");
-    let Some(count) = maybe_take_parse_error_report(&key, now_ms) else {
-        return;
-    };
-    let message = format!(
-        "{sender_id}: {data_type} parse errors: {count} packet(s) in the last {}s ({detail})",
-        PARSE_ERROR_REPORT_INTERVAL_MS / 1000
-    );
-    let _ = state.add_backend_message(message);
-}
-
-#[cfg(test)]
-fn reset_parse_error_reports() {
-    if let Some(reports) = PARSE_ERROR_REPORTS.get() {
-        reports.lock().unwrap().clear();
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn emit_derived_battery_rows(
-    state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbQueueItem>,
-    db_overflow: &DbOverflow,
-    ts_ms: i64,
-    sender_id: &str,
-    input_data_type: &str,
-    voltage: f32,
-    payload_json: &str,
-) {
-    let cfg = battery_layout_cfg().clone();
-    if cfg.sources.is_empty() {
-        return;
-    }
-
-    let window_ms = (cfg.estimator.window_seconds.max(30) as i64) * 1000;
-    let min_drop_rate = cfg.estimator.min_drop_rate_v_per_min.max(0.000001);
-
-    for source in cfg.sources.iter() {
-        if source.sender_id != sender_id || source.input_data_type != input_data_type {
-            continue;
-        }
-
-        let (_smoothed_voltage, drop_rate_v_per_min) =
-            push_battery_sample_and_compute_drop_rate(&source.id, ts_ms, voltage, window_ms);
-
-        let (empty_v, full_v) = battery_bounds_for_source(source);
-        let pct = battery_percent(voltage, empty_v, full_v, source.curve_exponent);
-        let raw_remaining_min = drop_rate_v_per_min.and_then(|rate| {
-            if rate < min_drop_rate {
-                return None;
-            }
-            let remaining_voltage = (voltage - empty_v).max(0.0);
-            Some(remaining_voltage / rate)
-        });
-        let remaining_min = smooth_remaining_minutes(&source.id, ts_ms, raw_remaining_min);
-        let (remaining_days, remaining_hours, remaining_minutes_part) =
-            battery_runtime_parts(remaining_min);
-        let (remaining_days_data_type, remaining_hours_data_type, remaining_minutes_part_data_type) =
-            battery_runtime_parts_data_types(&source.remaining_minutes_data_type);
-
-        let rows: Vec<(String, Vec<Option<f32>>)> = vec![
-            (source.percent_data_type.clone(), vec![Some(pct)]),
-            (
-                source.drop_rate_data_type.clone(),
-                vec![drop_rate_v_per_min],
-            ),
-            (
-                source.remaining_minutes_data_type.clone(),
-                vec![remaining_min],
-            ),
-            (remaining_days_data_type, vec![remaining_days]),
-            (remaining_hours_data_type, vec![remaining_hours]),
-            (
-                remaining_minutes_part_data_type,
-                vec![remaining_minutes_part],
-            ),
-        ];
-
-        for (data_type, values) in rows {
-            if should_persist_telemetry_sample(&data_type, sender_id, ts_ms) {
-                queue_db_write(
-                    state,
-                    db_tx,
-                    db_overflow,
-                    DbWrite::Telemetry {
-                        timestamp_ms: ts_ms,
-                        data_type: data_type.clone(),
-                        sender_id: sender_id.to_string(),
-                        values_json: telemetry_values_json(&values),
-                        payload_json: payload_json.to_string(),
-                    },
-                )
-                .await;
-            }
-
-            let row = TelemetryRow {
-                timestamp_ms: ts_ms,
-                data_type,
-                sender_id: sender_id.to_string(),
-                values,
-            };
-            state.cache_recent_telemetry(row.clone());
-            let _ = state.ws_tx.send(row);
-        }
-    }
-}
-
-struct DerivedLoadcellSample<'a> {
-    ts_ms: i64,
-    sender_id: &'a str,
-    sensor_id: &'a str,
-    raw_value: f32,
-    payload_json: &'a str,
-}
-
-async fn emit_derived_loadcell_rows(
-    state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbQueueItem>,
-    db_overflow: &DbOverflow,
-    sample: DerivedLoadcellSample<'_>,
-) {
-    let calibration_sensor_id = if sample.sensor_id == DataType::FuelTankPressure.as_str() {
-        loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
-    } else {
-        sample.sensor_id
-    };
-    let cfg = state.loadcell_calibration.lock().unwrap().clone();
-    let Some(calibrated_value) =
-        loadcell::calibrated_sensor_value(&cfg, calibration_sensor_id, sample.raw_value)
-    else {
-        match calibration_sensor_id {
-            loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
-                let mut latest = state.latest_fill_mass_kg.lock().unwrap();
-                *latest = None;
-            }
-            loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
-                let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
-                *pressure = None;
-            }
-            _ => {}
-        }
-        return;
-    };
-    let rows: Vec<(&str, Vec<Option<f32>>)> = match calibration_sensor_id {
-        loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
-            let percent = loadcell::fill_percent(&cfg, calibrated_value);
-            {
-                let mut latest = state.latest_fill_mass_kg.lock().unwrap();
-                *latest = Some(calibrated_value);
-            }
-            vec![
-                (
-                    loadcell::DERIVED_WEIGHT_DATA_TYPE,
-                    vec![Some(calibrated_value)],
-                ),
-                (
-                    loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
-                    vec![Some(percent)],
-                ),
-            ]
-        }
-        loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
-            {
-                let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
-                *pressure = Some(calibrated_value);
-            }
-            vec![(
-                loadcell::DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE,
-                vec![Some(calibrated_value)],
-            )]
-        }
-        _ => Vec::new(),
-    };
-
-    for (data_type, values) in rows {
-        if should_persist_telemetry_sample(data_type, sample.sender_id, sample.ts_ms) {
-            queue_db_write(
-                state,
-                db_tx,
-                db_overflow,
-                DbWrite::Telemetry {
-                    timestamp_ms: sample.ts_ms,
-                    data_type: data_type.to_string(),
-                    sender_id: sample.sender_id.to_string(),
-                    values_json: telemetry_values_json(&values),
-                    payload_json: sample.payload_json.to_string(),
-                },
-            )
-            .await;
-        }
-
-        let row = TelemetryRow {
-            timestamp_ms: sample.ts_ms,
-            data_type: data_type.to_string(),
-            sender_id: sample.sender_id.to_string(),
-            values,
-        };
-        state.cache_recent_telemetry(row.clone());
-        let _ = state.ws_tx.send(row);
-    }
-}
-
-async fn emit_derived_vehicle_speed_row(
-    state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbQueueItem>,
-    db_overflow: &DbOverflow,
-    ts_ms: i64,
-    speed_mps: f32,
-    payload_json: &str,
-) {
-    let values = vec![Some(speed_mps)];
-    if should_persist_telemetry_sample(VEHICLE_SPEED_DATA_TYPE, "", ts_ms) {
-        queue_db_write(
-            state,
-            db_tx,
-            db_overflow,
-            DbWrite::Telemetry {
-                timestamp_ms: ts_ms,
-                data_type: VEHICLE_SPEED_DATA_TYPE.to_string(),
-                sender_id: String::new(),
-                values_json: telemetry_values_json(&values),
-                payload_json: payload_json.to_string(),
-            },
-        )
-        .await;
-    }
-
-    let row = TelemetryRow {
-        timestamp_ms: ts_ms,
-        data_type: VEHICLE_SPEED_DATA_TYPE.to_string(),
-        sender_id: String::new(),
-        values,
-    };
-    state.cache_recent_telemetry(row.clone());
-    let _ = state.ws_tx.send(row);
-}
-
-fn normalized_gps_values(
-    state: &Arc<AppState>,
-    sender_id: &str,
-    raw_values: &[Option<f32>],
-) -> Vec<Option<f32>> {
-    let lat = raw_values.first().copied().flatten();
-    let lon = raw_values.get(1).copied().flatten();
-    let alt = raw_values.get(2).copied().flatten();
-
-    {
-        let mut fixes = state.latest_gps_fix_by_sender.lock().unwrap();
-        fixes.insert(sender_id.to_string(), vec![lat, lon, alt]);
-    }
-
-    vec![lat, lon, alt]
-}
-
-fn f32_values_from_payload_bytes(bytes: &[u8]) -> Option<Vec<Option<f32>>> {
-    if bytes.is_empty() || !bytes.len().is_multiple_of(size_of::<f32>()) {
-        return None;
-    }
-
-    Some(
-        bytes
-            .chunks_exact(size_of::<f32>())
-            .map(|chunk| Some(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
-            .collect(),
-    )
-}
-
-fn telemetry_f32_values(pkt: &Packet) -> Option<Vec<Option<f32>>> {
-    match pkt.data_as_f32() {
-        Ok(values) => Some(values.into_iter().map(Some).collect()),
-        Err(_) if pkt.data_type() == DataType::GpsData => {
-            f32_values_from_payload_bytes(pkt.payload())
-        }
-        Err(_) => None,
-    }
-}
-
-type TelemetryValues = Vec<Option<f32>>;
-
-fn split_imu_values(values: &[Option<f32>]) -> Option<(TelemetryValues, TelemetryValues)> {
-    if values.len() < 6 {
-        return None;
-    }
-
-    Some((values[..3].to_vec(), values[3..6].to_vec()))
-}
-
-fn telemetry_rows_from_packet_values(
-    state: &Arc<AppState>,
-    pkt: &Packet,
-    sender_id: &str,
-    mut values: Vec<Option<f32>>,
-) -> Vec<(String, Vec<Option<f32>>)> {
-    match pkt.data_type() {
-        DataType::GpsData => {
-            values = normalized_gps_values(state, sender_id, &values);
-            vec![(DataType::GpsData.as_str().to_string(), values)]
-        }
-        DataType::IMUData => split_imu_values(&values)
-            .map(|(accel, gyro)| {
-                vec![
-                    (DataType::AccelData.as_str().to_string(), accel),
-                    (DataType::GyroData.as_str().to_string(), gyro),
-                ]
-            })
-            .unwrap_or_else(|| vec![(DataType::IMUData.as_str().to_string(), values)]),
-        _ => vec![(pkt.data_type().as_str().to_string(), values)],
-    }
-}
-
-async fn handle_gps_satellite_count_packet(
-    state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbQueueItem>,
-    db_overflow: &DbOverflow,
-    pkt: &Packet,
-    payload_json: &str,
-) -> Option<TelemetryRow> {
-    let count = pkt.data_as_u8().ok().and_then(|v| v.first().copied())?;
-    let ts_ms = get_current_timestamp_ms() as i64;
-    let sender_id = pkt.sender().to_string();
-
-    {
-        let mut sats = state.latest_gps_satellites_by_sender.lock().unwrap();
-        sats.insert(sender_id.clone(), count);
-    }
-
-    let values = vec![Some(count as f32)];
-    if should_persist_telemetry_sample(GPS_SATELLITES_DATA_TYPE, &sender_id, ts_ms) {
-        queue_db_write(
-            state,
-            db_tx,
-            db_overflow,
-            DbWrite::Telemetry {
-                timestamp_ms: ts_ms,
-                data_type: GPS_SATELLITES_DATA_TYPE.to_string(),
-                sender_id: sender_id.clone(),
-                values_json: telemetry_values_json(&values),
-                payload_json: payload_json.to_string(),
-            },
-        )
-        .await;
-    }
-
-    Some(TelemetryRow {
-        timestamp_ms: ts_ms,
-        data_type: GPS_SATELLITES_DATA_TYPE.to_string(),
-        sender_id,
-        values,
-    })
-}
-
-fn smooth_remaining_minutes(source_id: &str, ts_ms: i64, raw: Option<f32>) -> Option<f32> {
-    const REMAINING_EMA_ALPHA: f32 = 0.05;
-    const REMAINING_MAX_STEP_MIN_PER_SEC: f32 = 0.08;
-
-    let by_source = BATTERY_ESTIMATOR_STATE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = by_source.lock().unwrap();
-    let state = map.entry(source_id.to_string()).or_default();
-    let Some(raw_val) = raw else {
-        state.ema_remaining_min = None;
-        return None;
-    };
-
-    let dt_s = state
-        .last_ts_ms
-        .map(|t0| (ts_ms.saturating_sub(t0) as f32 / 1000.0).clamp(0.0, 10.0))
-        .unwrap_or(0.0);
-    let prev = state.ema_remaining_min.unwrap_or(raw_val);
-    let max_step = REMAINING_MAX_STEP_MIN_PER_SEC * dt_s.max(0.02);
-    let slewed = raw_val.clamp(prev - max_step, prev + max_step);
-    let smoothed = prev + REMAINING_EMA_ALPHA * (slewed - prev);
-    state.ema_remaining_min = Some(smoothed.max(0.0));
-    state.ema_remaining_min
-}
+mod derived;
+use derived::*;
 
 pub fn set_network_time_router(router: Arc<Router>) {
     let _ = NETWORK_TIME_ROUTER.set(router);
@@ -1904,14 +92,26 @@ fn send_valve_launch_sequence_command(router: &Router) -> bool {
         log_telemetry_error("failed to log valve launch sequence command", e);
         false
     } else {
-        log_command_queue_success(
+        log_command_dispatch(
             "Valve launch sequence command",
+            "umbilical_comms",
             DataType::ValveCommand,
             &payload,
         );
         flush_command_tx(router, "Valve launch sequence command tx");
         true
     }
+}
+
+fn vent_valve_known_open_for_launch(state: &Arc<AppState>) -> bool {
+    effective_umbilical_valve_state(state, ValveBoardCommands::NormallyOpenOpen as u8) == Some(true)
+}
+
+fn warn_launch_blocked_by_vent_valve(state: &Arc<AppState>) {
+    emit_notification_warning(
+        state,
+        "Vent valve is still reported open. Close it before initiating the launch sequence.",
+    );
 }
 
 fn start_launch_clock_from_valve_sequence_status(state: &Arc<AppState>) {
@@ -1947,6 +147,15 @@ fn transition_launch_clock_to_t_plus_from_pilot_open(state: &Arc<AppState>) {
 
 #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router: Arc<Router>) {
+    if vent_valve_known_open_for_launch(&state) {
+        warn_launch_blocked_by_vent_valve(&state);
+        sequences::refresh_action_policy_now(&state);
+        state.broadcast_action_policy_snapshot();
+        gs_debug_println!(
+            "Ground-station launch command ignored because vent valve is reported open"
+        );
+        return;
+    }
     if matches!(
         state.launch_clock_snapshot().kind,
         LaunchClockKind::TMinus | LaunchClockKind::TPlus
@@ -1982,6 +191,13 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
 }
 
 async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc<Router>) {
+    if vent_valve_known_open_for_launch(&state) {
+        warn_launch_blocked_by_vent_valve(&state);
+        sequences::refresh_action_policy_now(&state);
+        state.broadcast_action_policy_snapshot();
+        gs_debug_println!("Launch command ignored because vent valve is reported open");
+        return;
+    }
     if matches!(
         state.launch_clock_snapshot().kind,
         LaunchClockKind::TMinus | LaunchClockKind::TPlus
@@ -1998,16 +214,13 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
     }
     let now_ms = get_current_timestamp_ms() as i64;
     state.set_launch_clock(launch_countdown_clock(now_ms));
-    if let Err(e) =
-        queue_locally_routed_flight_command(&router, &[FlightComputerCommands::LaunchSignal as u8])
-    {
+    if let Err(e) = queue_locally_routed_flight_command(
+        &router,
+        "Launch command",
+        &[FlightComputerCommands::Launch as u8],
+    ) {
         log_telemetry_error("failed to log Launch command", e);
     } else {
-        log_command_queue_success(
-            "Launch command",
-            DataType::FlightCommand,
-            &[FlightComputerCommands::LaunchSignal as u8],
-        );
         flush_command_tx(&router, "Launch command tx");
         state.set_launch_indicator_latched(true);
         sequences::refresh_action_policy_now(&state);
@@ -2038,12 +251,7 @@ pub async fn telemetry_task(
     );
     let packet_enqueue_burst = env_usize("GS_PACKET_ENQUEUE_BURST", PACKET_ENQUEUE_BURST, 32, 4096);
     let (packet_tx, mut packet_rx) = mpsc::channel::<Packet>(packet_work_queue_size);
-    let db_overflow = DbOverflow {
-        queue: Arc::new(Mutex::new(VecDeque::new())),
-        notify: Arc::new(Notify::new()),
-        running: Arc::new(AtomicBool::new(true)),
-        max_entries: env_usize("GS_DB_OVERFLOW_MAX", 250_000, 1024, 5_000_000),
-    };
+    let db_overflow = DbOverflow;
 
     let db_worker = {
         let state = state.clone();
@@ -2054,6 +262,7 @@ pub async fn telemetry_task(
             .unwrap_or(DB_BATCH_WAIT_MS_DEFAULT)
             .clamp(1, 250);
         tokio::spawn(async move {
+            log::info!("telemetry db worker started");
             let mut db_shutdown_rx = state.shutdown_subscribe();
             struct ActiveRecording {
                 pool: sqlx::SqlitePool,
@@ -2071,6 +280,7 @@ pub async fn telemetry_task(
             let mut last_recording_end_ms: Option<i64> = None;
 
             let mut pending: Vec<DbWrite> = Vec::with_capacity(db_batch_max);
+            let mut deferred_control_carry: Option<RecordingCommand> = None;
             let mut shutting_down = false;
             loop {
                 let first = if shutting_down {
@@ -2095,7 +305,7 @@ pub async fn telemetry_task(
                     }
                 };
 
-                let mut deferred_control: Option<RecordingCommand> = None;
+                let mut deferred_control: Option<RecordingCommand> = deferred_control_carry.take();
                 match first {
                     DbQueueItem::Write(write) => {
                         let newest_ts = write.timestamp_ms();
@@ -2149,27 +359,39 @@ pub async fn telemetry_task(
                     }
                 }
 
-                flush_recording_batch(active_recording.as_ref().map(|a| &a.pool), &mut pending)
-                    .await;
+                let flush_ok =
+                    flush_recording_batch(active_recording.as_ref().map(|a| &a.pool), &mut pending)
+                        .await;
+                if !flush_ok {
+                    deferred_control_carry = deferred_control;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
 
                 if let Some(cmd) = deferred_control {
                     match cmd {
                         RecordingCommand::StartNow | RecordingCommand::StartWithRecent => {
-                            if let Some(active) = active_recording.take() {
-                                close_and_finalize_sqlite(active.pool, &active.path).await;
-                                last_recording_end_ms = Some(get_current_timestamp_ms() as i64);
-                            }
-
                             let started_at_ms = get_current_timestamp_ms() as i64;
                             let target_path = session_db_path(&recordings_dir, started_at_ms);
                             match open_telemetry_db(&target_path).await {
-                                Ok((pool, path)) => {
-                                    state.replace_telemetry_db(pool.clone(), path.clone());
+                                Ok((new_pool, new_path)) => {
+                                    if let Some(active) = active_recording.take() {
+                                        log::info!("recording session closing db={}", active.path);
+                                        close_and_finalize_sqlite(active.pool, &active.path).await;
+                                        export_test_fire_csv_if_enabled(&state, &active.path).await;
+                                        last_recording_end_ms =
+                                            Some(get_current_timestamp_ms() as i64);
+                                    }
+                                    log::info!("recording session started db={new_path}");
+                                    state.replace_telemetry_db(new_pool.clone(), new_path.clone());
                                     state.set_recording_status(RecordingStatusMsg {
                                         mode: RecordingModeWire::Recording,
-                                        db_path: Some(path.clone()),
+                                        db_path: Some(new_path.clone()),
                                     });
-                                    active_recording = Some(ActiveRecording { pool, path });
+                                    active_recording = Some(ActiveRecording {
+                                        pool: new_pool,
+                                        path: new_path,
+                                    });
                                     mode = RecordingMode::Recording;
 
                                     if matches!(cmd, RecordingCommand::StartWithRecent)
@@ -2202,7 +424,12 @@ pub async fn telemetry_task(
                         }
                         RecordingCommand::Pause | RecordingCommand::Stop => {
                             if let Some(active) = active_recording.take() {
+                                log::info!("recording session closing db={}", active.path);
                                 close_and_finalize_sqlite(active.pool, &active.path).await;
+                                let deleted = delete_empty_recording_if_needed(&active.path).await;
+                                if !deleted {
+                                    export_test_fire_csv_if_enabled(&state, &active.path).await;
+                                }
                                 last_recording_end_ms = Some(get_current_timestamp_ms() as i64);
                             }
                             mode = if matches!(cmd, RecordingCommand::Pause) {
@@ -2210,41 +437,36 @@ pub async fn telemetry_task(
                             } else {
                                 RecordingMode::Idle
                             };
-                            rotate_placeholder_db(&state, &placeholder_path, mode).await;
+                            rotate_placeholder_db(&state, mode).await;
                             state.set_recording_status(RecordingStatusMsg {
                                 mode: RecordingModeWire::from(mode),
-                                db_path: Some(state.telemetry_db_path()),
+                                db_path: None,
                             });
+                        }
+                        RecordingCommand::ResetAll => {
+                            pending.clear();
+                            recent_writes.clear();
+                            let db = active_recording
+                                .as_ref()
+                                .map(|active| active.pool.clone())
+                                .unwrap_or_else(|| state.telemetry_db_pool());
+                            if let Err(err) = clear_telemetry_tables(&db).await {
+                                log::error!("failed clearing telemetry tables during reset: {err}");
+                            }
                         }
                     }
                 }
             }
 
             if let Some(active) = active_recording.take() {
+                log::info!("recording worker finalizing active db={}", active.path);
                 close_and_finalize_sqlite(active.pool, &active.path).await;
-            }
-        })
-    };
-
-    let db_overflow_worker = {
-        let db_tx = state.db_queue_tx.clone();
-        let db_overflow = db_overflow.clone();
-        tokio::spawn(async move {
-            while db_overflow.running.load(Ordering::Relaxed) {
-                db_overflow.notify.notified().await;
-                loop {
-                    let next = {
-                        let mut q = db_overflow.queue.lock().unwrap();
-                        q.pop_front()
-                    };
-                    let Some(write) = next else {
-                        break;
-                    };
-                    if db_tx.send(DbQueueItem::Write(write)).await.is_err() {
-                        return;
-                    }
+                let deleted = delete_empty_recording_if_needed(&active.path).await;
+                if !deleted {
+                    export_test_fire_csv_if_enabled(&state, &active.path).await;
                 }
             }
+            log::info!("telemetry db worker stopped");
         })
     };
 
@@ -2292,13 +514,18 @@ pub async fn telemetry_task(
                         continue;
                     }
                     if !state.is_command_allowed(&cmd) {
-                        emit_warning(
+                        emit_notification_warning(
                             &state,
                             format!("Command {cmd:?} blocked by sequence/key interlock"),
                         );
                         continue;
                     }
                     state.record_command_accepted(&cmd, get_current_timestamp_ms());
+                    if matches!(cmd, TelemetryCommand::Abort) {
+                        state.set_abort_indicator_latched(true);
+                        sequences::refresh_action_policy_now(&state);
+                        state.broadcast_action_policy_snapshot();
+                    }
                     if flight_sim::handle_command(&cmd) {
                         continue;
                     }
@@ -2324,12 +551,15 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::Abort => {
                                 state.clear_launch_sequence_command_pending();
-                                if let Err(e) = router.log(
-                                    DataType::Abort,
-                                    "Manual Abort Command Issued".as_ref(),
+                                if let Err(e) = queue_abort_packet(
+                                    &router,
+                                    "Manual Abort Command Issued",
                                 ) {
                                     log_telemetry_error("failed to log Abort command", e);
+                                } else {
+                                    flush_command_tx(&router, "Abort command tx");
                                 }
+                                emit_error(&state, "Manual abort triggered!".to_string());
                                 gs_debug_println!("Abort command sent");
                             }
                         TelemetryCommand::Igniter => {
@@ -2357,8 +587,9 @@ pub async fn telemetry_task(
                                 if let Err(e) = router.log_queue(DataType::ActuatorCommand, &payload) {
                                     log_telemetry_error("failed to log IgniterSequence command", e);
                                 } else {
-                                    log_command_queue_success(
+                                    log_command_dispatch(
                                         "IgniterSequence command",
+                                        "umbilical_comms",
                                         DataType::ActuatorCommand,
                                         &payload,
                                     );
@@ -2387,18 +618,22 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::NormallyOpen => {
                                 let key = ValveBoardCommands::NormallyOpenOpen as u8;
-                                let is_on = effective_umbilical_valve_state(&state, key).unwrap_or(false);
-                                let cmd = if is_on {
-                                    ValveBoardCommands::NormallyOpenClose
-                                } else {
+                                let effective_state = effective_umbilical_valve_state(&state, key);
+                                let should_close_for_armed_launch = effective_state.is_none()
+                                    && state.local_flight_state_snapshot() == FlightState::Armed;
+                                let is_on = effective_state.unwrap_or(false);
+                                let target = !(is_on || should_close_for_armed_launch);
+                                let cmd = if target {
                                     ValveBoardCommands::NormallyOpenOpen
+                                } else {
+                                    ValveBoardCommands::NormallyOpenClose
                                 };
                                 queue_guarded_fill_command(
                                     &state,
                                     &router,
                                     DataType::ValveCommand,
                                     key,
-                                    !is_on,
+                                    target,
                                     cmd as u8,
                                     "NormallyOpen command",
                                 );
@@ -2509,150 +744,60 @@ pub async fn telemetry_task(
                         TelemetryCommand::VigilantMode => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "VigilantMode",
                                     &[FlightComputerCommands::VigilantMode as u8],
                                 ) {
                                     log_telemetry_error("failed to log VigilantMode command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "VigilantMode command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::VigilantMode as u8],
-                                    );
                                 }
                                 gs_debug_println!("VigilantMode command sent");
                             }
                         TelemetryCommand::RevokeVigilantMode => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "RevokeVigilantMode",
                                     &[FlightComputerCommands::RevokeVigilantMode as u8],
                                 ) {
                                     log_telemetry_error("failed to log RevokeVigilantMode command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "RevokeVigilantMode command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::RevokeVigilantMode as u8],
-                                    );
                                 }
                                 gs_debug_println!("RevokeVigilantMode command sent");
-                            }
-                        TelemetryCommand::EvalSuccessive => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &router,
-                                    &[FlightComputerCommands::EvalSuccessive as u8],
-                                ) {
-                                    log_telemetry_error("failed to log EvalSuccessive command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "EvalSuccessive command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::EvalSuccessive as u8],
-                                    );
-                                }
-                                gs_debug_println!("EvalSuccessive command sent");
-                            }
-                        TelemetryCommand::RevokeEvalSuccessive => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &router,
-                                    &[FlightComputerCommands::RevokeEvalSuccessive as u8],
-                                ) {
-                                    log_telemetry_error("failed to log RevokeEvalSuccessive command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "RevokeEvalSuccessive command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::RevokeEvalSuccessive as u8],
-                                    );
-                                }
-                                gs_debug_println!("RevokeEvalSuccessive command sent");
-                            }
-                        TelemetryCommand::ResetFailures => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &router,
-                                    &[FlightComputerCommands::ResetFailures as u8],
-                                ) {
-                                    log_telemetry_error("failed to log ResetFailures command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "ResetFailures command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::ResetFailures as u8],
-                                    );
-                                }
-                                gs_debug_println!("ResetFailures command sent");
-                            }
-                        TelemetryCommand::RevokeResetFailures => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &router,
-                                    &[FlightComputerCommands::RevokeResetFailures as u8],
-                                ) {
-                                    log_telemetry_error("failed to log RevokeResetFailures command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "RevokeResetFailures command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::RevokeResetFailures as u8],
-                                    );
-                                }
-                                gs_debug_println!("RevokeResetFailures command sent");
                             }
                         TelemetryCommand::MeasmReports => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "MeasmReports",
                                     &[FlightComputerCommands::MeasmReports as u8],
                                 ) {
                                     log_telemetry_error("failed to log MeasmReports command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "MeasmReports command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::MeasmReports as u8],
-                                    );
                                 }
                                 gs_debug_println!("MeasmReports command sent");
                             }
                         TelemetryCommand::RevokeMeasmReports => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "RevokeMeasmReports",
                                     &[FlightComputerCommands::RevokeMeasmReports as u8],
                                 ) {
                                     log_telemetry_error("failed to log RevokeMeasmReports command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "RevokeMeasmReports command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::RevokeMeasmReports as u8],
-                                    );
                                 }
                                 gs_debug_println!("RevokeMeasmReports command sent");
                             }
                         TelemetryCommand::VelocityChecks => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "VelocityChecks",
                                     &[FlightComputerCommands::MeasmReports as u8],
                                 ) {
                                     log_telemetry_error("failed to log VelocityChecks command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "VelocityChecks command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::VelocityChecks as u8],
-                                    );
                                 }
                                 gs_debug_println!("MeasmReports command sent");
                             }
                         TelemetryCommand::RevokeVelocityChecks => {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
+                                    "RevokeVelocityChecks",
                                     &[FlightComputerCommands::RevokeVelocityChecks as u8],
                                 ) {
                                     log_telemetry_error("failed to log RevokeVelocityChecks command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "RevokeVelocityChecks command",
-                                        DataType::FlightCommand,
-                                        &[FlightComputerCommands::RevokeVelocityChecks as u8],
-                                    );
                                 }
                                 gs_debug_println!("RevokeMeasmReports command sent");
                             }
@@ -2684,14 +829,14 @@ pub async fn telemetry_task(
                                 state.broadcast_action_policy_snapshot();
                                 gs_debug_println!("Launch indicator latch reset");
                         }
-                        #[cfg(feature = "hitl_mode")]
+                        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
                         TelemetryCommand::AdvanceFlightState => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, 1);
                                 set_local_flight_state_for_operator_mode(&state, next).await;
                                 gs_debug_println!("Operator-mode flight state advanced: {:?} -> {:?}", current, next);
                         }
-                        #[cfg(feature = "hitl_mode")]
+                        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
                         TelemetryCommand::RewindFlightState => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, -1);
@@ -2699,30 +844,32 @@ pub async fn telemetry_task(
                                 gs_debug_println!("Operator-mode flight state rewound: {:?} -> {:?}", current, next);
                         }
                         #[cfg(feature = "hitl_mode")]
-                        TelemetryCommand::DeployParachute
+                        TelemetryCommand::EvalSuccessive
+                        | TelemetryCommand::RevokeEvalSuccessive
+                        | TelemetryCommand::ResetFailures
+                        | TelemetryCommand::RevokeResetFailures
+                        | TelemetryCommand::DeployParachute
                         | TelemetryCommand::ExpandParachute
                         | TelemetryCommand::EvaluationRelax
                         | TelemetryCommand::EvaluationFocus
                         | TelemetryCommand::EvaluationAbort
                         | TelemetryCommand::ReinitSensors
                         | TelemetryCommand::ReinitBarometer
-                        | TelemetryCommand::ReinitIMU
+                        | TelemetryCommand::EnableIMU
                         | TelemetryCommand::DisableIMU
+                        | TelemetryCommand::AbortAfter15
                         | TelemetryCommand::AbortAfter40
-                        | TelemetryCommand::AbortAfter100
-                        | TelemetryCommand::AbortAfter250
-                        | TelemetryCommand::ReinitAfter15
-                        | TelemetryCommand::ReinitAfter30
-                        | TelemetryCommand::ReinitAfter50 => {
+                        | TelemetryCommand::AbortAfter70
+                        | TelemetryCommand::ReinitAfter12
+                        | TelemetryCommand::ReinitAfter26
+                        | TelemetryCommand::ReinitAfter44 => {
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
-                                if let Err(e) = queue_locally_routed_flight_command(&router, &[cmd_id]) {
+                                if let Err(e) = queue_locally_routed_flight_command(
+                                    &router,
+                                    "HITL flight command",
+                                    &[cmd_id],
+                                ) {
                                     log_telemetry_error("failed to log HITL flight command", e);
-                                } else {
-                                    log_command_queue_success(
-                                        "HITL flight command",
-                                        DataType::FlightCommand,
-                                        &[cmd_id],
-                                    );
                                 }
                                 gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
                             }
@@ -2837,17 +984,6 @@ pub async fn telemetry_task(
         ),
     }
 
-    db_overflow.running.store(false, Ordering::Relaxed);
-    db_overflow.notify.notify_waiters();
-    match tokio::time::timeout(worker_shutdown_timeout, db_overflow_worker).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("DB overflow worker ended with error: {e}"),
-        Err(_) => eprintln!(
-            "DB overflow worker did not shut down within {:?}",
-            worker_shutdown_timeout
-        ),
-    }
-
     match tokio::time::timeout(worker_shutdown_timeout, db_worker).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("DB worker ended with error: {e}"),
@@ -2908,14 +1044,15 @@ fn queue_guarded_fill_command(
         log_telemetry_error(&format!("failed to queue {label}"), err);
         return;
     }
-    log_command_queue_success(label, data_type, &[cmd_payload]);
+    log_command_dispatch(label, "umbilical_comms", data_type, &[cmd_payload]);
     state.set_pending_umbilical_valve_state(key_cmd_id, desired_state);
-    state.set_umbilical_valve_state(key_cmd_id, desired_state);
     sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
 }
 
 const VALVE_STATE_DATA_TYPE: &str = "VALVE_STATE";
+const UMBILICAL_PENDING_VALVE_MISMATCH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
 
 fn bool_to_f32(value: Option<bool>) -> Option<f32> {
     value.map(|v| if v { 1.0 } else { 0.0 })
@@ -2977,15 +1114,17 @@ async fn insert_db_batch_once(
             }
             DbWrite::Telemetry {
                 timestamp_ms,
+                source_timestamp_ms,
                 data_type,
                 sender_id,
                 values_json,
                 payload_json,
             } => {
                 sqlx::query(
-                    "INSERT INTO telemetry (timestamp_ms, data_type, sender_id, values_json, payload_json) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO telemetry (timestamp_ms, source_timestamp_ms, data_type, sender_id, values_json, payload_json) VALUES (?, ?, ?, ?, ?, ?)",
                 )
                     .bind(*timestamp_ms)
+                    .bind(*source_timestamp_ms)
                     .bind(data_type.as_str())
                     .bind(sender_id.as_str())
                     .bind(values_json.as_deref())
@@ -3034,41 +1173,90 @@ async fn insert_db_batch_with_retry(
     Err(last_err.unwrap())
 }
 
-async fn flush_recording_batch(active: Option<&sqlx::SqlitePool>, batch: &mut Vec<DbWrite>) {
+async fn flush_recording_batch(
+    active: Option<&sqlx::SqlitePool>,
+    batch: &mut Vec<DbWrite>,
+) -> bool {
     if batch.is_empty() {
-        return;
+        return true;
     }
-    if let Some(active) = active
-        && let Err(e) = insert_db_batch_with_retry(active, batch).await
-    {
-        eprintln!("DB insert failed after retry: {e}");
+    if let Some(active) = active {
+        if let Err(e) = insert_db_batch_with_retry(active, batch).await {
+            eprintln!("DB insert failed after retry; preserving batch for retry: {e}");
+            return false;
+        }
     }
     batch.clear();
+    true
 }
 
-async fn rotate_placeholder_db(state: &Arc<AppState>, placeholder_path: &str, mode: RecordingMode) {
+async fn rotate_placeholder_db(state: &Arc<AppState>, mode: RecordingMode) {
     let old_pool = state.telemetry_db_pool();
     let old_path = state.telemetry_db_path();
-    if old_path != placeholder_path {
+    if old_path != "sqlite::memory:" {
         close_and_finalize_sqlite(old_pool, &old_path).await;
+        delete_empty_recording_if_needed(&old_path).await;
+    } else {
+        old_pool.close().await;
     }
-    let _ = std::fs::remove_file(placeholder_path);
-    match open_telemetry_db(std::path::Path::new(placeholder_path)).await {
-        Ok((db, db_path)) => {
-            state.replace_telemetry_db(db, db_path.clone());
+    match open_in_memory_telemetry_db().await {
+        Ok(db) => {
+            state.replace_telemetry_db(db, "sqlite::memory:".to_string());
             state.set_recording_status(RecordingStatusMsg {
                 mode: RecordingModeWire::from(mode),
-                db_path: Some(db_path),
+                db_path: None,
             });
         }
         Err(err) => {
             emit_warning(
                 state,
-                format!("Failed to reopen placeholder telemetry DB: {err}"),
+                format!("Failed to reopen in-memory telemetry DB: {err}"),
             );
         }
     }
 }
+
+async fn delete_empty_recording_if_needed(db_path: &str) -> bool {
+    match delete_sqlite_if_empty(db_path).await {
+        Ok(true) => {
+            log::info!("deleted empty recording db={db_path}");
+            true
+        }
+        Ok(false) => false,
+        Err(err) => {
+            log::error!("failed checking empty recording db {db_path}: {err}");
+            false
+        }
+    }
+}
+
+async fn clear_telemetry_tables(db: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    for stmt in [
+        "DELETE FROM telemetry",
+        "DELETE FROM alerts",
+        "DELETE FROM flight_state",
+        "DELETE FROM messages",
+    ] {
+        sqlx::query(stmt).execute(db).await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test_fire_mode")]
+async fn export_test_fire_csv_if_enabled(state: &Arc<AppState>, db_path: &str) {
+    let csv_path = test_fire_csv::csv_path_for_db_path(db_path);
+    let calibration = state.loadcell_calibration.lock().unwrap().clone();
+    match test_fire_csv::export_recording_csv(db_path, &csv_path, &calibration).await {
+        Ok(()) => log::info!("exported test-fire csv {}", csv_path.display()),
+        Err(err) => log::error!(
+            "failed exporting test-fire csv for {}: {err}",
+            csv_path.display()
+        ),
+    }
+}
+
+#[cfg(not(feature = "test_fire_mode"))]
+async fn export_test_fire_csv_if_enabled(_state: &Arc<AppState>, _db_path: &str) {}
 
 async fn queue_db_write(
     state: &AppState,
@@ -3076,62 +1264,11 @@ async fn queue_db_write(
     db_overflow: &DbOverflow,
     write: DbWrite,
 ) {
-    if drop_db_writes_on_backpressure() {
-        match db_tx.try_send(DbQueueItem::Write(write)) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                DB_BACKPRESSURE_DROPPED.fetch_add(1, Ordering::Relaxed);
-                if !db_backpressure_log_enabled() {
-                    return;
-                }
-                let now_ms = get_current_timestamp_ms();
-                let prev = DB_BACKPRESSURE_LAST_LOG_MS.load(Ordering::Relaxed);
-                if now_ms.saturating_sub(prev) >= db_backpressure_log_interval_ms() {
-                    DB_BACKPRESSURE_LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
-                    let dropped = DB_BACKPRESSURE_DROPPED.swap(0, Ordering::Relaxed);
-                    eprintln!(
-                        "Telemetry DB backpressured: dropped {} DB rows (realtime ingest preserved)",
-                        dropped
-                    );
-                }
-            }
-            Err(TrySendError::Closed(_)) => {
-                emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
-            }
-        }
-        return;
-    }
-
+    let _ = db_overflow;
     match db_tx.try_send(DbQueueItem::Write(write)) {
         Ok(()) => {}
         Err(TrySendError::Full(DbQueueItem::Write(write))) => {
-            let mut write_opt = Some(write);
-            let mut queued_len = 0usize;
-            let mut pushed = false;
-            {
-                let mut q = db_overflow.queue.lock().unwrap();
-                if q.len() < db_overflow.max_entries {
-                    q.push_back(write_opt.take().unwrap());
-                    queued_len = q.len();
-                    pushed = true;
-                }
-            }
-            if pushed {
-                db_overflow.notify.notify_one();
-                let now_ms = get_current_timestamp_ms();
-                let prev = DB_OVERFLOW_LAST_LOG_MS.load(Ordering::Relaxed);
-                if now_ms.saturating_sub(prev) >= 60_000 {
-                    DB_OVERFLOW_LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
-                    eprintln!(
-                        "Telemetry DB overflow queue buffered {} pending rows (no drop mode)",
-                        queued_len
-                    );
-                }
-            } else if db_tx
-                .send(DbQueueItem::Write(write_opt.take().unwrap()))
-                .await
-                .is_err()
-            {
+            if db_tx.send(DbQueueItem::Write(write)).await.is_err() {
                 emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
             }
         }
@@ -3154,6 +1291,15 @@ async fn handle_packet(
     pkt: Packet,
 ) -> Vec<TelemetryRow> {
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+    if cfg!(feature = "test_fire_mode")
+        && *state.state.lock().unwrap() == FlightState::Startup
+        && state.all_required_boards_seen()
+    {
+        state.set_local_flight_state(FlightState::Idle);
+        state.set_sequence_policy_state(crate::sequences::SequencePolicyState::default());
+        sequences::refresh_action_policy_now(state);
+        state.broadcast_action_policy_snapshot();
+    }
     let sender_id = canonical_sender_id(pkt.sender()).to_string();
 
     if pkt.data_type() == DataType::Warning {
@@ -3235,7 +1381,12 @@ async fn handle_packet(
             *fs = new_flight_state;
         }
         let ts_ms = pkt.timestamp() as i64;
-        state.update_launch_clock_for_state(new_flight_state, ts_ms);
+        let launch_clock_ts_ms = if sender_id == Board::GroundStation.sender_id() {
+            ts_ms
+        } else {
+            get_current_timestamp_ms() as i64
+        };
+        state.update_launch_clock_for_state(new_flight_state, launch_clock_ts_ms);
         queue_db_write(
             state,
             db_tx,
@@ -3267,8 +1418,12 @@ async fn handle_packet(
                 return Vec::new();
             }
             if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
-                state.clear_pending_umbilical_valve_state(key_cmd_id);
                 state.set_umbilical_valve_state(key_cmd_id, key_on);
+                state.reconcile_pending_umbilical_valve_state(
+                    key_cmd_id,
+                    key_on,
+                    UMBILICAL_PENDING_VALVE_MISMATCH_TIMEOUT,
+                );
                 if key_cmd_id == ValveBoardCommands::PilotOpen as u8 && key_on {
                     transition_launch_clock_to_t_plus_from_pilot_open(state);
                 }
@@ -3293,6 +1448,7 @@ async fn handle_packet(
                     db_overflow,
                     DbWrite::Telemetry {
                         timestamp_ms: ts_ms,
+                        source_timestamp_ms: Some(pkt.timestamp() as i64),
                         data_type: VALVE_STATE_DATA_TYPE.to_string(),
                         sender_id: sender_id.clone(),
                         values_json,
@@ -3343,6 +1499,7 @@ async fn handle_packet(
                     db_overflow,
                     DbWrite::Telemetry {
                         timestamp_ms: ts_ms,
+                        source_timestamp_ms: Some(pkt.timestamp() as i64),
                         data_type: row_data_type.clone(),
                         sender_id: sender_id.clone(),
                         values_json: telemetry_values_json(&row_values),
@@ -3353,11 +1510,19 @@ async fn handle_packet(
             }
 
             if let Some(first_value) = row_values.first().copied().flatten() {
+                if row_data_type == DataType::BatteryVoltage.as_str()
+                    && is_fill_system_battery_sender(&sender_id)
+                    && update_fill_system_low_voltage_latch(first_value)
+                {
+                    emit_warning(state, FILL_SYSTEM_LOW_VOLTAGE_WARNING);
+                }
+
                 emit_derived_battery_rows(
                     state,
                     db_tx,
                     db_overflow,
                     ts_ms,
+                    Some(pkt.timestamp() as i64),
                     &sender_id,
                     &row_data_type,
                     first_value,
@@ -3377,6 +1542,7 @@ async fn handle_packet(
                         db_overflow,
                         DerivedLoadcellSample {
                             ts_ms,
+                            source_timestamp_ms: Some(pkt.timestamp() as i64),
                             sender_id: &sender_id,
                             sensor_id: &row_data_type,
                             raw_value: first_value,
@@ -3395,6 +1561,7 @@ async fn handle_packet(
                     db_tx,
                     db_overflow,
                     ts_ms,
+                    Some(pkt.timestamp() as i64),
                     speed_mps,
                     &payload_json,
                 )
@@ -3418,6 +1585,7 @@ async fn handle_packet(
                 db_overflow,
                 DbWrite::Telemetry {
                     timestamp_ms: ts_ms,
+                    source_timestamp_ms: Some(pkt.timestamp() as i64),
                     data_type: data_type_str.clone(),
                     sender_id: sender_id.clone(),
                     values_json: None,
@@ -3498,53 +1666,6 @@ fn log_router_decode_error(err: sedsprintf_rs_2026::TelemetryError) {
     }
 }
 
-fn log_command_queue_success(context: &str, ty: DataType, payload: &[u8]) {
-    eprintln!(
-        "{context}: queued ty={ty:?} payload={}",
-        payload
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-}
-
-fn queue_locally_routed_command<T: Copy + 'static>(
-    router: &Router,
-    ty: DataType,
-    payload: &[T],
-) -> sedsprintf_rs_2026::TelemetryResult<()> {
-    let timestamp_ms = get_current_timestamp_ms();
-    let endpoints = endpoints_from_datatype(ty);
-    let pkt = Packet::from_prim_le_slice(ty, payload, endpoints, timestamp_ms)?;
-    router.rx_queue(pkt)
-}
-
-fn queue_locally_routed_flight_command(
-    router: &Router,
-    payload: &[u8],
-) -> sedsprintf_rs_2026::TelemetryResult<()> {
-    let topology = router.export_topology();
-    let rocket_has_fc = topology.routes.iter().any(|route| {
-        route.side_name == "rocket_comms"
-            && route
-                .reachable_endpoints
-                .contains(&DataEndpoint::FlightController)
-    });
-    let umbilical_has_fc = topology.routes.iter().any(|route| {
-        route.side_name == "umbilical_comms"
-            && route
-                .reachable_endpoints
-                .contains(&DataEndpoint::FlightController)
-    });
-
-    if rocket_has_fc && !umbilical_has_fc {
-        return queue_locally_routed_command(router, DataType::FlightCommand, payload);
-    }
-
-    router.log_queue(DataType::FlightCommand, payload)
-}
-
 fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::TelemetryError> {
     if let Err(err) = router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS) {
         log_telemetry_error("router tx queue processing failed", err);
@@ -3578,18 +1699,12 @@ async fn reset_testing_simulation(state: &Arc<AppState>) {
     state.broadcast_fill_targets_snapshot();
 
     let now_ms = get_current_timestamp_ms() as i64;
-    let db = state.telemetry_db_pool();
-    if let Err(err) = sqlx::query("DELETE FROM telemetry").execute(&db).await {
-        eprintln!("Reset Sim failed to clear telemetry table: {err}");
-    }
-    if let Err(err) = sqlx::query("DELETE FROM alerts").execute(&db).await {
-        eprintln!("Reset Sim failed to clear alerts table: {err}");
-    }
-    if let Err(err) = sqlx::query("DELETE FROM flight_state").execute(&db).await {
-        eprintln!("Reset Sim failed to clear flight_state table: {err}");
-    }
-    if let Err(err) = sqlx::query("DELETE FROM messages").execute(&db).await {
-        eprintln!("Reset Sim failed to clear messages table: {err}");
+    if let Err(err) = state
+        .db_queue_tx
+        .send(DbQueueItem::Control(RecordingCommand::ResetAll))
+        .await
+    {
+        eprintln!("Reset Sim failed to enqueue DB reset: {err}");
     }
     state.set_messages_snapshot(Vec::new());
     if let Err(err) = state
@@ -3611,12 +1726,6 @@ async fn reset_testing_simulation(state: &Arc<AppState>) {
         .board_status_tx
         .send(state.board_status_snapshot(now_ms));
     state.broadcast_dashboard_reset();
-}
-
-fn flush_command_tx(router: &Router, context: &str) {
-    if let Err(err) = router.process_all_queues_with_timeout(ROUTER_TX_BUDGET_MS) {
-        log_telemetry_error(context, err);
-    }
 }
 
 fn payload_json_from_pkt(pkt: &Packet) -> String {
@@ -3676,12 +1785,7 @@ mod tests {
     }
 
     fn test_db_overflow() -> DbOverflow {
-        DbOverflow {
-            queue: Arc::new(Mutex::new(VecDeque::new())),
-            notify: Arc::new(Notify::new()),
-            running: Arc::new(AtomicBool::new(true)),
-            max_entries: 16,
-        }
+        DbOverflow
     }
 
     #[test]
@@ -3751,6 +1855,18 @@ mod tests {
             &serialize::serialize_packet(&valve_pkt)
         ));
 
+        let abort_pkt = Packet::new(
+            DataType::Abort,
+            &[sedsprintf_rs_2026::config::DataEndpoint::Abort],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from("Manual Abort Command Issued".as_bytes()),
+        )
+        .expect("failed to build abort packet");
+        assert!(is_fill_system_command_payload(
+            &serialize::serialize_packet(&abort_pkt)
+        ));
+
         let flight_pkt = Packet::new(
             DataType::FlightCommand,
             &[sedsprintf_rs_2026::config::DataEndpoint::FlightController],
@@ -3764,7 +1880,1372 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn queue_abort_packet_transmits_to_router_side() {
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sent_clone = sent.clone();
+        let router = Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        );
+        router.add_side_serialized_with_options(
+            "umbilical_comms",
+            move |bytes| {
+                sent_clone
+                    .lock()
+                    .expect("failed to lock sent packets")
+                    .push(bytes.to_vec());
+                Ok(())
+            },
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+
+        queue_abort_packet(&router, "Manual Abort Command Issued")
+            .expect("failed to queue abort packet");
+        router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process router queues");
+
+        let sent = sent.lock().expect("failed to lock sent packets");
+        let abort_packets = sent
+            .iter()
+            .filter_map(|wire| serialize::deserialize_packet(wire).ok())
+            .filter(|pkt| pkt.data_type() == DataType::Abort)
+            .collect::<Vec<_>>();
+        assert_eq!(abort_packets.len(), 1);
+        assert_eq!(abort_packets[0].payload(), b"Manual Abort Command Issued");
+    }
+
+    #[test]
+    fn flight_command_transmits_to_rocket_side_when_fc_is_discovered_there() {
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sent_clone = sent.clone();
+        let router = Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        );
+        let rocket_side = router.add_side_serialized_with_options(
+            "rocket_comms",
+            move |bytes| {
+                sent_clone
+                    .lock()
+                    .expect("failed to lock sent packets")
+                    .push(bytes.to_vec());
+                Ok(())
+            },
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let discovery = sedsprintf_rs_2026::discovery::build_discovery_announce(
+            Board::RFBoard.sender_id(),
+            123,
+            &[DataEndpoint::FlightController],
+        )
+        .expect("failed to build RF discovery");
+        let discovery_wire = serialize::serialize_packet(&discovery);
+        router
+            .rx_serialized_from_side(&discovery_wire, rocket_side)
+            .expect("failed to queue RF discovery");
+        router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process RF discovery");
+
+        queue_locally_routed_flight_command(
+            &router,
+            "test flight command",
+            &[FlightComputerCommands::VigilantMode as u8],
+        )
+        .expect("failed to queue flight command");
+        router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process router queues");
+
+        let sent = sent.lock().expect("failed to lock sent packets");
+        let flight_packets = sent
+            .iter()
+            .filter_map(|wire| serialize::deserialize_packet(wire).ok())
+            .filter(|pkt| pkt.data_type() == DataType::FlightCommand)
+            .collect::<Vec<_>>();
+        assert!(!flight_packets.is_empty());
+        assert_eq!(
+            flight_packets[0].payload(),
+            &[FlightComputerCommands::VigilantMode as u8]
+        );
+        assert!(
+            flight_packets[0]
+                .endpoints()
+                .contains(&DataEndpoint::FlightController)
+        );
+    }
+
+    struct TestRadioComms {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        scheduler_status: Option<Arc<Mutex<Vec<(u8, bool)>>>>,
+        windows: VecDeque<crate::comms::RadioWindowUpdate>,
+        inject_tx_on_recv: Option<(mpsc::UnboundedSender<Vec<u8>>, Vec<u8>)>,
+        fail_sends: usize,
+    }
+
+    impl CommsDevice for TestRadioComms {
+        fn recv_packet(
+            &mut self,
+            _router: &Router,
+            _packet_tap: &mut dyn FnMut(&Packet),
+        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+            Ok(())
+        }
+
+        fn send_data(
+            &mut self,
+            payload: &[u8],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail_sends > 0 {
+                self.fail_sends -= 1;
+                return Err("injected radio send failure".into());
+            }
+            self.sent
+                .lock()
+                .expect("failed to lock sent radio payloads")
+                .push(payload.to_vec());
+            Ok(())
+        }
+
+        fn set_side_id(&mut self, _side_id: RouterSideId) {}
+
+        fn recv_serialized_packets_with_budget(
+            &mut self,
+            _packet_sink: &mut dyn FnMut(Vec<u8>),
+            _timeout: Duration,
+            _max_packets: usize,
+        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+            if let Some((tx, payload)) = self.inject_tx_on_recv.take() {
+                tx.send(payload)
+                    .expect("failed to inject radio worker tx during recv");
+            }
+            Ok(())
+        }
+
+        fn take_radio_window_update(&mut self) -> Option<crate::comms::RadioWindowUpdate> {
+            self.windows.pop_front()
+        }
+
+        fn send_radio_scheduler_status(
+            &mut self,
+            seq: u8,
+            has_more: bool,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if let Some(status) = &self.scheduler_status {
+                status
+                    .lock()
+                    .expect("failed to lock scheduler statuses")
+                    .push((seq, has_more));
+            }
+            Ok(())
+        }
+    }
+
+    const RFBOARD_SCHED_DOWNLINK: u8 = 0;
+    const RFBOARD_SCHED_UPLINK: u8 = 1;
+    const RFBOARD_SCHED_FLAG_HAS_MORE: u8 = 0x01;
+    const RFBOARD_SCHED_FLAG_YIELD: u8 = 0x02;
+    const RFBOARD_SCHED_BURST_MESSAGES: usize = 5;
+    const RFBOARD_SCHED_DOWNLINK_TIMEOUT_MS: u64 = 500;
+    const RFBOARD_SCHED_UPLINK_TIMEOUT_MS: u64 = 3000;
+    const RFBOARD_SCHED_IDLE_UPLINK_POLL_MS: u64 = 50;
+    const RFBOARD_SCHED_GRANT_RETRY_MS: u64 = 50;
+    const RFBOARD_SCHED_GRANT_REANNOUNCE_MS: u64 = 5000;
+    const RFBOARD_SCHED_TURNAROUND_MS: u64 = 75;
+    const RFBOARD_SCHED_UPLINK_TO_DOWNLINK_TURNAROUND_MS: u64 = 150;
+    const RFBOARD_SCHED_GS_TX_TURNAROUND_MS: u64 = 100;
+
+    struct RfBoardScheduler {
+        radio_turn: u8,
+        radio_turn_seq: u8,
+        radio_turn_sent: usize,
+        radio_turn_grant_sent: bool,
+        radio_turn_started_ms: u64,
+        next_control_retry_ms: u64,
+        next_grant_reannounce_ms: u64,
+        next_idle_uplink_poll_ms: u64,
+        now_ms: u64,
+        started_at: std::time::Instant,
+        gs_seq: u8,
+        gs_flags: u8,
+        gs_seen: bool,
+    }
+
+    impl RfBoardScheduler {
+        fn new() -> Self {
+            Self {
+                radio_turn: RFBOARD_SCHED_DOWNLINK,
+                radio_turn_seq: 0,
+                radio_turn_sent: 0,
+                radio_turn_grant_sent: false,
+                radio_turn_started_ms: 0,
+                next_control_retry_ms: 0,
+                next_grant_reannounce_ms: 0,
+                next_idle_uplink_poll_ms: 0,
+                now_ms: 0,
+                started_at: std::time::Instant::now(),
+                gs_seq: 0,
+                gs_flags: 0,
+                gs_seen: false,
+            }
+        }
+
+        fn handle_ground_station_status(&mut self, seq: u8, has_more: bool) {
+            self.gs_seq = seq;
+            self.gs_flags = RFBOARD_SCHED_FLAG_YIELD
+                | if has_more {
+                    RFBOARD_SCHED_FLAG_HAS_MORE
+                } else {
+                    0
+                };
+            self.gs_seen = true;
+        }
+
+        fn step(
+            &mut self,
+            rf_tx_queue: &mut VecDeque<Vec<u8>>,
+            updates: &mut VecDeque<crate::comms::RadioWindowUpdate>,
+            packet_sink: &mut dyn FnMut(Vec<u8>),
+            max_packets: usize,
+        ) {
+            self.now_ms = self.started_at.elapsed().as_millis().max(1) as u64;
+
+            // Copied from rfboard26/Core/Src/telemetry_thread.c:
+            // emit an initial downlink grant, alternate downlink/uplink turns,
+            // retry/reannounce grants, and leave uplink when GS yields or times out.
+            if self.radio_turn_started_ms == 0 {
+                self.radio_turn_started_ms = self.now_ms;
+                self.radio_turn_seq = self.radio_turn_seq.wrapping_add(1);
+                if self.emit_radio_grant(rf_tx_queue, updates) {
+                    self.radio_turn_grant_sent = true;
+                    self.next_grant_reannounce_ms = self.now_ms + RFBOARD_SCHED_GRANT_REANNOUNCE_MS;
+                } else {
+                    self.radio_turn_grant_sent = false;
+                    self.next_control_retry_ms = self.now_ms + RFBOARD_SCHED_GRANT_RETRY_MS;
+                }
+            }
+
+            if self.radio_turn == RFBOARD_SCHED_DOWNLINK {
+                let downlink_timeout = self.now_ms.saturating_sub(self.radio_turn_started_ms)
+                    >= RFBOARD_SCHED_DOWNLINK_TIMEOUT_MS;
+                if self.radio_turn_sent >= RFBOARD_SCHED_BURST_MESSAGES
+                    || downlink_timeout
+                    || (rf_tx_queue.is_empty() && self.now_ms >= self.next_idle_uplink_poll_ms)
+                {
+                    self.radio_turn = RFBOARD_SCHED_UPLINK;
+                    self.radio_turn_sent = 0;
+                    self.radio_turn_seq = self.radio_turn_seq.wrapping_add(1);
+                    self.radio_turn_grant_sent = false;
+                    self.radio_turn_started_ms = self.now_ms;
+                    self.next_control_retry_ms = self.now_ms + RFBOARD_SCHED_TURNAROUND_MS;
+                    self.next_grant_reannounce_ms = self.now_ms
+                        + RFBOARD_SCHED_TURNAROUND_MS
+                        + RFBOARD_SCHED_GRANT_REANNOUNCE_MS;
+                    self.next_idle_uplink_poll_ms = self.now_ms + RFBOARD_SCHED_IDLE_UPLINK_POLL_MS;
+                    self.gs_seen = false;
+                } else if self.radio_turn_grant_sent && max_packets > 0 {
+                    if let Some(payload) = rf_tx_queue.pop_front() {
+                        packet_sink(payload);
+                        self.radio_turn_sent += 1;
+                    }
+                }
+            } else {
+                let gs_done = self.gs_seen
+                    && self.gs_seq == self.radio_turn_seq
+                    && (self.gs_flags & RFBOARD_SCHED_FLAG_YIELD) != 0;
+                let uplink_timeout = self.now_ms.saturating_sub(self.radio_turn_started_ms)
+                    >= RFBOARD_SCHED_UPLINK_TIMEOUT_MS;
+                if gs_done || uplink_timeout {
+                    self.radio_turn = RFBOARD_SCHED_DOWNLINK;
+                    self.radio_turn_sent = 0;
+                    self.radio_turn_seq = self.radio_turn_seq.wrapping_add(1);
+                    self.radio_turn_grant_sent = false;
+                    self.radio_turn_started_ms = self.now_ms;
+                    self.next_control_retry_ms =
+                        self.now_ms + RFBOARD_SCHED_UPLINK_TO_DOWNLINK_TURNAROUND_MS;
+                    self.next_grant_reannounce_ms = self.now_ms
+                        + RFBOARD_SCHED_UPLINK_TO_DOWNLINK_TURNAROUND_MS
+                        + RFBOARD_SCHED_GRANT_REANNOUNCE_MS;
+                    self.gs_seen = false;
+                }
+            }
+
+            if !self.radio_turn_grant_sent && self.now_ms >= self.next_control_retry_ms {
+                if self.emit_radio_grant(rf_tx_queue, updates) {
+                    self.radio_turn_grant_sent = true;
+                    self.next_grant_reannounce_ms = self.now_ms + RFBOARD_SCHED_GRANT_REANNOUNCE_MS;
+                } else {
+                    self.radio_turn_grant_sent = false;
+                    self.next_control_retry_ms = self.now_ms + RFBOARD_SCHED_GRANT_RETRY_MS;
+                }
+            } else if self.radio_turn_grant_sent
+                && self.now_ms >= self.next_grant_reannounce_ms
+                && (self.radio_turn == RFBOARD_SCHED_UPLINK
+                    || (self.radio_turn == RFBOARD_SCHED_DOWNLINK && rf_tx_queue.is_empty()))
+            {
+                if self.emit_radio_grant(rf_tx_queue, updates) {
+                    self.next_grant_reannounce_ms = self.now_ms + RFBOARD_SCHED_GRANT_REANNOUNCE_MS;
+                } else {
+                    self.next_grant_reannounce_ms = self.now_ms + RFBOARD_SCHED_GRANT_RETRY_MS;
+                }
+            }
+        }
+
+        fn emit_radio_grant(
+            &self,
+            rf_tx_queue: &VecDeque<Vec<u8>>,
+            updates: &mut VecDeque<crate::comms::RadioWindowUpdate>,
+        ) -> bool {
+            let _flags = if rf_tx_queue.is_empty() {
+                0
+            } else {
+                RFBOARD_SCHED_FLAG_HAS_MORE
+            };
+            updates.push_back(crate::comms::RadioWindowUpdate {
+                kind: if self.radio_turn == RFBOARD_SCHED_UPLINK {
+                    crate::comms::RadioWindowKind::UplinkOpen
+                } else {
+                    crate::comms::RadioWindowKind::DownlinkOpen
+                },
+                seq: self.radio_turn_seq,
+                credit: RFBOARD_SCHED_BURST_MESSAGES,
+                turnaround_ms: RFBOARD_SCHED_GS_TX_TURNAROUND_MS,
+            });
+            true
+        }
+    }
+
+    struct RfBoardSchedulerComms {
+        sent_from_ground: Arc<Mutex<Vec<Vec<u8>>>>,
+        ground_tx_turns: Arc<Mutex<Vec<u8>>>,
+        scheduler_status: Arc<Mutex<Vec<(u8, bool)>>>,
+        rf_tx_queue: VecDeque<Vec<u8>>,
+        updates: VecDeque<crate::comms::RadioWindowUpdate>,
+        scheduler: RfBoardScheduler,
+    }
+
+    impl CommsDevice for RfBoardSchedulerComms {
+        fn recv_packet(
+            &mut self,
+            _router: &Router,
+            _packet_tap: &mut dyn FnMut(&Packet),
+        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+            Ok(())
+        }
+
+        fn send_data(
+            &mut self,
+            payload: &[u8],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.sent_from_ground
+                .lock()
+                .expect("failed to lock ground tx packets")
+                .push(payload.to_vec());
+            self.ground_tx_turns
+                .lock()
+                .expect("failed to lock ground tx turns")
+                .push(self.scheduler.radio_turn);
+            Ok(())
+        }
+
+        fn set_side_id(&mut self, _side_id: RouterSideId) {}
+
+        fn recv_serialized_packets_with_budget(
+            &mut self,
+            packet_sink: &mut dyn FnMut(Vec<u8>),
+            _timeout: Duration,
+            max_packets: usize,
+        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+            self.scheduler.step(
+                &mut self.rf_tx_queue,
+                &mut self.updates,
+                packet_sink,
+                max_packets,
+            );
+            Ok(())
+        }
+
+        fn take_radio_window_update(&mut self) -> Option<crate::comms::RadioWindowUpdate> {
+            self.updates.pop_front()
+        }
+
+        fn send_radio_scheduler_status(
+            &mut self,
+            seq: u8,
+            has_more: bool,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.scheduler.handle_ground_station_status(seq, has_more);
+            self.scheduler_status
+                .lock()
+                .expect("failed to lock scheduler statuses")
+                .push((seq, has_more));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn rfboard_scheduler_drives_web_button_command_and_rf_data_paths() {
+        let (db_tx, db_rx) = mpsc::channel(32);
+        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        let mut policy = state.action_policy_snapshot();
+        for control in policy.controls.iter_mut() {
+            if control.cmd == "VigilantMode" {
+                control.enabled = true;
+            }
+        }
+        state.set_action_policy(policy);
+        let mut ws_rx = state.ws_tx.subscribe();
+
+        let handler_state = state.clone();
+        let ground_station_handler =
+            sedsprintf_rs_2026::router::EndpointHandler::new_packet_handler(
+                DataEndpoint::GroundStation,
+                move |pkt: &Packet| {
+                    handler_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+                    handler_state.mark_packet_received(get_current_timestamp_ms());
+                    handler_state.ring_buffer.lock().unwrap().push(pkt.clone());
+                    Ok(())
+                },
+            );
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([ground_station_handler]),
+        ));
+        let (radio_tx, radio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        register_flight_command_tx_side("rocket_comms", radio_tx.clone());
+        let side_id = {
+            let radio_tx = radio_tx.clone();
+            router.add_side_serialized_with_options(
+                "rocket_comms",
+                move |bytes| {
+                    radio_tx.send(bytes.to_vec()).map_err(|_| {
+                        sedsprintf_rs_2026::TelemetryError::HandlerError("radio tx closed")
+                    })?;
+                    Ok(())
+                },
+                sedsprintf_rs_2026::router::RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: true,
+                },
+            )
+        };
+        let rf_discovery = sedsprintf_rs_2026::discovery::build_discovery_announce(
+            Board::RFBoard.sender_id(),
+            1,
+            &[DataEndpoint::FlightController],
+        )
+        .expect("failed to build RF discovery");
+        router
+            .rx_serialized_from_side(&serialize::serialize_packet(&rf_discovery), side_id)
+            .expect("failed to queue RF discovery");
+        router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process RF discovery");
+
+        let gps_values = [31.7619_f32, -106.485_f32, 1412.5_f32];
+        let gps_pkt = Packet::new(
+            DataType::GpsData,
+            &[DataEndpoint::GroundStation],
+            Board::RFBoard.sender_id(),
+            123_456,
+            f32_payload(&gps_values),
+        )
+        .expect("failed to build RF GPS packet");
+        let sent_from_ground = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let ground_tx_turns = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let scheduler_status = Arc::new(Mutex::new(Vec::<(u8, bool)>::new()));
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(RfBoardSchedulerComms {
+                sent_from_ground: sent_from_ground.clone(),
+                ground_tx_turns: ground_tx_turns.clone(),
+                scheduler_status: scheduler_status.clone(),
+                rf_tx_queue: VecDeque::from([serialize::serialize_packet(&gps_pkt).to_vec()]),
+                updates: VecDeque::new(),
+                scheduler: RfBoardScheduler::new(),
+            })));
+        let shutdown_rx = state.shutdown_subscribe();
+        let telemetry = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            vec![CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: radio_rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            }],
+            cmd_rx,
+            db_rx,
+            shutdown_rx,
+        ));
+
+        state
+            .cmd_tx
+            .send(TelemetryCommand::VigilantMode)
+            .await
+            .expect("failed to send command through AppState command channel");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .last_command_ms
+                    .lock()
+                    .expect("failed to lock last command map")
+                    .contains_key("VigilantMode")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for telemetry task to accept VigilantMode command");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row = ws_rx.recv().await.expect("telemetry websocket closed");
+                if row.sender_id == Board::RFBoard.sender_id()
+                    && row.data_type == DataType::GpsData.as_str()
+                {
+                    assert_eq!(row.values, gps_values.map(Some).to_vec());
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for RF-board downlink telemetry");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let sent = sent_from_ground
+                    .lock()
+                    .expect("failed to lock ground tx packets");
+                let flight_command_seen = sent
+                    .iter()
+                    .filter_map(|payload| serialize::deserialize_packet(payload).ok())
+                    .any(|pkt| {
+                        pkt.data_type() == DataType::FlightCommand
+                            && pkt.payload() == &[FlightComputerCommands::VigilantMode as u8]
+                            && pkt.endpoints().contains(&DataEndpoint::FlightController)
+                    });
+                if flight_command_seen {
+                    break;
+                }
+                drop(sent);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for GS command during RF-board uplink");
+
+        state.request_shutdown();
+        telemetry.await.expect("telemetry task join failed");
+
+        assert_eq!(
+            state
+                .latest_gps_fix_by_sender
+                .lock()
+                .unwrap()
+                .get(Board::RFBoard.sender_id())
+                .cloned(),
+            Some(gps_values.map(Some).to_vec())
+        );
+        assert!(
+            ground_tx_turns
+                .lock()
+                .expect("failed to lock ground tx turns")
+                .iter()
+                .all(|turn| *turn == RFBOARD_SCHED_UPLINK),
+            "ground station must only transmit during RF-board uplink turns"
+        );
+        assert!(
+            scheduler_status
+                .lock()
+                .expect("failed to lock scheduler statuses")
+                .iter()
+                .any(|(_, has_more)| !*has_more),
+            "GS should yield the RF-board uplink window after sending the command"
+        );
+    }
+
+    #[tokio::test]
+    async fn dedicated_radio_worker_sends_flight_command_during_uplink_window() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                scheduler_status: None,
+                windows: VecDeque::from([crate::comms::RadioWindowUpdate {
+                    kind: crate::comms::RadioWindowKind::UplinkOpen,
+                    seq: 1,
+                    credit: 5,
+                    turnaround_ms: 0,
+                }]),
+                inject_tx_on_recv: None,
+                fail_sends: 0,
+            })));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([FlightComputerCommands::VigilantMode as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let wire = serialize::serialize_packet(&pkt).to_vec();
+        tx.send(wire.clone())
+            .expect("failed to queue flight command to radio worker");
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+                if sent_guard.iter().any(|payload| payload == &wire) {
+                    break;
+                }
+                drop(sent_guard);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for radio worker send_data");
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        let flight_packets = sent_guard
+            .iter()
+            .filter_map(|payload| serialize::deserialize_packet(payload).ok())
+            .filter(|pkt| pkt.data_type() == DataType::FlightCommand)
+            .collect::<Vec<_>>();
+        assert!(!flight_packets.is_empty());
+        assert_eq!(
+            flight_packets[0].payload(),
+            &[FlightComputerCommands::VigilantMode as u8]
+        );
+        assert!(
+            flight_packets[0]
+                .endpoints()
+                .contains(&DataEndpoint::FlightController)
+        );
+    }
+
+    #[tokio::test]
+    async fn dedicated_radio_worker_drains_command_arriving_during_window_poll_before_yield() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let scheduler_status = Arc::new(Mutex::new(Vec::<(u8, bool)>::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([FlightComputerCommands::VigilantMode as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                scheduler_status: Some(scheduler_status.clone()),
+                windows: VecDeque::from([crate::comms::RadioWindowUpdate {
+                    kind: crate::comms::RadioWindowKind::UplinkOpen,
+                    seq: 9,
+                    credit: 5,
+                    turnaround_ms: 0,
+                }]),
+                inject_tx_on_recv: Some((tx.clone(), wire.clone())),
+                fail_sends: 0,
+            })));
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+                let statuses = scheduler_status
+                    .lock()
+                    .expect("failed to lock scheduler statuses");
+                if sent_guard.iter().any(|payload| payload == &wire)
+                    && statuses.iter().any(|status| *status == (9, false))
+                {
+                    break;
+                }
+                drop(statuses);
+                drop(sent_guard);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for command injected during radio poll");
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        assert_eq!(sent_guard.as_slice(), &[wire]);
+        drop(sent_guard);
+
+        let statuses = scheduler_status
+            .lock()
+            .expect("failed to lock scheduler statuses");
+        assert!(statuses.iter().any(|status| *status == (9, false)));
+    }
+
+    #[tokio::test]
+    async fn dedicated_radio_worker_waits_for_uplink_window_before_flight_command() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                scheduler_status: None,
+                windows: VecDeque::new(),
+                inject_tx_on_recv: None,
+                fail_sends: 0,
+            })));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([FlightComputerCommands::VigilantMode as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tx.send(wire.clone())
+            .expect("failed to queue flight command to radio worker");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        assert!(sent_guard.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dedicated_radio_worker_does_not_send_flight_command_during_downlink_window() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                scheduler_status: None,
+                windows: VecDeque::from([crate::comms::RadioWindowUpdate {
+                    kind: crate::comms::RadioWindowKind::DownlinkOpen,
+                    seq: 1,
+                    credit: 5,
+                    turnaround_ms: 0,
+                }]),
+                inject_tx_on_recv: None,
+                fail_sends: 0,
+            })));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([FlightComputerCommands::VigilantMode as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tx.send(wire)
+            .expect("failed to queue flight command to radio worker");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        assert!(sent_guard.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dedicated_radio_worker_prioritizes_flight_command_over_telemetry() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                scheduler_status: None,
+                windows: VecDeque::from([crate::comms::RadioWindowUpdate {
+                    kind: crate::comms::RadioWindowKind::UplinkOpen,
+                    seq: 1,
+                    credit: 1,
+                    turnaround_ms: 0,
+                }]),
+                inject_tx_on_recv: None,
+                fail_sends: 0,
+            })));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let telemetry_pkt = Packet::new(
+            DataType::Heartbeat,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([]),
+        )
+        .expect("failed to build telemetry packet");
+        let telemetry_wire = serialize::serialize_packet(&telemetry_pkt).to_vec();
+        let command_pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            124,
+            Arc::from([FlightComputerCommands::VigilantMode as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let command_wire = serialize::serialize_packet(&command_pkt).to_vec();
+        tx.send(telemetry_wire)
+            .expect("failed to queue telemetry to radio worker");
+        tx.send(command_wire.clone())
+            .expect("failed to queue flight command to radio worker");
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+                if !sent_guard.is_empty() {
+                    break;
+                }
+                drop(sent_guard);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for radio worker send_data");
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        assert_eq!(sent_guard.first(), Some(&command_wire));
+    }
+
+    #[tokio::test]
+    async fn dedicated_radio_worker_retries_flight_command_after_send_failure() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                scheduler_status: None,
+                windows: VecDeque::from([
+                    crate::comms::RadioWindowUpdate {
+                        kind: crate::comms::RadioWindowKind::UplinkOpen,
+                        seq: 1,
+                        credit: 1,
+                        turnaround_ms: 0,
+                    },
+                    crate::comms::RadioWindowUpdate {
+                        kind: crate::comms::RadioWindowKind::UplinkOpen,
+                        seq: 2,
+                        credit: 1,
+                        turnaround_ms: 0,
+                    },
+                ]),
+                inject_tx_on_recv: None,
+                fail_sends: 1,
+            })));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([FlightComputerCommands::VigilantMode as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tx.send(wire.clone())
+            .expect("failed to queue flight command to radio worker");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+                if sent_guard.iter().any(|payload| payload == &wire) {
+                    break;
+                }
+                drop(sent_guard);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for retried radio worker send_data");
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        assert_eq!(sent_guard.as_slice(), &[wire]);
+    }
+
+    #[tokio::test]
+    async fn dedicated_radio_worker_yields_rfboard_uplink_after_credit_is_used() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let scheduler_status = Arc::new(Mutex::new(Vec::<(u8, bool)>::new()));
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                scheduler_status: Some(scheduler_status.clone()),
+                windows: VecDeque::from([crate::comms::RadioWindowUpdate {
+                    kind: crate::comms::RadioWindowKind::UplinkOpen,
+                    seq: 7,
+                    credit: 5,
+                    turnaround_ms: 0,
+                }]),
+                inject_tx_on_recv: None,
+                fail_sends: 0,
+            })));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([FlightComputerCommands::VigilantMode as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let expected_window_sends = 5usize;
+        for _ in 0..(expected_window_sends + 1) {
+            tx.send(wire.clone())
+                .expect("failed to queue flight command to radio worker");
+        }
+
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+                let statuses = scheduler_status
+                    .lock()
+                    .expect("failed to lock scheduler statuses");
+                if sent_guard.len() >= expected_window_sends
+                    && statuses.iter().any(|status| *status == (7, true))
+                {
+                    break;
+                }
+                drop(statuses);
+                drop(sent_guard);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for RF-board uplink credit yield");
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        assert_eq!(sent_guard.len(), expected_window_sends);
+        assert!(sent_guard.iter().all(|payload| payload == &wire));
+        drop(sent_guard);
+
+        let statuses = scheduler_status
+            .lock()
+            .expect("failed to lock scheduler statuses");
+        assert!(statuses.iter().any(|status| *status == (7, true)));
+    }
+
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+    #[tokio::test]
+    async fn advance_flight_state_command_reaches_remote_router_end_to_end() {
+        let (db_tx, db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let remote_states = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let remote_states_handler = remote_states.clone();
+        let mut policy = state.action_policy_snapshot();
+        for control in policy.controls.iter_mut() {
+            if matches!(
+                control.cmd.as_str(),
+                "AdvanceFlightState" | "RewindFlightState"
+            ) {
+                control.enabled = true;
+            }
+        }
+        state.set_action_policy(policy);
+
+        let remote_router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([
+                sedsprintf_rs_2026::router::EndpointHandler::new_packet_handler(
+                    DataEndpoint::FlightState,
+                    move |pkt: &Packet| {
+                        if let Some(state_code) = pkt.payload().first().copied() {
+                            remote_states_handler
+                                .lock()
+                                .expect("failed to lock remote states")
+                                .push(state_code);
+                        }
+                        Ok(())
+                    },
+                ),
+            ]),
+        ));
+        let gs_router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+
+        let gs_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+        let remote_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+
+        let gs_side = {
+            let gs_peer = gs_peer.clone();
+            gs_router.add_side_serialized_with_options(
+                "umbilical_comms",
+                move |bytes| {
+                    let (peer, ingress) = gs_peer
+                        .lock()
+                        .expect("failed to lock gs peer")
+                        .clone()
+                        .expect("gs peer not initialized");
+                    peer.rx_serialized_from_side(bytes, ingress)
+                },
+                sedsprintf_rs_2026::router::RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: true,
+                },
+            )
+        };
+        let remote_side = {
+            let remote_peer = remote_peer.clone();
+            remote_router.add_side_serialized_with_options(
+                "gs_link",
+                move |bytes| {
+                    let (peer, ingress) = remote_peer
+                        .lock()
+                        .expect("failed to lock remote peer")
+                        .clone()
+                        .expect("remote peer not initialized");
+                    peer.rx_serialized_from_side(bytes, ingress)
+                },
+                sedsprintf_rs_2026::router::RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: true,
+                },
+            )
+        };
+        *gs_peer.lock().expect("failed to lock gs peer") =
+            Some((remote_router.clone(), remote_side));
+        *remote_peer.lock().expect("failed to lock remote peer") =
+            Some((gs_router.clone(), gs_side));
+
+        remote_router
+            .announce_discovery()
+            .expect("failed to queue remote discovery");
+        remote_router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process remote discovery");
+
+        state
+            .topology_router
+            .set(gs_router.clone())
+            .expect("failed to set topology router");
+
+        let shutdown_rx = state.shutdown_subscribe();
+        let telemetry = tokio::spawn(telemetry_task(
+            state.clone(),
+            gs_router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let start_state = state.local_flight_state_snapshot();
+        let commands = (0..16)
+            .map(|idx| {
+                if idx % 8 >= 4 {
+                    TelemetryCommand::RewindFlightState
+                } else {
+                    TelemetryCommand::AdvanceFlightState
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut expected_states = Vec::with_capacity(commands.len());
+        let mut current = start_state;
+        for cmd in &commands {
+            current = match cmd {
+                TelemetryCommand::AdvanceFlightState => {
+                    operator_mode_adjacent_flight_state(current, 1)
+                }
+                TelemetryCommand::RewindFlightState => {
+                    operator_mode_adjacent_flight_state(current, -1)
+                }
+                _ => current,
+            };
+            expected_states.push(current as u8);
+        }
+
+        for cmd in commands {
+            cmd_tx
+                .send(cmd)
+                .await
+                .expect("failed to send flight state command");
+        }
+
+        let remote_result = tokio::time::timeout(Duration::from_millis(1500), async {
+            loop {
+                let states = remote_states.lock().expect("failed to lock remote states");
+                if states.len() >= expected_states.len() {
+                    break;
+                }
+                drop(states);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+
+        state.request_shutdown();
+        telemetry.await.expect("telemetry task join failed");
+
+        assert_eq!(
+            state.local_flight_state_snapshot() as u8,
+            *expected_states.last().expect("expected states missing")
+        );
+        remote_result.expect("timed out waiting for remote flight state");
+        let states = remote_states.lock().expect("failed to lock remote states");
+        assert_eq!(states.as_slice(), expected_states.as_slice());
+    }
+
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
+        test_app_state_with_cmd_rx(db_tx).await.0
+    }
+
+    async fn test_app_state_with_cmd_rx(
+        db_tx: mpsc::Sender<DbQueueItem>,
+    ) -> (Arc<AppState>, mpsc::Receiver<TelemetryCommand>) {
         reset_parse_error_reports();
         let db = SqlitePool::connect("sqlite::memory:")
             .await
@@ -3772,7 +3253,7 @@ mod tests {
         let auth_db = SqlitePool::connect("sqlite::memory:")
             .await
             .expect("failed to open in-memory auth db");
-        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
         let (ws_tx, _ws_rx) = broadcast::channel(16);
         let (state_tx, _state_rx) = broadcast::channel(4);
         let (board_status_tx, _board_status_rx) = broadcast::channel(4);
@@ -3798,7 +3279,7 @@ mod tests {
             );
         }
 
-        Arc::new(AppState {
+        let state = Arc::new(AppState {
             ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
             cmd_tx,
             ws_tx,
@@ -3814,6 +3295,7 @@ mod tests {
             auth_db,
             state: Arc::new(Mutex::new(FlightState::Startup)),
             state_tx,
+            last_flight_state_packet_ts_ms: Arc::new(AtomicU64::new(0)),
             gpio: GpioPins::new(),
             board_status: Arc::new(Mutex::new(board_status)),
             board_status_tx,
@@ -3825,6 +3307,7 @@ mod tests {
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
             shutdown_tx,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             pending_db_writes: Arc::new(AtomicUsize::new(0)),
             db_write_notify: Arc::new(Notify::new()),
             notifications: Arc::new(Mutex::new(Vec::new())),
@@ -3834,6 +3317,9 @@ mod tests {
             messages_tx,
             next_message_id: Arc::new(AtomicU64::new(0)),
             action_policy: Arc::new(Mutex::new(default_action_policy())),
+            sequence_policy_state: Arc::new(Mutex::new(
+                crate::sequences::SequencePolicyState::default(),
+            )),
             action_policy_tx,
             fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
             fill_targets_tx,
@@ -3841,6 +3327,7 @@ mod tests {
             launch_clock_tx,
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
             launch_indicator_latched: Arc::new(AtomicBool::new(false)),
+            abort_indicator_latched: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "hitl_mode")]
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "hitl_mode")]
@@ -3864,7 +3351,9 @@ mod tests {
             auth: Arc::new(AuthManager::new(PathBuf::from(
                 "/tmp/groundstation-test-users.json",
             ))),
-        })
+        });
+
+        (state, cmd_rx)
     }
 
     fn f32_payload(values: &[f32]) -> Arc<[u8]> {
@@ -4109,7 +3598,7 @@ mod tests {
 
     #[tokio::test]
     async fn fuel_tank_pressure_updates_latest_with_calibrated_value() {
-        let (db_tx, _db_rx) = mpsc::channel(8);
+        let (db_tx, _db_rx) = mpsc::channel(32);
         let state = test_app_state(db_tx.clone()).await;
         let db_overflow = test_db_overflow();
         let mut ws_rx = state.ws_tx.subscribe();
@@ -4216,6 +3705,50 @@ mod tests {
             derived_rows
                 .iter()
                 .all(|derived| derived.timestamp_ms == row.timestamp_ms)
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_box_battery_voltage_below_thirteen_emits_latched_warning() {
+        reset_fill_system_low_voltage_latch_for_tests();
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        let mut warnings_rx = state.warnings_tx.subscribe();
+
+        let pkt = Packet::new(
+            DataType::BatteryVoltage,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            "GB",
+            678_902,
+            f32_payload(&[12.9]),
+        )
+        .expect("failed to build gateway low BATTERY_VOLTAGE packet");
+
+        let rows = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
+        assert_eq!(rows[0].data_type, DataType::BatteryVoltage.as_str());
+
+        let warning = tokio::time::timeout(Duration::from_millis(100), warnings_rx.recv())
+            .await
+            .expect("low fill-box voltage should emit a warning")
+            .expect("warnings channel should remain open");
+        assert_eq!(warning.message, FILL_SYSTEM_LOW_VOLTAGE_WARNING);
+
+        let pkt = Packet::new(
+            DataType::BatteryVoltage,
+            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            "GW",
+            678_903,
+            f32_payload(&[12.8]),
+        )
+        .expect("failed to build gateway repeated low BATTERY_VOLTAGE packet");
+
+        let _ = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), warnings_rx.recv())
+                .await
+                .is_err(),
+            "low fill-box voltage warning should stay latched until voltage recovers"
         );
     }
 

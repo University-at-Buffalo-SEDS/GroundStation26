@@ -139,7 +139,8 @@
         "cmd": "GroundStationLaunch",
         "border": "#22c55e",
         "bg": "#022c22",
-        "fg": "#bbf7d0"
+        "fg": "#bbf7d0",
+        "spacer_row_before": true
       },
       {
         "label": "Dump",
@@ -153,7 +154,8 @@
         "cmd": "Igniter",
         "border": "#60a5fa",
         "bg": "#0b1220",
-        "fg": "#bfdbfe"
+        "fg": "#bfdbfe",
+        "spacer_after": true
       },
       {
         "label": "Pilot",
@@ -163,7 +165,7 @@
         "fg": "#ddd6fe"
       },
       {
-        "label": "NormallyOpen",
+        "label": "Vent",
         "cmd": "NormallyOpen",
         "border": "#f97316",
         "bg": "#1f2937",
@@ -224,6 +226,11 @@
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -243,6 +250,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           },
           {
@@ -255,11 +267,21 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           }
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -279,6 +301,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           },
           {
@@ -291,16 +318,27 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           }
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
         "id": "BATTERY_RUNTIME",
         "label": "Battery Runtime",
+        "show_min_max": false,
         "channels": [
           "Valve Board %",
           "Valve Board Drop",
@@ -420,6 +458,7 @@
       {
         "id": "VALVE_STATE",
         "label": "Valve State",
+        "show_min_max": false,
         "channels": [
           "Pilot",
           "NormallyOpen",
@@ -473,7 +512,11 @@
             "false_label": "Installed",
             "unknown_label": "Unknown"
           }
-        ]
+        ],
+        "display_filter": {
+          "enabled": false,
+          "kind": "raw"
+        }
       },
       {
         "id": "LOADCELL",
@@ -499,7 +542,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               },
               {
                 "title": "Calibrated",
@@ -509,7 +557,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               },
               {
                 "title": "Fill %",
@@ -519,7 +572,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               }
             ],
             "summary_items": [
@@ -530,21 +588,41 @@
                 "formatter": {
                   "kind": "number",
                   "precision": 7
+                },
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
                 }
               },
               {
                 "label": "Calibrated",
                 "data_type": "LOADCELL_WEIGHT_KG",
-                "index": 0
+                "index": 0,
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               },
               {
                 "label": "Fill %",
                 "data_type": "LOADCELL_FILL_PERCENT",
-                "index": 0
+                "index": 0,
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               }
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "time_average",
+              "window_ms": 500
             }
           },
           {
@@ -563,7 +641,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "low_pass",
+                  "cutoff_hz": 8.0
+                }
               },
               {
                 "title": "Calibrated",
@@ -584,6 +667,11 @@
                 "formatter": {
                   "kind": "number",
                   "precision": 7
+                },
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "low_pass",
+                  "cutoff_hz": 8.0
                 }
               },
               {
@@ -594,6 +682,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           }
         ],
@@ -601,7 +694,11 @@
           "enabled": false
         }
       }
-    ]
+    ],
+    "default_display_filter": {
+      "enabled": false,
+      "kind": "raw"
+    }
   },
   "state_tab": {
     "states": [
@@ -707,8 +804,8 @@
         "states": [
           "PreFill",
           "FillTest",
-          "NitrogenFill",
-          "NitrousFill"
+          "NitrousFill",
+          "Aborted"
         ],
         "sections": [
           {
@@ -765,17 +862,32 @@
                   {
                     "data_type": "FUEL_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure"
+                    "label": "Tank Pressure",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "low_pass",
+                      "cutoff_hz": 8.0
+                    }
                   },
                   {
                     "data_type": "LOADCELL_WEIGHT_KG",
                     "index": 0,
-                    "label": "Mass (kg)"
+                    "label": "Mass (kg)",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   },
                   {
                     "data_type": "LOADCELL_FILL_PERCENT",
                     "index": 0,
-                    "label": "Fill Percent"
+                    "label": "Fill Percent",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   }
                 ],
                 "width": 1200.0,
@@ -796,7 +908,7 @@
                     "index": 0
                   },
                   {
-                    "label": "NormallyOpen",
+                    "label": "Vent",
                     "index": 1
                   },
                   {
@@ -1009,17 +1121,32 @@
                   {
                     "data_type": "FUEL_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure"
+                    "label": "Tank Pressure",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "low_pass",
+                      "cutoff_hz": 8.0
+                    }
                   },
                   {
                     "data_type": "LOADCELL_WEIGHT_KG",
                     "index": 0,
-                    "label": "Mass (kg)"
+                    "label": "Mass (kg)",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   },
                   {
                     "data_type": "LOADCELL_FILL_PERCENT",
                     "index": 0,
-                    "label": "Fill Percent"
+                    "label": "Fill Percent",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   }
                 ],
                 "width": 1200.0,
@@ -1063,7 +1190,7 @@
                     "index": 0
                   },
                   {
-                    "label": "NormallyOpen",
+                    "label": "Vent",
                     "index": 1
                   },
                   {
@@ -1141,7 +1268,7 @@
                   }
                 ],
                 "actions": [
-                  "Launch",
+                  "GroundStationLaunch",
                   "Dump",
                   "Pilot",
                   "AdvanceFlightState",
@@ -1285,17 +1412,32 @@
                   {
                     "data_type": "FUEL_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure"
+                    "label": "Tank Pressure",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "low_pass",
+                      "cutoff_hz": 8.0
+                    }
                   },
                   {
                     "data_type": "LOADCELL_WEIGHT_KG",
                     "index": 0,
-                    "label": "Mass (kg)"
+                    "label": "Mass (kg)",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   },
                   {
                     "data_type": "LOADCELL_FILL_PERCENT",
                     "index": 0,
-                    "label": "Fill Percent"
+                    "label": "Fill Percent",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   }
                 ],
                 "width": 1200.0,

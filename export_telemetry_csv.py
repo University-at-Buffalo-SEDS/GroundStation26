@@ -40,12 +40,17 @@ def main() -> None:
             row["name"]
             for row in conn.execute("PRAGMA table_info(telemetry)").fetchall()
         }
-        has_sender_id = "sender_id" in table_cols
+        select_cols = [
+            "timestamp_ms",
+            "data_type",
+            "sender_id" if "sender_id" in table_cols else "NULL AS sender_id",
+            "values_json" if "values_json" in table_cols else "NULL AS values_json",
+            "payload_json" if "payload_json" in table_cols else "NULL AS payload_json",
+        ]
         query = (
-                "SELECT timestamp_ms, data_type, "
-                + ("sender_id, " if has_sender_id else "NULL AS sender_id, ")
-                + "values_json, payload_json "
-                  "FROM telemetry ORDER BY timestamp_ms"
+            "SELECT "
+            + ", ".join(select_cols)
+            + " FROM telemetry ORDER BY timestamp_ms"
         )
         cursor = conn.execute(query)
         col_names = [col[0] for col in cursor.description]

@@ -1,4 +1,6 @@
+use crate::fill_targets::FillTargetsConfig;
 use crate::layout::ValueFormatter;
+use crate::types::FlightState;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -56,23 +58,6 @@ pub enum FitMode {
     Poly3Zero,
     Poly4,
     Poly4Zero,
-}
-
-impl FitMode {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "best" => Some(Self::Best),
-            "linear" => Some(Self::Linear),
-            "linear_zero" => Some(Self::LinearZero),
-            "poly2" | "parabolic" | "quadratic" => Some(Self::Poly2),
-            "poly2_zero" | "parabolic_zero" | "quadratic_zero" => Some(Self::Poly2Zero),
-            "poly3" | "cubic" => Some(Self::Poly3),
-            "poly3_zero" | "cubic_zero" => Some(Self::Poly3Zero),
-            "poly4" | "quartic" => Some(Self::Poly4),
-            "poly4_zero" | "quartic_zero" => Some(Self::Poly4Zero),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -442,11 +427,15 @@ fn points_for_channel(
             .extra_channels
             .get(key)
             .map(|channel| {
-                channel
+                let mut points: Vec<(f64, f64)> = channel
                     .points
                     .iter()
                     .map(|p| (p.raw as f64, p.expected as f64))
-                    .collect()
+                    .collect();
+                if let Some(zero_raw) = channel.zero_raw {
+                    points.push((zero_raw as f64, 0.0));
+                }
+                points
             })
             .unwrap_or_default(),
     }
@@ -509,7 +498,6 @@ pub fn upsert_point(
     expected: f32,
     raw: f32,
 ) {
-    let expected = expected.max(0.0);
     match &channel {
         CalibrationChannel::Custom(key) => {
             let channel = cfg.extra_channels.entry(key.clone()).or_default();
@@ -1122,7 +1110,7 @@ fn eval_channel_with_zero(
     let zero_offset = zero_raw
         .and_then(|zero| eval_channel_base(linear, fit, zero))
         .unwrap_or(0.0);
-    Some((base - zero_offset).max(0.0))
+    Some(base - zero_offset)
 }
 
 fn calibrated_channel_value(
@@ -1162,9 +1150,32 @@ pub fn calibrated_sensor_value(
     }
 }
 
-pub fn fill_percent(cfg: &LoadcellCalibrationFile, weight_kg: f32) -> f32 {
-    let denom = cfg.full_mass_kg.unwrap_or(DEFAULT_FULL_MASS_KG).max(0.0001);
-    ((weight_kg / denom) * 100.0).clamp(0.0, 100.0)
+pub fn active_fill_target_mass_kg(cfg: &FillTargetsConfig, flight_state: FlightState) -> f32 {
+    let target_mass_kg = if matches!(
+        flight_state,
+        FlightState::PreFill | FlightState::FillTest | FlightState::NitrogenFill
+    ) {
+        cfg.nitrogen.target_mass_kg
+    } else {
+        cfg.nitrous.target_mass_kg
+    };
+    normalized_mass_target(target_mass_kg)
+}
+
+pub fn fill_percent(target_mass_kg: f32, weight_kg: f32) -> f32 {
+    ((weight_kg / normalized_mass_target(target_mass_kg)) * 100.0).clamp(0.0, 100.0)
+}
+
+fn normalized_mass_target(target_mass_kg: f32) -> f32 {
+    if target_mass_kg.abs() < 0.0001 {
+        if target_mass_kg.is_sign_negative() {
+            -0.0001
+        } else {
+            0.0001
+        }
+    } else {
+        target_mass_kg
+    }
 }
 
 #[cfg(test)]
@@ -1191,6 +1202,7 @@ mod tests {
         capture_zero(&mut cfg, "ch1", 10.0);
 
         assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 10.0), Some(0.0));
+        assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 9.0), Some(-2.0));
         assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 12.0), Some(4.0));
     }
 
@@ -1217,6 +1229,7 @@ mod tests {
         capture_zero(&mut cfg, "ch1", 3.0);
 
         assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 3.0), Some(0.0));
+        assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 2.0), Some(-5.0));
         assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 4.0), Some(7.0));
     }
 }

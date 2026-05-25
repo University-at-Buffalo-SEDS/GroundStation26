@@ -27,7 +27,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
-pub const ROCKET_COMMS_PORT: &str = "/dev/ttyUSB1";
+pub const ROCKET_COMMS_PORT: &str = "/dev/ttyAMA0";
 pub const UMBILICAL_COMMS_PORT: &str = "/dev/ttyUSB2";
 pub const COMMS_BAUD_RATE: usize = 57_600;
 pub const MAX_PACKET_SIZE: usize = 256;
@@ -41,7 +41,11 @@ const RAW_UART_ASCII_SYNC_1: u8 = 0x7A;
 const RAW_UART_FRAME_HEADER_SIZE: usize = 4;
 const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
-const RADIO_WINDOW_CONTROL_KIND: u8 = 0x01;
+const RADIO_SCHED_MAGIC_0: u8 = 0x52;
+const RADIO_SCHED_MAGIC_1: u8 = 0x53;
+const RADIO_SCHED_VERSION: u8 = 1;
+const RADIO_SCHED_FLAG_HAS_MORE: u8 = 0x01;
+const RADIO_SCHED_FLAG_YIELD: u8 = 0x02;
 #[cfg(target_os = "linux")]
 const I2C_PACKET_MAX_BYTES: usize = 4_096;
 #[cfg(target_os = "linux")]
@@ -118,6 +122,15 @@ pub trait CommsDevice: Send {
     fn take_radio_window_update(&mut self) -> Option<RadioWindowUpdate> {
         None
     }
+    fn send_radio_scheduler_status(
+        &mut self,
+        seq: u8,
+        has_more: bool,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let _ = seq;
+        let _ = has_more;
+        Err("radio scheduler status is only supported by raw UART links".into())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,7 +142,9 @@ pub enum RadioWindowKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RadioWindowUpdate {
     pub kind: RadioWindowKind,
-    pub duration_ms: u16,
+    pub seq: u8,
+    pub credit: usize,
+    pub turnaround_ms: u64,
 }
 
 pub fn link_description(cfg: &CommsLinkConfig) -> String {
@@ -288,6 +303,8 @@ pub struct UartComms {
     rx_buf: Vec<u8>,
     radio_window_updates: VecDeque<RadioWindowUpdate>,
     protocol: SerialProtocol,
+    #[cfg(target_os = "linux")]
+    baud_rate: u32,
     slow_start_deadline: Option<Instant>,
 }
 
@@ -320,6 +337,8 @@ impl UartComms {
             rx_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
             radio_window_updates: VecDeque::with_capacity(8),
             protocol: cfg.protocol.clone(),
+            #[cfg(target_os = "linux")]
+            baud_rate: cfg.baud_rate as u32,
             slow_start_deadline: Some(Instant::now() + UART_STARTUP_TIMEOUT),
         })
     }
@@ -703,6 +722,33 @@ fn write_all_fd_with_poll(fd: RawFd, bytes: &[u8], timeout: Duration) -> std::io
 }
 
 #[cfg(target_os = "linux")]
+fn drain_fd_with_timeout(fd: RawFd, timeout: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if unsafe { libc::tcdrain(fd) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out draining raw UART tx",
+            ));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn uart_wire_timeout(len: usize, baud_rate: u32) -> Duration {
+    let baud = u64::from(baud_rate.max(1));
+    let wire_ms = ((len as u64 * 10 * 1_000) + baud - 1) / baud;
+    Duration::from_millis(wire_ms.saturating_add(50).max(100))
+}
+
+#[cfg(target_os = "linux")]
 fn read_once_fd_with_poll(fd: RawFd, buf: &mut [u8], timeout: Duration) -> std::io::Result<usize> {
     let timeout_ms = timeout.as_millis().clamp(0, i32::MAX as u128) as i32;
     let mut pollfd = libc::pollfd {
@@ -757,6 +803,10 @@ fn unix_now_ms() -> u64 {
 
 fn build_raw_uart_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
     build_link_frame(RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1, payload)
+}
+
+fn build_raw_uart_command_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    build_link_frame(RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1, payload)
 }
 
 #[cfg(target_os = "linux")]
@@ -827,17 +877,27 @@ fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
 }
 
 fn parse_radio_window_update(payload: &[u8]) -> Option<RadioWindowUpdate> {
-    if payload.len() < 4 || payload[0] != RADIO_WINDOW_CONTROL_KIND {
+    if payload.len() < 7
+        || payload[0] != RADIO_SCHED_MAGIC_0
+        || payload[1] != RADIO_SCHED_MAGIC_1
+        || payload[2] != RADIO_SCHED_VERSION
+    {
         return None;
     }
-    let kind = match payload[1] {
+    let kind = match payload[3] {
         0 => RadioWindowKind::DownlinkOpen,
         1 => RadioWindowKind::UplinkOpen,
         _ => return None,
     };
     Some(RadioWindowUpdate {
         kind,
-        duration_ms: u16::from_le_bytes([payload[2], payload[3]]),
+        seq: payload[4],
+        credit: payload[5].max(1) as usize,
+        turnaround_ms: if payload.len() >= 9 {
+            u16::from_le_bytes([payload[7], payload[8]]) as u64
+        } else {
+            0
+        },
     })
 }
 
@@ -939,6 +999,17 @@ fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
     );
 }
 
+fn maybe_log_raw_uart_tx(bytes: &[u8], protocol: &SerialProtocol) {
+    if !raw_uart_debug_enabled() || !matches!(protocol, SerialProtocol::RawUart) {
+        return;
+    }
+    eprintln!(
+        "raw_uart tx {} bytes: {}",
+        bytes.len(),
+        hex_preview(bytes, RAW_UART_DEBUG_PREVIEW_BYTES)
+    );
+}
+
 fn maybe_log_raw_uart_read_outcome(
     context: &str,
     buffered_len: usize,
@@ -1030,9 +1101,10 @@ fn maybe_log_raw_uart_command_frame(
     }
     match update {
         Some(update) => eprintln!(
-            "{context}: kind={:?} duration_ms={} payload={}",
+            "{context}: kind={:?} seq={} credit={} payload={}",
             update.kind,
-            update.duration_ms,
+            update.seq,
+            update.credit,
             hex_preview(payload, RAW_UART_DEBUG_PREVIEW_BYTES)
         ),
         None => eprintln!(
@@ -1290,14 +1362,63 @@ impl CommsDevice for UartComms {
                 #[cfg(target_os = "linux")]
                 {
                     let framed = build_raw_uart_frame(payload)?;
+                    maybe_log_raw_uart_tx(&framed, &self.protocol);
                     write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
+                    drain_fd_with_timeout(
+                        self.inner.as_raw_fd(),
+                        uart_wire_timeout(framed.len(), self.baud_rate),
+                    )?;
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    self.inner.write_all(&build_raw_uart_frame(payload)?)?;
+                    let framed = build_raw_uart_frame(payload)?;
+                    maybe_log_raw_uart_tx(&framed, &self.protocol);
+                    self.inner.write_all(&framed)?;
                     self.inner.flush()?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn send_radio_scheduler_status(
+        &mut self,
+        seq: u8,
+        has_more: bool,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !matches!(self.protocol, SerialProtocol::RawUart) {
+            return Err("radio scheduler status requires raw_uart protocol".into());
+        }
+
+        let flags = RADIO_SCHED_FLAG_YIELD
+            | if has_more {
+                RADIO_SCHED_FLAG_HAS_MORE
+            } else {
+                0
+            };
+        let payload = [
+            RADIO_SCHED_MAGIC_0,
+            RADIO_SCHED_MAGIC_1,
+            RADIO_SCHED_VERSION,
+            1,
+            seq,
+            0,
+            flags,
+        ];
+        let framed = build_raw_uart_command_frame(&payload)?;
+        maybe_log_raw_uart_tx(&framed, &self.protocol);
+        #[cfg(target_os = "linux")]
+        {
+            write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
+            drain_fd_with_timeout(
+                self.inner.as_raw_fd(),
+                uart_wire_timeout(framed.len(), self.baud_rate),
+            )?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.inner.write_all(&framed)?;
+            self.inner.flush()?;
         }
         Ok(())
     }
@@ -1332,15 +1453,13 @@ impl CommsDevice for UartComms {
         {
             return Err(err.into());
         }
-        if self.process_buffered_payloads_with_budget(packet_sink, max_packets)? {
-            return Ok(());
-        }
-
-        if let Err(err) = self.fill_rx_buf_with_timeout(timeout) {
-            return Err(err.into());
-        }
-
         let _ = self.process_buffered_payloads_with_budget(packet_sink, max_packets)?;
+        if !self.rx_buf.is_empty() {
+            if let Err(err) = self.fill_rx_buf_with_timeout(timeout) {
+                return Err(err.into());
+            }
+            let _ = self.process_buffered_payloads_with_budget(packet_sink, max_packets)?;
+        }
         maybe_log_raw_uart_buffer_state(&self.rx_buf, "waiting for complete frame", &self.protocol);
         Ok(())
     }
@@ -2009,6 +2128,7 @@ impl DummyComms {
                 DataEndpoint::ValveBoard,
                 DataEndpoint::ActuatorBoard,
                 DataEndpoint::Abort,
+                DataEndpoint::FlightState,
             ],
             _ => &[],
         }
@@ -2361,6 +2481,23 @@ mod raw_uart_tests {
     }
 
     #[test]
+    fn flight_command_packets_use_raw_uart_data_frame() {
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            "GS",
+            123,
+            Arc::from([0x0a_u8]),
+        )
+        .unwrap();
+        let wire = serialize::serialize_packet(&pkt);
+
+        let mut framed = build_raw_uart_frame(&wire).unwrap();
+        let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
+        assert_eq!(decoded, (RawUartFrameKind::Data, wire.to_vec()));
+    }
+
+    #[test]
     fn raw_uart_frame_resyncs_after_garbage() {
         let payload = vec![9, 8, 7];
         let mut framed = vec![0x00, 0x11, 0x22];
@@ -2368,6 +2505,25 @@ mod raw_uart_tests {
         let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
         assert_eq!(decoded, (RawUartFrameKind::Data, payload));
         assert!(framed.is_empty());
+    }
+
+    #[test]
+    fn raw_uart_command_frame_waits_for_split_rfboard_grant() {
+        let payload = [0x52, 0x53, 1, 1, 7, 5, 0, 100, 0];
+        let framed = build_raw_uart_command_frame(&payload).unwrap();
+        let mut partial = framed[..2].to_vec();
+
+        assert!(
+            take_raw_uart_framed_payload(&mut partial)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(partial, framed[..2]);
+
+        partial.extend_from_slice(&framed[2..]);
+        let decoded = take_raw_uart_framed_payload(&mut partial).unwrap().unwrap();
+        assert_eq!(decoded, (RawUartFrameKind::Command, payload.to_vec()));
+        assert!(partial.is_empty());
     }
 
     #[test]

@@ -1,10 +1,9 @@
 use crate::state::AppState;
-use crate::telemetry_task::get_current_timestamp_ms;
-use crate::types::{Board, FlightState};
+use crate::telemetry_task::{get_current_timestamp_ms, queue_abort_packet};
+use crate::types::{Board, FlightState, canonical_sender_id};
 use crate::web::{emit_warning, emit_warning_db_only};
 use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::router::Router;
-use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
@@ -52,6 +51,7 @@ const BATTERY_VOLTAGE_VALVE_BOARD_MIN_THRESHOLD: f32 = 12.3; // V
 const BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD: f32 = 16.5; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD: f32 = 12.3; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 16.5; // V
+const BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD: f32 = 13.0; // V
 
 // Battery current thresholds (A)
 const BATTERY_CURRENT_MIN_THRESHOLD: f32 = 0.0; // A
@@ -69,8 +69,6 @@ const KALMAN_STATE_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
 const BOARD_TIMEOUT_MS: u64 = 3000;
 #[cfg(not(feature = "testing"))]
 const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 3000;
-const FLIGHT_STATE_DB_RETRIES: usize = 5;
-const FLIGHT_STATE_DB_RETRY_DELAY_MS: u64 = 50;
 const SAFETY_WARNING_COOLDOWN_MS_DEFAULT: u64 = 5_000;
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -129,6 +127,31 @@ fn battery_voltage_bounds_by_sender() -> &'static HashMap<String, (f32, f32)> {
     })
 }
 
+fn is_fill_system_battery_sender(sender_id: &str) -> bool {
+    matches!(
+        canonical_sender_id(sender_id),
+        sender if sender == Board::GatewayBoard.sender_id()
+    )
+}
+
+fn battery_low_voltage_always_warns(sender_id: &str, voltage: f32) -> bool {
+    is_fill_system_battery_sender(sender_id) && voltage <= BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD
+}
+
+fn battery_voltage_out_of_range(sender_id: &str, voltage: f32) -> bool {
+    if !voltage.is_finite() {
+        return false;
+    }
+
+    let sender_id = canonical_sender_id(sender_id);
+    let outside_configured_range = battery_voltage_bounds_by_sender()
+        .get(sender_id)
+        .copied()
+        .is_some_and(|(min_v, max_v)| voltage < min_v || voltage > max_v);
+
+    outside_configured_range || battery_low_voltage_always_warns(sender_id, voltage)
+}
+
 fn check_accel_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
     if let Some(accel_x) = values.first()
         && ((ACCELERATION_X_MIN_THRESHOLD > *accel_x) || (*accel_x > ACCELERATION_X_MAX_THRESHOLD))
@@ -169,32 +192,6 @@ fn check_gyro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
     }
 }
 
-async fn insert_flight_state_with_retry(
-    db: &SqlitePool,
-    timestamp_ms: i64,
-    state_code: i64,
-) -> Result<(), sqlx::Error> {
-    let mut delay = FLIGHT_STATE_DB_RETRY_DELAY_MS;
-    let mut last_err: Option<sqlx::Error> = None;
-
-    for _ in 0..=FLIGHT_STATE_DB_RETRIES {
-        match sqlx::query("INSERT INTO flight_state (timestamp_ms, f_state) VALUES (?, ?)")
-            .bind(timestamp_ms)
-            .bind(state_code)
-            .execute(db)
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(delay)).await;
-                delay = (delay * 2).min(1000);
-            }
-        }
-    }
-
-    Err(last_err.unwrap())
-}
 #[cfg(feature = "testing")]
 const BOARD_TIMEOUT_MS: u64 = 3000;
 #[cfg(feature = "testing")]
@@ -338,32 +335,8 @@ pub async fn safety_task(
             && !cfg!(feature = "hitl_mode")
             && !cfg!(feature = "test_fire_mode")
         {
-            let should_advance = {
-                let mut fs = state.state.lock().unwrap();
-                if *fs == FlightState::Startup {
-                    *fs = FlightState::Idle;
-                    true
-                } else {
-                    false
-                }
-            };
-
-            if should_advance {
-                let ts_ms = get_current_timestamp_ms() as i64;
-                state.update_launch_clock_for_state(FlightState::Idle, ts_ms);
-                if let Err(e) = insert_flight_state_with_retry(
-                    &state.telemetry_db_pool(),
-                    ts_ms,
-                    FlightState::Idle as i64,
-                )
-                .await
-                {
-                    eprintln!("DB insert into flight_state failed after retry: {e}");
-                }
-                let _ = state.state_tx.send(crate::web::FlightStateMsg {
-                    state: FlightState::Idle,
-                });
-                state.broadcast_fill_targets_snapshot();
+            if *state.state.lock().unwrap() == FlightState::Startup {
+                state.set_local_flight_state(FlightState::Idle);
             }
         }
 
@@ -397,7 +370,6 @@ pub async fn safety_task(
         }
 
         let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
-
         for pkt in packets {
             match pkt.data_type() {
                 DataType::AccelData => {
@@ -489,13 +461,12 @@ pub async fn safety_task(
                 DataType::BatteryVoltage => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
                     // Voltage
-                    if let Some(voltage) = values.first()
-                        && let Some((min_v, max_v)) = battery_voltage_bounds_by_sender()
-                            .get(pkt.sender())
-                            .copied()
-                        && ((*voltage < min_v) || (*voltage > max_v))
-                    {
-                        cycle_warnings.insert("Critical: Battery voltage out of range!");
+                    if let Some(voltage) = values.first() {
+                        if is_fill_system_battery_sender(pkt.sender()) {
+                            continue;
+                        } else if battery_voltage_out_of_range(pkt.sender(), *voltage) {
+                            cycle_warnings.insert("Critical: Battery voltage out of range!");
+                        }
                     }
                 }
 
@@ -547,16 +518,42 @@ pub async fn safety_task(
         }
 
         if abort {
-            router
-                .log::<u8>(
-                    DataType::Abort,
-                    "Safety Task Abort Command Issued".as_bytes(),
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("failed to log Abort command: {:?}", e);
-                });
+            state.set_abort_indicator_latched(true);
+            crate::sequences::refresh_action_policy_now(&state);
+            state.broadcast_action_policy_snapshot();
+            queue_abort_packet(&router, "Safety Task Abort Command Issued").unwrap_or_else(|e| {
+                eprintln!("failed to log Abort command: {:?}", e);
+            });
+            if let Err(e) = router.process_all_queues_with_timeout(3) {
+                eprintln!("failed to flush Abort command: {:?}", e);
+            }
             gs_debug_println!("Safety task: Abort command sent");
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_voltage_floor_always_warns_for_fill_system_battery() {
+        assert!(battery_low_voltage_always_warns("GB", 13.0));
+        assert!(battery_low_voltage_always_warns("GW", 13.0));
+        assert!(battery_low_voltage_always_warns("GB", 12.99));
+    }
+
+    #[test]
+    fn low_voltage_floor_does_not_apply_to_non_fill_system_batteries() {
+        assert!(!battery_low_voltage_always_warns("PB", 7.4));
+        assert!(!battery_low_voltage_always_warns("PB", 13.0));
+        assert!(!battery_low_voltage_always_warns("VB", 13.0));
+    }
+
+    #[test]
+    fn battery_voltage_range_check_includes_non_configurable_fill_system_floor() {
+        assert!(battery_voltage_out_of_range("GB", 13.0));
+        assert!(battery_voltage_out_of_range("GW", 13.0));
     }
 }

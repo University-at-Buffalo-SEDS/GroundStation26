@@ -2,14 +2,14 @@ use crate::gpio::Trigger;
 use crate::sequences::{ActionPolicyMsg, BlinkMode};
 use crate::state::AppState;
 use crate::types::TelemetryCommand;
-use crate::web::{emit_error, emit_warning};
+use crate::web::emit_notification_warning;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::time::interval;
 
 //####################################################################
 // The values assigned here are GPIO pin numbers on the Raspberry Pi
@@ -46,15 +46,19 @@ pub const NORMALLY_OPEN_PIN: u8 = 20;
 pub const NORMALLY_OPEN_LED: u8 = 21;
 
 pub const WARNING_ACK_PIN: u8 = 26;
+pub const MASTER_ALARM_LED: u8 = 19;
+pub const MASTER_ALARM_BUZZER: u8 = 24;
 
 const LED_FRAME_MS: u64 = 16;
 const LED_DISABLED_BRIGHTNESS: f64 = 0.0;
+const ABORT_POLL_INTERVAL_MS: u64 = 10;
+const ABORT_DISPATCH_DEBOUNCE_MS: u64 = 250;
+static LAST_ABORT_DISPATCH_MS: AtomicU64 = AtomicU64::new(0);
 
 //####################################################################
 
 #[derive(Clone, Copy, Debug, Default)]
 struct AllowedActions {
-    abort: bool,
     launch: bool,
     dump: bool,
     igniter: bool,
@@ -65,12 +69,21 @@ struct AllowedActions {
     fill_lines: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlarmSeverity {
+    Warning,
+    Error,
+}
+
 pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
     let gpio = state.gpio.clone();
     let allowed = Arc::new(Mutex::new(AllowedActions::default()));
 
     // Inputs (buttons)
-    gpio.setup_input_pin(ABORT_PIN)?;
+    gpio.setup_input_pulldown_pin(ABORT_PIN)?;
+    log::info!(
+        "GPIO abort button configured on BCM GPIO {ABORT_PIN} as active-high pulldown input"
+    );
     gpio.setup_input_pin(LAUNCH_PIN)?;
     gpio.setup_input_pin(IGNITER_PIN)?;
     gpio.setup_input_pin(LAUNCH_ARM_PIN)?;
@@ -93,10 +106,12 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
     gpio.setup_led_pin(PILOT_VALVE_LED)?;
     gpio.setup_led_pin(NITROGEN_TANK_VALVE_LED)?;
     gpio.setup_led_pin(NITROUS_TANK_VALVE_LED)?;
+    gpio.setup_led_pin(MASTER_ALARM_LED)?;
+    gpio.setup_output_pin(MASTER_ALARM_BUZZER)?;
 
     setup_callbacks(&state, allowed.clone())?;
 
-    tokio::spawn(gpio_led_task(state, allowed));
+    spawn_gpio_led_thread(state, allowed);
 
     Ok(())
 }
@@ -109,21 +124,17 @@ fn setup_callbacks(
     let gpio = state.gpio.clone();
     let debounce = Duration::from_millis(50);
 
-    let allowed_abort = allowed.clone();
     let tx_abort = tx.clone();
-    let state_abort = state.clone();
     gpio.setup_callback_input_pin(ABORT_PIN, Trigger::RisingEdge, debounce, move |is_high| {
+        log::info!("GPIO abort button interrupt on BCM GPIO {ABORT_PIN}: is_high={is_high}");
         if !is_high {
+            log::warn!("GPIO abort button interrupt ignored because active-high input is low");
             return;
         }
-        if !allowed_abort.lock().unwrap().abort {
-            return;
-        }
-        if tx_abort.try_send(TelemetryCommand::Abort).is_err() {
-            eprintln!("GPIO abort button: failed to send command");
-        }
-        emit_error(&state_abort, "Manual abort button pressed!".to_string());
+
+        dispatch_gpio_abort(&tx_abort, "interrupt");
     })?;
+    spawn_abort_poll_thread(state.clone(), tx.clone());
 
     let allowed_launch = allowed.clone();
     let tx_launch = tx.clone();
@@ -140,7 +151,7 @@ fn setup_callbacks(
         if state_launch.hitl_button_interlock_enabled()
             && !is_input_enabled(&gpio_launch, ALL_BUTTONS_ENABLE_PIN)
         {
-            emit_warning(
+            emit_notification_warning(
                 &state_launch,
                 "Ignored launch button press: button interlock is enabled".to_string(),
             );
@@ -155,7 +166,7 @@ fn setup_callbacks(
         #[cfg(not(feature = "hitl_mode"))]
         let launch_interlock_ok = is_input_enabled(&gpio_launch, LAUNCH_ARM_PIN);
         if !launch_interlock_ok {
-            emit_warning(
+            emit_notification_warning(
                 &state_launch,
                 "Ignored Launch button press: launch arm signal is not enabled".to_string(),
             );
@@ -256,13 +267,67 @@ fn setup_callbacks(
             if !is_high {
                 return;
             }
-            state_warning_ack.acknowledge_warnings_through(
-                crate::telemetry_task::get_current_timestamp_ms() as i64,
-            );
+            let now_ms = crate::telemetry_task::get_current_timestamp_ms() as i64;
+            state_warning_ack.acknowledge_alerts_through(now_ms, now_ms);
         },
     )?;
 
     Ok(())
+}
+
+fn spawn_abort_poll_thread(state: Arc<AppState>, tx: mpsc::Sender<TelemetryCommand>) {
+    let gpio = state.gpio.clone();
+    let mut shutdown_rx = state.shutdown_subscribe();
+    let _ = thread::Builder::new()
+        .name("gpio_abort_poll".to_string())
+        .spawn(move || {
+            log::info!(
+                "GPIO abort polling fallback started on BCM GPIO {ABORT_PIN}; active-high"
+            );
+            let mut last_level: Option<bool> = None;
+            loop {
+                match shutdown_rx.try_recv() {
+                    Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                }
+
+                match gpio.read_input_pin(ABORT_PIN) {
+                    Ok(is_high) => {
+                        if last_level != Some(is_high) {
+                            log::info!(
+                                "GPIO abort poll level changed on BCM GPIO {ABORT_PIN}: is_high={is_high}"
+                            );
+                            if is_high {
+                                dispatch_gpio_abort(&tx, "polling fallback");
+                            }
+                            last_level = Some(is_high);
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("GPIO abort poll failed to read BCM GPIO {ABORT_PIN}: {err}");
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(ABORT_POLL_INTERVAL_MS));
+            }
+            log::info!("GPIO abort polling fallback stopped");
+        });
+}
+
+fn dispatch_gpio_abort(tx: &mpsc::Sender<TelemetryCommand>, source: &'static str) {
+    let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+    let last_ms = LAST_ABORT_DISPATCH_MS.swap(now_ms, Ordering::Relaxed);
+    if now_ms.saturating_sub(last_ms) < ABORT_DISPATCH_DEBOUNCE_MS {
+        log::info!("GPIO abort button {source}: duplicate dispatch ignored by debounce");
+        return;
+    }
+
+    log::info!("GPIO abort button {source}: queueing abort command");
+    match tx.try_send(TelemetryCommand::Abort) {
+        Ok(()) => log::info!("GPIO abort button {source}: Abort command queued to telemetry task"),
+        Err(err) => log::error!("GPIO abort button {source}: failed to send command: {err}"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -299,7 +364,7 @@ where
             if now_ms.saturating_sub(last) >= WARN_INTERVAL_MS.load(Ordering::Relaxed) {
                 guard.insert(cmd_name.clone(), now_ms);
                 drop(guard);
-                emit_warning(
+                emit_notification_warning(
                     &state,
                     format!("Ignored {cmd_name} button press: button interlock is enabled"),
                 );
@@ -317,7 +382,7 @@ where
                 if now_ms.saturating_sub(last) >= WARN_INTERVAL_MS.load(Ordering::Relaxed) {
                     guard.insert(cmd_name.clone(), now_ms);
                     drop(guard);
-                    emit_warning(
+                    emit_notification_warning(
                         &state,
                         format!(
                             "Ignored {cmd_name} button press: safety key is not installed/enabled"
@@ -334,11 +399,26 @@ where
     Ok(())
 }
 
-async fn gpio_led_task(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>) {
-    let mut tick = interval(Duration::from_millis(LED_FRAME_MS));
+fn spawn_gpio_led_thread(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>) {
+    let mut shutdown_rx = state.shutdown_subscribe();
+    thread::spawn(move || {
+        gpio_led_task(state, allowed, &mut shutdown_rx);
+    });
+}
+
+fn gpio_led_task(
+    state: Arc<AppState>,
+    allowed: Arc<Mutex<AllowedActions>>,
+    shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+) {
     let mut last_levels: HashMap<u8, u8> = HashMap::new();
     loop {
-        tick.tick().await;
+        match shutdown_rx.try_recv() {
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+            | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+        }
+        let frame_started = Instant::now();
         let now_ms = crate::telemetry_task::get_current_timestamp_ms();
 
         let policy = state.action_policy_snapshot();
@@ -404,6 +484,24 @@ async fn gpio_led_task(state: Arc<AppState>, allowed: Arc<Mutex<AllowedActions>>
             RETRACT_PIN_LED,
             led_for(&state, &policy, "RetractPlumbing", now_ms),
         );
+        set_led(
+            gpio,
+            &mut last_levels,
+            MASTER_ALARM_LED,
+            master_alarm_led_for(&state, now_ms),
+        );
+        set_binary_output(
+            gpio,
+            &mut last_levels,
+            MASTER_ALARM_BUZZER,
+            master_alarm_buzzer_for(&state, now_ms),
+        );
+
+        let frame_budget = Duration::from_millis(LED_FRAME_MS);
+        let elapsed = frame_started.elapsed();
+        if elapsed < frame_budget {
+            thread::sleep(frame_budget - elapsed);
+        }
     }
 }
 
@@ -418,7 +516,6 @@ fn allowed_from_policy(policy: &ActionPolicyMsg) -> AllowedActions {
     };
 
     AllowedActions {
-        abort: enabled("Abort"),
         launch: enabled("Launch"),
         dump: enabled("Dump"),
         igniter: enabled("Igniter"),
@@ -432,6 +529,9 @@ fn allowed_from_policy(policy: &ActionPolicyMsg) -> AllowedActions {
 
 fn led_for(state: &AppState, policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -> f64 {
     if cmd == "Launch" && state.launch_indicator_latched() {
+        return 1.0;
+    }
+    if cmd == "Abort" && state.abort_indicator_latched() {
         return 1.0;
     }
     let Some(control) = policy.controls.iter().find(|c| c.cmd == cmd) else {
@@ -456,6 +556,93 @@ fn led_for(state: &AppState, policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -
         1.0
     } else {
         LED_DISABLED_BRIGHTNESS
+    }
+}
+
+fn current_unacked_alarm_severity(state: &AppState) -> Option<AlarmSeverity> {
+    let ack = state.alert_ack_state_snapshot();
+    let mut has_warning = false;
+    let mut has_error = false;
+
+    for alert in state.recent_alerts_snapshot() {
+        match alert.severity.as_str() {
+            "warning" if alert.timestamp_ms > ack.warning_ack_timestamp_ms => {
+                has_warning = true;
+            }
+            "error" if alert.timestamp_ms > ack.error_ack_timestamp_ms => {
+                has_error = true;
+            }
+            _ => {}
+        }
+    }
+
+    if has_error {
+        Some(AlarmSeverity::Error)
+    } else if has_warning {
+        Some(AlarmSeverity::Warning)
+    } else {
+        None
+    }
+}
+
+fn master_alarm_led_for(state: &AppState, now_ms: u64) -> f64 {
+    let Some(severity) = current_unacked_alarm_severity(state) else {
+        return 0.0;
+    };
+    alarm_led_brightness(severity, now_ms)
+}
+
+fn master_alarm_buzzer_for(state: &AppState, now_ms: u64) -> bool {
+    let Some(severity) = current_unacked_alarm_severity(state) else {
+        return false;
+    };
+    alarm_active_window(severity, now_ms)
+}
+
+fn alarm_active_window(severity: AlarmSeverity, now_ms: u64) -> bool {
+    let (cycle_ms, on_ms) = match severity {
+        AlarmSeverity::Error => (8_000_u64, 5_000_u64),
+        AlarmSeverity::Warning => (3_500_u64, 500_u64),
+    };
+    now_ms % cycle_ms < on_ms
+}
+
+fn alarm_led_brightness(severity: AlarmSeverity, now_ms: u64) -> f64 {
+    match severity {
+        AlarmSeverity::Warning => {
+            let period_ms = 3_000_u64;
+            let phase = (now_ms % period_ms) as f64 / period_ms as f64;
+            0.5 - 0.5 * (std::f64::consts::TAU * phase).cos()
+        }
+        AlarmSeverity::Error => {
+            let cycle_ms = 900_u64;
+            let phase_ms = now_ms % cycle_ms;
+            for offset_ms in [0_u64, 180, 360] {
+                if let Some(pulse) = error_blink_pulse(phase_ms, offset_ms) {
+                    return pulse;
+                }
+            }
+            0.0
+        }
+    }
+}
+
+fn error_blink_pulse(phase_ms: u64, offset_ms: u64) -> Option<f64> {
+    let rise_ms = 35_u64;
+    let hold_ms = 100_u64;
+    let fall_ms = 35_u64;
+    let pulse_ms = rise_ms + hold_ms + fall_ms;
+    if phase_ms < offset_ms || phase_ms >= offset_ms + pulse_ms {
+        return None;
+    }
+    let local_ms = phase_ms - offset_ms;
+    if local_ms < rise_ms {
+        Some(local_ms as f64 / rise_ms as f64)
+    } else if local_ms < rise_ms + hold_ms {
+        Some(1.0)
+    } else {
+        let fade_ms = local_ms - rise_ms - hold_ms;
+        Some(1.0 - (fade_ms as f64 / fall_ms as f64))
     }
 }
 
@@ -499,5 +686,21 @@ fn set_led(
     last_levels.insert(pin, quantized);
     if let Err(e) = gpio.write_led_brightness(pin, f64::from(quantized) / 255.0) {
         eprintln!("GPIO LED pin {pin} PWM write failed: {e}");
+    }
+}
+
+fn set_binary_output(
+    gpio: &crate::gpio::GpioPins,
+    last_levels: &mut HashMap<u8, u8>,
+    pin: u8,
+    enabled: bool,
+) {
+    let next = if enabled { 255 } else { 0 };
+    if last_levels.get(&pin).copied() == Some(next) {
+        return;
+    }
+    last_levels.insert(pin, next);
+    if let Err(e) = gpio.write_output_pin(pin, enabled) {
+        eprintln!("GPIO output pin {pin} write failed: {e}");
     }
 }

@@ -2,12 +2,16 @@
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum FlightComputerCommands {
-    LaunchSignal = 1,
+    Launch = 1,
     VigilantMode = 2,
     RevokeVigilantMode = 3,
+    #[cfg(feature = "hitl_mode")]
     EvalSuccessive = 4,
+    #[cfg(feature = "hitl_mode")]
     RevokeEvalSuccessive = 5,
+    #[cfg(feature = "hitl_mode")]
     ResetFailures = 6,
+    #[cfg(feature = "hitl_mode")]
     RevokeResetFailures = 7,
     MeasmReports = 8,
     RevokeMeasmReports = 9,

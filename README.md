@@ -101,6 +101,7 @@ Mode notes:
 
 - For geolocation to work correctly in browsers, the backend should be behind HTTPS.
 - `docker-compose.yml` is set up for local TLS testing with a self-signed certificate.
+- The three bundled layouts (`layout.json`, `layout_hitl.json`, and `layout_test_fire.json`) define UI-only data display filter defaults. The frontend presents these as groundstation defaults and lets operators override filter kinds and tuning values locally. Loadcell display data is time-averaged while GPS and valve-state telemetry stay raw so saved telemetry remains unmodified.
 
 ## Map Data
 

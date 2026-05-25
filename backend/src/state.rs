@@ -3,7 +3,9 @@ use crate::fill_targets::FillTargetsConfig;
 use crate::gpio::GpioPins;
 use crate::loadcell::LoadcellCalibrationFile;
 use crate::ring_buffer::RingBuffer;
-use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
+use crate::sequences::{
+    ActionPolicyMsg, PersistentNotification, SequencePolicyState, command_name,
+};
 use crate::telemetry_db::{
     DbQueueItem, LaunchClockKind, LaunchClockMsg, RecordingModeWire, RecordingStatusMsg,
 };
@@ -14,7 +16,7 @@ use crate::types::{
     TelemetryRow, canonical_sender_id,
 };
 use crate::web::{AlertAckStateMsg, AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
-use sedsprintf_rs_2026::config::DataEndpoint;
+use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::Router;
 use sqlx::SqlitePool;
@@ -27,6 +29,12 @@ use tokio::time::{Duration, Instant};
 pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
 const NETWORK_TOPOLOGY_BOARD_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
+
+#[derive(Debug, Clone, Copy)]
+pub struct PendingUmbilicalValveState {
+    pub target: bool,
+    pub set_at: std::time::Instant,
+}
 
 fn recording_command_actuated(cmd: &str, mode: RecordingModeWire) -> Option<bool> {
     match cmd {
@@ -95,6 +103,9 @@ pub struct AppState {
     /// Flight state updates → frontend
     pub state_tx: broadcast::Sender<FlightStateMsg>,
 
+    /// Monotonic packet timestamp anchor for GS-originated flight-state packets.
+    pub last_flight_state_packet_ts_ms: Arc<AtomicU64>,
+
     /// GPIO interface
     pub gpio: Arc<GpioPins>,
 
@@ -114,7 +125,7 @@ pub struct AppState {
     pub umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
 
     /// Pending umbilical valve targets keyed by canonical command id (u8).
-    pub pending_umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
+    pub pending_umbilical_valve_states: Arc<Mutex<HashMap<u8, PendingUmbilicalValveState>>>,
 
     /// Latest fuel tank pressure (psi)
     pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
@@ -127,6 +138,9 @@ pub struct AppState {
 
     /// Broadcast shutdown notifications to long-running background tasks.
     pub shutdown_tx: broadcast::Sender<()>,
+
+    /// True once app-wide shutdown has been requested.
+    pub shutdown_requested: Arc<AtomicBool>,
 
     /// Number of in-flight async DB writes (alerts/warnings/errors).
     pub pending_db_writes: Arc<AtomicUsize>,
@@ -155,6 +169,9 @@ pub struct AppState {
     /// Current action policy (enabled/disabled/blink hints) for UI + command gating.
     pub action_policy: Arc<Mutex<ActionPolicyMsg>>,
 
+    /// Latest live sequence step snapshot used to rebuild action policy outside the main loop.
+    pub sequence_policy_state: Arc<Mutex<SequencePolicyState>>,
+
     /// Broadcast whenever action policy changes.
     pub action_policy_tx: broadcast::Sender<ActionPolicyMsg>,
 
@@ -176,6 +193,9 @@ pub struct AppState {
 
     /// True after a successful launch initiation until explicitly reset or process restart.
     pub launch_indicator_latched: Arc<AtomicBool>,
+
+    /// True after any abort path has triggered until process restart.
+    pub abort_indicator_latched: Arc<AtomicBool>,
 
     #[cfg(feature = "hitl_mode")]
     pub hitl_button_interlock_enabled: Arc<AtomicBool>,
@@ -224,6 +244,89 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn queue_router_flight_state_update(&self, next_state: FlightState) {
+        let Some(router) = self.topology_router.get() else {
+            log::warn!(
+                "flight-state change not dispatched because topology router is not initialized state={next_state:?}"
+            );
+            return;
+        };
+        let topology = router.export_topology();
+        let rocket_has_flight_state = topology.routes.iter().any(|route| {
+            route.side_name == "rocket_comms"
+                && route
+                    .reachable_endpoints
+                    .contains(&DataEndpoint::FlightState)
+        });
+        let umbilical_has_flight_state = topology.routes.iter().any(|route| {
+            route.side_name == "umbilical_comms"
+                && route
+                    .reachable_endpoints
+                    .contains(&DataEndpoint::FlightState)
+        });
+
+        let timestamp_ms = {
+            let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+            loop {
+                let prev = self.last_flight_state_packet_ts_ms.load(Ordering::Relaxed);
+                let next = now_ms.max(prev.saturating_add(1));
+                if self
+                    .last_flight_state_packet_ts_ms
+                    .compare_exchange(prev, next, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break next;
+                }
+            }
+        };
+        let pkt = match Packet::new(
+            DataType::FlightState,
+            &[DataEndpoint::FlightState],
+            Board::GroundStation.sender_id(),
+            timestamp_ms,
+            Arc::from([next_state as u8]),
+        ) {
+            Ok(pkt) => pkt,
+            Err(err) => {
+                log::warn!("failed to build flight-state packet for router delivery: {err}");
+                return;
+            }
+        };
+        if let Err(err) = router.rx_queue(pkt) {
+            log::warn!("failed to queue flight-state packet on router rx path: {err}");
+            return;
+        }
+
+        let dispatch_side = if rocket_has_flight_state && umbilical_has_flight_state {
+            "rocket_comms,umbilical_comms"
+        } else if rocket_has_flight_state {
+            "rocket_comms"
+        } else if umbilical_has_flight_state {
+            "umbilical_comms"
+        } else {
+            "broadcast"
+        };
+        log::info!(
+            "flight-state dispatched side={dispatch_side} state={next_state:?} rocket_has_flight_state={rocket_has_flight_state} umbilical_has_flight_state={umbilical_has_flight_state}"
+        );
+        if let Err(err) = router.process_all_queues_with_timeout(0) {
+            log::warn!("failed to process flight-state packet through router delivery path: {err}");
+        }
+        if !umbilical_has_flight_state {
+            log::warn!(
+                "flight-state change queued but umbilical_comms is not currently discovered with FlightState; fill-side delivery may not occur"
+            );
+        }
+    }
+
+    pub fn sequence_policy_state_snapshot(&self) -> SequencePolicyState {
+        *self.sequence_policy_state.lock().unwrap()
+    }
+
+    pub fn set_sequence_policy_state(&self, snapshot: SequencePolicyState) {
+        *self.sequence_policy_state.lock().unwrap() = snapshot;
+    }
+
     pub fn telemetry_db_pool(&self) -> SqlitePool {
         self.db.lock().unwrap().clone()
     }
@@ -259,34 +362,28 @@ impl AppState {
         self.alert_ack_state.lock().unwrap().clone()
     }
 
-    /// Updates the shared warning ack timestamp and broadcasts if it changed.
-    pub fn acknowledge_warnings_through(&self, timestamp_ms: i64) -> AlertAckStateMsg {
+    /// Updates warning and error ack timestamps together and broadcasts once if either changed.
+    pub fn acknowledge_alerts_through(
+        &self,
+        warning_timestamp_ms: i64,
+        error_timestamp_ms: i64,
+    ) -> AlertAckStateMsg {
         let mut slot = self.alert_ack_state.lock().unwrap();
-        let next_ts = timestamp_ms.max(slot.warning_ack_timestamp_ms);
-        if next_ts != slot.warning_ack_timestamp_ms {
-            slot.warning_ack_timestamp_ms = next_ts;
-            let snapshot = slot.clone();
-            drop(slot);
-            let _ = self.alert_ack_tx.send(snapshot.clone());
-            snapshot
-        } else {
-            slot.clone()
-        }
-    }
+        let next_warning_ts = warning_timestamp_ms.max(slot.warning_ack_timestamp_ms);
+        let next_error_ts = error_timestamp_ms.max(slot.error_ack_timestamp_ms);
+        let changed = next_warning_ts != slot.warning_ack_timestamp_ms
+            || next_error_ts != slot.error_ack_timestamp_ms;
 
-    /// Updates the shared error ack timestamp and broadcasts if it changed.
-    pub fn acknowledge_errors_through(&self, timestamp_ms: i64) -> AlertAckStateMsg {
-        let mut slot = self.alert_ack_state.lock().unwrap();
-        let next_ts = timestamp_ms.max(slot.error_ack_timestamp_ms);
-        if next_ts != slot.error_ack_timestamp_ms {
-            slot.error_ack_timestamp_ms = next_ts;
-            let snapshot = slot.clone();
-            drop(slot);
+        slot.warning_ack_timestamp_ms = next_warning_ts;
+        slot.error_ack_timestamp_ms = next_error_ts;
+        let snapshot = slot.clone();
+        drop(slot);
+
+        if changed {
             let _ = self.alert_ack_tx.send(snapshot.clone());
-            snapshot
-        } else {
-            slot.clone()
         }
+
+        snapshot
     }
 
     pub fn launch_clock_snapshot(&self) -> LaunchClockMsg {
@@ -329,6 +426,15 @@ impl AppState {
 
     pub fn set_launch_indicator_latched(&self, latched: bool) {
         self.launch_indicator_latched
+            .store(latched, Ordering::SeqCst);
+    }
+
+    pub fn abort_indicator_latched(&self) -> bool {
+        self.abort_indicator_latched.load(Ordering::SeqCst)
+    }
+
+    pub fn set_abort_indicator_latched(&self, latched: bool) {
+        self.abort_indicator_latched
             .store(latched, Ordering::SeqCst);
     }
 
@@ -527,6 +633,13 @@ impl AppState {
     /// Returns whether a board should be required for startup/state gating in the current mode.
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     pub fn board_required_for_progression(&self, board: Board) -> bool {
+        if cfg!(feature = "test_fire_mode") {
+            return matches!(
+                board,
+                Board::ValveBoard | Board::GatewayBoard | Board::ActuatorBoard
+            );
+        }
+
         if !self.layout_expected_boards().contains(&board) {
             return false;
         }
@@ -573,10 +686,20 @@ impl AppState {
     /// Builds the board-health payload sent to the dashboard.
     pub fn board_status_snapshot(&self, now_ms: u64) -> BoardStatusMsg {
         let map = self.board_status.lock().unwrap();
-        let mut boards = Vec::with_capacity(Board::ALL.len());
+        let visible_boards: Vec<Board> = if cfg!(feature = "test_fire_mode") {
+            vec![
+                Board::ValveBoard,
+                Board::GatewayBoard,
+                Board::ActuatorBoard,
+                Board::DaqBoard,
+            ]
+        } else {
+            Board::ALL.iter().copied().collect()
+        };
+        let mut boards = Vec::with_capacity(visible_boards.len());
 
-        for board in Board::ALL {
-            let status = map.get(board);
+        for board in visible_boards {
+            let status = map.get(&board);
             let last_seen_ms = status.and_then(|s| s.last_seen_ms);
             let packet_count = status.map(|s| s.packet_count).unwrap_or(0);
             let seen = last_seen_ms.is_some();
@@ -586,7 +709,7 @@ impl AppState {
                 .or_else(|| last_seen_ms.map(|ts| now_ms.saturating_sub(ts)));
 
             boards.push(BoardStatusEntry {
-                board: *board,
+                board,
                 board_label: board.as_str().to_string(),
                 sender_id: board.sender_id().to_string(),
                 seen,
@@ -603,17 +726,10 @@ impl AppState {
     pub fn network_topology_snapshot(&self, now_ms: u64) -> NetworkTopologyMsg {
         let simulated = crate::flight_sim::sim_mode_enabled();
         let topology_board_timeout_ms = network_topology_board_timeout_ms();
-        let exported = if cfg!(feature = "test_fire_mode") {
-            // In test-fire mode the AV-bay side is intentionally absent and both comms links may
-            // be dummy placeholders. Avoid router topology export here; that path has proven
-            // fragile with disconnected-link operator setups, while the dashboard can still render
-            // a useful topology from board visibility and known side mappings alone.
-            None
-        } else {
-            self.topology_router
-                .get()
-                .map(|router| router.export_topology())
-        };
+        let exported = self
+            .topology_router
+            .get()
+            .map(|router| router.export_topology());
         let board_snapshot = self.board_status_snapshot(now_ms);
         let route_snapshot = exported.as_ref();
         let mut local_endpoint_list = vec![
@@ -651,6 +767,7 @@ impl AppState {
         let mut links = Vec::new();
         let mut endpoint_ids = std::collections::BTreeSet::new();
         let mut side_ids = std::collections::BTreeMap::<String, String>::new();
+        let mut side_endpoints = std::collections::BTreeMap::<String, Vec<String>>::new();
 
         if let Some(snapshot) = route_snapshot {
             for route in &snapshot.routes {
@@ -665,6 +782,7 @@ impl AppState {
                     .collect::<Vec<_>>();
                 endpoints.sort();
                 endpoints.dedup();
+                side_endpoints.insert(route.side_name.to_string(), endpoints.clone());
                 let status = if simulated {
                     NetworkTopologyStatus::Simulated
                 } else {
@@ -788,11 +906,15 @@ impl AppState {
                 status,
                 group: "board".to_string(),
                 sender_id: Some(entry.sender_id.clone()),
-                endpoints: modeled_board_endpoints(
-                    entry.board,
-                    simulated,
-                    &local_visible_endpoint_list,
-                ),
+                endpoints: board_side(entry.board)
+                    .and_then(|side_name| side_endpoints.get(side_name).cloned())
+                    .unwrap_or_else(|| {
+                        modeled_board_endpoints(
+                            entry.board,
+                            simulated,
+                            &local_visible_endpoint_list,
+                        )
+                    }),
                 show_in_details: true,
                 detail: Some(match entry.age_ms {
                     Some(age_ms) => format!(
@@ -845,6 +967,7 @@ impl AppState {
     }
 
     /// Returns the timestamp of the most recent telemetry packet seen by the backend.
+    #[allow(dead_code)]
     pub fn last_packet_received_ms(&self) -> u64 {
         self.last_packet_rx_ms.load(Ordering::Relaxed)
     }
@@ -861,8 +984,15 @@ impl AppState {
     }
 
     /// Broadcasts a shutdown request to all long-running tasks.
-    pub fn request_shutdown(&self) {
-        let _ = self.shutdown_tx.send(());
+    pub fn request_shutdown(&self) -> bool {
+        let first = self
+            .shutdown_requested
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if first {
+            let _ = self.shutdown_tx.send(());
+        }
+        first
     }
 
     /// Updates local flight state, notifies subscribers, and persists the transition asynchronously.
@@ -875,6 +1005,7 @@ impl AppState {
         drop(slot);
         // Keep the simulator in lock-step with the real backend state machine.
         crate::flight_sim::sync_local_flight_state(next_state);
+        self.queue_router_flight_state_update(next_state);
 
         let _ = self.state_tx.send(FlightStateMsg { state: next_state });
         self.broadcast_fill_targets_snapshot();
@@ -891,6 +1022,11 @@ impl AppState {
                 ))
                 .await;
         });
+    }
+
+    /// Returns the current locally tracked flight state.
+    pub fn local_flight_state_snapshot(&self) -> FlightState {
+        *self.state.lock().unwrap()
     }
 
     /// Returns the number of async database writes still in progress.
@@ -1087,9 +1223,7 @@ impl AppState {
                 if !button_interlock_ok && !button_interlock_exempt {
                     control.enabled = false;
                 }
-                if !launch_interlock_ok
-                    && matches!(cmd, "Launch" | "GroundStationLaunch" | "LaunchSignal")
-                {
+                if !launch_interlock_ok && matches!(cmd, "Launch" | "GroundStationLaunch") {
                     control.enabled = false;
                 }
             }
@@ -1097,6 +1231,9 @@ impl AppState {
         for control in &mut policy.controls {
             if let Some(actuated) = recording_command_actuated(&control.cmd, recording_mode) {
                 control.actuated = Some(actuated);
+            }
+            if control.cmd == "Abort" && self.abort_indicator_latched() {
+                control.actuated = Some(true);
             }
             #[cfg(feature = "hitl_mode")]
             match control.cmd.as_str() {
@@ -1164,9 +1301,7 @@ impl AppState {
             }
             if matches!(
                 cmd,
-                TelemetryCommand::Launch
-                    | TelemetryCommand::LaunchSignal
-                    | TelemetryCommand::GroundStationLaunch
+                TelemetryCommand::Launch | TelemetryCommand::GroundStationLaunch
             ) && !self.hitl_launch_interlock_satisfied()
             {
                 return false;
@@ -1214,6 +1349,9 @@ impl AppState {
         ts_ms: u64,
         duplicate_window_ms: u64,
     ) -> bool {
+        if matches!(cmd, TelemetryCommand::Abort) {
+            return true;
+        }
         let mut map = self.last_command_ms.lock().unwrap();
         let key = command_dedup_key(cmd);
         if map
@@ -1226,16 +1364,14 @@ impl AppState {
         true
     }
 
-    /// Looks up the last accepted timestamp for a command name.
-    pub fn last_command_timestamp_ms(&self, cmd_name: &str) -> Option<u64> {
-        self.last_command_ms.lock().unwrap().get(cmd_name).copied()
-    }
-
     pub fn set_pending_umbilical_valve_state(&self, cmd_id: u8, value: bool) {
-        self.pending_umbilical_valve_states
-            .lock()
-            .unwrap()
-            .insert(cmd_id, value);
+        self.pending_umbilical_valve_states.lock().unwrap().insert(
+            cmd_id,
+            PendingUmbilicalValveState {
+                target: value,
+                set_at: std::time::Instant::now(),
+            },
+        );
     }
 
     pub fn get_pending_umbilical_valve_state(&self, cmd_id: u8) -> Option<bool> {
@@ -1243,14 +1379,24 @@ impl AppState {
             .lock()
             .unwrap()
             .get(&cmd_id)
-            .copied()
+            .map(|pending| pending.target)
     }
 
-    pub fn clear_pending_umbilical_valve_state(&self, cmd_id: u8) {
-        self.pending_umbilical_valve_states
-            .lock()
-            .unwrap()
-            .remove(&cmd_id);
+    pub fn reconcile_pending_umbilical_valve_state(
+        &self,
+        cmd_id: u8,
+        actual: bool,
+        mismatch_timeout: std::time::Duration,
+    ) -> bool {
+        let mut pending = self.pending_umbilical_valve_states.lock().unwrap();
+        let Some(entry) = pending.get(&cmd_id).copied() else {
+            return false;
+        };
+        if entry.target == actual || entry.set_at.elapsed() >= mismatch_timeout {
+            pending.remove(&cmd_id);
+            return true;
+        }
+        false
     }
 
     /// Appends a telemetry row to the in-memory reseed cache and prunes old entries.
@@ -1371,30 +1517,10 @@ fn modeled_board_endpoints(
         };
     }
 
-    let mut endpoints = match board {
+    match board {
         Board::GroundStation => local_endpoint_list.to_vec(),
-        Board::FlightComputer => vec![
-            DataEndpoint::FlightController.as_str().to_string(),
-            DataEndpoint::FlightState.as_str().to_string(),
-            DataEndpoint::SdCard.as_str().to_string(),
-        ],
-        Board::RFBoard => Vec::new(),
-        Board::PowerBoard => Vec::new(),
-        Board::ValveBoard => vec![
-            DataEndpoint::ValveBoard.as_str().to_string(),
-            DataEndpoint::Abort.as_str().to_string(),
-        ],
-        Board::GatewayBoard => Vec::new(),
-        Board::ActuatorBoard => vec![
-            DataEndpoint::ActuatorBoard.as_str().to_string(),
-            DataEndpoint::Abort.as_str().to_string(),
-        ],
-        Board::DaqBoard => Vec::new(),
-    };
-
-    endpoints.sort();
-    endpoints.dedup();
-    endpoints
+        _ => Vec::new(),
+    }
 }
 
 fn launch_clock_for_transition(
@@ -1483,6 +1609,19 @@ fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthManager;
+    use crate::fill_targets;
+    use crate::gpio::GpioPins;
+    use crate::loadcell;
+    use crate::ring_buffer::RingBuffer;
+    use crate::telemetry_db::{DbQueueItem, RecordingModeWire, RecordingStatusMsg};
+    use sedsprintf_rs_2026::router::{
+        EndpointHandler, RouterConfig, RouterMode, RouterSideId, RouterSideOptions,
+    };
+    use sqlx::SqlitePool;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::{Notify, broadcast, mpsc};
 
     #[test]
     fn flight_computer_modeled_endpoints_include_sd_card() {
@@ -1498,6 +1637,27 @@ mod tests {
     fn relay_boards_do_not_model_endpoints() {
         assert!(modeled_board_endpoints(Board::RFBoard, false, &[]).is_empty());
         assert!(modeled_board_endpoints(Board::GatewayBoard, false, &[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_umbilical_valve_state_clears_after_mismatch_timeout() {
+        let state = test_app_state().await;
+        state.set_pending_umbilical_valve_state(42, true);
+
+        assert_eq!(state.get_pending_umbilical_valve_state(42), Some(true));
+        assert!(!state.reconcile_pending_umbilical_valve_state(
+            42,
+            false,
+            std::time::Duration::from_secs(2),
+        ));
+        assert_eq!(state.get_pending_umbilical_valve_state(42), Some(true));
+
+        assert!(state.reconcile_pending_umbilical_valve_state(
+            42,
+            false,
+            std::time::Duration::ZERO,
+        ));
+        assert_eq!(state.get_pending_umbilical_valve_state(42), None);
     }
 
     #[test]
@@ -1602,6 +1762,308 @@ mod tests {
 
             assert_eq!(next, current);
         }
+    }
+
+    async fn test_app_state() -> Arc<AppState> {
+        let db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory telemetry db");
+        let auth_db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory auth db");
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (db_queue_tx, _db_queue_rx) = mpsc::channel::<DbQueueItem>(4);
+        let (ws_tx, _ws_rx) = broadcast::channel(16);
+        let (state_tx, _state_rx) = broadcast::channel(4);
+        let (board_status_tx, _board_status_rx) = broadcast::channel(4);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
+        let (notifications_tx, _notifications_rx) = broadcast::channel(4);
+        let (messages_tx, _messages_rx) = broadcast::channel(4);
+        let (action_policy_tx, _action_policy_rx) = broadcast::channel(4);
+        let (fill_targets_tx, _fill_targets_rx) = broadcast::channel(4);
+        let (launch_clock_tx, _launch_clock_rx) = broadcast::channel(4);
+        let (recording_status_tx, _recording_status_rx) = broadcast::channel(4);
+
+        let mut board_status = HashMap::new();
+        for board in Board::ALL {
+            board_status.insert(
+                *board,
+                BoardStatus {
+                    packet_count: 0,
+                    last_seen_ms: None,
+                    last_seen_instant: None,
+                    ema_gap_ms: None,
+                    warned: false,
+                },
+            );
+        }
+
+        Arc::new(AppState {
+            ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
+            cmd_tx,
+            ws_tx,
+            warnings_tx: broadcast::channel(4).0,
+            errors_tx: broadcast::channel(4).0,
+            alert_ack_state: Arc::new(Mutex::new(AlertAckStateMsg::default())),
+            alert_ack_tx: broadcast::channel(4).0,
+            dashboard_reset_tx: broadcast::channel(4).0,
+            db: Arc::new(Mutex::new(db)),
+            db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
+            placeholder_db_path: "sqlite::memory:".to_string(),
+            db_queue_tx,
+            auth_db,
+            state: Arc::new(Mutex::new(FlightState::Startup)),
+            state_tx,
+            last_flight_state_packet_ts_ms: Arc::new(AtomicU64::new(0)),
+            gpio: GpioPins::new(),
+            board_status: Arc::new(Mutex::new(board_status)),
+            board_status_tx,
+            last_board_status_broadcast_ms: Arc::new(AtomicU64::new(0)),
+            last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
+            umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
+            pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
+            latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+            latest_fill_mass_kg: Arc::new(Mutex::new(None)),
+            loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
+            shutdown_tx,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            pending_db_writes: Arc::new(AtomicUsize::new(0)),
+            db_write_notify: Arc::new(Notify::new()),
+            notifications: Arc::new(Mutex::new(Vec::new())),
+            notifications_tx,
+            next_notification_id: Arc::new(AtomicU64::new(0)),
+            messages: Arc::new(Mutex::new(Vec::new())),
+            messages_tx,
+            next_message_id: Arc::new(AtomicU64::new(0)),
+            action_policy: Arc::new(Mutex::new(crate::sequences::default_action_policy())),
+            sequence_policy_state: Arc::new(Mutex::new(
+                crate::sequences::SequencePolicyState::default(),
+            )),
+            action_policy_tx,
+            fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
+            fill_targets_tx,
+            launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
+            launch_clock_tx,
+            launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
+            launch_indicator_latched: Arc::new(AtomicBool::new(false)),
+            abort_indicator_latched: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "hitl_mode")]
+            hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "hitl_mode")]
+            hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "hitl_mode")]
+            hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
+            recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
+                mode: RecordingModeWire::Idle,
+                db_path: None,
+            })),
+            recording_status_tx,
+            last_command_ms: Arc::new(Mutex::new(HashMap::new())),
+            fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
+            recent_telemetry_cache: Arc::new(Mutex::new(VecDeque::new())),
+            latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
+            latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),
+            recent_alerts_cache: Arc::new(Mutex::new(VecDeque::new())),
+            av_bay_comms_connected: Arc::new(AtomicBool::new(false)),
+            fill_comms_connected: Arc::new(AtomicBool::new(false)),
+            topology_router: Arc::new(OnceLock::new()),
+            auth: Arc::new(AuthManager::new(PathBuf::from(
+                "/tmp/groundstation-state-test-users.json",
+            ))),
+        })
+    }
+
+    #[tokio::test]
+    async fn acknowledge_alerts_updates_warning_and_error_ack_state() {
+        let state = test_app_state().await;
+        let mut ack_rx = state.alert_ack_tx.subscribe();
+
+        let ack = state.acknowledge_alerts_through(1_000, 2_000);
+
+        assert_eq!(ack.warning_ack_timestamp_ms, 1_000);
+        assert_eq!(ack.error_ack_timestamp_ms, 2_000);
+        assert_eq!(state.alert_ack_state_snapshot(), ack);
+
+        let broadcast = ack_rx
+            .recv()
+            .await
+            .expect("alert ack update should broadcast");
+        assert_eq!(broadcast, ack);
+    }
+
+    #[tokio::test]
+    async fn repeated_groundstation_flight_state_changes_emit_multiple_packets() {
+        let state = test_app_state().await;
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sent_clone = sent.clone();
+        let router = Arc::new(Router::new(RouterMode::Relay, RouterConfig::new([])));
+        router.add_side_serialized_with_options(
+            "umbilical_comms",
+            move |bytes| {
+                sent_clone
+                    .lock()
+                    .expect("failed to lock sends")
+                    .push(bytes.to_vec());
+                Ok(())
+            },
+            RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        state
+            .topology_router
+            .set(router)
+            .expect("failed to set topology router");
+
+        let sequence = [
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::FillTest,
+            FlightState::PreFill,
+            FlightState::Idle,
+            FlightState::Startup,
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::FillTest,
+            FlightState::PreFill,
+            FlightState::Idle,
+            FlightState::Startup,
+        ];
+        for state_code in sequence {
+            state.queue_router_flight_state_update(state_code);
+        }
+
+        let sent = sent.lock().expect("failed to lock sends");
+        let flight_state_packets = sent
+            .iter()
+            .filter_map(|wire| sedsprintf_rs_2026::serialize::deserialize_packet(wire).ok())
+            .filter(|pkt| pkt.data_type() == DataType::FlightState)
+            .count();
+        assert_eq!(flight_state_packets, sequence.len());
+    }
+
+    #[tokio::test]
+    async fn repeated_groundstation_flight_state_changes_reach_remote_router_with_ack_path() {
+        let state = test_app_state().await;
+        let remote_states = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let remote_states_handler = remote_states.clone();
+        let remote_deliveries = Arc::new(AtomicUsize::new(0));
+        let remote_deliveries_handler = remote_deliveries.clone();
+
+        let remote_router = Arc::new(sedsprintf_rs_2026::router::Router::new(
+            RouterMode::Relay,
+            RouterConfig::new([EndpointHandler::new_packet_handler(
+                DataEndpoint::FlightState,
+                move |pkt: &Packet| {
+                    let payload = pkt.payload();
+                    if let Some(state_code) = payload.first().copied() {
+                        remote_states_handler
+                            .lock()
+                            .expect("failed to lock remote states")
+                            .push(state_code);
+                        remote_deliveries_handler.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(())
+                },
+            )]),
+        ));
+        let gs_router = Arc::new(sedsprintf_rs_2026::router::Router::new(
+            RouterMode::Relay,
+            RouterConfig::new([]),
+        ));
+
+        let gs_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+        let remote_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+
+        let gs_side = {
+            let gs_peer = gs_peer.clone();
+            gs_router.add_side_serialized_with_options(
+                "umbilical_comms",
+                move |bytes| {
+                    let (peer, ingress) = gs_peer
+                        .lock()
+                        .expect("failed to lock gs peer")
+                        .clone()
+                        .expect("gs peer not initialized");
+                    peer.rx_serialized_from_side(bytes, ingress)
+                },
+                RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: true,
+                },
+            )
+        };
+
+        let remote_side = {
+            let remote_peer = remote_peer.clone();
+            remote_router.add_side_serialized_with_options(
+                "gs_link",
+                move |bytes| {
+                    let (peer, ingress) = remote_peer
+                        .lock()
+                        .expect("failed to lock remote peer")
+                        .clone()
+                        .expect("remote peer not initialized");
+                    peer.rx_serialized_from_side(bytes, ingress)
+                },
+                RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: true,
+                },
+            )
+        };
+
+        *gs_peer.lock().expect("failed to lock gs peer") =
+            Some((remote_router.clone(), remote_side));
+        *remote_peer.lock().expect("failed to lock remote peer") =
+            Some((gs_router.clone(), gs_side));
+
+        remote_router
+            .announce_discovery()
+            .expect("failed to queue remote discovery announce");
+        remote_router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process remote discovery announce");
+
+        state
+            .topology_router
+            .set(gs_router.clone())
+            .expect("failed to set topology router");
+
+        let sequence = [
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::FillTest,
+            FlightState::PreFill,
+            FlightState::Idle,
+            FlightState::Startup,
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::FillTest,
+            FlightState::PreFill,
+            FlightState::Idle,
+            FlightState::Startup,
+        ];
+        for state_code in sequence {
+            state.queue_router_flight_state_update(state_code);
+        }
+
+        let states = remote_states.lock().expect("failed to lock remote states");
+        let expected = sequence
+            .iter()
+            .map(|state| *state as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(states.as_slice(), expected.as_slice());
+        assert_eq!(remote_deliveries.load(Ordering::Relaxed), sequence.len());
     }
 
     #[test]

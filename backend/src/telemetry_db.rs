@@ -1,9 +1,11 @@
 use anyhow::Result;
-use sqlx::sqlite::SqliteConnection;
+use sqlx::sqlite::{SqliteConnection, SqlitePoolOptions};
 use sqlx::{Connection, Row, SqlitePool};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
+use time::OffsetDateTime;
+use time::format_description::FormatItem;
 use tokio::time::Duration;
 
 pub const RECORDING_BUFFER_WINDOW_MS: i64 = 2 * 60 * 1000;
@@ -24,6 +26,7 @@ pub enum DbWrite {
     },
     Telemetry {
         timestamp_ms: i64,
+        source_timestamp_ms: Option<i64>,
         data_type: String,
         sender_id: String,
         values_json: Option<String>,
@@ -60,6 +63,7 @@ pub enum RecordingCommand {
     StartWithRecent,
     Pause,
     Stop,
+    ResetAll,
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +151,7 @@ fn env_i64(name: &str, default: i64, min: i64, max: i64) -> i64 {
 
 pub async fn apply_sqlite_pragmas(db: &SqlitePool) {
     let synchronous = std::env::var("GS_SQLITE_SYNCHRONOUS")
-        .unwrap_or_else(|_| "NORMAL".to_string())
+        .unwrap_or_else(|_| "FULL".to_string())
         .to_uppercase();
     let synchronous = match synchronous.as_str() {
         "OFF" | "NORMAL" | "FULL" | "EXTRA" => synchronous,
@@ -162,6 +166,8 @@ pub async fn apply_sqlite_pragmas(db: &SqlitePool) {
     let pragmas = [
         "PRAGMA journal_mode=WAL;".to_string(),
         format!("PRAGMA synchronous={synchronous};"),
+        "PRAGMA fullfsync=ON;".to_string(),
+        "PRAGMA checkpoint_fullfsync=ON;".to_string(),
         "PRAGMA temp_store=MEMORY;".to_string(),
         format!("PRAGMA busy_timeout={busy_timeout_ms};"),
         format!("PRAGMA wal_autocheckpoint={wal_autocheckpoint};"),
@@ -170,7 +176,7 @@ pub async fn apply_sqlite_pragmas(db: &SqlitePool) {
 
     for stmt in pragmas {
         if let Err(err) = sqlx::query(&stmt).execute(db).await {
-            eprintln!("SQLite pragma failed ({stmt}): {err}");
+            log::error!("sqlite pragma failed ({stmt}): {err}");
         }
     }
 }
@@ -181,6 +187,7 @@ pub async fn ensure_telemetry_schema(db: &SqlitePool) -> Result<()> {
         CREATE TABLE IF NOT EXISTS telemetry (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp_ms INTEGER NOT NULL,
+            source_timestamp_ms INTEGER,
             data_type    TEXT    NOT NULL,
             sender_id    TEXT,
             values_json  TEXT,
@@ -227,6 +234,14 @@ pub async fn ensure_telemetry_schema(db: &SqlitePool) -> Result<()> {
         .any(|row| row.get::<String, _>("name") == "sender_id");
     if !has_sender_id {
         sqlx::query("ALTER TABLE telemetry ADD COLUMN sender_id TEXT")
+            .execute(db)
+            .await?;
+    }
+    let has_source_timestamp_ms = cols
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "source_timestamp_ms");
+    if !has_source_timestamp_ms {
+        sqlx::query("ALTER TABLE telemetry ADD COLUMN source_timestamp_ms INTEGER")
             .execute(db)
             .await?;
     }
@@ -281,14 +296,51 @@ pub async fn ensure_telemetry_schema(db: &SqlitePool) -> Result<()> {
 
 pub async fn open_telemetry_db(path: &Path) -> Result<(SqlitePool, String)> {
     let db_path = ensure_sqlite_db_file(path)?;
-    let db = SqlitePool::connect(&format!("sqlite://{}", db_path)).await?;
+    let db = open_sqlite_pool(&format!("sqlite://{}", db_path)).await?;
     apply_sqlite_pragmas(&db).await;
     ensure_telemetry_schema(&db).await?;
     Ok((db, db_path))
 }
 
+pub async fn open_in_memory_telemetry_db() -> Result<SqlitePool> {
+    let db = open_sqlite_pool("sqlite::memory:").await?;
+    apply_sqlite_pragmas(&db).await;
+    ensure_telemetry_schema(&db).await?;
+    Ok(db)
+}
+
+async fn open_sqlite_pool(url: &str) -> Result<SqlitePool> {
+    Ok(SqlitePoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .connect(url)
+        .await?)
+}
+
 pub fn session_db_path(base_dir: &Path, started_at_ms: i64) -> PathBuf {
-    base_dir.join(format!("groundstation_{started_at_ms}.db"))
+    base_dir.join(format!(
+        "groundstation_recording_{}.db",
+        human_readable_session_stamp(started_at_ms)
+    ))
+}
+
+fn human_readable_session_stamp(started_at_ms: i64) -> String {
+    static FORMAT: &[FormatItem<'static>] = time::macros::format_description!(
+        "[year]-[month]-[day]_[hour]-[minute]-[second]_[subsecond digits:3]"
+    );
+
+    let timestamp_ns = started_at_ms
+        .checked_mul(1_000_000)
+        .and_then(|value| value.try_into().ok());
+    let Some(timestamp_ns) = timestamp_ns else {
+        return started_at_ms.to_string();
+    };
+    match OffsetDateTime::from_unix_timestamp_nanos(timestamp_ns) {
+        Ok(dt) => dt
+            .format(FORMAT)
+            .unwrap_or_else(|_| started_at_ms.to_string()),
+        Err(_) => started_at_ms.to_string(),
+    }
 }
 
 async fn exec_pragma_with_retry(
@@ -318,10 +370,10 @@ pub async fn flush_sqlite_journals(db: &SqlitePool) {
     if let Err(err) =
         exec_pragma_with_retry(db, "PRAGMA wal_checkpoint(TRUNCATE);", retries, delay_ms).await
     {
-        eprintln!("SQLite wal_checkpoint(TRUNCATE) failed after {retries} attempts: {err}");
+        log::error!("sqlite wal_checkpoint(TRUNCATE) failed after {retries} attempts: {err}");
     }
     if let Err(err) = exec_pragma_with_retry(db, "PRAGMA optimize;", retries, delay_ms).await {
-        eprintln!("SQLite PRAGMA optimize failed after {retries} attempts: {err}");
+        log::error!("sqlite PRAGMA optimize failed after {retries} attempts: {err}");
     }
 }
 
@@ -330,7 +382,7 @@ pub async fn finalize_sqlite_after_pool_close(db_path: &str) {
     let mut conn = match SqliteConnection::connect(&url).await {
         Ok(conn) => conn,
         Err(err) => {
-            eprintln!("Failed to reopen SQLite DB for finalization ({db_path}): {err}");
+            log::error!("failed to reopen sqlite db for finalization ({db_path}): {err}");
             return;
         }
     };
@@ -341,7 +393,7 @@ pub async fn finalize_sqlite_after_pool_close(db_path: &str) {
         "PRAGMA optimize;",
     ] {
         if let Err(err) = sqlx::query(stmt).execute(&mut conn).await {
-            eprintln!("SQLite finalization pragma failed ({stmt}): {err}");
+            log::error!("sqlite finalization pragma failed ({stmt}): {err}");
         }
     }
 
@@ -355,7 +407,7 @@ pub async fn finalize_sqlite_after_pool_close(db_path: &str) {
             Ok(_) => break,
             Err(err) => {
                 if attempt + 1 >= retries {
-                    eprintln!(
+                    log::error!(
                         "SQLite finalization pragma failed (PRAGMA journal_mode=DELETE;): {err}"
                     );
                 } else {
@@ -366,7 +418,7 @@ pub async fn finalize_sqlite_after_pool_close(db_path: &str) {
     }
 
     if let Err(err) = conn.close().await {
-        eprintln!("Failed closing SQLite finalization connection: {err}");
+        log::error!("failed closing sqlite finalization connection: {err}");
     }
 }
 
@@ -381,7 +433,7 @@ pub async fn remove_sqlite_sidecars(db_path: &str) {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
                 Err(err) => {
                     if attempt + 1 >= retries {
-                        eprintln!("Failed removing SQLite sidecar {sidecar}: {err}");
+                        log::error!("failed removing sqlite sidecar {sidecar}: {err}");
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
@@ -408,11 +460,64 @@ pub async fn close_and_finalize_sqlite(db: SqlitePool, db_path: &str) {
     remove_sqlite_sidecars(db_path).await;
     let lingering = sqlite_sidecars_present(db_path);
     if !lingering.is_empty() {
-        eprintln!(
+        log::error!(
             "WARNING: SQLite sidecar files still present after shutdown cleanup: {}",
             lingering.join(", ")
         );
     }
+}
+
+pub async fn sqlite_db_has_user_rows(db_path: &str) -> Result<bool> {
+    let url = format!("sqlite://{db_path}");
+    let db = open_sqlite_pool(&url).await?;
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT
+            COALESCE((SELECT COUNT(*) FROM telemetry), 0) +
+            COALESCE((SELECT COUNT(*) FROM alerts), 0) +
+            COALESCE((SELECT COUNT(*) FROM flight_state), 0) +
+            COALESCE((SELECT COUNT(*) FROM messages), 0)
+        "#,
+    )
+    .fetch_one(&db)
+    .await?;
+    db.close().await;
+    Ok(total > 0)
+}
+
+pub async fn delete_sqlite_if_empty(db_path: &str) -> Result<bool> {
+    if !Path::new(db_path).exists() {
+        return Ok(false);
+    }
+    if sqlite_db_has_user_rows(db_path).await? {
+        return Ok(false);
+    }
+    fs::remove_file(db_path)?;
+    remove_sqlite_sidecars(db_path).await;
+    Ok(true)
+}
+
+pub async fn recover_sqlite_sidecars_in_dir(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(dir)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("db") {
+            continue;
+        }
+        let db_path = path.to_string_lossy().to_string();
+        let sidecars = sqlite_sidecars_present(&db_path);
+        if sidecars.is_empty() {
+            continue;
+        }
+        log::info!("recovering sqlite sidecars for {}", path.display());
+        finalize_sqlite_after_pool_close(&db_path).await;
+        remove_sqlite_sidecars(&db_path).await;
+    }
+    Ok(())
 }
 
 pub fn prune_recent_writes(buffer: &mut VecDeque<DbWrite>, newest_ts_ms: i64) {

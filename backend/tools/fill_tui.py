@@ -82,6 +82,7 @@ def _enum_value(enum_cls: object, *names: str) -> int:
 
 
 FLIGHT_COMMAND_TYPE = _enum_value(DT, "FLIGHT_COMMAND", "FlightCommand")
+FLIGHT_STATE_TYPE = _enum_value(DT, "FLIGHT_STATE", "FlightState")
 VALVE_COMMAND_TYPE = _enum_value(DT, "VALVE_COMMAND", "ValveCommand")
 ACTUATOR_COMMAND_TYPE = _enum_value(DT, "ACTUATOR_COMMAND", "ActuatorCommand")
 GROUNDSTATION_ENDPOINT = _enum_value(EP, "GROUND_STATION", "GroundStation")
@@ -214,59 +215,67 @@ class TxMetadata:
 
 def build_command_groups(include_hitl: bool) -> list[tuple[str, list[CommandSpec]]]:
     rocket = [
-        CommandSpec("Launch", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 3, "FlightCommands::Launch"),
+        CommandSpec("Launch", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 1,
+                    "FlightComputerCommands::Launch"),
     ]
     if include_hitl:
         rocket.extend(
             [
-                CommandSpec("DeployParachute", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 0,
+                CommandSpec("DeployParachute", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 12,
                             "FlightComputerCommands"),
-                CommandSpec("ExpandParachute", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 1,
+                CommandSpec("ExpandParachute", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 13,
                             "FlightComputerCommands"),
-                CommandSpec("ReinitSensors", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 2,
+                CommandSpec("ReinitSensors", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 17,
                             "FlightComputerCommands"),
-                CommandSpec("LaunchSignal", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 3,
+                CommandSpec("EvaluationRelax", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 14,
                             "FlightComputerCommands"),
-                CommandSpec("EvaluationRelax", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 4,
+                CommandSpec("EvaluationFocus", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 15,
                             "FlightComputerCommands"),
-                CommandSpec("EvaluationFocus", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 5,
+                CommandSpec("EvaluationAbort", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 16,
                             "FlightComputerCommands"),
-                CommandSpec("EvaluationAbort", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 6,
+                CommandSpec("ReinitBarometer", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 18,
                             "FlightComputerCommands"),
-                CommandSpec("ReinitBarometer", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 7,
+                CommandSpec("EnableIMU", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 19, "FlightComputerCommands"),
+                CommandSpec("DisableIMU", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 20, "FlightComputerCommands"),
+                CommandSpec("MonitorAltitude", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 2,
                             "FlightComputerCommands"),
-                CommandSpec("EnableIMU", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 8, "FlightComputerCommands"),
-                CommandSpec("DisableIMU", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 9, "FlightComputerCommands"),
-                CommandSpec("MonitorAltitude", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 10,
+                CommandSpec("RevokeMonitorAltitude", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 3,
                             "FlightComputerCommands"),
-                CommandSpec("RevokeMonitorAltitude", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 11,
+                CommandSpec("ConsecutiveSamples", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 4,
                             "FlightComputerCommands"),
-                CommandSpec("ConsecutiveSamples", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 12,
+                CommandSpec("RevokeConsecutiveSamples", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 5,
                             "FlightComputerCommands"),
-                CommandSpec("RevokeConsecutiveSamples", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 13,
+                CommandSpec("ResetFailures", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 6,
                             "FlightComputerCommands"),
-                CommandSpec("ResetFailures", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 14,
+                CommandSpec("RevokeResetFailures", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 7,
                             "FlightComputerCommands"),
-                CommandSpec("RevokeResetFailures", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 15,
+                CommandSpec("ValidateMeasms", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 8,
                             "FlightComputerCommands"),
-                CommandSpec("ValidateMeasms", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 16,
+                CommandSpec("RevokeValidateMeasms", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 9,
                             "FlightComputerCommands"),
-                CommandSpec("RevokeValidateMeasms", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 17,
-                            "FlightComputerCommands"),
-                CommandSpec("AbortAfter15", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 18,
-                            "FlightComputerCommands"),
-                CommandSpec("AbortAfter40", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 19,
-                            "FlightComputerCommands"),
-                CommandSpec("AbortAfter70", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 20,
-                            "FlightComputerCommands"),
-                CommandSpec("ReinitAfter12", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 21,
-                            "FlightComputerCommands"),
-                CommandSpec("ReinitAfter26", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 22,
-                            "FlightComputerCommands"),
-                CommandSpec("ReinitAfter44", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 23,
+                CommandSpec("AbortAfter40", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 23,
                             "FlightComputerCommands"),
             ]
         )
+
+    flight_state = [
+        CommandSpec("Startup", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 0, "FlightState"),
+        CommandSpec("Idle", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 1, "FlightState"),
+        CommandSpec("PreFill", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 2, "FlightState"),
+        CommandSpec("FillTest", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 3, "FlightState"),
+        CommandSpec("NitrogenFill", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 4, "FlightState"),
+        CommandSpec("NitrousFill", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 5, "FlightState"),
+        CommandSpec("Armed", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 6, "FlightState"),
+        CommandSpec("LaunchState", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 7, "FlightState"),
+        CommandSpec("Ascent", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 8, "FlightState"),
+        CommandSpec("Coast", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 9, "FlightState"),
+        CommandSpec("Apogee", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 10, "FlightState"),
+        CommandSpec("ParachuteDeploy", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 11, "FlightState"),
+        CommandSpec("Descent", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 12, "FlightState"),
+        CommandSpec("Landed", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 13, "FlightState"),
+        CommandSpec("Recovery", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 14, "FlightState"),
+        CommandSpec("Aborted", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 15, "FlightState"),
+    ]
 
     valve = [
         CommandSpec("PilotOpen", VALVE_COMMAND_TYPE, VALVE_BOARD_ENDPOINT, 0, "ValveBoardCommands"),
@@ -287,7 +296,7 @@ def build_command_groups(include_hitl: bool) -> list[tuple[str, list[CommandSpec
         CommandSpec("NitrousClose", ACTUATOR_COMMAND_TYPE, ACTUATOR_BOARD_ENDPOINT, 13, "ActuatorBoardCommands"),
         CommandSpec("IgniterSequence", ACTUATOR_COMMAND_TYPE, ACTUATOR_BOARD_ENDPOINT, 14, "ActuatorBoardCommands"),
     ]
-    return [("Rocket", rocket), ("Valve", valve), ("Actuator", actuator)]
+    return [("Rocket", rocket), ("FlightState", flight_state), ("Valve", valve), ("Actuator", actuator)]
 
 
 def backend_root_from_script(script_path: Path) -> Path:

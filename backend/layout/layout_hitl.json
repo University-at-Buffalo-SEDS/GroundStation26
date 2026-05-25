@@ -143,7 +143,8 @@
         "cmd": "Launch",
         "border": "#22c55e",
         "bg": "#022c22",
-        "fg": "#bbf7d0"
+        "fg": "#bbf7d0",
+        "spacer_row_before": true
       },
       {
         "label": "GS Launch",
@@ -195,7 +196,8 @@
         "cmd": "Igniter",
         "border": "#60a5fa",
         "bg": "#0b1220",
-        "fg": "#bfdbfe"
+        "fg": "#bfdbfe",
+        "spacer_after": true
       },
       {
         "label": "Igniter Seq",
@@ -212,7 +214,7 @@
         "fg": "#ddd6fe"
       },
       {
-        "label": "NormallyOpen",
+        "label": "Vent",
         "cmd": "NormallyOpen",
         "border": "#f97316",
         "bg": "#1f2937",
@@ -373,8 +375,8 @@
         "fg": "#e0f2fe"
       },
       {
-        "label": "Reinit IMU",
-        "cmd": "ReinitIMU",
+        "label": "Enable IMU",
+        "cmd": "EnableIMU",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -401,6 +403,13 @@
         "fg": "#e0f2fe"
       },
       {
+        "label": "Abort After 15",
+        "cmd": "AbortAfter15",
+        "border": "#38bdf8",
+        "bg": "#0b1220",
+        "fg": "#e0f2fe"
+      },
+      {
         "label": "Abort After 40",
         "cmd": "AbortAfter40",
         "border": "#38bdf8",
@@ -408,36 +417,29 @@
         "fg": "#e0f2fe"
       },
       {
-        "label": "Abort After 100",
-        "cmd": "AbortAfter100",
+        "label": "Abort After 70",
+        "cmd": "AbortAfter70",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Abort After 250",
-        "cmd": "AbortAfter250",
+        "label": "Reinit After 12",
+        "cmd": "ReinitAfter12",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Reinit After 15",
-        "cmd": "ReinitAfter15",
+        "label": "Reinit After 26",
+        "cmd": "ReinitAfter26",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
       },
       {
-        "label": "Reinit After 30",
-        "cmd": "ReinitAfter30",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Reinit After 50",
-        "cmd": "ReinitAfter50",
+        "label": "Reinit After 44",
+        "cmd": "ReinitAfter44",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe"
@@ -461,6 +463,28 @@
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
+        }
+      },
+      {
+        "id": "EULER_ANGLES",
+        "label": "Euler Angles",
+        "channels": [
+          "Roll",
+          "Pitch",
+          "Yaw"
+        ],
+        "chart": {
+          "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -473,6 +497,11 @@
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -490,11 +519,21 @@
               1,
               2
             ],
-            "scale_mode": "per_series"
+            "scale_mode": "per_series",
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
+            }
           }
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -584,6 +623,7 @@
       {
         "id": "GPS_DATA",
         "label": "GPS Data",
+        "show_min_max": false,
         "channels": [
           "Lat",
           "Lon",
@@ -627,6 +667,10 @@
                 "index": 0,
                 "formatter": {
                   "precision": 7
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
                 }
               },
               {
@@ -635,12 +679,20 @@
                 "index": 1,
                 "formatter": {
                   "precision": 7
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
                 }
               },
               {
                 "label": "Altitude",
                 "data_type": "GPS_DATA",
-                "index": 2
+                "index": 2,
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
+                }
               },
               {
                 "label": "Satellites",
@@ -648,13 +700,25 @@
                 "index": 0,
                 "formatter": {
                   "kind": "integer"
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
                 }
               }
-            ]
+            ],
+            "display_filter": {
+              "enabled": false,
+              "kind": "raw"
+            }
           }
         ],
         "chart": {
           "enabled": false
+        },
+        "display_filter": {
+          "enabled": false,
+          "kind": "raw"
         }
       },
       {
@@ -671,6 +735,11 @@
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -681,6 +750,11 @@
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -700,6 +774,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           },
           {
@@ -712,6 +791,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           },
           {
@@ -724,11 +808,21 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           }
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
@@ -748,6 +842,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           },
           {
@@ -760,6 +859,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           },
           {
@@ -772,16 +876,27 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           }
         ],
         "chart": {
           "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
         }
       },
       {
         "id": "BATTERY_RUNTIME",
         "label": "Battery Runtime",
+        "show_min_max": false,
         "channels": [
           "AV Bay %",
           "AV Bay Drop",
@@ -955,6 +1070,7 @@
       {
         "id": "VALVE_STATE",
         "label": "Valve State",
+        "show_min_max": false,
         "channels": [
           "Pilot",
           "NormallyOpen",
@@ -1008,7 +1124,11 @@
             "false_label": "Installed",
             "unknown_label": "Unknown"
           }
-        ]
+        ],
+        "display_filter": {
+          "enabled": false,
+          "kind": "raw"
+        }
       },
       {
         "id": "LOADCELL",
@@ -1034,7 +1154,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               },
               {
                 "title": "Calibrated",
@@ -1044,7 +1169,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               },
               {
                 "title": "Fill %",
@@ -1054,7 +1184,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               }
             ],
             "summary_items": [
@@ -1065,21 +1200,41 @@
                 "formatter": {
                   "kind": "number",
                   "precision": 7
+                },
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
                 }
               },
               {
                 "label": "Calibrated",
                 "data_type": "LOADCELL_WEIGHT_KG",
-                "index": 0
+                "index": 0,
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               },
               {
                 "label": "Fill %",
                 "data_type": "LOADCELL_FILL_PERCENT",
-                "index": 0
+                "index": 0,
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
               }
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "time_average",
+              "window_ms": 500
             }
           },
           {
@@ -1098,7 +1253,12 @@
                 ],
                 "channels": [
                   0
-                ]
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "low_pass",
+                  "cutoff_hz": 8.0
+                }
               },
               {
                 "title": "Calibrated",
@@ -1119,6 +1279,11 @@
                 "formatter": {
                   "kind": "number",
                   "precision": 7
+                },
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "low_pass",
+                  "cutoff_hz": 8.0
                 }
               },
               {
@@ -1129,6 +1294,11 @@
             ],
             "chart": {
               "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "low_pass",
+              "cutoff_hz": 8.0
             }
           }
         ],
@@ -1136,7 +1306,11 @@
           "enabled": false
         }
       }
-    ]
+    ],
+    "default_display_filter": {
+      "enabled": false,
+      "kind": "raw"
+    }
   },
   "state_tab": {
     "states": [
@@ -1243,7 +1417,8 @@
           "PreFill",
           "FillTest",
           "NitrogenFill",
-          "NitrousFill"
+          "NitrousFill",
+          "Aborted"
         ],
         "sections": [
           {
@@ -1300,17 +1475,32 @@
                   {
                     "data_type": "FUEL_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure"
+                    "label": "Tank Pressure",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "low_pass",
+                      "cutoff_hz": 8.0
+                    }
                   },
                   {
                     "data_type": "LOADCELL_WEIGHT_KG",
                     "index": 0,
-                    "label": "Mass (kg)"
+                    "label": "Mass (kg)",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   },
                   {
                     "data_type": "LOADCELL_FILL_PERCENT",
                     "index": 0,
-                    "label": "Fill Percent"
+                    "label": "Fill Percent",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   }
                 ],
                 "width": 1200.0,
@@ -1331,7 +1521,7 @@
                     "index": 0
                   },
                   {
-                    "label": "NormallyOpen",
+                    "label": "Vent",
                     "index": 1
                   },
                   {
@@ -1544,17 +1734,32 @@
                   {
                     "data_type": "FUEL_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure"
+                    "label": "Tank Pressure",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "low_pass",
+                      "cutoff_hz": 8.0
+                    }
                   },
                   {
                     "data_type": "LOADCELL_WEIGHT_KG",
                     "index": 0,
-                    "label": "Mass (kg)"
+                    "label": "Mass (kg)",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   },
                   {
                     "data_type": "LOADCELL_FILL_PERCENT",
                     "index": 0,
-                    "label": "Fill Percent"
+                    "label": "Fill Percent",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   }
                 ],
                 "width": 1200.0,
@@ -1598,7 +1803,7 @@
                     "index": 0
                   },
                   {
-                    "label": "NormallyOpen",
+                    "label": "Vent",
                     "index": 1
                   },
                   {
@@ -1820,17 +2025,32 @@
                   {
                     "data_type": "FUEL_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure"
+                    "label": "Tank Pressure",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "low_pass",
+                      "cutoff_hz": 8.0
+                    }
                   },
                   {
                     "data_type": "LOADCELL_WEIGHT_KG",
                     "index": 0,
-                    "label": "Mass (kg)"
+                    "label": "Mass (kg)",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   },
                   {
                     "data_type": "LOADCELL_FILL_PERCENT",
                     "index": 0,
-                    "label": "Fill Percent"
+                    "label": "Fill Percent",
+                    "display_filter": {
+                      "enabled": true,
+                      "kind": "time_average",
+                      "window_ms": 500
+                    }
                   }
                 ],
                 "width": 1200.0,

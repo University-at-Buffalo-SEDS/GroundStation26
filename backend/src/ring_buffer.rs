@@ -20,6 +20,7 @@ impl<T> RingBuffer<T> {
         self.buf.push_back(item);
     }
 
+    #[allow(dead_code)]
     pub fn recent(&self, n: usize) -> Vec<&T> {
         self.buf.iter().rev().take(n).collect()
     }
@@ -31,6 +32,7 @@ impl<T> RingBuffer<T> {
     pub fn pop_newest(&mut self) -> Option<T> {
         self.buf.pop_back()
     }
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.buf.len()
     }

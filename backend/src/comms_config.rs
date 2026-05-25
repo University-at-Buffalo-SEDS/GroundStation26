@@ -106,6 +106,10 @@ fn default_baud_rate() -> usize {
     COMMS_BAUD_RATE
 }
 
+fn default_av_bay_baud_rate() -> usize {
+    9_600
+}
+
 fn default_serial_protocol() -> SerialProtocol {
     SerialProtocol::PacketFramed
 }
@@ -153,8 +157,8 @@ impl Default for CommsLinksConfig {
             av_bay: CommsLinkConfig::Serial {
                 serial: SerialLinkConfig {
                     port: ROCKET_COMMS_PORT.to_string(),
-                    baud_rate: default_baud_rate(),
-                    protocol: default_serial_protocol(),
+                    baud_rate: default_av_bay_baud_rate(),
+                    protocol: SerialProtocol::RawUart,
                 },
             },
             fill_box: CommsLinkConfig::Serial {
@@ -282,7 +286,7 @@ fn migrate_serial_protocol_defaults(raw: String, path: &PathBuf) -> String {
     let mut changed = false;
     if let Some(obj) = value.as_object_mut() {
         if let Some(av_bay) = obj.get_mut("av_bay") {
-            changed |= ensure_serial_protocol(av_bay, SerialProtocol::PacketFramed);
+            changed |= ensure_serial_protocol(av_bay, SerialProtocol::RawUart);
         }
         if let Some(fill_box) = obj.get_mut("fill_box") {
             changed |= ensure_serial_protocol(fill_box, SerialProtocol::RawUart);
@@ -350,9 +354,9 @@ mod tests {
             cfg.av_bay,
             CommsLinkConfig::Serial {
                 serial: SerialLinkConfig {
-                    port: "/dev/ttyUSB1".to_string(),
-                    baud_rate: 57_600,
-                    protocol: SerialProtocol::PacketFramed,
+                    port: "/dev/ttyAMA0".to_string(),
+                    baud_rate: 9_600,
+                    protocol: SerialProtocol::RawUart,
                 },
             }
         );
@@ -366,6 +370,27 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn checked_in_hardware_config_matches_rfboard_uart_contract() {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("comms/comms.json"),
+        )
+        .expect("checked-in comms config should be readable");
+        let cfg: CommsLinksConfig =
+            serde_json::from_str(&raw).expect("checked-in comms config should parse");
+
+        match cfg.av_bay {
+            CommsLinkConfig::Serial { serial }
+            | CommsLinkConfig::RaspberryPiGpioUart { serial }
+            | CommsLinkConfig::CustomSerial { serial } => {
+                assert_eq!(serial.port, "/dev/ttyAMA0");
+                assert_eq!(serial.baud_rate, 9_600);
+                assert_eq!(serial.protocol, SerialProtocol::RawUart);
+            }
+            other => panic!("RF-board av_bay link must be serial raw_uart, got {other:?}"),
+        }
     }
 
     #[test]

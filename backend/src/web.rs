@@ -32,6 +32,8 @@ use std::convert::Infallible;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration as StdDuration, Instant};
 use tokio::sync::{OnceCell, mpsc};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -371,7 +373,7 @@ pub struct ErrorMsg {
     pub message: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 pub struct AlertAckStateMsg {
     pub warning_ack_timestamp_ms: i64,
     pub error_ack_timestamp_ms: i64,
@@ -605,10 +607,7 @@ struct CaptureLoadcellSpanReq {
 }
 
 #[derive(Deserialize)]
-struct RefitLoadcellReq {
-    channel: String,
-    mode: String,
-}
+struct RefitLoadcellReq {}
 
 /// Returns the in-memory loadcell calibration file.
 async fn get_loadcell_calibration(
@@ -706,24 +705,8 @@ async fn refit_loadcell_channel(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
-    let channel = loadcell::CalibrationChannel::from_str(req.channel.trim());
-    let Some(mode) = loadcell::FitMode::from_str(req.mode.trim()) else {
-        return (StatusCode::BAD_REQUEST, "invalid fit mode".to_string()).into_response();
-    };
-
-    let updated = {
-        let mut cfg = state.loadcell_calibration.lock().unwrap();
-        if let Err(err) = loadcell::refit_channel(&mut cfg, channel, mode) {
-            return (StatusCode::BAD_REQUEST, err).into_response();
-        }
-        cfg.clone()
-    };
-
-    if let Err(err) = loadcell::save(&updated) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
-    }
-    state.broadcast_fill_targets_snapshot();
-    Json(updated).into_response()
+    let _ = req;
+    Json(state.loadcell_calibration.lock().unwrap().clone()).into_response()
 }
 
 /// Serves a map tile or a synthesized ancestor fallback when the exact tile is missing.
@@ -1284,11 +1267,8 @@ async fn dismiss_notification(
     if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
         return response;
     }
-    if state.dismiss_notification(id) {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
-    }
+    let _ = id;
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Returns the current command gating policy for the actions UI.
@@ -1299,6 +1279,7 @@ async fn get_action_policy(
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
+    crate::sequences::refresh_action_policy_now(&state);
     Json(state.action_policy_snapshot()).into_response()
 }
 
@@ -1464,7 +1445,7 @@ async fn send_command(
         return (StatusCode::FORBIDDEN, "command not allowed");
     }
     if !state.is_command_allowed(&cmd) {
-        emit_warning(
+        emit_notification_warning(
             &state,
             format!("Ignored software command {cmd:?}: command is currently disabled"),
         );
@@ -1486,16 +1467,9 @@ struct WsAuthQuery {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum AlertAckSeverity {
-    Warning,
-    Error,
-}
-
-#[derive(Deserialize)]
 struct AlertAckRequest {
-    severity: AlertAckSeverity,
-    timestamp_ms: i64,
+    warning_timestamp_ms: i64,
+    error_timestamp_ms: i64,
 }
 
 async fn ws_handler(
@@ -1526,7 +1500,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let mut telemetry_rx = state.ws_tx.subscribe();
     let mut warnings_rx = state.warnings_tx.subscribe();
     let mut errors_rx = state.errors_tx.subscribe();
-    let mut alert_ack_rx = state.alert_ack_tx.subscribe();
     let mut state_rx = state.state_tx.subscribe();
     let mut launch_clock_rx = state.launch_clock_tx.subscribe();
     let mut board_status_rx = state.board_status_tx.subscribe();
@@ -1536,6 +1509,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let mut fill_targets_rx = state.fill_targets_tx.subscribe();
     let mut recording_status_rx = state.recording_status_tx.subscribe();
     let mut dashboard_reset_rx = state.dashboard_reset_tx.subscribe();
+    let mut alert_ack_rx = state.alert_ack_tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
     let state_for_send = state.clone();
@@ -1576,11 +1550,19 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         if ws_out_tx.send(initial_messages).await.is_err() {
             return;
         }
+        crate::sequences::refresh_action_policy_now(&state_for_send);
         let initial_action_policy = serde_json::to_string(&WsOutMsg::ActionPolicy(
             state_for_send.action_policy_snapshot(),
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_action_policy).await.is_err() {
+            return;
+        }
+        let initial_flight_state = serde_json::to_string(&WsOutMsg::FlightState(FlightStateMsg {
+            state: state_for_send.local_flight_state_snapshot(),
+        }))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_flight_state).await.is_err() {
             return;
         }
         let initial_fill_targets = serde_json::to_string(&WsOutMsg::FillTargets(
@@ -1595,6 +1577,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_launch_clock).await.is_err() {
+            return;
+        }
+        let initial_board_status = serde_json::to_string(&WsOutMsg::BoardStatus(
+            state_for_send.board_status_snapshot(crate::telemetry_task::get_current_timestamp_ms()),
+        ))
+        .unwrap_or_default();
+        if ws_out_tx.send(initial_board_status).await.is_err() {
             return;
         }
         let initial_recording_status = serde_json::to_string(&WsOutMsg::RecordingStatus(
@@ -1654,10 +1643,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         let mut telemetry_pending: VecDeque<TelemetryRow> = VecDeque::new();
         let mut telemetry_flush =
             tokio::time::interval(std::time::Duration::from_millis(telemetry_flush_ms));
+        let ws_diagnostics = crate::ws_diagnostics_enabled();
+        let mut last_ws_diag_log = Instant::now();
+        let ws_diag_interval = StdDuration::from_secs(2);
 
         loop {
             tokio::select! {
-                biased;
 
                 recv = warnings_rx.recv() => {
                     match recv {
@@ -1687,20 +1678,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     }
                 }
 
-                recv = alert_ack_rx.recv() => {
-                    match recv {
-                        Ok(ack_state) => {
-                            let msg = WsOutMsg::AlertAckState(ack_state);
-                            let text = serde_json::to_string(&msg).unwrap_or_default();
-                            if ws_out_tx.send(text).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-
                 recv = dashboard_reset_rx.recv() => {
                     match recv {
                         Ok(()) => {
@@ -1715,6 +1692,26 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     }
                 }
 
+                recv = alert_ack_rx.recv() => {
+                    match recv {
+                        Ok(ack) => {
+                            let msg = WsOutMsg::AlertAckState(ack);
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::AlertAckState(state_for_send.alert_ack_state_snapshot());
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
                 recv = state_rx.recv() => {
                     match recv {
                         Ok(fs) => {
@@ -1724,7 +1721,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::FlightState(FlightStateMsg {
+                                state: state_for_send.local_flight_state_snapshot(),
+                            });
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1738,7 +1743,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::LaunchClock(state_for_send.launch_clock_snapshot());
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1761,7 +1772,21 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+                            let msg = WsOutMsg::BoardStatus(state_for_send.board_status_snapshot(now_ms));
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                            let topology = WsOutMsg::NetworkTopology(
+                                state_for_send.network_topology_snapshot(now_ms),
+                            );
+                            let text = serde_json::to_string(&topology).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1775,7 +1800,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::Notifications(state_for_send.notifications_snapshot());
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1789,7 +1820,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::Messages(state_for_send.messages_snapshot());
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1803,7 +1840,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            crate::sequences::refresh_action_policy_now(&state_for_send);
+                            let msg = WsOutMsg::ActionPolicy(state_for_send.action_policy_snapshot());
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1817,7 +1861,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::FillTargets(state_for_send.fill_targets_snapshot());
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1831,7 +1881,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let msg = WsOutMsg::RecordingStatus(
+                                state_for_send.recording_status_snapshot(),
+                            );
+                            let text = serde_json::to_string(&msg).unwrap_or_default();
+                            if ws_out_tx.send(text).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1853,9 +1911,32 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             while telemetry_pending.len() > telemetry_pending_cap {
                                 telemetry_pending.pop_front();
                             }
+                            if ws_diagnostics && last_ws_diag_log.elapsed() >= ws_diag_interval {
+                                eprintln!(
+                                    "ws telemetry enqueue: pending={} dynamic_max_per_flush={} out_queue_cap={}",
+                                    telemetry_pending.len(),
+                                    dynamic_max_per_flush,
+                                    ws_out_queue_cap,
+                                );
+                                last_ws_diag_log = Instant::now();
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            // On lag, keep going and flush what we already have.
+                            if ws_diagnostics {
+                                eprintln!(
+                                    "ws telemetry broadcast lagged; pending_before_reseed={}",
+                                    telemetry_pending.len()
+                                );
+                            }
+                            let mut snapshot = state_for_send.recent_telemetry_snapshot();
+                            let snapshot_cap =
+                                telemetry_pending_cap.min(max_telemetry_per_flush_cap.saturating_mul(4));
+                            if snapshot.len() > snapshot_cap {
+                                let drop_n = snapshot.len() - snapshot_cap;
+                                snapshot.drain(0..drop_n);
+                            }
+                            snapshot.sort_by_key(|row| row.timestamp_ms);
+                            telemetry_pending = snapshot.into_iter().collect();
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -1879,14 +1960,32 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     }
                     let mut rows: Vec<TelemetryRow> = telemetry_pending.drain(..).collect();
                     rows.sort_by_key(|r| r.timestamp_ms);
+                    let row_count = rows.len();
 
                     let msg = WsOutMsg::TelemetryBatch(rows);
                     let text = serde_json::to_string(&msg).unwrap_or_default();
-                    let queue_was_full = match ws_out_tx.try_send(text) {
-                        Ok(()) => false,
-                        Err(mpsc::error::TrySendError::Full(_)) => true,
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
-                    };
+                    if ws_diagnostics && last_ws_diag_log.elapsed() >= ws_diag_interval {
+                        eprintln!(
+                            "ws telemetry flush: rows={} pending_before={} dynamic_max_per_flush={}",
+                            row_count,
+                            pending_before,
+                            dynamic_max_per_flush,
+                        );
+                        last_ws_diag_log = Instant::now();
+                    }
+                    let send_started = Instant::now();
+                    if ws_out_tx.send(text).await.is_err() {
+                        break;
+                    }
+                    let send_wait = send_started.elapsed();
+                    let queue_was_full = send_wait >= StdDuration::from_millis(5);
+                    if ws_diagnostics && queue_was_full {
+                        eprintln!(
+                            "ws telemetry backpressure: rows={} send_wait_ms={}",
+                            row_count,
+                            send_wait.as_millis()
+                        );
+                    }
 
                     if adaptive_rate {
                         let congested = queue_was_full && pending_before >= max_this_flush;
@@ -1930,7 +2029,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             continue;
                         }
                         if !state_for_recv.is_command_allowed(&cmd.cmd) {
-                            emit_warning(
+                            emit_notification_warning(
                                 &state_for_recv,
                                 format!(
                                     "Ignored software command {:?}: command is currently disabled",
@@ -2053,12 +2152,8 @@ async fn post_alert_ack(
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-
-    let snapshot = match body.severity {
-        AlertAckSeverity::Warning => state.acknowledge_warnings_through(body.timestamp_ms),
-        AlertAckSeverity::Error => state.acknowledge_errors_through(body.timestamp_ms),
-    };
-    Json(snapshot).into_response()
+    Json(state.acknowledge_alerts_through(body.warning_timestamp_ms, body.error_timestamp_ms))
+        .into_response()
 }
 
 async fn get_boards(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
@@ -2086,16 +2181,16 @@ fn spawn_alert_insert(
         severity: severity.to_string(),
         message: message.clone(),
     });
-    let tx = state.db_queue_tx.clone();
-    tokio::spawn(async move {
-        let _ = tx
-            .send(DbQueueItem::Write(DbWrite::Alert {
-                timestamp_ms,
-                severity: severity.to_string(),
-                message,
-            }))
-            .await;
-    });
+    if let Err(err) = state
+        .db_queue_tx
+        .try_send(DbQueueItem::Write(DbWrite::Alert {
+            timestamp_ms,
+            severity: severity.to_string(),
+            message,
+        }))
+    {
+        log::warn!("failed to queue {severity} alert DB write: {err}");
+    }
 }
 
 /// PUBLIC HELPERS — can be called from *any thread* that has &AppState
@@ -2121,12 +2216,37 @@ pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
 }
 
 /// Log a warning to the DB without sending it to the frontend.
+#[allow(dead_code)]
 pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
     let msg_string = message.into();
     let timestamp = now_ms_i64();
 
     // Insert into DB asynchronously (tracked for graceful shutdown)
     spawn_alert_insert(state, timestamp, "warning", msg_string);
+}
+
+fn persist_message_db_only(state: &AppState, message: String) {
+    let timestamp_ms = now_ms_i64();
+    let id = state.next_message_id.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Err(err) = state
+        .db_queue_tx
+        .try_send(DbQueueItem::Write(DbWrite::Message {
+            id,
+            timestamp_ms,
+            message,
+            action_label: None,
+            action_cmd: None,
+        }))
+    {
+        log::warn!("failed to queue notification DB write: {err}");
+    }
+}
+
+/// Sends a frontend notification while persisting the event in the DB without creating a warning alert.
+pub fn emit_notification_warning<S: Into<String>>(state: &AppState, message: S) {
+    let msg_string = message.into();
+    state.add_temporary_notification(msg_string.clone());
+    persist_message_db_only(state, msg_string);
 }
 
 pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
