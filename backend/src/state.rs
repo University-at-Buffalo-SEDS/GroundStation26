@@ -36,13 +36,20 @@ pub struct PendingUmbilicalValveState {
     pub set_at: std::time::Instant,
 }
 
-fn recording_command_actuated(cmd: &str, mode: RecordingModeWire) -> Option<bool> {
+fn recording_command_state(cmd: &str, mode: RecordingModeWire) -> Option<(bool, bool)> {
     match cmd {
-        "StartWritingNow" | "StartWritingLastTwoMinutes" => {
-            Some(mode == RecordingModeWire::Recording)
-        }
-        "PauseWritingDb" => Some(mode == RecordingModeWire::Paused),
-        "StopWritingDb" => Some(mode == RecordingModeWire::Idle),
+        "StartWritingNow" | "StartWritingLastTwoMinutes" => match mode {
+            RecordingModeWire::Idle | RecordingModeWire::Paused => Some((true, true)),
+            RecordingModeWire::Recording => Some((false, false)),
+        },
+        "PauseWritingDb" => match mode {
+            RecordingModeWire::Recording => Some((true, true)),
+            RecordingModeWire::Idle | RecordingModeWire::Paused => Some((false, false)),
+        },
+        "StopWritingDb" => match mode {
+            RecordingModeWire::Recording | RecordingModeWire::Paused => Some((true, true)),
+            RecordingModeWire::Idle => Some((false, false)),
+        },
         _ => None,
     }
 }
@@ -1229,7 +1236,9 @@ impl AppState {
             }
         }
         for control in &mut policy.controls {
-            if let Some(actuated) = recording_command_actuated(&control.cmd, recording_mode) {
+            if let Some((enabled, actuated)) = recording_command_state(&control.cmd, recording_mode)
+            {
+                control.enabled = enabled;
                 control.actuated = Some(actuated);
             }
             if control.cmd == "Abort" && self.abort_indicator_latched() {
@@ -1871,6 +1880,88 @@ mod tests {
                 "/tmp/groundstation-state-test-users.json",
             ))),
         })
+    }
+
+    fn control_state(policy: &ActionPolicyMsg, cmd: &str) -> Option<(bool, Option<bool>)> {
+        policy
+            .controls
+            .iter()
+            .find(|control| control.cmd == cmd)
+            .map(|control| (control.enabled, control.actuated))
+    }
+
+    #[tokio::test]
+    async fn recording_action_policy_matches_recording_mode() {
+        let state = test_app_state().await;
+
+        state.set_recording_status(RecordingStatusMsg {
+            mode: RecordingModeWire::Idle,
+            db_path: None,
+        });
+        state.set_action_policy(crate::sequences::default_action_policy());
+        let idle = state.action_policy_snapshot();
+        assert_eq!(
+            control_state(&idle, "StartWritingNow"),
+            Some((true, Some(true)))
+        );
+        assert_eq!(
+            control_state(&idle, "StartWritingLastTwoMinutes"),
+            Some((true, Some(true)))
+        );
+        assert_eq!(
+            control_state(&idle, "PauseWritingDb"),
+            Some((false, Some(false)))
+        );
+        assert_eq!(
+            control_state(&idle, "StopWritingDb"),
+            Some((false, Some(false)))
+        );
+
+        state.set_recording_status(RecordingStatusMsg {
+            mode: RecordingModeWire::Recording,
+            db_path: Some("recording.db".to_string()),
+        });
+        state.set_action_policy(crate::sequences::default_action_policy());
+        let recording = state.action_policy_snapshot();
+        assert_eq!(
+            control_state(&recording, "StartWritingNow"),
+            Some((false, Some(false)))
+        );
+        assert_eq!(
+            control_state(&recording, "StartWritingLastTwoMinutes"),
+            Some((false, Some(false)))
+        );
+        assert_eq!(
+            control_state(&recording, "PauseWritingDb"),
+            Some((true, Some(true)))
+        );
+        assert_eq!(
+            control_state(&recording, "StopWritingDb"),
+            Some((true, Some(true)))
+        );
+
+        state.set_recording_status(RecordingStatusMsg {
+            mode: RecordingModeWire::Paused,
+            db_path: None,
+        });
+        state.set_action_policy(crate::sequences::default_action_policy());
+        let paused = state.action_policy_snapshot();
+        assert_eq!(
+            control_state(&paused, "StartWritingNow"),
+            Some((true, Some(true)))
+        );
+        assert_eq!(
+            control_state(&paused, "StartWritingLastTwoMinutes"),
+            Some((true, Some(true)))
+        );
+        assert_eq!(
+            control_state(&paused, "PauseWritingDb"),
+            Some((false, Some(false)))
+        );
+        assert_eq!(
+            control_state(&paused, "StopWritingDb"),
+            Some((true, Some(true)))
+        );
     }
 
     #[tokio::test]
