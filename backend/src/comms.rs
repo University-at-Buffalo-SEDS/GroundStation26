@@ -913,11 +913,9 @@ fn take_raw_uart_framed_payload(
         rx_buf.drain(..drop_len);
     }
 
-    let sync_pos = rx_buf.windows(2).position(|pair| {
-        pair == [RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1]
-            || pair == [RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1]
-            || pair == [RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1]
-    });
+    let sync_pos = rx_buf
+        .windows(2)
+        .position(|pair| raw_uart_sync_kind(pair[0], pair[1]).is_some());
     match sync_pos {
         Some(0) => {}
         Some(pos) => {
@@ -933,10 +931,7 @@ fn take_raw_uart_framed_payload(
                     "raw UART waiting for frame sync",
                     &rx_buf[..rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
                 );
-                let keep = usize::from(matches!(
-                    rx_buf.last().copied(),
-                    Some(RAW_UART_FRAME_SYNC_0 | RAW_UART_COMMAND_SYNC_0 | RAW_UART_ASCII_SYNC_0)
-                ));
+                let keep = usize::from(rx_buf.last().copied().is_some_and(is_raw_uart_sync_byte));
                 let drop_len = rx_buf.len().saturating_sub(keep);
                 if drop_len > 0 {
                     rx_buf.drain(..drop_len);
@@ -974,18 +969,35 @@ fn take_raw_uart_framed_payload(
         return Ok(None);
     }
 
-    let frame_kind = match (rx_buf[0], rx_buf[1]) {
-        (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1) => RawUartFrameKind::Data,
-        (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1) => RawUartFrameKind::Command,
-        (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1) => RawUartFrameKind::Ascii,
-        _ => {
-            rx_buf.drain(..1);
-            return Ok(None);
-        }
+    let Some(frame_kind) = raw_uart_sync_kind(rx_buf[0], rx_buf[1]) else {
+        rx_buf.drain(..1);
+        return Ok(None);
     };
     let payload = rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len].to_vec();
     rx_buf.drain(..total_len);
     Ok(Some((frame_kind, payload)))
+}
+
+fn raw_uart_sync_kind(first: u8, second: u8) -> Option<RawUartFrameKind> {
+    match (first, second) {
+        (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1)
+        | (RAW_UART_FRAME_SYNC_1, RAW_UART_FRAME_SYNC_0) => Some(RawUartFrameKind::Data),
+        (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1)
+        | (RAW_UART_COMMAND_SYNC_1, RAW_UART_COMMAND_SYNC_0) => Some(RawUartFrameKind::Command),
+        (RAW_UART_ASCII_SYNC_0, RAW_UART_ASCII_SYNC_1) => Some(RawUartFrameKind::Ascii),
+        _ => None,
+    }
+}
+
+fn is_raw_uart_sync_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        RAW_UART_FRAME_SYNC_0
+            | RAW_UART_FRAME_SYNC_1
+            | RAW_UART_COMMAND_SYNC_0
+            | RAW_UART_COMMAND_SYNC_1
+            | RAW_UART_ASCII_SYNC_0
+    )
 }
 
 fn maybe_log_raw_uart_rx(bytes: &[u8], protocol: &SerialProtocol) {
@@ -2524,6 +2536,25 @@ mod raw_uart_tests {
         let decoded = take_raw_uart_framed_payload(&mut partial).unwrap().unwrap();
         assert_eq!(decoded, (RawUartFrameKind::Command, payload.to_vec()));
         assert!(partial.is_empty());
+    }
+
+    #[test]
+    fn raw_uart_parser_accepts_reversed_data_and_command_sync() {
+        let data_payload = vec![1, 2, 3];
+        let command_payload = vec![0x52, 0x53, 1, 1, 9, 5, 0, 100, 0];
+        let mut data = build_raw_uart_frame(&data_payload).unwrap();
+        data.swap(0, 1);
+        let mut command = build_raw_uart_command_frame(&command_payload).unwrap();
+        command.swap(0, 1);
+
+        let decoded_data = take_raw_uart_framed_payload(&mut data).unwrap().unwrap();
+        let decoded_command = take_raw_uart_framed_payload(&mut command).unwrap().unwrap();
+
+        assert_eq!(decoded_data, (RawUartFrameKind::Data, data_payload));
+        assert_eq!(
+            decoded_command,
+            (RawUartFrameKind::Command, command_payload)
+        );
     }
 
     #[test]

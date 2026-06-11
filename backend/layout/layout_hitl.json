@@ -4,7 +4,7 @@
     "app_name": "Telemetry Dashboard",
     "dashboard_title": "Telemetry Dashboard",
     "tab_labels": {
-      "state": "Flight",
+      "state": "Dashboard",
       "connection-status": "Connection Status",
       "map": "Map",
       "actions": "Actions",
