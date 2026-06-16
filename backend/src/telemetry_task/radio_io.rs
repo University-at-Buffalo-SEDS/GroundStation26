@@ -1,6 +1,6 @@
 use crate::comms::{CommsDevice, RadioWindowKind};
 use crate::state::AppState;
-use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
+use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{Router, RouterSideId};
 use sedsprintf_rs_2026::serialize;
@@ -557,11 +557,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                 if let Ok(pkt) = serialize::deserialize_packet(&payload) {
                     ingress_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     ingress_state.mark_packet_received(get_current_timestamp_ms());
-                    // if matches!(
-                    //     pkt.data_type(),
-                    //     DataType::GpsData | DataType::GpsSatelliteNumber
-                    // ) && !pkt.endpoints().contains(&DataEndpoint::GroundStation)
-                    {
+                    if matches!(pkt.data_type(), DataType::GpsSatelliteNumber) {
                         let mut rb = ingress_state.ring_buffer.lock().unwrap();
                         rb.push(pkt);
                     }
