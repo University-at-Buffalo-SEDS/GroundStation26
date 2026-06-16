@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import select
+import struct
 import sys
 import termios
 import threading
@@ -190,6 +191,60 @@ def now_ms() -> int:
 def hex_preview(data: bytes, limit: int = 48) -> str:
     preview = data[:limit].hex(" ")
     return preview + (" ..." if len(data) > limit else "")
+
+
+def enum_name(enum_cls: object, value: int) -> str:
+    for name in dir(enum_cls):
+        if name.startswith("_"):
+            continue
+        try:
+            if int(getattr(enum_cls, name)) == value:
+                return name
+        except (TypeError, ValueError):
+            continue
+    return str(value)
+
+
+def decode_seds_packet_summary(payload: bytes) -> str | None:
+    try:
+        seds = import_seds()
+        if hasattr(seds, "deserialize_packet_py"):
+            pkt = seds.deserialize_packet_py(payload)
+        else:
+            pkt = seds.deserialize_packet(payload)
+    except Exception:
+        return None
+
+    ty = int(pkt.ty)
+    ty_name = enum_name(seds.DataType, ty)
+    sender = pkt.sender
+    endpoints = ",".join(enum_name(seds.DataEndpoint, int(ep)) for ep in pkt.endpoints)
+
+    gps_type = enum_value(seds.DataType, "GPS_DATA", "GpsData")
+    gps_satellite_type = enum_value(
+        seds.DataType,
+        "GPS_SATELLITE_NUMBER",
+        "GpsSatelliteNumber",
+    )
+
+    if ty == gps_type:
+        raw_payload = bytes(pkt.payload)
+        if len(raw_payload) >= 12:
+            lat, lon, alt = struct.unpack("<fff", raw_payload[:12])
+            summary = (
+                f"{ty_name} sender={sender} eps=[{endpoints}] "
+                f"lat={lat:.7f} lon={lon:.7f} alt={alt:.2f}m"
+            )
+            if len(raw_payload) > 12:
+                summary += f" sats={raw_payload[12]}"
+            return summary
+
+    if ty == gps_satellite_type:
+        raw_payload = bytes(pkt.payload)
+        sats = raw_payload[0] if raw_payload else None
+        return f"{ty_name} sender={sender} eps=[{endpoints}] sats={sats}"
+
+    return f"{ty_name} sender={sender} eps=[{endpoints}] payload={len(bytes(pkt.payload))}B"
 
 
 def parse_hex(raw: str) -> bytes:
@@ -379,6 +434,13 @@ class AvBayRadioApp:
         self.raw_rx_bytes = 0
         self.raw_rx_frames = 0
         self.radio_windows = 0
+        self.downlink_windows = 0
+        self.uplink_windows = 0
+        self.last_window_monotonic: float | None = None
+        self.last_downlink_monotonic: float | None = None
+        self.last_uplink_monotonic: float | None = None
+        self.last_data_monotonic: float | None = None
+        self.last_window_gap_ms: int | None = None
         self.sent_packets = 0
         self.sent_yields = 0
         self.last_window: RadioWindow | None = None
@@ -518,9 +580,11 @@ class AvBayRadioApp:
                     frames = extract_raw_frames(self.rx_buffer)
                     for kind, payload in frames:
                         if kind == "data":
+                            summary = decode_seds_packet_summary(payload) or "data frame"
                             with self.lock:
-                                self._record_rx(kind, "data frame", payload)
-                                self.status = f"RX data frame len={len(payload)}"
+                                self.last_data_monotonic = time.monotonic()
+                                self._record_rx(kind, summary, payload)
+                                self.status = f"RX {summary}"
                             continue
                         if kind == "ascii":
                             text = payload.decode("utf-8", errors="replace").strip()
@@ -536,6 +600,18 @@ class AvBayRadioApp:
                             continue
                         with self.lock:
                             self.radio_windows += 1
+                            now = time.monotonic()
+                            if self.last_window_monotonic is not None:
+                                self.last_window_gap_ms = int(
+                                    (now - self.last_window_monotonic) * 1000
+                                )
+                            self.last_window_monotonic = now
+                            if window.kind == "downlink":
+                                self.downlink_windows += 1
+                                self.last_downlink_monotonic = now
+                            elif window.kind == "uplink":
+                                self.uplink_windows += 1
+                                self.last_uplink_monotonic = now
                             self.last_window = window
                             self._record_rx(
                                 "window",
@@ -616,6 +692,9 @@ def draw_tui(stdscr: curses.window, app: AvBayRadioApp) -> None:
             raw_rx_bytes = app.raw_rx_bytes
             raw_rx_frames = app.raw_rx_frames
             radio_windows = app.radio_windows
+            downlink_windows = app.downlink_windows
+            uplink_windows = app.uplink_windows
+            last_window_gap_ms = app.last_window_gap_ms
             sent_packets = app.sent_packets
             sent_yields = app.sent_yields
             last_window = app.last_window
@@ -667,12 +746,14 @@ def draw_tui(stdscr: curses.window, app: AvBayRadioApp) -> None:
         status_lines = [
             f"Selected: {selected.label} ({selected.detail})",
             f"Pending={pending_len} TX packets={sent_packets} yields={sent_yields}",
-            f"RX bytes={raw_rx_bytes} frames={raw_rx_frames} windows={radio_windows}",
+            f"RX bytes={raw_rx_bytes} frames={raw_rx_frames} windows={radio_windows} down={downlink_windows} up={uplink_windows}",
         ]
         if last_window is not None:
             status_lines.append(
                 f"Last window: {last_window.kind} seq={last_window.seq} credit={last_window.credit} flags=0x{last_window.flags:02x} turn_ms={last_window.turnaround_ms}"
             )
+        if last_window_gap_ms is not None:
+            status_lines.append(f"Last window gap: {last_window_gap_ms} ms")
         if counts:
             status_lines.append(
                 "Counts: " + ", ".join(f"{kind}={count}" for kind, count in counts.most_common(5))
@@ -776,7 +857,13 @@ def run_once(args: argparse.Namespace, port: str, baud: int) -> int:
         rx_buffer = bytearray()
         sent = 0
         windows = 0
+        downlink_windows = 0
+        uplink_windows = 0
         rx_data_frames = 0
+        last_window_at: float | None = None
+        last_downlink_at: float | None = None
+        last_uplink_at: float | None = None
+        last_data_at: float | None = None
         deadline = time.monotonic() + args.duration
 
         if args.send_without_window:
@@ -786,14 +873,19 @@ def run_once(args: argparse.Namespace, port: str, baud: int) -> int:
                 print(f"tx #{idx + 1}: sent without scheduler window")
                 time.sleep(0.05)
 
-        while time.monotonic() < deadline and sent < args.count:
+        while time.monotonic() < deadline:
             readable, _, _ = select.select([fd], [], [], 0.05)
             if not readable:
                 continue
             for kind, payload in read_available(fd, rx_buffer, args.read_chunk):
                 if kind == "data":
                     rx_data_frames += 1
-                    print(f"rx data frame len={len(payload)} preview={hex_preview(payload, args.preview_bytes)}")
+                    last_data_at = time.monotonic()
+                    summary = decode_seds_packet_summary(payload) or "data frame"
+                    print(
+                        f"rx data frame len={len(payload)} {summary} "
+                        f"preview={hex_preview(payload, args.preview_bytes)}"
+                    )
                     continue
                 if kind == "ascii":
                     text = payload.decode("utf-8", errors="replace").strip()
@@ -804,11 +896,27 @@ def run_once(args: argparse.Namespace, port: str, baud: int) -> int:
                     print(f"rx command frame len={len(payload)} preview={hex_preview(payload, args.preview_bytes)}")
                     continue
                 windows += 1
+                now = time.monotonic()
+                gap = None if last_window_at is None else int((now - last_window_at) * 1000)
+                last_window_at = now
+                if window.kind == "downlink":
+                    downlink_windows += 1
+                    last_downlink_at = now
+                elif window.kind == "uplink":
+                    uplink_windows += 1
+                    last_uplink_at = now
+                gap_text = "" if gap is None else f" gap_ms={gap}"
                 print(
                     f"rx radio window kind={window.kind} seq={window.seq} "
                     f"credit={window.credit} flags=0x{window.flags:02x}"
+                    f" turn_ms={window.turnaround_ms}{gap_text}"
                 )
                 if window.kind != "uplink":
+                    continue
+                if sent >= args.count:
+                    if not args.no_yield:
+                        write_frame(fd, build_scheduler_yield(window.seq, False))
+                        print(f"tx scheduler yield seq={window.seq} has_more=False")
                     continue
                 sends_this_window = min(window.credit, args.count - sent)
                 for _ in range(sends_this_window):
@@ -819,10 +927,27 @@ def run_once(args: argparse.Namespace, port: str, baud: int) -> int:
                     write_frame(fd, build_scheduler_yield(window.seq, sent < args.count))
                     print(f"tx scheduler yield seq={window.seq} has_more={sent < args.count}")
 
-        print(f"done sent={sent}/{args.count} radio_windows={windows} rx_data_frames={rx_data_frames}")
+        now = time.monotonic()
+        ages = []
+        if last_downlink_at is not None:
+            ages.append(f"last_downlink_age_ms={int((now - last_downlink_at) * 1000)}")
+        if last_uplink_at is not None:
+            ages.append(f"last_uplink_age_ms={int((now - last_uplink_at) * 1000)}")
+        if last_data_at is not None:
+            ages.append(f"last_data_age_ms={int((now - last_data_at) * 1000)}")
+        age_text = "" if not ages else " " + " ".join(ages)
+        print(
+            f"done sent={sent}/{args.count} radio_windows={windows} "
+            f"downlink_windows={downlink_windows} uplink_windows={uplink_windows} "
+            f"rx_data_frames={rx_data_frames}{age_text}"
+        )
         if sent < args.count:
             print("timed out before enough uplink windows arrived", file=sys.stderr)
             return 2
+        if downlink_windows == 0:
+            print("warning: no downlink windows observed", file=sys.stderr)
+        elif rx_data_frames == 0:
+            print("warning: downlink windows observed but no data frames decoded", file=sys.stderr)
         return 0
     finally:
         os.close(fd)
