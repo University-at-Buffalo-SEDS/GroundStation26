@@ -30,6 +30,13 @@ RADIO_SCHED_FLAG_HAS_MORE = 0x01
 RADIO_SCHED_FLAG_YIELD = 0x02
 RADIO_UPLINK_TURNAROUND_S = float(os.environ.get("GS_RADIO_UPLINK_TURNAROUND_MS", "0")) / 1000.0
 RADIO_UPLINK_INTERFRAME_S = float(os.environ.get("GS_RADIO_UPLINK_INTERFRAME_MS", "0")) / 1000.0
+RADIO_UPLINK_WINDOW_S = float(os.environ.get("GS_RADIO_UPLINK_WINDOW_MS", "4000")) / 1000.0
+RADIO_UPLINK_TX_GUARD_S = float(os.environ.get("GS_RADIO_UPLINK_TX_GUARD_MS", "150")) / 1000.0
+RADIO_AIR_BIT_RATE_BPS = int(os.environ.get("GS_RADIO_AIR_BIT_RATE_BPS", "9600"))
+RADIO_AIR_FRAME_OVERHEAD_BYTES = int(os.environ.get("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", "16"))
+RADIO_TX_COOLDOWN_S = float(os.environ.get("GS_RADIO_TX_COOLDOWN_MS", "25")) / 1000.0
+SEDS_2026_GPS_DATA_TYPE = 1
+SEDS_2026_GPS_SATELLITE_NUMBER_TYPE = 21
 
 FLIGHT_COMMANDS = {
     "Launch": 1,
@@ -114,6 +121,13 @@ class TxEvent:
     packet_len: int
     frame_len: int
     seq: int | None
+
+
+@dataclass(frozen=True)
+class DecodedPacketSummary:
+    summary: str
+    type_name: str | None
+    decode_ok: bool
 
 
 @dataclass
@@ -205,27 +219,71 @@ def enum_name(enum_cls: object, value: int) -> str:
     return str(value)
 
 
-def decode_seds_packet_summary(payload: bytes) -> str | None:
+def canonical_data_type_name(enum_cls: object, value: int) -> str:
+    if value == SEDS_2026_GPS_DATA_TYPE:
+        return "GPS_DATA"
+    if value == SEDS_2026_GPS_SATELLITE_NUMBER_TYPE:
+        return "GPS_SATELLITE_NUMBER"
+    return enum_name(enum_cls, value)
+
+
+def raw_single_byte_payload(payload: bytes) -> int | None:
+    if len(payload) < 5:
+        return None
+    return payload[-5]
+
+
+def peek_seds_packet_header_summary(seds: object, payload: bytes) -> str | None:
+    if not hasattr(seds, "peek_header_py"):
+        return None
+    try:
+        header = seds.peek_header_py(payload)
+    except Exception:
+        return None
+
+    ty = int(header.get("ty"))
+    ty_name = canonical_data_type_name(seds.DataType, ty)
+    sender = header.get("sender")
+    endpoints = ",".join(enum_name(seds.DataEndpoint, int(ep)) for ep in header.get("endpoints", []))
+    timestamp = header.get("timestamp_ms")
+    return f"{ty_name} sender={sender} eps=[{endpoints}] ts={timestamp}"
+
+
+def decode_seds_packet_summary(payload: bytes) -> DecodedPacketSummary | None:
     try:
         seds = import_seds()
+    except Exception as err:
+        return DecodedPacketSummary(f"SEDS import failed: {err}", None, False)
+
+    try:
         if hasattr(seds, "deserialize_packet_py"):
             pkt = seds.deserialize_packet_py(payload)
         else:
             pkt = seds.deserialize_packet(payload)
-    except Exception:
-        return None
+    except Exception as err:
+        header = peek_seds_packet_header_summary(seds, payload)
+        if header:
+            try:
+                ty = int(seds.peek_header_py(payload).get("ty"))
+            except Exception:
+                ty = None
+            if ty == SEDS_2026_GPS_SATELLITE_NUMBER_TYPE:
+                sats = raw_single_byte_payload(payload)
+                return DecodedPacketSummary(
+                    f"{header} sats={sats} recovered_after_decode_error={err}",
+                    "GPS_SATELLITE_NUMBER",
+                    True,
+                )
+            return DecodedPacketSummary(f"{header} decode_error={err}", None, False)
+        return DecodedPacketSummary(f"SEDS decode failed: {err}", None, False)
 
     ty = int(pkt.ty)
-    ty_name = enum_name(seds.DataType, ty)
+    ty_name = canonical_data_type_name(seds.DataType, ty)
     sender = pkt.sender
     endpoints = ",".join(enum_name(seds.DataEndpoint, int(ep)) for ep in pkt.endpoints)
 
-    gps_type = enum_value(seds.DataType, "GPS_DATA", "GpsData")
-    gps_satellite_type = enum_value(
-        seds.DataType,
-        "GPS_SATELLITE_NUMBER",
-        "GpsSatelliteNumber",
-    )
+    gps_type = SEDS_2026_GPS_DATA_TYPE
+    gps_satellite_type = SEDS_2026_GPS_SATELLITE_NUMBER_TYPE
 
     if ty == gps_type:
         raw_payload = bytes(pkt.payload)
@@ -237,14 +295,22 @@ def decode_seds_packet_summary(payload: bytes) -> str | None:
             )
             if len(raw_payload) > 12:
                 summary += f" sats={raw_payload[12]}"
-            return summary
+            return DecodedPacketSummary(summary, ty_name, True)
 
     if ty == gps_satellite_type:
         raw_payload = bytes(pkt.payload)
         sats = raw_payload[0] if raw_payload else None
-        return f"{ty_name} sender={sender} eps=[{endpoints}] sats={sats}"
+        return DecodedPacketSummary(
+            f"{ty_name} sender={sender} eps=[{endpoints}] sats={sats}",
+            ty_name,
+            True,
+        )
 
-    return f"{ty_name} sender={sender} eps=[{endpoints}] payload={len(bytes(pkt.payload))}B"
+    return DecodedPacketSummary(
+        f"{ty_name} sender={sender} eps=[{endpoints}] payload={len(bytes(pkt.payload))}B",
+        ty_name,
+        True,
+    )
 
 
 def parse_hex(raw: str) -> bytes:
@@ -260,6 +326,12 @@ def build_raw_frame(sync: tuple[int, int], payload: bytes) -> bytes:
     if len(payload) > 0xFFFF:
         raise ValueError("raw UART payload is too large")
     return bytes(sync) + len(payload).to_bytes(2, "little") + payload
+
+
+def radio_air_time_s(payload_len: int) -> float:
+    framed_len = payload_len + RAW_HEADER_SIZE
+    bytes_on_air = framed_len + RADIO_AIR_FRAME_OVERHEAD_BYTES
+    return ((bytes_on_air * 10) / max(RADIO_AIR_BIT_RATE_BPS, 1)) + RADIO_TX_COOLDOWN_S
 
 
 def extract_raw_frames(buffer: bytearray) -> list[tuple[str, bytes]]:
@@ -434,6 +506,9 @@ class AvBayRadioApp:
         self.raw_rx_bytes = 0
         self.raw_rx_frames = 0
         self.radio_windows = 0
+        self.seds_decode_errors = 0
+        self.gps_data_frames = 0
+        self.gps_satellite_frames = 0
         self.downlink_windows = 0
         self.uplink_windows = 0
         self.last_window_monotonic: float | None = None
@@ -519,12 +594,17 @@ class AvBayRadioApp:
             RxEvent(now_ms(), kind, summary, len(payload), hex_preview(payload, self.preview_bytes))
         )
 
-    def _send_pending_for_window(self, window: RadioWindow) -> None:
+    def _send_pending_for_window(self, window: RadioWindow, opened_at: float) -> None:
         sent_this_window = 0
         turnaround_s = max(RADIO_UPLINK_TURNAROUND_S, window.turnaround_ms / 1000.0)
+        latest_tx_at = opened_at + max(0.0, RADIO_UPLINK_WINDOW_S - RADIO_UPLINK_TX_GUARD_S)
         if turnaround_s > 0:
-            time.sleep(turnaround_s)
+            sleep_s = min(turnaround_s, max(0.0, latest_tx_at - time.monotonic()))
+            if sleep_s > 0:
+                time.sleep(sleep_s)
         while sent_this_window < window.credit:
+            if time.monotonic() >= latest_tx_at:
+                break
             with self.lock:
                 if not self.pending:
                     break
@@ -538,6 +618,11 @@ class AvBayRadioApp:
                     break
                 if item is None:
                     break
+            air_time_s = radio_air_time_s(len(item.packet))
+            if time.monotonic() + air_time_s > latest_tx_at:
+                with self.lock:
+                    self.pending.appendleft(item)
+                break
             self._write_frame(item.frame)
             sent_this_window += 1
             item.remaining -= 1
@@ -548,7 +633,10 @@ class AvBayRadioApp:
                     self.pending.append(item)
                 self.status = f"TX {item.label} during uplink seq={window.seq}"
             if RADIO_UPLINK_INTERFRAME_S > 0:
-                time.sleep(RADIO_UPLINK_INTERFRAME_S)
+                air_time_s = max(air_time_s, RADIO_UPLINK_INTERFRAME_S)
+            sleep_s = min(air_time_s, max(0.0, latest_tx_at - time.monotonic()))
+            if sleep_s > 0:
+                time.sleep(sleep_s)
         if not self.no_yield:
             with self.lock:
                 has_more = bool(self.pending)
@@ -580,9 +668,19 @@ class AvBayRadioApp:
                     frames = extract_raw_frames(self.rx_buffer)
                     for kind, payload in frames:
                         if kind == "data":
-                            summary = decode_seds_packet_summary(payload) or "data frame"
+                            decoded = decode_seds_packet_summary(payload)
+                            summary = decoded.summary if decoded else "data frame"
                             with self.lock:
                                 self.last_data_monotonic = time.monotonic()
+                                if decoded is not None and not decoded.decode_ok:
+                                    self.seds_decode_errors += 1
+                                elif decoded is not None and decoded.type_name in {"GPS_DATA", "GpsData"}:
+                                    self.gps_data_frames += 1
+                                elif decoded is not None and decoded.type_name in {
+                                    "GPS_SATELLITE_NUMBER",
+                                    "GpsSatelliteNumber",
+                                }:
+                                    self.gps_satellite_frames += 1
                                 self._record_rx(kind, summary, payload)
                                 self.status = f"RX {summary}"
                             continue
@@ -600,27 +698,28 @@ class AvBayRadioApp:
                             continue
                         with self.lock:
                             self.radio_windows += 1
-                            now = time.monotonic()
+                            window_received_at = time.monotonic()
                             if self.last_window_monotonic is not None:
                                 self.last_window_gap_ms = int(
-                                    (now - self.last_window_monotonic) * 1000
+                                    (window_received_at - self.last_window_monotonic) * 1000
                                 )
-                            self.last_window_monotonic = now
+                            self.last_window_monotonic = window_received_at
                             if window.kind == "downlink":
                                 self.downlink_windows += 1
-                                self.last_downlink_monotonic = now
+                                self.last_downlink_monotonic = window_received_at
                             elif window.kind == "uplink":
                                 self.uplink_windows += 1
-                                self.last_uplink_monotonic = now
+                                self.last_uplink_monotonic = window_received_at
                             self.last_window = window
                             self._record_rx(
                                 "window",
-                                f"{window.kind} seq={window.seq} credit={window.credit} flags=0x{window.flags:02x} turn_ms={window.turnaround_ms}",
+                                f"{window.kind} seq={window.seq} credit={window.credit} flags=0x{window.flags:02x} "
+                                f"turn_ms={window.turnaround_ms}",
                                 payload,
                             )
                             self.status = f"RX {window.kind} window seq={window.seq}"
                         if window.kind == "uplink":
-                            self._send_pending_for_window(window)
+                            self._send_pending_for_window(window, window_received_at)
             except Exception as err:
                 with self.lock:
                     self.error = str(err)
@@ -692,6 +791,9 @@ def draw_tui(stdscr: curses.window, app: AvBayRadioApp) -> None:
             raw_rx_bytes = app.raw_rx_bytes
             raw_rx_frames = app.raw_rx_frames
             radio_windows = app.radio_windows
+            seds_decode_errors = app.seds_decode_errors
+            gps_data_frames = app.gps_data_frames
+            gps_satellite_frames = app.gps_satellite_frames
             downlink_windows = app.downlink_windows
             uplink_windows = app.uplink_windows
             last_window_gap_ms = app.last_window_gap_ms
@@ -746,11 +848,14 @@ def draw_tui(stdscr: curses.window, app: AvBayRadioApp) -> None:
         status_lines = [
             f"Selected: {selected.label} ({selected.detail})",
             f"Pending={pending_len} TX packets={sent_packets} yields={sent_yields}",
-            f"RX bytes={raw_rx_bytes} frames={raw_rx_frames} windows={radio_windows} down={downlink_windows} up={uplink_windows}",
+            f"RX bytes={raw_rx_bytes} frames={raw_rx_frames} windows={radio_windows} down={downlink_windows} up="
+            f"{uplink_windows}",
+            f"SEDS gps={gps_data_frames} gps_sats={gps_satellite_frames} decode_errors={seds_decode_errors}",
         ]
         if last_window is not None:
             status_lines.append(
-                f"Last window: {last_window.kind} seq={last_window.seq} credit={last_window.credit} flags=0x{last_window.flags:02x} turn_ms={last_window.turnaround_ms}"
+                f"Last window: {last_window.kind} seq={last_window.seq} credit={last_window.credit} flags=0x"
+                f"{last_window.flags:02x} turn_ms={last_window.turnaround_ms}"
             )
         if last_window_gap_ms is not None:
             status_lines.append(f"Last window gap: {last_window_gap_ms} ms")
@@ -860,6 +965,9 @@ def run_once(args: argparse.Namespace, port: str, baud: int) -> int:
         downlink_windows = 0
         uplink_windows = 0
         rx_data_frames = 0
+        gps_data_frames = 0
+        gps_satellite_frames = 0
+        seds_decode_errors = 0
         last_window_at: float | None = None
         last_downlink_at: float | None = None
         last_uplink_at: float | None = None
@@ -881,7 +989,17 @@ def run_once(args: argparse.Namespace, port: str, baud: int) -> int:
                 if kind == "data":
                     rx_data_frames += 1
                     last_data_at = time.monotonic()
-                    summary = decode_seds_packet_summary(payload) or "data frame"
+                    decoded = decode_seds_packet_summary(payload)
+                    summary = decoded.summary if decoded else "data frame"
+                    if decoded is not None and not decoded.decode_ok:
+                        seds_decode_errors += 1
+                    elif decoded is not None and decoded.type_name in {"GPS_DATA", "GpsData"}:
+                        gps_data_frames += 1
+                    elif decoded is not None and decoded.type_name in {
+                        "GPS_SATELLITE_NUMBER",
+                        "GpsSatelliteNumber",
+                    }:
+                        gps_satellite_frames += 1
                     print(
                         f"rx data frame len={len(payload)} {summary} "
                         f"preview={hex_preview(payload, args.preview_bytes)}"
@@ -896,15 +1014,19 @@ def run_once(args: argparse.Namespace, port: str, baud: int) -> int:
                     print(f"rx command frame len={len(payload)} preview={hex_preview(payload, args.preview_bytes)}")
                     continue
                 windows += 1
-                now = time.monotonic()
-                gap = None if last_window_at is None else int((now - last_window_at) * 1000)
-                last_window_at = now
+                window_received_at = time.monotonic()
+                gap = (
+                    None
+                    if last_window_at is None
+                    else int((window_received_at - last_window_at) * 1000)
+                )
+                last_window_at = window_received_at
                 if window.kind == "downlink":
                     downlink_windows += 1
-                    last_downlink_at = now
+                    last_downlink_at = window_received_at
                 elif window.kind == "uplink":
                     uplink_windows += 1
-                    last_uplink_at = now
+                    last_uplink_at = window_received_at
                 gap_text = "" if gap is None else f" gap_ms={gap}"
                 print(
                     f"rx radio window kind={window.kind} seq={window.seq} "
@@ -918,11 +1040,25 @@ def run_once(args: argparse.Namespace, port: str, baud: int) -> int:
                         write_frame(fd, build_scheduler_yield(window.seq, False))
                         print(f"tx scheduler yield seq={window.seq} has_more=False")
                     continue
+                turnaround_s = max(RADIO_UPLINK_TURNAROUND_S, window.turnaround_ms / 1000.0)
+                latest_tx_at = window_received_at + max(
+                    0.0, RADIO_UPLINK_WINDOW_S - RADIO_UPLINK_TX_GUARD_S
+                )
+                sleep_s = min(turnaround_s, max(0.0, latest_tx_at - time.monotonic()))
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
                 sends_this_window = min(window.credit, args.count - sent)
                 for _ in range(sends_this_window):
+                    air_time_s = radio_air_time_s(len(packet))
+                    if time.monotonic() + air_time_s > latest_tx_at:
+                        break
                     write_frame(fd, data_frame)
                     sent += 1
                     print(f"tx #{sent}: sent during uplink seq={window.seq}")
+                    air_time_s = max(air_time_s, RADIO_UPLINK_INTERFRAME_S)
+                    sleep_s = min(air_time_s, max(0.0, latest_tx_at - time.monotonic()))
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
                 if not args.no_yield:
                     write_frame(fd, build_scheduler_yield(window.seq, sent < args.count))
                     print(f"tx scheduler yield seq={window.seq} has_more={sent < args.count}")
@@ -939,7 +1075,9 @@ def run_once(args: argparse.Namespace, port: str, baud: int) -> int:
         print(
             f"done sent={sent}/{args.count} radio_windows={windows} "
             f"downlink_windows={downlink_windows} uplink_windows={uplink_windows} "
-            f"rx_data_frames={rx_data_frames}{age_text}"
+            f"rx_data_frames={rx_data_frames} gps_data_frames={gps_data_frames} "
+            f"gps_satellite_frames={gps_satellite_frames} "
+            f"seds_decode_errors={seds_decode_errors}{age_text}"
         )
         if sent < args.count:
             print("timed out before enough uplink windows arrived", file=sys.stderr)
@@ -948,6 +1086,8 @@ def run_once(args: argparse.Namespace, port: str, baud: int) -> int:
             print("warning: no downlink windows observed", file=sys.stderr)
         elif rx_data_frames == 0:
             print("warning: downlink windows observed but no data frames decoded", file=sys.stderr)
+        elif gps_satellite_frames == 0:
+            print("warning: no GPS_SATELLITE_NUMBER frames decoded", file=sys.stderr)
         return 0
     finally:
         os.close(fd)
