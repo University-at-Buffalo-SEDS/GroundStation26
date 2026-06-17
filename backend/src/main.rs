@@ -212,6 +212,60 @@ async fn shutdown_signal(state: Arc<AppState>) {
     }
 }
 
+fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>>, bool) {
+    match open_link(link) {
+        Ok(r) => {
+            gs_debug_println!("Rocket comms online");
+            (Arc::new(Mutex::new(r)), true)
+        }
+        Err(e) => {
+            gs_debug_println!("Rocket comms missing, using DummyComms: {}", e);
+            log::warn!(
+                "AV bay link unavailable: {e}. Setup hint: {}",
+                startup_failure_hint(link)
+            );
+            #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
+            {
+                (
+                    Arc::new(Mutex::new(Box::new(DummyComms::new("Rocket Comms")))),
+                    false,
+                )
+            }
+            #[cfg(not(feature = "testing"))]
+            #[cfg(not(feature = "hitl_mode"))]
+            #[cfg(not(feature = "test_fire_mode"))]
+            panic!("Rocket comms missing and testing mode not enabled")
+        }
+    }
+}
+
+fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>>, bool) {
+    match open_link(link) {
+        Ok(r) => {
+            gs_debug_println!("Umbilical comms online");
+            (Arc::new(Mutex::new(r)), true)
+        }
+        Err(e) => {
+            gs_debug_println!("Umbilical comms missing, using DummyComms: {}", e);
+            log::warn!(
+                "Fill box link unavailable: {e}. Setup hint: {}",
+                startup_failure_hint(link)
+            );
+            #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
+            {
+                (
+                    Arc::new(Mutex::new(Box::new(DummyComms::new("Umbilical Comms")))),
+                    false,
+                )
+            }
+            #[cfg(not(feature = "testing"))]
+            #[cfg(not(feature = "hitl_mode"))]
+            #[cfg(not(feature = "test_fire_mode"))]
+            panic!("Umbilical comms missing and testing mode not enabled")
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     logger::init()?;
@@ -455,77 +509,40 @@ async fn main() -> anyhow::Result<()> {
         link_description(&comms_links.fill_box)
     );
 
-    let (rocket_comms, av_bay_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
-        match open_link(&comms_links.av_bay) {
-            Ok(r) => {
-                gs_debug_println!("Rocket comms online");
-                (Arc::new(Mutex::new(r)), true)
-            }
-            Err(e) => {
-                gs_debug_println!("Rocket comms missing, using DummyComms: {}", e);
-                log::warn!(
-                    "AV bay link unavailable: {e}. Setup hint: {}",
-                    startup_failure_hint(&comms_links.av_bay)
-                );
-                #[cfg(feature = "testing")]
-                {
-                    (
-                        Arc::new(Mutex::new(Box::new(DummyComms::new("Rocket Comms")))),
-                        false,
-                    )
-                }
-                #[cfg(all(
-                    not(feature = "testing"),
-                    any(feature = "hitl_mode", feature = "test_fire_mode")
-                ))]
-                {
-                    (
-                        Arc::new(Mutex::new(Box::new(DummyComms::new("Rocket Comms")))),
-                        false,
-                    )
-                }
-                #[cfg(not(feature = "testing"))]
-                #[cfg(not(feature = "hitl_mode"))]
-                #[cfg(not(feature = "test_fire_mode"))]
-                panic!("Rocket comms missing and testing mode not enabled")
-            }
-        };
+    #[cfg(feature = "testing")]
+    let force_sim_comms = flight_sim::sim_mode_enabled();
 
-    let (umbilical_comms, fill_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
-        match open_link(&comms_links.fill_box) {
-            Ok(r) => {
-                gs_debug_println!("Umbilical comms online");
-                (Arc::new(Mutex::new(r)), true)
-            }
-            Err(e) => {
-                gs_debug_println!("Umbilical comms missing, using DummyComms: {}", e);
-                log::warn!(
-                    "Fill box link unavailable: {e}. Setup hint: {}",
-                    startup_failure_hint(&comms_links.fill_box)
-                );
-                #[cfg(feature = "testing")]
-                {
-                    (
-                        Arc::new(Mutex::new(Box::new(DummyComms::new("Umbilical Comms")))),
-                        false,
-                    )
-                }
-                #[cfg(all(
-                    not(feature = "testing"),
-                    any(feature = "hitl_mode", feature = "test_fire_mode")
-                ))]
-                {
-                    (
-                        Arc::new(Mutex::new(Box::new(DummyComms::new("Umbilical Comms")))),
-                        false,
-                    )
-                }
-                #[cfg(not(feature = "testing"))]
-                #[cfg(not(feature = "hitl_mode"))]
-                #[cfg(not(feature = "test_fire_mode"))]
-                panic!("Umbilical comms missing and testing mode not enabled")
-            }
+    #[cfg(feature = "testing")]
+    let (rocket_comms, av_bay_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+        if force_sim_comms {
+            gs_debug_println!("Testing simulator mode enabled; using DummyComms for rocket comms");
+            (
+                Arc::new(Mutex::new(Box::new(DummyComms::new("Rocket Comms")))),
+                false,
+            )
+        } else {
+            open_rocket_comms(&comms_links.av_bay)
         };
+    #[cfg(not(feature = "testing"))]
+    let (rocket_comms, av_bay_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+        open_rocket_comms(&comms_links.av_bay);
+
+    #[cfg(feature = "testing")]
+    let (umbilical_comms, fill_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+        if force_sim_comms {
+            gs_debug_println!(
+                "Testing simulator mode enabled; using DummyComms for umbilical comms"
+            );
+            (
+                Arc::new(Mutex::new(Box::new(DummyComms::new("Umbilical Comms")))),
+                false,
+            )
+        } else {
+            open_umbilical_comms(&comms_links.fill_box)
+        };
+    #[cfg(not(feature = "testing"))]
+    let (umbilical_comms, fill_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+        open_umbilical_comms(&comms_links.fill_box);
     state
         .av_bay_comms_connected
         .store(av_bay_comms_connected, Ordering::Relaxed);
