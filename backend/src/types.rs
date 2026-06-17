@@ -21,6 +21,7 @@ pub enum TelemetryCommand {
     StopWritingDb,
     ResetSim,
     ContinueFillSequence,
+    Postinit,
     Launch,
     VigilantMode,
     RevokeVigilantMode,

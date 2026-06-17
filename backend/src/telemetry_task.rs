@@ -742,6 +742,16 @@ pub async fn telemetry_task(
                                 state.request_fill_sequence_continue();
                                 gs_debug_println!("ContinueFillSequence command accepted");
                             }
+                        TelemetryCommand::Postinit => {
+                                if let Err(e) = queue_locally_routed_flight_command(
+                                    &router,
+                                    "Postinit",
+                                    &[FlightComputerCommands::Postinit as u8],
+                                ) {
+                                    log_telemetry_error("failed to log Postinit command", e);
+                                }
+                                gs_debug_println!("Postinit command sent");
+                            }
                         TelemetryCommand::Launch => {
                                 handle_flight_computer_launch_command(state.clone(), router.clone()).await;
                             }

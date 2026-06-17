@@ -2,6 +2,7 @@
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum FlightComputerCommands {
+    Postinit = 0,
     Launch = 1,
     VigilantMode = 2,
     RevokeVigilantMode = 3,
