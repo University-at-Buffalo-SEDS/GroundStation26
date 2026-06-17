@@ -85,7 +85,6 @@ pub fn set_network_time_router(router: Arc<Router>) {
     let _ = NETWORK_TIME_ROUTER.set(router);
 }
 
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 fn send_valve_launch_sequence_command(router: &Router) -> bool {
     let payload = [ValveBoardCommands::Sequence as u8];
     if let Err(e) = router.log_queue(DataType::ValveCommand, &payload) {
@@ -214,19 +213,28 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
     }
     let now_ms = get_current_timestamp_ms() as i64;
     state.set_launch_clock(launch_countdown_clock(now_ms));
-    if let Err(e) = queue_locally_routed_flight_command(
+    let flight_command_sent = if let Err(e) = queue_locally_routed_flight_command(
         &router,
         "Launch command",
         &[FlightComputerCommands::Launch as u8],
     ) {
         log_telemetry_error("failed to log Launch command", e);
+        false
     } else {
         flush_command_tx(&router, "Launch command tx");
+        true
+    };
+    let valve_command_sent = send_valve_launch_sequence_command(&router);
+    if flight_command_sent || valve_command_sent {
         state.set_launch_indicator_latched(true);
         sequences::refresh_action_policy_now(&state);
         state.broadcast_action_policy_snapshot();
     }
-    gs_debug_println!("Launch command sent to flight computer");
+    gs_debug_println!(
+        "Launch command sent to flight computer: {}; valve board sequence command sent: {}",
+        flight_command_sent,
+        valve_command_sent
+    );
 }
 
 pub async fn telemetry_task(
@@ -1980,6 +1988,63 @@ mod tests {
             flight_packets[0]
                 .endpoints()
                 .contains(&DataEndpoint::FlightController)
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_command_also_queues_valve_board_sequence() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sent_clone = sent.clone();
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let valve_side = router.add_side_serialized_with_options(
+            "umbilical_comms",
+            move |bytes| {
+                sent_clone
+                    .lock()
+                    .expect("failed to lock sent packets")
+                    .push(bytes.to_vec());
+                Ok(())
+            },
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let discovery = sedsprintf_rs_2026::discovery::build_discovery_announce(
+            Board::ValveBoard.sender_id(),
+            123,
+            &[DataEndpoint::ValveBoard],
+        )
+        .expect("failed to build valve-board discovery");
+        router
+            .rx_serialized_from_side(&serialize::serialize_packet(&discovery), valve_side)
+            .expect("failed to queue valve-board discovery");
+        router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process valve-board discovery");
+
+        handle_flight_computer_launch_command(state, router.clone()).await;
+        router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to process launch command queues");
+
+        let sent = sent.lock().expect("failed to lock sent packets");
+        let valve_sequence_seen = sent
+            .iter()
+            .filter_map(|wire| serialize::deserialize_packet(wire).ok())
+            .any(|pkt| {
+                pkt.data_type() == DataType::ValveCommand
+                    && pkt.payload() == &[ValveBoardCommands::Sequence as u8]
+                    && pkt.endpoints().contains(&DataEndpoint::ValveBoard)
+            });
+        assert!(
+            valve_sequence_seen,
+            "normal launch should also queue the valve-board sequence command"
         );
     }
 

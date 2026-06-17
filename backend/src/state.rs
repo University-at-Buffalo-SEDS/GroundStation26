@@ -1319,7 +1319,7 @@ impl AppState {
         }
         #[cfg(not(feature = "hitl_mode"))]
         {
-            if matches!(cmd, TelemetryCommand::ResetSim) && crate::flight_sim::sim_mode_enabled() {
+            if crate::flight_sim::sim_mode_enabled() {
                 return true;
             }
             if matches!(
@@ -1888,6 +1888,22 @@ mod tests {
             .iter()
             .find(|control| control.cmd == cmd)
             .map(|control| (control.enabled, control.actuated))
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn simulator_mode_allows_button_commands_even_when_policy_disabled() {
+        let state = test_app_state().await;
+        let mut policy = crate::sequences::default_action_policy();
+        for control in &mut policy.controls {
+            control.enabled = false;
+        }
+        state.set_action_policy(policy);
+
+        assert!(crate::flight_sim::sim_mode_enabled());
+        assert!(state.is_command_allowed(&TelemetryCommand::Dump));
+        assert!(state.is_command_allowed(&TelemetryCommand::Launch));
+        assert!(state.is_command_allowed(&TelemetryCommand::ResetSim));
     }
 
     #[tokio::test]
