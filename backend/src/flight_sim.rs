@@ -731,6 +731,7 @@ impl FlightSimState {
                 // Backend-local controls are handled outside the simulator command stream.
             }
             TelemetryCommand::MonitorAltitude
+            | TelemetryCommand::Postinit
             | TelemetryCommand::RevokeMonitorAltitude
             | TelemetryCommand::ConsecutiveSamples
             | TelemetryCommand::RevokeConsecutiveSamples

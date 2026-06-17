@@ -1222,6 +1222,7 @@ impl AppState {
                         | "StartWritingLastTwoMinutes"
                         | "PauseWritingDb"
                         | "StopWritingDb"
+                        | "Postinit"
                         | "ToggleButtonInterlock"
                         | "ToggleLaunchInterlock"
                         | "TogglePhysicalLaunchMode"
@@ -1296,6 +1297,7 @@ impl AppState {
             let exempt = matches!(
                 cmd,
                 TelemetryCommand::Abort
+                    | TelemetryCommand::Postinit
                     | TelemetryCommand::StartWritingNow
                     | TelemetryCommand::StartWritingLastTwoMinutes
                     | TelemetryCommand::PauseWritingDb
@@ -1325,6 +1327,7 @@ impl AppState {
             if matches!(
                 cmd,
                 TelemetryCommand::Abort
+                    | TelemetryCommand::Postinit
                     | TelemetryCommand::NitrogenClose
                     | TelemetryCommand::NitrousClose
                     | TelemetryCommand::ContinueFillSequence

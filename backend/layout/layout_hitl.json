@@ -139,6 +139,13 @@
         "spacer_row_after": true
       },
       {
+        "label": "Postinit",
+        "cmd": "Postinit",
+        "border": "#38bdf8",
+        "bg": "#082f49",
+        "fg": "#e0f2fe"
+      },
+      {
         "label": "Launch",
         "cmd": "Launch",
         "border": "#22c55e",

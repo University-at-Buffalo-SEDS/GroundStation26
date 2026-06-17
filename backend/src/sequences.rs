@@ -543,6 +543,7 @@ fn is_fill_state(state: FlightState) -> bool {
 
 pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
     match cmd {
+        TelemetryCommand::Postinit => "Postinit",
         TelemetryCommand::Launch => "Launch",
         TelemetryCommand::Dump => "Dump",
         TelemetryCommand::Abort => "Abort",
@@ -631,6 +632,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
+        "Postinit",
         "Launch",
         "MonitorAltitude",
         "RevokeMonitorAltitude",
@@ -664,6 +666,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
+        "Postinit",
         "Launch",
         "MonitorAltitude",
         "RevokeMonitorAltitude",
@@ -714,6 +717,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "PauseWritingDb",
         "StopWritingDb",
         "ContinueFillSequence",
+        "Postinit",
         "Launch",
         "GroundStationLaunch",
         "MonitorAltitude",
@@ -749,7 +753,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
             .into_iter()
             .map(|cmd| {
                 let enabled = default_recording_command_enabled(cmd)
-                    .unwrap_or_else(|| matches!(cmd, "Abort" | "ResetSim"));
+                    .unwrap_or_else(|| matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
                 ActionControl {
                     cmd: cmd.to_string(),
                     enabled,
@@ -783,6 +787,7 @@ fn policy_with_overrides(
                     | "StartWritingLastTwoMinutes"
                     | "PauseWritingDb"
                     | "StopWritingDb"
+                    | "Postinit"
             ) {
                 true
             } else if cmd == "ContinueFillSequence" {
@@ -837,6 +842,13 @@ fn set_control_enabled(policy: &mut ActionPolicyMsg, cmd: &str, enabled: bool) {
         if !enabled {
             control.blink = BlinkMode::None;
         }
+    }
+}
+
+fn enable_launch_when_key_pressed(policy: &mut ActionPolicyMsg, inputs: PolicyInputs) {
+    if inputs.key_enabled {
+        set_control_enabled(policy, "Launch", true);
+        set_control_enabled(policy, "GroundStationLaunch", true);
     }
 }
 
@@ -1773,12 +1785,14 @@ fn build_policy(
             enabled.insert("GroundStationLaunch", BlinkMode::None);
         }
         enabled.insert("Dump", BlinkMode::None);
-        return policy_with_overrides(
+        let mut policy = policy_with_overrides(
             true,
             inputs.software_buttons_enabled,
             inputs.valves,
             enabled,
         );
+        enable_launch_when_key_pressed(&mut policy, inputs);
+        return policy;
     }
 
     if !is_fill_state(inputs.flight_state) {
@@ -1823,6 +1837,7 @@ fn build_policy(
             set_control_enabled(&mut policy, "Launch", false);
             set_control_enabled(&mut policy, "GroundStationLaunch", false);
         }
+        enable_launch_when_key_pressed(&mut policy, inputs);
         return policy;
     }
 
@@ -2014,6 +2029,7 @@ fn build_policy(
     );
     set_control_enabled(&mut policy, "Launch", false);
     set_control_enabled(&mut policy, "GroundStationLaunch", false);
+    enable_launch_when_key_pressed(&mut policy, inputs);
     policy
 }
 
@@ -2306,6 +2322,33 @@ mod tests {
             pending_nitrous_open: Some(false),
             ..ValveSnapshot::default()
         }));
+    }
+
+    #[test]
+    fn key_pressed_keeps_launch_controls_enabled() {
+        let inputs = PolicyInputs {
+            flight_state: FlightState::Coast,
+            key_enabled: true,
+            software_buttons_enabled: true,
+            valves: ValveSnapshot::default(),
+            now_ms: 0,
+        };
+        let mut policy = policy_with_overrides(true, true, inputs.valves, HashMap::new());
+        set_control_enabled(&mut policy, "Launch", false);
+        set_control_enabled(&mut policy, "GroundStationLaunch", false);
+
+        enable_launch_when_key_pressed(&mut policy, inputs);
+
+        let enabled = |cmd: &str| {
+            policy
+                .controls
+                .iter()
+                .find(|control| control.cmd == cmd)
+                .map(|control| control.enabled)
+        };
+        assert_eq!(enabled("Launch"), Some(true));
+        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+        assert_eq!(enabled("GroundStationLaunch"), Some(true));
     }
 
     #[cfg(feature = "hitl_mode")]

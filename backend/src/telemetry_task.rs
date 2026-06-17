@@ -37,6 +37,7 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
         TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
         TelemetryCommand::EnableIMU => FlightComputerCommands::EnableIMU as u8,
         TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
+        TelemetryCommand::Postinit => FlightComputerCommands::Postinit as u8,
         TelemetryCommand::AdvanceFlightState => FlightComputerCommands::AdvanceFlightState as u8,
         TelemetryCommand::RewindFlightState => FlightComputerCommands::RewindFlightState as u8,
         TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
@@ -178,6 +179,18 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
             .send(DbQueueItem::Control(RecordingCommand::StartNow))
             .await;
         gs_debug_println!("Ground-station launch auto-started DB recording");
+    }
+    #[cfg(feature = "test_fire_mode")]
+    {
+        if let Err(e) = queue_locally_routed_flight_command(
+            &router,
+            "Ground-station launch FC command",
+            &[FlightComputerCommands::Launch as u8],
+        ) {
+            log_telemetry_error("failed to log Ground-station launch FC command", e);
+        } else {
+            flush_command_tx(&router, "Ground-station launch FC command tx");
+        }
     }
     if !send_valve_launch_sequence_command(&router) {
         state.clear_launch_sequence_command_pending();
@@ -743,6 +756,18 @@ pub async fn telemetry_task(
                         TelemetryCommand::ContinueFillSequence => {
                                 state.request_fill_sequence_continue();
                                 gs_debug_println!("ContinueFillSequence command accepted");
+                            }
+                        TelemetryCommand::Postinit => {
+                                if let Err(e) = queue_locally_routed_flight_command(
+                                    &router,
+                                    "Postinit command",
+                                    &[FlightComputerCommands::Postinit as u8],
+                                ) {
+                                    log_telemetry_error("failed to log Postinit command", e);
+                                } else {
+                                    flush_command_tx(&router, "Postinit command tx");
+                                }
+                                gs_debug_println!("Postinit command sent to flight computer");
                             }
                         TelemetryCommand::Launch => {
                                 handle_flight_computer_launch_command(state.clone(), router.clone()).await;
@@ -1895,6 +1920,7 @@ mod tests {
 
     #[test]
     fn flight_command_discriminants_match_current_layout() {
+        assert_eq!(FlightComputerCommands::Postinit as u8, 0);
         assert_eq!(FlightComputerCommands::Launch as u8, 1);
         assert_eq!(FlightComputerCommands::MonitorAltitude as u8, 2);
         assert_eq!(FlightComputerCommands::RevokeMonitorAltitude as u8, 3);
@@ -1906,10 +1932,118 @@ mod tests {
         assert_eq!(FlightComputerCommands::RevokeValidateMeasms as u8, 9);
     }
 
+    #[tokio::test]
+    async fn postinit_command_sends_flight_command_zero() {
+        let (db_tx, db_rx) = mpsc::channel(8);
+        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let (radio_tx, mut radio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        register_flight_command_tx_side("rocket_comms", radio_tx);
+
+        let shutdown_rx = state.shutdown_subscribe();
+        let telemetry = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            shutdown_rx,
+        ));
+
+        state
+            .cmd_tx
+            .send(TelemetryCommand::Postinit)
+            .await
+            .expect("failed to send postinit command");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let Some(wire) = radio_rx.recv().await else {
+                    panic!("flight command tx channel closed");
+                };
+                let pkt = serialize::deserialize_packet(&wire)
+                    .expect("failed to deserialize flight command packet");
+                if pkt.data_type() == DataType::FlightCommand {
+                    assert_eq!(pkt.payload(), &[FlightComputerCommands::Postinit as u8]);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for postinit flight-command packet");
+
+        state.request_shutdown();
+        telemetry.await.expect("telemetry task join failed");
+    }
+
+    #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    #[tokio::test]
+    async fn test_fire_ground_station_launch_sends_flight_computer_launch_command() {
+        let (db_tx, db_rx) = mpsc::channel(8);
+        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        let mut policy = state.action_policy_snapshot();
+        for control in policy.controls.iter_mut() {
+            if control.cmd == "GroundStationLaunch" {
+                control.enabled = true;
+            }
+        }
+        state.set_action_policy(policy);
+
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let (radio_tx, mut radio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        register_flight_command_tx_side("rocket_comms", radio_tx);
+
+        let shutdown_rx = state.shutdown_subscribe();
+        let telemetry = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            shutdown_rx,
+        ));
+
+        state
+            .cmd_tx
+            .send(TelemetryCommand::GroundStationLaunch)
+            .await
+            .expect("failed to send test-fire launch command");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let Some(wire) = radio_rx.recv().await else {
+                    panic!("flight command tx channel closed");
+                };
+                let pkt = serialize::deserialize_packet(&wire)
+                    .expect("failed to deserialize flight command packet");
+                if pkt.data_type() == DataType::FlightCommand {
+                    assert_eq!(pkt.payload(), &[FlightComputerCommands::Launch as u8]);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for test-fire launch flight-command packet");
+
+        state.request_shutdown();
+        telemetry.await.expect("telemetry task join failed");
+    }
+
     #[cfg(feature = "hitl_mode")]
     #[test]
     fn hitl_flight_command_mapping_matches_current_layout() {
         let cases = [
+            (
+                TelemetryCommand::Postinit,
+                FlightComputerCommands::Postinit as u8,
+            ),
             (
                 TelemetryCommand::DeployParachute,
                 FlightComputerCommands::DeployParachute as u8,
