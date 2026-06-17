@@ -20,6 +20,10 @@ pub enum FlightComputerCommands {
     ReinitBarometer = 18,
     EnableIMU = 19,
     DisableIMU = 20,
+    #[cfg(feature = "hitl_mode")]
+    AdvanceFlightState = 21,
+    #[cfg(feature = "hitl_mode")]
+    RewindFlightState = 22,
     AbortAfter40 = 23,
 }
 

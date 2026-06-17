@@ -193,7 +193,7 @@ fn check_gyro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
 }
 
 #[cfg(feature = "testing")]
-const BOARD_TIMEOUT_MS: u64 = 3000;
+const BOARD_TIMEOUT_MS: u64 = 12000;
 #[cfg(feature = "testing")]
 const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 6000;
 

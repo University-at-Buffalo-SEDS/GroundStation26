@@ -37,12 +37,14 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
         TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
         TelemetryCommand::EnableIMU => FlightComputerCommands::EnableIMU as u8,
         TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
+        TelemetryCommand::AdvanceFlightState => FlightComputerCommands::AdvanceFlightState as u8,
+        TelemetryCommand::RewindFlightState => FlightComputerCommands::RewindFlightState as u8,
         TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
         _ => return None,
     })
 }
 
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
 const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Startup,
     FlightState::Idle,
@@ -62,7 +64,7 @@ const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Aborted,
 ];
 
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
 fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> FlightState {
     let idx = OPERATOR_MODE_FLIGHT_STATE_ORDER
         .iter()
@@ -73,7 +75,7 @@ fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> Flig
     OPERATOR_MODE_FLIGHT_STATE_ORDER[next_idx]
 }
 
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
 async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_state: FlightState) {
     state.set_local_flight_state(next_state);
 }
@@ -857,14 +859,44 @@ pub async fn telemetry_task(
                                 state.broadcast_action_policy_snapshot();
                                 gs_debug_println!("Launch indicator latch reset");
                         }
-                        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::AdvanceFlightState => {
+                            if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
+                                if let Err(e) = queue_locally_routed_flight_command(
+                                    &router,
+                                    "AdvanceFlightState command",
+                                    &[cmd_id],
+                                ) {
+                                    log_telemetry_error("failed to log AdvanceFlightState command", e);
+                                } else {
+                                    flush_command_tx(&router, "AdvanceFlightState command tx");
+                                }
+                                gs_debug_println!("AdvanceFlightState command sent to flight computer ({cmd_id})");
+                            }
+                        }
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::RewindFlightState => {
+                            if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
+                                if let Err(e) = queue_locally_routed_flight_command(
+                                    &router,
+                                    "RewindFlightState command",
+                                    &[cmd_id],
+                                ) {
+                                    log_telemetry_error("failed to log RewindFlightState command", e);
+                                } else {
+                                    flush_command_tx(&router, "RewindFlightState command tx");
+                                }
+                                gs_debug_println!("RewindFlightState command sent to flight computer ({cmd_id})");
+                            }
+                        }
+                        #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
                         TelemetryCommand::AdvanceFlightState => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, 1);
                                 set_local_flight_state_for_operator_mode(&state, next).await;
                                 gs_debug_println!("Operator-mode flight state advanced: {:?} -> {:?}", current, next);
                         }
-                        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+                        #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
                         TelemetryCommand::RewindFlightState => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, -1);
@@ -1905,6 +1937,14 @@ mod tests {
             (
                 TelemetryCommand::DisableIMU,
                 FlightComputerCommands::DisableIMU as u8,
+            ),
+            (
+                TelemetryCommand::AdvanceFlightState,
+                FlightComputerCommands::AdvanceFlightState as u8,
+            ),
+            (
+                TelemetryCommand::RewindFlightState,
+                FlightComputerCommands::RewindFlightState as u8,
             ),
             (
                 TelemetryCommand::AbortAfter40,
@@ -3302,7 +3342,7 @@ mod tests {
         assert!(statuses.iter().any(|status| *status == (7, true)));
     }
 
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+    #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
     #[tokio::test]
     async fn advance_flight_state_command_reaches_remote_router_end_to_end() {
         let (db_tx, db_rx) = mpsc::channel(8);
@@ -3464,6 +3504,65 @@ mod tests {
         remote_result.expect("timed out waiting for remote flight state");
         let states = remote_states.lock().expect("failed to lock remote states");
         assert_eq!(states.as_slice(), expected_states.as_slice());
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn advance_flight_state_command_reaches_flight_computer_command_path() {
+        let (db_tx, db_rx) = mpsc::channel(8);
+        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        let mut policy = state.action_policy_snapshot();
+        for control in policy.controls.iter_mut() {
+            if control.cmd == "AdvanceFlightState" {
+                control.enabled = true;
+            }
+        }
+        state.set_action_policy(policy);
+
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let (radio_tx, mut radio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        register_flight_command_tx_side("rocket_comms", radio_tx);
+
+        let shutdown_rx = state.shutdown_subscribe();
+        let telemetry = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            shutdown_rx,
+        ));
+
+        state
+            .cmd_tx
+            .send(TelemetryCommand::AdvanceFlightState)
+            .await
+            .expect("failed to send advance flight state command");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let Some(wire) = radio_rx.recv().await else {
+                    panic!("flight command tx channel closed");
+                };
+                let pkt = serialize::deserialize_packet(&wire)
+                    .expect("failed to deserialize flight command packet");
+                if pkt.data_type() == DataType::FlightCommand {
+                    assert_eq!(
+                        pkt.payload(),
+                        &[FlightComputerCommands::AdvanceFlightState as u8]
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for advance flight state flight-command packet");
+
+        state.request_shutdown();
+        telemetry.await.expect("telemetry task join failed");
     }
 
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
