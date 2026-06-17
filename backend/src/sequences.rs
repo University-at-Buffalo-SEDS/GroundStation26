@@ -65,11 +65,19 @@ fn is_recording_command(cmd: &str) -> bool {
 }
 
 #[cfg_attr(feature = "hitl_mode", allow(dead_code))]
+fn default_recording_command_enabled(cmd: &str) -> Option<bool> {
+    match cmd {
+        "StartWritingNow" | "StartWritingLastTwoMinutes" => Some(true),
+        "PauseWritingDb" | "StopWritingDb" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg_attr(feature = "hitl_mode", allow(dead_code))]
 fn default_recording_command_actuated(cmd: &str) -> Option<bool> {
     match cmd {
-        "StartWritingNow" | "StartWritingLastTwoMinutes" => Some(false),
-        "PauseWritingDb" => Some(false),
-        "StopWritingDb" => Some(true),
+        "StartWritingNow" | "StartWritingLastTwoMinutes" => Some(true),
+        "PauseWritingDb" | "StopWritingDb" => Some(false),
         _ => None,
     }
 }
@@ -746,15 +754,8 @@ pub fn default_action_policy() -> ActionPolicyMsg {
         let controls = all_command_names()
             .into_iter()
             .map(|cmd| {
-                let enabled = matches!(
-                    cmd,
-                    "Abort"
-                        | "ResetSim"
-                        | "StartWritingNow"
-                        | "StartWritingLastTwoMinutes"
-                        | "PauseWritingDb"
-                        | "StopWritingDb"
-                );
+                let enabled = default_recording_command_enabled(cmd)
+                    .unwrap_or_else(|| matches!(cmd, "Abort" | "ResetSim"));
                 ActionControl {
                     cmd: cmd.to_string(),
                     enabled,

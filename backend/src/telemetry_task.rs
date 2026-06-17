@@ -2054,14 +2054,14 @@ mod tests {
     const RFBOARD_SCHED_FLAG_HAS_MORE: u8 = 0x01;
     const RFBOARD_SCHED_FLAG_YIELD: u8 = 0x02;
     const RFBOARD_SCHED_BURST_MESSAGES: usize = 5;
-    const RFBOARD_SCHED_DOWNLINK_TIMEOUT_MS: u64 = 500;
-    const RFBOARD_SCHED_UPLINK_TIMEOUT_MS: u64 = 3000;
+    const RFBOARD_SCHED_DOWNLINK_TIMEOUT_MS: u64 = 300;
+    const RFBOARD_SCHED_UPLINK_TIMEOUT_MS: u64 = 4000;
     const RFBOARD_SCHED_IDLE_UPLINK_POLL_MS: u64 = 50;
     const RFBOARD_SCHED_GRANT_RETRY_MS: u64 = 50;
     const RFBOARD_SCHED_GRANT_REANNOUNCE_MS: u64 = 5000;
     const RFBOARD_SCHED_TURNAROUND_MS: u64 = 75;
     const RFBOARD_SCHED_UPLINK_TO_DOWNLINK_TURNAROUND_MS: u64 = 150;
-    const RFBOARD_SCHED_GS_TX_TURNAROUND_MS: u64 = 100;
+    const RFBOARD_SCHED_GS_TX_TURNAROUND_MS: u64 = 600;
 
     struct RfBoardScheduler {
         radio_turn: u8,
@@ -2218,6 +2218,7 @@ mod tests {
                 seq: self.radio_turn_seq,
                 credit: RFBOARD_SCHED_BURST_MESSAGES,
                 turnaround_ms: RFBOARD_SCHED_GS_TX_TURNAROUND_MS,
+                received_at: std::time::Instant::now(),
             });
             true
         }
@@ -2504,6 +2505,7 @@ mod tests {
                     seq: 1,
                     credit: 5,
                     turnaround_ms: 0,
+                    received_at: std::time::Instant::now(),
                 }]),
                 inject_tx_on_recv: None,
                 fail_sends: 0,
@@ -2609,6 +2611,7 @@ mod tests {
                     seq: 9,
                     credit: 5,
                     turnaround_ms: 0,
+                    received_at: std::time::Instant::now(),
                 }]),
                 inject_tx_on_recv: Some((tx.clone(), wire.clone())),
                 fail_sends: 0,
@@ -2754,6 +2757,7 @@ mod tests {
                     seq: 1,
                     credit: 5,
                     turnaround_ms: 0,
+                    received_at: std::time::Instant::now(),
                 }]),
                 inject_tx_on_recv: None,
                 fail_sends: 0,
@@ -2823,6 +2827,7 @@ mod tests {
                     seq: 1,
                     credit: 1,
                     turnaround_ms: 0,
+                    received_at: std::time::Instant::now(),
                 }]),
                 inject_tx_on_recv: None,
                 fail_sends: 0,
@@ -2915,12 +2920,14 @@ mod tests {
                         seq: 1,
                         credit: 1,
                         turnaround_ms: 0,
+                        received_at: std::time::Instant::now(),
                     },
                     crate::comms::RadioWindowUpdate {
                         kind: crate::comms::RadioWindowKind::UplinkOpen,
                         seq: 2,
                         credit: 1,
                         turnaround_ms: 0,
+                        received_at: std::time::Instant::now(),
                     },
                 ]),
                 inject_tx_on_recv: None,
@@ -2978,6 +2985,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dedicated_radio_worker_drops_stale_uplink_window_before_sending_command() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Arc::new(Router::new(
+            sedsprintf_rs_2026::router::RouterMode::Relay,
+            sedsprintf_rs_2026::router::RouterConfig::new([]),
+        ));
+        let side_id = router.add_side_serialized_with_options(
+            "rocket_comms",
+            |_bytes| Ok(()),
+            sedsprintf_rs_2026::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+            },
+        );
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let stale_received_at = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("failed to build stale receive time");
+        let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
+            Arc::new(Mutex::new(Box::new(TestRadioComms {
+                sent: sent.clone(),
+                scheduler_status: None,
+                windows: VecDeque::from([crate::comms::RadioWindowUpdate {
+                    kind: crate::comms::RadioWindowKind::UplinkOpen,
+                    seq: 11,
+                    credit: 5,
+                    turnaround_ms: 0,
+                    received_at: stale_received_at,
+                }]),
+                inject_tx_on_recv: None,
+                fail_sends: 0,
+            })));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pkt = Packet::new(
+            DataType::FlightCommand,
+            &[DataEndpoint::FlightController],
+            Board::GroundStation.sender_id(),
+            123,
+            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+        )
+        .expect("failed to build flight command packet");
+        let wire = serialize::serialize_packet(&pkt).to_vec();
+        tx.send(wire)
+            .expect("failed to queue flight command to radio worker");
+
+        let workers = spawn_dedicated_radio_io_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                comms,
+                tx_comms: None,
+                side_id,
+                tx_rx: rx,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: true,
+            },
+        )
+        .expect("failed to spawn radio workers");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().expect("radio worker panicked");
+        }
+
+        let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
+        assert!(sent_guard.is_empty());
+    }
+
+    #[tokio::test]
     async fn dedicated_radio_worker_yields_rfboard_uplink_after_credit_is_used() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
@@ -3004,6 +3085,7 @@ mod tests {
                     seq: 7,
                     credit: 5,
                     turnaround_ms: 0,
+                    received_at: std::time::Instant::now(),
                 }]),
                 inject_tx_on_recv: None,
                 fail_sends: 0,

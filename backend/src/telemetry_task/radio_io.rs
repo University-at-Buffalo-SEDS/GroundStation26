@@ -1,6 +1,6 @@
 use crate::comms::{CommsDevice, RadioWindowKind};
 use crate::state::AppState;
-use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
+use sedsprintf_rs_2026::config::DataType;
 use sedsprintf_rs_2026::packet::Packet;
 use sedsprintf_rs_2026::router::{Router, RouterSideId};
 use sedsprintf_rs_2026::serialize;
@@ -292,10 +292,13 @@ pub(super) fn spawn_dedicated_radio_io_threads(
             let radio_rx_idle_packets = radio_rx_packets_idle();
             let radio_rx_uplink_packets = radio_rx_packets_uplink();
             let radio_rx_downlink_packets = radio_rx_packets_downlink();
+            let radio_window_max_age = Duration::from_millis(radio_window_max_age_ms());
             let radio_tx_backlog_limit = radio_tx_backlog_limit();
             let radio_tx_window_packets = radio_tx_packets_per_window();
+            let radio_uplink_window = Duration::from_millis(radio_uplink_window_ms());
             let radio_uplink_turnaround = Duration::from_millis(radio_uplink_turnaround_ms());
             let radio_uplink_tx_guard = Duration::from_millis(radio_uplink_tx_guard_ms());
+            let radio_uplink_yield_grace = Duration::from_millis(radio_uplink_yield_grace_ms());
             let mut command_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             let mut telemetry_backlog: VecDeque<Vec<u8>> = VecDeque::new();
             let mut last_window_update_at: Option<std::time::Instant> = None;
@@ -308,6 +311,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
             let mut has_seen_window_update = false;
             let mut sent_in_current_uplink_window = 0usize;
             let mut sent_uplink_yield = false;
+            let mut last_uplink_tx_at: Option<std::time::Instant> = None;
+            let mut next_uplink_tx_at: Option<std::time::Instant> = None;
             let mut last_uplink_log_at: Option<std::time::Instant> = None;
 
             loop {
@@ -364,6 +369,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                         &mut follow_window_until,
                         &mut follow_window_is_uplink,
                         &mut sent_in_current_uplink_window,
+                        &mut last_uplink_tx_at,
+                        &mut next_uplink_tx_at,
                         &mut last_send_error_log_ms,
                         &mut suppressed_send_errors,
                     );
@@ -406,8 +413,25 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     ) {
                         return;
                     }
-                    let opened_at = std::time::Instant::now();
-                    let deadline = opened_at + radio_follow_timeout;
+                    let now = std::time::Instant::now();
+                    if now.saturating_duration_since(update.received_at) > radio_window_max_age {
+                        if crate::radio_diagnostics_enabled() {
+                            eprintln!(
+                                "{worker_name}: radio scheduler dropped stale {:?} seq={} age_ms={}",
+                                update.kind,
+                                update.seq,
+                                now.saturating_duration_since(update.received_at).as_millis()
+                            );
+                        }
+                        continue;
+                    }
+                    let opened_at = update.received_at;
+                    let deadline = opened_at
+                        + if matches!(update.kind, RadioWindowKind::UplinkOpen) {
+                            radio_follow_timeout.min(radio_uplink_window)
+                        } else {
+                            radio_follow_timeout
+                        };
                     has_seen_window_update = true;
                     last_window_update_at = Some(opened_at);
                     follow_window_opened_at = Some(opened_at);
@@ -424,11 +448,15 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                             follow_window_is_uplink = false;
                             sent_in_current_uplink_window = 0;
                             sent_uplink_yield = false;
+                            last_uplink_tx_at = None;
+                            next_uplink_tx_at = None;
                         }
                         RadioWindowKind::UplinkOpen => {
                             // RF-board uplink means GS may transmit to the board.
                             follow_window_is_uplink = true;
                             sent_in_current_uplink_window = 0;
+                            last_uplink_tx_at = None;
+                            next_uplink_tx_at = None;
                             let uplink_log_now = std::time::Instant::now();
                             let should_log = !(command_backlog.is_empty()
                                 && telemetry_backlog.is_empty())
@@ -461,6 +489,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                                 &mut follow_window_until,
                                 &mut follow_window_is_uplink,
                                 &mut sent_in_current_uplink_window,
+                                &mut last_uplink_tx_at,
+                                &mut next_uplink_tx_at,
                                 &mut last_send_error_log_ms,
                                 &mut suppressed_send_errors,
                             );
@@ -491,6 +521,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     &mut follow_window_until,
                     &mut follow_window_is_uplink,
                     &mut sent_in_current_uplink_window,
+                    &mut last_uplink_tx_at,
+                    &mut next_uplink_tx_at,
                     &mut last_send_error_log_ms,
                     &mut suppressed_send_errors,
                 );
@@ -502,9 +534,28 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                                 .unwrap_or(opened_at)
                     })
                     .unwrap_or(true);
+                let uplink_yield_grace_elapsed =
+                    if sent_in_current_uplink_window >= follow_window_credit {
+                        true
+                    } else {
+                        last_uplink_tx_at
+                            .or(follow_window_opened_at)
+                            .map(|started_at| {
+                                std::time::Instant::now()
+                                    >= started_at
+                                        .checked_add(radio_uplink_yield_grace)
+                                        .unwrap_or(started_at)
+                            })
+                            .unwrap_or(true)
+                    };
+                let uplink_airtime_elapsed = next_uplink_tx_at
+                    .map(|next_tx_at| std::time::Instant::now() >= next_tx_at)
+                    .unwrap_or(true);
                 if follow_window_is_uplink
                     && !sent_uplink_yield
                     && uplink_turnaround_elapsed
+                    && uplink_yield_grace_elapsed
+                    && uplink_airtime_elapsed
                     && (command_backlog.is_empty() && telemetry_backlog.is_empty()
                         || sent_in_current_uplink_window >= follow_window_credit)
                 {
@@ -518,6 +569,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                             follow_window_until =
                                 Some(std::time::Instant::now() + radio_follow_timeout);
                             sent_in_current_uplink_window = 0;
+                            last_uplink_tx_at = None;
+                            next_uplink_tx_at = None;
                         }
                         Err(e) => {
                             log_repeated_worker_error(
@@ -557,11 +610,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                 if let Ok(pkt) = serialize::deserialize_packet(&payload) {
                     ingress_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     ingress_state.mark_packet_received(get_current_timestamp_ms());
-                    if matches!(
-                        pkt.data_type(),
-                        DataType::GpsData | DataType::GpsSatelliteNumber
-                    ) && !pkt.endpoints().contains(&DataEndpoint::GroundStation)
-                    {
+                    if matches!(pkt.data_type(), DataType::GpsSatelliteNumber) {
                         let mut rb = ingress_state.ring_buffer.lock().unwrap();
                         rb.push(pkt);
                     }
@@ -768,7 +817,7 @@ pub(super) fn spawn_router_worker_thread(
 }
 fn radio_follow_timeout_ms() -> u64 {
     static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 3_000, 50, 20_000) as u64)
+    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_FOLLOW_TIMEOUT_MS", 4_500, 50, 20_000) as u64)
 }
 
 fn radio_rx_poll_idle_ms() -> u64 {
@@ -801,6 +850,11 @@ fn radio_rx_packets_downlink() -> usize {
     *LIMIT.get_or_init(|| env_usize("GS_RADIO_RX_PACKETS_DOWNLINK", 16, 1, 256))
 }
 
+fn radio_window_max_age_ms() -> u64 {
+    static TIMEOUT_MS: OnceLock<u64> = OnceLock::new();
+    *TIMEOUT_MS.get_or_init(|| env_usize("GS_RADIO_WINDOW_MAX_AGE_MS", 1_000, 50, 5_000) as u64)
+}
+
 fn radio_tx_backlog_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_BACKLOG_LIMIT", 256, 1, 256))
@@ -809,6 +863,11 @@ fn radio_tx_backlog_limit() -> usize {
 fn radio_tx_packets_per_window() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| env_usize("GS_RADIO_TX_PACKETS_PER_WINDOW", 5, 1, 128))
+}
+
+fn radio_uplink_window_ms() -> u64 {
+    static DELAY_MS: OnceLock<u64> = OnceLock::new();
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_WINDOW_MS", 4_000, 500, 20_000) as u64)
 }
 
 fn radio_flight_command_repeats() -> usize {
@@ -822,7 +881,35 @@ fn radio_uplink_turnaround_ms() -> u64 {
 
 fn radio_uplink_tx_guard_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 0, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_TX_GUARD_MS", 150, 0, 1_000) as u64)
+}
+
+fn radio_uplink_yield_grace_ms() -> u64 {
+    static DELAY_MS: OnceLock<u64> = OnceLock::new();
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_UPLINK_YIELD_GRACE_MS", 75, 0, 1_000) as u64)
+}
+
+fn radio_air_bit_rate_bps() -> u64 {
+    static BPS: OnceLock<u64> = OnceLock::new();
+    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 9_600, 300, 62_500) as u64)
+}
+
+fn radio_air_frame_overhead_bytes() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| env_usize("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", 16, 0, 128) as u64)
+}
+
+fn radio_tx_cooldown_ms() -> u64 {
+    static DELAY_MS: OnceLock<u64> = OnceLock::new();
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_TX_COOLDOWN_MS", 25, 0, 1_000) as u64)
+}
+
+fn radio_air_time_for_payload(payload_len: usize) -> Duration {
+    let framed_len = payload_len as u64 + 4;
+    let bytes = framed_len + radio_air_frame_overhead_bytes();
+    let bps = radio_air_bit_rate_bps().max(1);
+    let air_ms = ((bytes * 10 * 1_000) + bps - 1) / bps;
+    Duration::from_millis(air_ms.saturating_add(radio_tx_cooldown_ms()))
 }
 
 fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
@@ -1027,6 +1114,8 @@ fn send_while_uplink_window_open(
     follow_window_until: &mut Option<std::time::Instant>,
     follow_window_is_uplink: &mut bool,
     sent_in_current_uplink_window: &mut usize,
+    last_uplink_tx_at: &mut Option<std::time::Instant>,
+    next_uplink_tx_at: &mut Option<std::time::Instant>,
     last_send_error_log_ms: &mut u64,
     suppressed_send_errors: &mut u64,
 ) -> bool {
@@ -1076,16 +1165,27 @@ fn send_while_uplink_window_open(
                 tx_start = earliest_tx_at;
             }
         }
+        if let Some(next_tx_at) = *next_uplink_tx_at
+            && next_tx_at > tx_start
+        {
+            tx_start = next_tx_at;
+        }
         if now < tx_start {
             break;
         }
 
         let sending_command = !command_backlog.is_empty();
-        if !sending_command {
-            let latest_finish = deadline.checked_sub(uplink_tx_guard).unwrap_or(deadline);
-            if now >= latest_finish {
-                break;
-            }
+        let Some(payload) = (if sending_command {
+            command_backlog.front()
+        } else {
+            telemetry_backlog.front()
+        }) else {
+            break;
+        };
+        let air_time = radio_air_time_for_payload(payload.len());
+        let latest_finish = deadline.checked_sub(uplink_tx_guard).unwrap_or(deadline);
+        if now.checked_add(air_time).unwrap_or(now) > latest_finish {
+            break;
         }
 
         let Some(payload) = (if sending_command {
@@ -1101,6 +1201,9 @@ fn send_while_uplink_window_open(
             Ok(()) => {
                 log_radio_command_event("radio TX sent", worker_name, &payload);
                 *sent_in_current_uplink_window += 1;
+                let sent_at = std::time::Instant::now();
+                *last_uplink_tx_at = Some(sent_at);
+                *next_uplink_tx_at = Some(sent_at.checked_add(air_time).unwrap_or(sent_at));
                 sent_any = true;
                 if *suppressed_send_errors > 0 {
                     eprintln!(
