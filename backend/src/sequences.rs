@@ -2024,7 +2024,10 @@ fn read_key_enabled(state: &AppState, cfg: &SequenceConfig) -> bool {
     if cfg!(feature = "testing") {
         return true;
     }
-    if cfg!(feature = "hitl_mode") || cfg!(feature = "test_fire_mode") {
+    if cfg!(feature = "raspberry_pi")
+        || cfg!(feature = "hitl_mode")
+        || cfg!(feature = "test_fire_mode")
+    {
         return true;
     }
     if !cfg.key_required {
@@ -2045,6 +2048,12 @@ fn read_software_buttons_enabled(state: &AppState, cfg: &SequenceConfig) -> bool
     }
     if cfg!(feature = "hitl_mode") || cfg!(feature = "test_fire_mode") {
         return true;
+    }
+    if cfg!(feature = "raspberry_pi") {
+        return state
+            .gpio
+            .read_input_pin(crate::gpio_panel::ALL_BUTTONS_ENABLE_PIN)
+            .unwrap_or(false);
     }
     state
         .gpio
@@ -2089,6 +2098,7 @@ pub fn start_sequence_task(
     }
 
     if !cfg!(feature = "testing")
+        && !cfg!(feature = "raspberry_pi")
         && !cfg!(feature = "hitl_mode")
         && !cfg!(feature = "test_fire_mode")
         && let Err(err) = state.gpio.setup_input_pin(cfg.software_disable_pin)

@@ -66,9 +66,9 @@ const KALMAN_STATE_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
 const KALMAN_STATE_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
 
 #[cfg(not(feature = "testing"))]
-const BOARD_TIMEOUT_MS: u64 = 3000;
+const BOARD_TIMEOUT_MS: u64 = 12000;
 #[cfg(not(feature = "testing"))]
-const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 3000;
+const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 6000;
 const SAFETY_WARNING_COOLDOWN_MS_DEFAULT: u64 = 5_000;
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -131,6 +131,13 @@ fn is_fill_system_battery_sender(sender_id: &str) -> bool {
     matches!(
         canonical_sender_id(sender_id),
         sender if sender == Board::GatewayBoard.sender_id()
+    )
+}
+
+fn is_av_bay_board(board: Board) -> bool {
+    matches!(
+        board,
+        Board::FlightComputer | Board::RFBoard | Board::PowerBoard
     )
 }
 
@@ -275,6 +282,10 @@ pub async fn safety_task(
                 let in_flight_ignored_board = !on_ground && is_ground_board;
 
                 if offline {
+                    if is_av_bay_board(*board) {
+                        status.warned = false;
+                        continue;
+                    }
                     if !status.warned && !suppress_disconnect_warnings {
                         let msg = format!(
                             "Warning: No messages from {} in >{}ms",

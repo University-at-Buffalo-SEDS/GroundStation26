@@ -44,7 +44,7 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     })
 }
 
-#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Startup,
     FlightState::Idle,
@@ -64,7 +64,7 @@ const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Aborted,
 ];
 
-#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> FlightState {
     let idx = OPERATOR_MODE_FLIGHT_STATE_ORDER
         .iter()
@@ -75,7 +75,7 @@ fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> Flig
     OPERATOR_MODE_FLIGHT_STATE_ORDER[next_idx]
 }
 
-#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_state: FlightState) {
     state.set_local_flight_state(next_state);
 }
@@ -861,6 +861,8 @@ pub async fn telemetry_task(
                         }
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::AdvanceFlightState => {
+                            let current = *state.state.lock().unwrap();
+                            let next = operator_mode_adjacent_flight_state(current, 1);
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
@@ -873,9 +875,13 @@ pub async fn telemetry_task(
                                 }
                                 gs_debug_println!("AdvanceFlightState command sent to flight computer ({cmd_id})");
                             }
+                            set_local_flight_state_for_operator_mode(&state, next).await;
+                            gs_debug_println!("Operator-mode flight state advanced: {:?} -> {:?}", current, next);
                         }
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::RewindFlightState => {
+                            let current = *state.state.lock().unwrap();
+                            let next = operator_mode_adjacent_flight_state(current, -1);
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
@@ -888,6 +894,8 @@ pub async fn telemetry_task(
                                 }
                                 gs_debug_println!("RewindFlightState command sent to flight computer ({cmd_id})");
                             }
+                            set_local_flight_state_for_operator_mode(&state, next).await;
+                            gs_debug_println!("Operator-mode flight state rewound: {:?} -> {:?}", current, next);
                         }
                         #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
                         TelemetryCommand::AdvanceFlightState => {
@@ -3511,6 +3519,7 @@ mod tests {
     async fn advance_flight_state_command_reaches_flight_computer_command_path() {
         let (db_tx, db_rx) = mpsc::channel(8);
         let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        let mut state_rx = state.state_tx.subscribe();
         let mut policy = state.action_policy_snapshot();
         for control in policy.controls.iter_mut() {
             if control.cmd == "AdvanceFlightState" {
@@ -3560,6 +3569,31 @@ mod tests {
         })
         .await
         .expect("timed out waiting for advance flight state flight-command packet");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.local_flight_state_snapshot() == FlightState::Idle {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for local flight state advance");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let msg = state_rx
+                    .recv()
+                    .await
+                    .expect("flight state broadcast channel closed");
+                if msg.state == FlightState::Idle {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for flight state broadcast");
 
         state.request_shutdown();
         telemetry.await.expect("telemetry task join failed");
