@@ -56,6 +56,14 @@ mod real {
 
         pub fn setup_input_pin(&self, pin_number: u8) -> Result<(), Box<dyn std::error::Error>> {
             ensure_regular_gpio_pin_allowed(pin_number)?;
+            if self
+                .input_pins
+                .lock()
+                .expect("failed to get lock")
+                .contains_key(&pin_number)
+            {
+                return Ok(());
+            }
             let pin = self.gpio.get(pin_number)?.into_input();
             self.input_pins
                 .lock()
@@ -69,6 +77,14 @@ mod real {
             pin_number: u8,
         ) -> Result<(), Box<dyn std::error::Error>> {
             ensure_regular_gpio_pin_allowed(pin_number)?;
+            if self
+                .input_pins
+                .lock()
+                .expect("failed to get lock")
+                .contains_key(&pin_number)
+            {
+                return Ok(());
+            }
             let pin = self.gpio.get(pin_number)?.into_input_pulldown();
             self.input_pins
                 .lock()

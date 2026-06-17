@@ -1854,6 +1854,70 @@ mod tests {
     }
 
     #[test]
+    fn flight_command_discriminants_match_current_layout() {
+        assert_eq!(FlightComputerCommands::Launch as u8, 1);
+        assert_eq!(FlightComputerCommands::MonitorAltitude as u8, 2);
+        assert_eq!(FlightComputerCommands::RevokeMonitorAltitude as u8, 3);
+        assert_eq!(FlightComputerCommands::ConsecutiveSamples as u8, 4);
+        assert_eq!(FlightComputerCommands::RevokeConsecutiveSamples as u8, 5);
+        assert_eq!(FlightComputerCommands::ResetFailures as u8, 6);
+        assert_eq!(FlightComputerCommands::RevokeResetFailures as u8, 7);
+        assert_eq!(FlightComputerCommands::ValidateMeasms as u8, 8);
+        assert_eq!(FlightComputerCommands::RevokeValidateMeasms as u8, 9);
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    #[test]
+    fn hitl_flight_command_mapping_matches_current_layout() {
+        let cases = [
+            (
+                TelemetryCommand::DeployParachute,
+                FlightComputerCommands::DeployParachute as u8,
+            ),
+            (
+                TelemetryCommand::ExpandParachute,
+                FlightComputerCommands::ExpandParachute as u8,
+            ),
+            (
+                TelemetryCommand::EvaluationRelax,
+                FlightComputerCommands::EvaluationRelax as u8,
+            ),
+            (
+                TelemetryCommand::EvaluationFocus,
+                FlightComputerCommands::EvaluationFocus as u8,
+            ),
+            (
+                TelemetryCommand::EvaluationAbort,
+                FlightComputerCommands::EvaluationAbort as u8,
+            ),
+            (
+                TelemetryCommand::ReinitSensors,
+                FlightComputerCommands::ReinitSensors as u8,
+            ),
+            (
+                TelemetryCommand::ReinitBarometer,
+                FlightComputerCommands::ReinitBarometer as u8,
+            ),
+            (
+                TelemetryCommand::EnableIMU,
+                FlightComputerCommands::EnableIMU as u8,
+            ),
+            (
+                TelemetryCommand::DisableIMU,
+                FlightComputerCommands::DisableIMU as u8,
+            ),
+            (
+                TelemetryCommand::AbortAfter40,
+                FlightComputerCommands::AbortAfter40 as u8,
+            ),
+        ];
+
+        for (telemetry_cmd, expected_id) in cases {
+            assert_eq!(hitl_flight_command_id(&telemetry_cmd), Some(expected_id));
+        }
+    }
+
+    #[test]
     fn rocket_drop_filter_matches_fill_system_commands_only() {
         let actuator_pkt = Packet::new(
             DataType::ActuatorCommand,
