@@ -735,7 +735,7 @@ impl FlightSimState {
             | TelemetryCommand::RevokeVigilantMode
             | TelemetryCommand::MeasmReports
             | TelemetryCommand::RevokeMeasmReports
-            | TelemetryCommand::VelocityChecks 
+            | TelemetryCommand::VelocityChecks
             | TelemetryCommand::RevokeVelocityChecks => {
                 // Flight-computer commands are backend-forwarded and do not affect fill simulation.
             }
@@ -765,7 +765,7 @@ impl FlightSimState {
             | TelemetryCommand::RevokeResetFailures
             | TelemetryCommand::MeasmReports
             | TelemetryCommand::RevokeMeasmReports
-            | TelemetryCommand::VelocityChecks 
+            | TelemetryCommand::VelocityChecks
             | TelemetryCommand::RevokeVelocityChecks
             | TelemetryCommand::AbortAfter40
             | TelemetryCommand::AbortAfter70

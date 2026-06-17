@@ -35,7 +35,7 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
         TelemetryCommand::EvaluationAbort => FlightComputerCommands::EvaluationAbort as u8,
         TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
         TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
-        TelemetryCommand::EnableIMU => FlightComputerCommands::EnableIMU as u8,
+        TelemetryCommand::EnableIMU => FlightComputerCommands::ReinitIMU as u8,
         TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
         TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
         _ => return None,
@@ -3089,7 +3089,7 @@ mod tests {
             &[DataEndpoint::FlightController],
             Board::GroundStation.sender_id(),
             123,
-            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+            Arc::from([FlightComputerCommands::VigilantMode as u8]),
         )
         .expect("failed to build flight command packet");
         let wire = serialize::serialize_packet(&pkt).to_vec();
