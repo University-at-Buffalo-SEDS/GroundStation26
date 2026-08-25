@@ -99,7 +99,10 @@ def maybe_preview(data: bytes, limit: int) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Own a UART, receive aggressively, optionally transmit on quiet windows."
+        description=(
+            "Own a UART and test direct duplex traffic without the RF-board scheduler. "
+            "Optional transmissions are timed from UART inactivity only."
+        )
     )
     parser.add_argument("--port", default="/dev/ttyAMA0")
     parser.add_argument("--baud", type=int, default=9600)
@@ -119,7 +122,7 @@ def main() -> int:
         "--tx-quiet-ms",
         type=int,
         default=150,
-        help="only transmit if no RX bytes arrived for this long",
+        help="only transmit after this much UART inactivity (not a scheduler window)",
     )
     parser.add_argument(
         "--print-frames",
@@ -155,7 +158,7 @@ def main() -> int:
         tx_count = 0
 
         print(
-            f"listening on {args.port} @ {args.baud}; duration={args.duration}s"
+            f"listening on {args.port} @ {args.baud}; duration={args.duration}s; scheduler=disabled"
             + ("; tx enabled" if tx_bytes and not args.rx_only else "; rx only")
         )
 
