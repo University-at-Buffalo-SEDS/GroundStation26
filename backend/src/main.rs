@@ -268,6 +268,10 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The RF-board link needs scheduled uplink/downlink windows. An RFD900x is a
+    // transparent serial link, so set this to false when using one.
+    let radio_scheduler_enabled = false;
+
     logger::init()?;
     log::info!(
         "groundstation backend starting features testing={} hitl_mode={} test_fire_mode={}",
@@ -630,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
                 tx_rx: rocket_rx,
                 legacy_single_worker: false,
                 prioritize_rx: false,
-                dedicated_radio_io: true,
+                dedicated_radio_io: radio_scheduler_enabled,
             },
             CommsWorkerHandle {
                 name: "umbilical_comms",
