@@ -118,7 +118,7 @@ def main() -> int:
         )
     )
     parser.add_argument("--port", default="/dev/ttyAMA0")
-    parser.add_argument("--baud", type=int, default=9600)
+    parser.add_argument("--baud", type=int, default=57600)
     parser.add_argument("--duration", type=float, default=15.0)
     parser.add_argument("--read-chunk", type=int, default=512)
     parser.add_argument("--preview-bytes", type=int, default=32)

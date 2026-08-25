@@ -109,7 +109,7 @@ def main() -> int:
         )
     )
     parser.add_argument("--port", default="/dev/ttyAMA0")
-    parser.add_argument("--baud", type=int, default=9600)
+    parser.add_argument("--baud", type=int, default=57600)
     parser.add_argument(
         "--frame-type",
         choices=("command", "data", "ascii"),

@@ -164,7 +164,7 @@ def load_av_bay_serial_config(path: Path) -> dict[str, object]:
         raise SystemExit(f"av_bay protocol must be raw_uart for the radio driver, got {protocol!r}")
     return {
         "port": av_bay.get("port", "/dev/ttyAMA0"),
-        "baud_rate": int(av_bay.get("baud_rate", 9600)),
+        "baud_rate": int(av_bay.get("baud_rate", 57600)),
     }
 
 

@@ -107,7 +107,7 @@ fn default_baud_rate() -> usize {
 }
 
 fn default_av_bay_baud_rate() -> usize {
-    9_600
+    57_600
 }
 
 fn default_serial_protocol() -> SerialProtocol {
@@ -355,7 +355,7 @@ mod tests {
             CommsLinkConfig::Serial {
                 serial: SerialLinkConfig {
                     port: "/dev/ttyAMA0".to_string(),
-                    baud_rate: 9_600,
+                    baud_rate: 57_600,
                     protocol: SerialProtocol::RawUart,
                 },
             }
@@ -386,7 +386,7 @@ mod tests {
             | CommsLinkConfig::RaspberryPiGpioUart { serial }
             | CommsLinkConfig::CustomSerial { serial } => {
                 assert_eq!(serial.port, "/dev/ttyAMA0");
-                assert_eq!(serial.baud_rate, 9_600);
+                assert_eq!(serial.baud_rate, 57_600);
                 assert_eq!(serial.protocol, SerialProtocol::RawUart);
             }
             other => panic!("RF-board av_bay link must be serial raw_uart, got {other:?}"),
