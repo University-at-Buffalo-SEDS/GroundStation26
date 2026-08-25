@@ -11,7 +11,19 @@ import time
 
 SYNC_0 = 0xA5
 SYNC_1 = 0x5A
+COMMAND_SYNC_0 = 0xA6
+COMMAND_SYNC_1 = 0x5B
+ASCII_SYNC_0 = 0xA7
+ASCII_SYNC_1 = 0x7A
 RAW_HEADER_SIZE = 4
+FRAME_KINDS = {
+    (SYNC_0, SYNC_1): "data",
+    (SYNC_1, SYNC_0): "data",
+    (COMMAND_SYNC_0, COMMAND_SYNC_1): "command",
+    (COMMAND_SYNC_1, COMMAND_SYNC_0): "command",
+    (ASCII_SYNC_0, ASCII_SYNC_1): "ascii",
+}
+SYNC_FIRST_BYTES = {pair[0] for pair in FRAME_KINDS}
 
 
 def configure_raw_serial(fd: int, baud: int) -> None:
@@ -63,16 +75,16 @@ def build_frame(payload: bytes) -> bytes:
     return bytes((SYNC_0, SYNC_1)) + len(payload).to_bytes(2, "little") + payload
 
 
-def extract_frames(buffer: bytearray) -> list[bytes]:
-    out: list[bytes] = []
+def extract_frames(buffer: bytearray) -> list[tuple[str, bytes]]:
+    out: list[tuple[str, bytes]] = []
     while True:
         sync_pos = -1
         for idx in range(max(0, len(buffer) - 1)):
-            if buffer[idx] == SYNC_0 and buffer[idx + 1] == SYNC_1:
+            if (buffer[idx], buffer[idx + 1]) in FRAME_KINDS:
                 sync_pos = idx
                 break
         if sync_pos < 0:
-            if buffer and buffer[-1] == SYNC_0:
+            if buffer and buffer[-1] in SYNC_FIRST_BYTES:
                 del buffer[:-1]
             else:
                 buffer.clear()
@@ -81,6 +93,7 @@ def extract_frames(buffer: bytearray) -> list[bytes]:
             del buffer[:sync_pos]
         if len(buffer) < RAW_HEADER_SIZE:
             break
+        frame_kind = FRAME_KINDS[(buffer[0], buffer[1])]
         payload_len = int.from_bytes(buffer[2:4], "little")
         total_len = RAW_HEADER_SIZE + payload_len
         if payload_len == 0:
@@ -88,7 +101,7 @@ def extract_frames(buffer: bytearray) -> list[bytes]:
             continue
         if len(buffer) < total_len:
             break
-        out.append(bytes(buffer[RAW_HEADER_SIZE:total_len]))
+        out.append((frame_kind, bytes(buffer[RAW_HEADER_SIZE:total_len])))
         del buffer[:total_len]
     return out
 
@@ -127,7 +140,12 @@ def main() -> int:
     parser.add_argument(
         "--print-frames",
         action="store_true",
-        help="print each extracted raw-uart frame payload preview",
+        help="print each extracted data, command, or ASCII frame payload preview",
+    )
+    parser.add_argument(
+        "--print-raw",
+        action="store_true",
+        help="print each raw UART read before frame parsing",
     )
     parser.add_argument(
         "--rx-only",
@@ -155,6 +173,7 @@ def main() -> int:
         rx_buffer = bytearray()
         rx_bytes = 0
         rx_frames = 0
+        rx_frame_kinds = {"data": 0, "command": 0, "ascii": 0}
         tx_count = 0
 
         print(
@@ -174,13 +193,20 @@ def main() -> int:
                 if chunk:
                     last_rx_time = now
                     rx_bytes += len(chunk)
+                    if args.print_raw:
+                        print(
+                            f"rx raw len={len(chunk)} preview={maybe_preview(chunk, args.preview_bytes)}"
+                        )
                     rx_buffer.extend(chunk)
                     frames = extract_frames(rx_buffer)
                     rx_frames += len(frames)
+                    for frame_kind, _ in frames:
+                        rx_frame_kinds[frame_kind] += 1
                     if args.print_frames:
-                        for frame in frames:
+                        for frame_kind, frame in frames:
                             print(
-                                f"rx frame len={len(frame)} preview={maybe_preview(frame, args.preview_bytes)}"
+                                f"rx {frame_kind} frame len={len(frame)} "
+                                f"preview={maybe_preview(frame, args.preview_bytes)}"
                             )
 
             should_tx = (
@@ -198,12 +224,14 @@ def main() -> int:
             if now - last_stats_time >= 1.0:
                 print(
                     f"stats rx_bytes={rx_bytes} rx_frames={rx_frames} tx_count={tx_count} "
+                    f"frame_kinds={rx_frame_kinds} "
                     f"idle_ms={(now - last_rx_time) * 1000.0:.0f} buffered={len(rx_buffer)}"
                 )
                 last_stats_time = now
 
         print(
-            f"done rx_bytes={rx_bytes} rx_frames={rx_frames} tx_count={tx_count} buffered={len(rx_buffer)}"
+            f"done rx_bytes={rx_bytes} rx_frames={rx_frames} tx_count={tx_count} "
+            f"frame_kinds={rx_frame_kinds} buffered={len(rx_buffer)}"
         )
         return 0
     finally:
