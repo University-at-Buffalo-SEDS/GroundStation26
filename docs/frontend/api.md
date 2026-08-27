@@ -346,6 +346,36 @@ Frontend expectations:
 - `generated_ms` is the backend time the snapshot was created.
 - Node `kind`, `status`, `group`, `sender_id`, and `detail` are rendered directly.
 
+### Firmware OTA endpoints
+
+Firmware updates use the LaunchCore delta protocol over a routed SEDSnet v4 P2P stream. They require a session with
+`send_commands`; a restricted command allowlist must also include `FirmwareUpdate`. Read-only status endpoints require
+`view_data`. Only one update may be active at a time.
+
+- `GET /api/firmware/targets` lists `FC`, `RF`, `PB`, `VB`, `GB`, `AB`, and `DAQ`, including whether each hostname is
+  currently present in the SEDSnet address book.
+- `POST /api/firmware/flash/{board}` accepts the raw delta artifact as the request body and returns `202 Accepted` with
+  a job object. Set `Content-Type: application/octet-stream` and optionally `X-Firmware-Filename`.
+- `GET /api/firmware/updates` returns recent jobs.
+- `GET /api/firmware/updates/{id}` returns progress for one job.
+- `POST /api/firmware/updates/{id}/cancel` aborts an active transfer and resets its stream.
+
+Example:
+
+```sh
+curl -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/octet-stream" \
+  -H "X-Firmware-Filename: ActuationBoard.delta" \
+  --data-binary @ActuationBoard.delta \
+  http://localhost:3000/api/firmware/flash/AB
+```
+
+The returned `phase` progresses through `queued`, `connecting`, `beginning`, `transferring`, `finishing`, `rebooting`,
+and `completed`, or ends as `failed`/`cancelled`. `bytes_sent`, `total_bytes`, `progress_percent`, `board_max_bytes`, and
+`message` provide operator feedback. A completed job means the board accepted the artifact and requested its LaunchCore
+reboot; boot confirmation happens on the board after restart.
+
 ### `GET /api/notifications`
 
 Purpose:

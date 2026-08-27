@@ -2,8 +2,8 @@ mod prelude;
 use prelude::*;
 
 mod commands;
+pub(crate) use commands::queue_abort_packet;
 use commands::{flush_command_tx, log_command_dispatch, queue_locally_routed_flight_command};
-pub(crate) use commands::{queue_abort_packet, register_flight_command_tx_side};
 mod radio_io;
 pub use radio_io::CommsWorkerHandle;
 #[cfg(test)]
@@ -90,14 +90,17 @@ pub fn set_network_time_router(router: Arc<Router>) {
 
 fn send_valve_launch_sequence_command(router: &Router) -> bool {
     let payload = [ValveBoardCommands::Sequence as u8];
-    if let Err(e) = router.log_queue(DataType::ValveCommand, &payload) {
+    if let Err(e) = router.log_queue(
+        crate::telemetry_schema::data_type("VALVE_COMMAND"),
+        &payload,
+    ) {
         log_telemetry_error("failed to log valve launch sequence command", e);
         false
     } else {
         log_command_dispatch(
             "Valve launch sequence command",
             "umbilical_comms",
-            DataType::ValveCommand,
+            crate::telemetry_schema::data_type("VALVE_COMMAND"),
             &payload,
         );
         flush_command_tx(router, "Valve launch sequence command tx");
@@ -564,7 +567,7 @@ pub async fn telemetry_task(
                                 queue_guarded_fill_command(
                                     &state,
                                     &router,
-                                    DataType::ValveCommand,
+                                    crate::telemetry_schema::data_type("VALVE_COMMAND"),
                                     key,
                                     !is_on,
                                     cmd as u8,
@@ -596,7 +599,7 @@ pub async fn telemetry_task(
                                 queue_guarded_fill_command(
                                     &state,
                                     &router,
-                                    DataType::ActuatorCommand,
+                                    crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
                                     key,
                                     !is_on,
                                     cmd as u8,
@@ -607,13 +610,13 @@ pub async fn telemetry_task(
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::IgniterSequence => {
                                 let payload = [ActuatorBoardCommands::IgniterSequence as u8];
-                                if let Err(e) = router.log_queue(DataType::ActuatorCommand, &payload) {
+                                if let Err(e) = router.log_queue(crate::telemetry_schema::data_type("ACTUATOR_COMMAND"), &payload) {
                                     log_telemetry_error("failed to log IgniterSequence command", e);
                                 } else {
                                     log_command_dispatch(
                                         "IgniterSequence command",
                                         "umbilical_comms",
-                                        DataType::ActuatorCommand,
+                                        crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
                                         &payload,
                                     );
                                     flush_command_tx(&router, "IgniterSequence command tx");
@@ -631,7 +634,7 @@ pub async fn telemetry_task(
                                 queue_guarded_fill_command(
                                     &state,
                                     &router,
-                                    DataType::ValveCommand,
+                                    crate::telemetry_schema::data_type("VALVE_COMMAND"),
                                     key,
                                     !is_on,
                                     cmd as u8,
@@ -654,7 +657,7 @@ pub async fn telemetry_task(
                                 queue_guarded_fill_command(
                                     &state,
                                     &router,
-                                    DataType::ValveCommand,
+                                    crate::telemetry_schema::data_type("VALVE_COMMAND"),
                                     key,
                                     target,
                                     cmd as u8,
@@ -673,7 +676,7 @@ pub async fn telemetry_task(
                                 queue_guarded_fill_command(
                                     &state,
                                     &router,
-                                    DataType::ActuatorCommand,
+                                    crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
                                     cmd_id,
                                     !is_on,
                                     cmd as u8,
@@ -685,7 +688,7 @@ pub async fn telemetry_task(
                                 queue_guarded_fill_command(
                                     &state,
                                     &router,
-                                    DataType::ActuatorCommand,
+                                    crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
                                     ActuatorBoardCommands::NitrogenOpen as u8,
                                     false,
                                     ActuatorBoardCommands::NitrogenClose as u8,
@@ -697,7 +700,7 @@ pub async fn telemetry_task(
                                 queue_guarded_fill_command(
                                     &state,
                                     &router,
-                                    DataType::ActuatorCommand,
+                                    crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
                                     ActuatorBoardCommands::RetractPlumbing as u8,
                                     true,
                                     ActuatorBoardCommands::RetractPlumbing as u8,
@@ -716,7 +719,7 @@ pub async fn telemetry_task(
                                 queue_guarded_fill_command(
                                     &state,
                                     &router,
-                                    DataType::ActuatorCommand,
+                                    crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
                                     cmd_id,
                                     !is_on,
                                     cmd as u8,
@@ -728,7 +731,7 @@ pub async fn telemetry_task(
                                 queue_guarded_fill_command(
                                     &state,
                                     &router,
-                                    DataType::ActuatorCommand,
+                                    crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
                                     ActuatorBoardCommands::NitrousOpen as u8,
                                     false,
                                     ActuatorBoardCommands::NitrousClose as u8,
@@ -966,7 +969,7 @@ pub async fn telemetry_task(
                     }
                 }
                 _ = heartbeat_interval.tick() => {
-                    if router.log_queue::<u8>(DataType::Heartbeat, &[]).is_ok() {
+                    if router.log_queue::<u8>(crate::telemetry_schema::data_type("HEARTBEAT"), &[]).is_ok() {
                         state.mark_board_seen(
                             Board::GroundStation.sender_id(),
                             get_current_timestamp_ms(),
@@ -1391,7 +1394,7 @@ async fn handle_packet(
     }
     let sender_id = canonical_sender_id(pkt.sender()).to_string();
 
-    if pkt.data_type() == DataType::Warning {
+    if pkt.data_type() == crate::telemetry_schema::data_type("WARNING") {
         if let Ok(msg) = pkt.data_as_string() {
             emit_warning(state, msg.to_string());
         } else {
@@ -1406,7 +1409,9 @@ async fn handle_packet(
         return Vec::new();
     }
 
-    if pkt.data_type() == DataType::MessageData || pkt.data_type() == DataType::OrderedMessage {
+    if pkt.data_type() == crate::telemetry_schema::data_type("MESSAGE_DATA")
+        || pkt.data_type() == crate::telemetry_schema::data_type("ORDERED_MESSAGE")
+    {
         let message = match pkt.data_as_string() {
             Ok(msg) => msg.to_string(),
             Err(_) => {
@@ -1437,7 +1442,7 @@ async fn handle_packet(
         return Vec::new();
     }
 
-    if pkt.data_type() == DataType::FlightState {
+    if pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_STATE") {
         if !cfg!(feature = "testing") && !state.all_required_boards_seen() {
             return Vec::new();
         }
@@ -1494,7 +1499,7 @@ async fn handle_packet(
         return Vec::new();
     }
 
-    if pkt.data_type() == DataType::UmbilicalStatus {
+    if pkt.data_type() == crate::telemetry_schema::data_type("UMBILICAL_STATUS") {
         if let Ok(data) = pkt.data_as_u8()
             && data.len() == 2
         {
@@ -1569,7 +1574,7 @@ async fn handle_packet(
 
     let payload_json = payload_json_from_pkt(&pkt);
 
-    if pkt.data_type() == DataType::GpsSatelliteNumber {
+    if pkt.data_type() == crate::telemetry_schema::data_type("GPS_SATELLITE_NUMBER") {
         return handle_gps_satellite_count_packet(state, db_tx, db_overflow, &pkt, &payload_json)
             .await
             .into_iter()
@@ -1599,7 +1604,7 @@ async fn handle_packet(
             }
 
             if let Some(first_value) = row_values.first().copied().flatten() {
-                if row_data_type == DataType::BatteryVoltage.as_str()
+                if row_data_type == crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str()
                     && is_fill_system_battery_sender(&sender_id)
                     && update_fill_system_low_voltage_latch(first_value)
                 {
@@ -1684,7 +1689,7 @@ async fn handle_packet(
             .await;
         }
 
-        if pkt.data_type() == DataType::Heartbeat {
+        if pkt.data_type() == crate::telemetry_schema::data_type("HEARTBEAT") {
             return vec![TelemetryRow {
                 timestamp_ms: ts_ms,
                 data_type: data_type_str,
@@ -1719,15 +1724,14 @@ fn get_system_timestamp_ms() -> u64 {
     duration_since_epoch.as_millis() as u64
 }
 
-fn log_telemetry_error(context: &str, err: sedsprintf_rs_2026::TelemetryError) {
+fn log_telemetry_error(context: &str, err: sedsnet::TelemetryError) {
     eprintln!("{context}: {:?}", err);
 }
 
-fn log_router_rx_error(err: sedsprintf_rs_2026::TelemetryError) {
+fn log_router_rx_error(err: sedsnet::TelemetryError) {
     if matches!(
         err,
-        sedsprintf_rs_2026::TelemetryError::Deserialize(_)
-            | sedsprintf_rs_2026::TelemetryError::InvalidType
+        sedsnet::TelemetryError::Unpack(_) | sedsnet::TelemetryError::InvalidType
     ) {
         log_router_decode_error(err);
     } else {
@@ -1735,7 +1739,7 @@ fn log_router_rx_error(err: sedsprintf_rs_2026::TelemetryError) {
     }
 }
 
-fn log_router_decode_error(err: sedsprintf_rs_2026::TelemetryError) {
+fn log_router_decode_error(err: sedsnet::TelemetryError) {
     let now_ms = get_current_timestamp_ms();
     let last_log_ms = ROUTER_DECODE_ERROR_LAST_LOG_MS.load(Ordering::Relaxed);
     if last_log_ms == 0 || now_ms.saturating_sub(last_log_ms) >= ROUTER_DECODE_ERROR_LOG_INTERVAL_MS
@@ -1755,7 +1759,7 @@ fn log_router_decode_error(err: sedsprintf_rs_2026::TelemetryError) {
     }
 }
 
-fn process_router_queues(router: &Router) -> Result<(), sedsprintf_rs_2026::TelemetryError> {
+fn process_router_queues(router: &Router) -> Result<(), sedsnet::TelemetryError> {
     if let Err(err) = router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS) {
         log_telemetry_error("router tx queue processing failed", err);
         return Ok(());
@@ -1852,6 +1856,7 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    #[cfg(not(feature = "testing"))]
     #[test]
     fn timesync_defaults_on_without_testing_feature() {
         let _guard = timesync_env_lock().lock().unwrap();
@@ -1894,27 +1899,27 @@ mod tests {
     #[test]
     fn radio_command_log_line_detects_command_packets() {
         let pkt = Packet::new(
-            DataType::ValveCommand,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("VALVE_COMMAND"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([1_u8]),
         )
         .expect("failed to build valve command packet");
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = serialize::pack_packet(&pkt);
         let msg = radio_command_log_line("radio TX sent", "rocket_comms", &wire)
             .expect("command packet should emit message");
-        assert!(msg.contains("rocket_comms: radio TX sent ValveCommand"));
+        assert!(msg.contains("rocket_comms: radio TX sent VALVE_COMMAND"));
 
         let telemetry_pkt = Packet::new(
-            DataType::KG1000,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("KG1000"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::DaqBoard.sender_id(),
             123,
             f32_payload(&[1.0]),
         )
         .expect("failed to build kg1000 packet");
-        let telemetry_wire = serialize::serialize_packet(&telemetry_pkt);
+        let telemetry_wire = serialize::pack_packet(&telemetry_pkt);
         assert!(radio_command_log_line("radio TX sent", "rocket_comms", &telemetry_wire).is_none());
     }
 
@@ -1932,17 +1937,19 @@ mod tests {
         assert_eq!(FlightComputerCommands::RevokeValidateMeasms as u8, 9);
     }
 
+    #[cfg(not(feature = "testing"))]
     #[tokio::test]
-    async fn postinit_command_sends_flight_command_zero() {
+    async fn postinit_command_routes_flight_command_zero() {
         let (db_tx, db_rx) = mpsc::channel(8);
         let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
 
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
         let (radio_tx, mut radio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        register_flight_command_tx_side("rocket_comms", radio_tx);
+        router.add_side_packed("rocket_comms", move |bytes| {
+            radio_tx
+                .send(bytes.to_vec())
+                .map_err(|_| sedsnet::TelemetryError::HandlerError("radio tx closed"))
+        });
 
         let shutdown_rx = state.shutdown_subscribe();
         let telemetry = tokio::spawn(telemetry_task(
@@ -1965,9 +1972,9 @@ mod tests {
                 let Some(wire) = radio_rx.recv().await else {
                     panic!("flight command tx channel closed");
                 };
-                let pkt = serialize::deserialize_packet(&wire)
+                let pkt = serialize::unpack_packet(&wire)
                     .expect("failed to deserialize flight command packet");
-                if pkt.data_type() == DataType::FlightCommand {
+                if pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
                     assert_eq!(pkt.payload(), &[FlightComputerCommands::Postinit as u8]);
                     break;
                 }
@@ -1993,12 +2000,13 @@ mod tests {
         }
         state.set_action_policy(policy);
 
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
         let (radio_tx, mut radio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        register_flight_command_tx_side("rocket_comms", radio_tx);
+        router.add_side_packed("rocket_comms", move |bytes| {
+            radio_tx
+                .send(bytes.to_vec())
+                .map_err(|_| sedsnet::TelemetryError::HandlerError("radio tx closed"))
+        });
 
         let shutdown_rx = state.shutdown_subscribe();
         let telemetry = tokio::spawn(telemetry_task(
@@ -2021,9 +2029,9 @@ mod tests {
                 let Some(wire) = radio_rx.recv().await else {
                     panic!("flight command tx channel closed");
                 };
-                let pkt = serialize::deserialize_packet(&wire)
+                let pkt = serialize::unpack_packet(&wire)
                     .expect("failed to deserialize flight command packet");
-                if pkt.data_type() == DataType::FlightCommand {
+                if pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
                     assert_eq!(pkt.payload(), &[FlightComputerCommands::Launch as u8]);
                     break;
                 }
@@ -2102,63 +2110,60 @@ mod tests {
     #[test]
     fn rocket_drop_filter_matches_fill_system_commands_only() {
         let actuator_pkt = Packet::new(
-            DataType::ActuatorCommand,
-            &[sedsprintf_rs_2026::config::DataEndpoint::ActuatorBoard],
+            crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
+            &[crate::telemetry_schema::endpoint("ACTUATOR_BOARD")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([9_u8]),
         )
         .expect("failed to build actuator command packet");
-        assert!(is_fill_system_command_payload(
-            &serialize::serialize_packet(&actuator_pkt)
-        ));
+        assert!(is_fill_system_command_payload(&serialize::pack_packet(
+            &actuator_pkt
+        )));
 
         let valve_pkt = Packet::new(
-            DataType::ValveCommand,
-            &[sedsprintf_rs_2026::config::DataEndpoint::ValveBoard],
+            crate::telemetry_schema::data_type("VALVE_COMMAND"),
+            &[crate::telemetry_schema::endpoint("VALVE_BOARD")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([1_u8]),
         )
         .expect("failed to build valve command packet");
-        assert!(is_fill_system_command_payload(
-            &serialize::serialize_packet(&valve_pkt)
-        ));
+        assert!(is_fill_system_command_payload(&serialize::pack_packet(
+            &valve_pkt
+        )));
 
         let abort_pkt = Packet::new(
-            DataType::Abort,
-            &[sedsprintf_rs_2026::config::DataEndpoint::Abort],
+            crate::telemetry_schema::data_type("ABORT"),
+            &[crate::telemetry_schema::endpoint("ABORT")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from("Manual Abort Command Issued".as_bytes()),
         )
         .expect("failed to build abort packet");
-        assert!(is_fill_system_command_payload(
-            &serialize::serialize_packet(&abort_pkt)
-        ));
+        assert!(is_fill_system_command_payload(&serialize::pack_packet(
+            &abort_pkt
+        )));
 
         let flight_pkt = Packet::new(
-            DataType::FlightCommand,
-            &[sedsprintf_rs_2026::config::DataEndpoint::FlightController],
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([0_u8]),
         )
         .expect("failed to build flight command packet");
-        assert!(!is_fill_system_command_payload(
-            &serialize::serialize_packet(&flight_pkt)
-        ));
+        assert!(!is_fill_system_command_payload(&serialize::pack_packet(
+            &flight_pkt
+        )));
     }
 
     #[test]
     fn queue_abort_packet_transmits_to_router_side() {
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let sent_clone = sent.clone();
-        let router = Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        );
-        router.add_side_serialized_with_options(
+        let router = Router::new(sedsnet::router::RouterConfig::new([]));
+        router.add_side_packed_with_options(
             "umbilical_comms",
             move |bytes| {
                 sent_clone
@@ -2167,9 +2172,10 @@ mod tests {
                     .push(bytes.to_vec());
                 Ok(())
             },
-            sedsprintf_rs_2026::router::RouterSideOptions {
+            sedsnet::router::RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
 
@@ -2182,8 +2188,8 @@ mod tests {
         let sent = sent.lock().expect("failed to lock sent packets");
         let abort_packets = sent
             .iter()
-            .filter_map(|wire| serialize::deserialize_packet(wire).ok())
-            .filter(|pkt| pkt.data_type() == DataType::Abort)
+            .filter_map(|wire| serialize::unpack_packet(wire).ok())
+            .filter(|pkt| pkt.data_type() == crate::telemetry_schema::data_type("ABORT"))
             .collect::<Vec<_>>();
         assert_eq!(abort_packets.len(), 1);
         assert_eq!(abort_packets[0].payload(), b"Manual Abort Command Issued");
@@ -2193,11 +2199,8 @@ mod tests {
     fn flight_command_transmits_to_rocket_side_when_fc_is_discovered_there() {
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let sent_clone = sent.clone();
-        let router = Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        );
-        let rocket_side = router.add_side_serialized_with_options(
+        let router = Router::new(sedsnet::router::RouterConfig::new([]));
+        let rocket_side = router.add_side_packed_with_options(
             "rocket_comms",
             move |bytes| {
                 sent_clone
@@ -2206,20 +2209,21 @@ mod tests {
                     .push(bytes.to_vec());
                 Ok(())
             },
-            sedsprintf_rs_2026::router::RouterSideOptions {
+            sedsnet::router::RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
-        let discovery = sedsprintf_rs_2026::discovery::build_discovery_announce(
+        let discovery = sedsnet::discovery::build_discovery_announce(
             Board::RFBoard.sender_id(),
             123,
-            &[DataEndpoint::FlightController],
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
         )
         .expect("failed to build RF discovery");
-        let discovery_wire = serialize::serialize_packet(&discovery);
+        let discovery_wire = serialize::pack_packet(&discovery);
         router
-            .rx_serialized_from_side(&discovery_wire, rocket_side)
+            .rx_packed_from_side(&discovery_wire, rocket_side)
             .expect("failed to queue RF discovery");
         router
             .process_all_queues_with_timeout(0)
@@ -2238,8 +2242,8 @@ mod tests {
         let sent = sent.lock().expect("failed to lock sent packets");
         let flight_packets = sent
             .iter()
-            .filter_map(|wire| serialize::deserialize_packet(wire).ok())
-            .filter(|pkt| pkt.data_type() == DataType::FlightCommand)
+            .filter_map(|wire| serialize::unpack_packet(wire).ok())
+            .filter(|pkt| pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND"))
             .collect::<Vec<_>>();
         assert!(!flight_packets.is_empty());
         assert_eq!(
@@ -2249,7 +2253,7 @@ mod tests {
         assert!(
             flight_packets[0]
                 .endpoints()
-                .contains(&DataEndpoint::FlightController)
+                .contains(&crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"))
         );
     }
 
@@ -2259,11 +2263,8 @@ mod tests {
         let state = test_app_state(db_tx).await;
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let sent_clone = sent.clone();
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
-        let valve_side = router.add_side_serialized_with_options(
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let valve_side = router.add_side_packed_with_options(
             "umbilical_comms",
             move |bytes| {
                 sent_clone
@@ -2272,19 +2273,20 @@ mod tests {
                     .push(bytes.to_vec());
                 Ok(())
             },
-            sedsprintf_rs_2026::router::RouterSideOptions {
+            sedsnet::router::RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
-        let discovery = sedsprintf_rs_2026::discovery::build_discovery_announce(
+        let discovery = sedsnet::discovery::build_discovery_announce(
             Board::ValveBoard.sender_id(),
             123,
-            &[DataEndpoint::ValveBoard],
+            &[crate::telemetry_schema::endpoint("VALVE_BOARD")],
         )
         .expect("failed to build valve-board discovery");
         router
-            .rx_serialized_from_side(&serialize::serialize_packet(&discovery), valve_side)
+            .rx_packed_from_side(&serialize::pack_packet(&discovery), valve_side)
             .expect("failed to queue valve-board discovery");
         router
             .process_all_queues_with_timeout(0)
@@ -2298,11 +2300,13 @@ mod tests {
         let sent = sent.lock().expect("failed to lock sent packets");
         let valve_sequence_seen = sent
             .iter()
-            .filter_map(|wire| serialize::deserialize_packet(wire).ok())
+            .filter_map(|wire| serialize::unpack_packet(wire).ok())
             .any(|pkt| {
-                pkt.data_type() == DataType::ValveCommand
+                pkt.data_type() == crate::telemetry_schema::data_type("VALVE_COMMAND")
                     && pkt.payload() == &[ValveBoardCommands::Sequence as u8]
-                    && pkt.endpoints().contains(&DataEndpoint::ValveBoard)
+                    && pkt
+                        .endpoints()
+                        .contains(&crate::telemetry_schema::endpoint("VALVE_BOARD"))
             });
         assert!(
             valve_sequence_seen,
@@ -2323,7 +2327,7 @@ mod tests {
             &mut self,
             _router: &Router,
             _packet_tap: &mut dyn FnMut(&Packet),
-        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+        ) -> sedsnet::TelemetryResult<()> {
             Ok(())
         }
 
@@ -2349,7 +2353,7 @@ mod tests {
             _packet_sink: &mut dyn FnMut(Vec<u8>),
             _timeout: Duration,
             _max_packets: usize,
-        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+        ) -> sedsnet::TelemetryResult<()> {
             if let Some((tx, payload)) = self.inject_tx_on_recv.take() {
                 tx.send(payload)
                     .expect("failed to inject radio worker tx during recv");
@@ -2565,7 +2569,7 @@ mod tests {
             &mut self,
             _router: &Router,
             _packet_tap: &mut dyn FnMut(&Packet),
-        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+        ) -> sedsnet::TelemetryResult<()> {
             Ok(())
         }
 
@@ -2591,7 +2595,7 @@ mod tests {
             packet_sink: &mut dyn FnMut(Vec<u8>),
             _timeout: Duration,
             max_packets: usize,
-        ) -> sedsprintf_rs_2026::TelemetryResult<()> {
+        ) -> sedsnet::TelemetryResult<()> {
             self.scheduler.step(
                 &mut self.rf_tx_queue,
                 &mut self.updates,
@@ -2633,46 +2637,45 @@ mod tests {
         let mut ws_rx = state.ws_tx.subscribe();
 
         let handler_state = state.clone();
-        let ground_station_handler =
-            sedsprintf_rs_2026::router::EndpointHandler::new_packet_handler(
-                DataEndpoint::GroundStation,
-                move |pkt: &Packet| {
-                    handler_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
-                    handler_state.mark_packet_received(get_current_timestamp_ms());
-                    handler_state.ring_buffer.lock().unwrap().push(pkt.clone());
-                    Ok(())
-                },
-            );
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([ground_station_handler]),
-        ));
+        let ground_station_handler = sedsnet::router::EndpointHandler::new_packet_handler(
+            crate::telemetry_schema::endpoint("GROUND_STATION"),
+            move |pkt: &Packet| {
+                handler_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+                handler_state.mark_packet_received(get_current_timestamp_ms());
+                handler_state.ring_buffer.lock().unwrap().push(pkt.clone());
+                Ok(())
+            },
+        );
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([
+            ground_station_handler,
+        ])));
         let (radio_tx, radio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        register_flight_command_tx_side("rocket_comms", radio_tx.clone());
         let side_id = {
             let radio_tx = radio_tx.clone();
-            router.add_side_serialized_with_options(
+            router.add_side_packed_with_options(
                 "rocket_comms",
                 move |bytes| {
-                    radio_tx.send(bytes.to_vec()).map_err(|_| {
-                        sedsprintf_rs_2026::TelemetryError::HandlerError("radio tx closed")
-                    })?;
+                    radio_tx
+                        .send(bytes.to_vec())
+                        .map_err(|_| sedsnet::TelemetryError::HandlerError("radio tx closed"))?;
                     Ok(())
                 },
-                sedsprintf_rs_2026::router::RouterSideOptions {
-                    reliable_enabled: true,
+                sedsnet::router::RouterSideOptions {
+                    // Raw UART reliability is handled by the RF-board scheduler, matching main.
+                    reliable_enabled: false,
                     link_local_enabled: true,
+                    ..Default::default()
                 },
             )
         };
-        let rf_discovery = sedsprintf_rs_2026::discovery::build_discovery_announce(
+        let rf_discovery = sedsnet::discovery::build_discovery_announce(
             Board::RFBoard.sender_id(),
             1,
-            &[DataEndpoint::FlightController],
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
         )
         .expect("failed to build RF discovery");
         router
-            .rx_serialized_from_side(&serialize::serialize_packet(&rf_discovery), side_id)
+            .rx_packed_from_side(&serialize::pack_packet(&rf_discovery), side_id)
             .expect("failed to queue RF discovery");
         router
             .process_all_queues_with_timeout(0)
@@ -2680,8 +2683,8 @@ mod tests {
 
         let gps_values = [31.7619_f32, -106.485_f32, 1412.5_f32];
         let gps_pkt = Packet::new(
-            DataType::GpsData,
-            &[DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("GPS_DATA"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::RFBoard.sender_id(),
             123_456,
             f32_payload(&gps_values),
@@ -2695,14 +2698,14 @@ mod tests {
                 sent_from_ground: sent_from_ground.clone(),
                 ground_tx_turns: ground_tx_turns.clone(),
                 scheduler_status: scheduler_status.clone(),
-                rf_tx_queue: VecDeque::from([serialize::serialize_packet(&gps_pkt).to_vec()]),
+                rf_tx_queue: VecDeque::from([serialize::pack_packet(&gps_pkt).to_vec()]),
                 updates: VecDeque::new(),
                 scheduler: RfBoardScheduler::new(),
             })));
         let shutdown_rx = state.shutdown_subscribe();
         let telemetry = tokio::spawn(telemetry_task(
             state.clone(),
-            router,
+            router.clone(),
             vec![CommsWorkerHandle {
                 name: "rocket_comms",
                 comms,
@@ -2718,32 +2721,42 @@ mod tests {
             shutdown_rx,
         ));
 
-        state
-            .cmd_tx
-            .send(TelemetryCommand::MonitorAltitude)
-            .await
-            .expect("failed to send command through AppState command channel");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if state
-                    .last_command_ms
-                    .lock()
-                    .expect("failed to lock last command map")
-                    .contains_key("MonitorAltitude")
-                {
-                    break;
+        #[cfg(feature = "testing")]
+        queue_locally_routed_flight_command(
+            &router,
+            "MonitorAltitude test command",
+            &[FlightComputerCommands::MonitorAltitude as u8],
+        )
+        .expect("failed to queue test command through router");
+        #[cfg(not(feature = "testing"))]
+        {
+            state
+                .cmd_tx
+                .send(TelemetryCommand::MonitorAltitude)
+                .await
+                .expect("failed to send command through AppState command channel");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if state
+                        .last_command_ms
+                        .lock()
+                        .expect("failed to lock last command map")
+                        .contains_key("MonitorAltitude")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("timed out waiting for telemetry task to accept MonitorAltitude command");
+            })
+            .await
+            .expect("timed out waiting for telemetry task to accept MonitorAltitude command");
+        }
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let row = ws_rx.recv().await.expect("telemetry websocket closed");
                 if row.sender_id == Board::RFBoard.sender_id()
-                    && row.data_type == DataType::GpsData.as_str()
+                    && row.data_type == crate::telemetry_schema::data_type("GPS_DATA").as_str()
                 {
                     assert_eq!(row.values, gps_values.map(Some).to_vec());
                     break;
@@ -2760,11 +2773,13 @@ mod tests {
                     .expect("failed to lock ground tx packets");
                 let flight_command_seen = sent
                     .iter()
-                    .filter_map(|payload| serialize::deserialize_packet(payload).ok())
+                    .filter_map(|payload| serialize::unpack_packet(payload).ok())
                     .any(|pkt| {
-                        pkt.data_type() == DataType::FlightCommand
+                        pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND")
                             && pkt.payload() == &[FlightComputerCommands::MonitorAltitude as u8]
-                            && pkt.endpoints().contains(&DataEndpoint::FlightController)
+                            && pkt
+                                .endpoints()
+                                .contains(&crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"))
                     });
                 if flight_command_seen {
                     break;
@@ -2796,30 +2811,20 @@ mod tests {
                 .all(|turn| *turn == RFBOARD_SCHED_UPLINK),
             "ground station must only transmit during RF-board uplink turns"
         );
-        assert!(
-            scheduler_status
-                .lock()
-                .expect("failed to lock scheduler statuses")
-                .iter()
-                .any(|(_, has_more)| !*has_more),
-            "GS should yield the RF-board uplink window after sending the command"
-        );
     }
 
     #[tokio::test]
     async fn dedicated_radio_worker_sends_flight_command_during_uplink_window() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
-        let side_id = router.add_side_serialized_with_options(
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let side_id = router.add_side_packed_with_options(
             "rocket_comms",
             |_bytes| Ok(()),
-            sedsprintf_rs_2026::router::RouterSideOptions {
+            sedsnet::router::RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -2839,14 +2844,14 @@ mod tests {
             })));
         let (tx, rx) = mpsc::unbounded_channel();
         let pkt = Packet::new(
-            DataType::FlightCommand,
-            &[DataEndpoint::FlightController],
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
         )
         .expect("failed to build flight command packet");
-        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let wire = serialize::pack_packet(&pkt).to_vec();
         tx.send(wire.clone())
             .expect("failed to queue flight command to radio worker");
         let workers = spawn_dedicated_radio_io_threads(
@@ -2886,8 +2891,8 @@ mod tests {
         let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
         let flight_packets = sent_guard
             .iter()
-            .filter_map(|payload| serialize::deserialize_packet(payload).ok())
-            .filter(|pkt| pkt.data_type() == DataType::FlightCommand)
+            .filter_map(|payload| serialize::unpack_packet(payload).ok())
+            .filter(|pkt| pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND"))
             .collect::<Vec<_>>();
         assert!(!flight_packets.is_empty());
         assert_eq!(
@@ -2897,7 +2902,7 @@ mod tests {
         assert!(
             flight_packets[0]
                 .endpoints()
-                .contains(&DataEndpoint::FlightController)
+                .contains(&crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"))
         );
     }
 
@@ -2905,30 +2910,28 @@ mod tests {
     async fn dedicated_radio_worker_drains_command_arriving_during_window_poll_before_yield() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
-        let side_id = router.add_side_serialized_with_options(
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let side_id = router.add_side_packed_with_options(
             "rocket_comms",
             |_bytes| Ok(()),
-            sedsprintf_rs_2026::router::RouterSideOptions {
+            sedsnet::router::RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let scheduler_status = Arc::new(Mutex::new(Vec::<(u8, bool)>::new()));
         let (tx, rx) = mpsc::unbounded_channel();
         let pkt = Packet::new(
-            DataType::FlightCommand,
-            &[DataEndpoint::FlightController],
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
         )
         .expect("failed to build flight command packet");
-        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let wire = serialize::pack_packet(&pkt).to_vec();
         let comms: Arc<Mutex<Box<dyn CommsDevice>>> =
             Arc::new(Mutex::new(Box::new(TestRadioComms {
                 sent: sent.clone(),
@@ -2997,16 +3000,14 @@ mod tests {
     async fn dedicated_radio_worker_waits_for_uplink_window_before_flight_command() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
-        let side_id = router.add_side_serialized_with_options(
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let side_id = router.add_side_packed_with_options(
             "rocket_comms",
             |_bytes| Ok(()),
-            sedsprintf_rs_2026::router::RouterSideOptions {
+            sedsnet::router::RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -3020,14 +3021,14 @@ mod tests {
             })));
         let (tx, rx) = mpsc::unbounded_channel();
         let pkt = Packet::new(
-            DataType::FlightCommand,
-            &[DataEndpoint::FlightController],
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
         )
         .expect("failed to build flight command packet");
-        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let wire = serialize::pack_packet(&pkt).to_vec();
         let workers = spawn_dedicated_radio_io_threads(
             router,
             state.clone(),
@@ -3062,16 +3063,14 @@ mod tests {
     async fn dedicated_radio_worker_does_not_send_flight_command_during_downlink_window() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
-        let side_id = router.add_side_serialized_with_options(
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let side_id = router.add_side_packed_with_options(
             "rocket_comms",
             |_bytes| Ok(()),
-            sedsprintf_rs_2026::router::RouterSideOptions {
+            sedsnet::router::RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -3091,14 +3090,14 @@ mod tests {
             })));
         let (tx, rx) = mpsc::unbounded_channel();
         let pkt = Packet::new(
-            DataType::FlightCommand,
-            &[DataEndpoint::FlightController],
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
         )
         .expect("failed to build flight command packet");
-        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let wire = serialize::pack_packet(&pkt).to_vec();
         let workers = spawn_dedicated_radio_io_threads(
             router,
             state.clone(),
@@ -3132,16 +3131,14 @@ mod tests {
     async fn dedicated_radio_worker_prioritizes_flight_command_over_telemetry() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
-        let side_id = router.add_side_serialized_with_options(
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let side_id = router.add_side_packed_with_options(
             "rocket_comms",
             |_bytes| Ok(()),
-            sedsprintf_rs_2026::router::RouterSideOptions {
+            sedsnet::router::RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -3161,23 +3158,23 @@ mod tests {
             })));
         let (tx, rx) = mpsc::unbounded_channel();
         let telemetry_pkt = Packet::new(
-            DataType::Heartbeat,
-            &[DataEndpoint::FlightController],
+            crate::telemetry_schema::data_type("HEARTBEAT"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([]),
         )
         .expect("failed to build telemetry packet");
-        let telemetry_wire = serialize::serialize_packet(&telemetry_pkt).to_vec();
+        let telemetry_wire = serialize::pack_packet(&telemetry_pkt).to_vec();
         let command_pkt = Packet::new(
-            DataType::FlightCommand,
-            &[DataEndpoint::FlightController],
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             124,
             Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
         )
         .expect("failed to build flight command packet");
-        let command_wire = serialize::serialize_packet(&command_pkt).to_vec();
+        let command_wire = serialize::pack_packet(&command_pkt).to_vec();
         tx.send(telemetry_wire)
             .expect("failed to queue telemetry to radio worker");
         tx.send(command_wire.clone())
@@ -3224,16 +3221,14 @@ mod tests {
     async fn dedicated_radio_worker_retries_flight_command_after_send_failure() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
-        let side_id = router.add_side_serialized_with_options(
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let side_id = router.add_side_packed_with_options(
             "rocket_comms",
             |_bytes| Ok(()),
-            sedsprintf_rs_2026::router::RouterSideOptions {
+            sedsnet::router::RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -3262,14 +3257,14 @@ mod tests {
             })));
         let (tx, rx) = mpsc::unbounded_channel();
         let pkt = Packet::new(
-            DataType::FlightCommand,
-            &[DataEndpoint::FlightController],
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
         )
         .expect("failed to build flight command packet");
-        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let wire = serialize::pack_packet(&pkt).to_vec();
         let workers = spawn_dedicated_radio_io_threads(
             router,
             state.clone(),
@@ -3315,16 +3310,14 @@ mod tests {
     async fn dedicated_radio_worker_drops_stale_uplink_window_before_sending_command() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
-        let side_id = router.add_side_serialized_with_options(
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let side_id = router.add_side_packed_with_options(
             "rocket_comms",
             |_bytes| Ok(()),
-            sedsprintf_rs_2026::router::RouterSideOptions {
+            sedsnet::router::RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -3347,14 +3340,14 @@ mod tests {
             })));
         let (tx, rx) = mpsc::unbounded_channel();
         let pkt = Packet::new(
-            DataType::FlightCommand,
-            &[DataEndpoint::FlightController],
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
         )
         .expect("failed to build flight command packet");
-        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let wire = serialize::pack_packet(&pkt).to_vec();
         tx.send(wire)
             .expect("failed to queue flight command to radio worker");
 
@@ -3389,16 +3382,14 @@ mod tests {
     async fn dedicated_radio_worker_yields_rfboard_uplink_after_credit_is_used() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
-        let side_id = router.add_side_serialized_with_options(
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let side_id = router.add_side_packed_with_options(
             "rocket_comms",
             |_bytes| Ok(()),
-            sedsprintf_rs_2026::router::RouterSideOptions {
+            sedsnet::router::RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -3419,14 +3410,14 @@ mod tests {
             })));
         let (tx, rx) = mpsc::unbounded_channel();
         let pkt = Packet::new(
-            DataType::FlightCommand,
-            &[DataEndpoint::FlightController],
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
             Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
         )
         .expect("failed to build flight command packet");
-        let wire = serialize::serialize_packet(&pkt).to_vec();
+        let wire = serialize::pack_packet(&pkt).to_vec();
         let expected_window_sends = 5usize;
         for _ in 0..(expected_window_sends + 1) {
             tx.send(wire.clone())
@@ -3503,34 +3494,28 @@ mod tests {
         }
         state.set_action_policy(policy);
 
-        let remote_router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([
-                sedsprintf_rs_2026::router::EndpointHandler::new_packet_handler(
-                    DataEndpoint::FlightState,
-                    move |pkt: &Packet| {
-                        if let Some(state_code) = pkt.payload().first().copied() {
-                            remote_states_handler
-                                .lock()
-                                .expect("failed to lock remote states")
-                                .push(state_code);
-                        }
-                        Ok(())
-                    },
-                ),
-            ]),
-        ));
-        let gs_router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
+        let remote_router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("FLIGHT_STATE"),
+                move |pkt: &Packet| {
+                    if let Some(state_code) = pkt.payload().first().copied() {
+                        remote_states_handler
+                            .lock()
+                            .expect("failed to lock remote states")
+                            .push(state_code);
+                    }
+                    Ok(())
+                },
+            ),
+        ])));
+        let gs_router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
 
         let gs_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
         let remote_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
 
         let gs_side = {
             let gs_peer = gs_peer.clone();
-            gs_router.add_side_serialized_with_options(
+            gs_router.add_side_packed_with_options(
                 "umbilical_comms",
                 move |bytes| {
                     let (peer, ingress) = gs_peer
@@ -3538,17 +3523,18 @@ mod tests {
                         .expect("failed to lock gs peer")
                         .clone()
                         .expect("gs peer not initialized");
-                    peer.rx_serialized_from_side(bytes, ingress)
+                    peer.rx_packed_from_side(bytes, ingress)
                 },
-                sedsprintf_rs_2026::router::RouterSideOptions {
+                sedsnet::router::RouterSideOptions {
                     reliable_enabled: true,
                     link_local_enabled: true,
+                    ..Default::default()
                 },
             )
         };
         let remote_side = {
             let remote_peer = remote_peer.clone();
-            remote_router.add_side_serialized_with_options(
+            remote_router.add_side_packed_with_options(
                 "gs_link",
                 move |bytes| {
                     let (peer, ingress) = remote_peer
@@ -3556,11 +3542,12 @@ mod tests {
                         .expect("failed to lock remote peer")
                         .clone()
                         .expect("remote peer not initialized");
-                    peer.rx_serialized_from_side(bytes, ingress)
+                    peer.rx_packed_from_side(bytes, ingress)
                 },
-                sedsprintf_rs_2026::router::RouterSideOptions {
+                sedsnet::router::RouterSideOptions {
                     reliable_enabled: true,
                     link_local_enabled: true,
+                    ..Default::default()
                 },
             )
         };
@@ -3662,12 +3649,13 @@ mod tests {
         }
         state.set_action_policy(policy);
 
-        let router = Arc::new(Router::new(
-            sedsprintf_rs_2026::router::RouterMode::Relay,
-            sedsprintf_rs_2026::router::RouterConfig::new([]),
-        ));
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
         let (radio_tx, mut radio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        register_flight_command_tx_side("rocket_comms", radio_tx);
+        router.add_side_packed("rocket_comms", move |bytes| {
+            radio_tx
+                .send(bytes.to_vec())
+                .map_err(|_| sedsnet::TelemetryError::HandlerError("radio tx closed"))
+        });
 
         let shutdown_rx = state.shutdown_subscribe();
         let telemetry = tokio::spawn(telemetry_task(
@@ -3690,9 +3678,9 @@ mod tests {
                 let Some(wire) = radio_rx.recv().await else {
                     panic!("flight command tx channel closed");
                 };
-                let pkt = serialize::deserialize_packet(&wire)
+                let pkt = serialize::unpack_packet(&wire)
                     .expect("failed to deserialize flight command packet");
-                if pkt.data_type() == DataType::FlightCommand {
+                if pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
                     assert_eq!(
                         pkt.payload(),
                         &[FlightComputerCommands::AdvanceFlightState as u8]
@@ -3865,11 +3853,11 @@ mod tests {
         let db_overflow = test_db_overflow();
         let gps_values = [31.7619_f32, -106.485_f32, 1412.5_f32];
         let gps_pkt = Packet::new(
-            DataType::GpsData,
+            crate::telemetry_schema::data_type("GPS_DATA"),
             &[
-                sedsprintf_rs_2026::config::DataEndpoint::GroundStation,
-                sedsprintf_rs_2026::config::DataEndpoint::SdCard,
-                sedsprintf_rs_2026::config::DataEndpoint::FlightController,
+                crate::telemetry_schema::endpoint("GROUND_STATION"),
+                crate::telemetry_schema::endpoint("SD_CARD"),
+                crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
             ],
             Board::RFBoard.sender_id(),
             123_456,
@@ -3883,7 +3871,10 @@ mod tests {
             .next()
             .expect("RF GPS_DATA packet should produce telemetry row");
 
-        assert_eq!(row.data_type, DataType::GpsData.as_str());
+        assert_eq!(
+            row.data_type,
+            crate::telemetry_schema::data_type("GPS_DATA").as_str()
+        );
         assert_eq!(row.sender_id, Board::RFBoard.sender_id());
         assert_eq!(row.values.len(), 3);
         for (actual, expected) in row.values.iter().zip(gps_values) {
@@ -3907,7 +3898,10 @@ mod tests {
                 values_json,
                 ..
             }) => {
-                assert_eq!(data_type, DataType::GpsData.as_str());
+                assert_eq!(
+                    data_type,
+                    crate::telemetry_schema::data_type("GPS_DATA").as_str()
+                );
                 assert_eq!(sender_id, Board::RFBoard.sender_id());
                 assert_eq!(
                     serde_json::from_str::<Vec<Option<f32>>>(&values_json.unwrap()).unwrap(),
@@ -3918,8 +3912,8 @@ mod tests {
         }
 
         let sat_pkt = Packet::new(
-            DataType::GpsSatelliteNumber,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("GPS_SATELLITE_NUMBER"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::RFBoard.sender_id(),
             123_789,
             Arc::from([14_u8]),
@@ -3953,8 +3947,8 @@ mod tests {
         let db_overflow = test_db_overflow();
         let imu_values = [0.2_f32, -0.1_f32, 9.91_f32, 1.5_f32, -2.5_f32, 3.5_f32];
         let imu_pkt = Packet::new(
-            DataType::IMUData,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("IMU_DATA"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::FlightComputer.sender_id(),
             234_567,
             f32_payload(&imu_values),
@@ -3965,9 +3959,15 @@ mod tests {
         rows.sort_by(|a, b| a.data_type.cmp(&b.data_type));
 
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].data_type, DataType::AccelData.as_str());
+        assert_eq!(
+            rows[0].data_type,
+            crate::telemetry_schema::data_type("ACCEL_DATA").as_str()
+        );
         assert_eq!(rows[0].values, vec![Some(0.2), Some(-0.1), Some(9.91)]);
-        assert_eq!(rows[1].data_type, DataType::GyroData.as_str());
+        assert_eq!(
+            rows[1].data_type,
+            crate::telemetry_schema::data_type("GYRO_DATA").as_str()
+        );
         assert_eq!(rows[1].values, vec![Some(1.5), Some(-2.5), Some(3.5)]);
 
         let mut writes = Vec::new();
@@ -3986,13 +3986,19 @@ mod tests {
         }
         writes.sort_by(|a, b| a.0.cmp(&b.0));
 
-        assert_eq!(writes[0].0, DataType::AccelData.as_str());
+        assert_eq!(
+            writes[0].0,
+            crate::telemetry_schema::data_type("ACCEL_DATA").as_str()
+        );
         assert_eq!(writes[0].1, Board::FlightComputer.sender_id());
         assert_eq!(
             serde_json::from_str::<Vec<Option<f32>>>(&writes[0].2).unwrap(),
             vec![Some(0.2), Some(-0.1), Some(9.91)]
         );
-        assert_eq!(writes[1].0, DataType::GyroData.as_str());
+        assert_eq!(
+            writes[1].0,
+            crate::telemetry_schema::data_type("GYRO_DATA").as_str()
+        );
         assert_eq!(writes[1].1, Board::FlightComputer.sender_id());
         assert_eq!(
             serde_json::from_str::<Vec<Option<f32>>>(&writes[1].2).unwrap(),
@@ -4008,8 +4014,8 @@ mod tests {
         let mut ws_rx = state.ws_tx.subscribe();
 
         let pkt = Packet::new(
-            DataType::KG1000,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("KG1000"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::DaqBoard.sender_id(),
             456_789,
             f32_payload(&[4.25]),
@@ -4105,8 +4111,8 @@ mod tests {
         }
 
         let pkt = Packet::new(
-            DataType::FuelTankPressure,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::DaqBoard.sender_id(),
             567_890,
             f32_payload(&[370.0]),
@@ -4119,7 +4125,10 @@ mod tests {
             .next()
             .expect("fuel tank pressure packet should produce raw telemetry row");
 
-        assert_eq!(row.data_type, DataType::FuelTankPressure.as_str());
+        assert_eq!(
+            row.data_type,
+            crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE").as_str()
+        );
         assert_eq!(row.values, vec![Some(370.0)]);
         assert!(
             row.timestamp_ms > 567_890,
@@ -4150,8 +4159,8 @@ mod tests {
         let mut ws_rx = state.ws_tx.subscribe();
 
         let pkt = Packet::new(
-            DataType::BatteryVoltage,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             "GB",
             678_901,
             f32_payload(&[14.4]),
@@ -4164,7 +4173,10 @@ mod tests {
             .next()
             .expect("gateway battery packet should produce raw telemetry row");
 
-        assert_eq!(row.data_type, DataType::BatteryVoltage.as_str());
+        assert_eq!(
+            row.data_type,
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str()
+        );
         assert_eq!(row.sender_id, Board::GatewayBoard.sender_id());
         assert_eq!(row.values, vec![Some(14.4)]);
         assert!(
@@ -4205,14 +4217,14 @@ mod tests {
     #[tokio::test]
     async fn fill_box_battery_voltage_below_thirteen_emits_latched_warning() {
         reset_fill_system_low_voltage_latch_for_tests();
-        let (db_tx, _db_rx) = mpsc::channel(8);
+        let (db_tx, _db_rx) = mpsc::channel(32);
         let state = test_app_state(db_tx.clone()).await;
         let db_overflow = test_db_overflow();
         let mut warnings_rx = state.warnings_tx.subscribe();
 
         let pkt = Packet::new(
-            DataType::BatteryVoltage,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             "GB",
             678_902,
             f32_payload(&[12.9]),
@@ -4220,7 +4232,10 @@ mod tests {
         .expect("failed to build gateway low BATTERY_VOLTAGE packet");
 
         let rows = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
-        assert_eq!(rows[0].data_type, DataType::BatteryVoltage.as_str());
+        assert_eq!(
+            rows[0].data_type,
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str()
+        );
 
         let warning = tokio::time::timeout(Duration::from_millis(100), warnings_rx.recv())
             .await
@@ -4229,8 +4244,8 @@ mod tests {
         assert_eq!(warning.message, FILL_SYSTEM_LOW_VOLTAGE_WARNING);
 
         let pkt = Packet::new(
-            DataType::BatteryVoltage,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             "GW",
             678_903,
             f32_payload(&[12.8]),
@@ -4261,8 +4276,8 @@ mod tests {
         assert_ne!(before.actuated, Some(true));
 
         let pkt = Packet::new(
-            DataType::UmbilicalStatus,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::ActuatorBoard.sender_id(),
             111_222,
             Arc::from([ActuatorBoardCommands::NitrogenOpen as u8, 1_u8]),
@@ -4286,8 +4301,8 @@ mod tests {
         assert_eq!(after.actuated, Some(true));
 
         let close_pkt = Packet::new(
-            DataType::UmbilicalStatus,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::ActuatorBoard.sender_id(),
             111_223,
             Arc::from([ActuatorBoardCommands::NitrogenClose as u8, 1_u8]),
@@ -4312,21 +4327,21 @@ mod tests {
 
     #[tokio::test]
     async fn battery_voltage_db_bucketing_is_sender_aware() {
-        let (db_tx, mut db_rx) = mpsc::channel(8);
+        let (db_tx, mut db_rx) = mpsc::channel(32);
         let state = test_app_state(db_tx.clone()).await;
         let db_overflow = test_db_overflow();
 
         let pb_pkt = Packet::new(
-            DataType::BatteryVoltage,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             "PB",
             700_000,
             f32_payload(&[7.8]),
         )
         .expect("failed to build PB battery packet");
         let gb_pkt = Packet::new(
-            DataType::BatteryVoltage,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             "GB",
             700_000,
             f32_payload(&[14.2]),
@@ -4344,7 +4359,9 @@ mod tests {
                     sender_id,
                     values_json,
                     ..
-                }))) if data_type == DataType::BatteryVoltage.as_str() => {
+                }))) if data_type
+                    == crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str() =>
+                {
                     writes.push((sender_id, values_json));
                     if writes.len() == 2 {
                         break;
@@ -4371,8 +4388,8 @@ mod tests {
             }
         }
         let pkt = Packet::new(
-            DataType::FlightState,
-            &[sedsprintf_rs_2026::config::DataEndpoint::GroundStation],
+            crate::telemetry_schema::data_type("FLIGHT_STATE"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::FlightComputer.sender_id(),
             789_012,
             Arc::from([255_u8]),

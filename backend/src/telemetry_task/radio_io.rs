@@ -1,9 +1,8 @@
 use crate::comms::{CommsDevice, RadioWindowKind};
 use crate::state::AppState;
-use sedsprintf_rs_2026::config::DataType;
-use sedsprintf_rs_2026::packet::Packet;
-use sedsprintf_rs_2026::router::{Router, RouterSideId};
-use sedsprintf_rs_2026::serialize;
+use sedsnet::packet::Packet;
+use sedsnet::router::{Router, RouterSideId};
+use sedsnet::wire_format as serialize;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -607,16 +606,17 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 };
 
-                if let Ok(pkt) = serialize::deserialize_packet(&payload) {
+                if let Ok(pkt) = serialize::unpack_packet(&payload) {
                     ingress_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     ingress_state.mark_packet_received(get_current_timestamp_ms());
-                    if matches!(pkt.data_type(), DataType::GpsSatelliteNumber) {
+                    if pkt.data_type() == crate::telemetry_schema::data_type("GPS_SATELLITE_NUMBER")
+                    {
                         let mut rb = ingress_state.ring_buffer.lock().unwrap();
                         rb.push(pkt);
                     }
                 }
 
-                if let Err(err) = router.rx_serialized_queue_from_side(&payload, side_id) {
+                if let Err(err) = router.rx_packed_queue_from_side(&payload, side_id) {
                     log_repeated_worker_error(
                         &format!("{worker_name} radio ingress queue failed"),
                         &format!("{err:?}"),
@@ -916,10 +916,10 @@ fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
     if !crate::radio_diagnostics_enabled() {
         return;
     }
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+    let Ok(pkt) = serialize::unpack_packet(payload) else {
         return;
     };
-    if !matches!(pkt.data_type(), DataType::FlightCommand) {
+    if pkt.data_type() != crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
         return;
     }
     let cmd_bytes = pkt.payload();
@@ -942,17 +942,19 @@ pub(super) fn radio_command_log_line(
     worker_name: &str,
     payload: &[u8],
 ) -> Option<String> {
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+    let Ok(pkt) = serialize::unpack_packet(payload) else {
         return None;
     };
-    let is_command = matches!(
-        pkt.data_type(),
-        DataType::ValveCommand
-            | DataType::FlightCommand
-            | DataType::ActuatorCommand
-            | DataType::FlightState
-            | DataType::Abort
-    );
+    let ty = pkt.data_type();
+    let is_command = [
+        "VALVE_COMMAND",
+        "FLIGHT_COMMAND",
+        "ACTUATOR_COMMAND",
+        "FLIGHT_STATE",
+        "ABORT",
+    ]
+    .into_iter()
+    .any(|name| ty == crate::telemetry_schema::data_type(name));
     if !is_command {
         return None;
     }
@@ -982,10 +984,10 @@ fn log_radio_command_event(event: &str, worker_name: &str, payload: &[u8]) {
 }
 
 fn log_link_control_send(worker_name: &str, payload: &[u8]) {
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+    let Ok(pkt) = serialize::unpack_packet(payload) else {
         return;
     };
-    if !matches!(pkt.data_type(), DataType::FlightState) {
+    if pkt.data_type() != crate::telemetry_schema::data_type("FLIGHT_STATE") {
         return;
     }
     let payload_preview = pkt
@@ -1007,7 +1009,7 @@ fn log_radio_packet_event(event: &str, worker_name: &str, payload: &[u8]) {
     if !crate::radio_diagnostics_enabled() {
         return;
     }
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+    let Ok(pkt) = serialize::unpack_packet(payload) else {
         return;
     };
     eprintln!(
@@ -1027,34 +1029,36 @@ fn log_radio_uplink_available(worker_name: &str, credit: usize, backlog_len: usi
 }
 
 fn is_command_payload(payload: &[u8]) -> bool {
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+    let Ok(pkt) = serialize::unpack_packet(payload) else {
         return false;
     };
-    matches!(
-        pkt.data_type(),
-        DataType::ValveCommand
-            | DataType::FlightCommand
-            | DataType::ActuatorCommand
-            | DataType::FlightState
-            | DataType::Abort
-    )
+    let ty = pkt.data_type();
+    [
+        "VALVE_COMMAND",
+        "FLIGHT_COMMAND",
+        "ACTUATOR_COMMAND",
+        "FLIGHT_STATE",
+        "ABORT",
+    ]
+    .into_iter()
+    .any(|name| ty == crate::telemetry_schema::data_type(name))
 }
 
 pub(super) fn is_fill_system_command_payload(payload: &[u8]) -> bool {
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+    let Ok(pkt) = serialize::unpack_packet(payload) else {
         return false;
     };
-    matches!(
-        pkt.data_type(),
-        DataType::ValveCommand | DataType::ActuatorCommand | DataType::Abort
-    )
+    let ty = pkt.data_type();
+    ["VALVE_COMMAND", "ACTUATOR_COMMAND", "ABORT"]
+        .into_iter()
+        .any(|name| ty == crate::telemetry_schema::data_type(name))
 }
 
 fn is_flight_command_payload(payload: &[u8]) -> bool {
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+    let Ok(pkt) = serialize::unpack_packet(payload) else {
         return false;
     };
-    matches!(pkt.data_type(), DataType::FlightCommand)
+    pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND")
 }
 
 fn drain_radio_tx_queue(

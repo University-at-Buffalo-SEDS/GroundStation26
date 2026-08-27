@@ -1,5 +1,6 @@
 use crate::auth::{AuthFailure, LoginChallengeRequest, LoginRequest, Permission};
 use crate::fill_targets::{self, FillTargetsConfig};
+use crate::firmware_update::{self, FirmwareUpdateStatus};
 use crate::flight_setup::{self, FlightSetupConfig};
 use crate::i18n::{self, TranslateRequest, TranslateResponse, TranslationCatalogResponse};
 use crate::layout;
@@ -9,9 +10,9 @@ use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::state::AppState;
 use crate::telemetry_db::{DbQueueItem, DbWrite, LaunchClockMsg, RecordingStatusMsg};
 use crate::types::{
-    BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryCommand, TelemetryRow,
+    Board, BoardStatusMsg, FlightState, NetworkTopologyMsg, TelemetryCommand, TelemetryRow,
 };
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::{
     Json, Router,
@@ -196,6 +197,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/network_time", get(get_network_time))
         .route("/api/launch_clock", get(get_launch_clock))
         .route("/api/network_topology", get(get_network_topology))
+        .route("/api/firmware/targets", get(get_firmware_targets))
+        .route("/api/firmware/updates", get(get_firmware_updates))
+        .route("/api/firmware/updates/{id}", get(get_firmware_update))
+        .route(
+            "/api/firmware/updates/{id}/cancel",
+            post(cancel_firmware_update),
+        )
+        .route("/api/firmware/flash/{board}", post(start_firmware_update))
         .route("/api/recording_status", get(get_recording_status))
         .route("/api/notifications", get(get_notifications))
         .route("/api/messages", get(get_messages))
@@ -1384,7 +1393,7 @@ async fn apply_flight_setup(
     };
 
     match router.log_queue(
-        sedsprintf_rs_2026::config::DataType::FlightCommand,
+        crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
         &payload,
     ) {
         Ok(()) => Json(FlightSetupApplyResponse {
@@ -1417,6 +1426,137 @@ async fn get_network_topology(
     }
     Json(state.network_topology_snapshot(crate::telemetry_task::get_current_timestamp_ms()))
         .into_response()
+}
+
+#[derive(Serialize)]
+struct FirmwareTarget {
+    board: String,
+    board_label: String,
+    hostname: String,
+    discovered: bool,
+    ota_stream_port: u16,
+    artifact_kind: &'static str,
+}
+
+/// Lists every board that can be addressed by the common LaunchCore OTA stream protocol.
+async fn get_firmware_targets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    let router = state.topology_router.get();
+    let targets = Board::ALL
+        .iter()
+        .copied()
+        .filter(|board| *board != Board::GroundStation)
+        .map(|board| FirmwareTarget {
+            board: board.sender_id().to_string(),
+            board_label: board.as_str().to_string(),
+            hostname: board.sender_id().to_string(),
+            discovered: router
+                .is_some_and(|router| router.resolve_hostname(board.sender_id()).is_some()),
+            ota_stream_port: firmware_update::OTA_STREAM_PORT,
+            artifact_kind: "launchcore_delta",
+        })
+        .collect::<Vec<_>>();
+    Json(targets).into_response()
+}
+
+/// Returns recent firmware jobs so clients can restore progress after reconnecting.
+async fn get_firmware_updates(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(firmware_update::update_history()).into_response()
+}
+
+async fn get_firmware_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    match firmware_update::update_status(id) {
+        Some(status) => Json(status).into_response(),
+        None => (StatusCode::NOT_FOUND, "firmware update not found").into_response(),
+    }
+}
+
+/// Accepts a raw LaunchCore delta artifact and starts an asynchronous SEDSnet stream transfer.
+async fn start_firmware_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(board): Path<String>,
+    body: Body,
+) -> impl IntoResponse {
+    let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal.permissions.send_commands {
+        return (StatusCode::FORBIDDEN, "permission denied").into_response();
+    }
+    if !principal.allows_command_name("FirmwareUpdate") {
+        return (StatusCode::FORBIDDEN, "firmware update not allowed").into_response();
+    }
+    let Some(board) = firmware_update::parse_board_target(&board) else {
+        return (StatusCode::BAD_REQUEST, "unknown firmware target board").into_response();
+    };
+    let filename = headers
+        .get("x-firmware-filename")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("firmware.delta")
+        .to_string();
+    let firmware = match to_bytes(body, firmware_update::MAX_UPLOAD_BYTES).await {
+        Ok(bytes) => bytes.to_vec(),
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "firmware upload exceeds the server limit",
+            )
+                .into_response();
+        }
+    };
+    let Some(router) = state.topology_router.get() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "router unavailable").into_response();
+    };
+    match firmware_update::start_update(router.clone(), board, filename, firmware) {
+        Ok(status) => (StatusCode::ACCEPTED, Json(status)).into_response(),
+        Err(err) if err.contains("already active") => (StatusCode::CONFLICT, err).into_response(),
+        Err(err) if err.contains("not present") => {
+            (StatusCode::SERVICE_UNAVAILABLE, err).into_response()
+        }
+        Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
+    }
+}
+
+async fn cancel_firmware_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !principal.permissions.send_commands {
+        return (StatusCode::FORBIDDEN, "permission denied").into_response();
+    }
+    if !principal.allows_command_name("FirmwareUpdate") {
+        return (StatusCode::FORBIDDEN, "firmware update not allowed").into_response();
+    }
+    match firmware_update::cancel_update(id) {
+        Ok(status) => Json::<FirmwareUpdateStatus>(status).into_response(),
+        Err(err) if err.contains("not found") => (StatusCode::NOT_FOUND, err).into_response(),
+        Err(err) => (StatusCode::CONFLICT, err).into_response(),
+    }
 }
 
 /// Validates and forwards a frontend command into the backend command channel.

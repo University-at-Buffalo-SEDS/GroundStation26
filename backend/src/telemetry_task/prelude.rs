@@ -20,12 +20,12 @@ pub(super) use crate::types::{
     Board, FlightState, TelemetryCommand, TelemetryRow, canonical_sender_id, u8_to_flight_state,
 };
 pub(super) use crate::web::{FlightStateMsg, emit_error, emit_notification_warning, emit_warning};
-pub(super) use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
-pub(super) use sedsprintf_rs_2026::packet::Packet;
-pub(super) use sedsprintf_rs_2026::router::Router;
+pub(super) use sedsnet::config::{DataEndpoint, DataType};
+pub(super) use sedsnet::packet::Packet;
+pub(super) use sedsnet::router::Router;
 #[cfg(test)]
-pub(super) use sedsprintf_rs_2026::router::RouterSideId;
-pub(super) use sedsprintf_rs_2026::serialize;
+pub(super) use sedsnet::router::RouterSideId;
+pub(super) use sedsnet::wire_format as serialize;
 pub(super) use std::collections::{HashMap, VecDeque};
 pub(super) use std::sync::atomic::{AtomicU64, Ordering};
 pub(super) use std::sync::{Arc, Mutex, OnceLock};

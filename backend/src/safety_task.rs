@@ -2,8 +2,7 @@ use crate::state::AppState;
 use crate::telemetry_task::{get_current_timestamp_ms, queue_abort_packet};
 use crate::types::{Board, FlightState, canonical_sender_id};
 use crate::web::{emit_warning, emit_warning_db_only};
-use sedsprintf_rs_2026::config::DataType;
-use sedsprintf_rs_2026::router::Router;
+use sedsnet::router::Router;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
@@ -383,17 +382,17 @@ pub async fn safety_task(
         let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
         for pkt in packets {
             match pkt.data_type() {
-                DataType::AccelData => {
+                ty if ty == crate::telemetry_schema::data_type("ACCEL_DATA") => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
                     check_accel_thresholds(&values, &mut cycle_warnings);
                 }
 
-                DataType::GyroData => {
+                ty if ty == crate::telemetry_schema::data_type("GYRO_DATA") => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
                     check_gyro_thresholds(&values, &mut cycle_warnings);
                 }
 
-                DataType::IMUData => {
+                ty if ty == crate::telemetry_schema::data_type("IMU_DATA") => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 6]);
                     if values.len() >= 6 {
                         check_accel_thresholds(&values[..3], &mut cycle_warnings);
@@ -401,7 +400,7 @@ pub async fn safety_task(
                     }
                 }
 
-                DataType::BarometerData => {
+                ty if ty == crate::telemetry_schema::data_type("BAROMETER_DATA") => {
                     // [pressure_Pa, temperature_C, altitude_m]
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
 
@@ -432,7 +431,7 @@ pub async fn safety_task(
                 }
 
                 // GPS: [lat, lon] in "xy"
-                DataType::GpsData => {
+                ty if ty == crate::telemetry_schema::data_type("GPS_DATA") => {
                     #[cfg(not(feature = "hitl_mode"))]
                     {
                         let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
@@ -457,7 +456,7 @@ pub async fn safety_task(
                     }
                 }
 
-                DataType::BatteryCurrent => {
+                ty if ty == crate::telemetry_schema::data_type("BATTERY_CURRENT") => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
 
                     // Current
@@ -469,7 +468,7 @@ pub async fn safety_task(
                     }
                 }
 
-                DataType::BatteryVoltage => {
+                ty if ty == crate::telemetry_schema::data_type("BATTERY_VOLTAGE") => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
                     // Voltage
                     if let Some(voltage) = values.first() {
@@ -482,7 +481,7 @@ pub async fn safety_task(
                 }
 
                 // Fuel tank pressure: [pressure_psi, ...]
-                DataType::FuelTankPressure => {
+                ty if ty == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE") => {
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 1]);
 
                     if let Some(pressure) = values.first()
@@ -494,7 +493,9 @@ pub async fn safety_task(
                 }
 
                 // Ascent/descent Kalman filter state packets.
-                DataType::AscentState | DataType::DescentState => {
+                ty if ty == crate::telemetry_schema::data_type("ASCENT_STATE")
+                    || ty == crate::telemetry_schema::data_type("DESCENT_STATE") =>
+                {
                     let values = pkt.data_as_f32().unwrap_or_default();
 
                     if values.iter().any(|value| {
@@ -506,7 +507,7 @@ pub async fn safety_task(
                     }
                 }
 
-                DataType::GenericError => {
+                ty if ty == crate::telemetry_schema::data_type("GENERIC_ERROR") => {
                     abort = true;
                     cycle_warnings.insert("Generic Error received from vehicle!");
                     gs_debug_println!("Safety: Generic Error packet received");

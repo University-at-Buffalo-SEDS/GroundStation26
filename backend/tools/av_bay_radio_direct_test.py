@@ -35,9 +35,6 @@ RADIO_UPLINK_TX_GUARD_S = float(os.environ.get("GS_RADIO_UPLINK_TX_GUARD_MS", "1
 RADIO_AIR_BIT_RATE_BPS = int(os.environ.get("GS_RADIO_AIR_BIT_RATE_BPS", "9600"))
 RADIO_AIR_FRAME_OVERHEAD_BYTES = int(os.environ.get("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", "16"))
 RADIO_TX_COOLDOWN_S = float(os.environ.get("GS_RADIO_TX_COOLDOWN_MS", "25")) / 1000.0
-SEDS_2026_GPS_DATA_TYPE = 1
-SEDS_2026_GPS_SATELLITE_NUMBER_TYPE = 21
-
 FLIGHT_COMMANDS = {
     "Launch": 1,
     "MonitorAltitude": 2,
@@ -62,19 +59,16 @@ FLIGHT_COMMANDS = {
 
 
 def import_seds() -> object:
+    os.environ.setdefault(
+        "SEDSNET_STATIC_SCHEMA_PATH",
+        str(Path(__file__).resolve().parents[1] / "config" / "telemetry_config.json"),
+    )
     try:
-        import sedsprintf_rs_2026 as seds
+        import sedsnet as seds
 
         return seds
-    except ModuleNotFoundError:
-        try:
-            import sedsprintf_rs as seds
-
-            return seds
-        except ModuleNotFoundError as e:
-            raise SystemExit(
-                "Missing dependency 'sedsprintf_rs_2026' or 'sedsprintf_rs'. Build/install the Python module first."
-            ) from e
+    except ModuleNotFoundError as e:
+        raise SystemExit("Missing dependency 'sedsnet'. Install SEDSnet 4.0.2 first.") from e
 
 
 def enum_value(enum_cls: object, *names: str) -> int:
@@ -220,9 +214,9 @@ def enum_name(enum_cls: object, value: int) -> str:
 
 
 def canonical_data_type_name(enum_cls: object, value: int) -> str:
-    if value == SEDS_2026_GPS_DATA_TYPE:
+    if value == enum_value(enum_cls, "GPS_DATA", "GpsData"):
         return "GPS_DATA"
-    if value == SEDS_2026_GPS_SATELLITE_NUMBER_TYPE:
+    if value == enum_value(enum_cls, "GPS_SATELLITE_NUMBER", "GpsSatelliteNumber"):
         return "GPS_SATELLITE_NUMBER"
     return enum_name(enum_cls, value)
 
@@ -256,10 +250,7 @@ def decode_seds_packet_summary(payload: bytes) -> DecodedPacketSummary | None:
         return DecodedPacketSummary(f"SEDS import failed: {err}", None, False)
 
     try:
-        if hasattr(seds, "deserialize_packet_py"):
-            pkt = seds.deserialize_packet_py(payload)
-        else:
-            pkt = seds.deserialize_packet(payload)
+        pkt = seds.unpack_packet_py(payload)
     except Exception as err:
         header = peek_seds_packet_header_summary(seds, payload)
         if header:
@@ -267,7 +258,7 @@ def decode_seds_packet_summary(payload: bytes) -> DecodedPacketSummary | None:
                 ty = int(seds.peek_header_py(payload).get("ty"))
             except Exception:
                 ty = None
-            if ty == SEDS_2026_GPS_SATELLITE_NUMBER_TYPE:
+            if ty == enum_value(seds.DataType, "GPS_SATELLITE_NUMBER", "GpsSatelliteNumber"):
                 sats = raw_single_byte_payload(payload)
                 return DecodedPacketSummary(
                     f"{header} sats={sats} recovered_after_decode_error={err}",
@@ -282,8 +273,10 @@ def decode_seds_packet_summary(payload: bytes) -> DecodedPacketSummary | None:
     sender = pkt.sender
     endpoints = ",".join(enum_name(seds.DataEndpoint, int(ep)) for ep in pkt.endpoints)
 
-    gps_type = SEDS_2026_GPS_DATA_TYPE
-    gps_satellite_type = SEDS_2026_GPS_SATELLITE_NUMBER_TYPE
+    gps_type = enum_value(seds.DataType, "GPS_DATA", "GpsData")
+    gps_satellite_type = enum_value(
+        seds.DataType, "GPS_SATELLITE_NUMBER", "GpsSatelliteNumber"
+    )
 
     if ty == gps_type:
         raw_payload = bytes(pkt.payload)
@@ -470,7 +463,7 @@ class PacketBuilder:
             timestamp_ms=now_ms(),
             payload=payload,
         )
-        return bytes(packet.serialize())
+        return bytes(packet.pack())
 
 
 class AvBayRadioApp:

@@ -3,6 +3,7 @@
 """Bind to a UART, send telemetry packets, and print received packets."""
 
 import argparse
+import os
 import select
 import struct
 import sys
@@ -10,6 +11,7 @@ import termios
 import threading
 import time
 import tty
+from pathlib import Path
 
 try:
     import serial
@@ -18,19 +20,17 @@ except ModuleNotFoundError as e:
         "Missing dependency 'pyserial'. Install it with `python -m pip install pyserial` and retry."
     ) from e
 
+os.environ.setdefault(
+    "SEDSNET_STATIC_SCHEMA_PATH",
+    str(Path(__file__).resolve().parent / "config" / "telemetry_config.json"),
+)
 try:
-    import sedsprintf_rs_2026 as seds
-except ModuleNotFoundError:
-    try:
-        import sedsprintf_rs as seds
-    except ModuleNotFoundError as e:
-        raise SystemExit(
-            "Missing dependency 'sedsprintf_rs_2026' or 'sedsprintf_rs'. Build/install the Python module first."
-        ) from e
+    import sedsnet as seds
+except ModuleNotFoundError as e:
+    raise SystemExit("Missing dependency 'sedsnet'. Install SEDSnet 4.0.2 first.") from e
 
 DT = seds.DataType
 EP = seds.DataEndpoint
-RM = seds.RouterMode
 
 
 def _enum_value(enum_cls, *names: str) -> int:
@@ -117,12 +117,11 @@ class UartPacketBridge:
                 (DISCOVERY_ENDPOINT, self._handle_discovery_packet, None),
                 (HEARTBEAT_ENDPOINT, self._handle_heartbeat_packet, None),
             ],
-            mode=RM.Sink,
         )
-        self.router_side_id = self.router.add_side_serialized("UART", self._tx_serialized)
+        self.router_side_id = self.router.add_side_packed("UART", self._tx_serialized)
 
     def _write_packet(self, packet: seds.Packet) -> None:
-        wire = bytes(packet.serialize())
+        wire = bytes(packet.pack())
         self._tx_serialized(wire)
 
     def _tx_serialized(self, wire: bytes) -> None:
@@ -132,7 +131,7 @@ class UartPacketBridge:
 
     def _dispatch_received_packet(self, frame: bytes) -> None:
         with self.router_lock:
-            self.router.receive_serialized_queue_from_side(self.router_side_id, frame)
+            self.router.receive_packed_queue_from_side(self.router_side_id, frame)
             self.router.process_all_queues()
 
     def _handle_groundstation_packet(self, pkt: seds.Packet) -> None:

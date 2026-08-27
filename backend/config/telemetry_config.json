@@ -1,0 +1,583 @@
+{
+  "endpoints": [
+    {
+      "name": "SD_CARD",
+      "doc": "On-board storage (e.g. SD card / flash)."
+    },
+    {
+      "name": "GROUND_STATION",
+      "doc": "Data destined for the groundstation"
+    },
+    {
+      "name": "FLIGHT_CONTROLLER",
+      "doc": "Data destined for the Flight Computer"
+    },
+    {
+      "name": "VALVE_BOARD",
+      "doc": "Data destined for the Valve Board"
+    },
+    {
+      "name": "ABORT",
+      "doc": "Endpoint For abort commands"
+    },
+    {
+      "name": "FLIGHT_STATE",
+      "doc": "Flight state updates"
+    },
+    {
+      "name": "HEART_BEAT",
+      "doc": "Endpoint for heartbeat messages",
+      "broadcast_mode": "Default"
+    },
+    {
+      "name": "ACTUATOR_BOARD",
+      "doc": "Actuator board endpoint"
+    }
+  ],
+  "types": [
+    {
+      "name": "GENERIC_ERROR",
+      "doc": "Generic Error: Dynamic string payload (human-readable error message).",
+      "class": "Error",
+      "element": {
+        "kind": "Dynamic",
+        "data_type": "String"
+      },
+      "endpoints": [
+        "SD_CARD",
+        "GROUND_STATION"
+      ],
+      "reliable_mode": "Ordered",
+      "reliable": true,
+      "priority": 0
+    },
+    {
+      "name": "GPS_DATA",
+      "doc": "GPS Data: 3 \u00d7 float32 elements (latitude, longitude, altitude).",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "GROUND_STATION",
+        "SD_CARD",
+        "FLIGHT_CONTROLLER"
+      ],
+      "reliable_mode": "None",
+      "reliable": false,
+      "priority": 0
+    },
+    {
+      "name": "GYRO_DATA",
+      "doc": "Gyro Data: 3 \u00d7 float32 elements (x, y, z). Logged only to GroundStation.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable_mode": "None",
+      "reliable": false,
+      "priority": 0
+    },
+    {
+      "name": "ACCEL_DATA",
+      "doc": "Accel Data: 3 \u00d7 float32 elements (x, y, z). Logged only to GroundStation.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable_mode": "None",
+      "reliable": false,
+      "priority": 0
+    },
+    {
+      "name": "BATTERY_VOLTAGE",
+      "doc": "Battery Voltage: 1 \u00d7 float32 element.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 1
+      },
+      "endpoints": [
+        "GROUND_STATION",
+        "SD_CARD"
+      ],
+      "reliable_mode": "None",
+      "reliable": false,
+      "priority": 0
+    },
+    {
+      "name": "BATTERY_CURRENT",
+      "doc": "Battery Current: 1 \u00d7 float32 element.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 1
+      },
+      "endpoints": [
+        "GROUND_STATION",
+        "SD_CARD"
+      ],
+      "reliable_mode": "None",
+      "reliable": false,
+      "priority": 0
+    },
+    {
+      "name": "BAROMETER_DATA",
+      "doc": "Barometer Data: 3 \u00d7 float32 elements (alt, prs, tmp). Logged only to GroundStation.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable_mode": "None",
+      "reliable": false,
+      "priority": 0
+    },
+    {
+      "name": "ABORT",
+      "doc": "Abort: Dynamic string payload (reason / code / message).",
+      "class": "Error",
+      "element": {
+        "kind": "Dynamic",
+        "data_type": "String"
+      },
+      "endpoints": [
+        "ABORT",
+        "SD_CARD"
+      ],
+      "reliable_mode": "Unordered",
+      "reliable": true,
+      "priority": 0
+    },
+    {
+      "name": "FUEL_FLOW",
+      "doc": "Fuel Flow: 1 \u00d7 float32 element.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 1
+      },
+      "endpoints": [
+        "GROUND_STATION",
+        "SD_CARD"
+      ],
+      "reliable_mode": "None",
+      "reliable": false,
+      "priority": 0
+    },
+    {
+      "name": "VALVE_COMMAND",
+      "doc": "Valve Command: 1 \u00d7 uint8 element (command).",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 1
+      },
+      "endpoints": [
+        "GROUND_STATION",
+        "VALVE_BOARD"
+      ],
+      "reliable_mode": "Ordered",
+      "reliable": true,
+      "priority": 0
+    },
+    {
+      "name": "FLIGHT_COMMAND",
+      "doc": "Flight Command: 1 \u00d7 uint8 element (command).",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 1
+      },
+      "endpoints": [
+        "GROUND_STATION",
+        "SD_CARD",
+        "FLIGHT_CONTROLLER"
+      ],
+      "reliable_mode": "Ordered",
+      "reliable": true,
+      "priority": 0
+    },
+    {
+      "name": "FUEL_TANK_PRESSURE",
+      "doc": "Fuel Tank Pressure: 1 \u00d7 float32 element.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 1
+      },
+      "endpoints": [
+        "GROUND_STATION",
+        "SD_CARD"
+      ],
+      "reliable_mode": "None",
+      "reliable": false,
+      "priority": 0
+    },
+    {
+      "name": "FLIGHT_STATE",
+      "doc": "Flight State: 1 \\u00d7 uint8 element.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 1
+      },
+      "endpoints": [
+        "FLIGHT_STATE",
+        "SD_CARD",
+        "GROUND_STATION"
+      ],
+      "reliable_mode": "Ordered",
+      "reliable": true,
+      "priority": 0
+    },
+    {
+      "name": "HEARTBEAT",
+      "doc": "Heartbeat: No payload.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "NoData",
+        "count": 0
+      },
+      "endpoints": [
+        "HEART_BEAT",
+        "GROUND_STATION",
+        "FLIGHT_CONTROLLER"
+      ],
+      "reliable_mode": "None",
+      "reliable": false,
+      "priority": 0
+    },
+    {
+      "name": "WARNING",
+      "doc": "Warning: Dynamic string payload (human-readable warning text).",
+      "class": "Warning",
+      "element": {
+        "kind": "Dynamic",
+        "data_type": "String"
+      },
+      "endpoints": [
+        "SD_CARD",
+        "GROUND_STATION"
+      ],
+      "reliable_mode": "Ordered",
+      "reliable": true,
+      "priority": 0
+    },
+    {
+      "name": "MESSAGE_DATA",
+      "doc": "Message Data: Dynamic string payload (free-form log message).",
+      "class": "Data",
+      "element": {
+        "kind": "Dynamic",
+        "data_type": "String"
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable_mode": "None",
+      "reliable": false,
+      "priority": 0
+    },
+    {
+      "name": "ACTUATOR_COMMAND",
+      "doc": "Commands to be sent to the actuator board (1 u8)",
+      "reliable": true,
+      "reliable_mode": "Ordered",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 1
+      },
+      "endpoints": [
+        "ACTUATOR_BOARD",
+        "GROUND_STATION"
+      ],
+      "priority": 0
+    },
+    {
+      "name": "UMBILICAL_STATUS",
+      "doc": "The status of the umbilical setup (valves, actuator position, ingnighter state, etc)(2 u8's valve, position)",
+      "reliable": false,
+      "reliable_mode": "None",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 2
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "priority": 0
+    },
+    {
+      "name": "KG1000",
+      "doc": "1000kg loadcell values (1 float32)",
+      "reliable": false,
+      "reliable_mode": "None",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 1
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "priority": 0
+    },
+    {
+      "name": "KG50",
+      "doc": "50kg Loadcell (1 float32)",
+      "reliable": false,
+      "reliable_mode": "None",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 1
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "priority": 0
+    },
+    {
+      "name": "GPS_SATELLITE_NUMBER",
+      "doc": "(1 x U8) The number of satelites the gps sees in the sky.",
+      "reliable": false,
+      "reliable_mode": "None",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 1
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "priority": 0
+    },
+    {
+      "name": "EULER_ANGLES",
+      "doc": "Initial condition euler angles: 3 x float32 values.",
+      "reliable": true,
+      "reliable_mode": "Unordered",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "SD_CARD",
+        "GROUND_STATION"
+      ]
+    },
+    {
+      "name": "ORDERED_MESSAGE",
+      "doc": "Ordered Message: MessageData variant for responses to manual commands and critical state changes.",
+      "reliable": true,
+      "reliable_mode": "Ordered",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Dynamic",
+        "data_type": "String"
+      },
+      "endpoints": [
+        "SD_CARD",
+        "GROUND_STATION"
+      ]
+    },
+    {
+      "name": "ASCENT_STATE",
+      "doc": "Ascent State: Quaternion vector (4 x 1 x float32) and shared state (2 x 1 x float32). Logged only to GroundStation.",
+      "reliable": false,
+      "reliable_mode": "None",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 6
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ]
+    },
+    {
+      "name": "DESCENT_STATE",
+      "doc": "Descent State: low pass coordinates (2 x 1 x float32) and shared state (2 x 1 x float32). Logged only to GroundStation.",
+      "reliable": false,
+      "reliable_mode": "None",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 4
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ]
+    },
+    {
+      "name": "ASCENT_BIASES",
+      "doc": "Ascent Biases: pre-launch command to update biases of Ascent KF (4 x float32).",
+      "reliable": true,
+      "reliable_mode": "Unordered",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 4
+      },
+      "endpoints": [
+        "SD_CARD",
+        "GROUND_STATION",
+        "FLIGHT_CONTROLLER"
+      ]
+    },
+    {
+      "name": "GYRO_LOCAL",
+      "doc": "Gyro Data: 3 \u00d7 float32 elements (x, y, z). Logged only to SD.",
+      "reliable": false,
+      "reliable_mode": "None",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
+    },
+    {
+      "name": "ACCEL_LOCAL",
+      "doc": "Accel Data: 3 \u00d7 float32 elements (x, y, z). Logged only to SD.",
+      "reliable": false,
+      "reliable_mode": "None",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
+    },
+    {
+      "name": "IMU_DATA",
+      "doc": "Accel and Gyro Data: 6 \u00d7 float32 elements (ax, ay, az, gx, gy, gz). Logged only to GroundStation.",
+      "reliable": false,
+      "reliable_mode": "None",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 6
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ]
+    },
+    {
+      "name": "IMU_LOCAL",
+      "doc": "Accel and Gyro Data: 6 \u00d7 float32 elements (ax, ay, az, gx, gy, gz). Logged only to SD.",
+      "reliable": false,
+      "reliable_mode": "None",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 6
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
+    },
+    {
+      "name": "BAROMETER_LOCAL",
+      "doc": "Barometer Data: 3 \u00d7 float32 elements (alt, prs, tmp). Logged only to SD.",
+      "reliable": false,
+      "reliable_mode": "None",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
+    },
+    {
+      "name": "ASCENT_LOCAL",
+      "doc": "Ascent State: Quaternion vector (4 x 1 x float32) and shared state (2 x 1 x float32). Logged only to SD.",
+      "reliable": false,
+      "reliable_mode": "None",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 6
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
+    },
+    {
+      "name": "DESCENT_LOCAL",
+      "doc": "Descent State: low pass coordinates (2 x 1 x float32) and shared state (2 x 1 x float32). Logged only to SD.",
+      "reliable": false,
+      "reliable_mode": "None",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 4
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
+    }
+  ]
+}

@@ -4,12 +4,11 @@ use crate::comms_config::{
 #[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
-use sedsprintf_rs_2026::{
+use sedsnet::{
     TelemetryError, TelemetryResult,
-    config::DataEndpoint,
     packet::Packet,
     router::{Router, RouterSideId},
-    serialize,
+    wire_format as serialize,
 };
 use serialport::SerialPort;
 use std::collections::VecDeque;
@@ -200,18 +199,18 @@ pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
 }
 
 fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(&Packet)) {
-    let Ok(pkt) = serialize::deserialize_packet(payload) else {
+    let Ok(pkt) = serialize::unpack_packet(payload) else {
         return;
     };
-    let is_gps = matches!(
-        pkt.data_type(),
-        sedsprintf_rs_2026::config::DataType::GpsData
-            | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
-    );
+    let ty = pkt.data_type();
+    let is_gps = ty == crate::telemetry_schema::data_type("GPS_DATA")
+        || ty == crate::telemetry_schema::data_type("GPS_SATELLITE_NUMBER");
     if !is_gps {
         return;
     }
-    let has_groundstation = pkt.endpoints().contains(&DataEndpoint::GroundStation);
+    let has_groundstation = pkt
+        .endpoints()
+        .contains(&crate::telemetry_schema::endpoint("GROUND_STATION"));
     if !has_groundstation {
         packet_tap(&pkt);
     }
@@ -221,7 +220,7 @@ fn is_valid_serialized_packet_or_ack(payload: &[u8]) -> bool {
     let Ok(frame) = serialize::peek_frame_info(payload) else {
         return false;
     };
-    frame.ack_only() || serialize::deserialize_packet(payload).is_ok()
+    frame.ack_only() || serialize::unpack_packet(payload).is_ok()
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -235,7 +234,7 @@ fn take_buffered_serialized_packet(
             let Ok(frame) = serialize::peek_frame_info(candidate) else {
                 continue;
             };
-            if !frame.ack_only() && serialize::deserialize_packet(candidate).is_err() {
+            if !frame.ack_only() && serialize::unpack_packet(candidate).is_err() {
                 continue;
             }
             let payload = candidate.to_vec();
@@ -557,7 +556,7 @@ impl UartComms {
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
             maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
             tap_non_groundstation_gps_payload(&payload, packet_tap);
-            match router.rx_serialized_queue_from_side(&payload, side_id) {
+            match router.rx_packed_queue_from_side(&payload, side_id) {
                 Ok(()) => {
                     maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
                 }
@@ -1737,7 +1736,7 @@ impl CommsDevice for I2cComms {
                                     continue;
                                 }
                                 tap_non_groundstation_gps_payload(&packet, packet_tap);
-                                match router.rx_serialized_queue_from_side(&packet, side_id) {
+                                match router.rx_packed_queue_from_side(&packet, side_id) {
                                     Ok(()) => {}
                                     Err(err) => {
                                         let _ = err;
@@ -1893,7 +1892,7 @@ impl CommsDevice for SpiComms {
                 return Ok(());
             }
             tap_non_groundstation_gps_payload(payload, packet_tap);
-            return router.rx_serialized_queue_from_side(payload, side_id);
+            return router.rx_packed_queue_from_side(payload, side_id);
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -2054,7 +2053,7 @@ impl CommsDevice for CanComms {
                 return Ok(());
             }
             tap_non_groundstation_gps_payload(&packet, packet_tap);
-            return router.rx_serialized_queue_from_side(&packet, side_id);
+            return router.rx_packed_queue_from_side(&packet, side_id);
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -2119,7 +2118,7 @@ pub struct DummyComms {
     #[cfg(feature = "testing")]
     timesync_next_announce_ms: u64,
     #[cfg(feature = "testing")]
-    pending_rx: std::collections::VecDeque<sedsprintf_rs_2026::packet::Packet>,
+    pending_rx: std::collections::VecDeque<sedsnet::packet::Packet>,
 }
 
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
@@ -2147,20 +2146,18 @@ impl DummyComms {
     }
 
     #[cfg(feature = "testing")]
-    fn simulated_discovery_endpoints(&self) -> &'static [sedsprintf_rs_2026::config::DataEndpoint] {
-        use sedsprintf_rs_2026::config::DataEndpoint;
-
+    fn simulated_discovery_endpoints(&self) -> &'static [sedsnet::config::DataEndpoint] {
         match self.name {
             "Rocket Comms" => &[
-                DataEndpoint::FlightController,
-                DataEndpoint::FlightState,
-                DataEndpoint::SdCard,
+                crate::telemetry_schema::endpoints::FLIGHT_CONTROLLER,
+                crate::telemetry_schema::endpoints::FLIGHT_STATE,
+                crate::telemetry_schema::endpoints::SD_CARD,
             ],
             "Umbilical Comms" => &[
-                DataEndpoint::ValveBoard,
-                DataEndpoint::ActuatorBoard,
-                DataEndpoint::Abort,
-                DataEndpoint::FlightState,
+                crate::telemetry_schema::endpoints::VALVE_BOARD,
+                crate::telemetry_schema::endpoints::ACTUATOR_BOARD,
+                crate::telemetry_schema::endpoints::ABORT,
+                crate::telemetry_schema::endpoints::FLIGHT_STATE,
             ],
             _ => &[],
         }
@@ -2195,23 +2192,22 @@ impl DummyComms {
         let endpoints = self.simulated_discovery_endpoints();
         if !endpoints.is_empty() {
             self.pending_rx
-                .push_back(sedsprintf_rs_2026::discovery::build_discovery_announce(
+                .push_back(sedsnet::discovery::build_discovery_announce(
                     sender, now_ms, endpoints,
                 )?);
         }
         let timesync_sources = self.simulated_timesync_sources();
         if !timesync_sources.is_empty() {
-            self.pending_rx.push_back(
-                sedsprintf_rs_2026::discovery::build_discovery_timesync_sources(
+            self.pending_rx
+                .push_back(sedsnet::discovery::build_discovery_timesync_sources(
                     sender,
                     now_ms,
                     timesync_sources,
-                )?,
-            );
+                )?);
         }
 
         self.discovery_next_announce_ms =
-            now_ms.saturating_add(sedsprintf_rs_2026::discovery::DISCOVERY_SLOW_INTERVAL_MS);
+            now_ms.saturating_add(sedsnet::discovery::DISCOVERY_SLOW_INTERVAL_MS);
         Ok(())
     }
 
@@ -2227,13 +2223,12 @@ impl DummyComms {
         }
 
         if !self.simulated_timesync_sources().is_empty() {
-            self.pending_rx.push_back(
-                sedsprintf_rs_2026::timesync::build_timesync_announce_with_sender(
+            self.pending_rx
+                .push_back(sedsnet::timesync::build_timesync_announce_with_sender(
                     self.simulated_discovery_sender(),
                     self.simulated_timesync_priority(),
                     now_ms,
-                )?,
-            );
+                )?);
         }
 
         self.timesync_next_announce_ms = now_ms.saturating_add(1_000);
@@ -2256,24 +2251,24 @@ impl CommsDevice for DummyComms {
             self.maybe_queue_discovery()?;
             self.maybe_queue_timesync()?;
             if let Some(pkt) = self.pending_rx.pop_front() {
-                if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
-                    && matches!(
-                        pkt.data_type(),
-                        sedsprintf_rs_2026::config::DataType::GpsData
-                            | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
-                    )
+                let ty = pkt.data_type();
+                if !pkt
+                    .endpoints()
+                    .contains(&crate::telemetry_schema::endpoint("GROUND_STATION"))
+                    && (ty == crate::telemetry_schema::data_type("GPS_DATA")
+                        || ty == crate::telemetry_schema::data_type("GPS_SATELLITE_NUMBER"))
                 {
                     packet_tap(&pkt);
                 }
                 return _router.rx_queue_from_side(pkt, side_id);
             }
             if let Some(pkt) = get_dummy_packet()? {
-                if !pkt.endpoints().contains(&DataEndpoint::GroundStation)
-                    && matches!(
-                        pkt.data_type(),
-                        sedsprintf_rs_2026::config::DataType::GpsData
-                            | sedsprintf_rs_2026::config::DataType::GpsSatelliteNumber
-                    )
+                let ty = pkt.data_type();
+                if !pkt
+                    .endpoints()
+                    .contains(&crate::telemetry_schema::endpoint("GROUND_STATION"))
+                    && (ty == crate::telemetry_schema::data_type("GPS_DATA")
+                        || ty == crate::telemetry_schema::data_type("GPS_SATELLITE_NUMBER"))
                 {
                     packet_tap(&pkt);
                 }
@@ -2292,32 +2287,30 @@ impl CommsDevice for DummyComms {
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        use sedsprintf_rs_2026::config::DataType;
-        use sedsprintf_rs_2026::serialize::peek_envelope;
+        use sedsnet::wire_format::peek_envelope;
 
-        if peek_envelope(payload).unwrap().ty == DataType::Heartbeat {
+        if peek_envelope(payload).unwrap().ty == crate::telemetry_schema::data_type("HEARTBEAT") {
             return Ok(());
         }
         #[cfg(feature = "testing")]
         if crate::telemetry_task::timesync_enabled()
-            && let Ok(pkt) = sedsprintf_rs_2026::serialize::deserialize_packet(payload)
-            && pkt.data_type() == DataType::TimeSyncRequest
+            && let Ok(pkt) = sedsnet::wire_format::unpack_packet(payload)
+            && pkt.data_type() == sedsnet::config::DataType::TimeSyncRequest
             && !self.simulated_timesync_sources().is_empty()
         {
-            let req = sedsprintf_rs_2026::timesync::decode_timesync_request(&pkt)?;
+            let req = sedsnet::timesync::decode_timesync_request(&pkt)?;
             let now_ms = crate::telemetry_task::get_current_timestamp_ms();
             let mut response_bytes = Vec::with_capacity(4 * std::mem::size_of::<u64>());
             for word in [req.seq, req.t1_ms, now_ms, now_ms] {
                 response_bytes.extend_from_slice(&word.to_le_bytes());
             }
-            self.pending_rx
-                .push_back(sedsprintf_rs_2026::packet::Packet::new(
-                    DataType::TimeSyncResponse,
-                    &[DataEndpoint::TimeSync],
-                    self.simulated_discovery_sender(),
-                    now_ms,
-                    response_bytes.into(),
-                )?);
+            self.pending_rx.push_back(sedsnet::packet::Packet::new(
+                sedsnet::config::DataType::TimeSyncResponse,
+                &[sedsnet::config::DataEndpoint::TimeSync],
+                self.simulated_discovery_sender(),
+                now_ms,
+                response_bytes.into(),
+            )?);
             return Ok(());
         }
         static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2499,8 +2492,6 @@ mod tests {
 #[cfg(test)]
 mod raw_uart_tests {
     use super::*;
-    use sedsprintf_rs_2026::config::DataEndpoint;
-    use sedsprintf_rs_2026::config::DataType;
     use std::sync::Arc;
 
     #[test]
@@ -2515,14 +2506,14 @@ mod raw_uart_tests {
     #[test]
     fn flight_command_packets_use_raw_uart_data_frame() {
         let pkt = Packet::new(
-            DataType::FlightCommand,
-            &[DataEndpoint::FlightController],
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             "GS",
             123,
             Arc::from([0x0a_u8]),
         )
         .unwrap();
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = serialize::pack_packet(&pkt);
 
         let mut framed = build_raw_uart_frame(&wire).unwrap();
         let decoded = take_raw_uart_framed_payload(&mut framed).unwrap().unwrap();
@@ -2607,13 +2598,13 @@ mod raw_uart_tests {
     #[test]
     fn buffered_serialized_packet_waits_for_complete_packet() {
         let pkt = Packet::from_f32_slice(
-            DataType::GpsData,
+            crate::telemetry_schema::data_type("GPS_DATA"),
             &[1.0, 2.0, 3.0],
-            &[DataEndpoint::GroundStation],
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             123,
         )
         .unwrap();
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = serialize::pack_packet(&pkt);
         let split_at = wire.len() / 2;
         let mut buffered = wire[..split_at].to_vec();
 
@@ -2635,14 +2626,17 @@ mod raw_uart_tests {
     #[test]
     fn tap_non_groundstation_gps_skips_groundstation_addressed_fill_telemetry() {
         let pkt = Packet::new(
-            DataType::FuelTankPressure,
-            &[DataEndpoint::GroundStation, DataEndpoint::SdCard],
+            crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE"),
+            &[
+                crate::telemetry_schema::endpoint("GROUND_STATION"),
+                crate::telemetry_schema::endpoint("SD_CARD"),
+            ],
             "GB",
             123,
             Arc::from(42.0f32.to_le_bytes().to_vec().into_boxed_slice()),
         )
         .unwrap();
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = serialize::pack_packet(&pkt);
         let mut mirrored = None;
         tap_non_groundstation_gps_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
         assert!(mirrored.is_none());
@@ -2651,29 +2645,35 @@ mod raw_uart_tests {
     #[test]
     fn tap_non_groundstation_gps_includes_non_groundstation_gps() {
         let pkt = Packet::from_f32_slice(
-            DataType::GpsData,
+            crate::telemetry_schema::data_type("GPS_DATA"),
             &[1.0, 2.0, 3.0],
-            &[DataEndpoint::SdCard],
+            &[crate::telemetry_schema::endpoint("SD_CARD")],
             123,
         )
         .unwrap();
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = serialize::pack_packet(&pkt);
         let mut mirrored = None;
         tap_non_groundstation_gps_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
-        assert_eq!(mirrored.unwrap().data_type(), DataType::GpsData);
+        assert_eq!(
+            mirrored.unwrap().data_type(),
+            crate::telemetry_schema::data_type("GPS_DATA")
+        );
     }
 
     #[test]
     fn tap_non_groundstation_gps_skips_router_local_control_packets() {
         let pkt = Packet::new(
-            DataType::Heartbeat,
-            &[DataEndpoint::GroundStation, DataEndpoint::HeartBeat],
+            crate::telemetry_schema::data_type("HEARTBEAT"),
+            &[
+                crate::telemetry_schema::endpoint("GROUND_STATION"),
+                crate::telemetry_schema::endpoint("HEART_BEAT"),
+            ],
             "GB",
             123,
             Arc::from([].as_slice()),
         )
         .unwrap();
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = serialize::pack_packet(&pkt);
         let mut mirrored = None;
         tap_non_groundstation_gps_payload(&wire, &mut |pkt| mirrored = Some(pkt.clone()));
         assert!(mirrored.is_none());

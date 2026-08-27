@@ -14,6 +14,7 @@ mod comms_config;
 #[cfg(feature = "testing")]
 mod dummy_packets;
 mod fill_targets;
+mod firmware_update;
 mod flight_setup;
 mod flight_sim;
 mod gpio;
@@ -30,6 +31,7 @@ mod safety_task;
 mod sequences;
 mod state;
 mod telemetry_db;
+mod telemetry_schema;
 mod telemetry_task;
 #[cfg(feature = "test_fire_mode")]
 mod test_fire_csv;
@@ -57,12 +59,10 @@ use crate::comms::{CommsDevice, link_description, open_link, startup_failure_hin
 use crate::comms_config::{CommsLinkConfig, SerialProtocol};
 use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
-use sedsprintf_rs_2026::TelemetryError;
-use sedsprintf_rs_2026::config::DataEndpoint::{Abort, FlightState, GroundStation, HeartBeat};
-use sedsprintf_rs_2026::config::DataType;
-use sedsprintf_rs_2026::packet::Packet;
-use sedsprintf_rs_2026::router::{EndpointHandler, RouterMode, RouterSideOptions};
-use sedsprintf_rs_2026::timesync::{TimeSyncConfig, TimeSyncRole};
+use sedsnet::TelemetryError;
+use sedsnet::packet::Packet;
+use sedsnet::router::{EndpointHandler, RouterSideOptions};
+use sedsnet::timesync::{TimeSyncConfig, TimeSyncRole};
 use sqlx::Row;
 use std::collections::HashMap;
 use std::fs;
@@ -268,6 +268,8 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    telemetry_schema::initialize()?;
+
     // The RF-board link needs scheduled uplink/downlink windows. An RFD900x is a
     // transparent serial link, so set this to false when using one.
     let radio_scheduler_enabled = false;
@@ -442,8 +444,9 @@ async fn main() -> anyhow::Result<()> {
     let flight_state_handler_state_clone = state.clone();
     let heartbeat_handler_state_clone = state.clone();
 
-    let ground_station_handler =
-        EndpointHandler::new_packet_handler(GroundStation, move |pkt: &Packet| {
+    let ground_station_handler = EndpointHandler::new_packet_handler(
+        telemetry_schema::endpoint("GROUND_STATION"),
+        move |pkt: &Packet| {
             ground_station_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
@@ -453,46 +456,55 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap();
             rb.push(pkt.clone());
             Ok(())
-        });
+        },
+    );
 
-    let flight_state_handler =
-        EndpointHandler::new_packet_handler(FlightState, move |pkt: &Packet| {
+    let flight_state_handler = EndpointHandler::new_packet_handler(
+        telemetry_schema::endpoint("FLIGHT_STATE"),
+        move |pkt: &Packet| {
             flight_state_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             flight_state_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
             let mut rb = flight_state_handler_state_clone.ring_buffer.lock().unwrap();
             rb.push(pkt.clone());
             Ok(())
-        });
+        },
+    );
 
-    let abort_handler = EndpointHandler::new_packet_handler(Abort, move |pkt: &Packet| {
-        abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
-        abort_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
-        abort_handler_state_clone.clear_launch_sequence_command_pending();
-        abort_handler_state_clone.set_abort_indicator_latched(true);
-        crate::sequences::refresh_action_policy_now(&abort_handler_state_clone);
-        abort_handler_state_clone.broadcast_action_policy_snapshot();
-        let error_msg = pkt
-            .data_as_string()
-            .unwrap_or_else(|_| String::from_utf8_lossy(pkt.payload()).into_owned());
-        log::error!(
-            "abort packet received sender={} endpoints={:?} message={error_msg}",
-            pkt.sender(),
-            pkt.endpoints()
-        );
-        emit_error(&abort_handler_state_clone, error_msg);
-        Ok(())
-    });
+    let abort_handler = EndpointHandler::new_packet_handler(
+        telemetry_schema::endpoint("ABORT"),
+        move |pkt: &Packet| {
+            abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+            abort_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
+            abort_handler_state_clone.clear_launch_sequence_command_pending();
+            abort_handler_state_clone.set_abort_indicator_latched(true);
+            crate::sequences::refresh_action_policy_now(&abort_handler_state_clone);
+            abort_handler_state_clone.broadcast_action_policy_snapshot();
+            let error_msg = pkt
+                .data_as_string()
+                .unwrap_or_else(|_| String::from_utf8_lossy(pkt.payload()).into_owned());
+            log::error!(
+                "abort packet received sender={} endpoints={:?} message={error_msg}",
+                pkt.sender(),
+                pkt.endpoints()
+            );
+            emit_error(&abort_handler_state_clone, error_msg);
+            Ok(())
+        },
+    );
 
-    let heartbeat_handler = EndpointHandler::new_packet_handler(HeartBeat, move |pkt: &Packet| {
-        heartbeat_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
-        heartbeat_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
-        let mut rb = heartbeat_handler_state_clone.ring_buffer.lock().unwrap();
-        rb.push(pkt.clone());
-        Ok(())
-    });
+    let heartbeat_handler = EndpointHandler::new_packet_handler(
+        telemetry_schema::endpoint("HEART_BEAT"),
+        move |pkt: &Packet| {
+            heartbeat_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+            heartbeat_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
+            let mut rb = heartbeat_handler_state_clone.ring_buffer.lock().unwrap();
+            rb.push(pkt.clone());
+            Ok(())
+        },
+    );
 
-    let mut cfg = sedsprintf_rs_2026::router::RouterConfig::new([
+    let mut cfg = sedsnet::router::RouterConfig::new([
         ground_station_handler,
         abort_handler,
         flight_state_handler,
@@ -554,24 +566,21 @@ async fn main() -> anyhow::Result<()> {
         .fill_comms_connected
         .store(fill_comms_connected, Ordering::Relaxed);
 
-    let router = Arc::new(sedsprintf_rs_2026::router::Router::new(
-        RouterMode::Relay,
-        cfg,
-    ));
+    let router = Arc::new(sedsnet::router::Router::new(cfg));
     set_network_time_router(router.clone());
     let _ = state.topology_router.set(router.clone());
 
     let (rocket_tx, rocket_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    telemetry_task::register_flight_command_tx_side("rocket_comms", rocket_tx.clone());
 
     let rocket_side = {
         let rocket_tx = rocket_tx.clone();
         let opts = RouterSideOptions {
             reliable_enabled: router_hop_reliable_enabled(&comms_links.av_bay),
             link_local_enabled: false,
+            ..Default::default()
         };
-        router.add_side_serialized_with_options(
+        router.add_side_packed_with_options(
             "rocket_comms",
             move |pkt| {
                 rocket_tx
@@ -591,8 +600,9 @@ async fn main() -> anyhow::Result<()> {
             // GroundStation-addressed traffic and local heartbeat/discovery flow) to traverse
             // the physical link so it can forward them back out over its UART/USB bridge.
             link_local_enabled: true,
+            ..Default::default()
         };
-        router.add_side_serialized_with_options(
+        router.add_side_packed_with_options(
             "umbilical_comms",
             move |pkt| {
                 umbilical_tx
@@ -617,7 +627,10 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("WARNING: failed to queue initial discovery announce: {err}");
     }
 
-    router.log_queue(DataType::FlightState, &[FlightStateMode::Startup as u8])?;
+    router.log_queue(
+        crate::telemetry_schema::data_type("FLIGHT_STATE"),
+        &[FlightStateMode::Startup as u8],
+    )?;
 
     // --- Background tasks ---
     let telemetry_shutdown_rx = state.shutdown_subscribe();

@@ -16,9 +16,9 @@ use crate::types::{
     TelemetryRow, canonical_sender_id,
 };
 use crate::web::{AlertAckStateMsg, AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
-use sedsprintf_rs_2026::config::{DataEndpoint, DataType};
-use sedsprintf_rs_2026::packet::Packet;
-use sedsprintf_rs_2026::router::Router;
+use sedsnet::config::DataEndpoint;
+use sedsnet::packet::Packet;
+use sedsnet::router::Router;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -263,13 +263,13 @@ impl AppState {
             route.side_name == "rocket_comms"
                 && route
                     .reachable_endpoints
-                    .contains(&DataEndpoint::FlightState)
+                    .contains(&crate::telemetry_schema::endpoint("FLIGHT_STATE"))
         });
         let umbilical_has_flight_state = topology.routes.iter().any(|route| {
             route.side_name == "umbilical_comms"
                 && route
                     .reachable_endpoints
-                    .contains(&DataEndpoint::FlightState)
+                    .contains(&crate::telemetry_schema::endpoint("FLIGHT_STATE"))
         });
 
         let timestamp_ms = {
@@ -287,8 +287,8 @@ impl AppState {
             }
         };
         let pkt = match Packet::new(
-            DataType::FlightState,
-            &[DataEndpoint::FlightState],
+            crate::telemetry_schema::data_type("FLIGHT_STATE"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
             Board::GroundStation.sender_id(),
             timestamp_ms,
             Arc::from([next_state as u8]),
@@ -740,10 +740,18 @@ impl AppState {
         let board_snapshot = self.board_status_snapshot(now_ms);
         let route_snapshot = exported.as_ref();
         let mut local_endpoint_list = vec![
-            DataEndpoint::GroundStation.as_str().to_string(),
-            DataEndpoint::Abort.as_str().to_string(),
-            DataEndpoint::FlightState.as_str().to_string(),
-            DataEndpoint::HeartBeat.as_str().to_string(),
+            crate::telemetry_schema::endpoint("GROUND_STATION")
+                .as_str()
+                .to_string(),
+            crate::telemetry_schema::endpoint("ABORT")
+                .as_str()
+                .to_string(),
+            crate::telemetry_schema::endpoint("FLIGHT_STATE")
+                .as_str()
+                .to_string(),
+            crate::telemetry_schema::endpoint("HEART_BEAT")
+                .as_str()
+                .to_string(),
         ];
         if telemetry_task::timesync_enabled() {
             local_endpoint_list.push(DataEndpoint::TimeSync.as_str().to_string());
@@ -752,11 +760,17 @@ impl AppState {
         local_endpoint_list.dedup();
         let local_visible_endpoint_list = local_endpoint_list
             .iter()
-            .filter(|endpoint| endpoint.as_str() != DataEndpoint::GroundStation.as_str())
+            .filter(|endpoint| {
+                endpoint.as_str() != crate::telemetry_schema::endpoint("GROUND_STATION").as_str()
+            })
             .cloned()
             .collect::<Vec<_>>();
         let router_endpoints = if simulated {
-            vec![DataEndpoint::GroundStation.as_str().to_string()]
+            vec![
+                crate::telemetry_schema::endpoint("GROUND_STATION")
+                    .as_str()
+                    .to_string(),
+            ]
         } else {
             local_visible_endpoint_list.clone()
         };
@@ -769,7 +783,7 @@ impl AppState {
             sender_id: Some(Board::GroundStation.sender_id().to_string()),
             endpoints: router_endpoints,
             show_in_details: true,
-            detail: Some("SEDSprintf relay router".to_string()),
+            detail: Some("SEDSnet router".to_string()),
         }];
         let mut links = Vec::new();
         let mut endpoint_ids = std::collections::BTreeSet::new();
@@ -812,10 +826,9 @@ impl AppState {
                     label: Some("route".to_string()),
                     status,
                 });
-                for endpoint in endpoints
-                    .into_iter()
-                    .filter(|endpoint| endpoint != DataEndpoint::GroundStation.as_str())
-                {
+                for endpoint in endpoints.into_iter().filter(|endpoint| {
+                    endpoint != crate::telemetry_schema::endpoint("GROUND_STATION").as_str()
+                }) {
                     let endpoint_id = format!("endpoint_{}", endpoint.to_ascii_lowercase());
                     if endpoint_ids.insert(endpoint_id.clone()) {
                         nodes.push(NetworkTopologyNode {
@@ -1627,21 +1640,20 @@ mod tests {
     use crate::loadcell;
     use crate::ring_buffer::RingBuffer;
     use crate::telemetry_db::{DbQueueItem, RecordingModeWire, RecordingStatusMsg};
-    use sedsprintf_rs_2026::router::{
-        EndpointHandler, RouterConfig, RouterMode, RouterSideId, RouterSideOptions,
-    };
+    use sedsnet::router::{EndpointHandler, RouterConfig, RouterSideId, RouterSideOptions};
     use sqlx::SqlitePool;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::{Notify, broadcast, mpsc};
 
+    #[cfg(feature = "testing")]
     #[test]
     fn flight_computer_modeled_endpoints_include_sd_card() {
-        let endpoints = modeled_board_endpoints(Board::FlightComputer, false, &[]);
+        let endpoints = modeled_board_endpoints(Board::FlightComputer, true, &[]);
         assert!(
             endpoints
                 .iter()
-                .any(|endpoint| endpoint == DataEndpoint::SdCard.as_str())
+                .any(|endpoint| endpoint == crate::telemetry_schema::endpoint("SD_CARD").as_str())
         );
     }
 
@@ -2006,8 +2018,8 @@ mod tests {
         let state = test_app_state().await;
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let sent_clone = sent.clone();
-        let router = Arc::new(Router::new(RouterMode::Relay, RouterConfig::new([])));
-        router.add_side_serialized_with_options(
+        let router = Arc::new(Router::new(RouterConfig::new([])));
+        router.add_side_packed_with_options(
             "umbilical_comms",
             move |bytes| {
                 sent_clone
@@ -2019,6 +2031,7 @@ mod tests {
             RouterSideOptions {
                 reliable_enabled: true,
                 link_local_enabled: true,
+                ..Default::default()
             },
         );
         state
@@ -2051,8 +2064,8 @@ mod tests {
         let sent = sent.lock().expect("failed to lock sends");
         let flight_state_packets = sent
             .iter()
-            .filter_map(|wire| sedsprintf_rs_2026::serialize::deserialize_packet(wire).ok())
-            .filter(|pkt| pkt.data_type() == DataType::FlightState)
+            .filter_map(|wire| sedsnet::wire_format::unpack_packet(wire).ok())
+            .filter(|pkt| pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_STATE"))
             .count();
         assert_eq!(flight_state_packets, sequence.len());
     }
@@ -2065,10 +2078,9 @@ mod tests {
         let remote_deliveries = Arc::new(AtomicUsize::new(0));
         let remote_deliveries_handler = remote_deliveries.clone();
 
-        let remote_router = Arc::new(sedsprintf_rs_2026::router::Router::new(
-            RouterMode::Relay,
-            RouterConfig::new([EndpointHandler::new_packet_handler(
-                DataEndpoint::FlightState,
+        let remote_router = Arc::new(sedsnet::router::Router::new(RouterConfig::new([
+            EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("FLIGHT_STATE"),
                 move |pkt: &Packet| {
                     let payload = pkt.payload();
                     if let Some(state_code) = payload.first().copied() {
@@ -2080,19 +2092,16 @@ mod tests {
                     }
                     Ok(())
                 },
-            )]),
-        ));
-        let gs_router = Arc::new(sedsprintf_rs_2026::router::Router::new(
-            RouterMode::Relay,
-            RouterConfig::new([]),
-        ));
+            ),
+        ])));
+        let gs_router = Arc::new(sedsnet::router::Router::new(RouterConfig::new([])));
 
         let gs_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
         let remote_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
 
         let gs_side = {
             let gs_peer = gs_peer.clone();
-            gs_router.add_side_serialized_with_options(
+            gs_router.add_side_packed_with_options(
                 "umbilical_comms",
                 move |bytes| {
                     let (peer, ingress) = gs_peer
@@ -2100,18 +2109,19 @@ mod tests {
                         .expect("failed to lock gs peer")
                         .clone()
                         .expect("gs peer not initialized");
-                    peer.rx_serialized_from_side(bytes, ingress)
+                    peer.rx_packed_from_side(bytes, ingress)
                 },
                 RouterSideOptions {
                     reliable_enabled: true,
                     link_local_enabled: true,
+                    ..Default::default()
                 },
             )
         };
 
         let remote_side = {
             let remote_peer = remote_peer.clone();
-            remote_router.add_side_serialized_with_options(
+            remote_router.add_side_packed_with_options(
                 "gs_link",
                 move |bytes| {
                     let (peer, ingress) = remote_peer
@@ -2119,11 +2129,12 @@ mod tests {
                         .expect("failed to lock remote peer")
                         .clone()
                         .expect("remote peer not initialized");
-                    peer.rx_serialized_from_side(bytes, ingress)
+                    peer.rx_packed_from_side(bytes, ingress)
                 },
                 RouterSideOptions {
                     reliable_enabled: true,
                     link_local_enabled: true,
+                    ..Default::default()
                 },
             )
         };

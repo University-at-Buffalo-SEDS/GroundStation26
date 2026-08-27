@@ -103,6 +103,7 @@ def default_layout() -> dict:
                 "detailed": "#0ea5e9",
                 "map": "#22c55e",
                 "actions": "#a78bfa",
+                "firmware-update": "#22d3ee",
                 "calibration": "#14b8a6",
                 "notifications": "#3b82f6",
                 "warnings": "#facc15",
@@ -116,6 +117,7 @@ def default_layout() -> dict:
             "connection-status",
             "map",
             "actions",
+            "firmware-update",
             "calibration",
             "notifications",
             "warnings",
@@ -127,7 +129,7 @@ def default_layout() -> dict:
         "connection_tab": {"sections": []},
         "network_tab": {
             "enabled": False,
-            "title": "SEDSprintf Network",
+            "title": "SEDSnet Network",
             "expected_boards": ["FC", "RF", "PB", "VB", "GB", "AB", "DAQ"],
         },
         "actions_tab": {
@@ -314,6 +316,7 @@ class LayoutEditor(tk.Tk):
             "connection-status",
             "map",
             "actions",
+            "firmware-update",
             "calibration",
             "notifications",
             "warnings",
@@ -2129,6 +2132,7 @@ class LayoutEditor(tk.Tk):
                 "connection-status",
                 "map",
                 "actions",
+                "firmware-update",
                 "calibration",
                 "notifications",
                 "warnings",
@@ -2153,7 +2157,7 @@ class LayoutEditor(tk.Tk):
         self.data.setdefault("connection_tab", {}).setdefault("sections", [])
         network = self.data.setdefault("network_tab", {})
         network.setdefault("enabled", False)
-        network.setdefault("title", "SEDSprintf Network")
+        network.setdefault("title", "SEDSnet Network")
         network.setdefault("expected_boards", ["FC", "RF", "PB", "VB", "GB", "AB", "DAQ"])
         actions_tab = self.data.setdefault("actions_tab", {})
         actions_tab.setdefault("disable_actions_by_default", False)

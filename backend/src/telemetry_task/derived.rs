@@ -264,7 +264,9 @@ pub(super) fn update_vehicle_speed_estimate(
     let mut state = state_cell.lock().unwrap();
 
     match data_type {
-        dt if dt == DataType::AccelData.as_str() || dt == DataType::IMUData.as_str() => {
+        dt if dt == crate::telemetry_schema::data_type("ACCEL_DATA").as_str()
+            || dt == crate::telemetry_schema::data_type("IMU_DATA").as_str() =>
+        {
             if let Some(accel_z_mps2) = values.get(2).copied().flatten()
                 && accel_z_mps2.is_finite()
             {
@@ -272,7 +274,7 @@ pub(super) fn update_vehicle_speed_estimate(
                 state.accel_ts_ms = Some(ts_ms);
             }
         }
-        dt if dt == DataType::BarometerData.as_str() => {
+        dt if dt == crate::telemetry_schema::data_type("BAROMETER_DATA").as_str() => {
             if let Some(altitude_m) = values.get(2).copied().flatten()
                 && altitude_m.is_finite()
             {
@@ -291,7 +293,7 @@ pub(super) fn update_vehicle_speed_estimate(
                 );
             }
         }
-        dt if dt == DataType::GpsData.as_str() => {
+        dt if dt == crate::telemetry_schema::data_type("GPS_DATA").as_str() => {
             if let Some(altitude_m) = values.get(2).copied().flatten()
                 && altitude_m.is_finite()
             {
@@ -576,11 +578,12 @@ pub(super) async fn emit_derived_loadcell_rows(
     db_overflow: &DbOverflow,
     sample: DerivedLoadcellSample<'_>,
 ) {
-    let calibration_sensor_id = if sample.sensor_id == DataType::FuelTankPressure.as_str() {
-        loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
-    } else {
-        sample.sensor_id
-    };
+    let calibration_sensor_id =
+        if sample.sensor_id == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE").as_str() {
+            loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
+        } else {
+            sample.sensor_id
+        };
     let cfg = state.loadcell_calibration.lock().unwrap().clone();
     let Some(calibrated_value) =
         loadcell::calibrated_sensor_value(&cfg, calibration_sensor_id, sample.raw_value)
@@ -731,7 +734,7 @@ pub(super) fn f32_values_from_payload_bytes(bytes: &[u8]) -> Option<Vec<Option<f
 pub(super) fn telemetry_f32_values(pkt: &Packet) -> Option<Vec<Option<f32>>> {
     match pkt.data_as_f32() {
         Ok(values) => Some(values.into_iter().map(Some).collect()),
-        Err(_) if pkt.data_type() == DataType::GpsData => {
+        Err(_) if pkt.data_type() == crate::telemetry_schema::data_type("GPS_DATA") => {
             f32_values_from_payload_bytes(pkt.payload())
         }
         Err(_) => None,
@@ -757,18 +760,40 @@ pub(super) fn telemetry_rows_from_packet_values(
     mut values: Vec<Option<f32>>,
 ) -> Vec<(String, Vec<Option<f32>>)> {
     match pkt.data_type() {
-        DataType::GpsData => {
+        ty if ty == crate::telemetry_schema::data_type("GPS_DATA") => {
             values = normalized_gps_values(state, sender_id, &values);
-            vec![(DataType::GpsData.as_str().to_string(), values)]
+            vec![(
+                crate::telemetry_schema::data_type("GPS_DATA")
+                    .as_str()
+                    .to_string(),
+                values,
+            )]
         }
-        DataType::IMUData => split_imu_values(&values)
+        ty if ty == crate::telemetry_schema::data_type("IMU_DATA") => split_imu_values(&values)
             .map(|(accel, gyro)| {
                 vec![
-                    (DataType::AccelData.as_str().to_string(), accel),
-                    (DataType::GyroData.as_str().to_string(), gyro),
+                    (
+                        crate::telemetry_schema::data_type("ACCEL_DATA")
+                            .as_str()
+                            .to_string(),
+                        accel,
+                    ),
+                    (
+                        crate::telemetry_schema::data_type("GYRO_DATA")
+                            .as_str()
+                            .to_string(),
+                        gyro,
+                    ),
                 ]
             })
-            .unwrap_or_else(|| vec![(DataType::IMUData.as_str().to_string(), values)]),
+            .unwrap_or_else(|| {
+                vec![(
+                    crate::telemetry_schema::data_type("IMU_DATA")
+                        .as_str()
+                        .to_string(),
+                    values,
+                )]
+            }),
         _ => vec![(pkt.data_type().as_str().to_string(), values)],
     }
 }

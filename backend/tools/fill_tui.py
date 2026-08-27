@@ -26,19 +26,17 @@ except ModuleNotFoundError as e:
         "Missing dependency 'pyserial'. Install it with `python -m pip install pyserial`."
     ) from e
 
+os.environ.setdefault(
+    "SEDSNET_STATIC_SCHEMA_PATH",
+    str(Path(__file__).resolve().parents[1] / "config" / "telemetry_config.json"),
+)
 try:
-    import sedsprintf_rs_2026 as seds
-except ModuleNotFoundError:
-    try:
-        import sedsprintf_rs as seds
-    except ModuleNotFoundError as e:
-        raise SystemExit(
-            "Missing dependency 'sedsprintf_rs_2026' or 'sedsprintf_rs'. Build/install the Python module first."
-        ) from e
+    import sedsnet as seds
+except ModuleNotFoundError as e:
+    raise SystemExit("Missing dependency 'sedsnet'. Install SEDSnet 4.0.2 first.") from e
 
 DT = seds.DataType
 EP = seds.DataEndpoint
-RM = seds.RouterMode
 
 SERIAL_DEFAULT_BAUD = 57_600
 SERIAL_OVERRIDE_DEFAULT_BAUD = 115_200
@@ -962,9 +960,8 @@ class FillLinkApp:
                 (ACTUATOR_BOARD_ENDPOINT, self._on_packet, None),
                 (SD_CARD_ENDPOINT, self._on_packet, None),
             ],
-            mode=RM.Sink,
         )
-        self.side_id = self.router.add_side_serialized("fill_link", self.transport.send_serialized)
+        self.side_id = self.router.add_side_packed("fill_link", self.transport.send_serialized)
         self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
 
     def start(self) -> None:
@@ -1015,7 +1012,7 @@ class FillLinkApp:
                     self.raw_rx_count += 1
                     self.last_rx_ms = now_ms()
                     self.status = f"RX bytes {len(packet)}"
-                self.router.receive_serialized_queue_from_side(self.side_id, packet)
+                self.router.receive_packed_queue_from_side(self.side_id, packet)
                 self.router.process_all_queues()
             except Exception as err:
                 with self.lock:
@@ -1031,7 +1028,7 @@ class FillLinkApp:
             timestamp_ms=now_ms(),
             payload=bytes([spec.command_id]),
         )
-        wire = bytes(packet.serialize())
+        wire = bytes(packet.pack())
         self.transport.send_serialized(wire)
         with self.lock:
             self.tx_metadata.appendleft(
