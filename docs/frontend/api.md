@@ -352,8 +352,13 @@ Firmware updates use the LaunchCore delta protocol over a routed SEDSnet v4 P2P 
 `send_commands`; a restricted command allowlist must also include `FirmwareUpdate`. Read-only status endpoints require
 `view_data`. Only one update may be active at a time.
 
-- `GET /api/firmware/targets` lists `FC`, `RF`, `PB`, `VB`, `GB`, `AB`, and `DAQ`, including whether each hostname is
-  currently present in the SEDSnet address book.
+The sibling 2026 firmware repositories currently expose this live receiver only in `ActuatorBoard26`, on port 4510.
+The other board entries are reported as unsupported until their application firmware implements the same receiver.
+ActuatorBoard's build may also emit a full-image `.seds` fallback when a delta cannot be generated or does not fit; that
+artifact is intentionally rejected here because its supported workflow is UART bootloader recovery, not live SEDSnet OTA.
+
+- `GET /api/firmware/targets` lists `FC`, `RF`, `PB`, `VB`, `GB`, `AB`, and `DAQ`, including discovery, live-OTA support,
+  workflow, and the reason an entry is unavailable.
 - `POST /api/firmware/flash/{board}` accepts a raw `.seds` firmware artifact as the request body and returns `202 Accepted` with
   a job object. Set `Content-Type: application/octet-stream` and the required `X-Firmware-Filename` header; the filename
   must end in `.seds`.

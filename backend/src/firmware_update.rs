@@ -11,6 +11,11 @@ pub const OTA_STREAM_PORT: u16 = 4510;
 pub const OTA_MAX_CHUNK: usize = 120;
 pub const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
 
+const LAUNCHCORE_DELTA_MAGIC: u32 = 0x4C43_4450;
+const LAUNCHCORE_IMAGE_MAGIC: u32 = 0x4C43_494D;
+const LAUNCHCORE_DELTA_VERSION: u16 = 1;
+const LAUNCHCORE_DELTA_HEADER_SIZE: usize = 100;
+
 const OTA_OP_BEGIN_DELTA: u8 = 0x01;
 const OTA_OP_CHUNK: u8 = 0x02;
 const OTA_OP_FINISH: u8 = 0x03;
@@ -231,6 +236,12 @@ pub fn start_update(
     if board == Board::GroundStation {
         return Err("the ground station cannot be an OTA target".to_string());
     }
+    if !supports_live_ota(board) {
+        return Err(format!(
+            "{} does not expose a live SEDSnet OTA receiver in its current firmware",
+            board.as_str()
+        ));
+    }
     if firmware.is_empty() {
         return Err("firmware upload is empty".to_string());
     }
@@ -243,6 +254,7 @@ pub fn start_update(
     if firmware.len() > u32::MAX as usize {
         return Err("firmware upload is too large for the OTA protocol".to_string());
     }
+    validate_live_ota_artifact(&firmware)?;
     if router.resolve_hostname(board.sender_id()).is_none() {
         return Err(format!(
             "{} ({}) is not present in the SEDSnet address book",
@@ -597,6 +609,72 @@ pub fn validate_firmware_filename(filename: &str) -> Result<String, String> {
     Ok(filename)
 }
 
+/// Returns whether the checked-in firmware for a board implements the live OTA stream service.
+pub fn supports_live_ota(board: Board) -> bool {
+    // Audited against the sibling 2026 firmware repositories. ActuatorBoard26 currently owns
+    // the sole application-side OTA receiver (`Core/Src/ota_stream.c`, stream port 4510).
+    board == Board::ActuatorBoard
+}
+
+/// Rejects recovery/full-image `.seds` files and malformed deltas before opening a board stream.
+fn validate_live_ota_artifact(firmware: &[u8]) -> Result<(), String> {
+    if firmware.len() < 4 {
+        return Err(".seds artifact is too small to contain a LaunchCore header".to_string());
+    }
+    let magic = u32::from_le_bytes(firmware[0..4].try_into().expect("four-byte magic"));
+    if magic == LAUNCHCORE_IMAGE_MAGIC {
+        return Err(
+            "this .seds file is a full-image recovery artifact; the current board workflow requires UART bootloader recovery"
+                .to_string(),
+        );
+    }
+    if magic != LAUNCHCORE_DELTA_MAGIC {
+        return Err(".seds artifact is not a LaunchCore delta".to_string());
+    }
+    if firmware.len() < LAUNCHCORE_DELTA_HEADER_SIZE {
+        return Err("LaunchCore delta header is truncated".to_string());
+    }
+    let version = u16::from_le_bytes(firmware[4..6].try_into().expect("two-byte version"));
+    let header_size =
+        u16::from_le_bytes(firmware[6..8].try_into().expect("two-byte header size")) as usize;
+    let total_size =
+        u32::from_le_bytes(firmware[8..12].try_into().expect("four-byte total size")) as usize;
+    let erase_size = u32::from_le_bytes(firmware[12..16].try_into().expect("four-byte erase size"));
+    let record_count =
+        u32::from_le_bytes(firmware[24..28].try_into().expect("four-byte record count"));
+    let records_offset = u32::from_le_bytes(
+        firmware[28..32]
+            .try_into()
+            .expect("four-byte records offset"),
+    ) as usize;
+    if version != LAUNCHCORE_DELTA_VERSION
+        || header_size != LAUNCHCORE_DELTA_HEADER_SIZE
+        || records_offset != header_size
+        || total_size != firmware.len()
+        || erase_size == 0
+        || record_count == 0
+    {
+        return Err(".seds artifact has an invalid LaunchCore delta header".to_string());
+    }
+    let expected_crc =
+        u32::from_le_bytes(firmware[96..100].try_into().expect("four-byte header CRC"));
+    if crc32(&firmware[..96]) != expected_crc {
+        return Err(".seds artifact has an invalid LaunchCore delta header CRC".to_string());
+    }
+    Ok(())
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -668,6 +746,41 @@ mod tests {
             validate_firmware_filename("FIRMWARE.SEDS").unwrap(),
             "FIRMWARE.SEDS"
         );
+    }
+
+    #[test]
+    fn exposes_only_the_checked_in_live_ota_receiver() {
+        for board in Board::ALL.iter().copied() {
+            assert_eq!(supports_live_ota(board), board == Board::ActuatorBoard);
+        }
+    }
+
+    #[test]
+    fn validates_launchcore_delta_artifacts_and_rejects_recovery_images() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        let mut delta = vec![0_u8; LAUNCHCORE_DELTA_HEADER_SIZE + 1];
+        delta[0..4].copy_from_slice(&LAUNCHCORE_DELTA_MAGIC.to_le_bytes());
+        delta[4..6].copy_from_slice(&LAUNCHCORE_DELTA_VERSION.to_le_bytes());
+        delta[6..8].copy_from_slice(&(LAUNCHCORE_DELTA_HEADER_SIZE as u16).to_le_bytes());
+        let delta_size = delta.len() as u32;
+        delta[8..12].copy_from_slice(&delta_size.to_le_bytes());
+        delta[12..16].copy_from_slice(&2048_u32.to_le_bytes());
+        delta[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        delta[28..32].copy_from_slice(&(LAUNCHCORE_DELTA_HEADER_SIZE as u32).to_le_bytes());
+        let header_crc = crc32(&delta[..96]);
+        delta[96..100].copy_from_slice(&header_crc.to_le_bytes());
+        validate_live_ota_artifact(&delta).unwrap();
+
+        let mut recovery = vec![0_u8; 256];
+        recovery[0..4].copy_from_slice(&LAUNCHCORE_IMAGE_MAGIC.to_le_bytes());
+        assert!(
+            validate_live_ota_artifact(&recovery)
+                .unwrap_err()
+                .contains("UART bootloader recovery")
+        );
+
+        delta[8..12].copy_from_slice(&999_u32.to_le_bytes());
+        assert!(validate_live_ota_artifact(&delta).is_err());
     }
 
     #[tokio::test]

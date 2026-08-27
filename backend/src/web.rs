@@ -1434,8 +1434,11 @@ struct FirmwareTarget {
     board_label: String,
     hostname: String,
     discovered: bool,
+    supported: bool,
     ota_stream_port: u16,
     artifact_kind: &'static str,
+    workflow: &'static str,
+    unavailable_reason: Option<&'static str>,
 }
 
 /// Lists every board that can be addressed by the common LaunchCore OTA stream protocol.
@@ -1457,8 +1460,17 @@ async fn get_firmware_targets(
             hostname: board.sender_id().to_string(),
             discovered: router
                 .is_some_and(|router| router.resolve_hostname(board.sender_id()).is_some()),
+            supported: firmware_update::supports_live_ota(board),
             ota_stream_port: firmware_update::OTA_STREAM_PORT,
             artifact_kind: "launchcore_delta",
+            workflow: if firmware_update::supports_live_ota(board) {
+                "sedsnet_delta"
+            } else {
+                "unavailable"
+            },
+            unavailable_reason: (!firmware_update::supports_live_ota(board)).then_some(
+                "current board firmware does not implement the live SEDSnet OTA receiver",
+            ),
         })
         .collect::<Vec<_>>();
     Json(targets).into_response()
