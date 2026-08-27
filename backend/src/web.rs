@@ -1489,7 +1489,7 @@ async fn get_firmware_update(
     }
 }
 
-/// Accepts a raw LaunchCore delta artifact and starts an asynchronous SEDSnet stream transfer.
+/// Accepts a `.seds` firmware artifact and starts an asynchronous SEDSnet stream transfer.
 async fn start_firmware_update(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1509,11 +1509,20 @@ async fn start_firmware_update(
     let Some(board) = firmware_update::parse_board_target(&board) else {
         return (StatusCode::BAD_REQUEST, "unknown firmware target board").into_response();
     };
-    let filename = headers
+    let Some(filename) = headers
         .get("x-firmware-filename")
         .and_then(|value| value.to_str().ok())
-        .unwrap_or("firmware.delta")
-        .to_string();
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "X-Firmware-Filename is required and must end in .seds",
+        )
+            .into_response();
+    };
+    let filename = match firmware_update::validate_firmware_filename(filename) {
+        Ok(filename) => filename,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
     let firmware = match to_bytes(body, firmware_update::MAX_UPLOAD_BYTES).await {
         Ok(bytes) => bytes.to_vec(),
         Err(_) => {

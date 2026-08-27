@@ -354,8 +354,9 @@ Firmware updates use the LaunchCore delta protocol over a routed SEDSnet v4 P2P 
 
 - `GET /api/firmware/targets` lists `FC`, `RF`, `PB`, `VB`, `GB`, `AB`, and `DAQ`, including whether each hostname is
   currently present in the SEDSnet address book.
-- `POST /api/firmware/flash/{board}` accepts the raw delta artifact as the request body and returns `202 Accepted` with
-  a job object. Set `Content-Type: application/octet-stream` and optionally `X-Firmware-Filename`.
+- `POST /api/firmware/flash/{board}` accepts a raw `.seds` firmware artifact as the request body and returns `202 Accepted` with
+  a job object. Set `Content-Type: application/octet-stream` and the required `X-Firmware-Filename` header; the filename
+  must end in `.seds`.
 - `GET /api/firmware/updates` returns recent jobs.
 - `GET /api/firmware/updates/{id}` returns progress for one job.
 - `POST /api/firmware/updates/{id}/cancel` aborts an active transfer and resets its stream.
@@ -366,8 +367,8 @@ Example:
 curl -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/octet-stream" \
-  -H "X-Firmware-Filename: ActuationBoard.delta" \
-  --data-binary @ActuationBoard.delta \
+  -H "X-Firmware-Filename: ActuationBoard.seds" \
+  --data-binary @ActuationBoard.seds \
   http://localhost:3000/api/firmware/flash/AB
 ```
 

@@ -227,6 +227,7 @@ pub fn start_update(
     filename: String,
     firmware: Vec<u8>,
 ) -> Result<FirmwareUpdateStatus, String> {
+    let filename = validate_firmware_filename(&filename)?;
     if board == Board::GroundStation {
         return Err("the ground station cannot be an OTA target".to_string());
     }
@@ -250,7 +251,6 @@ pub fn start_update(
         ));
     }
 
-    let filename = sanitize_filename(&filename);
     let (id, cancel) = MANAGER.create_job(board, filename, firmware.len())?;
     let status = MANAGER.get(id).expect("new firmware update must exist");
     tokio::spawn(run_update(id, router, board, firmware, cancel));
@@ -579,10 +579,22 @@ fn sanitize_filename(filename: &str) -> String {
         .take(128)
         .collect::<String>();
     if safe.is_empty() {
-        "firmware.delta".to_string()
+        "firmware.seds".to_string()
     } else {
         safe
     }
+}
+
+/// Sanitizes an upload name and requires the SEDS firmware artifact extension.
+pub fn validate_firmware_filename(filename: &str) -> Result<String, String> {
+    if filename.trim().is_empty() {
+        return Err("firmware filename is required".to_string());
+    }
+    let filename = sanitize_filename(filename);
+    if !filename.to_ascii_lowercase().ends_with(".seds") {
+        return Err("firmware filename must use the .seds extension".to_string());
+    }
+    Ok(filename)
 }
 
 fn now_ms() -> u64 {
@@ -642,8 +654,19 @@ mod tests {
     #[test]
     fn strips_paths_and_unsafe_filename_characters() {
         assert_eq!(
-            sanitize_filename("../../build/fw update.delta"),
-            "fwupdate.delta"
+            validate_firmware_filename("../../build/fw update.seds").unwrap(),
+            "fwupdate.seds"
+        );
+    }
+
+    #[test]
+    fn rejects_non_seds_firmware_artifacts() {
+        for filename in ["firmware.bin", "firmware.delta", "firmware.seds.zip", ""] {
+            assert!(validate_firmware_filename(filename).is_err(), "{filename}");
+        }
+        assert_eq!(
+            validate_firmware_filename("FIRMWARE.SEDS").unwrap(),
+            "FIRMWARE.SEDS"
         );
     }
 
