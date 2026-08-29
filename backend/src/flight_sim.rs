@@ -1551,11 +1551,9 @@ mod tests {
     #[test]
     fn flight_computer_simulated_endpoints_include_sd_card() {
         let endpoints = super::simulated_board_endpoints(crate::types::Board::FlightComputer);
-        assert!(
-            endpoints.iter().any(|endpoint| {
-                endpoint == crate::telemetry_schema::endpoint("SD_CARD").as_str()
-            })
-        );
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint.as_str() == &*crate::telemetry_schema::endpoint("SD_CARD").as_str()
+        }));
     }
 
     #[cfg(feature = "testing")]

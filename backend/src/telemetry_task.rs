@@ -1402,7 +1402,7 @@ async fn handle_packet(
             report_parse_error(
                 state,
                 &sender_id,
-                pkt.data_type().as_str(),
+                &pkt.data_type().as_str(),
                 "invalid UTF-8 payload",
             );
         }
@@ -1418,7 +1418,7 @@ async fn handle_packet(
                 report_parse_error(
                     state,
                     &sender_id,
-                    pkt.data_type().as_str(),
+                    &pkt.data_type().as_str(),
                     "invalid UTF-8 payload",
                 );
                 "Telemetry message with invalid UTF-8 payload".to_string()
@@ -1452,7 +1452,7 @@ async fn handle_packet(
                 report_parse_error(
                     state,
                     &sender_id,
-                    pkt.data_type().as_str(),
+                    &pkt.data_type().as_str(),
                     "expected u8 flight-state payload",
                 );
                 return Vec::new();
@@ -1464,7 +1464,7 @@ async fn handle_packet(
                 report_parse_error(
                     state,
                     &sender_id,
-                    pkt.data_type().as_str(),
+                    &pkt.data_type().as_str(),
                     "unknown flight-state code",
                 );
                 return Vec::new();
@@ -1563,7 +1563,7 @@ async fn handle_packet(
         report_parse_error(
             state,
             &sender_id,
-            pkt.data_type().as_str(),
+            &pkt.data_type().as_str(),
             "expected 2-byte umbilical status payload",
         );
         return Vec::new();
@@ -1604,7 +1604,7 @@ async fn handle_packet(
             }
 
             if let Some(first_value) = row_values.first().copied().flatten() {
-                if row_data_type == crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str()
+                if row_data_type == &*crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str()
                     && is_fill_system_battery_sender(&sender_id)
                     && update_fill_system_low_voltage_latch(first_value)
                 {
@@ -1701,7 +1701,7 @@ async fn handle_packet(
         report_parse_error(
             state,
             &sender_id,
-            pkt.data_type().as_str(),
+            &pkt.data_type().as_str(),
             "unable to decode telemetry payload as f32 values",
         );
 
@@ -2756,7 +2756,7 @@ mod tests {
             loop {
                 let row = ws_rx.recv().await.expect("telemetry websocket closed");
                 if row.sender_id == Board::RFBoard.sender_id()
-                    && row.data_type == crate::telemetry_schema::data_type("GPS_DATA").as_str()
+                    && row.data_type == &*crate::telemetry_schema::data_type("GPS_DATA").as_str()
                 {
                     assert_eq!(row.values, gps_values.map(Some).to_vec());
                     break;
@@ -3873,7 +3873,9 @@ mod tests {
 
         assert_eq!(
             row.data_type,
-            crate::telemetry_schema::data_type("GPS_DATA").as_str()
+            crate::telemetry_schema::data_type("GPS_DATA")
+                .as_str()
+                .to_string()
         );
         assert_eq!(row.sender_id, Board::RFBoard.sender_id());
         assert_eq!(row.values.len(), 3);
@@ -3900,7 +3902,9 @@ mod tests {
             }) => {
                 assert_eq!(
                     data_type,
-                    crate::telemetry_schema::data_type("GPS_DATA").as_str()
+                    crate::telemetry_schema::data_type("GPS_DATA")
+                        .as_str()
+                        .to_string()
                 );
                 assert_eq!(sender_id, Board::RFBoard.sender_id());
                 assert_eq!(
@@ -3961,12 +3965,16 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0].data_type,
-            crate::telemetry_schema::data_type("ACCEL_DATA").as_str()
+            crate::telemetry_schema::data_type("ACCEL_DATA")
+                .as_str()
+                .to_string()
         );
         assert_eq!(rows[0].values, vec![Some(0.2), Some(-0.1), Some(9.91)]);
         assert_eq!(
             rows[1].data_type,
-            crate::telemetry_schema::data_type("GYRO_DATA").as_str()
+            crate::telemetry_schema::data_type("GYRO_DATA")
+                .as_str()
+                .to_string()
         );
         assert_eq!(rows[1].values, vec![Some(1.5), Some(-2.5), Some(3.5)]);
 
@@ -3988,7 +3996,9 @@ mod tests {
 
         assert_eq!(
             writes[0].0,
-            crate::telemetry_schema::data_type("ACCEL_DATA").as_str()
+            crate::telemetry_schema::data_type("ACCEL_DATA")
+                .as_str()
+                .to_string()
         );
         assert_eq!(writes[0].1, Board::FlightComputer.sender_id());
         assert_eq!(
@@ -3997,7 +4007,9 @@ mod tests {
         );
         assert_eq!(
             writes[1].0,
-            crate::telemetry_schema::data_type("GYRO_DATA").as_str()
+            crate::telemetry_schema::data_type("GYRO_DATA")
+                .as_str()
+                .to_string()
         );
         assert_eq!(writes[1].1, Board::FlightComputer.sender_id());
         assert_eq!(
@@ -4127,7 +4139,9 @@ mod tests {
 
         assert_eq!(
             row.data_type,
-            crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE").as_str()
+            crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE")
+                .as_str()
+                .to_string()
         );
         assert_eq!(row.values, vec![Some(370.0)]);
         assert!(
@@ -4175,7 +4189,9 @@ mod tests {
 
         assert_eq!(
             row.data_type,
-            crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str()
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE")
+                .as_str()
+                .to_string()
         );
         assert_eq!(row.sender_id, Board::GatewayBoard.sender_id());
         assert_eq!(row.values, vec![Some(14.4)]);
@@ -4234,7 +4250,9 @@ mod tests {
         let rows = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
         assert_eq!(
             rows[0].data_type,
-            crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str()
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE")
+                .as_str()
+                .to_string()
         );
 
         let warning = tokio::time::timeout(Duration::from_millis(100), warnings_rx.recv())
@@ -4359,8 +4377,8 @@ mod tests {
                     sender_id,
                     values_json,
                     ..
-                }))) if data_type
-                    == crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str() =>
+                }))) if data_type.as_str()
+                    == &*crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str() =>
                 {
                     writes.push((sender_id, values_json));
                     if writes.len() == 2 {

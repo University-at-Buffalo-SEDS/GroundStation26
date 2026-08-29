@@ -264,8 +264,8 @@ pub(super) fn update_vehicle_speed_estimate(
     let mut state = state_cell.lock().unwrap();
 
     match data_type {
-        dt if dt == crate::telemetry_schema::data_type("ACCEL_DATA").as_str()
-            || dt == crate::telemetry_schema::data_type("IMU_DATA").as_str() =>
+        dt if dt == &*crate::telemetry_schema::data_type("ACCEL_DATA").as_str()
+            || dt == &*crate::telemetry_schema::data_type("IMU_DATA").as_str() =>
         {
             if let Some(accel_z_mps2) = values.get(2).copied().flatten()
                 && accel_z_mps2.is_finite()
@@ -274,7 +274,7 @@ pub(super) fn update_vehicle_speed_estimate(
                 state.accel_ts_ms = Some(ts_ms);
             }
         }
-        dt if dt == crate::telemetry_schema::data_type("BAROMETER_DATA").as_str() => {
+        dt if dt == &*crate::telemetry_schema::data_type("BAROMETER_DATA").as_str() => {
             if let Some(altitude_m) = values.get(2).copied().flatten()
                 && altitude_m.is_finite()
             {
@@ -293,7 +293,7 @@ pub(super) fn update_vehicle_speed_estimate(
                 );
             }
         }
-        dt if dt == crate::telemetry_schema::data_type("GPS_DATA").as_str() => {
+        dt if dt == &*crate::telemetry_schema::data_type("GPS_DATA").as_str() => {
             if let Some(altitude_m) = values.get(2).copied().flatten()
                 && altitude_m.is_finite()
             {
@@ -578,12 +578,13 @@ pub(super) async fn emit_derived_loadcell_rows(
     db_overflow: &DbOverflow,
     sample: DerivedLoadcellSample<'_>,
 ) {
-    let calibration_sensor_id =
-        if sample.sensor_id == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE").as_str() {
-            loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
-        } else {
-            sample.sensor_id
-        };
+    let calibration_sensor_id = if sample.sensor_id
+        == &*crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE").as_str()
+    {
+        loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
+    } else {
+        sample.sensor_id
+    };
     let cfg = state.loadcell_calibration.lock().unwrap().clone();
     let Some(calibrated_value) =
         loadcell::calibrated_sensor_value(&cfg, calibration_sensor_id, sample.raw_value)

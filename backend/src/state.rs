@@ -583,7 +583,7 @@ impl AppState {
         let mut map = self.board_status.lock().unwrap();
         for route in snapshot.routes {
             saw_active_route = true;
-            let relay_board = match route.side_name {
+            let relay_board = match route.side_name.as_str() {
                 "rocket_comms" => Some(Board::RFBoard),
                 "umbilical_comms" => Some(Board::GatewayBoard),
                 _ => None,
@@ -761,7 +761,7 @@ impl AppState {
         let local_visible_endpoint_list = local_endpoint_list
             .iter()
             .filter(|endpoint| {
-                endpoint.as_str() != crate::telemetry_schema::endpoint("GROUND_STATION").as_str()
+                endpoint.as_str() != &*crate::telemetry_schema::endpoint("GROUND_STATION").as_str()
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -798,8 +798,7 @@ impl AppState {
                     .reachable_endpoints
                     .iter()
                     .copied()
-                    .map(|ep| ep.as_str())
-                    .map(str::to_string)
+                    .map(|ep| ep.as_str().to_string())
                     .collect::<Vec<_>>();
                 endpoints.sort();
                 endpoints.dedup();
@@ -827,7 +826,8 @@ impl AppState {
                     status,
                 });
                 for endpoint in endpoints.into_iter().filter(|endpoint| {
-                    endpoint != crate::telemetry_schema::endpoint("GROUND_STATION").as_str()
+                    endpoint.as_str()
+                        != &*crate::telemetry_schema::endpoint("GROUND_STATION").as_str()
                 }) {
                     let endpoint_id = format!("endpoint_{}", endpoint.to_ascii_lowercase());
                     if endpoint_ids.insert(endpoint_id.clone()) {
@@ -1650,11 +1650,9 @@ mod tests {
     #[test]
     fn flight_computer_modeled_endpoints_include_sd_card() {
         let endpoints = modeled_board_endpoints(Board::FlightComputer, true, &[]);
-        assert!(
-            endpoints
-                .iter()
-                .any(|endpoint| endpoint == crate::telemetry_schema::endpoint("SD_CARD").as_str())
-        );
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint.as_str() == &*crate::telemetry_schema::endpoint("SD_CARD").as_str()
+        }));
     }
 
     #[test]
