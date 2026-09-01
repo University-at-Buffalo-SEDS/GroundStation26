@@ -683,21 +683,28 @@ async fn main() -> anyhow::Result<()> {
         .as_deref()
         == Some("1")
     {
-        let validation_router = router.clone();
-        let validation_state = state.clone();
-        tokio::spawn(async move {
-            let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
-            for _ in 0..100 {
+            let validation_router = router.clone();
+            let validation_state = state.clone();
+            tokio::spawn(async move {
+                let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
+            let mut route_ready = false;
+            for _ in 0..300 {
                 if validation_router
                     .export_topology()
                     .routes
                     .iter()
                     .any(|route| route.reachable_endpoints.contains(&valve_endpoint))
                 {
+                    route_ready = true;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            if !route_ready {
+                log::error!("full-bay valve validation timed out waiting for discovery route");
+                return;
+            }
+            log::info!("full-bay valve discovery route is ready");
 
             let command_type = telemetry_schema::data_type("VALVE_COMMAND");
             let command_endpoints = [
@@ -719,7 +726,7 @@ async fn main() -> anyhow::Result<()> {
             flush_command_tx(&validation_router, "full-bay valve-open validation tx");
             log::info!("full-bay valve-open validation command queued");
 
-            for _ in 0..100 {
+            for _ in 0..150 {
                 if validation_state.get_umbilical_valve_state(ValveBoardCommands::PilotOpen as u8)
                     == Some(true)
                 {
