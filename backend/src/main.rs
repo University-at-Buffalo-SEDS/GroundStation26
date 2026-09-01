@@ -41,6 +41,7 @@ mod web;
 
 use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
+use crate::rocket_commands::ValveBoardCommands;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
@@ -676,6 +677,54 @@ async fn main() -> anyhow::Result<()> {
         db_queue_rx,
         telemetry_shutdown_rx,
     ));
+    if std::env::var("GS_SIM_VALIDATE_VALVE_ROUNDTRIP")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        let validation_router = router.clone();
+        let validation_state = state.clone();
+        tokio::spawn(async move {
+            let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
+            for _ in 0..100 {
+                if validation_router
+                    .export_topology()
+                    .routes
+                    .iter()
+                    .any(|route| route.reachable_endpoints.contains(&valve_endpoint))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            let command_type = telemetry_schema::data_type("VALVE_COMMAND");
+            if let Err(err) =
+                validation_router.log_queue(command_type, &[ValveBoardCommands::PilotOpen as u8])
+            {
+                log::error!("full-bay valve-open validation command failed: {err}");
+                return;
+            }
+            log::info!("full-bay valve-open validation command queued");
+
+            for _ in 0..100 {
+                if validation_state.get_umbilical_valve_state(ValveBoardCommands::PilotOpen as u8)
+                    == Some(true)
+                {
+                    if let Err(err) = validation_router
+                        .log_queue(command_type, &[ValveBoardCommands::PilotClose as u8])
+                    {
+                        log::error!("full-bay valve ACK confirmation command failed: {err}");
+                    } else {
+                        log::info!("full-bay valve ACK reached GroundStation; confirmation queued");
+                    }
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            log::error!("full-bay valve command timed out waiting for board status ACK");
+        });
+    }
     #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
     let mut st = tokio::spawn(safety_task(
         state.clone(),
