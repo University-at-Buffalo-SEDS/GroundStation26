@@ -233,30 +233,42 @@ pub fn load_or_default() -> CommsLinksConfig {
 }
 
 fn apply_simulator_serial_overrides(config: &mut CommsLinksConfig) {
-    for (name, link) in [
-        ("GS_AV_BAY_SERIAL_PORT", &mut config.av_bay),
-        ("GS_FILL_SERIAL_PORT", &mut config.fill_box),
+    for (name, link, fallback_baud_rate) in [
+        (
+            "GS_AV_BAY_SERIAL_PORT",
+            &mut config.av_bay,
+            default_av_bay_baud_rate(),
+        ),
+        ("GS_FILL_SERIAL_PORT", &mut config.fill_box, 115_200),
     ] {
         let Some(port) = std::env::var_os(name) else {
             continue;
         };
         let port = port.to_string_lossy().into_owned();
-        match link {
-            CommsLinkConfig::Serial { serial }
-            | CommsLinkConfig::RaspberryPiGpioUart { serial }
-            | CommsLinkConfig::CustomSerial { serial } => {
-                serial.port = port;
-                serial.protocol = SerialProtocol::RawUart;
-            }
-            _ => {
-                *link = CommsLinkConfig::Serial {
-                    serial: SerialLinkConfig {
-                        port,
-                        baud_rate: default_av_bay_baud_rate(),
-                        protocol: SerialProtocol::RawUart,
-                    },
-                };
-            }
+        apply_simulator_serial_override(link, port, fallback_baud_rate);
+    }
+}
+
+fn apply_simulator_serial_override(
+    link: &mut CommsLinkConfig,
+    port: String,
+    fallback_baud_rate: usize,
+) {
+    match link {
+        CommsLinkConfig::Serial { serial }
+        | CommsLinkConfig::RaspberryPiGpioUart { serial }
+        | CommsLinkConfig::CustomSerial { serial } => {
+            serial.port = port;
+            serial.protocol = SerialProtocol::RawUart;
+        }
+        _ => {
+            *link = CommsLinkConfig::Serial {
+                serial: SerialLinkConfig {
+                    port,
+                    baud_rate: fallback_baud_rate,
+                    protocol: SerialProtocol::RawUart,
+                },
+            };
         }
     }
 }
@@ -374,7 +386,7 @@ fn ensure_serial_protocol(link: &mut serde_json::Value, protocol: SerialProtocol
 mod tests {
     use super::{
         CanLinkConfig, CommsLinkConfig, CommsLinksConfig, I2cLinkConfig, SerialLinkConfig,
-        SerialProtocol, SpiLinkConfig,
+        SerialProtocol, SpiLinkConfig, apply_simulator_serial_override,
     };
 
     #[test]
@@ -401,6 +413,28 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn fill_simulator_override_preserves_gateway_uart_baud_rate() {
+        let mut fill = CommsLinkConfig::I2c {
+            i2c: I2cLinkConfig {
+                bus: 1,
+                addr: 0x55,
+                chunk_delay_ms: 0,
+                initial_wait_ms: 0,
+            },
+        };
+        apply_simulator_serial_override(&mut fill, "/tmp/fill.pty".to_string(), 115_200);
+        assert!(matches!(
+            fill,
+            CommsLinkConfig::Serial {
+                serial: SerialLinkConfig {
+                    baud_rate: 115_200,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]

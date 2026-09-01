@@ -691,10 +691,10 @@ async fn main() -> anyhow::Result<()> {
         .as_deref()
         == Some("1")
     {
-            let validation_router = router.clone();
-            let validation_state = state.clone();
-            tokio::spawn(async move {
-                let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
+        let validation_router = router.clone();
+        let validation_state = state.clone();
+        tokio::spawn(async move {
+            let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
             let mut route_ready = false;
             for _ in 0..300 {
                 if validation_router
@@ -756,10 +756,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Err(err) = close_result {
                         log::error!("full-bay valve ACK confirmation command failed: {err}");
                     } else {
-                        flush_command_tx(
-                            &validation_router,
-                            "full-bay valve ACK confirmation tx",
-                        );
+                        flush_command_tx(&validation_router, "full-bay valve ACK confirmation tx");
                         log::info!("full-bay valve ACK reached GroundStation; confirmation queued");
                     }
                     return;
