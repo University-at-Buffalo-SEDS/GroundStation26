@@ -611,9 +611,18 @@ pub fn validate_firmware_filename(filename: &str) -> Result<String, String> {
 
 /// Returns whether the checked-in firmware for a board implements the live OTA stream service.
 pub fn supports_live_ota(board: Board) -> bool {
-    // Audited against the sibling 2026 firmware repositories. ActuatorBoard26 currently owns
-    // the sole application-side OTA receiver (`Core/Src/ota_stream.c`, stream port 4510).
-    board == Board::ActuatorBoard
+    // Audited against the sibling 2026 firmware repositories. These applications expose
+    // `Core/Src/ota_stream.c` on stream port 4510. The flight computer is intentionally kept
+    // unavailable until its application wires in the same receiver.
+    matches!(
+        board,
+        Board::RFBoard
+            | Board::PowerBoard
+            | Board::ValveBoard
+            | Board::GatewayBoard
+            | Board::ActuatorBoard
+            | Board::DaqBoard
+    )
 }
 
 /// Rejects recovery/full-image `.seds` files and malformed deltas before opening a board stream.
@@ -749,10 +758,19 @@ mod tests {
     }
 
     #[test]
-    fn exposes_only_the_checked_in_live_ota_receiver() {
-        for board in Board::ALL.iter().copied() {
-            assert_eq!(supports_live_ota(board), board == Board::ActuatorBoard);
+    fn exposes_every_checked_in_live_ota_receiver() {
+        for board in [
+            Board::RFBoard,
+            Board::PowerBoard,
+            Board::ValveBoard,
+            Board::GatewayBoard,
+            Board::ActuatorBoard,
+            Board::DaqBoard,
+        ] {
+            assert!(supports_live_ota(board), "{}", board.as_str());
         }
+        assert!(!supports_live_ota(Board::GroundStation));
+        assert!(!supports_live_ota(Board::FlightComputer));
     }
 
     #[test]
