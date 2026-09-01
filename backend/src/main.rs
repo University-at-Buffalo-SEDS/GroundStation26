@@ -585,6 +585,9 @@ async fn main() -> anyhow::Result<()> {
         router.add_side_packed_with_options(
             "rocket_comms",
             move |pkt| {
+                if telemetry_schema::is_host_only_schema_packet(pkt) {
+                    return Ok(());
+                }
                 rocket_tx
                     .send(pkt.to_vec())
                     .map_err(|_| TelemetryError::HandlerError("rocket_comms tx queue closed"))?;
@@ -607,6 +610,9 @@ async fn main() -> anyhow::Result<()> {
         router.add_side_packed_with_options(
             "umbilical_comms",
             move |pkt| {
+                if telemetry_schema::is_host_only_schema_packet(pkt) {
+                    return Ok(());
+                }
                 umbilical_tx
                     .send(pkt.to_vec())
                     .map_err(|_| TelemetryError::HandlerError("umbilical_comms tx queue closed"))?;
