@@ -579,7 +579,9 @@ async fn main() -> anyhow::Result<()> {
         let rocket_tx = rocket_tx.clone();
         let opts = RouterSideOptions {
             reliable_enabled: router_hop_reliable_enabled(&comms_links.av_bay),
-            link_local_enabled: false,
+            // Discovery, topology, managed-variable requests, and their ACKs
+            // must cross both halves of the GroundStation bridge.
+            link_local_enabled: true,
             ..Default::default()
         };
         router.add_side_packed_with_options(
