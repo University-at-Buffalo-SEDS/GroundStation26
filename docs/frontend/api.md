@@ -344,7 +344,9 @@ Expected response:
 Frontend expectations:
 
 - `generated_ms` is the backend time the snapshot was created.
+- Nodes and links come from SEDSnet discovery rather than a frontend or backend-assumed board topology.
 - Node `kind`, `status`, `group`, `sender_id`, and `detail` are rendered directly.
+- Node `stats` contains SEDSnet-reported `packets_sent`, `packets_received`, `bytes_sent`, and `bytes_received` counters.
 
 ### Firmware OTA endpoints
 

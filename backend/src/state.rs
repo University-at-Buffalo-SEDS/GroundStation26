@@ -12,11 +12,10 @@ use crate::telemetry_db::{
 use crate::telemetry_task;
 use crate::types::{
     Board, BoardStatusEntry, BoardStatusMsg, FlightState, NetworkTopologyLink, NetworkTopologyMsg,
-    NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus, TelemetryCommand,
-    TelemetryRow, canonical_sender_id,
+    NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStats, NetworkTopologyStatus,
+    TelemetryCommand, TelemetryRow, canonical_sender_id,
 };
 use crate::web::{AlertAckStateMsg, AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
-use sedsnet::config::DataEndpoint;
 use sedsnet::packet::Packet;
 use sedsnet::router::Router;
 use sqlx::SqlitePool;
@@ -27,7 +26,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 
 pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
-const NETWORK_TOPOLOGY_BOARD_TIMEOUT_MS_DEFAULT: u64 = 120_000;
+pub const UMBILICAL_PENDING_VALVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
 
 #[derive(Debug, Clone, Copy)]
@@ -729,242 +728,115 @@ impl AppState {
         BoardStatusMsg { boards }
     }
 
-    /// Projects the current router and board state into the UI-friendly topology graph.
+    /// Projects the topology and traffic counters reported by SEDSnet into the dashboard graph.
     pub fn network_topology_snapshot(&self, now_ms: u64) -> NetworkTopologyMsg {
         let simulated = crate::flight_sim::sim_mode_enabled();
-        let topology_board_timeout_ms = network_topology_board_timeout_ms();
-        let exported = self
-            .topology_router
-            .get()
-            .map(|router| router.export_topology());
-        let board_snapshot = self.board_status_snapshot(now_ms);
-        let route_snapshot = exported.as_ref();
-        let mut local_endpoint_list = vec![
-            crate::telemetry_schema::endpoint("GROUND_STATION")
-                .as_str()
-                .to_string(),
-            crate::telemetry_schema::endpoint("ABORT")
-                .as_str()
-                .to_string(),
-            crate::telemetry_schema::endpoint("FLIGHT_STATE")
-                .as_str()
-                .to_string(),
-            crate::telemetry_schema::endpoint("HEART_BEAT")
-                .as_str()
-                .to_string(),
-        ];
-        if telemetry_task::timesync_enabled() {
-            local_endpoint_list.push(DataEndpoint::TimeSync.as_str().to_string());
-        }
-        local_endpoint_list.sort();
-        local_endpoint_list.dedup();
-        let local_visible_endpoint_list = local_endpoint_list
-            .iter()
-            .filter(|endpoint| {
-                endpoint.as_str() != &*crate::telemetry_schema::endpoint("GROUND_STATION").as_str()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let router_endpoints = if simulated {
-            vec![
-                crate::telemetry_schema::endpoint("GROUND_STATION")
-                    .as_str()
-                    .to_string(),
-            ]
-        } else {
-            local_visible_endpoint_list.clone()
+        let Some(router) = self.topology_router.get() else {
+            return NetworkTopologyMsg {
+                generated_ms: now_ms,
+                simulated,
+                nodes: Vec::new(),
+                links: Vec::new(),
+            };
         };
-        let mut nodes = vec![NetworkTopologyNode {
-            id: "router".to_string(),
-            label: "Ground Station Router".to_string(),
-            kind: NetworkTopologyNodeKind::Router,
-            status: NetworkTopologyStatus::Online,
-            group: "local".to_string(),
-            sender_id: Some(Board::GroundStation.sender_id().to_string()),
-            endpoints: router_endpoints,
-            show_in_details: true,
-            detail: Some("SEDSnet router".to_string()),
-        }];
-        let mut links = Vec::new();
-        let mut endpoint_ids = std::collections::BTreeSet::new();
-        let mut side_ids = std::collections::BTreeMap::<String, String>::new();
-        let mut side_endpoints = std::collections::BTreeMap::<String, Vec<String>>::new();
-
-        if let Some(snapshot) = route_snapshot {
-            for route in &snapshot.routes {
-                let side_id = format!("side_{}", route.side_name.to_ascii_lowercase());
-                side_ids.insert(route.side_name.to_string(), side_id.clone());
-                let mut endpoints = route
+        let exported = router.export_topology();
+        let runtime = router.export_runtime_stats();
+        let local_sender = router.sender().to_string();
+        let status = if simulated {
+            NetworkTopologyStatus::Simulated
+        } else {
+            NetworkTopologyStatus::Online
+        };
+        let local_stats = NetworkTopologyStats {
+            packets_sent: runtime.sides.iter().map(|side| side.tx_packets).sum(),
+            packets_received: runtime.sides.iter().map(|side| side.rx_packets).sum(),
+            bytes_sent: runtime.sides.iter().map(|side| side.tx_bytes).sum(),
+            bytes_received: runtime.sides.iter().map(|side| side.rx_bytes).sum(),
+        };
+        let node_id = |sender_id: &str| {
+            format!(
+                "board_{}",
+                sender_id
+                    .chars()
+                    .map(|ch| if ch.is_ascii_alphanumeric() {
+                        ch.to_ascii_lowercase()
+                    } else {
+                        '_'
+                    })
+                    .collect::<String>()
+            )
+        };
+        let mut nodes = exported
+            .routers
+            .iter()
+            .map(|board| {
+                let is_local = board.sender_id == local_sender;
+                let stats = if is_local {
+                    Some(local_stats)
+                } else {
+                    router
+                        .client_stats(&board.sender_id)
+                        .map(|stats| NetworkTopologyStats {
+                            packets_sent: stats.packets_sent,
+                            packets_received: stats.packets_received,
+                            bytes_sent: stats.bytes_sent,
+                            bytes_received: stats.bytes_received,
+                        })
+                };
+                let label = Board::from_sender_id(&board.sender_id)
+                    .map(|known| known.as_str().to_string())
+                    .unwrap_or_else(|| board.sender_id.clone());
+                let mut endpoints = board
                     .reachable_endpoints
                     .iter()
-                    .copied()
-                    .map(|ep| ep.as_str().to_string())
+                    .map(|endpoint| endpoint.as_str().to_string())
                     .collect::<Vec<_>>();
                 endpoints.sort();
                 endpoints.dedup();
-                side_endpoints.insert(route.side_name.to_string(), endpoints.clone());
-                let status = if simulated {
-                    NetworkTopologyStatus::Simulated
-                } else {
-                    NetworkTopologyStatus::Online
-                };
-                nodes.push(NetworkTopologyNode {
-                    id: side_id.clone(),
-                    label: route.side_name.to_string(),
-                    kind: NetworkTopologyNodeKind::Side,
+                NetworkTopologyNode {
+                    id: node_id(&board.sender_id),
+                    label: if is_local {
+                        "Ground Station Router".to_string()
+                    } else {
+                        label
+                    },
+                    kind: if is_local {
+                        NetworkTopologyNodeKind::Router
+                    } else {
+                        NetworkTopologyNodeKind::Board
+                    },
                     status,
-                    group: "side".to_string(),
-                    sender_id: None,
-                    endpoints: endpoints.clone(),
+                    group: if is_local { "local" } else { "board" }.to_string(),
+                    sender_id: Some(board.sender_id.clone()),
+                    endpoints,
                     show_in_details: true,
-                    detail: Some(format!("Last discovery route {} ms ago", route.age_ms)),
-                });
-                links.push(NetworkTopologyLink {
-                    source: "router".to_string(),
-                    target: side_id.clone(),
-                    label: Some("route".to_string()),
-                    status,
-                });
-                for endpoint in endpoints.into_iter().filter(|endpoint| {
-                    endpoint.as_str()
-                        != &*crate::telemetry_schema::endpoint("GROUND_STATION").as_str()
-                }) {
-                    let endpoint_id = format!("endpoint_{}", endpoint.to_ascii_lowercase());
-                    if endpoint_ids.insert(endpoint_id.clone()) {
-                        nodes.push(NetworkTopologyNode {
-                            id: endpoint_id.clone(),
-                            label: endpoint.clone(),
-                            kind: NetworkTopologyNodeKind::Endpoint,
-                            status,
-                            group: "endpoint".to_string(),
-                            sender_id: None,
-                            endpoints: vec![endpoint.clone()],
-                            show_in_details: true,
-                            detail: None,
-                        });
-                    }
-                    links.push(NetworkTopologyLink {
-                        source: side_id.clone(),
-                        target: endpoint_id,
-                        label: Some("advertises".to_string()),
-                        status,
-                    });
-                }
-            }
-        }
-
-        for endpoint in &local_visible_endpoint_list {
-            if simulated {
-                continue;
-            }
-            let endpoint_id = format!("endpoint_{}", endpoint.to_ascii_lowercase());
-            if endpoint_ids.insert(endpoint_id.clone()) {
-                nodes.push(NetworkTopologyNode {
-                    id: endpoint_id.clone(),
-                    label: endpoint.clone(),
-                    kind: NetworkTopologyNodeKind::Endpoint,
-                    status: NetworkTopologyStatus::Online,
-                    group: "endpoint".to_string(),
-                    sender_id: None,
-                    endpoints: vec![endpoint.clone()],
-                    show_in_details: true,
-                    detail: Some("Locally advertised endpoint".to_string()),
-                });
-            }
-            links.push(NetworkTopologyLink {
-                source: "router".to_string(),
-                target: endpoint_id,
-                label: Some("local".to_string()),
-                status: NetworkTopologyStatus::Online,
-            });
-        }
-
-        let board_side = |board: Board| -> Option<&'static str> {
-            match board {
-                Board::GroundStation => None,
-                Board::FlightComputer | Board::RFBoard | Board::PowerBoard => Some("rocket_comms"),
-                Board::ValveBoard
-                | Board::GatewayBoard
-                | Board::ActuatorBoard
-                | Board::DaqBoard => Some("umbilical_comms"),
-            }
-        };
-        let side_relay = |side_name: &str| -> Option<Board> {
-            match side_name {
-                "rocket_comms" => Some(Board::RFBoard),
-                "umbilical_comms" => Some(Board::GatewayBoard),
-                _ => None,
-            }
-        };
-        let seen_boards = board_snapshot
-            .boards
-            .iter()
-            .filter(|entry| board_visible_in_topology(entry, topology_board_timeout_ms))
-            .map(|entry| {
-                (
-                    entry.board,
-                    format!("board_{}", entry.sender_id.to_ascii_lowercase()),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-
-        for entry in board_snapshot
-            .boards
-            .iter()
-            .filter(|entry| board_visible_in_topology(entry, topology_board_timeout_ms))
-        {
-            let node_id = format!("board_{}", entry.sender_id.to_ascii_lowercase());
-            let status = if simulated {
-                NetworkTopologyStatus::Simulated
-            } else {
-                NetworkTopologyStatus::Online
-            };
-            nodes.push(NetworkTopologyNode {
-                id: node_id.clone(),
-                label: entry.board_label.clone(),
-                kind: NetworkTopologyNodeKind::Board,
-                status,
-                group: "board".to_string(),
-                sender_id: Some(entry.sender_id.clone()),
-                endpoints: board_side(entry.board)
-                    .and_then(|side_name| side_endpoints.get(side_name).cloned())
-                    .unwrap_or_else(|| {
-                        modeled_board_endpoints(
-                            entry.board,
-                            simulated,
-                            &local_visible_endpoint_list,
+                    detail: stats.map(|stats| {
+                        format!(
+                            "Network traffic: {} tx / {} rx packets | {} tx / {} rx bytes",
+                            stats.packets_sent,
+                            stats.packets_received,
+                            stats.bytes_sent,
+                            stats.bytes_received,
                         )
                     }),
-                show_in_details: true,
-                detail: Some(match entry.age_ms {
-                    Some(age_ms) => format!(
-                        "Packets seen: {} | Last packet {} ms ago",
-                        entry.packet_count, age_ms
-                    ),
-                    None => format!("Packets seen: {}", entry.packet_count),
-                }),
-            });
-            let source = if let Some(side_name) = board_side(entry.board) {
-                if side_relay(side_name) == Some(entry.board) {
-                    "router".to_string()
-                } else if let Some(relay_id) =
-                    side_relay(side_name).and_then(|relay| seen_boards.get(&relay))
-                {
-                    relay_id.clone()
-                } else {
-                    "router".to_string()
+                    stats,
                 }
-            } else {
-                "router".to_string()
-            };
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
 
-            links.push(NetworkTopologyLink {
-                source,
-                target: node_id,
-                label: Some("seen".to_string()),
+        let mut links = exported
+            .links
+            .iter()
+            .map(|link| NetworkTopologyLink {
+                source: node_id(&link.source),
+                target: node_id(&link.target),
+                label: Some("network".to_string()),
                 status,
-            });
-        }
+            })
+            .collect::<Vec<_>>();
+        links.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+        links.dedup_by(|a, b| a.source == b.source && a.target == b.target);
 
         NetworkTopologyMsg {
             generated_ms: now_ms,
@@ -1408,6 +1280,13 @@ impl AppState {
             .map(|pending| pending.target)
     }
 
+    pub fn expire_pending_umbilical_valve_states(&self, max_age: std::time::Duration) -> bool {
+        let mut pending = self.pending_umbilical_valve_states.lock().unwrap();
+        let before = pending.len();
+        pending.retain(|_, state| state.set_at.elapsed() < max_age);
+        pending.len() != before
+    }
+
     pub fn reconcile_pending_umbilical_valve_state(
         &self,
         cmd_id: u8,
@@ -1513,40 +1392,8 @@ impl AppState {
     }
 }
 
-fn network_topology_board_timeout_ms() -> u64 {
-    std::env::var("GS_NETWORK_TOPOLOGY_BOARD_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(NETWORK_TOPOLOGY_BOARD_TIMEOUT_MS_DEFAULT)
-}
-
-fn board_visible_in_topology(entry: &BoardStatusEntry, timeout_ms: u64) -> bool {
-    entry.board != Board::GroundStation
-        && entry.seen
-        && entry.age_ms.is_some_and(|age_ms| age_ms <= timeout_ms)
-}
-
 fn command_dedup_key(cmd: &TelemetryCommand) -> String {
     format!("dedup:{cmd:?}")
-}
-
-fn modeled_board_endpoints(
-    board: Board,
-    simulated: bool,
-    local_endpoint_list: &[String],
-) -> Vec<String> {
-    if simulated {
-        return match board {
-            Board::GroundStation => local_endpoint_list.to_vec(),
-            Board::RFBoard | Board::GatewayBoard => Vec::new(),
-            _ => crate::flight_sim::simulated_board_endpoints(board),
-        };
-    }
-
-    match board {
-        Board::GroundStation => local_endpoint_list.to_vec(),
-        _ => Vec::new(),
-    }
 }
 
 fn launch_clock_for_transition(
@@ -1647,21 +1494,6 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::{Notify, broadcast, mpsc};
 
-    #[cfg(feature = "testing")]
-    #[test]
-    fn flight_computer_modeled_endpoints_include_sd_card() {
-        let endpoints = modeled_board_endpoints(Board::FlightComputer, true, &[]);
-        assert!(endpoints.iter().any(|endpoint| {
-            endpoint.as_str() == &*crate::telemetry_schema::endpoint("SD_CARD").as_str()
-        }));
-    }
-
-    #[test]
-    fn relay_boards_do_not_model_endpoints() {
-        assert!(modeled_board_endpoints(Board::RFBoard, false, &[]).is_empty());
-        assert!(modeled_board_endpoints(Board::GatewayBoard, false, &[]).is_empty());
-    }
-
     #[tokio::test]
     async fn pending_umbilical_valve_state_clears_after_mismatch_timeout() {
         let state = test_app_state().await;
@@ -1681,6 +1513,86 @@ mod tests {
             std::time::Duration::ZERO,
         ));
         assert_eq!(state.get_pending_umbilical_valve_state(42), None);
+    }
+
+    #[tokio::test]
+    async fn pending_umbilical_valve_state_expires_without_board_telemetry() {
+        let state = test_app_state().await;
+        state.set_pending_umbilical_valve_state(42, true);
+
+        assert!(state.expire_pending_umbilical_valve_states(std::time::Duration::ZERO,));
+        assert_eq!(state.get_pending_umbilical_valve_state(42), None);
+    }
+
+    #[tokio::test]
+    async fn network_topology_snapshot_uses_sedsnet_discovery_and_runtime_stats() {
+        let state = test_app_state().await;
+        let ground_router = Arc::new(Router::new(
+            RouterConfig::new([]).with_sender(Board::GroundStation.sender_id()),
+        ));
+        let valve_router = Arc::new(Router::new(
+            RouterConfig::new([]).with_sender(Board::ValveBoard.sender_id()),
+        ));
+        let ground_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+        let valve_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+
+        let ground_side = {
+            let ground_peer = ground_peer.clone();
+            ground_router.add_side_packed("fill_link", move |bytes| {
+                let (peer, ingress) = ground_peer
+                    .lock()
+                    .expect("failed to lock ground peer")
+                    .clone()
+                    .expect("ground peer not initialized");
+                peer.rx_packed_from_side(bytes, ingress)
+            })
+        };
+        let valve_side = {
+            let valve_peer = valve_peer.clone();
+            valve_router.add_side_packed("ground_link", move |bytes| {
+                let (peer, ingress) = valve_peer
+                    .lock()
+                    .expect("failed to lock valve peer")
+                    .clone()
+                    .expect("valve peer not initialized");
+                peer.rx_packed_from_side(bytes, ingress)
+            })
+        };
+        *ground_peer.lock().expect("failed to lock ground peer") =
+            Some((valve_router.clone(), valve_side));
+        *valve_peer.lock().expect("failed to lock valve peer") =
+            Some((ground_router.clone(), ground_side));
+        state
+            .topology_router
+            .set(ground_router.clone())
+            .expect("failed to set topology router");
+
+        valve_router
+            .announce_discovery()
+            .expect("failed to announce valve router");
+        valve_router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to deliver valve discovery");
+
+        let snapshot = state.network_topology_snapshot(1_000);
+        let ground = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.sender_id.as_deref() == Some(Board::GroundStation.sender_id()))
+            .expect("ground router missing from discovered topology");
+        let valve = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.sender_id.as_deref() == Some(Board::ValveBoard.sender_id()))
+            .expect("valve router missing from discovered topology");
+
+        assert_eq!(ground.kind, NetworkTopologyNodeKind::Router);
+        assert_eq!(valve.kind, NetworkTopologyNodeKind::Board);
+        assert!(valve.stats.is_some_and(|stats| stats.packets_received > 0));
+        assert!(snapshot.links.iter().any(|link| {
+            (link.source == ground.id && link.target == valve.id)
+                || (link.source == valve.id && link.target == ground.id)
+        }));
     }
 
     #[test]

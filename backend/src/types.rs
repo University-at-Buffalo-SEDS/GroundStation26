@@ -223,6 +223,20 @@ pub struct NetworkTopologyNode {
     #[serde(default = "default_true")]
     pub show_in_details: bool,
     pub detail: Option<String>,
+    #[serde(default)]
+    pub stats: Option<NetworkTopologyStats>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Default)]
+pub struct NetworkTopologyStats {
+    #[serde(default)]
+    pub packets_sent: u64,
+    #[serde(default)]
+    pub packets_received: u64,
+    #[serde(default)]
+    pub bytes_sent: u64,
+    #[serde(default)]
+    pub bytes_received: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

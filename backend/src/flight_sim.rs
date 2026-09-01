@@ -1399,58 +1399,6 @@ pub fn sim_mode_enabled() -> bool {
 }
 
 #[cfg(feature = "testing")]
-pub fn simulated_board_endpoints(board: Board) -> Vec<String> {
-    let mut endpoints = match board {
-        Board::GroundStation => Vec::new(),
-        Board::FlightComputer => vec![
-            crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")
-                .as_str()
-                .to_string(),
-            crate::telemetry_schema::endpoint("FLIGHT_STATE")
-                .as_str()
-                .to_string(),
-            crate::telemetry_schema::endpoint("SD_CARD")
-                .as_str()
-                .to_string(),
-        ],
-        Board::RFBoard => Vec::new(),
-        Board::PowerBoard => Vec::new(),
-        Board::ValveBoard => vec![
-            crate::telemetry_schema::endpoint("VALVE_BOARD")
-                .as_str()
-                .to_string(),
-            crate::telemetry_schema::endpoint("ABORT")
-                .as_str()
-                .to_string(),
-            crate::telemetry_schema::endpoint("FLIGHT_STATE")
-                .as_str()
-                .to_string(),
-        ],
-        Board::GatewayBoard => Vec::new(),
-        Board::ActuatorBoard => vec![
-            crate::telemetry_schema::endpoint("ACTUATOR_BOARD")
-                .as_str()
-                .to_string(),
-            crate::telemetry_schema::endpoint("ABORT")
-                .as_str()
-                .to_string(),
-            crate::telemetry_schema::endpoint("FLIGHT_STATE")
-                .as_str()
-                .to_string(),
-        ],
-        Board::DaqBoard => Vec::new(),
-    };
-    endpoints.sort();
-    endpoints.dedup();
-    endpoints
-}
-
-#[cfg(not(feature = "testing"))]
-pub fn simulated_board_endpoints(_board: crate::types::Board) -> Vec<String> {
-    Vec::new()
-}
-
-#[cfg(feature = "testing")]
 pub fn handle_command(cmd: &TelemetryCommand) -> bool {
     if !sim_mode_enabled() {
         return false;
@@ -1548,22 +1496,6 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "testing")]
-    #[test]
-    fn flight_computer_simulated_endpoints_include_sd_card() {
-        let endpoints = super::simulated_board_endpoints(crate::types::Board::FlightComputer);
-        assert!(endpoints.iter().any(|endpoint| {
-            endpoint.as_str() == &*crate::telemetry_schema::endpoint("SD_CARD").as_str()
-        }));
-    }
-
-    #[cfg(feature = "testing")]
-    #[test]
-    fn relay_boards_have_no_simulated_endpoints() {
-        assert!(super::simulated_board_endpoints(crate::types::Board::RFBoard).is_empty());
-        assert!(super::simulated_board_endpoints(crate::types::Board::GatewayBoard).is_empty());
-    }
-
     #[cfg(feature = "testing")]
     #[test]
     fn queued_flight_state_is_prioritized_for_launch_clock_sync() {

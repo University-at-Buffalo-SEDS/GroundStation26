@@ -1,5 +1,5 @@
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
-use crate::state::AppState;
+use crate::state::{AppState, UMBILICAL_PENDING_VALVE_TIMEOUT};
 use crate::types::{FlightState, TelemetryCommand};
 use crate::web::emit_warning;
 use crate::{fill_targets, loadcell};
@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
 use tokio::sync::broadcast;
 
 pub const KEY_ENABLE_PIN: u8 = 25;
@@ -2094,6 +2095,7 @@ pub fn start_sequence_task(
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
+                        state.expire_pending_umbilical_valve_states(UMBILICAL_PENDING_VALVE_TIMEOUT);
                         let valves = ValveSnapshot::read(&state);
                         state.set_action_policy(hitl_action_policy(valves));
                     }
@@ -2145,6 +2147,7 @@ pub fn start_sequence_task(
                 }
             }
 
+            state.expire_pending_umbilical_valve_states(UMBILICAL_PENDING_VALVE_TIMEOUT);
             let mut flight_state = *state.state.lock().unwrap();
             let valves = ValveSnapshot::read(&state);
             let pressure_psi = *state.latest_fuel_tank_pressure.lock().unwrap();
