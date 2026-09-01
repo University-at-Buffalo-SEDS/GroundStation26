@@ -881,6 +881,22 @@ pub async fn telemetry_task(
                                 gs_debug_println!("HITL physical launch mode toggled: uses_ground_station={uses_gs}");
                         }
                         #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::ToggleAvBayUnderglow => {
+                            match crate::network_variables::toggle_underglow(&router) {
+                                Ok(enabled) => {
+                                    sequences::refresh_action_policy_now(&state);
+                                    state.broadcast_action_policy_snapshot();
+                                    gs_debug_println!("AV bay underglow network variable toggled: {enabled}");
+                                }
+                                Err(err) => {
+                                    emit_notification_warning(
+                                        &state,
+                                        format!("Failed to persist or publish AV bay underglow: {err}"),
+                                    );
+                                }
+                            }
+                        }
+                        #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::ResetLaunchLatch => {
                                 state.set_launch_indicator_latched(false);
                                 sequences::refresh_action_policy_now(&state);

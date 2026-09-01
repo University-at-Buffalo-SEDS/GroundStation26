@@ -24,6 +24,7 @@ mod layout;
 mod loadcell;
 mod logger;
 mod map;
+mod network_variables;
 mod ring_buffer;
 mod rocket_commands;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
@@ -567,6 +568,7 @@ async fn main() -> anyhow::Result<()> {
         .store(fill_comms_connected, Ordering::Relaxed);
 
     let router = Arc::new(sedsnet::router::Router::new(cfg));
+    network_variables::initialize(&router)?;
     set_network_time_router(router.clone());
     let _ = state.topology_router.set(router.clone());
 
@@ -622,6 +624,8 @@ async fn main() -> anyhow::Result<()> {
         .lock()
         .expect("failed to get umbilical comms lock")
         .set_side_id(umbilical_side);
+
+    network_variables::publish_current(&router)?;
 
     if let Err(err) = router.announce_discovery() {
         eprintln!("WARNING: failed to queue initial discovery announce: {err}");

@@ -578,6 +578,22 @@
       "endpoints": [
         "SD_CARD"
       ]
+    },
+    {
+      "name": "AV_BAY_UNDERGLOW",
+      "doc": "Persistent avionics-bay underglow network variable (0 off, 1 on).",
+      "reliable": true,
+      "reliable_mode": "Ordered",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 1
+      },
+      "endpoints": [
+        "HEART_BEAT"
+      ]
     }
   ]
 }

@@ -195,6 +195,14 @@
         "fg": "#fef3c7"
       },
       {
+        "label": "AV Bay Underglow",
+        "cmd": "ToggleAvBayUnderglow",
+        "border": "#3b82f6",
+        "bg": "#172554",
+        "fg": "#dbeafe",
+        "illuminated": true
+      },
+      {
         "label": "Dump",
         "cmd": "Dump",
         "border": "#ef4444",

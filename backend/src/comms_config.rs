@@ -196,7 +196,7 @@ pub fn config_path() -> PathBuf {
 pub fn load_or_default() -> CommsLinksConfig {
     let path = config_path();
     migrate_legacy_config(&path);
-    match fs::read_to_string(&path) {
+    let mut config = match fs::read_to_string(&path) {
         Ok(raw) => {
             let raw = migrate_serial_protocol_defaults(raw, &path);
             match serde_json::from_str::<CommsLinksConfig>(&raw) {
@@ -226,6 +226,37 @@ pub fn load_or_default() -> CommsLinksConfig {
                 path.display()
             );
             CommsLinksConfig::default()
+        }
+    };
+    apply_simulator_serial_overrides(&mut config);
+    config
+}
+
+fn apply_simulator_serial_overrides(config: &mut CommsLinksConfig) {
+    for (name, link) in [
+        ("GS_AV_BAY_SERIAL_PORT", &mut config.av_bay),
+        ("GS_FILL_SERIAL_PORT", &mut config.fill_box),
+    ] {
+        let Some(port) = std::env::var_os(name) else {
+            continue;
+        };
+        let port = port.to_string_lossy().into_owned();
+        match link {
+            CommsLinkConfig::Serial { serial }
+            | CommsLinkConfig::RaspberryPiGpioUart { serial }
+            | CommsLinkConfig::CustomSerial { serial } => {
+                serial.port = port;
+                serial.protocol = SerialProtocol::RawUart;
+            }
+            _ => {
+                *link = CommsLinkConfig::Serial {
+                    serial: SerialLinkConfig {
+                        port,
+                        baud_rate: default_av_bay_baud_rate(),
+                        protocol: SerialProtocol::RawUart,
+                    },
+                };
+            }
         }
     }
 }

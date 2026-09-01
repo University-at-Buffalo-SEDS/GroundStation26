@@ -40,6 +40,8 @@ pub enum TelemetryCommand {
     #[cfg(feature = "hitl_mode")]
     TogglePhysicalLaunchMode,
     #[cfg(feature = "hitl_mode")]
+    ToggleAvBayUnderglow,
+    #[cfg(feature = "hitl_mode")]
     ResetLaunchLatch,
     #[cfg(feature = "hitl_mode")]
     DeployParachute,

@@ -85,6 +85,8 @@ fn default_recording_command_actuated(cmd: &str) -> Option<bool> {
 fn default_command_actuated(cmd: &str) -> Option<bool> {
     match cmd {
         "ResetSim" => Some(true),
+        #[cfg(feature = "hitl_mode")]
+        "ToggleAvBayUnderglow" => Some(crate::network_variables::underglow_enabled()),
         _ => default_recording_command_actuated(cmd),
     }
 }
@@ -578,6 +580,8 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::TogglePhysicalLaunchMode => "TogglePhysicalLaunchMode",
         #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ToggleAvBayUnderglow => "ToggleAvBayUnderglow",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ResetLaunchLatch => "ResetLaunchLatch",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
@@ -680,6 +684,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "ToggleButtonInterlock",
         "ToggleLaunchInterlock",
         "TogglePhysicalLaunchMode",
+        "ToggleAvBayUnderglow",
         "ResetLaunchLatch",
         "DeployParachute",
         "ExpandParachute",
