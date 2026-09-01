@@ -323,8 +323,8 @@
     {
       "name": "UMBILICAL_STATUS",
       "doc": "The status of the umbilical setup (valves, actuator position, ingnighter state, etc)(2 u8's valve, position)",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": true,
+      "reliable_mode": "Unordered",
       "class": "Data",
       "element": {
         "kind": "Static",
@@ -334,7 +334,7 @@
       "endpoints": [
         "GROUND_STATION"
       ],
-      "priority": 0
+      "priority": 200
     },
     {
       "name": "KG1000",
