@@ -700,9 +700,19 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let command_type = telemetry_schema::data_type("VALVE_COMMAND");
-            if let Err(err) =
-                validation_router.log_queue(command_type, &[ValveBoardCommands::PilotOpen as u8])
-            {
+            let command_endpoints = [
+                telemetry_schema::endpoint("GROUND_STATION"),
+                telemetry_schema::endpoint("VALVE_BOARD"),
+            ];
+            let open_packet = Packet::new(
+                command_type,
+                &command_endpoints,
+                Board::GroundStation.sender_id(),
+                get_current_timestamp_ms(),
+                Arc::from([ValveBoardCommands::PilotOpen as u8]),
+            );
+            let open_result = open_packet.and_then(|packet| validation_router.rx_queue(packet));
+            if let Err(err) = open_result {
                 log::error!("full-bay valve-open validation command failed: {err}");
                 return;
             }
@@ -713,9 +723,16 @@ async fn main() -> anyhow::Result<()> {
                 if validation_state.get_umbilical_valve_state(ValveBoardCommands::PilotOpen as u8)
                     == Some(true)
                 {
-                    if let Err(err) = validation_router
-                        .log_queue(command_type, &[ValveBoardCommands::PilotClose as u8])
-                    {
+                    let close_packet = Packet::new(
+                        command_type,
+                        &command_endpoints,
+                        Board::GroundStation.sender_id(),
+                        get_current_timestamp_ms(),
+                        Arc::from([ValveBoardCommands::PilotClose as u8]),
+                    );
+                    let close_result =
+                        close_packet.and_then(|packet| validation_router.rx_queue(packet));
+                    if let Err(err) = close_result {
                         log::error!("full-bay valve ACK confirmation command failed: {err}");
                     } else {
                         flush_command_tx(
