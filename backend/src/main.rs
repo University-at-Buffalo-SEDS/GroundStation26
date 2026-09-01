@@ -744,21 +744,7 @@ async fn main() -> anyhow::Result<()> {
                 if validation_state.get_umbilical_valve_state(ValveBoardCommands::PilotOpen as u8)
                     == Some(true)
                 {
-                    let close_packet = Packet::new(
-                        command_type,
-                        &command_endpoints,
-                        Board::GroundStation.sender_id(),
-                        get_current_timestamp_ms(),
-                        Arc::from([ValveBoardCommands::PilotClose as u8]),
-                    );
-                    let close_result =
-                        close_packet.and_then(|packet| validation_router.rx_queue(packet));
-                    if let Err(err) = close_result {
-                        log::error!("full-bay valve ACK confirmation command failed: {err}");
-                    } else {
-                        flush_command_tx(&validation_router, "full-bay valve ACK confirmation tx");
-                        log::info!("full-bay valve ACK reached GroundStation; confirmation queued");
-                    }
+                    log::info!("full-bay valve ACK reached GroundStation");
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
