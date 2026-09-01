@@ -701,7 +701,10 @@ async fn main() -> anyhow::Result<()> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             if !route_ready {
-                log::error!("full-bay valve validation timed out waiting for discovery route");
+                log::error!(
+                    "full-bay valve validation timed out waiting for discovery route; topology={:?}",
+                    validation_router.export_topology()
+                );
                 return;
             }
             log::info!("full-bay valve discovery route is ready");
