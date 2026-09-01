@@ -450,6 +450,14 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("GROUND_STATION"),
         move |pkt: &Packet| {
+            if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
+                log::info!(
+                    "umbilical status packet received sender={} endpoints={:?} payload={:02x?}",
+                    pkt.sender(),
+                    pkt.endpoints(),
+                    pkt.payload()
+                );
+            }
             ground_station_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
