@@ -737,7 +737,10 @@ async fn main() -> anyhow::Result<()> {
             flush_command_tx(&validation_router, "full-bay valve-open validation tx");
             log::info!("full-bay valve-open validation command queued");
 
-            for _ in 0..150 {
+            // The linked firmware simulator advances seven MCUs cooperatively;
+            // a packet that is near-instantaneous on hardware can take tens of
+            // seconds of host time to traverse both emulated serial bridges.
+            for _ in 0..600 {
                 if validation_state.get_umbilical_valve_state(ValveBoardCommands::PilotOpen as u8)
                     == Some(true)
                 {
