@@ -740,7 +740,7 @@ async fn main() -> anyhow::Result<()> {
             // The linked firmware simulator advances seven MCUs cooperatively;
             // a packet that is near-instantaneous on hardware can take tens of
             // seconds of host time to traverse both emulated serial bridges.
-            for _ in 0..600 {
+            for _ in 0..5000 {
                 if validation_state.get_umbilical_valve_state(ValveBoardCommands::PilotOpen as u8)
                     == Some(true)
                 {
