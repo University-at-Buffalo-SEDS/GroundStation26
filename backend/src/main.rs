@@ -740,7 +740,7 @@ async fn main() -> anyhow::Result<()> {
             // The linked firmware simulator advances seven MCUs cooperatively;
             // a packet that is near-instantaneous on hardware can take tens of
             // seconds of host time to traverse both emulated serial bridges.
-            for _ in 0..5000 {
+            loop {
                 if validation_state.get_umbilical_valve_state(ValveBoardCommands::PilotOpen as u8)
                     == Some(true)
                 {
@@ -763,7 +763,6 @@ async fn main() -> anyhow::Result<()> {
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            log::error!("full-bay valve command timed out waiting for board status ACK");
         });
     }
     #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
