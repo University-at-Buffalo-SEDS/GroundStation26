@@ -72,7 +72,7 @@ pub(crate) fn queue_abort_packet(router: &Router, reason: &str) -> sedsnet::Tele
     router.rx_queue(pkt)
 }
 
-pub(super) fn flush_command_tx(router: &Router, context: &str) {
+pub(crate) fn flush_command_tx(router: &Router, context: &str) {
     if let Err(err) = router.process_all_queues_with_timeout(ROUTER_TX_BUDGET_MS) {
         log_telemetry_error(context, err);
     }

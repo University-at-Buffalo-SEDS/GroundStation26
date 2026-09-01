@@ -52,7 +52,8 @@ use crate::telemetry_db::{
     ensure_sqlite_db_file, open_in_memory_telemetry_db, recover_sqlite_sidecars_in_dir,
 };
 use crate::telemetry_task::{
-    CommsWorkerHandle, get_current_timestamp_ms, set_network_time_router, telemetry_task,
+    CommsWorkerHandle, flush_command_tx, get_current_timestamp_ms, set_network_time_router,
+    telemetry_task,
 };
 
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
@@ -705,6 +706,7 @@ async fn main() -> anyhow::Result<()> {
                 log::error!("full-bay valve-open validation command failed: {err}");
                 return;
             }
+            flush_command_tx(&validation_router, "full-bay valve-open validation tx");
             log::info!("full-bay valve-open validation command queued");
 
             for _ in 0..100 {
@@ -716,6 +718,10 @@ async fn main() -> anyhow::Result<()> {
                     {
                         log::error!("full-bay valve ACK confirmation command failed: {err}");
                     } else {
+                        flush_command_tx(
+                            &validation_router,
+                            "full-bay valve ACK confirmation tx",
+                        );
                         log::info!("full-bay valve ACK reached GroundStation; confirmation queued");
                     }
                     return;
