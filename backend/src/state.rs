@@ -1191,6 +1191,7 @@ impl AppState {
                     | TelemetryCommand::ToggleLaunchInterlock
                     | TelemetryCommand::TogglePhysicalLaunchMode
                     | TelemetryCommand::ToggleAvBayUnderglow
+                    | TelemetryCommand::ToggleFlightBuzzer
                     | TelemetryCommand::ResetLaunchLatch
             );
             if !exempt && !self.hitl_button_interlock_satisfied() {

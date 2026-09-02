@@ -249,6 +249,7 @@ mod tests {
         assert_eq!(data_type("GENERIC_ERROR"), DataType(100));
         assert_eq!(data_type("VALVE_COMMAND"), DataType(109));
         assert_eq!(data_type("AV_BAY_UNDERGLOW"), DataType(133));
+        assert_eq!(data_type("FLIGHT_BUZZER"), DataType(134));
     }
 
     #[test]

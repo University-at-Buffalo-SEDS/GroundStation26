@@ -734,6 +734,24 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    if let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_BUZZER_SEQUENCE") {
+        let validation_router = router.clone();
+        tokio::spawn(async move {
+            for value in sequence.split(',') {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                let enabled = matches!(value.trim(), "1" | "true" | "on");
+                match network_variables::set_flight_buzzer(&validation_router, enabled) {
+                    Ok(()) => {
+                        log::info!("full-bay validation set Flight buzzer: {enabled}")
+                    }
+                    Err(error) => {
+                        log::error!("full-bay Flight buzzer sequence failed: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
     if std::env::var("GS_SIM_VALIDATE_VALVE_ROUNDTRIP")
         .ok()
         .as_deref()

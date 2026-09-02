@@ -757,6 +757,7 @@ impl FlightSimState {
             | TelemetryCommand::ToggleLaunchInterlock
             | TelemetryCommand::TogglePhysicalLaunchMode
             | TelemetryCommand::ToggleAvBayUnderglow
+            | TelemetryCommand::ToggleFlightBuzzer
             | TelemetryCommand::ResetLaunchLatch
             | TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute

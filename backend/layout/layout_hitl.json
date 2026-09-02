@@ -203,6 +203,14 @@
         "illuminated": true
       },
       {
+        "label": "Flight Buzzer",
+        "cmd": "ToggleFlightBuzzer",
+        "border": "#a855f7",
+        "bg": "#2e1065",
+        "fg": "#f3e8ff",
+        "illuminated": true
+      },
+      {
         "label": "Dump",
         "cmd": "Dump",
         "border": "#ef4444",

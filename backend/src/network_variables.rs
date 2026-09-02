@@ -10,11 +10,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const DEFAULT_CACHE_PATH: &str = "backend/data/network_variables.json";
 const UNDERGLOW_TYPE: &str = "AV_BAY_UNDERGLOW";
+const FLIGHT_BUZZER_TYPE: &str = "FLIGHT_BUZZER";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 struct PersistentVariables {
     #[serde(default)]
     av_bay_underglow: bool,
+    #[serde(default)]
+    flight_buzzer: bool,
 }
 
 struct VariableStore {
@@ -36,6 +39,9 @@ fn load(path: &Path) -> PersistentVariables {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_else(|| PersistentVariables {
             av_bay_underglow: std::env::var("GS_AV_BAY_UNDERGLOW_DEFAULT")
+                .ok()
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on")),
+            flight_buzzer: std::env::var("GS_FLIGHT_BUZZER_DEFAULT")
                 .ok()
                 .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on")),
         })
@@ -68,9 +74,9 @@ fn persist(path: &Path, values: PersistentVariables) -> Result<()> {
     Ok(())
 }
 
-fn packet(enabled: bool) -> Result<Packet> {
+fn packet(data_type: &str, enabled: bool) -> Result<Packet> {
     Ok(Packet::new(
-        crate::telemetry_schema::data_type(UNDERGLOW_TYPE),
+        crate::telemetry_schema::data_type(data_type),
         &[crate::telemetry_schema::endpoint("HEART_BEAT")],
         Board::GroundStation.sender_id(),
         get_current_timestamp_ms(),
@@ -79,8 +85,12 @@ fn packet(enabled: bool) -> Result<Packet> {
 }
 
 pub fn initialize(router: &Router) -> Result<()> {
-    let ty = crate::telemetry_schema::data_type(UNDERGLOW_TYPE);
-    router.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)?;
+    for data_type in [UNDERGLOW_TYPE, FLIGHT_BUZZER_TYPE] {
+        router.enable_network_variable(
+            crate::telemetry_schema::data_type(data_type),
+            NetworkVariablePermissions::READ_WRITE,
+        )?;
+    }
     {
         let guard = store()
             .lock()
@@ -89,12 +99,14 @@ pub fn initialize(router: &Router) -> Result<()> {
             persist(&guard.path, guard.values)?;
         }
     }
-    router.seed_managed_variable(packet(underglow_enabled())?)?;
+    router.seed_managed_variable(packet(UNDERGLOW_TYPE, underglow_enabled())?)?;
+    router.seed_managed_variable(packet(FLIGHT_BUZZER_TYPE, flight_buzzer_enabled())?)?;
     Ok(())
 }
 
 pub fn publish_current(router: &Router) -> Result<()> {
-    router.set_network_variable(packet(underglow_enabled())?)?;
+    router.set_network_variable(packet(UNDERGLOW_TYPE, underglow_enabled())?)?;
+    router.set_network_variable(packet(FLIGHT_BUZZER_TYPE, flight_buzzer_enabled())?)?;
     Ok(())
 }
 
@@ -112,10 +124,29 @@ pub fn set_underglow(router: &Router, enabled: bool) -> Result<()> {
         guard.values.av_bay_underglow = enabled;
         persist(&guard.path, guard.values)?;
     }
-    router.set_network_variable(packet(enabled)?)?;
+    router.set_network_variable(packet(UNDERGLOW_TYPE, enabled)?)?;
     Ok(())
 }
 
+pub fn toggle_flight_buzzer(router: &Router) -> Result<bool> {
+    let enabled = !flight_buzzer_enabled();
+    set_flight_buzzer(router, enabled)?;
+    Ok(enabled)
+}
+
+pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
+    {
+        let mut guard = store()
+            .lock()
+            .expect("network-variable store lock poisoned");
+        guard.values.flight_buzzer = enabled;
+        persist(&guard.path, guard.values)?;
+    }
+    router.set_network_variable(packet(FLIGHT_BUZZER_TYPE, enabled)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn toggle_persisted(store: &mut VariableStore) -> Result<bool> {
     store.values.av_bay_underglow = !store.values.av_bay_underglow;
     persist(&store.path, store.values)?;
@@ -128,6 +159,14 @@ pub fn underglow_enabled() -> bool {
         .expect("network-variable store lock poisoned")
         .values
         .av_bay_underglow
+}
+
+pub fn flight_buzzer_enabled() -> bool {
+    store()
+        .lock()
+        .expect("network-variable store lock poisoned")
+        .values
+        .flight_buzzer
 }
 
 #[cfg(test)]
@@ -152,10 +191,12 @@ mod tests {
             &path,
             PersistentVariables {
                 av_bay_underglow: true,
+                flight_buzzer: true,
             },
         )
         .unwrap();
         assert!(load(&path).av_bay_underglow);
+        assert!(load(&path).flight_buzzer);
         fs::remove_file(path).unwrap();
     }
 
@@ -169,6 +210,7 @@ mod tests {
             &path,
             PersistentVariables {
                 av_bay_underglow: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -219,7 +261,9 @@ mod tests {
         let source_rx = source.clone();
         peer.add_side_packet("to-gs", move |packet| source_rx.rx_from_side(packet, 0));
 
-        source.set_network_variable(packet(true).unwrap()).unwrap();
+        source
+            .set_network_variable(packet(UNDERGLOW_TYPE, true).unwrap())
+            .unwrap();
         source.process_all_queues().unwrap();
         peer.process_all_queues().unwrap();
         assert_eq!(*observed.lock().unwrap(), vec![vec![1]]);

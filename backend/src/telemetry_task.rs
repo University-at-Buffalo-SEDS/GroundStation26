@@ -897,6 +897,22 @@ pub async fn telemetry_task(
                             }
                         }
                         #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::ToggleFlightBuzzer => {
+                            match crate::network_variables::toggle_flight_buzzer(&router) {
+                                Ok(enabled) => {
+                                    sequences::refresh_action_policy_now(&state);
+                                    state.broadcast_action_policy_snapshot();
+                                    gs_debug_println!("Flight buzzer network variable toggled: {enabled}");
+                                }
+                                Err(err) => {
+                                    emit_notification_warning(
+                                        &state,
+                                        format!("Failed to persist or publish Flight buzzer: {err}"),
+                                    );
+                                }
+                            }
+                        }
+                        #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::ResetLaunchLatch => {
                                 state.set_launch_indicator_latched(false);
                                 sequences::refresh_action_policy_now(&state);
