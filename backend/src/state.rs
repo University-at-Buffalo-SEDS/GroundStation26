@@ -109,9 +109,6 @@ pub struct AppState {
     /// Flight state updates → frontend
     pub state_tx: broadcast::Sender<FlightStateMsg>,
 
-    /// Monotonic packet timestamp anchor for GS-originated flight-state packets.
-    pub last_flight_state_packet_ts_ms: Arc<AtomicU64>,
-
     /// GPIO interface
     pub gpio: Arc<GpioPins>,
 
@@ -257,71 +254,8 @@ impl AppState {
             );
             return;
         };
-        let topology = router.export_topology();
-        let rocket_has_flight_state = topology.routes.iter().any(|route| {
-            route.side_name == "rocket_comms"
-                && route
-                    .reachable_endpoints
-                    .contains(&crate::telemetry_schema::endpoint("FLIGHT_STATE"))
-        });
-        let umbilical_has_flight_state = topology.routes.iter().any(|route| {
-            route.side_name == "umbilical_comms"
-                && route
-                    .reachable_endpoints
-                    .contains(&crate::telemetry_schema::endpoint("FLIGHT_STATE"))
-        });
-
-        let timestamp_ms = {
-            let now_ms = crate::telemetry_task::get_current_timestamp_ms();
-            loop {
-                let prev = self.last_flight_state_packet_ts_ms.load(Ordering::Relaxed);
-                let next = now_ms.max(prev.saturating_add(1));
-                if self
-                    .last_flight_state_packet_ts_ms
-                    .compare_exchange(prev, next, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    break next;
-                }
-            }
-        };
-        let pkt = match Packet::new(
-            crate::telemetry_schema::data_type("FLIGHT_STATE"),
-            &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
-            Board::GroundStation.sender_id(),
-            timestamp_ms,
-            Arc::from([next_state as u8]),
-        ) {
-            Ok(pkt) => pkt,
-            Err(err) => {
-                log::warn!("failed to build flight-state packet for router delivery: {err}");
-                return;
-            }
-        };
-        if let Err(err) = router.rx_queue(pkt) {
-            log::warn!("failed to queue flight-state packet on router rx path: {err}");
-            return;
-        }
-
-        let dispatch_side = if rocket_has_flight_state && umbilical_has_flight_state {
-            "rocket_comms,umbilical_comms"
-        } else if rocket_has_flight_state {
-            "rocket_comms"
-        } else if umbilical_has_flight_state {
-            "umbilical_comms"
-        } else {
-            "broadcast"
-        };
-        log::info!(
-            "flight-state dispatched side={dispatch_side} state={next_state:?} rocket_has_flight_state={rocket_has_flight_state} umbilical_has_flight_state={umbilical_has_flight_state}"
-        );
-        if let Err(err) = router.process_all_queues_with_timeout(0) {
-            log::warn!("failed to process flight-state packet through router delivery path: {err}");
-        }
-        if !umbilical_has_flight_state {
-            log::warn!(
-                "flight-state change queued but umbilical_comms is not currently discovered with FlightState; fill-side delivery may not occur"
-            );
+        if let Err(err) = crate::network_variables::set_flight_state(router, next_state as u8) {
+            log::warn!("failed to persist or publish flight-state network variable: {err}");
         }
     }
 
@@ -1750,7 +1684,6 @@ mod tests {
             auth_db,
             state: Arc::new(Mutex::new(FlightState::Startup)),
             state_tx,
-            last_flight_state_packet_ts_ms: Arc::new(AtomicU64::new(0)),
             gpio: GpioPins::new(),
             board_status: Arc::new(Mutex::new(board_status)),
             board_status_tx,

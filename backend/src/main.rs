@@ -392,9 +392,11 @@ async fn main() -> anyhow::Result<()> {
         placeholder_db_path: placeholder_db_path.to_string_lossy().to_string(),
         db_queue_tx,
         auth_db,
-        state: Arc::new(Mutex::new(FlightStateMode::Startup)),
+        state: Arc::new(Mutex::new(
+            crate::types::u8_to_flight_state(network_variables::flight_state())
+                .unwrap_or(FlightStateMode::Startup),
+        )),
         state_tx: broadcast::channel(16).0,
-        last_flight_state_packet_ts_ms: Arc::new(AtomicU64::new(0)),
         gpio,
         board_status: Arc::new(Mutex::new(board_status)),
         board_status_tx,
@@ -680,11 +682,6 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = router.announce_discovery() {
         eprintln!("WARNING: failed to queue initial discovery announce: {err}");
     }
-
-    router.log_queue(
-        crate::telemetry_schema::data_type("FLIGHT_STATE"),
-        &[FlightStateMode::Startup as u8],
-    )?;
 
     // --- Background tasks ---
     let telemetry_shutdown_rx = state.shutdown_subscribe();

@@ -3807,7 +3807,6 @@ mod tests {
             auth_db,
             state: Arc::new(Mutex::new(FlightState::Startup)),
             state_tx,
-            last_flight_state_packet_ts_ms: Arc::new(AtomicU64::new(0)),
             gpio: GpioPins::new(),
             board_status: Arc::new(Mutex::new(board_status)),
             board_status_tx,
