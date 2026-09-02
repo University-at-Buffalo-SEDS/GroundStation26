@@ -144,6 +144,21 @@ fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
     }
 }
 
+fn configure_fill_command_routes(
+    router: &sedsnet::router::Router,
+    rocket_side: sedsnet::router::RouterSideId,
+    umbilical_side: sedsnet::router::RouterSideId,
+) -> Result<(), TelemetryError> {
+    for ty in [
+        telemetry_schema::data_type("VALVE_COMMAND"),
+        telemetry_schema::data_type("ACTUATOR_COMMAND"),
+    ] {
+        router.set_typed_route(None, ty, rocket_side, false)?;
+        router.set_typed_route(None, ty, umbilical_side, true)?;
+    }
+    Ok(())
+}
+
 /// Creates or upgrades the auth session table used by token-based login.
 async fn ensure_auth_sessions_table(db: &sqlx::SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
@@ -633,6 +648,11 @@ async fn main() -> anyhow::Result<()> {
             opts,
         )
     };
+
+    // The GroundStation terminates two independent routed networks. Fill
+    // commands must never enter the rocket-radio side merely because a stale
+    // or reflected discovery path scores equally with the direct Pico-Fi path.
+    configure_fill_command_routes(&router, rocket_side, umbilical_side)?;
 
     rocket_comms
         .lock()
