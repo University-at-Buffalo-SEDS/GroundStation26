@@ -82,7 +82,9 @@ pub fn initialize(router: &Router) -> Result<()> {
     let ty = crate::telemetry_schema::data_type(UNDERGLOW_TYPE);
     router.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)?;
     {
-        let guard = store().lock().expect("network-variable store lock poisoned");
+        let guard = store()
+            .lock()
+            .expect("network-variable store lock poisoned");
         if !guard.path.exists() {
             persist(&guard.path, guard.values)?;
         }
@@ -101,12 +103,16 @@ pub fn toggle_underglow(router: &Router) -> Result<bool> {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
-        guard.values.av_bay_underglow = !guard.values.av_bay_underglow;
-        persist(&guard.path, guard.values)?;
-        guard.values.av_bay_underglow
+        toggle_persisted(&mut guard)?
     };
     router.set_network_variable(packet(enabled)?)?;
     Ok(enabled)
+}
+
+fn toggle_persisted(store: &mut VariableStore) -> Result<bool> {
+    store.values.av_bay_underglow = !store.values.av_bay_underglow;
+    persist(&store.path, store.values)?;
+    Ok(store.values.av_bay_underglow)
 }
 
 pub fn underglow_enabled() -> bool {
@@ -142,6 +148,36 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(load(&path).av_bay_underglow);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn persisted_toggle_survives_two_process_style_reloads() {
+        let path = std::env::temp_dir().join(format!(
+            "gs26-network-vars-toggle-{}.json",
+            std::process::id()
+        ));
+        persist(
+            &path,
+            PersistentVariables {
+                av_bay_underglow: true,
+            },
+        )
+        .unwrap();
+
+        let mut first_restart = VariableStore {
+            path: path.clone(),
+            values: load(&path),
+        };
+        assert!(!toggle_persisted(&mut first_restart).unwrap());
+        assert!(!load(&path).av_bay_underglow);
+
+        let mut second_restart = VariableStore {
+            path: path.clone(),
+            values: load(&path),
+        };
+        assert!(toggle_persisted(&mut second_restart).unwrap());
         assert!(load(&path).av_bay_underglow);
         fs::remove_file(path).unwrap();
     }

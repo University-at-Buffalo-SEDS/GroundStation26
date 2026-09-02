@@ -664,6 +664,18 @@ async fn main() -> anyhow::Result<()> {
         .set_side_id(umbilical_side);
 
     network_variables::publish_current(&router)?;
+    // The full-system simulator uses the production toggle path while each
+    // phase starts a fresh GroundStation process. Keeping this behind an
+    // explicit validation-only environment flag avoids altering deployment
+    // startup behavior.
+    if std::env::var("GS_SIM_TOGGLE_UNDERGLOW_ON_START")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        let enabled = network_variables::toggle_underglow(&router)?;
+        log::info!("full-bay validation toggled AV bay underglow: {enabled}");
+    }
 
     if let Err(err) = router.announce_discovery() {
         eprintln!("WARNING: failed to queue initial discovery announce: {err}");
