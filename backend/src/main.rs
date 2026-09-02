@@ -716,7 +716,10 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
             let mut route_ready = false;
-            for _ in 0..300 {
+            // Seven instruction-accurate MCUs can need well over 30 seconds of
+            // host time to establish the routed topology even though only a
+            // few virtual seconds have elapsed. This wait is simulator-only.
+            for _ in 0..1200 {
                 if validation_router
                     .export_topology()
                     .routes
