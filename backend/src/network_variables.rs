@@ -99,14 +99,21 @@ pub fn publish_current(router: &Router) -> Result<()> {
 }
 
 pub fn toggle_underglow(router: &Router) -> Result<bool> {
-    let enabled = {
+    let enabled = !underglow_enabled();
+    set_underglow(router, enabled)?;
+    Ok(enabled)
+}
+
+pub fn set_underglow(router: &Router, enabled: bool) -> Result<()> {
+    {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
-        toggle_persisted(&mut guard)?
-    };
+        guard.values.av_bay_underglow = enabled;
+        persist(&guard.path, guard.values)?;
+    }
     router.set_network_variable(packet(enabled)?)?;
-    Ok(enabled)
+    Ok(())
 }
 
 fn toggle_persisted(store: &mut VariableStore) -> Result<bool> {

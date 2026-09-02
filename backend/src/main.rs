@@ -718,6 +718,22 @@ async fn main() -> anyhow::Result<()> {
         db_queue_rx,
         telemetry_shutdown_rx,
     ));
+    if let Ok(sequence) = std::env::var("GS_SIM_UNDERGLOW_SEQUENCE") {
+        let validation_router = router.clone();
+        tokio::spawn(async move {
+            for value in sequence.split(',') {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                let enabled = matches!(value.trim(), "1" | "true" | "on");
+                match network_variables::set_underglow(&validation_router, enabled) {
+                    Ok(()) => log::info!("full-bay validation set AV bay underglow: {enabled}"),
+                    Err(error) => {
+                        log::error!("full-bay underglow sequence failed: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
     if std::env::var("GS_SIM_VALIDATE_VALVE_ROUNDTRIP")
         .ok()
         .as_deref()
