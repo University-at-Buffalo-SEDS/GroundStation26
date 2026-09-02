@@ -716,10 +716,10 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
             let mut route_ready = false;
-            // Seven instruction-accurate MCUs can need well over 30 seconds of
-            // host time to establish the routed topology even though only a
-            // few virtual seconds have elapsed. This wait is simulator-only.
-            for _ in 0..1200 {
+            // Give routed discovery a short warm-up, but do not make command
+            // delivery depend on it: fill command types have an explicit
+            // umbilical route above precisely for degraded discovery cases.
+            for _ in 0..100 {
                 if validation_router
                     .export_topology()
                     .routes
@@ -732,13 +732,13 @@ async fn main() -> anyhow::Result<()> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             if !route_ready {
-                log::error!(
-                    "full-bay valve validation timed out waiting for discovery route; topology={:?}",
+                log::warn!(
+                    "full-bay valve validation using explicit fill route before discovery; topology={:?}",
                     validation_router.export_topology()
                 );
-                return;
+            } else {
+                log::info!("full-bay valve discovery route is ready");
             }
-            log::info!("full-bay valve discovery route is ready");
 
             let command_type = telemetry_schema::data_type("VALVE_COMMAND");
             let command_endpoints = [
