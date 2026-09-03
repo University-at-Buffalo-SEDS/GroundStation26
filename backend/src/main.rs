@@ -63,6 +63,7 @@ use crate::comms_config::{CommsLinkConfig, SerialProtocol};
 use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
 use sedsnet::TelemetryError;
+use sedsnet::config::DataType;
 use sedsnet::packet::Packet;
 use sedsnet::router::{EndpointHandler, RouterSideOptions};
 use sedsnet::timesync::{TimeSyncConfig, TimeSyncRole};
@@ -149,6 +150,14 @@ fn configure_fill_command_routes(
     rocket_side: sedsnet::router::RouterSideId,
     umbilical_side: sedsnet::router::RouterSideId,
 ) -> Result<(), TelemetryError> {
+    // DiscoveryAddress already carries the aggregated reachable endpoint set
+    // used for hierarchical route selection. Keep the detailed graph local to
+    // the hosted GroundStation: sending it over either constrained serial link
+    // forces small embedded routers to allocate a multi-kilobyte snapshot that
+    // they do not need in order to route commands or telemetry.
+    router.set_typed_route(None, DataType::DiscoveryTopology, rocket_side, false)?;
+    router.set_typed_route(None, DataType::DiscoveryTopology, umbilical_side, false)?;
+
     for ty in [
         telemetry_schema::data_type("VALVE_COMMAND"),
         telemetry_schema::data_type("ACTUATOR_COMMAND"),
