@@ -16,6 +16,9 @@ serde_json = "1.0.149"
 tokio = { version = "1.52.1", features = ["full"] }
 axum = "0.8.9"
 
+[patch.crates-io]
+SEDSnet = { git = "https://github.com/Rylan-Meilutis/SEDSnet.git", rev = "41e62b448bf4757066471c2fe158e9cf5439a09e" }
+
 [profile.release]
 opt-level = 3
 lto = "fat"
