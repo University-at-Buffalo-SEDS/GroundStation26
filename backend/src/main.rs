@@ -88,6 +88,17 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .clamp(min, max)
 }
 
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        })
+        .unwrap_or(default)
+}
+
 pub(crate) fn debug_prints_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -293,9 +304,10 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
 async fn main() -> anyhow::Result<()> {
     telemetry_schema::initialize()?;
 
-    // The RF-board link needs scheduled uplink/downlink windows. An RFD900x is a
-    // transparent serial link, so set this to false when using one.
-    let radio_scheduler_enabled = false;
+    // RFBoard26 uses scheduled uplink/downlink windows on its E22 link. Keep
+    // both ends in the same mode by default; transparent radios can explicitly
+    // opt out without requiring another binary.
+    let radio_scheduler_enabled = env_bool("GS_RADIO_SCHEDULER_ENABLED", true);
 
     logger::init()?;
     log::info!(
