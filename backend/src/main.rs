@@ -801,18 +801,12 @@ async fn main() -> anyhow::Result<()> {
             log::info!("full-bay valve discovery route is ready");
 
             let command_type = telemetry_schema::data_type("VALVE_COMMAND");
-            let command_endpoints = [
-                telemetry_schema::endpoint("GROUND_STATION"),
-                telemetry_schema::endpoint("VALVE_BOARD"),
-            ];
-            let open_packet = Packet::new(
-                command_type,
-                &command_endpoints,
-                Board::GroundStation.sender_id(),
-                get_current_timestamp_ms(),
-                Arc::from([ValveBoardCommands::PilotOpen as u8]),
-            );
-            let open_result = open_packet.and_then(|packet| validation_router.rx_queue(packet));
+            /* Exercise the same runtime-schema path as the UI. log_queue uses
+             * the VALVE_COMMAND endpoint ownership learned by discovery;
+             * manually constructing a packet here bypassed that schema lookup
+             * and could leave it local to the GroundStation. */
+            let open_result =
+                validation_router.log_queue(command_type, &[ValveBoardCommands::PilotOpen as u8]);
             if let Err(err) = open_result {
                 log::error!("full-bay valve-open validation command failed: {err}");
                 return;
