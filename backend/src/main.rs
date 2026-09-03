@@ -304,10 +304,9 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
 async fn main() -> anyhow::Result<()> {
     telemetry_schema::initialize()?;
 
-    // RFBoard26 uses scheduled uplink/downlink windows on its E22 link. Keep
-    // both ends in the same mode by default; transparent radios can explicitly
-    // opt out without requiring another binary.
-    let radio_scheduler_enabled = env_bool("GS_RADIO_SCHEDULER_ENABLED", true);
+    // The RFD900x is a transparent serial link and does not need the LoRa
+    // uplink/downlink turn scheduler. Keep the override for legacy LoRa rigs.
+    let radio_scheduler_enabled = env_bool("GS_RADIO_SCHEDULER_ENABLED", false);
 
     logger::init()?;
     log::info!(

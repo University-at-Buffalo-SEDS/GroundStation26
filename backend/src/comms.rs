@@ -18,11 +18,13 @@ use std::ffi::CString;
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
@@ -713,6 +715,11 @@ fn drain_fd_with_timeout(fd: RawFd, timeout: Duration) -> std::io::Result<()> {
             return Ok(());
         }
         let err = std::io::Error::last_os_error();
+        if simulated_serial_pty() && err.raw_os_error() == Some(libc::EIO) {
+            // Renode's PTY backend can report EIO from tcdrain after accepting
+            // the complete write. A physical UART must still surface EIO.
+            return Ok(());
+        }
         if err.kind() != std::io::ErrorKind::Interrupted {
             return Err(err);
         }
@@ -757,6 +764,12 @@ fn read_once_fd_with_poll(fd: RawFd, buf: &mut [u8], timeout: Duration) -> std::
         let read_len = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
         if read_len < 0 {
             let err = std::io::Error::last_os_error();
+            if simulated_serial_pty() && err.raw_os_error() == Some(libc::EIO) {
+                // A Renode PTY briefly reports EIO while its UART backend is
+                // between synchronized virtual-time quanta. Treat that as an
+                // idle poll instead of tearing down the comms worker.
+                return Ok(0);
+            }
             if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
@@ -764,6 +777,12 @@ fn read_once_fd_with_poll(fd: RawFd, buf: &mut [u8], timeout: Duration) -> std::
         }
         return Ok(read_len as usize);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn simulated_serial_pty() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GS_SIMULATED_SERIAL_PTY").ok().as_deref() == Some("1"))
 }
 
 fn is_idle_serial_timeout(err: &std::io::Error) -> bool {
@@ -1513,7 +1532,12 @@ impl CommsDevice for UartComms {
 
 pub struct I2cComms {
     #[cfg(target_os = "linux")]
-    inner: File,
+    inner: Option<File>,
+    /// Simulation-only transaction endpoint. This preserves the production
+    /// I2C slot framing while the simulator models the Pico-Fi I2C-to-UART
+    /// bridge on the other end of the socket.
+    #[cfg(target_os = "linux")]
+    simulated: Option<UnixStream>,
     side_id: Option<RouterSideId>,
     #[cfg(target_os = "linux")]
     addr: u16,
@@ -1533,10 +1557,30 @@ impl I2cComms {
     pub fn open(cfg: &I2cLinkConfig) -> anyhow::Result<Self> {
         #[cfg(target_os = "linux")]
         {
+            if let Some(socket) = std::env::var_os("GS_SIMULATED_I2C_SOCKET") {
+                let simulated = UnixStream::connect(&socket).with_context(|| {
+                    format!(
+                        "connecting simulated Pico-Fi I2C endpoint {}",
+                        socket.to_string_lossy()
+                    )
+                })?;
+                return Ok(Self {
+                    inner: None,
+                    simulated: Some(simulated),
+                    side_id: None,
+                    addr: cfg.addr,
+                    chunk_delay: Duration::from_millis(cfg.chunk_delay_ms),
+                    initial_wait: Duration::from_millis(cfg.initial_wait_ms),
+                    tx_transfer_id: 1,
+                    rx_assembly: None,
+                    rx_payload_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
+                });
+            }
             let path = format!("/dev/i2c-{}", cfg.bus);
             let inner = OpenOptions::new().read(true).write(true).open(&path)?;
             Ok(Self {
-                inner,
+                inner: Some(inner),
+                simulated: None,
                 side_id: None,
                 addr: cfg.addr,
                 chunk_delay: Duration::from_millis(cfg.chunk_delay_ms),
@@ -1666,6 +1710,17 @@ impl I2cComms {
 
     #[cfg(target_os = "linux")]
     fn transfer_write(&mut self, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if let Some(simulated) = self.simulated.as_mut() {
+            simulated.write_all(&[b'W'])?;
+            simulated.write_all(data)?;
+            simulated.flush()?;
+            let mut status = [0u8; 1];
+            simulated.read_exact(&mut status)?;
+            if status[0] != 0 {
+                return Err(std::io::Error::other("simulated Pico-Fi rejected I2C write").into());
+            }
+            return Ok(());
+        }
         let mut msg = I2cMsg {
             addr: self.addr,
             flags: 0,
@@ -1677,6 +1732,12 @@ impl I2cComms {
 
     #[cfg(target_os = "linux")]
     fn transfer_read(&mut self, data: &mut [u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if let Some(simulated) = self.simulated.as_mut() {
+            simulated.write_all(&[b'R'])?;
+            simulated.flush()?;
+            simulated.read_exact(data)?;
+            return Ok(());
+        }
         let mut msg = I2cMsg {
             addr: self.addr,
             flags: I2C_M_RD,
@@ -1693,7 +1754,11 @@ impl I2cComms {
             nmsgs: 1,
         };
 
-        let rc = unsafe { libc::ioctl(self.inner.as_raw_fd(), I2C_RDWR as _, &mut ioctl_data) };
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("physical I2C device is not open"))?;
+        let rc = unsafe { libc::ioctl(inner.as_raw_fd(), I2C_RDWR as _, &mut ioctl_data) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
