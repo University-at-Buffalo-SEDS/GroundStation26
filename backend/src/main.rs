@@ -774,30 +774,28 @@ async fn main() -> anyhow::Result<()> {
         let validation_state = state.clone();
         tokio::spawn(async move {
             let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
-            let mut route_ready = false;
-            // Give routed discovery a short warm-up, but do not make command
-            // delivery depend on it: fill command types have an explicit
-            // umbilical route above precisely for degraded discovery cases.
-            for _ in 0..100 {
+            // Command validation must exercise learned discovery routing. The
+            // linked simulator advances virtual MCU time more slowly than host
+            // wall time, so a fixed host-side timeout can fire before the
+            // Valve discovery announcement crosses CAN, Gateway, Pico-Fi, and
+            // I2C. Wait for the actual route instead of injecting a fanout.
+            let mut waits = 0u32;
+            loop {
                 if validation_router
                     .export_topology()
                     .routes
                     .iter()
                     .any(|route| route.reachable_endpoints.contains(&valve_endpoint))
                 {
-                    route_ready = true;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
+                waits += 1;
+                if waits.is_multiple_of(100) {
+                    log::info!("full-bay validation waiting for Valve discovery route");
+                }
             }
-            if !route_ready {
-                log::warn!(
-                    "full-bay valve validation using explicit fill route before discovery; topology={:?}",
-                    validation_router.export_topology()
-                );
-            } else {
-                log::info!("full-bay valve discovery route is ready");
-            }
+            log::info!("full-bay valve discovery route is ready");
 
             let command_type = telemetry_schema::data_type("VALVE_COMMAND");
             let command_endpoints = [
