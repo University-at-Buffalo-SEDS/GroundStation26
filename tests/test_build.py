@@ -58,6 +58,37 @@ class FrontendBranchTests(unittest.TestCase):
             ],
         )
 
+    def test_single_branch_checkout_creates_selected_branch_without_tracking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(build, "run") as run, patch.object(
+            build,
+            "run_capture",
+            side_effect=[
+                "true",
+                build.FRONTEND_REPO_URL,
+                "",
+                "main",
+            ],
+        ):
+            checkout = Path(tmp)
+            build._ensure_frontend_checkout(checkout, "dev")
+
+        self.assertIn(
+            call(
+                [
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "switch",
+                    "--no-track",
+                    "-c",
+                    "dev",
+                    "origin/dev",
+                ],
+                cwd=checkout,
+            ),
+            run.call_args_list,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

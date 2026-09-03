@@ -360,7 +360,7 @@ def _ensure_frontend_checkout(checkout_dir: Path, branch: str) -> None:
         run(["git", "-C", str(checkout_dir), "switch", branch], cwd=checkout_dir)
     else:
         run(
-            ["git", "-C", str(checkout_dir), "switch", "--track", "-c", branch, f"origin/{branch}"],
+            ["git", "-C", str(checkout_dir), "switch", "--no-track", "-c", branch, f"origin/{branch}"],
             cwd=checkout_dir,
         )
     run(["git", "-C", str(checkout_dir), "pull", "--ff-only", "origin", branch], cwd=checkout_dir)
