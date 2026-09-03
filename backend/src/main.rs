@@ -62,10 +62,10 @@ use crate::comms::{CommsDevice, link_description, open_link, startup_failure_hin
 use crate::comms_config::{CommsLinkConfig, SerialProtocol};
 use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
+use sedsnet::TelemetryError;
 use sedsnet::packet::Packet;
 use sedsnet::router::{EndpointHandler, RouterSideOptions};
 use sedsnet::timesync::{TimeSyncConfig, TimeSyncRole};
-use sedsnet::{RouteSelectionMode, TelemetryError};
 use sqlx::Row;
 use std::collections::HashMap;
 use std::fs;
@@ -149,17 +149,30 @@ fn configure_fill_command_routes(
     rocket_side: sedsnet::router::RouterSideId,
     umbilical_side: sedsnet::router::RouterSideId,
 ) -> Result<(), TelemetryError> {
-    // GroundStation originates control traffic for two independent physical
-    // networks. Discovery may advertise the same logical endpoint (notably
-    // HEART_BEAT) on both, so adaptive single-path selection would otherwise
-    // send managed variables and heartbeats down only one side. Fan out local
-    // traffic, then retain the stricter typed routes below for fill commands.
-    router.set_source_route_mode(None, RouteSelectionMode::Fanout)?;
     for ty in [
         telemetry_schema::data_type("VALVE_COMMAND"),
         telemetry_schema::data_type("ACTUATOR_COMMAND"),
     ] {
         router.set_typed_route(None, ty, rocket_side, false)?;
+        router.set_typed_route(None, ty, umbilical_side, true)?;
+    }
+    // These managed variables intentionally target the avionics network. The
+    // logical HEART_BEAT endpoint exists on both networks, so endpoint-only
+    // discovery cannot disambiguate them without a narrow type policy.
+    for ty in [
+        telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+        telemetry_schema::data_type("FLIGHT_BUZZER"),
+    ] {
+        router.set_typed_route(None, ty, rocket_side, true)?;
+        router.set_typed_route(None, ty, umbilical_side, false)?;
+    }
+    // Flight state and GroundStation liveness are consumed on both networks;
+    // all other data remains discovery-routed.
+    for ty in [
+        telemetry_schema::data_type("FLIGHT_STATE"),
+        telemetry_schema::data_type("HEARTBEAT"),
+    ] {
+        router.set_typed_route(None, ty, rocket_side, true)?;
         router.set_typed_route(None, ty, umbilical_side, true)?;
     }
     Ok(())
@@ -628,7 +641,7 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(|_| TelemetryError::HandlerError("rocket_comms tx queue closed"))?;
                 Ok(())
             },
-            opts,
+            opts.with_small_packet_transport(1024),
         )
     };
 
@@ -653,7 +666,7 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(|_| TelemetryError::HandlerError("umbilical_comms tx queue closed"))?;
                 Ok(())
             },
-            opts,
+            opts.with_small_packet_transport(1024),
         )
     };
 
