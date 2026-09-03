@@ -1775,10 +1775,20 @@ impl CommsDevice for I2cComms {
                             if kind != I2C_KIND_DATA {
                                 continue;
                             }
-                            // Pico-Fi's I2C mailbox carries the raw bridge
-                            // payload. UART framing exists only between the
-                            // UART-side Pico and the Gateway board.
-                            self.rx_payload_buf.extend_from_slice(&payload);
+                            // Pico-Fi stages a complete DATA response frame
+                            // inside the mailbox slots. Remove that I2C-side
+                            // envelope before passing SEDSNet bytes to the
+                            // router; the UART-side Pico uses an independent
+                            // envelope on its Gateway connection.
+                            let Some((header, data)) = parse_link_frame(&payload) else {
+                                continue;
+                            };
+                            if header != (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1)
+                                || data.is_empty()
+                            {
+                                continue;
+                            }
+                            self.rx_payload_buf.extend_from_slice(data);
                             while let Some(packet) = self.try_take_buffered_packet()? {
                                 if !is_valid_serialized_packet_or_ack(&packet) {
                                     continue;
@@ -1828,7 +1838,8 @@ impl CommsDevice for I2cComms {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(target_os = "linux")]
         {
-            self.write_payload(I2C_KIND_DATA, payload)
+            let framed = build_raw_uart_frame(payload)?;
+            self.write_payload(I2C_KIND_DATA, &framed)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -2533,6 +2544,16 @@ mod tests {
     fn timed_out_i2c_read_is_treated_as_idle() {
         let err = std::io::Error::from_raw_os_error(libc::ETIMEDOUT);
         assert!(is_i2c_idle_read_error(&err));
+    }
+
+    #[test]
+    fn pico_i2c_data_payload_uses_the_common_link_envelope() {
+        let payload = b"sedsnet";
+        let framed = build_raw_uart_frame(payload).unwrap();
+        assert_eq!(&framed[..4], &[0xA5, 0x5A, 7, 0]);
+        let (kind, decoded) = parse_link_frame(&framed).unwrap();
+        assert_eq!(kind, (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1));
+        assert_eq!(decoded, payload);
     }
 }
 

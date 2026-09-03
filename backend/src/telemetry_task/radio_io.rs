@@ -95,6 +95,7 @@ pub(super) fn spawn_comms_worker_threads(
                     else {
                         break;
                     };
+                    let command = is_command_payload(&payload);
                     let mut comms = tx_worker_comms.lock().expect("failed to get lock");
                     match comms.send_data(&payload) {
                         Ok(()) => {
@@ -110,6 +111,16 @@ pub(super) fn spawn_comms_worker_threads(
                             }
                         }
                         Err(e) => {
+                            // A transport error means the packet never reached
+                            // Pico-Fi. Preserve queue ordering and retry the
+                            // entire logical packet from a new START slot.
+                            if command {
+                                command_backlog.push_front(payload);
+                            } else {
+                                telemetry_backlog.push_front(payload);
+                            }
+                            next_tx_allowed_at = std::time::Instant::now()
+                                + Duration::from_millis(COMMS_TX_GAP_MS);
                             log_repeated_worker_error(
                                 &format!("{worker_name} comms worker send_data failed"),
                                 &e.to_string(),
