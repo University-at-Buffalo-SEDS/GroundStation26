@@ -49,8 +49,6 @@ const RADIO_SCHED_FLAG_HAS_MORE: u8 = 0x01;
 const RADIO_SCHED_FLAG_YIELD: u8 = 0x02;
 #[cfg(target_os = "linux")]
 const I2C_PACKET_MAX_BYTES: usize = 4_096;
-#[cfg(target_os = "linux")]
-const I2C_FRAME_PAYLOAD_MAX_BYTES: usize = I2C_PACKET_MAX_BYTES - RAW_UART_FRAME_HEADER_SIZE;
 const UART_STARTUP_TIMEOUT: Duration = Duration::from_millis(500);
 const UART_NORMAL_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(target_os = "linux")]
@@ -810,19 +808,6 @@ fn build_raw_uart_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send 
 
 fn build_raw_uart_command_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
     build_link_frame(RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1, payload)
-}
-
-#[cfg(target_os = "linux")]
-fn build_i2c_data_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    if payload.len() > I2C_FRAME_PAYLOAD_MAX_BYTES {
-        return Err(format!(
-            "packet too large to send over i2c framed link: {} > {} bytes",
-            payload.len(),
-            I2C_FRAME_PAYLOAD_MAX_BYTES
-        )
-        .into());
-    }
-    build_link_frame(RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1, payload)
 }
 
 fn build_link_frame(
@@ -1792,13 +1777,10 @@ impl CommsDevice for I2cComms {
                             if kind != I2C_KIND_DATA {
                                 continue;
                             }
-                            let Some((header, payload)) = parse_link_frame(&payload) else {
-                                continue;
-                            };
-                            if header != (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1) {
-                                continue;
-                            }
-                            self.rx_payload_buf.extend_from_slice(payload);
+                            // Pico-Fi's I2C mailbox carries the raw bridge
+                            // payload. UART framing exists only between the
+                            // UART-side Pico and the Gateway board.
+                            self.rx_payload_buf.extend_from_slice(&payload);
                             while let Some(packet) = self.try_take_buffered_packet()? {
                                 if !is_valid_serialized_packet_or_ack(&packet) {
                                     continue;
@@ -1848,8 +1830,7 @@ impl CommsDevice for I2cComms {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(target_os = "linux")]
         {
-            let framed = build_i2c_data_frame(payload)?;
-            self.write_payload(I2C_KIND_DATA, &framed)
+            self.write_payload(I2C_KIND_DATA, payload)
         }
         #[cfg(not(target_os = "linux"))]
         {
