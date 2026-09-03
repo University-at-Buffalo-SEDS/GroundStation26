@@ -785,7 +785,10 @@ async fn main() -> anyhow::Result<()> {
                     .export_topology()
                     .routes
                     .iter()
-                    .any(|route| route.reachable_endpoints.contains(&valve_endpoint))
+                    .any(|route| {
+                        route.side_name == "umbilical_comms"
+                            && route.reachable_endpoints.contains(&valve_endpoint)
+                    })
                 {
                     break;
                 }
