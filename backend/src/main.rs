@@ -145,7 +145,7 @@ fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
     }
 }
 
-fn configure_fill_command_routes(
+fn configure_constrained_discovery(
     router: &sedsnet::router::Router,
     rocket_side: sedsnet::router::RouterSideId,
     umbilical_side: sedsnet::router::RouterSideId,
@@ -158,32 +158,9 @@ fn configure_fill_command_routes(
     router.set_typed_route(None, DataType::DiscoveryTopology, rocket_side, false)?;
     router.set_typed_route(None, DataType::DiscoveryTopology, umbilical_side, false)?;
 
-    for ty in [
-        telemetry_schema::data_type("VALVE_COMMAND"),
-        telemetry_schema::data_type("ACTUATOR_COMMAND"),
-    ] {
-        router.set_typed_route(None, ty, rocket_side, false)?;
-        router.set_typed_route(None, ty, umbilical_side, true)?;
-    }
-    // These managed variables intentionally target the avionics network. The
-    // logical HEART_BEAT endpoint exists on both networks, so endpoint-only
-    // discovery cannot disambiguate them without a narrow type policy.
-    for ty in [
-        telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
-        telemetry_schema::data_type("FLIGHT_BUZZER"),
-    ] {
-        router.set_typed_route(None, ty, rocket_side, true)?;
-        router.set_typed_route(None, ty, umbilical_side, false)?;
-    }
-    // Flight state and GroundStation liveness are consumed on both networks;
-    // all other data remains discovery-routed.
-    for ty in [
-        telemetry_schema::data_type("FLIGHT_STATE"),
-        telemetry_schema::data_type("HEARTBEAT"),
-    ] {
-        router.set_typed_route(None, ty, rocket_side, true)?;
-        router.set_typed_route(None, ty, umbilical_side, true)?;
-    }
+    // All application data, commands, and network variables use learned
+    // discovery routes. Do not install static side rules here: they bypass
+    // ownership discovery and duplicate traffic over the radio link.
     Ok(())
 }
 
@@ -682,7 +659,7 @@ async fn main() -> anyhow::Result<()> {
     // The GroundStation terminates two independent routed networks. Fill
     // commands must never enter the rocket-radio side merely because a stale
     // or reflected discovery path scores equally with the direct Pico-Fi path.
-    configure_fill_command_routes(&router, rocket_side, umbilical_side)?;
+    configure_constrained_discovery(&router, rocket_side, umbilical_side)?;
 
     rocket_comms
         .lock()
