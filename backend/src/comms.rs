@@ -546,27 +546,30 @@ impl UartComms {
 
         while let Some(payload) = self.try_take_packet()? {
             processed_any = true;
-            if !is_valid_serialized_packet_or_ack(&payload) {
-                maybe_log_raw_uart_parse_issue(
-                    "dropping invalid serialized payload from framed raw UART packet",
-                    &payload[..payload.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
-                );
-                continue;
-            }
-            maybe_log_raw_uart_decoded(&payload, &self.protocol);
-            maybe_log_raw_uart_router_queue_before(&payload, &self.protocol);
-            tap_non_groundstation_gps_payload(&payload, packet_tap);
-            match router.rx_packed_queue_from_side(&payload, side_id) {
-                Ok(()) => {
-                    maybe_log_raw_uart_router_queue_after(&payload, &self.protocol);
-                }
-                Err(err) => {
-                    return Err(err);
-                }
-            }
+            // The serial envelope has already validated framing, length, and CRC.
+            // Do not require its payload to be a complete canonical SEDSNet packet:
+            // sides configured with `with_small_packet_transport` carry fragments
+            // here, and the router owns their validation and reassembly.  Rejecting
+            // fragments here prevents discovery from ever crossing the radio link.
+            queue_uart_router_payload(router, side_id, &payload, &self.protocol, packet_tap)?;
         }
         Ok(processed_any)
     }
+}
+
+fn queue_uart_router_payload(
+    router: &Router,
+    side_id: RouterSideId,
+    payload: &[u8],
+    protocol: &SerialProtocol,
+    packet_tap: &mut dyn FnMut(&Packet),
+) -> TelemetryResult<()> {
+    maybe_log_raw_uart_decoded(payload, protocol);
+    maybe_log_raw_uart_router_queue_before(payload, protocol);
+    tap_non_groundstation_gps_payload(payload, packet_tap);
+    router.rx_packed_queue_from_side(payload, side_id)?;
+    maybe_log_raw_uart_router_queue_after(payload, protocol);
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2492,7 +2495,68 @@ mod tests {
 #[cfg(test)]
 mod raw_uart_tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn uart_adapter_passes_small_transport_fragments_to_router_reassembly() {
+        let delivered = Arc::new(Mutex::new(Vec::<Packet>::new()));
+        let delivered_from_handler = delivered.clone();
+        let receiver = Router::new(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("GROUND_STATION"),
+                move |packet| {
+                    delivered_from_handler.lock().unwrap().push(packet.clone());
+                    Ok(())
+                },
+            ),
+        ]));
+        let receiver_side = receiver.add_side_packed_small_packets("radio", |_| Ok(()), 32);
+
+        let fragments = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let fragments_from_tx = fragments.clone();
+        let sender = Router::new(sedsnet::router::RouterConfig::new([]));
+        sender.add_side_packed_small_packets(
+            "radio",
+            move |payload| {
+                fragments_from_tx.lock().unwrap().push(payload.to_vec());
+                Ok(())
+            },
+            32,
+        );
+        let packet = Packet::from_f32_slice(
+            crate::telemetry_schema::data_type("GPS_DATA"),
+            &[1.0, 2.0, 3.0],
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            123,
+        )
+        .unwrap();
+        sender.tx(packet.clone()).unwrap();
+
+        let fragments = fragments.lock().unwrap().clone();
+        assert!(fragments.len() > 1, "test packet was not fragmented");
+        assert!(
+            fragments
+                .iter()
+                .any(|fragment| !is_valid_serialized_packet_or_ack(fragment)),
+            "transport fragments unexpectedly all parsed as canonical packets"
+        );
+        for fragment in fragments {
+            queue_uart_router_payload(
+                &receiver,
+                receiver_side,
+                &fragment,
+                &SerialProtocol::RawUart,
+                &mut |_| {},
+            )
+            .unwrap();
+        }
+        receiver.process_all_queues().unwrap();
+
+        let delivered = delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].data_type(), packet.data_type());
+        assert_eq!(delivered[0].payload(), packet.payload());
+    }
 
     #[test]
     fn raw_uart_frame_roundtrip() {
