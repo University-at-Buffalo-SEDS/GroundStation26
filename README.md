@@ -37,6 +37,7 @@ python3 build.py hitl-mode
 python3 build.py backend_only
 python3 build.py frontend_web
 python3 build.py debug
+python3 build.py --frontend-dev
 ```
 
 Scoped build entry points:
@@ -52,6 +53,7 @@ Docker images:
 python3 build.py docker
 python3 build.py docker pi_build
 python3 build.py docker testing
+python3 build.py docker --frontend-dev
 ```
 
 ## Documentation

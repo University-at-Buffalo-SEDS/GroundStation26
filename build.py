@@ -13,6 +13,8 @@ LOG_FILE: Optional[Path] = None
 INTERRUPTED_EXIT_CODE = 130
 FRONTEND_REPO_URL = "https://github.com/Rylan-Meilutis/Seds-Ground-Station-Frontend"
 FRONTEND_CHECKOUT_ENV = "GS26_FRONTEND_CHECKOUT_DIR"
+FRONTEND_STABLE_BRANCH = "main"
+FRONTEND_DEV_BRANCH = "dev"
 WASM_OPT_FAILURE_HINTS = (
     "wasm-opt failed",
     "error parsing wasm",
@@ -144,7 +146,13 @@ def get_compose_base_cmd() -> list[str]:
         sys.exit(1)
 
 
-def build_docker(repo_root: Path, pi_build: bool, testing: bool, plain_progress: bool) -> None:
+def build_docker(
+        repo_root: Path,
+        pi_build: bool,
+        testing: bool,
+        plain_progress: bool,
+        frontend_dev: bool,
+) -> None:
     compose_cmd = get_compose_base_cmd()
     cmd: list[str] = [*compose_cmd, "build"]
     if plain_progress and compose_cmd == ["docker", "compose"]:
@@ -155,6 +163,9 @@ def build_docker(repo_root: Path, pi_build: bool, testing: bool, plain_progress:
     if testing:
         print("Testing mode (docker) → passing --build-arg TESTING=TRUE")
         cmd.extend(["--build-arg", "TESTING=TRUE"])
+    if frontend_dev:
+        print("Frontend development source (docker) → passing --build-arg FRONTEND_DEV=TRUE")
+        cmd.extend(["--build-arg", "FRONTEND_DEV=TRUE"])
     run(cmd, cwd=repo_root)
 
 
@@ -236,6 +247,10 @@ def _frontend_checkout_dir() -> Path:
     return _default_frontend_checkout_dir()
 
 
+def _frontend_branch(frontend_dev: bool) -> str:
+    return FRONTEND_DEV_BRANCH if frontend_dev else FRONTEND_STABLE_BRANCH
+
+
 def _frontend_sync_dir(repo_root: Path) -> Path:
     return repo_root / "frontend"
 
@@ -296,10 +311,13 @@ def _resolve_external_favicon(checkout_dir: Path) -> Optional[Path]:
     return None
 
 
-def _ensure_frontend_checkout(checkout_dir: Path) -> None:
+def _ensure_frontend_checkout(checkout_dir: Path, branch: str) -> None:
     if not checkout_dir.exists():
         checkout_dir.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "clone", "--depth", "1", FRONTEND_REPO_URL, str(checkout_dir)], cwd=checkout_dir.parent)
+        run(
+            ["git", "clone", "--depth", "1", "--branch", branch, FRONTEND_REPO_URL, str(checkout_dir)],
+            cwd=checkout_dir.parent,
+        )
         return
 
     if not checkout_dir.is_dir():
@@ -330,7 +348,22 @@ def _ensure_frontend_checkout(checkout_dir: Path) -> None:
             f"Frontend checkout has local changes; refusing to pull latest from origin: {checkout_dir}"
         )
 
-    run(["git", "-C", str(checkout_dir), "pull", "--ff-only"], cwd=checkout_dir)
+    run(
+        ["git", "-C", str(checkout_dir), "fetch", "origin", f"{branch}:refs/remotes/origin/{branch}"],
+        cwd=checkout_dir,
+    )
+    local_branches = run_capture(
+        ["git", "-C", str(checkout_dir), "branch", "--format=%(refname:short)"],
+        cwd=checkout_dir,
+    ).splitlines()
+    if branch in local_branches:
+        run(["git", "-C", str(checkout_dir), "switch", branch], cwd=checkout_dir)
+    else:
+        run(
+            ["git", "-C", str(checkout_dir), "switch", "--track", "-c", branch, f"origin/{branch}"],
+            cwd=checkout_dir,
+        )
+    run(["git", "-C", str(checkout_dir), "pull", "--ff-only", "origin", branch], cwd=checkout_dir)
 
 
 def _sync_frontend_public_assets(repo_root: Path, checkout_dir: Path) -> None:
@@ -355,9 +388,12 @@ def _run_frontend_build(
         max_size_mode: bool,
         use_existing: bool,
         log_file_arg: Optional[str],
+        frontend_dev: bool,
 ) -> None:
     checkout_dir = _frontend_checkout_dir()
-    _ensure_frontend_checkout(checkout_dir)
+    branch = _frontend_branch(frontend_dev)
+    print(f"Frontend source: {FRONTEND_REPO_URL} branch {branch}")
+    _ensure_frontend_checkout(checkout_dir, branch)
 
     script = _resolve_external_frontend_script(checkout_dir)
     args = ["frontend_web"]
@@ -419,6 +455,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py test-fire-mode          # local: backend w/ test_fire_mode feature")
     print("  ./build.py debug                   # local: build frontend+backend in debug mode")
     print("  ./build.py max_size                # web wasm: add wasm-opt --converge (slower, smaller)")
+    print("  ./build.py --frontend-dev          # build frontend from dev instead of stable main")
     print("  ./build.py plain                   # docker only: pass --progress plain")
     print("  ./build.py log=build.log           # tee command output into a log file")
     print("  ./build.py docker [pi_build|no_pi] [testing]")
@@ -431,6 +468,7 @@ def print_usage(exit_code: int = 1) -> None:
     print(f"  default checkout path is {FRONTEND_CHECKOUT_ENV} or {_frontend_checkout_dir()}")
     print("  the checkout is cloned only when absent and otherwise updated with `git pull --ff-only`")
     print("  local changes in the external checkout abort the update instead of being modified")
+    print(f"  frontend source defaults to '{FRONTEND_STABLE_BRANCH}'; --frontend-dev selects '{FRONTEND_DEV_BRANCH}'")
     sys.exit(exit_code)
 
 
@@ -445,6 +483,7 @@ def main() -> None:
     max_size_mode = False
     plain_mode = False
     use_existing = False
+    frontend_dev = False
     backend_only = False
     log_file_arg: Optional[str] = None
     frontend_only_platform: Optional[str] = None
@@ -479,6 +518,8 @@ def main() -> None:
             backend_only = True
         elif arg == "existing":
             use_existing = True
+        elif arg in {"--frontend-dev", "frontend-dev", "frontend_dev"}:
+            frontend_dev = True
         elif arg.startswith("log="):
             value = raw_arg.split("=", 1)[1].strip()
             if not value:
@@ -516,6 +557,7 @@ def main() -> None:
             max_size_mode=max_size_mode,
             use_existing=use_existing,
             log_file_arg=log_file_arg,
+            frontend_dev=frontend_dev,
         )
         return
 
@@ -552,6 +594,7 @@ def main() -> None:
             pi_build=pi_build_flag,
             testing=testing_mode,
             plain_progress=use_plain,
+            frontend_dev=frontend_dev,
         )
         return
 
@@ -573,13 +616,14 @@ def main() -> None:
             max_size_mode=max_size_mode,
             use_existing=use_existing,
             log_file_arg=log_file_arg,
+            frontend_dev=frontend_dev,
         )
         _run_script(repo_root, _backend_script(repo_root), backend_args)
         return
 
     frontend_proc = mp.Process(
         target=_run_frontend_build,
-        args=(repo_root, debug_mode, max_size_mode, use_existing, log_file_arg),
+        args=(repo_root, debug_mode, max_size_mode, use_existing, log_file_arg, frontend_dev),
     )
     backend_proc = mp.Process(
         target=_run_script,

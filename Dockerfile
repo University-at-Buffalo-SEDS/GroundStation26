@@ -1,6 +1,7 @@
 FROM registry.gitlab.rylanswebsite.com/rylan-meilutis/rust-docker-builder:latest AS builder
 ARG PI_BUILD=""
 ARG TESTING=""
+ARG FRONTEND_DEV=""
 ARG BINARYEN_VERSION=117
 
 LABEL authors="rylan"
@@ -60,6 +61,12 @@ RUN set -e; \
         args="$args testing"; \
     else \
         echo "TESTING not set to 'TRUE'"; \
+    fi; \
+    if [ -n "${FRONTEND_DEV}" ] && [ "${FRONTEND_DEV}" = "TRUE" ]; then \
+        echo "FRONTEND_DEV='${FRONTEND_DEV}' → using frontend dev branch"; \
+        args="$args --frontend-dev"; \
+    else \
+        echo "FRONTEND_DEV not set to 'TRUE' → using frontend main branch"; \
     fi; \
     if [ -n "$args" ]; then \
         echo "→ ./build.py$args"; \
