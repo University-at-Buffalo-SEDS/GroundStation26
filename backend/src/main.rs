@@ -748,6 +748,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             log::info!("full-bay valve discovery route is ready");
+            log::info!(
+                "full-bay Valve discovery topology: {:?}",
+                validation_router.export_topology().routes
+            );
 
             let command_type = telemetry_schema::data_type("VALVE_COMMAND");
             /* Exercise the same runtime-schema path as the UI. log_queue uses
@@ -761,6 +765,10 @@ async fn main() -> anyhow::Result<()> {
                 return;
             }
             flush_command_tx(&validation_router, "full-bay valve-open validation tx");
+            log::info!(
+                "full-bay router stats after valve command: {:?}",
+                validation_router.export_runtime_stats().sides
+            );
             log::info!("full-bay valve-open validation command queued");
 
             // The linked firmware simulator advances seven MCUs cooperatively;
