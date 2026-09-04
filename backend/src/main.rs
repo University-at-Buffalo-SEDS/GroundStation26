@@ -717,6 +717,26 @@ async fn main() -> anyhow::Result<()> {
                         "full-bay named discovery ready: {}",
                         discovered.into_iter().collect::<Vec<_>>().join(",")
                     );
+                    if let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_STATE_SEQUENCE") {
+                        for value in sequence.split(',') {
+                            tokio::time::sleep(Duration::from_millis(750)).await;
+                            let Ok(state) = value.trim().parse::<u8>() else {
+                                log::error!(
+                                    "full-bay flight-state sequence contains invalid value {value:?}"
+                                );
+                                break;
+                            };
+                            match network_variables::set_flight_state(&validation_router, state) {
+                                Ok(()) => {
+                                    log::info!("full-bay validation set flight state: {state}")
+                                }
+                                Err(error) => {
+                                    log::error!("full-bay flight-state sequence failed: {error}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -751,25 +771,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(error) => {
                         log::error!("full-bay Flight buzzer sequence failed: {error}");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-    if let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_STATE_SEQUENCE") {
-        let validation_router = router.clone();
-        tokio::spawn(async move {
-            for value in sequence.split(',') {
-                tokio::time::sleep(Duration::from_millis(750)).await;
-                let Ok(state) = value.trim().parse::<u8>() else {
-                    log::error!("full-bay flight-state sequence contains invalid value {value:?}");
-                    break;
-                };
-                match network_variables::set_flight_state(&validation_router, state) {
-                    Ok(()) => log::info!("full-bay validation set flight state: {state}"),
-                    Err(error) => {
-                        log::error!("full-bay flight-state sequence failed: {error}");
                         break;
                     }
                 }
