@@ -264,7 +264,12 @@ pub async fn telemetry_task(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     let mut handle_interval = interval(Duration::from_millis(1));
-    let mut heartbeat_interval = interval(Duration::from_millis(500));
+    let heartbeat_period_ms = std::env::var("GS_HEARTBEAT_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 100)
+        .unwrap_or(500);
+    let mut heartbeat_interval = interval(Duration::from_millis(heartbeat_period_ms));
     handle_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_failed = false;

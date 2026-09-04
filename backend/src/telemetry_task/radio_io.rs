@@ -801,12 +801,18 @@ pub(super) fn spawn_router_worker_thread(
                 }
 
                 let mut did_work = false;
-                match router.poll_discovery() {
-                    Ok(queued) => {
-                        did_work |= queued;
-                    }
-                    Err(e) => {
-                        log_telemetry_error("router discovery polling failed", e);
+                if std::env::var("GS_SIM_DISABLE_PERIODIC_DISCOVERY")
+                    .ok()
+                    .as_deref()
+                    != Some("1")
+                {
+                    match router.poll_discovery() {
+                        Ok(queued) => {
+                            did_work |= queued;
+                        }
+                        Err(e) => {
+                            log_telemetry_error("router discovery polling failed", e);
+                        }
                     }
                 }
                 if timesync_enabled()
