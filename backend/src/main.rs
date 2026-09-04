@@ -588,7 +588,8 @@ async fn main() -> anyhow::Result<()> {
         let opts = RouterSideOptions {
             reliable_enabled: router_hop_reliable_enabled(&comms_links.av_bay),
             ..Default::default()
-        };
+        }
+        .with_small_packet_transport(1024);
         router.add_side_packed_with_options(
             "rocket_comms",
             move |pkt| {
@@ -606,7 +607,8 @@ async fn main() -> anyhow::Result<()> {
         let opts = RouterSideOptions {
             reliable_enabled: router_hop_reliable_enabled(&comms_links.fill_box),
             ..Default::default()
-        };
+        }
+        .with_small_packet_transport(1024);
         router.add_side_packed_with_options(
             "umbilical_comms",
             move |pkt| {
