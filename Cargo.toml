@@ -17,7 +17,7 @@ tokio = { version = "1.52.1", features = ["full"] }
 axum = "0.8.9"
 
 [patch.crates-io]
-SEDSnet = { git = "https://github.com/Rylan-Meilutis/SEDSnet.git", rev = "a17aec279e464402b38349d53bf1338ce40036d0" }
+SEDSnet = { git = "https://github.com/Rylan-Meilutis/SEDSnet.git", rev = "c1d7da66abff3c12276662e2faccc41d463083ee" }
 
 [profile.release]
 opt-level = 3
