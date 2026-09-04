@@ -644,7 +644,19 @@ async fn main() -> anyhow::Result<()> {
         log::info!("full-bay validation toggled AV bay underglow: {enabled}");
     }
 
-    if let Err(err) = router.announce_discovery() {
+    let initial_discovery = if std::env::var("GS_SIM_COMPACT_INITIAL_DISCOVERY")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        /* Every linked-validation firmware image embeds this same schema.
+         * Send the normal lightweight topology/address refresh and omit the
+         * redundant multi-kilobyte hosted schema transfer. */
+        router.poll_discovery().map(|_| ())
+    } else {
+        router.announce_discovery()
+    };
+    if let Err(err) = initial_discovery {
         eprintln!("WARNING: failed to queue initial discovery announce: {err}");
     }
 
