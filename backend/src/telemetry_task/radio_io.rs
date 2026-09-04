@@ -1055,16 +1055,6 @@ fn is_command_payload(payload: &[u8]) -> bool {
     .any(|name| ty == crate::telemetry_schema::data_type(name))
 }
 
-pub(super) fn is_fill_system_command_payload(payload: &[u8]) -> bool {
-    let Ok(pkt) = serialize::unpack_packet(payload) else {
-        return false;
-    };
-    let ty = pkt.data_type();
-    ["VALVE_COMMAND", "ACTUATOR_COMMAND", "ABORT"]
-        .into_iter()
-        .any(|name| ty == crate::telemetry_schema::data_type(name))
-}
-
 fn is_flight_command_payload(payload: &[u8]) -> bool {
     let Ok(pkt) = serialize::unpack_packet(payload) else {
         return false;
@@ -1082,14 +1072,6 @@ fn drain_radio_tx_queue(
     loop {
         match tx_rx.try_recv() {
             Ok(payload) => {
-                if worker_name == "rocket_comms" && is_fill_system_command_payload(&payload) {
-                    log_radio_command_event(
-                        "radio TX dropped fill-system command",
-                        worker_name,
-                        &payload,
-                    );
-                    continue;
-                }
                 log_radio_command_event("radio TX backlog", worker_name, &payload);
                 let repeats =
                     if worker_name == "rocket_comms" && is_flight_command_payload(&payload) {

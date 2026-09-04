@@ -8,7 +8,7 @@ mod radio_io;
 pub use radio_io::CommsWorkerHandle;
 #[cfg(test)]
 use radio_io::{
-    is_fill_system_command_payload, radio_command_log_line, spawn_dedicated_radio_io_threads,
+    radio_command_log_line, spawn_dedicated_radio_io_threads,
 };
 use radio_io::{spawn_comms_worker_threads, spawn_router_worker_thread};
 
@@ -2135,57 +2135,6 @@ mod tests {
         for (telemetry_cmd, expected_id) in cases {
             assert_eq!(hitl_flight_command_id(&telemetry_cmd), Some(expected_id));
         }
-    }
-
-    #[test]
-    fn rocket_drop_filter_matches_fill_system_commands_only() {
-        let actuator_pkt = Packet::new(
-            crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
-            &[crate::telemetry_schema::endpoint("ACTUATOR_BOARD")],
-            Board::GroundStation.sender_id(),
-            123,
-            Arc::from([9_u8]),
-        )
-        .expect("failed to build actuator command packet");
-        assert!(is_fill_system_command_payload(&serialize::pack_packet(
-            &actuator_pkt
-        )));
-
-        let valve_pkt = Packet::new(
-            crate::telemetry_schema::data_type("VALVE_COMMAND"),
-            &[crate::telemetry_schema::endpoint("VALVE_BOARD")],
-            Board::GroundStation.sender_id(),
-            123,
-            Arc::from([1_u8]),
-        )
-        .expect("failed to build valve command packet");
-        assert!(is_fill_system_command_payload(&serialize::pack_packet(
-            &valve_pkt
-        )));
-
-        let abort_pkt = Packet::new(
-            crate::telemetry_schema::data_type("ABORT"),
-            &[crate::telemetry_schema::endpoint("ABORT")],
-            Board::GroundStation.sender_id(),
-            123,
-            Arc::from("Manual Abort Command Issued".as_bytes()),
-        )
-        .expect("failed to build abort packet");
-        assert!(is_fill_system_command_payload(&serialize::pack_packet(
-            &abort_pkt
-        )));
-
-        let flight_pkt = Packet::new(
-            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
-            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
-            Board::GroundStation.sender_id(),
-            123,
-            Arc::from([0_u8]),
-        )
-        .expect("failed to build flight command packet");
-        assert!(!is_fill_system_command_payload(&serialize::pack_packet(
-            &flight_pkt
-        )));
     }
 
     #[test]

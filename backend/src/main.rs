@@ -63,7 +63,6 @@ use crate::comms_config::{CommsLinkConfig, SerialProtocol};
 use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
 use sedsnet::TelemetryError;
-use sedsnet::config::DataType;
 use sedsnet::packet::Packet;
 use sedsnet::router::{EndpointHandler, RouterSideOptions};
 use sedsnet::timesync::{TimeSyncConfig, TimeSyncRole};
@@ -154,34 +153,6 @@ fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
         }
         CommsLinkConfig::Spi { .. } | CommsLinkConfig::Can { .. } => true,
     }
-}
-
-fn configure_constrained_discovery(
-    router: &sedsnet::router::Router,
-    rocket_side: sedsnet::router::RouterSideId,
-    umbilical_side: sedsnet::router::RouterSideId,
-) -> Result<(), TelemetryError> {
-    // DiscoveryAddress already carries the aggregated reachable endpoint set
-    // used for hierarchical route selection. Keep the detailed graph local to
-    // the hosted GroundStation: sending it over either constrained serial link
-    // forces small embedded routers to allocate a multi-kilobyte snapshot that
-    // they do not need in order to route commands or telemetry.
-    router.set_typed_route(None, DataType::DiscoveryTopology, rocket_side, false)?;
-    router.set_typed_route(None, DataType::DiscoveryTopology, umbilical_side, false)?;
-
-    // Every deployed firmware router uses its immutable generated schema and
-    // intentionally ignores remote DiscoverySchema packets.  Sending the
-    // hosted GroundStation schema over the radio and Pico-Fi links consumes
-    // several kilobytes at startup and can hold commands behind data that the
-    // receiver will discard.  Keep schema reception enabled, but do not emit
-    // the host schema toward embedded-only sides.
-    router.set_typed_route(None, DataType::DiscoverySchema, rocket_side, false)?;
-    router.set_typed_route(None, DataType::DiscoverySchema, umbilical_side, false)?;
-
-    // All application data, commands, and network variables use learned
-    // discovery routes. Do not install static side rules here: they bypass
-    // ownership discovery and duplicate traffic over the radio link.
-    Ok(())
 }
 
 /// Creates or upgrades the auth session table used by token-based login.
@@ -647,7 +618,7 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(|_| TelemetryError::HandlerError("rocket_comms tx queue closed"))?;
                 Ok(())
             },
-            opts.with_small_packet_transport(1024),
+            opts,
         )
     };
 
@@ -672,14 +643,9 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(|_| TelemetryError::HandlerError("umbilical_comms tx queue closed"))?;
                 Ok(())
             },
-            opts.with_small_packet_transport(1024),
+            opts,
         )
     };
-
-    // The GroundStation terminates two independent routed networks. Fill
-    // commands must never enter the rocket-radio side merely because a stale
-    // or reflected discovery path scores equally with the direct Pico-Fi path.
-    configure_constrained_discovery(&router, rocket_side, umbilical_side)?;
 
     rocket_comms
         .lock()
