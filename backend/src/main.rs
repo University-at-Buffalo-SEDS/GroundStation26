@@ -67,7 +67,7 @@ use sedsnet::packet::Packet;
 use sedsnet::router::{EndpointHandler, RouterSideOptions};
 use sedsnet::timesync::{TimeSyncConfig, TimeSyncRole};
 use sqlx::Row;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -692,6 +692,37 @@ async fn main() -> anyhow::Result<()> {
         db_queue_rx,
         telemetry_shutdown_rx,
     ));
+    if let Ok(expected) = std::env::var("GS_SIM_EXPECT_DISCOVERY_NODES") {
+        let validation_router = router.clone();
+        tokio::spawn(async move {
+            let expected = expected
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            loop {
+                let topology = validation_router.export_topology();
+                let mut discovered = BTreeSet::new();
+                for route in topology.routes {
+                    for announcer in route.announcers {
+                        discovered.insert(announcer.sender_id);
+                        for board in announcer.routers {
+                            discovered.insert(board.sender_id);
+                        }
+                    }
+                }
+                if expected.is_subset(&discovered) {
+                    log::info!(
+                        "full-bay named discovery ready: {}",
+                        discovered.into_iter().collect::<Vec<_>>().join(",")
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
     if let Ok(sequence) = std::env::var("GS_SIM_UNDERGLOW_SEQUENCE") {
         let validation_router = router.clone();
         tokio::spawn(async move {
@@ -720,6 +751,25 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(error) => {
                         log::error!("full-bay Flight buzzer sequence failed: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    if let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_STATE_SEQUENCE") {
+        let validation_router = router.clone();
+        tokio::spawn(async move {
+            for value in sequence.split(',') {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                let Ok(state) = value.trim().parse::<u8>() else {
+                    log::error!("full-bay flight-state sequence contains invalid value {value:?}");
+                    break;
+                };
+                match network_variables::set_flight_state(&validation_router, state) {
+                    Ok(()) => log::info!("full-bay validation set flight state: {state}"),
+                    Err(error) => {
+                        log::error!("full-bay flight-state sequence failed: {error}");
                         break;
                     }
                 }
