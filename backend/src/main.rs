@@ -87,17 +87,6 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .clamp(min, max)
 }
 
-fn env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        })
-        .unwrap_or(default)
-}
-
 pub(crate) fn debug_prints_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -283,10 +272,6 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     telemetry_schema::initialize()?;
-
-    // The RFD900x is a transparent serial link and does not need the LoRa
-    // uplink/downlink turn scheduler. Keep the override for legacy LoRa rigs.
-    let radio_scheduler_enabled = env_bool("GS_RADIO_SCHEDULER_ENABLED", false);
 
     logger::init()?;
     log::info!(
@@ -602,17 +587,11 @@ async fn main() -> anyhow::Result<()> {
         let rocket_tx = rocket_tx.clone();
         let opts = RouterSideOptions {
             reliable_enabled: router_hop_reliable_enabled(&comms_links.av_bay),
-            // Discovery, topology, managed-variable requests, and their ACKs
-            // must cross both halves of the GroundStation bridge.
-            link_local_enabled: true,
             ..Default::default()
         };
         router.add_side_packed_with_options(
             "rocket_comms",
             move |pkt| {
-                if telemetry_schema::is_host_only_schema_packet(pkt) {
-                    return Ok(());
-                }
                 rocket_tx
                     .send(pkt.to_vec())
                     .map_err(|_| TelemetryError::HandlerError("rocket_comms tx queue closed"))?;
@@ -626,18 +605,11 @@ async fn main() -> anyhow::Result<()> {
         let umbilical_tx = umbilical_tx.clone();
         let opts = RouterSideOptions {
             reliable_enabled: router_hop_reliable_enabled(&comms_links.fill_box),
-            // The Pico bridge on the I2C side needs router-local packets (for example
-            // GroundStation-addressed traffic and local heartbeat/discovery flow) to traverse
-            // the physical link so it can forward them back out over its UART/USB bridge.
-            link_local_enabled: true,
             ..Default::default()
         };
         router.add_side_packed_with_options(
             "umbilical_comms",
             move |pkt| {
-                if telemetry_schema::is_host_only_schema_packet(pkt) {
-                    return Ok(());
-                }
                 umbilical_tx
                     .send(pkt.to_vec())
                     .map_err(|_| TelemetryError::HandlerError("umbilical_comms tx queue closed"))?;
@@ -689,7 +661,7 @@ async fn main() -> anyhow::Result<()> {
                 tx_rx: rocket_rx,
                 legacy_single_worker: false,
                 prioritize_rx: false,
-                dedicated_radio_io: radio_scheduler_enabled,
+                dedicated_radio_io: false,
             },
             CommsWorkerHandle {
                 name: "umbilical_comms",

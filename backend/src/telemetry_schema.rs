@@ -224,15 +224,6 @@ pub fn data_type(name: &str) -> DataType {
     DataType::named(name)
 }
 
-/// Embedded peers carry an immutable copy of this schema and deliberately do
-/// not merge discovery schema snapshots. Avoid putting those multi-kilobyte
-/// host-only packets on constrained UART/radio links.
-pub fn is_host_only_schema_packet(packed: &[u8]) -> bool {
-    sedsnet::wire_format::unpack_packet(packed)
-        .map(|packet| packet.data_type() == DataType::DiscoverySchema)
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,13 +243,4 @@ mod tests {
         assert_eq!(data_type("FLIGHT_BUZZER"), DataType(134));
     }
 
-    #[test]
-    fn filters_schema_snapshots_that_embedded_peers_cannot_consume() {
-        initialize().expect("schema registration");
-        let packet =
-            sedsnet::discovery::build_discovery_schema("GS", 1).expect("discovery schema packet");
-        let packed = sedsnet::wire_format::pack_packet(&packet);
-        assert!(is_host_only_schema_packet(&packed));
-        assert!(!is_host_only_schema_packet(&[0x00, 0x01]));
-    }
 }
