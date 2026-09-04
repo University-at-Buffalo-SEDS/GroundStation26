@@ -169,6 +169,15 @@ fn configure_constrained_discovery(
     router.set_typed_route(None, DataType::DiscoveryTopology, rocket_side, false)?;
     router.set_typed_route(None, DataType::DiscoveryTopology, umbilical_side, false)?;
 
+    // Every deployed firmware router uses its immutable generated schema and
+    // intentionally ignores remote DiscoverySchema packets.  Sending the
+    // hosted GroundStation schema over the radio and Pico-Fi links consumes
+    // several kilobytes at startup and can hold commands behind data that the
+    // receiver will discard.  Keep schema reception enabled, but do not emit
+    // the host schema toward embedded-only sides.
+    router.set_typed_route(None, DataType::DiscoverySchema, rocket_side, false)?;
+    router.set_typed_route(None, DataType::DiscoverySchema, umbilical_side, false)?;
+
     // All application data, commands, and network variables use learned
     // discovery routes. Do not install static side rules here: they bypass
     // ownership discovery and duplicate traffic over the radio link.
