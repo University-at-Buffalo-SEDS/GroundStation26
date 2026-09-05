@@ -135,12 +135,31 @@ pub(crate) fn ws_diagnostics_enabled() -> bool {
 fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
     match link {
         CommsLinkConfig::I2c { .. } => false,
-        CommsLinkConfig::Serial { serial }
-        | CommsLinkConfig::RaspberryPiGpioUart { serial }
-        | CommsLinkConfig::CustomSerial { serial } => {
-            !matches!(serial.protocol, SerialProtocol::RawUart)
-        }
+        // Raw UART is only the outer transport framing.  SEDSNet still owns
+        // delivery semantics on the RFD900x/Gateway hop, so reliable packets
+        // must retain their hop ACK/retry header here too.
+        CommsLinkConfig::Serial { .. }
+        | CommsLinkConfig::RaspberryPiGpioUart { .. }
+        | CommsLinkConfig::CustomSerial { .. } => true,
         CommsLinkConfig::Spi { .. } | CommsLinkConfig::Can { .. } => true,
+    }
+}
+
+#[cfg(test)]
+mod router_link_policy_tests {
+    use super::*;
+
+    #[test]
+    fn raw_uart_radio_keeps_sedsnet_reliability_enabled() {
+        let link = CommsLinkConfig::Serial {
+            serial: crate::comms_config::SerialLinkConfig {
+                port: "sim://av-bay".to_owned(),
+                baud_rate: 57_600,
+                protocol: SerialProtocol::RawUart,
+            },
+        };
+
+        assert!(router_hop_reliable_enabled(&link));
     }
 }
 
