@@ -608,7 +608,7 @@
         "count": 1
       },
       "endpoints": [
-        "HEART_BEAT"
+        "FLIGHT_CONTROLLER"
       ]
     }
   ]

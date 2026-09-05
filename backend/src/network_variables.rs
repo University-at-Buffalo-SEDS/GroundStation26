@@ -203,7 +203,11 @@ pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
         guard.values.flight_buzzer = enabled;
         persist(&guard.path, guard.values)?;
     }
-    router.set_network_variable(packet(FLIGHT_BUZZER_TYPE, "HEART_BEAT", u8::from(enabled))?)?;
+    router.set_network_variable(packet(
+        FLIGHT_BUZZER_TYPE,
+        "FLIGHT_CONTROLLER",
+        u8::from(enabled),
+    )?)?;
     Ok(())
 }
 
@@ -388,6 +392,17 @@ mod tests {
         source.process_all_queues().unwrap();
         peer.process_all_queues().unwrap();
         assert_eq!(*observed.lock().unwrap(), vec![vec![1]]);
+    }
+
+    #[test]
+    fn flight_buzzer_targets_only_the_discovered_flight_controller() {
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = packet(FLIGHT_BUZZER_TYPE, "FLIGHT_CONTROLLER", 1).unwrap();
+        assert_eq!(
+            packet.endpoints(),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")]
+        );
+        assert_eq!(packet.payload(), &[1]);
     }
 
     #[test]
