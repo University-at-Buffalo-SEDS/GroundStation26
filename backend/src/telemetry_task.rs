@@ -2302,7 +2302,7 @@ mod tests {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
         scheduler_status: Option<Arc<Mutex<Vec<(u8, bool)>>>>,
         windows: VecDeque<crate::comms::RadioWindowUpdate>,
-        inject_tx_on_recv: Option<(mpsc::UnboundedSender<Vec<u8>>, Vec<u8>)>,
+        inject_tx_on_recv: Option<(mpsc::UnboundedSender<(u8, Vec<u8>)>, Vec<u8>)>,
         fail_sends: usize,
     }
 
@@ -2339,7 +2339,7 @@ mod tests {
             _max_packets: usize,
         ) -> sedsnet::TelemetryResult<()> {
             if let Some((tx, payload)) = self.inject_tx_on_recv.take() {
-                tx.send(payload)
+                tx.send((0, payload))
                     .expect("failed to inject radio worker tx during recv");
             }
             Ok(())
@@ -2633,14 +2633,14 @@ mod tests {
         let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([
             ground_station_handler,
         ])));
-        let (radio_tx, radio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (radio_tx, radio_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
         let side_id = {
             let radio_tx = radio_tx.clone();
-            router.add_side_packed_with_options(
+            router.add_side_packed_with_priority_and_options(
                 "rocket_comms",
-                move |bytes| {
+                move |bytes, priority| {
                     radio_tx
-                        .send(bytes.to_vec())
+                        .send((priority, bytes.to_vec()))
                         .map_err(|_| sedsnet::TelemetryError::HandlerError("radio tx closed"))?;
                     Ok(())
                 },
@@ -2836,7 +2836,7 @@ mod tests {
         )
         .expect("failed to build flight command packet");
         let wire = serialize::pack_packet(&pkt).to_vec();
-        tx.send(wire.clone())
+        tx.send((0, wire.clone()))
             .expect("failed to queue flight command to radio worker");
         let workers = spawn_dedicated_radio_io_threads(
             router,
@@ -3029,7 +3029,7 @@ mod tests {
         )
         .expect("failed to spawn radio workers");
 
-        tx.send(wire.clone())
+        tx.send((0, wire.clone()))
             .expect("failed to queue flight command to radio worker");
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3098,7 +3098,7 @@ mod tests {
         )
         .expect("failed to spawn radio workers");
 
-        tx.send(wire)
+        tx.send((0, wire))
             .expect("failed to queue flight command to radio worker");
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -3159,9 +3159,9 @@ mod tests {
         )
         .expect("failed to build flight command packet");
         let command_wire = serialize::pack_packet(&command_pkt).to_vec();
-        tx.send(telemetry_wire)
+        tx.send((1, telemetry_wire))
             .expect("failed to queue telemetry to radio worker");
-        tx.send(command_wire.clone())
+        tx.send((0, command_wire.clone()))
             .expect("failed to queue flight command to radio worker");
         let workers = spawn_dedicated_radio_io_threads(
             router,
@@ -3265,7 +3265,7 @@ mod tests {
         )
         .expect("failed to spawn radio workers");
 
-        tx.send(wire.clone())
+        tx.send((0, wire.clone()))
             .expect("failed to queue flight command to radio worker");
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -3332,7 +3332,7 @@ mod tests {
         )
         .expect("failed to build flight command packet");
         let wire = serialize::pack_packet(&pkt).to_vec();
-        tx.send(wire)
+        tx.send((0, wire))
             .expect("failed to queue flight command to radio worker");
 
         let workers = spawn_dedicated_radio_io_threads(
@@ -3404,7 +3404,7 @@ mod tests {
         let wire = serialize::pack_packet(&pkt).to_vec();
         let expected_window_sends = 5usize;
         for _ in 0..(expected_window_sends + 1) {
-            tx.send(wire.clone())
+            tx.send((0, wire.clone()))
                 .expect("failed to queue flight command to radio worker");
         }
 

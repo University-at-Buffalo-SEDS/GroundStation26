@@ -580,8 +580,8 @@ async fn main() -> anyhow::Result<()> {
     set_network_time_router(router.clone());
     let _ = state.topology_router.set(router.clone());
 
-    let (rocket_tx, rocket_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (rocket_tx, rocket_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+    let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
 
     let rocket_side = {
         let rocket_tx = rocket_tx.clone();
@@ -590,11 +590,11 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         }
         .with_small_packet_transport(1024);
-        router.add_side_packed_with_options(
+        router.add_side_packed_with_priority_and_options(
             "rocket_comms",
-            move |pkt| {
+            move |pkt, priority| {
                 rocket_tx
-                    .send(pkt.to_vec())
+                    .send((priority, pkt.to_vec()))
                     .map_err(|_| TelemetryError::HandlerError("rocket_comms tx queue closed"))?;
                 Ok(())
             },
@@ -609,11 +609,11 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         }
         .with_small_packet_transport(1024);
-        router.add_side_packed_with_options(
+        router.add_side_packed_with_priority_and_options(
             "umbilical_comms",
-            move |pkt| {
+            move |pkt, priority| {
                 umbilical_tx
-                    .send(pkt.to_vec())
+                    .send((priority, pkt.to_vec()))
                     .map_err(|_| TelemetryError::HandlerError("umbilical_comms tx queue closed"))?;
                 Ok(())
             },
