@@ -1,9 +1,10 @@
 use crate::comms::{CommsDevice, RadioWindowKind};
 use crate::state::AppState;
+use sedsnet::config::DataType;
 use sedsnet::packet::Packet;
 use sedsnet::router::{Router, RouterSideId};
 use sedsnet::wire_format as serialize;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use tokio::sync::{broadcast, mpsc};
@@ -27,7 +28,100 @@ pub struct CommsWorkerHandle {
 
 const COMMS_TX_BURST: usize = 1;
 const COMMS_TX_GAP_MS: u64 = 10;
+const GENERAL_COMMS_TX_BURST: usize = 16;
 const COMMS_IDLE_SLEEP_MS: u64 = 1;
+
+type PriorityBacklog = BTreeMap<u8, VecDeque<Vec<u8>>>;
+
+fn outbound_payload_priority(payload: &[u8]) -> u8 {
+    let Ok(pkt) = serialize::unpack_packet(payload) else {
+        // Transport chunks are emitted consecutively by the router. Keep an
+        // unknown chunk below protocol control traffic but above bulk data so
+        // a large logical packet cannot be starved indefinitely.
+        return 1;
+    };
+    protocol_priority(pkt.data_type())
+}
+
+fn protocol_priority(ty: DataType) -> u8 {
+    if ["AV_BAY_UNDERGLOW", "FLIGHT_BUZZER", "FLIGHT_STATE"]
+        .into_iter()
+        .any(|name| ty == crate::telemetry_schema::data_type(name))
+    {
+        return 254;
+    }
+    match ty {
+        DataType::ReliableAck
+        | DataType::ReliablePartialAck
+        | DataType::ReliablePacketRequest
+        | DataType::DiscoveryAnnounce
+        | DataType::DiscoveryTimeSyncSources
+        | DataType::DiscoveryTopology
+        | DataType::DiscoverySchema
+        | DataType::DiscoveryTopologyRequest
+        | DataType::DiscoverySchemaRequest
+        | DataType::DiscoveryLeave
+        | DataType::DiscoveryLinkCapabilities
+        | DataType::DiscoveryAddress => 255,
+        DataType::ManagedVariableRequest
+        | DataType::ManagedVariableValue
+        | DataType::TimeSyncAnnounce
+        | DataType::TimeSyncRequest
+        | DataType::TimeSyncResponse => 254,
+        _ => sedsnet::message_priority(ty).min(253),
+    }
+}
+
+fn backlog_push(backlog: &mut PriorityBacklog, payload: Vec<u8>, front: bool) {
+    let queue = backlog
+        .entry(outbound_payload_priority(&payload))
+        .or_default();
+    if front {
+        queue.push_front(payload);
+    } else {
+        queue.push_back(payload);
+    }
+}
+
+fn backlog_pop(backlog: &mut PriorityBacklog) -> Option<Vec<u8>> {
+    let priority = backlog.last_key_value().map(|(priority, _)| *priority)?;
+    let queue = backlog.get_mut(&priority).expect("priority just selected");
+    let payload = queue.pop_front();
+    if queue.is_empty() {
+        backlog.remove(&priority);
+    }
+    payload
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_precedes_shared_state_and_user_traffic() {
+        assert_eq!(protocol_priority(DataType::DiscoveryAnnounce), 255);
+        assert_eq!(protocol_priority(DataType::ManagedVariableValue), 254);
+        assert_eq!(protocol_priority(DataType::TimeSyncAnnounce), 254);
+        assert!(
+            protocol_priority(crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"))
+                > protocol_priority(crate::telemetry_schema::data_type("KG1000"))
+        );
+    }
+
+    #[test]
+    fn priority_backlog_preserves_fifo_within_each_band() {
+        let mut backlog = PriorityBacklog::new();
+        backlog.entry(5).or_default().extend([vec![1], vec![2]]);
+        backlog.entry(255).or_default().push_back(vec![3]);
+        backlog.entry(254).or_default().push_back(vec![4]);
+
+        assert_eq!(backlog_pop(&mut backlog), Some(vec![3]));
+        assert_eq!(backlog_pop(&mut backlog), Some(vec![4]));
+        assert_eq!(backlog_pop(&mut backlog), Some(vec![1]));
+        assert_eq!(backlog_pop(&mut backlog), Some(vec![2]));
+        assert_eq!(backlog_pop(&mut backlog), None);
+    }
+}
 pub(super) fn spawn_comms_worker_threads(
     router: Arc<Router>,
     state: Arc<AppState>,
@@ -57,8 +151,7 @@ pub(super) fn spawn_comms_worker_threads(
             let mut last_send_error_log_ms = 0;
             let mut suppressed_send_errors = 0;
             let mut next_tx_allowed_at = std::time::Instant::now();
-            let mut command_backlog: VecDeque<Vec<u8>> = VecDeque::new();
-            let mut telemetry_backlog: VecDeque<Vec<u8>> = VecDeque::new();
+            let mut backlog = PriorityBacklog::new();
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -76,11 +169,7 @@ pub(super) fn spawn_comms_worker_threads(
                 loop {
                     match comms_handle.tx_rx.try_recv() {
                         Ok(payload) => {
-                            if is_command_payload(&payload) {
-                                command_backlog.push_back(payload);
-                            } else {
-                                telemetry_backlog.push_back(payload);
-                            }
+                            backlog_push(&mut backlog, payload, false);
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => return,
@@ -88,14 +177,10 @@ pub(super) fn spawn_comms_worker_threads(
                 }
 
                 let mut sent_any = false;
-                for _ in 0..COMMS_TX_BURST {
-                    let Some(payload) = command_backlog
-                        .pop_front()
-                        .or_else(|| telemetry_backlog.pop_front())
-                    else {
+                for _ in 0..GENERAL_COMMS_TX_BURST {
+                    let Some(payload) = backlog_pop(&mut backlog) else {
                         break;
                     };
-                    let command = is_command_payload(&payload);
                     let mut comms = tx_worker_comms.lock().expect("failed to get lock");
                     match comms.send_data(&payload) {
                         Ok(()) => {
@@ -114,11 +199,7 @@ pub(super) fn spawn_comms_worker_threads(
                             // A transport error means the packet never reached
                             // Pico-Fi. Preserve queue ordering and retry the
                             // entire logical packet from a new START slot.
-                            if command {
-                                command_backlog.push_front(payload);
-                            } else {
-                                telemetry_backlog.push_front(payload);
-                            }
+                            backlog_push(&mut backlog, payload, true);
                             next_tx_allowed_at = std::time::Instant::now()
                                 + Duration::from_millis(COMMS_TX_GAP_MS);
                             log_repeated_worker_error(
@@ -132,8 +213,10 @@ pub(super) fn spawn_comms_worker_threads(
                 }
 
                 if sent_any {
-                    next_tx_allowed_at =
-                        std::time::Instant::now() + Duration::from_millis(COMMS_TX_GAP_MS);
+                    // send_data drains the OS/device transport. An additional
+                    // per-packet delay only lowers throughput and increases
+                    // discovery/network-variable latency.
+                    next_tx_allowed_at = std::time::Instant::now();
                     thread::yield_now();
                 } else {
                     thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
