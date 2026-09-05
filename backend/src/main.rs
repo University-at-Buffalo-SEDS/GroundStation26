@@ -59,7 +59,7 @@ use crate::telemetry_task::{
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 use crate::comms::DummyComms;
 use crate::comms::{CommsDevice, link_description, open_link, startup_failure_hint};
-use crate::comms_config::{CommsLinkConfig, SerialProtocol};
+use crate::comms_config::CommsLinkConfig;
 use crate::types::{Board, FlightState as FlightStateMode};
 use axum::Router;
 use sedsnet::TelemetryError;
@@ -155,7 +155,7 @@ mod router_link_policy_tests {
             serial: crate::comms_config::SerialLinkConfig {
                 port: "sim://av-bay".to_owned(),
                 baud_rate: 57_600,
-                protocol: SerialProtocol::RawUart,
+                protocol: crate::comms_config::SerialProtocol::RawUart,
             },
         };
 
