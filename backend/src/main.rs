@@ -694,6 +694,10 @@ async fn main() -> anyhow::Result<()> {
     ));
     if let Ok(expected) = std::env::var("GS_SIM_EXPECT_DISCOVERY_NODES") {
         let validation_router = router.clone();
+        let control_step_ms = std::env::var("GS_SIM_CONTROL_STEP_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(750);
         tokio::spawn(async move {
             let expected = expected
                 .split(',')
@@ -719,7 +723,7 @@ async fn main() -> anyhow::Result<()> {
                     );
                     if let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_STATE_SEQUENCE") {
                         for value in sequence.split(',') {
-                            tokio::time::sleep(Duration::from_millis(750)).await;
+                            tokio::time::sleep(Duration::from_millis(control_step_ms)).await;
                             let Ok(state) = value.trim().parse::<u8>() else {
                                 log::error!(
                                     "full-bay flight-state sequence contains invalid value {value:?}"
@@ -739,7 +743,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     if let Ok(sequence) = std::env::var("GS_SIM_UNDERGLOW_SEQUENCE") {
                         for value in sequence.split(',') {
-                            tokio::time::sleep(Duration::from_millis(750)).await;
+                            tokio::time::sleep(Duration::from_millis(control_step_ms)).await;
                             let enabled = matches!(value.trim(), "1" | "true" | "on");
                             match network_variables::set_underglow(&validation_router, enabled) {
                                 Ok(()) => log::info!(
@@ -754,7 +758,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     if let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_BUZZER_SEQUENCE") {
                         for value in sequence.split(',') {
-                            tokio::time::sleep(Duration::from_millis(750)).await;
+                            tokio::time::sleep(Duration::from_millis(control_step_ms)).await;
                             let enabled = matches!(value.trim(), "1" | "true" | "on");
                             match network_variables::set_flight_buzzer(&validation_router, enabled)
                             {
