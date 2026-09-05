@@ -737,13 +737,46 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    if let Ok(sequence) = std::env::var("GS_SIM_UNDERGLOW_SEQUENCE") {
+                        for value in sequence.split(',') {
+                            tokio::time::sleep(Duration::from_millis(750)).await;
+                            let enabled = matches!(value.trim(), "1" | "true" | "on");
+                            match network_variables::set_underglow(&validation_router, enabled) {
+                                Ok(()) => log::info!(
+                                    "full-bay validation set AV bay underglow: {enabled}"
+                                ),
+                                Err(error) => {
+                                    log::error!("full-bay underglow sequence failed: {error}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_BUZZER_SEQUENCE") {
+                        for value in sequence.split(',') {
+                            tokio::time::sleep(Duration::from_millis(750)).await;
+                            let enabled = matches!(value.trim(), "1" | "true" | "on");
+                            match network_variables::set_flight_buzzer(&validation_router, enabled)
+                            {
+                                Ok(()) => {
+                                    log::info!("full-bay validation set Flight buzzer: {enabled}")
+                                }
+                                Err(error) => {
+                                    log::error!("full-bay Flight buzzer sequence failed: {error}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
     }
-    if let Ok(sequence) = std::env::var("GS_SIM_UNDERGLOW_SEQUENCE") {
+    if std::env::var_os("GS_SIM_EXPECT_DISCOVERY_NODES").is_none()
+        && let Ok(sequence) = std::env::var("GS_SIM_UNDERGLOW_SEQUENCE")
+    {
         let validation_router = router.clone();
         tokio::spawn(async move {
             for value in sequence.split(',') {
@@ -759,7 +792,9 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-    if let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_BUZZER_SEQUENCE") {
+    if std::env::var_os("GS_SIM_EXPECT_DISCOVERY_NODES").is_none()
+        && let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_BUZZER_SEQUENCE")
+    {
         let validation_router = router.clone();
         tokio::spawn(async move {
             for value in sequence.split(',') {
