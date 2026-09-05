@@ -243,4 +243,18 @@ mod tests {
         assert_eq!(data_type("FLIGHT_BUZZER"), DataType(134));
     }
 
+    #[test]
+    fn umbilical_command_ack_is_reliable_and_ordered() {
+        let schema: serde_json::Value =
+            serde_json::from_slice(SCHEMA_JSON).expect("embedded telemetry schema");
+        let status = schema["types"]
+            .as_array()
+            .expect("schema types")
+            .iter()
+            .find(|item| item["name"] == "UMBILICAL_STATUS")
+            .expect("UMBILICAL_STATUS type");
+        assert_eq!(status["reliable"], true);
+        assert_eq!(status["reliable_mode"], "Ordered");
+    }
+
 }

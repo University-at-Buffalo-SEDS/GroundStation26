@@ -874,6 +874,22 @@ async fn main() -> anyhow::Result<()> {
                 validation_router.export_topology().routes
             );
 
+            // Seeing Valve proves the outbound path. Ask every discovered
+            // router for a fresh topology snapshot before emitting the ACKed
+            // command so Valve also learns the reverse GroundStation route.
+            // This uses the production discovery protocol; it does not add a
+            // route override or broadcast application data.
+            if let Err(err) = validation_router.request_topology() {
+                log::error!("full-bay reverse-route discovery request failed: {err}");
+                return;
+            }
+            flush_command_tx(&validation_router, "full-bay reverse-route discovery tx");
+            let settle_ms = std::env::var("GS_SIM_VALVE_ROUTE_SETTLE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(6_000);
+            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+
             let command_type = telemetry_schema::data_type("VALVE_COMMAND");
             /* Exercise the same runtime-schema path as the UI. log_queue uses
              * the VALVE_COMMAND endpoint ownership learned by discovery;
