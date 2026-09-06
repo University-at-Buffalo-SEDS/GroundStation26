@@ -570,6 +570,22 @@ fn queue_uart_router_payload(
     Ok(())
 }
 
+fn queue_i2c_router_payload(
+    router: &Router,
+    side_id: RouterSideId,
+    payload: &[u8],
+    packet_tap: &mut dyn FnMut(&Packet),
+) -> TelemetryResult<bool> {
+    let Some((header, data)) = parse_link_frame(payload) else {
+        return Ok(false);
+    };
+    if header != (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1) || data.is_empty() {
+        return Ok(false);
+    }
+    queue_uart_router_payload(router, side_id, data, &SerialProtocol::RawUart, packet_tap)?;
+    Ok(true)
+}
+
 #[cfg(target_os = "linux")]
 fn linux_baud_rate_constant(baud: u32) -> Option<libc::speed_t> {
     match baud {
@@ -833,7 +849,6 @@ enum RawUartFrameKind {
     Ascii,
 }
 
-#[cfg(target_os = "linux")]
 fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
     if payload.len() < RAW_UART_FRAME_HEADER_SIZE {
         return None;
@@ -1780,35 +1795,15 @@ impl CommsDevice for I2cComms {
                             // envelope before passing SEDSNet bytes to the
                             // router; the UART-side Pico uses an independent
                             // envelope on its Gateway connection.
-                            let Some((header, data)) = parse_link_frame(&payload) else {
-                                continue;
-                            };
-                            if header != (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1)
-                                || data.is_empty()
+                            // Each Pico-Fi DATA envelope contains one router-side
+                            // transport unit. It may be a compact frame or a
+                            // chunk, not necessarily a complete canonical
+                            // SEDSNet packet. Let the router validate and
+                            // reassemble it just like the raw-UART path does.
+                            if !queue_i2c_router_payload(router, side_id, &payload, packet_tap)
+                                .unwrap_or(false)
                             {
                                 continue;
-                            }
-                            self.rx_payload_buf.extend_from_slice(data);
-                            while let Some(packet) = self.try_take_buffered_packet()? {
-                                if !is_valid_serialized_packet_or_ack(&packet) {
-                                    continue;
-                                }
-                                tap_non_groundstation_gps_payload(&packet, packet_tap);
-                                match router.rx_packed_queue_from_side(&packet, side_id) {
-                                    Ok(()) => {}
-                                    Err(err) => {
-                                        let _ = err;
-                                        continue;
-                                    }
-                                }
-                            }
-                            if !self.rx_payload_buf.is_empty() {
-                                match serialize::peek_frame_info(&self.rx_payload_buf) {
-                                    Ok(_) => {}
-                                    Err(err) => {
-                                        let _ = err;
-                                    }
-                                }
                             }
                         }
                     }
@@ -2561,6 +2556,56 @@ mod tests {
 mod raw_uart_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn i2c_adapter_passes_small_transport_fragments_to_router_reassembly() {
+        let delivered = Arc::new(Mutex::new(Vec::<Packet>::new()));
+        let delivered_from_handler = delivered.clone();
+        let receiver = Router::new(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("GROUND_STATION"),
+                move |packet| {
+                    delivered_from_handler.lock().unwrap().push(packet.clone());
+                    Ok(())
+                },
+            ),
+        ]));
+        let receiver_side = receiver.add_side_packed_small_packets("pico-i2c", |_| Ok(()), 32);
+        let fragments = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let fragments_from_tx = fragments.clone();
+        let sender = Router::new(sedsnet::router::RouterConfig::new([]));
+        sender.add_side_packed_small_packets(
+            "gateway-uart",
+            move |payload| {
+                fragments_from_tx.lock().unwrap().push(payload.to_vec());
+                Ok(())
+            },
+            32,
+        );
+        let packet = Packet::from_f32_slice(
+            crate::telemetry_schema::data_type("GPS_DATA"),
+            &[1.0, 2.0, 3.0],
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            123,
+        )
+        .unwrap();
+        sender.tx(packet.clone()).unwrap();
+
+        let fragments = fragments.lock().unwrap().clone();
+        assert!(fragments.len() > 1, "test packet was not fragmented");
+        for fragment in fragments {
+            let framed = build_raw_uart_frame(&fragment).unwrap();
+            assert!(
+                queue_i2c_router_payload(&receiver, receiver_side, &framed, &mut |_| {},).unwrap()
+            );
+        }
+        receiver.process_all_queues().unwrap();
+
+        let delivered = delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].data_type(), packet.data_type());
+        assert_eq!(delivered[0].payload(), packet.payload());
+    }
 
     #[test]
     fn uart_adapter_passes_small_transport_fragments_to_router_reassembly() {
