@@ -73,7 +73,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 
 use crate::web::AlertAckStateMsg;
 use crate::web::emit_error;
@@ -85,6 +85,34 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(default)
         .clamp(min, max)
+}
+
+async fn wait_for_validation_reliable_delivery(
+    router: &sedsnet::router::Router,
+    label: &str,
+) -> bool {
+    let timeout_ms = std::env::var("GS_SIM_RELIABLE_ACK_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30_000);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let pending = router
+            .export_runtime_stats()
+            .reliable
+            .end_to_end_pending_destination_count;
+        if pending == 0 {
+            log::info!("full-bay reliable delivery complete: {label}");
+            return true;
+        }
+        if Instant::now() >= deadline {
+            log::error!(
+                "full-bay reliable delivery timed out for {label}: {pending} destination ACK(s) pending"
+            );
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 pub(crate) fn debug_prints_enabled() -> bool {
@@ -751,7 +779,19 @@ async fn main() -> anyhow::Result<()> {
                             };
                             match network_variables::set_flight_state(&validation_router, state) {
                                 Ok(()) => {
-                                    log::info!("full-bay validation set flight state: {state}")
+                                    log::info!("full-bay validation set flight state: {state}");
+                                    flush_command_tx(
+                                        &validation_router,
+                                        "full-bay flight-state validation tx",
+                                    );
+                                    if !wait_for_validation_reliable_delivery(
+                                        &validation_router,
+                                        "flight state",
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
                                 }
                                 Err(error) => {
                                     log::error!("full-bay flight-state sequence failed: {error}");
@@ -765,9 +805,23 @@ async fn main() -> anyhow::Result<()> {
                             tokio::time::sleep(Duration::from_millis(control_step_ms)).await;
                             let enabled = matches!(value.trim(), "1" | "true" | "on");
                             match network_variables::set_underglow(&validation_router, enabled) {
-                                Ok(()) => log::info!(
-                                    "full-bay validation set AV bay underglow: {enabled}"
-                                ),
+                                Ok(()) => {
+                                    log::info!(
+                                        "full-bay validation set AV bay underglow: {enabled}"
+                                    );
+                                    flush_command_tx(
+                                        &validation_router,
+                                        "full-bay underglow validation tx",
+                                    );
+                                    if !wait_for_validation_reliable_delivery(
+                                        &validation_router,
+                                        "AV bay underglow",
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
+                                }
                                 Err(error) => {
                                     log::error!("full-bay underglow sequence failed: {error}");
                                     break;
@@ -782,7 +836,19 @@ async fn main() -> anyhow::Result<()> {
                             match network_variables::set_flight_buzzer(&validation_router, enabled)
                             {
                                 Ok(()) => {
-                                    log::info!("full-bay validation set Flight buzzer: {enabled}")
+                                    log::info!("full-bay validation set Flight buzzer: {enabled}");
+                                    flush_command_tx(
+                                        &validation_router,
+                                        "full-bay Flight buzzer validation tx",
+                                    );
+                                    if !wait_for_validation_reliable_delivery(
+                                        &validation_router,
+                                        "Flight buzzer",
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
                                 }
                                 Err(error) => {
                                     log::error!("full-bay Flight buzzer sequence failed: {error}");
