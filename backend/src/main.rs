@@ -768,93 +768,85 @@ async fn main() -> anyhow::Result<()> {
                         "full-bay named discovery ready: {}",
                         discovered.into_iter().collect::<Vec<_>>().join(",")
                     );
-                    if let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_STATE_SEQUENCE") {
-                        for value in sequence.split(',') {
-                            tokio::time::sleep(Duration::from_millis(control_step_ms)).await;
-                            let Ok(state) = value.trim().parse::<u8>() else {
-                                log::error!(
-                                    "full-bay flight-state sequence contains invalid value {value:?}"
-                                );
-                                break;
-                            };
-                            match network_variables::set_flight_state(&validation_router, state) {
-                                Ok(()) => {
-                                    log::info!("full-bay validation set flight state: {state}");
-                                    flush_command_tx(
-                                        &validation_router,
-                                        "full-bay flight-state validation tx",
-                                    );
-                                    if !wait_for_validation_reliable_delivery(
-                                        &validation_router,
-                                        "flight state",
-                                    )
-                                    .await
-                                    {
-                                        break;
+                    let flight_states = std::env::var("GS_SIM_FLIGHT_STATE_SEQUENCE")
+                        .ok()
+                        .map(|sequence| {
+                            sequence
+                                .split(',')
+                                .filter_map(|value| match value.trim().parse::<u8>() {
+                                    Ok(state) => Some(state),
+                                    Err(_) => {
+                                        log::error!(
+                                            "full-bay flight-state sequence contains invalid value {value:?}"
+                                        );
+                                        None
                                     }
-                                }
-                                Err(error) => {
-                                    log::error!("full-bay flight-state sequence failed: {error}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if let Ok(sequence) = std::env::var("GS_SIM_UNDERGLOW_SEQUENCE") {
-                        for value in sequence.split(',') {
-                            tokio::time::sleep(Duration::from_millis(control_step_ms)).await;
-                            let enabled = matches!(value.trim(), "1" | "true" | "on");
-                            match network_variables::set_underglow(&validation_router, enabled) {
-                                Ok(()) => {
-                                    log::info!(
-                                        "full-bay validation set AV bay underglow: {enabled}"
-                                    );
-                                    flush_command_tx(
-                                        &validation_router,
-                                        "full-bay underglow validation tx",
-                                    );
-                                    if !wait_for_validation_reliable_delivery(
-                                        &validation_router,
-                                        "AV bay underglow",
-                                    )
-                                    .await
-                                    {
-                                        break;
-                                    }
-                                }
-                                Err(error) => {
-                                    log::error!("full-bay underglow sequence failed: {error}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_BUZZER_SEQUENCE") {
-                        for value in sequence.split(',') {
-                            tokio::time::sleep(Duration::from_millis(control_step_ms)).await;
-                            let enabled = matches!(value.trim(), "1" | "true" | "on");
-                            match network_variables::set_flight_buzzer(&validation_router, enabled)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let underglow = std::env::var("GS_SIM_UNDERGLOW_SEQUENCE")
+                        .ok()
+                        .map(|sequence| {
+                            sequence
+                                .split(',')
+                                .map(|value| matches!(value.trim(), "1" | "true" | "on"))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let flight_buzzer = std::env::var("GS_SIM_FLIGHT_BUZZER_SEQUENCE")
+                        .ok()
+                        .map(|sequence| {
+                            sequence
+                                .split(',')
+                                .map(|value| matches!(value.trim(), "1" | "true" | "on"))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let rounds = flight_states
+                        .len()
+                        .max(underglow.len())
+                        .max(flight_buzzer.len());
+                    for round in 0..rounds {
+                        tokio::time::sleep(Duration::from_millis(control_step_ms)).await;
+                        if let Some(&state) = flight_states.get(round) {
+                            if let Err(error) =
+                                network_variables::set_flight_state(&validation_router, state)
                             {
-                                Ok(()) => {
-                                    log::info!("full-bay validation set Flight buzzer: {enabled}");
-                                    flush_command_tx(
-                                        &validation_router,
-                                        "full-bay Flight buzzer validation tx",
-                                    );
-                                    if !wait_for_validation_reliable_delivery(
-                                        &validation_router,
-                                        "Flight buzzer",
-                                    )
-                                    .await
-                                    {
-                                        break;
-                                    }
-                                }
-                                Err(error) => {
-                                    log::error!("full-bay Flight buzzer sequence failed: {error}");
-                                    break;
-                                }
+                                log::error!("full-bay flight-state sequence failed: {error}");
+                                break;
                             }
+                            log::info!("full-bay validation set flight state: {state}");
+                        }
+                        if let Some(&enabled) = underglow.get(round) {
+                            if let Err(error) =
+                                network_variables::set_underglow(&validation_router, enabled)
+                            {
+                                log::error!("full-bay underglow sequence failed: {error}");
+                                break;
+                            }
+                            log::info!("full-bay validation set AV bay underglow: {enabled}");
+                        }
+                        if let Some(&enabled) = flight_buzzer.get(round) {
+                            if let Err(error) =
+                                network_variables::set_flight_buzzer(&validation_router, enabled)
+                            {
+                                log::error!("full-bay Flight buzzer sequence failed: {error}");
+                                break;
+                            }
+                            log::info!("full-bay validation set Flight buzzer: {enabled}");
+                        }
+                        flush_command_tx(
+                            &validation_router,
+                            "full-bay managed-variable validation tx",
+                        );
+                        if !wait_for_validation_reliable_delivery(
+                            &validation_router,
+                            "managed-variable round",
+                        )
+                        .await
+                        {
+                            break;
                         }
                     }
                     break;
