@@ -221,34 +221,6 @@ fn is_valid_serialized_packet_or_ack(payload: &[u8]) -> bool {
     frame.ack_only() || serialize::unpack_packet(payload).is_ok()
 }
 
-#[cfg(any(test, target_os = "linux"))]
-fn take_buffered_serialized_packet(
-    rx_payload_buf: &mut Vec<u8>,
-) -> TelemetryResult<Option<Vec<u8>>> {
-    let scan_len = rx_payload_buf.len().min(RAW_UART_MAX_FRAME_BYTES);
-    for start in 0..scan_len {
-        for end in (start + 1)..=scan_len {
-            let candidate = &rx_payload_buf[start..end];
-            let Ok(frame) = serialize::peek_frame_info(candidate) else {
-                continue;
-            };
-            if !frame.ack_only() && serialize::unpack_packet(candidate).is_err() {
-                continue;
-            }
-            let payload = candidate.to_vec();
-            rx_payload_buf.drain(..end);
-            return Ok(Some(payload));
-        }
-    }
-
-    if rx_payload_buf.len() > RAW_UART_MAX_FRAME_BYTES {
-        let drop_len = rx_payload_buf.len() - RAW_UART_MAX_FRAME_BYTES;
-        rx_payload_buf.drain(..drop_len);
-    }
-
-    Ok(None)
-}
-
 fn serial_description(name: &str, serial: &SerialLinkConfig) -> String {
     format!(
         "interface={name} port={} baud_rate={} protocol={:?}",
@@ -1547,8 +1519,6 @@ pub struct I2cComms {
     tx_transfer_id: u16,
     #[cfg(target_os = "linux")]
     rx_assembly: Option<I2cRxAssembly>,
-    #[cfg(target_os = "linux")]
-    rx_payload_buf: Vec<u8>,
 }
 
 impl I2cComms {
@@ -1571,7 +1541,6 @@ impl I2cComms {
                     initial_wait: Duration::from_millis(cfg.initial_wait_ms),
                     tx_transfer_id: 1,
                     rx_assembly: None,
-                    rx_payload_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
                 });
             }
             let path = format!("/dev/i2c-{}", cfg.bus);
@@ -1585,7 +1554,6 @@ impl I2cComms {
                 initial_wait: Duration::from_millis(cfg.initial_wait_ms),
                 tx_transfer_id: 1,
                 rx_assembly: None,
-                rx_payload_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -1699,11 +1667,6 @@ impl I2cComms {
             self.rx_assembly = None;
         }
         Ok(completed.map(|payload| (slot.kind, payload)))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn try_take_buffered_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
-        take_buffered_serialized_packet(&mut self.rx_payload_buf)
     }
 
     #[cfg(target_os = "linux")]
@@ -2767,34 +2730,6 @@ mod raw_uart_tests {
         assert_eq!(update.seq, 9);
         assert_eq!(update.credit, 5);
         assert_eq!(update.turnaround_ms, 100);
-    }
-
-    #[test]
-    fn buffered_serialized_packet_waits_for_complete_packet() {
-        let pkt = Packet::from_f32_slice(
-            crate::telemetry_schema::data_type("GPS_DATA"),
-            &[1.0, 2.0, 3.0],
-            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
-            123,
-        )
-        .unwrap();
-        let wire = serialize::pack_packet(&pkt);
-        let split_at = wire.len() / 2;
-        let mut buffered = wire[..split_at].to_vec();
-
-        assert!(
-            take_buffered_serialized_packet(&mut buffered)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(buffered, wire[..split_at]);
-
-        buffered.extend_from_slice(&wire[split_at..]);
-        let decoded = take_buffered_serialized_packet(&mut buffered)
-            .unwrap()
-            .unwrap();
-        assert_eq!(decoded, wire.as_ref());
-        assert!(buffered.is_empty());
     }
 
     #[test]

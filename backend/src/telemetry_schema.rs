@@ -270,5 +270,4 @@ mod tests {
         assert_eq!(heartbeat["priority"], 255);
         assert_eq!(heartbeat["reliable"], false);
     }
-
 }

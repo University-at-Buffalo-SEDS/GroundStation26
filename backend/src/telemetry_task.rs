@@ -7,9 +7,7 @@ use commands::{log_command_dispatch, queue_locally_routed_flight_command};
 mod radio_io;
 pub use radio_io::CommsWorkerHandle;
 #[cfg(test)]
-use radio_io::{
-    radio_command_log_line, spawn_dedicated_radio_io_threads,
-};
+use radio_io::{radio_command_log_line, spawn_dedicated_radio_io_threads};
 use radio_io::{spawn_comms_worker_threads, spawn_router_worker_thread};
 
 const PACKET_WORK_QUEUE_SIZE: usize = 8_192;
