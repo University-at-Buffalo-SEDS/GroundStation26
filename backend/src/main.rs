@@ -87,6 +87,14 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .clamp(min, max)
 }
 
+fn network_router_time_divisor() -> u64 {
+    std::env::var("GS_SIM_ROUTER_TIME_DIVISOR")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
 async fn wait_for_validation_reliable_delivery(
     router: &sedsnet::router::Router,
     label: &str,
@@ -632,7 +640,22 @@ async fn main() -> anyhow::Result<()> {
         .fill_comms_connected
         .store(fill_comms_connected, Ordering::Relaxed);
 
-    let router = Arc::new(sedsnet::router::Router::new(cfg));
+    let router = Arc::new(if network_router_time_divisor() == 1 {
+        sedsnet::router::Router::new(cfg)
+    } else {
+        // Renode advances several MCU instances cooperatively and can run much
+        // slower than wall time. Keep discovery expiry on the simulated time
+        // scale so valid firmware routes do not disappear only because the
+        // host process runs natively. Production defaults to a divisor of one.
+        let divisor = network_router_time_divisor();
+        let started = std::time::Instant::now();
+        sedsnet::router::Router::new_with_clock(
+            cfg,
+            Box::new(move || {
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX) / divisor
+            }),
+        )
+    });
     network_variables::initialize(&router)?;
     set_network_time_router(router.clone());
     let _ = state.topology_router.set(router.clone());
