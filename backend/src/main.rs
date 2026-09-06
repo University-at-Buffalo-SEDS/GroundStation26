@@ -90,6 +90,7 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
 async fn wait_for_validation_reliable_delivery(
     router: &sedsnet::router::Router,
     label: &str,
+    tx_before: &[(sedsnet::config::DataType, u64)],
 ) -> bool {
     let timeout_ms = std::env::var("GS_SIM_RELIABLE_ACK_TIMEOUT_MS")
         .ok()
@@ -97,17 +98,26 @@ async fn wait_for_validation_reliable_delivery(
         .unwrap_or(30_000);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        let pending = router
-            .export_runtime_stats()
-            .reliable
-            .end_to_end_pending_destination_count;
-        if pending == 0 {
+        let stats = router.export_runtime_stats();
+        let pending = stats.reliable.end_to_end_pending_destination_count;
+        let all_types_transmitted = tx_before.iter().all(|(expected, before)| {
+            let now = stats
+                .sides
+                .iter()
+                .flat_map(|side| side.data_types.iter())
+                .filter(|kind| kind.data_type == *expected)
+                .map(|kind| kind.tx_packets)
+                .sum::<u64>();
+            now > *before
+        });
+        if all_types_transmitted && stats.queues.tx_len == 0 && pending == 0 {
             log::info!("full-bay reliable delivery complete: {label}");
             return true;
         }
         if Instant::now() >= deadline {
             log::error!(
-                "full-bay reliable delivery timed out for {label}: {pending} destination ACK(s) pending"
+                "full-bay reliable delivery timed out for {label}: {pending} destination ACK(s) pending, tx queue depth {}, all requested types transmitted={all_types_transmitted}",
+                stats.queues.tx_len,
             );
             return false;
         }
@@ -809,6 +819,31 @@ async fn main() -> anyhow::Result<()> {
                         .max(flight_buzzer.len());
                     for round in 0..rounds {
                         tokio::time::sleep(Duration::from_millis(control_step_ms)).await;
+                        let expected_types = [
+                            flight_states
+                                .get(round)
+                                .map(|_| telemetry_schema::data_type("FLIGHT_STATE")),
+                            underglow
+                                .get(round)
+                                .map(|_| telemetry_schema::data_type("AV_BAY_UNDERGLOW")),
+                            flight_buzzer
+                                .get(round)
+                                .map(|_| telemetry_schema::data_type("FLIGHT_BUZZER")),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .map(|data_type| {
+                            let count = validation_router
+                                .export_runtime_stats()
+                                .sides
+                                .iter()
+                                .flat_map(|side| side.data_types.iter())
+                                .filter(|kind| kind.data_type == data_type)
+                                .map(|kind| kind.tx_packets)
+                                .sum::<u64>();
+                            (data_type, count)
+                        })
+                        .collect::<Vec<_>>();
                         if let Some(&state) = flight_states.get(round) {
                             if let Err(error) =
                                 network_variables::set_flight_state(&validation_router, state)
@@ -843,6 +878,7 @@ async fn main() -> anyhow::Result<()> {
                         if !wait_for_validation_reliable_delivery(
                             &validation_router,
                             "managed-variable round",
+                            &expected_types,
                         )
                         .await
                         {
