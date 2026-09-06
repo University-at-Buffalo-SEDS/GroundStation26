@@ -257,4 +257,18 @@ mod tests {
         assert_eq!(status["reliable_mode"], "Ordered");
     }
 
+    #[test]
+    fn heartbeat_matches_firmware_priority() {
+        let schema: serde_json::Value =
+            serde_json::from_slice(SCHEMA_JSON).expect("embedded telemetry schema");
+        let heartbeat = schema["types"]
+            .as_array()
+            .expect("schema types")
+            .iter()
+            .find(|item| item["name"] == "HEARTBEAT")
+            .expect("HEARTBEAT type");
+        assert_eq!(heartbeat["priority"], 255);
+        assert_eq!(heartbeat["reliable"], false);
+    }
+
 }

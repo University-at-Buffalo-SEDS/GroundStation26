@@ -270,7 +270,7 @@
       ],
       "reliable_mode": "None",
       "reliable": false,
-      "priority": 0
+      "priority": 255
     },
     {
       "name": "WARNING",
