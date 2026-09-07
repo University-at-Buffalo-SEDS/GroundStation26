@@ -149,7 +149,7 @@ async fn wait_for_validation_reliable_delivery(
                 return false;
             }
             log::info!(
-                "full-bay managed-variable queues quiesced within bound: {elapsed_ms} ms <= {latency_limit_ms} ms ({label}); per-type tx before/after={transmission_counts:?}"
+                "full-bay managed-variable latency within bound: {elapsed_ms} ms <= {latency_limit_ms} ms ({label}); queues quiesced; per-type tx before/after={transmission_counts:?}"
             );
             return true;
         }
@@ -926,6 +926,11 @@ async fn main() -> anyhow::Result<()> {
                         .max(flight_buzzer.len());
                     for round in 0..rounds {
                         tokio::time::sleep(Duration::from_millis(control_step_ms)).await;
+                        log::info!(
+                            "full-bay managed-variable topology before round {}: {:?}",
+                            round + 1,
+                            validation_router.export_topology().routes
+                        );
                         let expected_types = [
                             flight_states
                                 .get(round)
