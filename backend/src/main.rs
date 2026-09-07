@@ -95,11 +95,26 @@ fn network_router_time_divisor() -> u64 {
         .unwrap_or(1)
 }
 
+fn validation_elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX) / network_router_time_divisor()
+}
+
+fn validation_latency_limit_ms(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 async fn wait_for_validation_reliable_delivery(
     router: &sedsnet::router::Router,
     label: &str,
     tx_before: &[(sedsnet::config::DataType, u64)],
 ) -> bool {
+    let started = Instant::now();
+    let latency_limit_ms =
+        validation_latency_limit_ms("GS_SIM_MANAGED_VARIABLE_MAX_LATENCY_MS", 2_500);
     let timeout_ms = std::env::var("GS_SIM_RELIABLE_ACK_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -119,7 +134,16 @@ async fn wait_for_validation_reliable_delivery(
             now > *before
         });
         if all_types_transmitted && stats.queues.tx_len == 0 && pending == 0 {
-            log::info!("full-bay reliable delivery complete: {label}");
+            let elapsed_ms = validation_elapsed_ms(started);
+            if elapsed_ms > latency_limit_ms {
+                log::error!(
+                    "full-bay reliable delivery exceeded latency bound for {label}: {elapsed_ms} ms > {latency_limit_ms} ms"
+                );
+                return false;
+            }
+            log::info!(
+                "full-bay managed-variable latency within bound: {elapsed_ms} ms <= {latency_limit_ms} ms ({label})"
+            );
             return true;
         }
         if Instant::now() >= deadline {
@@ -506,6 +530,8 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Router endpoint handlers ---
     let ground_station_handler_state_clone = state.clone();
+    let pilot_open_ack_generation = Arc::new(AtomicU64::new(0));
+    let pilot_open_ack_generation_handler = pilot_open_ack_generation.clone();
     let abort_handler_state_clone = state.clone();
     let flight_state_handler_state_clone = state.clone();
     let heartbeat_handler_state_clone = state.clone();
@@ -520,6 +546,9 @@ async fn main() -> anyhow::Result<()> {
                     pkt.endpoints(),
                     pkt.payload()
                 );
+                if pkt.payload() == [ValveBoardCommands::PilotOpen as u8, 1].as_slice() {
+                    pilot_open_ack_generation_handler.fetch_add(1, Ordering::Relaxed);
+                }
             }
             ground_station_handler_state_clone
                 .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
@@ -959,7 +988,9 @@ async fn main() -> anyhow::Result<()> {
     {
         let validation_router = router.clone();
         let validation_state = state.clone();
+        let validation_pilot_ack_generation = pilot_open_ack_generation.clone();
         tokio::spawn(async move {
+            let discovery_started = Instant::now();
             let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
             // Command validation must exercise learned discovery routing. The
             // linked simulator advances virtual MCU time more slowly than host
@@ -985,6 +1016,18 @@ async fn main() -> anyhow::Result<()> {
                     log::info!("full-bay validation waiting for Valve discovery route");
                 }
             }
+            let discovery_elapsed_ms = validation_elapsed_ms(discovery_started);
+            let discovery_limit_ms =
+                validation_latency_limit_ms("GS_SIM_DISCOVERY_MAX_LATENCY_MS", 5_000);
+            if discovery_elapsed_ms > discovery_limit_ms {
+                log::error!(
+                    "full-bay discovery exceeded latency bound: {discovery_elapsed_ms} ms > {discovery_limit_ms} ms"
+                );
+                return;
+            }
+            log::info!(
+                "full-bay discovery latency within bound: {discovery_elapsed_ms} ms <= {discovery_limit_ms} ms"
+            );
             log::info!("full-bay valve discovery route is ready");
             log::info!(
                 "full-bay Valve discovery topology: {:?}",
@@ -1012,6 +1055,8 @@ async fn main() -> anyhow::Result<()> {
              * the VALVE_COMMAND endpoint ownership learned by discovery;
              * manually constructing a packet here bypassed that schema lookup
              * and could leave it local to the GroundStation. */
+            let ack_generation_before = validation_pilot_ack_generation.load(Ordering::Relaxed);
+            let command_started = Instant::now();
             let open_result =
                 validation_router.log_queue(command_type, &[ValveBoardCommands::PilotOpen as u8]);
             if let Err(err) = open_result {
@@ -1029,9 +1074,23 @@ async fn main() -> anyhow::Result<()> {
             // a packet that is near-instantaneous on hardware can take tens of
             // seconds of host time to traverse both emulated serial bridges.
             loop {
-                if validation_state.get_umbilical_valve_state(ValveBoardCommands::PilotOpen as u8)
-                    == Some(true)
+                if validation_pilot_ack_generation.load(Ordering::Relaxed) > ack_generation_before
+                    && validation_state
+                        .get_umbilical_valve_state(ValveBoardCommands::PilotOpen as u8)
+                        == Some(true)
                 {
+                    let elapsed_ms = validation_elapsed_ms(command_started);
+                    let latency_limit_ms =
+                        validation_latency_limit_ms("GS_SIM_VALVE_ACK_MAX_LATENCY_MS", 2_500);
+                    if elapsed_ms > latency_limit_ms {
+                        log::error!(
+                            "full-bay valve ACK exceeded latency bound: {elapsed_ms} ms > {latency_limit_ms} ms"
+                        );
+                        return;
+                    }
+                    log::info!(
+                        "full-bay valve ACK latency within bound: {elapsed_ms} ms <= {latency_limit_ms} ms"
+                    );
                     log::info!("full-bay valve ACK reached GroundStation");
                     return;
                 }
