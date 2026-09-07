@@ -32,6 +32,10 @@
     {
       "name": "ACTUATOR_BOARD",
       "doc": "Actuator board endpoint"
+    },
+    {
+      "name": "AV_BAY_UNDERGLOW_OWNER",
+      "doc": "Boards that own the persistent avionics-bay underglow variable"
     }
   ],
   "types": [
@@ -592,7 +596,7 @@
         "count": 1
       },
       "endpoints": [
-        "HEART_BEAT"
+        "AV_BAY_UNDERGLOW_OWNER"
       ]
     },
     {
