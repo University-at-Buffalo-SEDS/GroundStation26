@@ -823,8 +823,15 @@ async fn main() -> anyhow::Result<()> {
         db_queue_rx,
         telemetry_shutdown_rx,
     ));
+    let full_bay_discovery_ready = Arc::new(AtomicBool::new(false));
     if let Ok(expected) = std::env::var("GS_SIM_EXPECT_DISCOVERY_NODES") {
         let validation_router = router.clone();
+        let validation_discovery_ready = full_bay_discovery_ready.clone();
+        let validation_pilot_ack_generation = pilot_open_ack_generation.clone();
+        let validate_valve_roundtrip = std::env::var("GS_SIM_VALIDATE_VALVE_ROUNDTRIP")
+            .ok()
+            .as_deref()
+            == Some("1");
         let control_step_ms = std::env::var("GS_SIM_CONTROL_STEP_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -848,10 +855,23 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 if expected.is_subset(&discovered) {
+                    validation_discovery_ready.store(true, Ordering::Release);
                     log::info!(
                         "full-bay named discovery ready: {}",
                         discovered.into_iter().collect::<Vec<_>>().join(",")
                     );
+                    if validate_valve_roundtrip {
+                        let deadline = Instant::now() + Duration::from_secs(30);
+                        while validation_pilot_ack_generation.load(Ordering::Acquire) == 0 {
+                            if Instant::now() >= deadline {
+                                log::error!(
+                                    "full-bay managed-variable validation timed out waiting for Valve command acknowledgement"
+                                );
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
                     let flight_states = std::env::var("GS_SIM_FLIGHT_STATE_SEQUENCE")
                         .ok()
                         .map(|sequence| {
@@ -1011,6 +1031,7 @@ async fn main() -> anyhow::Result<()> {
         let validation_router = router.clone();
         let validation_state = state.clone();
         let validation_pilot_ack_generation = pilot_open_ack_generation.clone();
+        let validation_discovery_ready = full_bay_discovery_ready.clone();
         tokio::spawn(async move {
             let discovery_started = Instant::now();
             let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
@@ -1021,14 +1042,15 @@ async fn main() -> anyhow::Result<()> {
             // I2C. Wait for the actual route instead of injecting a fanout.
             let mut waits = 0u32;
             loop {
-                if validation_router
-                    .export_topology()
-                    .routes
-                    .iter()
-                    .any(|route| {
-                        route.side_name == "umbilical_comms"
-                            && route.reachable_endpoints.contains(&valve_endpoint)
-                    })
+                if validation_discovery_ready.load(Ordering::Acquire)
+                    && validation_router
+                        .export_topology()
+                        .routes
+                        .iter()
+                        .any(|route| {
+                            route.side_name == "umbilical_comms"
+                                && route.reachable_endpoints.contains(&valve_endpoint)
+                        })
                 {
                     break;
                 }
