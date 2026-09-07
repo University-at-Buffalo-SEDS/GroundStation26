@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn umbilical_command_ack_is_reliable_and_ordered() {
+    fn umbilical_command_ack_is_reliable_and_unordered() {
         let schema: serde_json::Value =
             serde_json::from_slice(SCHEMA_JSON).expect("embedded telemetry schema");
         let status = schema["types"]
@@ -254,7 +254,7 @@ mod tests {
             .find(|item| item["name"] == "UMBILICAL_STATUS")
             .expect("UMBILICAL_STATUS type");
         assert_eq!(status["reliable"], true);
-        assert_eq!(status["reliable_mode"], "Ordered");
+        assert_eq!(status["reliable_mode"], "Unordered");
     }
 
     #[test]

@@ -210,11 +210,11 @@ pub(crate) fn ws_diagnostics_enabled() -> bool {
 
 fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
     match link {
-        CommsLinkConfig::I2c { .. } => false,
-        // Raw UART is only the outer transport framing.  SEDSNet still owns
-        // delivery semantics on the RFD900x/Gateway hop, so reliable packets
-        // must retain their hop ACK/retry header here too.
-        CommsLinkConfig::Serial { .. }
+        // I2C and raw UART are only outer transport framing. SEDSNet still
+        // owns delivery semantics on the Pico-Fi/RFD900x hops, so reliable
+        // packets must retain their hop ACK/retry header on every link.
+        CommsLinkConfig::I2c { .. }
+        | CommsLinkConfig::Serial { .. }
         | CommsLinkConfig::RaspberryPiGpioUart { .. }
         | CommsLinkConfig::CustomSerial { .. } => true,
         CommsLinkConfig::Spi { .. } | CommsLinkConfig::Can { .. } => true,
@@ -232,6 +232,20 @@ mod router_link_policy_tests {
                 port: "sim://av-bay".to_owned(),
                 baud_rate: 57_600,
                 protocol: crate::comms_config::SerialProtocol::RawUart,
+            },
+        };
+
+        assert!(router_hop_reliable_enabled(&link));
+    }
+
+    #[test]
+    fn pico_fi_i2c_keeps_sedsnet_reliability_enabled() {
+        let link = CommsLinkConfig::I2c {
+            i2c: crate::comms_config::I2cLinkConfig {
+                bus: 1,
+                addr: 0x17,
+                chunk_delay_ms: 1,
+                initial_wait_ms: 0,
             },
         };
 
@@ -1040,20 +1054,13 @@ async fn main() -> anyhow::Result<()> {
                 validation_router.export_topology().routes
             );
 
-            // Seeing Valve proves the outbound path. Ask every discovered
-            // router for a fresh topology snapshot before emitting the ACKed
-            // command so Valve also learns the reverse GroundStation route.
-            // This uses the production discovery protocol; it does not add a
-            // route override or broadcast application data.
-            if let Err(err) = validation_router.request_topology() {
-                log::error!("full-bay reverse-route discovery request failed: {err}");
-                return;
-            }
-            flush_command_tx(&validation_router, "full-bay reverse-route discovery tx");
+            // Incremental discovery propagates additions in both directions.
+            // Do not force a full topology refresh before each command: that
+            // would hide discovery regressions and waste bandwidth.
             let settle_ms = std::env::var("GS_SIM_VALVE_ROUTE_SETTLE_MS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(6_000);
+                .unwrap_or(500);
             tokio::time::sleep(Duration::from_millis(settle_ms)).await;
 
             let command_type = telemetry_schema::data_type("VALVE_COMMAND");
