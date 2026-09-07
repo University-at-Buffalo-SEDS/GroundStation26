@@ -210,11 +210,12 @@ pub(crate) fn ws_diagnostics_enabled() -> bool {
 
 fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
     match link {
-        // I2C and raw UART are only outer transport framing. SEDSNet still
-        // owns delivery semantics on the Pico-Fi/RFD900x hops, so reliable
-        // packets must retain their hop ACK/retry header on every link.
-        CommsLinkConfig::I2c { .. }
-        | CommsLinkConfig::Serial { .. }
+        // Pico-Fi's polled I2C bridge owns delivery and cannot sustain
+        // SEDSNet's bidirectional hop-ACK traffic without starving Gateway.
+        CommsLinkConfig::I2c { .. } => false,
+        // Raw UART only provides outer framing on the RFD900x hop, so SEDSNet
+        // retains delivery semantics there.
+        CommsLinkConfig::Serial { .. }
         | CommsLinkConfig::RaspberryPiGpioUart { .. }
         | CommsLinkConfig::CustomSerial { .. } => true,
         CommsLinkConfig::Spi { .. } | CommsLinkConfig::Can { .. } => true,
@@ -239,7 +240,7 @@ mod router_link_policy_tests {
     }
 
     #[test]
-    fn pico_fi_i2c_keeps_sedsnet_reliability_enabled() {
+    fn pico_fi_i2c_uses_transport_delivery_without_hop_retries() {
         let link = CommsLinkConfig::I2c {
             i2c: crate::comms_config::I2cLinkConfig {
                 bus: 1,
@@ -249,7 +250,7 @@ mod router_link_policy_tests {
             },
         };
 
-        assert!(router_hop_reliable_enabled(&link));
+        assert!(!router_hop_reliable_enabled(&link));
     }
 }
 
