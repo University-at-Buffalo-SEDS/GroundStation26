@@ -629,11 +629,24 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
+    let telemetry_error_handler = EndpointHandler::new_packet_handler(
+        sedsnet::config::DataEndpoint::TelemetryError,
+        |pkt: &Packet| {
+            log::error!(
+                "remote SEDSNet error from {}: {}",
+                pkt.sender(),
+                String::from_utf8_lossy(pkt.payload())
+            );
+            Ok(())
+        },
+    );
+
     let mut cfg = sedsnet::router::RouterConfig::new([
         ground_station_handler,
         abort_handler,
         flight_state_handler,
         heartbeat_handler,
+        telemetry_error_handler,
     ]);
     if telemetry_task::timesync_enabled() {
         cfg = cfg.with_timesync(TimeSyncConfig {
