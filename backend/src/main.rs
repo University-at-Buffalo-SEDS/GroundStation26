@@ -123,16 +123,22 @@ async fn wait_for_validation_reliable_delivery(
     loop {
         let stats = router.export_runtime_stats();
         let pending = stats.reliable.end_to_end_pending_destination_count;
-        let all_types_transmitted = tx_before.iter().all(|(expected, before)| {
-            let now = stats
-                .sides
-                .iter()
-                .flat_map(|side| side.data_types.iter())
-                .filter(|kind| kind.data_type == *expected)
-                .map(|kind| kind.tx_packets)
-                .sum::<u64>();
-            now > *before
-        });
+        let transmission_counts = tx_before
+            .iter()
+            .map(|(expected, before)| {
+                let now = stats
+                    .sides
+                    .iter()
+                    .flat_map(|side| side.data_types.iter())
+                    .filter(|kind| kind.data_type == *expected)
+                    .map(|kind| kind.tx_packets)
+                    .sum::<u64>();
+                (*expected, *before, now)
+            })
+            .collect::<Vec<_>>();
+        let all_types_transmitted = transmission_counts
+            .iter()
+            .all(|(_, before, now)| now > before);
         if all_types_transmitted && stats.queues.tx_len == 0 && pending == 0 {
             let elapsed_ms = validation_elapsed_ms(started);
             if elapsed_ms > latency_limit_ms {
@@ -148,7 +154,7 @@ async fn wait_for_validation_reliable_delivery(
         }
         if Instant::now() >= deadline {
             log::error!(
-                "full-bay reliable delivery timed out for {label}: {pending} destination ACK(s) pending, tx queue depth {}, all requested types transmitted={all_types_transmitted}",
+                "full-bay reliable delivery timed out for {label}: {pending} destination ACK(s) pending, tx queue depth {}, all requested types transmitted={all_types_transmitted}, per-type tx before/after={transmission_counts:?}",
                 stats.queues.tx_len,
             );
             return false;
@@ -1057,6 +1063,8 @@ async fn main() -> anyhow::Result<()> {
              * and could leave it local to the GroundStation. */
             let ack_generation_before = validation_pilot_ack_generation.load(Ordering::Relaxed);
             let command_started = Instant::now();
+            let ack_latency_limit_ms =
+                validation_latency_limit_ms("GS_SIM_VALVE_ACK_MAX_LATENCY_MS", 2_500);
             let open_result =
                 validation_router.log_queue(command_type, &[ValveBoardCommands::PilotOpen as u8]);
             if let Err(err) = open_result {
@@ -1080,18 +1088,28 @@ async fn main() -> anyhow::Result<()> {
                         == Some(true)
                 {
                     let elapsed_ms = validation_elapsed_ms(command_started);
-                    let latency_limit_ms =
-                        validation_latency_limit_ms("GS_SIM_VALVE_ACK_MAX_LATENCY_MS", 2_500);
-                    if elapsed_ms > latency_limit_ms {
+                    if elapsed_ms > ack_latency_limit_ms {
                         log::error!(
-                            "full-bay valve ACK exceeded latency bound: {elapsed_ms} ms > {latency_limit_ms} ms"
+                            "full-bay valve ACK exceeded latency bound: {elapsed_ms} ms > {ack_latency_limit_ms} ms"
                         );
                         return;
                     }
                     log::info!(
-                        "full-bay valve ACK latency within bound: {elapsed_ms} ms <= {latency_limit_ms} ms"
+                        "full-bay valve ACK latency within bound: {elapsed_ms} ms <= {ack_latency_limit_ms} ms"
                     );
                     log::info!("full-bay valve ACK reached GroundStation");
+                    return;
+                }
+                if validation_elapsed_ms(command_started) > ack_latency_limit_ms {
+                    log::error!(
+                        "full-bay valve ACK timed out: generation before={}, generation now={}, app state={:?}, topology={:?}, router stats={:?}",
+                        ack_generation_before,
+                        validation_pilot_ack_generation.load(Ordering::Relaxed),
+                        validation_state
+                            .get_umbilical_valve_state(ValveBoardCommands::PilotOpen as u8),
+                        validation_router.export_topology().routes,
+                        validation_router.export_runtime_stats().sides,
+                    );
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
