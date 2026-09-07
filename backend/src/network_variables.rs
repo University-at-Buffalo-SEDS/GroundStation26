@@ -144,12 +144,12 @@ pub fn initialize(router: &Router) -> Result<()> {
     }
     router.seed_managed_variable(packet(
         UNDERGLOW_TYPE,
-        "HEART_BEAT",
+        "AV_BAY_UNDERGLOW_OWNER",
         u8::from(underglow_enabled()),
     )?)?;
     router.seed_managed_variable(packet(
         FLIGHT_BUZZER_TYPE,
-        "HEART_BEAT",
+        "FLIGHT_CONTROLLER",
         u8::from(flight_buzzer_enabled()),
     )?)?;
     router.seed_managed_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?)?;
@@ -159,12 +159,12 @@ pub fn initialize(router: &Router) -> Result<()> {
 pub fn publish_current(router: &Router) -> Result<()> {
     router.set_network_variable(packet(
         UNDERGLOW_TYPE,
-        "HEART_BEAT",
+        "AV_BAY_UNDERGLOW_OWNER",
         u8::from(underglow_enabled()),
     )?)?;
     router.set_network_variable(packet(
         FLIGHT_BUZZER_TYPE,
-        "HEART_BEAT",
+        "FLIGHT_CONTROLLER",
         u8::from(flight_buzzer_enabled()),
     )?)?;
     router.set_network_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?)?;
@@ -185,7 +185,11 @@ pub fn set_underglow(router: &Router, enabled: bool) -> Result<()> {
         guard.values.av_bay_underglow = enabled;
         persist(&guard.path, guard.values)?;
     }
-    router.set_network_variable(packet(UNDERGLOW_TYPE, "HEART_BEAT", u8::from(enabled))?)?;
+    router.set_network_variable(packet(
+        UNDERGLOW_TYPE,
+        "AV_BAY_UNDERGLOW_OWNER",
+        u8::from(enabled),
+    )?)?;
     Ok(())
 }
 
@@ -387,7 +391,7 @@ mod tests {
         peer.add_side_packet("to-gs", move |packet| source_rx.rx_from_side(packet, 0));
 
         source
-            .set_network_variable(packet(UNDERGLOW_TYPE, "HEART_BEAT", 1).unwrap())
+            .set_network_variable(packet(UNDERGLOW_TYPE, "AV_BAY_UNDERGLOW_OWNER", 1).unwrap())
             .unwrap();
         source.process_all_queues().unwrap();
         peer.process_all_queues().unwrap();
