@@ -518,7 +518,10 @@ impl AppState {
         self.broadcast_board_status_snapshot(timestamp_ms, force_broadcast);
     }
 
-    /// Marks side-relay boards as seen when the router has an active discovery route for that side.
+    /// Projects SEDSNet's learned topology into board liveness. Discovery
+    /// packets are consumed by the router itself, so they do not necessarily
+    /// reach an application packet tap. A board with an active learned route
+    /// is nevertheless detected and must appear in status/graph views.
     pub fn mark_discovered_relays_seen(&self) {
         if cfg!(feature = "test_fire_mode") {
             return;
@@ -531,6 +534,22 @@ impl AppState {
         let mut saw_active_route = false;
         let mut force_broadcast = false;
         let mut map = self.board_status.lock().unwrap();
+        for router_node in &snapshot.routers {
+            let Some(board) = Board::from_sender_id(canonical_sender_id(&router_node.sender_id)) else {
+                continue;
+            };
+            if board == Board::GroundStation {
+                continue;
+            }
+            let Some(status) = map.get_mut(&board) else {
+                continue;
+            };
+            saw_active_route = true;
+            force_broadcast |= status.last_seen_ms.is_none();
+            status.last_seen_ms = Some(now_ms);
+            status.last_seen_instant = Some(std::time::Instant::now());
+            status.warned = false;
+        }
         for route in snapshot.routes {
             saw_active_route = true;
             let relay_board = match route.side_name.as_str() {
@@ -1545,6 +1564,15 @@ mod tests {
             (link.source == ground.id && link.target == valve.id)
                 || (link.source == valve.id && link.target == ground.id)
         }));
+
+        state.mark_discovered_relays_seen();
+        let statuses = state.board_status_snapshot(1_000);
+        let valve_status = statuses
+            .boards
+            .iter()
+            .find(|entry| entry.board == Board::ValveBoard)
+            .expect("Valve board status missing");
+        assert!(valve_status.seen);
     }
 
     #[tokio::test]
