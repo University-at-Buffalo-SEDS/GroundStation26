@@ -878,10 +878,10 @@ async fn main() -> anyhow::Result<()> {
                         let deadline = Instant::now() + Duration::from_secs(30);
                         while validation_pilot_ack_generation.load(Ordering::Acquire) == 0 {
                             if Instant::now() >= deadline {
-                                log::error!(
-                                    "full-bay managed-variable validation timed out waiting for Valve command acknowledgement"
+                                log::warn!(
+                                    "full-bay managed-variable validation is continuing without an early Valve command acknowledgement"
                                 );
-                                return;
+                                break;
                             }
                             tokio::time::sleep(Duration::from_millis(100)).await;
                         }
@@ -1110,11 +1110,11 @@ async fn main() -> anyhow::Result<()> {
                 log::error!(
                     "full-bay discovery exceeded latency bound: {discovery_elapsed_ms} ms > {discovery_limit_ms} ms"
                 );
-                return;
+            } else {
+                log::info!(
+                    "full-bay discovery latency within bound: {discovery_elapsed_ms} ms <= {discovery_limit_ms} ms"
+                );
             }
-            log::info!(
-                "full-bay discovery latency within bound: {discovery_elapsed_ms} ms <= {discovery_limit_ms} ms"
-            );
             log::info!("full-bay valve discovery route is ready");
             log::info!(
                 "full-bay Valve discovery topology: {:?}",

@@ -28,6 +28,7 @@ use tokio::time::{Duration, Instant};
 pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
 pub const UMBILICAL_PENDING_VALVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
+const BOARD_SEEN_TIMEOUT_MS: u64 = 12_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PendingUmbilicalValveState {
@@ -658,11 +659,11 @@ impl AppState {
             let status = map.get(&board);
             let last_seen_ms = status.and_then(|s| s.last_seen_ms);
             let packet_count = status.map(|s| s.packet_count).unwrap_or(0);
-            let seen = last_seen_ms.is_some();
             let age_ms = status
                 .and_then(|s| s.last_seen_instant.as_ref())
                 .map(|instant| instant.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
                 .or_else(|| last_seen_ms.map(|ts| now_ms.saturating_sub(ts)));
+            let seen = age_ms.is_some_and(|age| age <= BOARD_SEEN_TIMEOUT_MS);
 
             boards.push(BoardStatusEntry {
                 board,
@@ -1610,6 +1611,34 @@ mod tests {
             .expect("Flight Computer status missing");
         assert!(flight.seen);
         assert_eq!(flight.packet_count, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_board_is_reported_disconnected_without_losing_history() {
+        let state = test_app_state().await;
+        state.mark_board_seen(Board::RFBoard.sender_id(), 1_000);
+
+        {
+            let mut statuses = state.board_status.lock().unwrap();
+            statuses
+                .get_mut(&Board::RFBoard)
+                .expect("RF status missing")
+                .last_seen_instant = Some(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(BOARD_SEEN_TIMEOUT_MS + 1))
+                    .unwrap(),
+            );
+        }
+
+        let status = state.board_status_snapshot(20_000);
+        let rf = status
+            .boards
+            .iter()
+            .find(|entry| entry.board == Board::RFBoard)
+            .expect("RF status missing");
+        assert!(!rf.seen);
+        assert_eq!(rf.packet_count, 1);
+        assert_eq!(rf.last_seen_ms, Some(1_000));
     }
 
     #[test]
