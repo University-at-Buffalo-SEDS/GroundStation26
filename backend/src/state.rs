@@ -248,7 +248,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    fn board_from_network_sender(&self, sender: &str) -> Option<Board> {
+    pub(crate) fn board_from_network_sender(&self, sender: &str) -> Option<Board> {
         if let Some(board) = Board::from_sender_id(canonical_sender_id(sender)) {
             return Some(board);
         }

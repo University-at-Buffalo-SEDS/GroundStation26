@@ -554,6 +554,10 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler_state_clone = state.clone();
     let pilot_open_ack_generation = Arc::new(AtomicU64::new(0));
     let pilot_open_ack_generation_handler = pilot_open_ack_generation.clone();
+    let rf_gps_seen = Arc::new(AtomicBool::new(false));
+    let rf_gps_seen_handler = rf_gps_seen.clone();
+    let fc_sensor_seen = Arc::new(AtomicBool::new(false));
+    let fc_sensor_seen_handler = fc_sensor_seen.clone();
     let abort_handler_state_clone = state.clone();
     let flight_state_handler_state_clone = state.clone();
     let heartbeat_handler_state_clone = state.clone();
@@ -561,6 +565,25 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("GROUND_STATION"),
         move |pkt: &Packet| {
+            if std::env::var_os("GS_SIM_VALIDATE_TELEMETRY_RETURN").is_some() {
+                let board = ground_station_handler_state_clone
+                    .board_from_network_sender(pkt.sender());
+                if board == Some(Board::RFBoard)
+                    && pkt.data_type()
+                        == telemetry_schema::data_type("GPS_SATELLITE_NUMBER")
+                    && !rf_gps_seen_handler.swap(true, Ordering::AcqRel)
+                {
+                    log::info!("full-bay RF GPS telemetry reached GroundStation");
+                }
+                if board == Some(Board::FlightComputer)
+                    && (pkt.data_type() == telemetry_schema::data_type("IMU_DATA")
+                        || pkt.data_type()
+                            == telemetry_schema::data_type("BAROMETER_DATA"))
+                    && !fc_sensor_seen_handler.swap(true, Ordering::AcqRel)
+                {
+                    log::info!("full-bay Flight sensor telemetry reached GroundStation");
+                }
+            }
             if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
                 log::info!(
                     "umbilical status packet received sender={} endpoints={:?} payload={:02x?}",
