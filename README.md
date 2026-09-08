@@ -4,6 +4,8 @@
 
 - Rust: install from https://rustup.rs/
 - `dioxus-cli`: install with `cargo install dioxus-cli`
+- SEDSNet v4.0.18 from crates.io (the workspace lockfile fixes the exact tested
+  release)
 
 The frontend uses Dioxus. No separate WASM toolchain workflow is needed beyond the Rust targets used by `build.py`.
 
@@ -39,6 +41,11 @@ python3 build.py frontend_web
 python3 build.py debug
 python3 build.py --frontend-dev
 ```
+
+`--frontend-dev` checks out the frontend's `dev` branch; the default frontend
+build uses its stable release branch. The cached checkout is fetched and reset
+to the selected remote branch, so an existing local branch is not assumed to
+have valid tracking metadata.
 
 Scoped build entry points:
 
@@ -98,6 +105,12 @@ Mode notes:
 - `testing` enables the flight simulator and uses `backend/calibration/loadcell_calibration_testing.json`.
 - `hitl-mode` is for hardware-in-the-loop testing. It uses the HITL layout, ignores the key interlock, starts in
   `Startup`, and does not run the normal fill sequence state machine.
+
+The backend is a normal SEDSNet endpoint and discovers subscribers and routes by
+schema data type. It does not broadcast every value to both physical links.
+Managed underglow, startup-buzzer, and flight-state values are cached on disk;
+their last authoritative values are restored when GroundStation restarts and
+are resynchronized when boards join or reboot.
 
 ## Frontend / Backend Notes
 

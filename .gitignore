@@ -4,7 +4,6 @@
 # Added by cargo
 
 /target
-Cargo.lock
 data/
 pkg/
 vendor/
