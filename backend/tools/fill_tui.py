@@ -33,7 +33,7 @@ os.environ.setdefault(
 try:
     import sedsnet as seds
 except ModuleNotFoundError as e:
-    raise SystemExit("Missing dependency 'sedsnet'. Install SEDSnet 4.0.18 first.") from e
+    raise SystemExit("Missing dependency 'sedsnet'. Install SEDSnet 4.0.19 first.") from e
 
 DT = seds.DataType
 EP = seds.DataEndpoint

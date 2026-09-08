@@ -68,7 +68,7 @@ def import_seds() -> object:
 
         return seds
     except ModuleNotFoundError as e:
-        raise SystemExit("Missing dependency 'sedsnet'. Install SEDSnet 4.0.18 first.") from e
+        raise SystemExit("Missing dependency 'sedsnet'. Install SEDSnet 4.0.19 first.") from e
 
 
 def enum_value(enum_cls: object, *names: str) -> int:
