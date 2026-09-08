@@ -938,7 +938,11 @@ fn radio_uplink_yield_grace_ms() -> u64 {
 
 fn radio_air_bit_rate_bps() -> u64 {
     static BPS: OnceLock<u64> = OnceLock::new();
-    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 9_600, 300, 62_500) as u64)
+    /* The RFD900x UART and air link are configured for 57,600 bit/s. The old
+     * LoRa-era 9,600 bit/s default artificially held each packet in the host
+     * scheduler six times too long, so its backlog and command latency grew
+     * continuously even though the physical radio still had capacity. */
+    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 57_600, 300, 115_200) as u64)
 }
 
 fn radio_air_frame_overhead_bytes() -> u64 {

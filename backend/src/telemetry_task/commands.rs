@@ -12,7 +12,7 @@ pub(super) fn log_command_dispatch(context: &str, side: &str, ty: DataType, payl
     );
 }
 
-pub(super) fn queue_locally_routed_flight_command(
+pub(crate) fn queue_locally_routed_flight_command(
     router: &Router,
     context: &str,
     payload: &[u8],

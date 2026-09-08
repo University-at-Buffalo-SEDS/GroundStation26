@@ -41,7 +41,7 @@ mod web;
 
 use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
-use crate::rocket_commands::ValveBoardCommands;
+use crate::rocket_commands::{FlightComputerCommands, ValveBoardCommands};
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
@@ -52,8 +52,8 @@ use crate::telemetry_db::{
     ensure_sqlite_db_file, open_in_memory_telemetry_db, recover_sqlite_sidecars_in_dir,
 };
 use crate::telemetry_task::{
-    CommsWorkerHandle, flush_command_tx, get_current_timestamp_ms, set_network_time_router,
-    telemetry_task,
+    CommsWorkerHandle, flush_command_tx, get_current_timestamp_ms,
+    queue_locally_routed_flight_command, set_network_time_router, telemetry_task,
 };
 
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
@@ -647,7 +647,8 @@ async fn main() -> anyhow::Result<()> {
         flight_state_handler,
         heartbeat_handler,
         telemetry_error_handler,
-    ]);
+    ])
+    .with_sender(Board::GroundStation.sender_id());
     if telemetry_task::timesync_enabled() {
         cfg = cfg.with_timesync(TimeSyncConfig {
             role: TimeSyncRole::Source,
@@ -883,6 +884,30 @@ async fn main() -> anyhow::Result<()> {
                                 return;
                             }
                             tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                    if std::env::var("GS_SIM_VALIDATE_FLIGHT_COMMAND")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
+                        let command = FlightComputerCommands::EvaluationRelax as u8;
+                        match queue_locally_routed_flight_command(
+                            &validation_router,
+                            "full-bay Flight Computer validation",
+                            &[command],
+                        ) {
+                            Ok(()) => {
+                                flush_command_tx(
+                                    &validation_router,
+                                    "full-bay Flight Computer validation tx",
+                                );
+                                log::info!("full-bay Flight Computer command queued: {command}");
+                            }
+                            Err(error) => {
+                                log::error!("full-bay Flight Computer command failed: {error}");
+                                return;
+                            }
                         }
                     }
                     let flight_states = std::env::var("GS_SIM_FLIGHT_STATE_SEQUENCE")

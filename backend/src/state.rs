@@ -247,6 +247,22 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn board_from_network_sender(&self, sender: &str) -> Option<Board> {
+        if let Some(board) = Board::from_sender_id(canonical_sender_id(sender)) {
+            return Some(board);
+        }
+
+        let address = sender
+            .strip_prefix("@addr:")
+            .and_then(|value| value.parse::<u32>().ok())?;
+        let hostname = self
+            .topology_router
+            .get()?
+            .resolve_address(address)?
+            .hostname;
+        Board::from_sender_id(canonical_sender_id(hostname.as_ref()))
+    }
+
     fn queue_router_flight_state_update(&self, next_state: FlightState) {
         let Some(router) = self.topology_router.get() else {
             log::warn!(
@@ -471,7 +487,7 @@ impl AppState {
 
     /// Updates heartbeat tracking for a board after a packet arrives from that sender.
     pub fn mark_board_seen(&self, sender: &str, timestamp_ms: u64) {
-        let Some(board) = Board::from_sender_id(canonical_sender_id(sender)) else {
+        let Some(board) = self.board_from_network_sender(sender) else {
             return;
         };
         let mut map = self.board_status.lock().unwrap();
@@ -1528,6 +1544,72 @@ mod tests {
             (link.source == ground.id && link.target == valve.id)
                 || (link.source == valve.id && link.target == ground.id)
         }));
+    }
+
+    #[tokio::test]
+    async fn compact_wire_sender_marks_discovered_board_seen() {
+        let state = test_app_state().await;
+        let ground_router = Arc::new(Router::new(
+            RouterConfig::new([]).with_sender(Board::GroundStation.sender_id()),
+        ));
+        let flight_router = Arc::new(Router::new(
+            RouterConfig::new([]).with_sender(Board::FlightComputer.sender_id()),
+        ));
+        let ground_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+        let flight_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+
+        let ground_side = {
+            let ground_peer = ground_peer.clone();
+            ground_router.add_side_packed("flight_link", move |bytes| {
+                let (peer, ingress) = ground_peer
+                    .lock()
+                    .expect("failed to lock ground peer")
+                    .clone()
+                    .expect("ground peer not initialized");
+                peer.rx_packed_from_side(bytes, ingress)
+            })
+        };
+        let flight_side = {
+            let flight_peer = flight_peer.clone();
+            flight_router.add_side_packed("ground_link", move |bytes| {
+                let (peer, ingress) = flight_peer
+                    .lock()
+                    .expect("failed to lock flight peer")
+                    .clone()
+                    .expect("flight peer not initialized");
+                peer.rx_packed_from_side(bytes, ingress)
+            })
+        };
+        *ground_peer.lock().expect("failed to lock ground peer") =
+            Some((flight_router.clone(), flight_side));
+        *flight_peer.lock().expect("failed to lock flight peer") =
+            Some((ground_router.clone(), ground_side));
+        state
+            .topology_router
+            .set(ground_router.clone())
+            .expect("failed to set topology router");
+
+        flight_router
+            .announce_discovery()
+            .expect("failed to announce Flight Computer");
+        flight_router
+            .process_all_queues_with_timeout(0)
+            .expect("failed to deliver Flight Computer discovery");
+        let address = ground_router
+            .resolve_hostname(Board::FlightComputer.sender_id())
+            .expect("Flight Computer address was not learned")
+            .address;
+
+        state.mark_board_seen(&format!("@addr:{address}"), 1_234);
+
+        let status = state.board_status_snapshot(1_234);
+        let flight = status
+            .boards
+            .iter()
+            .find(|entry| entry.board == Board::FlightComputer)
+            .expect("Flight Computer status missing");
+        assert!(flight.seen);
+        assert_eq!(flight.packet_count, 1);
     }
 
     #[test]

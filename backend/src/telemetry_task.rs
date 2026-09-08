@@ -2,8 +2,10 @@ mod prelude;
 use prelude::*;
 
 mod commands;
-pub(crate) use commands::{flush_command_tx, queue_abort_packet};
-use commands::{log_command_dispatch, queue_locally_routed_flight_command};
+use commands::log_command_dispatch;
+pub(crate) use commands::{
+    flush_command_tx, queue_abort_packet, queue_locally_routed_flight_command,
+};
 mod radio_io;
 pub use radio_io::CommsWorkerHandle;
 #[cfg(test)]
