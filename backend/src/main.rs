@@ -223,6 +223,36 @@ fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
     }
 }
 
+#[derive(Default)]
+struct StreamRateProbe {
+    last_timestamp_ms: Option<u64>,
+    consecutive_valid_intervals: u32,
+}
+
+impl StreamRateProbe {
+    fn observe(
+        &mut self,
+        timestamp_ms: u64,
+        minimum_interval_ms: u64,
+        maximum_interval_ms: u64,
+        required_intervals: u32,
+    ) -> bool {
+        let Some(previous) = self.last_timestamp_ms.replace(timestamp_ms) else {
+            return false;
+        };
+        if timestamp_ms <= previous {
+            return false;
+        }
+        let interval = timestamp_ms - previous;
+        if (minimum_interval_ms..=maximum_interval_ms).contains(&interval) {
+            self.consecutive_valid_intervals += 1;
+        } else {
+            self.consecutive_valid_intervals = 0;
+        }
+        self.consecutive_valid_intervals >= required_intervals
+    }
+}
+
 #[cfg(test)]
 mod router_link_policy_tests {
     use super::*;
@@ -252,6 +282,15 @@ mod router_link_policy_tests {
         };
 
         assert!(!router_hop_reliable_enabled(&link));
+    }
+
+    #[test]
+    fn stream_rate_probe_requires_consecutive_timestamp_intervals() {
+        let mut probe = StreamRateProbe::default();
+        assert!(!probe.observe(1_000, 750, 1_250, 2));
+        assert!(!probe.observe(2_010, 750, 1_250, 2));
+        assert!(probe.observe(3_020, 750, 1_250, 2));
+        assert!(!probe.observe(5_000, 750, 1_250, 2));
     }
 }
 
@@ -554,16 +593,16 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler_state_clone = state.clone();
     let pilot_open_ack_generation = Arc::new(AtomicU64::new(0));
     let pilot_open_ack_generation_handler = pilot_open_ack_generation.clone();
-    let rf_gps_count = Arc::new(AtomicU64::new(0));
-    let rf_gps_count_handler = rf_gps_count.clone();
+    let rf_gps_rate = Arc::new(Mutex::new(StreamRateProbe::default()));
+    let rf_gps_rate_handler = rf_gps_rate.clone();
     let rf_gps_rate_reported = Arc::new(AtomicBool::new(false));
     let rf_gps_rate_reported_handler = rf_gps_rate_reported.clone();
-    let fc_sensor_count = Arc::new(AtomicU64::new(0));
-    let fc_sensor_count_handler = fc_sensor_count.clone();
+    let fc_sensor_rate = Arc::new(Mutex::new(StreamRateProbe::default()));
+    let fc_sensor_rate_handler = fc_sensor_rate.clone();
     let fc_sensor_rate_reported = Arc::new(AtomicBool::new(false));
     let fc_sensor_rate_reported_handler = fc_sensor_rate_reported.clone();
-    let power_sensor_count = Arc::new(AtomicU64::new(0));
-    let power_sensor_count_handler = power_sensor_count.clone();
+    let power_sensor_rate = Arc::new(Mutex::new(StreamRateProbe::default()));
+    let power_sensor_rate_handler = power_sensor_rate.clone();
     let power_rate_reported = Arc::new(AtomicBool::new(false));
     let power_rate_reported_handler = power_rate_reported.clone();
     let fill_telemetry_seen = Arc::new(Mutex::new(HashSet::<Board>::new()));
@@ -581,33 +620,39 @@ async fn main() -> anyhow::Result<()> {
                 if board == Some(Board::RFBoard)
                     && pkt.data_type() == telemetry_schema::data_type("GPS_SATELLITE_NUMBER")
                 {
-                    let count = rf_gps_count_handler.fetch_add(1, Ordering::AcqRel) + 1;
-                    if count >= 3 && !rf_gps_rate_reported_handler.swap(true, Ordering::AcqRel) {
-                        log::info!(
-                            "full-bay RF GPS 1 Hz stream reached GroundStation: {count} samples"
-                        );
+                    let valid =
+                        rf_gps_rate_handler
+                            .lock()
+                            .unwrap()
+                            .observe(pkt.timestamp(), 750, 1_250, 2);
+                    if valid && !rf_gps_rate_reported_handler.swap(true, Ordering::AcqRel) {
+                        log::info!("full-bay RF GPS 1 Hz stream reached GroundStation");
                     }
                 }
                 if board == Some(Board::FlightComputer)
-                    && (pkt.data_type() == telemetry_schema::data_type("IMU_DATA")
-                        || pkt.data_type() == telemetry_schema::data_type("BAROMETER_DATA"))
+                    && pkt.data_type() == telemetry_schema::data_type("IMU_DATA")
                 {
-                    let count = fc_sensor_count_handler.fetch_add(1, Ordering::AcqRel) + 1;
-                    if count >= 3 && !fc_sensor_rate_reported_handler.swap(true, Ordering::AcqRel) {
-                        log::info!(
-                            "full-bay Flight sensor 1 Hz stream reached GroundStation: {count} samples"
-                        );
+                    let valid = fc_sensor_rate_handler.lock().unwrap().observe(
+                        pkt.timestamp(),
+                        750,
+                        1_250,
+                        2,
+                    );
+                    if valid && !fc_sensor_rate_reported_handler.swap(true, Ordering::AcqRel) {
+                        log::info!("full-bay Flight sensor 1 Hz stream reached GroundStation");
                     }
                 }
                 if board == Some(Board::PowerBoard)
-                    && (pkt.data_type() == telemetry_schema::data_type("BATTERY_VOLTAGE")
-                        || pkt.data_type() == telemetry_schema::data_type("BATTERY_CURRENT"))
+                    && pkt.data_type() == telemetry_schema::data_type("BATTERY_VOLTAGE")
                 {
-                    let count = power_sensor_count_handler.fetch_add(1, Ordering::AcqRel) + 1;
-                    if count >= 2 && !power_rate_reported_handler.swap(true, Ordering::AcqRel) {
-                        log::info!(
-                            "full-bay Power 5-second stream reached GroundStation: {count} samples"
-                        );
+                    let valid = power_sensor_rate_handler.lock().unwrap().observe(
+                        pkt.timestamp(),
+                        4_000,
+                        6_000,
+                        1,
+                    );
+                    if valid && !power_rate_reported_handler.swap(true, Ordering::AcqRel) {
+                        log::info!("full-bay Power 5-second stream reached GroundStation");
                     }
                 }
                 if let Some(
