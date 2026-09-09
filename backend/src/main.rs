@@ -617,6 +617,17 @@ async fn main() -> anyhow::Result<()> {
             if std::env::var_os("GS_SIM_VALIDATE_TELEMETRY_RETURN").is_some() {
                 let board =
                     ground_station_handler_state_clone.board_from_network_sender(pkt.sender());
+                if pkt.data_type() == telemetry_schema::data_type("GPS_SATELLITE_NUMBER")
+                    || pkt.data_type() == telemetry_schema::data_type("IMU_DATA")
+                    || pkt.data_type() == telemetry_schema::data_type("BATTERY_VOLTAGE")
+                {
+                    log::info!(
+                        "full-bay telemetry candidate sender={} resolved={board:?} type={:?} timestamp={}",
+                        pkt.sender(),
+                        pkt.data_type(),
+                        pkt.timestamp()
+                    );
+                }
                 if board == Some(Board::RFBoard)
                     && pkt.data_type() == telemetry_schema::data_type("GPS_SATELLITE_NUMBER")
                 {
