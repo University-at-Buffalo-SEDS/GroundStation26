@@ -256,7 +256,7 @@
       ],
       "reliable_mode": "Ordered",
       "reliable": true,
-      "priority": 0
+      "priority": 16
     },
     {
       "name": "HEARTBEAT",
