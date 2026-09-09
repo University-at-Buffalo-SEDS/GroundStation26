@@ -1300,6 +1300,74 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    if std::env::var("GS_SIM_VALIDATE_SOAK_COMMANDS")
+        .ok()
+        .as_deref()
+        == Some("1")
+        && let Ok(sample_path) = std::env::var("FIRMWARE_SIM_SAMPLE_FILE")
+    {
+        let soak_router = router.clone();
+        let soak_ack_generation = pilot_open_ack_generation.clone();
+        let soak_discovery_ready = full_bay_discovery_ready.clone();
+        let rounds = std::env::var("GS_SIM_SOAK_COMMAND_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(11);
+        tokio::spawn(async move {
+            while !soak_discovery_ready.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let command_type = telemetry_schema::data_type("VALVE_COMMAND");
+            for target_sample in 1..=rounds {
+                loop {
+                    let observed_sample = fs::read_to_string(&sample_path)
+                        .ok()
+                        .and_then(|value| value.trim().parse::<u32>().ok())
+                        .unwrap_or(0);
+                    if observed_sample >= target_sample {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+
+                let generation_before = soak_ack_generation.load(Ordering::Acquire);
+                let started = Instant::now();
+                if let Err(error) =
+                    soak_router.log_queue(command_type, &[ValveBoardCommands::PilotOpen as u8])
+                {
+                    log::error!(
+                        "full-bay soak valve command {target_sample}/{rounds} failed to queue: {error}"
+                    );
+                    return;
+                }
+                flush_command_tx(&soak_router, "full-bay soak valve command tx");
+                let latency_limit_ms =
+                    validation_latency_limit_ms("GS_SIM_SOAK_COMMAND_ACK_MAX_LATENCY_MS", 2_500);
+                loop {
+                    if soak_ack_generation.load(Ordering::Acquire) > generation_before {
+                        let elapsed_ms = validation_elapsed_ms(started);
+                        if elapsed_ms > latency_limit_ms {
+                            log::error!(
+                                "full-bay soak valve command {target_sample}/{rounds} ACK exceeded latency bound: {elapsed_ms} ms > {latency_limit_ms} ms"
+                            );
+                            return;
+                        }
+                        log::info!(
+                            "full-bay soak valve command acknowledged: round {target_sample}/{rounds}, latency {elapsed_ms} ms"
+                        );
+                        break;
+                    }
+                    if validation_elapsed_ms(started) > latency_limit_ms {
+                        log::error!(
+                            "full-bay soak valve command {target_sample}/{rounds} ACK timed out"
+                        );
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        });
+    }
     #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
     let mut st = tokio::spawn(safety_task(
         state.clone(),
