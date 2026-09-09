@@ -1309,16 +1309,23 @@ async fn main() -> anyhow::Result<()> {
         let soak_router = router.clone();
         let soak_ack_generation = pilot_open_ack_generation.clone();
         let soak_discovery_ready = full_bay_discovery_ready.clone();
-        let rounds = std::env::var("GS_SIM_SOAK_COMMAND_ROUNDS")
+        let command_samples = std::env::var("GS_SIM_SOAK_COMMAND_SAMPLES")
             .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(11);
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter_map(|sample| sample.trim().parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|samples| !samples.is_empty())
+            .unwrap_or_else(|| (1..12).collect());
         tokio::spawn(async move {
             while !soak_discovery_ready.load(Ordering::Acquire) {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             let command_type = telemetry_schema::data_type("VALVE_COMMAND");
-            for target_sample in 1..=rounds {
+            let rounds = command_samples.len();
+            for (round_index, target_sample) in command_samples.into_iter().enumerate() {
                 loop {
                     let observed_sample = fs::read_to_string(&sample_path)
                         .ok()
@@ -1336,7 +1343,8 @@ async fn main() -> anyhow::Result<()> {
                     soak_router.log_queue(command_type, &[ValveBoardCommands::PilotOpen as u8])
                 {
                     log::error!(
-                        "full-bay soak valve command {target_sample}/{rounds} failed to queue: {error}"
+                        "full-bay soak valve command round {}/{rounds} at sample {target_sample} failed to queue: {error}",
+                        round_index + 1
                     );
                     return;
                 }
@@ -1348,18 +1356,21 @@ async fn main() -> anyhow::Result<()> {
                         let elapsed_ms = validation_elapsed_ms(started);
                         if elapsed_ms > latency_limit_ms {
                             log::error!(
-                                "full-bay soak valve command {target_sample}/{rounds} ACK exceeded latency bound: {elapsed_ms} ms > {latency_limit_ms} ms"
+                                "full-bay soak valve command round {}/{rounds} at sample {target_sample} ACK exceeded latency bound: {elapsed_ms} ms > {latency_limit_ms} ms",
+                                round_index + 1
                             );
                             return;
                         }
                         log::info!(
-                            "full-bay soak valve command acknowledged: round {target_sample}/{rounds}, latency {elapsed_ms} ms"
+                            "full-bay soak valve command acknowledged: round {}/{rounds}, sample {target_sample}, latency {elapsed_ms} ms",
+                            round_index + 1
                         );
                         break;
                     }
                     if validation_elapsed_ms(started) > latency_limit_ms {
                         log::error!(
-                            "full-bay soak valve command {target_sample}/{rounds} ACK timed out"
+                            "full-bay soak valve command round {}/{rounds} at sample {target_sample} ACK timed out",
+                            round_index + 1
                         );
                         return;
                     }
