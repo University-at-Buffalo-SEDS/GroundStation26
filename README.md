@@ -4,7 +4,7 @@
 
 - Rust: install from https://rustup.rs/
 - `dioxus-cli`: install with `cargo install dioxus-cli`
-- SEDSNet v4.0.22 from crates.io (the workspace lockfile fixes the exact tested
+- SEDSNet v4.0.23 from crates.io (the workspace lockfile fixes the exact tested
   release)
 
 The frontend uses Dioxus. No separate WASM toolchain workflow is needed beyond the Rust targets used by `build.py`.
