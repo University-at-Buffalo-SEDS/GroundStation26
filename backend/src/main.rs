@@ -603,6 +603,8 @@ async fn main() -> anyhow::Result<()> {
     let fc_sensor_rate_reported_handler = fc_sensor_rate_reported.clone();
     let power_sensor_rate = Arc::new(Mutex::new(StreamRateProbe::default()));
     let power_sensor_rate_handler = power_sensor_rate.clone();
+    let power_seen = Arc::new(AtomicBool::new(false));
+    let power_seen_handler = power_seen.clone();
     let power_rate_reported = Arc::new(AtomicBool::new(false));
     let power_rate_reported_handler = power_rate_reported.clone();
     let fill_telemetry_seen = Arc::new(Mutex::new(HashSet::<Board>::new()));
@@ -656,6 +658,9 @@ async fn main() -> anyhow::Result<()> {
                 if board == Some(Board::PowerBoard)
                     && pkt.data_type() == telemetry_schema::data_type("BATTERY_VOLTAGE")
                 {
+                    if !power_seen_handler.swap(true, Ordering::AcqRel) {
+                        log::info!("full-bay Power telemetry reached GroundStation");
+                    }
                     let valid = power_sensor_rate_handler.lock().unwrap().observe(
                         pkt.timestamp(),
                         4_000,
