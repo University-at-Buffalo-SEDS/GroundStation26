@@ -535,7 +535,8 @@ impl AppState {
         let mut force_broadcast = false;
         let mut map = self.board_status.lock().unwrap();
         for router_node in &snapshot.routers {
-            let Some(board) = Board::from_sender_id(canonical_sender_id(&router_node.sender_id)) else {
+            let Some(board) = Board::from_sender_id(canonical_sender_id(&router_node.sender_id))
+            else {
                 continue;
             };
             if board == Board::GroundStation {

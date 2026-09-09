@@ -67,7 +67,7 @@ use sedsnet::packet::Packet;
 use sedsnet::router::{EndpointHandler, RouterSideOptions};
 use sedsnet::timesync::{TimeSyncConfig, TimeSyncRole};
 use sqlx::Row;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -554,10 +554,20 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler_state_clone = state.clone();
     let pilot_open_ack_generation = Arc::new(AtomicU64::new(0));
     let pilot_open_ack_generation_handler = pilot_open_ack_generation.clone();
-    let rf_gps_seen = Arc::new(AtomicBool::new(false));
-    let rf_gps_seen_handler = rf_gps_seen.clone();
-    let fc_sensor_seen = Arc::new(AtomicBool::new(false));
-    let fc_sensor_seen_handler = fc_sensor_seen.clone();
+    let rf_gps_count = Arc::new(AtomicU64::new(0));
+    let rf_gps_count_handler = rf_gps_count.clone();
+    let rf_gps_rate_reported = Arc::new(AtomicBool::new(false));
+    let rf_gps_rate_reported_handler = rf_gps_rate_reported.clone();
+    let fc_sensor_count = Arc::new(AtomicU64::new(0));
+    let fc_sensor_count_handler = fc_sensor_count.clone();
+    let fc_sensor_rate_reported = Arc::new(AtomicBool::new(false));
+    let fc_sensor_rate_reported_handler = fc_sensor_rate_reported.clone();
+    let power_sensor_count = Arc::new(AtomicU64::new(0));
+    let power_sensor_count_handler = power_sensor_count.clone();
+    let power_rate_reported = Arc::new(AtomicBool::new(false));
+    let power_rate_reported_handler = power_rate_reported.clone();
+    let fill_telemetry_seen = Arc::new(Mutex::new(HashSet::<Board>::new()));
+    let fill_telemetry_seen_handler = fill_telemetry_seen.clone();
     let abort_handler_state_clone = state.clone();
     let flight_state_handler_state_clone = state.clone();
     let heartbeat_handler_state_clone = state.clone();
@@ -566,22 +576,54 @@ async fn main() -> anyhow::Result<()> {
         telemetry_schema::endpoint("GROUND_STATION"),
         move |pkt: &Packet| {
             if std::env::var_os("GS_SIM_VALIDATE_TELEMETRY_RETURN").is_some() {
-                let board = ground_station_handler_state_clone
-                    .board_from_network_sender(pkt.sender());
+                let board =
+                    ground_station_handler_state_clone.board_from_network_sender(pkt.sender());
                 if board == Some(Board::RFBoard)
-                    && pkt.data_type()
-                        == telemetry_schema::data_type("GPS_SATELLITE_NUMBER")
-                    && !rf_gps_seen_handler.swap(true, Ordering::AcqRel)
+                    && pkt.data_type() == telemetry_schema::data_type("GPS_SATELLITE_NUMBER")
                 {
-                    log::info!("full-bay RF GPS telemetry reached GroundStation");
+                    let count = rf_gps_count_handler.fetch_add(1, Ordering::AcqRel) + 1;
+                    if count >= 3 && !rf_gps_rate_reported_handler.swap(true, Ordering::AcqRel) {
+                        log::info!(
+                            "full-bay RF GPS 1 Hz stream reached GroundStation: {count} samples"
+                        );
+                    }
                 }
                 if board == Some(Board::FlightComputer)
                     && (pkt.data_type() == telemetry_schema::data_type("IMU_DATA")
-                        || pkt.data_type()
-                            == telemetry_schema::data_type("BAROMETER_DATA"))
-                    && !fc_sensor_seen_handler.swap(true, Ordering::AcqRel)
+                        || pkt.data_type() == telemetry_schema::data_type("BAROMETER_DATA"))
                 {
-                    log::info!("full-bay Flight sensor telemetry reached GroundStation");
+                    let count = fc_sensor_count_handler.fetch_add(1, Ordering::AcqRel) + 1;
+                    if count >= 3 && !fc_sensor_rate_reported_handler.swap(true, Ordering::AcqRel) {
+                        log::info!(
+                            "full-bay Flight sensor 1 Hz stream reached GroundStation: {count} samples"
+                        );
+                    }
+                }
+                if board == Some(Board::PowerBoard)
+                    && (pkt.data_type() == telemetry_schema::data_type("BATTERY_VOLTAGE")
+                        || pkt.data_type() == telemetry_schema::data_type("BATTERY_CURRENT"))
+                {
+                    let count = power_sensor_count_handler.fetch_add(1, Ordering::AcqRel) + 1;
+                    if count >= 2 && !power_rate_reported_handler.swap(true, Ordering::AcqRel) {
+                        log::info!(
+                            "full-bay Power 5-second stream reached GroundStation: {count} samples"
+                        );
+                    }
+                }
+                if let Some(
+                    board @ (Board::GatewayBoard
+                    | Board::ActuatorBoard
+                    | Board::ValveBoard
+                    | Board::DaqBoard),
+                ) = board
+                {
+                    let mut seen = fill_telemetry_seen_handler.lock().unwrap();
+                    if seen.insert(board) {
+                        log::info!(
+                            "full-bay fill telemetry reached GroundStation from {}",
+                            board.sender_id()
+                        );
+                    }
                 }
             }
             if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
