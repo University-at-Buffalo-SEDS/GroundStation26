@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "SEDSnet"
-version = "4.0.20"
+version = "4.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d691d6774fd1f4438352a863e6295bc9a025a848af9bc475fadc80c7017728be"
+checksum = "a825dc550205e82d393e7feafbe5104d631b4bf5f4e6012419a0361143546b81"
 dependencies = [
  "crc32fast",
  "sedsnet_macros",
