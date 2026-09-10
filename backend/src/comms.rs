@@ -2303,9 +2303,14 @@ impl CommsDevice for DummyComms {
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        #[cfg(feature = "testing")]
         use sedsnet::wire_format::peek_envelope;
 
-        if peek_envelope(payload).unwrap().ty == crate::telemetry_schema::data_type("HEARTBEAT") {
+        #[cfg(feature = "testing")]
+        if peek_envelope(payload)
+            .map(|envelope| envelope.ty == crate::telemetry_schema::data_type("HEARTBEAT"))
+            .unwrap_or(false)
+        {
             return Ok(());
         }
         #[cfg(feature = "testing")]
