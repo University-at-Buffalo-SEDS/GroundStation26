@@ -175,7 +175,12 @@ pub async fn apply_sqlite_pragmas(db: &SqlitePool) {
     ];
 
     for stmt in pragmas {
-        if let Err(err) = sqlx::query(&stmt).execute(db).await {
+        // Every interpolated value above is either allow-listed or parsed and
+        // clamped as an integer before it becomes SQL.
+        if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(stmt.as_str()))
+            .execute(db)
+            .await
+        {
             log::error!("sqlite pragma failed ({stmt}): {err}");
         }
     }
@@ -350,7 +355,8 @@ async fn exec_pragma_with_retry(
     delay_ms: u64,
 ) -> Result<(), sqlx::Error> {
     for attempt in 0..retries {
-        match sqlx::query(stmt).execute(db).await {
+        // Callers pass only the fixed PRAGMA statements below.
+        match sqlx::query(sqlx::AssertSqlSafe(stmt)).execute(db).await {
             Ok(_) => return Ok(()),
             Err(err) => {
                 if attempt + 1 >= retries {
