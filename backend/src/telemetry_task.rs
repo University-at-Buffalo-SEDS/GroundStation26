@@ -1160,10 +1160,11 @@ fn queue_guarded_fill_command(
     cmd_payload: u8,
     label: &str,
 ) {
-    if state
-        .get_pending_umbilical_valve_state(key_cmd_id)
-        .is_some()
-    {
+    /* A second operator action must be able to reverse an unacknowledged
+     * command. Previously any pending open suppressed the following close,
+     * so the UI appeared to work in one direction only whenever the status
+     * return path was delayed. Only deduplicate the same target. */
+    if state.get_pending_umbilical_valve_state(key_cmd_id) == Some(desired_state) {
         return;
     }
     if effective_umbilical_valve_state(state, key_cmd_id) == Some(desired_state) {
@@ -1175,6 +1176,7 @@ fn queue_guarded_fill_command(
     }
     log_command_dispatch(label, "umbilical_comms", data_type, &[cmd_payload]);
     state.set_pending_umbilical_valve_state(key_cmd_id, desired_state);
+    flush_command_tx(router, &format!("{label} tx"));
     sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
 }
@@ -1427,7 +1429,7 @@ async fn handle_packet(
         sequences::refresh_action_policy_now(state);
         state.broadcast_action_policy_snapshot();
     }
-    let sender_id = canonical_sender_id(pkt.sender()).to_string();
+    let sender_id = state.canonical_network_sender_id(pkt.sender());
 
     if pkt.data_type() == crate::telemetry_schema::data_type("WARNING") {
         if let Ok(msg) = pkt.data_as_string() {
@@ -2238,6 +2240,31 @@ mod tests {
             flight_packets[0]
                 .endpoints()
                 .contains(&crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"))
+        );
+    }
+
+    #[tokio::test]
+    async fn opposite_valve_command_supersedes_unacknowledged_pending_target() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Router::new(sedsnet::router::RouterConfig::new([]));
+        let key = ValveBoardCommands::PilotOpen as u8;
+
+        state.set_pending_umbilical_valve_state(key, true);
+        queue_guarded_fill_command(
+            &state,
+            &router,
+            crate::telemetry_schema::data_type("VALVE_COMMAND"),
+            key,
+            false,
+            ValveBoardCommands::PilotClose as u8,
+            "Pilot close test",
+        );
+
+        assert_eq!(
+            state.get_pending_umbilical_valve_state(key),
+            Some(false),
+            "a pending open must not suppress the operator's close command"
         );
     }
 
@@ -4211,6 +4238,73 @@ mod tests {
                 .iter()
                 .all(|derived| derived.timestamp_ms == row.timestamp_ms)
         );
+    }
+
+    #[tokio::test]
+    async fn compact_power_sender_is_resolved_before_battery_grouping() {
+        let (db_tx, _db_rx) = mpsc::channel(16);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        let mut ws_rx = state.ws_tx.subscribe();
+
+        let ground_router = Arc::new(Router::new(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+        ));
+        let power_router = Arc::new(Router::new(
+            sedsnet::router::RouterConfig::new([]).with_sender("PB"),
+        ));
+        let ground_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+        let power_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
+        let ground_side = {
+            let ground_peer = ground_peer.clone();
+            ground_router.add_side_packed("rocket_comms", move |bytes| {
+                let (peer, side) = ground_peer.lock().unwrap().clone().unwrap();
+                peer.rx_packed_from_side(bytes, side)
+            })
+        };
+        let power_side = {
+            let power_peer = power_peer.clone();
+            power_router.add_side_packed("can", move |bytes| {
+                let (peer, side) = power_peer.lock().unwrap().clone().unwrap();
+                peer.rx_packed_from_side(bytes, side)
+            })
+        };
+        *ground_peer.lock().unwrap() = Some((power_router.clone(), power_side));
+        *power_peer.lock().unwrap() = Some((ground_router.clone(), ground_side));
+        state
+            .topology_router
+            .set(ground_router.clone())
+            .expect("failed to install test topology router");
+        power_router.announce_discovery().unwrap();
+        power_router.process_all_queues_with_timeout(0).unwrap();
+        let address = ground_router
+            .resolve_hostname("PB")
+            .expect("Power Board address was not learned")
+            .address;
+
+        let pkt = Packet::new(
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            &format!("@addr:{address}"),
+            678_903,
+            f32_payload(&[8.0]),
+        )
+        .expect("failed to build compact Power Board battery packet");
+
+        let row = handle_packet(&state, &db_tx, &db_overflow, pkt)
+            .await
+            .into_iter()
+            .next()
+            .expect("battery packet should produce a raw row");
+        assert_eq!(row.sender_id, "PB");
+
+        let mut saw_av_bay_percent = false;
+        for _ in 0..6 {
+            let derived = ws_rx.recv().await.expect("derived battery row missing");
+            assert_eq!(derived.sender_id, "PB");
+            saw_av_bay_percent |= derived.data_type == "AV_BAY_BATTERY_PERCENT";
+        }
+        assert!(saw_av_bay_percent);
     }
 
     #[tokio::test]

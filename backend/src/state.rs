@@ -264,6 +264,14 @@ impl AppState {
         Board::from_sender_id(canonical_sender_id(hostname.as_ref()))
     }
 
+    /// Converts compact on-wire address senders back to the stable board ID
+    /// used by telemetry layout filters, persistence, and UI grouping.
+    pub(crate) fn canonical_network_sender_id(&self, sender: &str) -> String {
+        self.board_from_network_sender(sender)
+            .map(|board| board.sender_id().to_string())
+            .unwrap_or_else(|| canonical_sender_id(sender).to_string())
+    }
+
     fn queue_router_flight_state_update(&self, next_state: FlightState) {
         let Some(router) = self.topology_router.get() else {
             log::warn!(
@@ -1574,6 +1582,78 @@ mod tests {
             .find(|entry| entry.board == Board::ValveBoard)
             .expect("Valve board status missing");
         assert!(valve_status.seen);
+    }
+
+    #[tokio::test]
+    async fn network_topology_includes_flight_computer_discovered_behind_rf() {
+        let state = test_app_state().await;
+        let ground = Arc::new(Router::new(
+            RouterConfig::new([]).with_sender(Board::GroundStation.sender_id()),
+        ));
+        let rf = Arc::new(Router::new(
+            RouterConfig::new([]).with_sender(Board::RFBoard.sender_id()),
+        ));
+        let flight = Arc::new(Router::new(
+            RouterConfig::new([]).with_sender(Board::FlightComputer.sender_id()),
+        ));
+
+        let gs_to_rf = Arc::new(Mutex::new(None::<RouterSideId>));
+        let rf_radio_side_slot = gs_to_rf.clone();
+        let rf_for_ground = rf.clone();
+        let ground_side = ground.add_side_packed("rocket_comms", move |bytes| {
+            rf_for_ground.rx_packed_from_side(
+                bytes,
+                rf_radio_side_slot.lock().unwrap().unwrap(),
+            )
+        });
+        let ground_for_rf = ground.clone();
+        let rf_radio_side = rf.add_side_packed("radio", move |bytes| {
+            ground_for_rf.rx_packed_from_side(bytes, ground_side)
+        });
+        *gs_to_rf.lock().unwrap() = Some(rf_radio_side);
+
+        let rf_to_flight = Arc::new(Mutex::new(None::<RouterSideId>));
+        let flight_side_slot = rf_to_flight.clone();
+        let flight_for_rf = flight.clone();
+        let rf_can_side = rf.add_side_packed("can", move |bytes| {
+            flight_for_rf.rx_packed_from_side(
+                bytes,
+                flight_side_slot.lock().unwrap().unwrap(),
+            )
+        });
+        let rf_for_flight = rf.clone();
+        let flight_side = flight.add_side_packed("can", move |bytes| {
+            rf_for_flight.rx_packed_from_side(bytes, rf_can_side)
+        });
+        *rf_to_flight.lock().unwrap() = Some(flight_side);
+
+        state
+            .topology_router
+            .set(ground.clone())
+            .expect("failed to set topology router");
+
+        ground.announce_discovery().unwrap();
+        rf.announce_discovery().unwrap();
+        flight.announce_discovery().unwrap();
+        for _ in 0..12 {
+            ground.process_all_queues_with_timeout(0).unwrap();
+            rf.process_all_queues_with_timeout(0).unwrap();
+            flight.process_all_queues_with_timeout(0).unwrap();
+        }
+
+        let snapshot = state.network_topology_snapshot(2_000);
+        assert!(snapshot.nodes.iter().any(|node| {
+            node.sender_id.as_deref() == Some(Board::RFBoard.sender_id())
+        }));
+        assert!(snapshot.nodes.iter().any(|node| {
+            node.sender_id.as_deref() == Some(Board::FlightComputer.sender_id())
+        }));
+        let rf_id = "board_rf";
+        let flight_id = "board_fc";
+        assert!(snapshot.links.iter().any(|link| {
+            (link.source == rf_id && link.target == flight_id)
+                || (link.source == flight_id && link.target == rf_id)
+        }));
     }
 
     #[tokio::test]

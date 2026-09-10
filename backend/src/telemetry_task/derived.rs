@@ -844,7 +844,7 @@ pub(super) async fn handle_gps_satellite_count_packet(
 ) -> Option<TelemetryRow> {
     let count = pkt.data_as_u8().ok().and_then(|v| v.first().copied())?;
     let ts_ms = get_current_timestamp_ms() as i64;
-    let sender_id = pkt.sender().to_string();
+    let sender_id = state.canonical_network_sender_id(pkt.sender());
 
     {
         let mut sats = state.latest_gps_satellites_by_sender.lock().unwrap();
