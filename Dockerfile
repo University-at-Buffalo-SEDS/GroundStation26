@@ -9,7 +9,12 @@ LABEL authors="rylan"
 # Install dependencies for build script and map downloader
 RUN set -e; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl xz-utils; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libudev-dev \
+        pkg-config \
+        xz-utils; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
 # Directory creation
@@ -27,6 +32,7 @@ COPY backend/src backend/src
 COPY backend/layout backend/layout
 COPY backend/calibration backend/calibration
 COPY backend/comms backend/comms
+COPY backend/config backend/config
 COPY backend/users backend/users
 COPY backend/build.py backend/
 
