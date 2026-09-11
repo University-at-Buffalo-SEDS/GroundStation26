@@ -1,5 +1,20 @@
 # Frontend API Contract
 
+## Live dashboard cadence
+
+Each `/api/dashboard_status` stat now includes backend-owned `binding` metadata
+(`data_type`, optional `sender_id`, `index`, `scale`, `offset`). The operator UI
+uses these bindings with live WebSocket telemetry, not the slower HTTP snapshot,
+to update numerical values. Missing/stale bound data must show unavailable rather
+than falling back to an old snapshot. Older backends without bindings retain the
+HTTP-value fallback. Bindings are not user-editable controls.
+
+The backend's default telemetry flush is 20 ms; live frontend renders are coalesced
+at 16 ms, including Mission/Vehicle views. Neither imposes a 1 Hz FC cap; a 200 ms
+source cadence can update values at 5 Hz. Actual arrival rates still depend on board
+configuration, radio transport, connection and device load. Delayed streamer views
+continue using delayed program values, never live operator telemetry.
+
 ## Mission video and vehicle models
 
 The Actions tab retains its manual controls and presents GSE sequence commands in

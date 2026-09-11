@@ -6,37 +6,79 @@
       "label": "Altitude",
       "value": 125,
       "unit": "m",
-      "precision": 1
+      "precision": 1,
+      "binding": {
+        "data_type": "GPS_DATA",
+        "sender_id": "RF",
+        "index": 2,
+        "scale": 1,
+        "offset": 0
+      }
     },
     {
       "label": "Latitude",
       "value": 42,
       "unit": "°",
-      "precision": 5
+      "precision": 5,
+      "binding": {
+        "data_type": "GPS_DATA",
+        "sender_id": "RF",
+        "index": 0,
+        "scale": 1,
+        "offset": 0
+      }
     },
     {
       "label": "Longitude",
       "value": -78,
       "unit": "°",
-      "precision": 5
+      "precision": 5,
+      "binding": {
+        "data_type": "GPS_DATA",
+        "sender_id": "RF",
+        "index": 1,
+        "scale": 1,
+        "offset": 0
+      }
     },
     {
       "label": "Tank pressure",
       "value": null,
       "unit": "psi",
-      "precision": 1
+      "precision": 1,
+      "binding": {
+        "data_type": "PRESSURE_TRANSDUCER_CALIBRATED",
+        "sender_id": null,
+        "index": 0,
+        "scale": 1,
+        "offset": 0
+      }
     },
     {
       "label": "Fill mass",
       "value": 6,
       "unit": "kg",
-      "precision": 1
+      "precision": 1,
+      "binding": {
+        "data_type": "LOADCELL_WEIGHT_KG",
+        "sender_id": null,
+        "index": 0,
+        "scale": 1,
+        "offset": 0
+      }
     },
     {
       "label": "Fill level",
       "value": 60,
       "unit": "%",
-      "precision": 1
+      "precision": 1,
+      "binding": {
+        "data_type": "LOADCELL_FILL_PERCENT",
+        "sender_id": null,
+        "index": 0,
+        "scale": 1,
+        "offset": 0
+      }
     }
   ]
 }

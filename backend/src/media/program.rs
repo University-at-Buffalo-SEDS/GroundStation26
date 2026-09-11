@@ -164,7 +164,7 @@ fn telemetry_snapshot(app: &AppState, presentation: &Presentation, now: u64) -> 
             let value=rows.iter().rev().find(|r|r.data_type==b.data_type && b.sender_id.as_ref().is_none_or(|s|s==&r.sender_id))
                 .filter(|r|r.timestamp_ms>=0 && now.saturating_sub(r.timestamp_ms as u64)<5000)
                 .and_then(|r|r.values.get(b.index).copied().flatten()).map(|v|v*b.scale+b.offset).filter(|v|v.is_finite());
-            serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision.min(6)})
+            serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision.min(6),"binding":b})
         }).collect()
     };
     serde_json::json!({"phase":format!("{:?}",*app.state.lock().unwrap()),"stats":stats,"t_clock":program_t_clock(&app.launch_clock_snapshot(),now.min(i64::MAX as u64) as i64)})
@@ -601,11 +601,23 @@ mod tests {
                 values: vec![Some(42.0), Some(-78.0), Some(125.0)],
             });
         let fresh = telemetry_snapshot(&app, &profile, 100_500);
+        assert_eq!(fresh["stats"][0]["binding"]["data_type"], "GPS_DATA");
+        assert_eq!(fresh["stats"][0]["binding"]["index"], 2);
         assert_eq!(fresh["stats"][0]["value"], 125.0);
         assert_eq!(fresh["stats"][1]["value"], 42.0);
         assert!(fresh["stats"][3]["value"].is_null());
         let stale = telemetry_snapshot(&app, &profile, 106_000);
         assert!(stale["stats"][0]["value"].is_null());
+        for sample in 1..=5 {
+            let now = 106_000 + sample * 200;
+            app.recent_telemetry_cache.lock().unwrap().push_back(crate::types::TelemetryRow {
+                timestamp_ms: now as i64,
+                data_type: "GPS_DATA".into(),
+                sender_id: "RF".into(),
+                values: vec![Some(42.0), Some(-78.0), Some(sample as f32)],
+            });
+            assert_eq!(telemetry_snapshot(&app, &profile, now)["stats"][0]["value"].as_f64(), Some(sample as f64));
+        }
     }
     #[test]
     fn program_clock_uses_snapshot_time_and_backend_countdown_semantics() {
