@@ -2100,6 +2100,40 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "hitl_mode")]
+    async fn hitl_published_gse_buttons_follow_manual_valve_availability() {
+        let state = test_app_state().await;
+        for flight_state in [
+            FlightState::Startup, FlightState::Idle, FlightState::PreFill,
+            FlightState::FillTest, FlightState::NitrogenFill,
+            FlightState::NitrousFill, FlightState::Armed,
+        ] {
+            *state.state.lock().unwrap() = flight_state;
+            crate::sequences::refresh_action_policy_now(&state);
+            let policy = state.action_policy_snapshot();
+            let enabled = |name: &str| policy.controls.iter()
+                .find(|control| control.cmd == name).is_some_and(|control| control.enabled);
+            assert!(policy.software_buttons_enabled);
+            assert!(enabled("Dump"));
+            for (name, cmd) in [
+                ("StartFill", TelemetryCommand::StartFill),
+                ("PauseFill", TelemetryCommand::PauseFill),
+                ("CancelFill", TelemetryCommand::CancelFill),
+                ("NitrogenTest", TelemetryCommand::NitrogenTest),
+            ] {
+                assert!(enabled(name), "{name} must be enabled in {flight_state:?}");
+                assert!(state.is_command_allowed(&cmd));
+            }
+            assert!(enabled("ToggleGroundStationControl"));
+            assert!(!enabled("ValveSelfTest"));
+        }
+        state.gse.lock().unwrap().engine.config.dry_self_test_confirmed = true;
+        crate::sequences::refresh_action_policy_now(&state);
+        assert!(state.action_policy_snapshot().controls.iter()
+            .any(|control| control.cmd == "ValveSelfTest" && control.enabled));
+    }
+
+    #[tokio::test]
     async fn gse_active_sequence_blocks_manual_and_ignition_controls() {
         let state = test_app_state().await;
         *state.state.lock().unwrap() = FlightState::Idle;
