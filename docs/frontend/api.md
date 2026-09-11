@@ -318,6 +318,12 @@ Failure impact:
 
 ### `GET /flightstate`
 
+Returns the authoritative live state used by command gating and WebSocket
+snapshots, with `Cache-Control: no-store`. Recording history is not a live-state
+source; an empty recording must not invent Startup. GSE status also includes
+`request_gate: {hitl_mode, flight_state, prelaunch, button_interlock_satisfied}`
+for diagnosing why a request is unavailable. Diagnostics do not bypass checks.
+
 Purpose:
 
 - Seed current flight state before websocket updates arrive.

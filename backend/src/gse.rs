@@ -520,7 +520,18 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if let Err(e) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
         return e;
     }
-    Json(state.gse.lock().unwrap().engine.status.clone()).into_response()
+    let flight_state = *state.state.lock().unwrap();
+    let prelaunch = prelaunch_flight_state(flight_state);
+    let interlock = interlock(&state, &state.action_policy_snapshot());
+    let mut response = serde_json::to_value(state.gse.lock().unwrap().engine.status.clone())
+        .expect("GSE status is serializable");
+    response["request_gate"] = serde_json::json!({
+        "hitl_mode": cfg!(feature = "hitl_mode"),
+        "flight_state": flight_state,
+        "prelaunch": prelaunch,
+        "button_interlock_satisfied": interlock,
+    });
+    Json(response).into_response()
 }
 
 #[cfg(test)]
