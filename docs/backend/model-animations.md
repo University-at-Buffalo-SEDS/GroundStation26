@@ -1,13 +1,16 @@
 # Telemetry-driven model animation
 
-![Browser-tested GLB with synthetic fin, gimbal, separation and recovery inputs](vehicle-animation.png)
+The default Dashboard renders the backend GLB using the bundled Three.js named-node
+renderer. The current rocket is single-stage, with aft fins and no upper fins or
+airbrake panels. Multi-stage support remains available for other backend profiles.
+Settings → General → Viewing mode → Ground Station view restores the instrument
+and control dashboard on that device. The separate Vehicle tab and user-facing
+binding editor have been removed.
 
-The Vehicle screen renders the backend GLB using a bundled Three.js named-node
-renderer. It can animate actual model parts, not just adjacent status cards.
-Open **Vehicle → Model & telemetry animation bindings** with operator permissions
-to edit and save the visualization document. The editor accepts built-in vehicle
-and GSE scenes as well as uploaded stage-model URLs. Saving a model never sends
-hardware commands. Stream-manager status alone does not authorize these edits.
+Configure bindings in the backend's stage-model directory `_presentation.json`
+(`vehicle.motions`, `vehicle.attitude`, `vehicle.stages`, and `stats`). Backend
+administration tools may also use the authenticated vehicle configuration API;
+ordinary viewers never configure bindings. Hardware permissions are unchanged.
 
 The `motions` array maps normalized telemetry to model transforms:
 
@@ -39,11 +42,10 @@ telemetry shows unknown instead of continuing to present it as live.
 
 | Built-in nodes | Intended mapping |
 | --- | --- |
-| `booster-stage`, `sustainer-stage` | Separation translation/rotation |
+| `stage-1` | Single airframe transform; no stock separation |
 | `fin-pivot-0` … `fin-pivot-3` | Individual fin angles |
 | `gimbal-pivot` | Engine gimbal angle(s) |
 | `motor-flame` | Motor active state or throttle scale |
-| `airbrake-pivot-0` … `airbrake-pivot-3` | Airbrake angles |
 | `drogue-parachute`, `main-parachute` | Recovery deployment/expansion |
 | `nitrogen-level`, `nitrous-level` in `gse-site.glb` | Measured fullness (Y scale) |
 | `umbilical_boom` (Three.js sanitizes spaces) | Disconnect translation/rotation |
@@ -55,7 +57,7 @@ When a telemetry binding is provided, missing telemetry does not fall back to ph
 Existing `phase_animations` GLB clips and attitude bindings remain supported.
 
 Your hardware does not currently expose every requested fin/gimbal/fullness signal
-in the checked-in telemetry schema. The renderer/editor support them, but you must
+in the checked-in telemetry schema. The renderer supports them, but backend administrators must
 provide real telemetry and correct model pivots/mappings before treating those visuals
 as live measurements. Tank pressure is not automatically converted to tank fullness.
 The equipment scene remains illustrative unless level/disconnect channels are mapped.

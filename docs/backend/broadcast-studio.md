@@ -46,6 +46,19 @@ are changed by installing this feature.
 
 ## Delay and cutting
 
+Any account with viewing access can open **Settings → General → Viewing mode →
+Streamer**; a stream-manager role is needed only to direct the broadcast. Use
+**Exit streamer** at the upper right to return to Dashboard. Ground Station view
+is a separate, per-device settings toggle; it does not grant hardware permissions.
+
+The model dashboard and program bottom bars cycle three telemetry fields every
+five seconds while keeping flight state and T clock visible. Backend defaults
+include RF GPS altitude/latitude/longitude, calibrated tank pressure, fill mass and
+fill percentage. Missing/stale samples show “—”, never fabricated values. Configure
+`stats` in the backend `_presentation.json` to change channels, sources or units;
+empty/missing legacy stats lists inherit these defaults. `/api/dashboard_status`
+returns server-resolved live values, while the program uses delayed snapshots.
+
 The studio exposes **Audience delay**, 3–60 seconds, default 10. This is the minimum
 server release delay; playback adds approximately 2.5 seconds plus network/decoder
 jitter. The browser integration test measured about 12.6 seconds for a 10-second

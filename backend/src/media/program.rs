@@ -9,6 +9,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
         .route("/api/media-assets/program/state", get(program_state))
         .route("/api/media-assets/hls/{id}/{file}", get(hls))
         .route("/api/stream-roles", get(roles).post(set_role))
+        .route("/api/dashboard_status", get(dashboard_status))
         .route(
             "/assets/hls.min.js",
             get(|| async {
@@ -90,17 +91,7 @@ async fn program_state(
         streams.push(serde_json::json!({"id":stream.id,"label":presentation.stream_labels.get(&stream.id).unwrap_or(&stream.id),"url":format!("/api/media-assets/hls/{}/index.m3u8?ticket={access}",stream.id)}));
     }
     let now = now_ms();
-    let stats: Vec<_> = {
-        let rows = state.app.recent_telemetry_cache.lock().unwrap();
-        presentation.stats.iter().map(|stat|{
-            let b=&stat.binding;
-            let value=rows.iter().rev().find(|r|r.data_type==b.data_type && b.sender_id.as_ref().is_none_or(|s|s==&r.sender_id))
-                .filter(|r|r.timestamp_ms>=0 && now.saturating_sub(r.timestamp_ms as u64)<5000)
-                .and_then(|r|r.values.get(b.index).copied().flatten()).map(|v|v*b.scale+b.offset).filter(|v|v.is_finite());
-            serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision.min(6)})
-        }).collect()
-    };
-    let snapshot = serde_json::json!({"phase":format!("{:?}",*state.app.state.lock().unwrap()),"stats":stats,"t_clock":program_t_clock(&state.app.launch_clock_snapshot(),now.min(i64::MAX as u64) as i64)});
+    let snapshot = telemetry_snapshot(&state.app, &presentation, now);
     let mut history = state.program_history.lock().await;
     if history
         .back()
@@ -122,6 +113,31 @@ async fn program_state(
         .filter(|(t, _)| target.saturating_sub(*t) < 2000)
         .map(|(_, v)| v.clone());
     Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry}))).into_response())
+}
+async fn dashboard_status(
+    State(state): State<Arc<MediaState>>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    authorize(&state, &headers, Permission::ViewData).await?;
+    let presentation = read_presentation(&state).await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(telemetry_snapshot(&state.app, &presentation, now_ms())),
+    )
+        .into_response())
+}
+fn telemetry_snapshot(app: &AppState, presentation: &Presentation, now: u64) -> serde_json::Value {
+    let stats: Vec<_> = {
+        let rows = app.recent_telemetry_cache.lock().unwrap();
+        presentation.stats.iter().map(|stat|{
+            let b=&stat.binding;
+            let value=rows.iter().rev().find(|r|r.data_type==b.data_type && b.sender_id.as_ref().is_none_or(|s|s==&r.sender_id))
+                .filter(|r|r.timestamp_ms>=0 && now.saturating_sub(r.timestamp_ms as u64)<5000)
+                .and_then(|r|r.values.get(b.index).copied().flatten()).map(|v|v*b.scale+b.offset).filter(|v|v.is_finite());
+            serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision.min(6)})
+        }).collect()
+    };
+    serde_json::json!({"phase":format!("{:?}",*app.state.lock().unwrap()),"stats":stats,"t_clock":program_t_clock(&app.launch_clock_snapshot(),now.min(i64::MAX as u64) as i64)})
 }
 
 fn valid_hls_file(name: &str) -> bool {
@@ -508,6 +524,29 @@ async fn set_role(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn dashboard_resolves_channels_and_marks_stale_samples_unknown() {
+        let app = crate::state::tests::test_app_state().await;
+        let profile = Presentation {
+            stats: default_stats(),
+            ..Presentation::default()
+        };
+        app.recent_telemetry_cache
+            .lock()
+            .unwrap()
+            .push_back(crate::types::TelemetryRow {
+                timestamp_ms: 100_000,
+                data_type: "GPS_DATA".into(),
+                sender_id: "RF".into(),
+                values: vec![Some(42.0), Some(-78.0), Some(125.0)],
+            });
+        let fresh = telemetry_snapshot(&app, &profile, 100_500);
+        assert_eq!(fresh["stats"][0]["value"], 125.0);
+        assert_eq!(fresh["stats"][1]["value"], 42.0);
+        assert!(fresh["stats"][3]["value"].is_null());
+        let stale = telemetry_snapshot(&app, &profile, 106_000);
+        assert!(stale["stats"][0]["value"].is_null());
+    }
     #[test]
     fn program_clock_uses_snapshot_time_and_backend_countdown_semantics() {
         use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};

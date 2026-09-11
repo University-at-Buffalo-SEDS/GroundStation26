@@ -11,7 +11,7 @@ async function until(fn,timeout=90000){const stop=Date.now()+timeout;let v;while
  let cfg=(await(await api('/api/live_streams','producer')).json()).broadcast;
  assert.equal((await api('/api/live_streams/control','viewer',cfg)).status,403);
  assert.equal((await api('/api/live_streams/control','producer',{...cfg,delay_seconds:61})).status,400);
- let r=await api('/api/live_streams/control','producer',{...cfg,featured_stream_id:'front',label:'Delay integration',delay_seconds:10});assert.equal(r.status,200);cfg=await r.json();
+ let r=await api('/api/live_streams/control','producer',{...cfg,featured_stream_id:'front',hidden_stream_ids:[],layout:'hero',label:'Delay integration',delay_seconds:10});assert.equal(r.status,200);cfg=await r.json();
  assert.equal((await api('/api/live_streams/control','producer',{...cfg,revision:0})).status,409);
  assert.equal((await api('/api/stream-roles','administrator',{username:'viewer',stream_master:true})).status,200);
  assert.equal((await(await api('/api/live_streams','viewer')).json()).can_manage_stream,true);

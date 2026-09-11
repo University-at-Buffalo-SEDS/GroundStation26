@@ -26,6 +26,7 @@ function scene(){
 const site=scene();
 site.box('pad',site.black,[0,-.1,0],[10,.2,7]);
 site.rocket(2,0);
+singleStageAirframe(site);
 for(const x of [2.9,3.65])for(const z of [-.8,.1])site.box('tower upright',site.steel,[x,3.9,z],[.1,8,.1]);
 for(let y=.5;y+.8<=7.9;y+=.8){site.box('tower rail',site.steel,[3.28,y,-.8],[.85,.06,.06]);site.pipe('tower brace',site.steel,[2.9,y,-.8],[3.65,y+.8,-.8],.025);}
 site.box('umbilical boom',site.white,[2.7,5.2,-.3],[1.8,.12,.12]);
@@ -46,6 +47,14 @@ for(const [name,x,z,height,color]of [['nitrogen-level',-3,-.51,2.7,site.blue],['
 }
 site.save('gse-site.glb');
 const rocket=scene();rocket.rocket();
+singleStageAirframe(rocket);
+function singleStageAirframe(s){
+ const body=s.doc.nodes.find(n=>n.name==='booster');
+ const join=s.doc.nodes.find(n=>n.name==='interstage');
+ join.mesh=body.mesh;
+ body.name='airframe-lower';join.name='airframe-join';
+ s.doc.nodes.find(n=>n.name==='sustainer').name='airframe-upper';
+}
 function group(s,name,children,origin=[0,0,0]){
   const index=s.doc.nodes.length;s.doc.nodes.push({name,translation:origin,children});
   for(const child of children){const n=s.doc.nodes[child];n.translation=n.translation.map((v,i)=>v-origin[i]);}
@@ -55,9 +64,8 @@ const fins=rocket.doc.nodes.flatMap((n,i)=>n.name==='fin'?[i]:[]).map((i,n)=>gro
 const flameMat=rocket.material('exhaust',[1,.48,.15],0,.8);
 const flame=rocket.node('motor-flame','cone',flameMat,[0,-.35,0],[.22,1,.22],[1,0,0,0]);
 const engine=group(rocket,'gimbal-pivot',[4,flame],[0,.45,0]);
-group(rocket,'booster-stage',[0,engine,...fins]);
-group(rocket,'sustainer-stage',[1,2,3]);
-for(let i=0;i<4;i++){const a=i*Math.PI/2,at=[Math.cos(a)*.32,4.6,Math.sin(a)*.32];const panel=rocket.box('airbrake-panel-'+i,rocket.black,at,[.18,.42,.035]);group(rocket,'airbrake-pivot-'+i,[panel],at);}
+// Current airframe is single-stage: one group, aft fins only, no upper panels.
+group(rocket,'stage-1',[0,1,2,3,engine,...fins]);
 for(const [name,y,r]of [['drogue',9,.7],['main',11,1.7]]){
  const nodes=[rocket.node(name+'-canopy','cone',rocket.white,[0,y,0],[r,.45,r])];
  for(let i=0;i<4;i++){const a=i*Math.PI/2;nodes.push(rocket.pipe(name+'-line',rocket.steel,[0,7.4,0],[Math.cos(a)*r,y-.22,Math.sin(a)*r],.009));}

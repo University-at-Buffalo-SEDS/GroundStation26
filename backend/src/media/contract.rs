@@ -68,6 +68,56 @@ struct BroadcastStat {
     precision: usize,
 }
 
+fn default_stats() -> Vec<BroadcastStat> {
+    use crate::types::Board;
+    [
+        (
+            "Altitude",
+            "GPS_DATA",
+            Some(Board::RFBoard.sender_id()),
+            2,
+            "m",
+        ),
+        (
+            "Latitude",
+            "GPS_DATA",
+            Some(Board::RFBoard.sender_id()),
+            0,
+            "°",
+        ),
+        (
+            "Longitude",
+            "GPS_DATA",
+            Some(Board::RFBoard.sender_id()),
+            1,
+            "°",
+        ),
+        (
+            "Tank pressure",
+            "PRESSURE_TRANSDUCER_CALIBRATED",
+            None,
+            0,
+            "psi",
+        ),
+        ("Fill mass", "LOADCELL_WEIGHT_KG", None, 0, "kg"),
+        ("Fill level", "LOADCELL_FILL_PERCENT", None, 0, "%"),
+    ]
+    .into_iter()
+    .map(|(label, data_type, sender, index, unit)| BroadcastStat {
+        label: label.into(),
+        binding: Binding {
+            data_type: data_type.into(),
+            sender_id: sender.map(str::to_owned),
+            index,
+            scale: 1.0,
+            offset: 0.0,
+        },
+        unit: unit.into(),
+        precision: if unit == "°" { 5 } else { 1 },
+    })
+    .collect()
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Vehicle {
@@ -183,17 +233,22 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
 }
 
 async fn read_presentation(state: &MediaState) -> ApiResult<Presentation> {
-    match tokio::fs::read(state.models.join("_presentation.json")).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| {
-            log::error!("media presentation: {err}");
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Invalid media presentation configuration",
-            )
-        }),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Presentation::default()),
-        Err(err) => Err(io_error(err)),
+    let mut presentation: Presentation =
+        match tokio::fs::read(state.models.join("_presentation.json")).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| {
+                log::error!("media presentation: {err}");
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid media presentation configuration",
+                )
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Presentation::default()),
+            Err(err) => Err(io_error(err)),
+        }?;
+    if presentation.stats.is_empty() {
+        presentation.stats = default_stats();
     }
+    Ok(presentation)
 }
 
 async fn write_presentation(state: &MediaState, value: &Presentation) -> ApiResult<()> {
@@ -456,9 +511,13 @@ async fn vehicle(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> Ap
     {
         vehicle.model_url = format!("/api/stage-models/{}/{}", model.stage, model.name);
     }
-    if vehicle.model_url.is_empty() {
+    if vehicle.model_url.is_empty() || vehicle.model_url == "/assets/models/vehicle.glb" {
         vehicle.model_url = "/assets/models/vehicle.glb".into();
-        vehicle.model_alt = "Minimal two-stage launch vehicle".into();
+        vehicle.model_alt = "Single-stage rocket with aft fins".into();
+        vehicle.motions.retain(|motion| {
+            !matches!(motion.node.as_str(), "booster-stage" | "sustainer-stage")
+                && !motion.node.starts_with("airbrake-")
+        });
         if vehicle.motions.is_empty() {
             vehicle.motions = vec![
                 Motion {
@@ -498,20 +557,12 @@ async fn vehicle(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> Ap
                 },
             ];
         }
-        vehicle.stages = vec![
-            Stage {
-                id: "booster".into(),
-                label: "Booster".into(),
-                separation: None,
-                components: vec![],
-            },
-            Stage {
-                id: "sustainer".into(),
-                label: "Sustainer".into(),
-                separation: None,
-                components: vec![],
-            },
-        ];
+        vehicle.stages = vec![Stage {
+            id: "stage-1".into(),
+            label: "Single stage".into(),
+            separation: None,
+            components: vec![],
+        }];
     }
     if let Some(path) = vehicle.model_url.strip_prefix("/api/stage-models/") {
         let (stage, name) = path
@@ -673,5 +724,25 @@ mod tests {
         ] {
             assert!(wire.get(key).is_some());
         }
+    }
+    #[test]
+    fn dashboard_defaults_have_real_telemetry_channels() {
+        let stats = default_stats();
+        assert_eq!(stats.len(), 6);
+        assert_eq!(stats[0].binding.data_type, "GPS_DATA");
+        assert_eq!(stats[0].binding.sender_id.as_deref(), Some("RF"));
+        assert_eq!(stats[0].binding.index, 2);
+        assert_eq!(
+            stats[3].binding.data_type,
+            crate::loadcell::DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE
+        );
+        assert_eq!(
+            stats[4].binding.data_type,
+            crate::loadcell::DERIVED_WEIGHT_DATA_TYPE
+        );
+        assert_eq!(
+            stats[5].binding.data_type,
+            crate::loadcell::DERIVED_FILL_PERCENT_DATA_TYPE
+        );
     }
 }
