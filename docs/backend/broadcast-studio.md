@@ -66,7 +66,7 @@ anchors, and expired authentication fail closed. Keep ground-station time accura
 (NTP). Timing reflects relay ingestion, not a camera shutter timestamp. The delay
 cannot retract frames already delivered under a previous, shorter setting.
 
-Phase and configured statistics use a bounded delayed snapshot history. New viewers
+Phase, T−/T+ launch clock and configured statistics use a bounded delayed snapshot history. The T clock is calculated at snapshot time and displayed beside the other program data; it never advances using the live clock. New viewers
 may initially see “Buffering delayed telemetry”; current telemetry is never substituted
 into the delayed banner. Banner labels, layouts and camera cuts are editorial changes
 and apply promptly (500 ms polling), rather than being delayed again.

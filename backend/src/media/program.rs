@@ -40,6 +40,36 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+fn program_t_clock(clock: &crate::telemetry_db::LaunchClockMsg, now: i64) -> Option<String> {
+    use crate::telemetry_db::LaunchClockKind;
+    let (sign, delta) = match clock.kind {
+        LaunchClockKind::Idle => (
+            "−",
+            clock
+                .duration_ms
+                .unwrap_or(crate::state::LAUNCH_COUNTDOWN_DURATION_MS),
+        ),
+        LaunchClockKind::TMinus => (
+            "−",
+            match (clock.anchor_timestamp_ms, clock.duration_ms) {
+                (Some(anchor), Some(duration)) => {
+                    duration.saturating_sub(now.saturating_sub(anchor))
+                }
+                (Some(target), None) => target.saturating_sub(now),
+                (None, Some(duration)) => duration,
+                _ => return None,
+            },
+        ),
+        LaunchClockKind::TPlus => ("+", now.saturating_sub(clock.anchor_timestamp_ms?)),
+    };
+    let centis = delta.max(0).saturating_add(5) / 10;
+    Some(format!(
+        "T{sign} {:02}:{:02}.{:02}",
+        centis / 6000,
+        centis / 100 % 60,
+        centis % 100
+    ))
+}
 async fn program_state(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<MediaQuery>,
@@ -70,8 +100,7 @@ async fn program_state(
             serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision.min(6)})
         }).collect()
     };
-    let snapshot =
-        serde_json::json!({"phase":format!("{:?}",*state.app.state.lock().unwrap()),"stats":stats});
+    let snapshot = serde_json::json!({"phase":format!("{:?}",*state.app.state.lock().unwrap()),"stats":stats,"t_clock":program_t_clock(&state.app.launch_clock_snapshot(),now.min(i64::MAX as u64) as i64)});
     let mut history = state.program_history.lock().await;
     if history
         .back()
@@ -479,6 +508,45 @@ async fn set_role(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn program_clock_uses_snapshot_time_and_backend_countdown_semantics() {
+        use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
+        let mut clock = LaunchClockMsg {
+            kind: LaunchClockKind::TMinus,
+            anchor_timestamp_ms: Some(100_000),
+            duration_ms: Some(10_000),
+        };
+        assert_eq!(
+            program_t_clock(&clock, 104_250).as_deref(),
+            Some("T− 00:05.75")
+        );
+        assert_eq!(
+            program_t_clock(&clock, 115_000).as_deref(),
+            Some("T− 00:00.00")
+        );
+        clock.kind = LaunchClockKind::TPlus;
+        clock.anchor_timestamp_ms = Some(110_000);
+        assert_eq!(
+            program_t_clock(&clock, 115_250).as_deref(),
+            Some("T+ 00:05.25")
+        );
+        // A delayed snapshot must not use the current/live clock time.
+        assert_eq!(
+            program_t_clock(&clock, 125_250).as_deref(),
+            Some("T+ 00:15.25")
+        );
+        clock.anchor_timestamp_ms = None;
+        assert_eq!(program_t_clock(&clock, 125_250), None);
+        clock.kind = LaunchClockKind::TMinus;
+        assert_eq!(
+            program_t_clock(&clock, 125_250).as_deref(),
+            Some("T− 00:10.00")
+        );
+        assert_eq!(
+            program_t_clock(&LaunchClockMsg::idle(), 125_250).as_deref(),
+            Some("T− 00:10.00")
+        );
+    }
     #[test]
     fn playlist_uris_are_scoped() {
         let p =
