@@ -677,6 +677,7 @@ pub fn load_layout() -> Result<LayoutConfig, String> {
 }
 
 fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
+    ensure_gse_sequence_actions(layout);
     if !crate::flight_sim::sim_mode_enabled() {
         return;
     }
@@ -708,9 +709,157 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
     );
 }
 
+const GSE_SEQUENCE_ACTIONS: [(&str, &str); 5] = [
+    ("StartFill", "Start fill"),
+    ("PauseFill", "Pause fill"),
+    ("CancelFill", "Cancel fill"),
+    ("NitrogenTest", "Nitrogen test"),
+    ("ValveSelfTest", "Valve self-test"),
+];
+
+fn is_ground_action_state(state: &str) -> bool {
+    matches!(
+        state,
+        "Startup" | "Idle" | "PreFill" | "FillTest" | "NitrogenFill" | "NitrousFill" | "Armed"
+    )
+}
+
+/// All clients (including embedded state widgets) resolve commands from this
+/// catalog. Frontend-only injection into ActionsTab leaves those widgets empty.
+fn ensure_gse_sequence_actions(layout: &mut LayoutConfig) {
+    let mut sequence = Vec::new();
+    for (cmd, label) in GSE_SEQUENCE_ACTIONS {
+        let mut spec =
+            if let Some(index) = layout.actions_tab.actions.iter().position(|a| a.cmd == cmd) {
+                layout.actions_tab.actions.remove(index)
+            } else {
+                serde_json::from_value::<ActionSpec>(serde_json::json!({
+                    "cmd": cmd, "label": label, "border": "#38bdf8",
+                    "bg": "#082f49", "fg": "#e0f2fe", "illuminated": true
+                }))
+                .expect("valid built-in GSE action")
+            };
+        spec.group = "GSE sequence actions".into();
+        sequence.push(spec);
+    }
+    sequence.append(&mut layout.actions_tab.actions);
+    layout.actions_tab.actions = sequence;
+    // Stock layouts share sections between filling and Aborted. Split those
+    // selections so adding prelaunch commands does not alter abort/flight views.
+    let mut ground_layouts = Vec::new();
+    for state in &mut layout.state_tab.states {
+        if state.states.iter().any(|s| is_ground_action_state(s))
+            && !state.states.iter().all(|s| is_ground_action_state(s))
+        {
+            let mut ground = state.clone();
+            ground.states.retain(|s| is_ground_action_state(s));
+            state.states.retain(|s| !is_ground_action_state(s));
+            ground_layouts.push(ground);
+        }
+    }
+    layout.state_tab.states.extend(ground_layouts);
+    for state in &mut layout.state_tab.states {
+        // Do not introduce ground commands into flight/recovery views.
+        if !state.states.iter().all(|s| {
+            matches!(
+                s.as_str(),
+                "Startup"
+                    | "Idle"
+                    | "PreFill"
+                    | "FillTest"
+                    | "NitrogenFill"
+                    | "NitrousFill"
+                    | "Armed"
+            )
+        }) {
+            continue;
+        }
+        for section in &mut state.sections {
+            for widget in &mut section.widgets {
+                let Some(actions) = widget.actions.as_mut() else {
+                    continue;
+                };
+                if !actions.iter().any(|cmd| {
+                    matches!(
+                        cmd.as_str(),
+                        "Dump" | "NormallyOpen" | "Pilot" | "Nitrogen" | "Nitrous" | "StartFill"
+                    )
+                }) {
+                    continue;
+                }
+                let mut grouped: Vec<String> = GSE_SEQUENCE_ACTIONS
+                    .iter()
+                    .map(|(cmd, _)| (*cmd).into())
+                    .collect();
+                grouped.extend(
+                    actions
+                        .iter()
+                        .filter(|cmd| !GSE_SEQUENCE_ACTIONS.iter().any(|(new, _)| new == cmd))
+                        .cloned(),
+                );
+                *actions = grouped;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gse_commands_are_available_in_all_layouts_and_prelaunch_valve_widgets() {
+        for source in [
+            include_str!("../layout/layout.json"),
+            include_str!("../layout/layout_hitl.json"),
+            include_str!("../layout/layout_test_fire.json"),
+        ] {
+            let mut layout: LayoutConfig = serde_json::from_str(source).unwrap();
+            ensure_gse_sequence_actions(&mut layout);
+            let once = serde_json::to_value(&layout).unwrap();
+            ensure_gse_sequence_actions(&mut layout);
+            assert_eq!(once, serde_json::to_value(&layout).unwrap());
+            for (cmd, _) in GSE_SEQUENCE_ACTIONS {
+                assert_eq!(
+                    layout
+                        .actions_tab
+                        .actions
+                        .iter()
+                        .filter(|a| a.cmd == cmd)
+                        .count(),
+                    1
+                );
+            }
+            let mut checked = 0;
+            for state in &layout.state_tab.states {
+                if !state.states.iter().all(|s| {
+                    matches!(
+                        s.as_str(),
+                        "Startup"
+                            | "Idle"
+                            | "PreFill"
+                            | "FillTest"
+                            | "NitrogenFill"
+                            | "NitrousFill"
+                            | "Armed"
+                    )
+                }) {
+                    continue;
+                }
+                for widget in state.sections.iter().flat_map(|s| &s.widgets) {
+                    if let Some(actions) = &widget.actions {
+                        if actions.iter().any(|s| s == "Nitrous") {
+                            checked += 1;
+                            for (cmd, _) in GSE_SEQUENCE_ACTIONS {
+                                assert!(actions.iter().any(|s| s == cmd));
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(checked > 0);
+        }
+    }
 
     #[test]
     fn layout_json_is_valid() {

@@ -118,6 +118,13 @@ The main dashboard instead uses the bundled Three.js named-node renderer (MIT).
 Uploaded models using compression may need additional decoder assets.
 # HITL button availability
 
+The backend layout now includes all five GSE sequence action definitions and
+adds their command IDs to prelaunch state widgets that contain manual valves.
+They therefore appear both in Actions and in the embedded ground-station valve
+control panels; manual commands remain available. Layout normalization is
+idempotent and applies to regular, HITL, test-fire and custom layouts.
+Authorization, action-policy enablement and self-test confirmation are unchanged.
+
 HITL adds illuminated `ToggleGroundStationControl` (**Ground station control**),
 default ON on backend restart. It is an authenticated command like Button
 Interlock; its state is authoritative in the action policy. It controls automatic
