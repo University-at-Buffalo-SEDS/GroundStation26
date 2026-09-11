@@ -5,7 +5,13 @@ rtsp: true
 rtspAddress: :8554
 rtspTransports: [tcp]
 rtmp: false
-hls: false
+hls: true
+hlsAddress: :8888
+hlsAlwaysRemux: true
+hlsVariant: fmp4
+hlsSegmentDuration: 1s
+hlsSegmentCount: 90
+hlsSegmentMaxSize: 8M
 srt: false
 moq: false
 playback: false

@@ -7,9 +7,22 @@ The media endpoints follow the sibling frontend's `docs/backend-api.md`:
 `GET /api/vehicle_visualization`. Streams use `kind: "webrtc"` and a backend-hosted
 iframe player. Stream and model asset URLs carry scoped, expiring tickets so
 HTML elements do not need bearer headers. Broadcast control requires an
-authenticated `stream_master` session or explicit `StreamControl` permission,
+authenticated `stream_master`/`stream_admin` account role or explicit `StreamControl` permission,
 persists its revision, and rejects stale updates. Existing telemetry payloads and
 bindings are unchanged. See [setup and API details](../backend/video-and-models.md).
+
+Roles are returned in session `roles`, not `session_type`, and never imply hardware
+command permission. `/api/live_streams` includes authoritative `can_manage_stream`,
+`can_preview_live`, and a scoped `program_url`. Viewers and streamer mode embed the
+delayed program; managers/operators retain separate live previews. Broadcast state
+adds `delay_seconds` (3–60, default 10). Stream admins assign/revoke existing accounts
+through `GET`/`POST /api/stream-roles`. See [broadcast contract and setup](../backend/broadcast-studio.md).
+
+Vehicle configuration adds `motions` for named GLB nodes, phase states and telemetry
+bindings. The bundled offline renderer implements rotation, translation, scale and
+visibility with interpolation. `POST /api/vehicle_visualization` saves configuration
+with hardware/configuration permission, returning `{ "saved": true }`; the existing
+PUT returns 204. See [model mappings](../backend/model-animations.md).
 
 This document describes the backend surface the Dioxus frontend depends on to boot, seed state, remain connected, and
 render the dashboard correctly.

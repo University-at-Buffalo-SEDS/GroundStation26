@@ -4,6 +4,7 @@ services:
     environment:
       GS_VIDEO_API_URL: http://video:9997
       GS_VIDEO_WEBRTC_URL: http://video:8889
+      GS_VIDEO_HLS_URL: http://video:8888
       GS_VIDEO_PASSWORD: ${GS_VIDEO_PASSWORD:?Set GS_VIDEO_PASSWORD to a strong secret}
     depends_on:
       - video

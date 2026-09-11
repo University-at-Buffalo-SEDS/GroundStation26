@@ -24,11 +24,15 @@ struct MediaState {
     client: reqwest::Client,
     api_url: String,
     webrtc_url: String,
+    hls_url: String,
     relay_password: String,
     model_write: Mutex<()>,
     models: PathBuf,
     presentation_write: Mutex<()>,
     tickets: Mutex<Vec<contract::Ticket>>,
+    program_history: Mutex<std::collections::VecDeque<(u64, serde_json::Value)>>,
+    hls_segments: Mutex<std::collections::HashMap<(String, String), u64>>,
+    preview_sessions: Mutex<Vec<(String, String, String)>>,
 }
 
 pub fn router(app: Arc<AppState>) -> Router<Arc<AppState>> {
@@ -43,10 +47,15 @@ pub fn router(app: Arc<AppState>) -> Router<Arc<AppState>> {
             .unwrap_or_else(|_| "http://127.0.0.1:9997".into()),
         webrtc_url: std::env::var("GS_VIDEO_WEBRTC_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8889".into()),
+        hls_url: std::env::var("GS_VIDEO_HLS_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8888".into()),
         relay_password: std::env::var("GS_VIDEO_PASSWORD").unwrap_or_default(),
         model_write: Mutex::new(()),
         presentation_write: Mutex::new(()),
         tickets: Mutex::new(Vec::new()),
+        program_history: Mutex::new(std::collections::VecDeque::new()),
+        hls_segments: Mutex::new(std::collections::HashMap::new()),
+        preview_sessions: Mutex::new(Vec::new()),
         models: std::env::var_os("GS_STAGE_MODELS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/stage_models")),
@@ -124,7 +133,10 @@ async fn list_streams(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
 ) -> ApiResult<axum::Json<Vec<StreamInfo>>> {
-    authorize(&state, &headers, Permission::ViewData).await?;
+    contract::authorize_preview(&state, &headers).await?;
+    fetch_streams(&state).await
+}
+async fn fetch_streams(state: &MediaState) -> ApiResult<axum::Json<Vec<StreamInfo>>> {
     let response = state
         .client
         .get(format!(
@@ -165,7 +177,7 @@ async fn whep_offer(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> ApiResult<Response> {
-    contract::authorize_media(&state, &headers, &query, &format!("stream:{id}")).await?;
+    contract::authorize_preview_media(&state, &headers, &query, &format!("stream:{id}")).await?;
     check_id(&id)?;
     let upstream = state
         .client
@@ -191,6 +203,38 @@ async fn whep_offer(
         .ok_or_else(|| error(StatusCode::BAD_GATEWAY, "Invalid video session response"))?
         .to_owned();
     let body = upstream.bytes().await.map_err(upstream_error)?;
+    // Serialize registration against role changes: an in-flight offer must not
+    // establish a new live preview after its owner's role has been revoked.
+    let _guard = state.presentation_write.lock().await;
+    let mut owner =
+        contract::preview_owner(&state, &headers, &query, &format!("stream:{id}")).await;
+    if owner.is_ok() && state.preview_sessions.lock().await.len() >= 16384 {
+        owner = Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Live preview session limit reached",
+        ));
+    }
+    match owner {
+        Ok(owner) => {
+            state
+                .preview_sessions
+                .lock()
+                .await
+                .push((owner, id.clone(), session.clone()));
+        }
+        Err(err) => {
+            let _ = state
+                .client
+                .delete(format!(
+                    "{}/{id}/whep/{session}",
+                    state.webrtc_url.trim_end_matches('/')
+                ))
+                .basic_auth("groundstation", Some(&state.relay_password))
+                .send()
+                .await;
+            return Err(err);
+        }
+    }
     Ok((
         status,
         [
@@ -215,6 +259,11 @@ async fn whep_delete(
     contract::authorize_media(&state, &headers, &query, &format!("stream:{id}")).await?;
     check_id(&id)?;
     check_id(&session)?;
+    state
+        .preview_sessions
+        .lock()
+        .await
+        .retain(|(_, stream, key)| stream != &id || key != &session);
     let upstream = state
         .client
         .request(
@@ -373,6 +422,38 @@ async fn list_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Loopback-only synthetic media fixture. No sequence tasks or hardware I/O.
+    #[tokio::test]
+    #[ignore = "manual browser/MediaMTX integration fixture; requires GS_MEDIA_TEST_DIR"]
+    async fn serve_synthetic_media() {
+        let dir = PathBuf::from(
+            std::env::var("GS_MEDIA_TEST_DIR").expect("Set an isolated test directory"),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("users.json");
+        let accounts = [
+            ("producer", vec!["stream_master"]),
+            ("administrator", vec!["stream_admin"]),
+            ("viewer", vec![]),
+        ];
+        let users:Vec<_>=accounts.iter().map(|(name,roles)|serde_json::json!({"username":name,"roles":roles,"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":false}})).collect();
+        std::fs::write(&path,serde_json::to_vec(&serde_json::json!({"anonymous":{"view_data":true,"send_commands":false},"users":users})).unwrap()).unwrap();
+        let mut app = crate::state::tests::test_app_state().await;
+        Arc::get_mut(&mut app).unwrap().auth = Arc::new(crate::auth::AuthManager::new(path));
+        crate::ensure_auth_sessions_table(&app.auth_db)
+            .await
+            .unwrap();
+        for (name, _) in accounts {
+            sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,allowed_commands_json,created_at_ms,expires_at_ms) VALUES(?,?,'session',1,0,'[]',0,9999999999999)")
+                .bind(format!("synthetic-{name}")).bind(name).execute(&app.auth_db).await.unwrap();
+        }
+        let routes = router(app.clone()).with_state(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:19090")
+            .await
+            .unwrap();
+        axum::serve(listener, routes).await.unwrap();
+    }
 
     #[test]
     fn ids_cannot_escape_storage() {

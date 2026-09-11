@@ -2,10 +2,13 @@
 use super::*;
 use serde::Deserialize;
 use std::{collections::BTreeMap, time::Instant};
+#[path = "program.rs"]
+mod program;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct Broadcast {
+    delay_seconds: u32,
     label: String,
     featured_stream_id: String,
     hidden_stream_ids: Vec<String>,
@@ -16,6 +19,7 @@ pub(super) struct Broadcast {
 impl Default for Broadcast {
     fn default() -> Self {
         Self {
+            delay_seconds: 10,
             label: String::new(),
             featured_stream_id: String::new(),
             hidden_stream_ids: Vec::new(),
@@ -67,6 +71,7 @@ struct BroadcastStat {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Vehicle {
+    motions: Vec<Motion>,
     title: String,
     model_url: String,
     renderer_url: String,
@@ -76,6 +81,19 @@ struct Vehicle {
     attitude: Attitude,
     stages: Vec<Stage>,
     ground_systems: Vec<Component>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Motion {
+    node: String,
+    transform: String,
+    axis: [f32; 3],
+    from: f32,
+    to: f32,
+    #[serde(default)]
+    binding: Option<Binding>,
+    #[serde(default)]
+    phase_values: BTreeMap<String, f32>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -118,7 +136,12 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
     Router::new()
         .route("/api/live_streams", get(live_streams))
         .route("/api/live_streams/control", post(control_broadcast))
-        .route("/api/vehicle_visualization", get(vehicle).put(save_vehicle))
+        .merge(program::routes())
+        .route("/assets/three/{file}", get(three_asset))
+        .route(
+            "/api/vehicle_visualization",
+            get(vehicle).put(save_vehicle).post(save_vehicle_post),
+        )
         .route("/api/media-assets/streams/{id}", get(player))
         .route(
             "/assets/model-viewer.min.js",
@@ -198,6 +221,7 @@ pub(super) struct Ticket {
 #[derive(Default, Deserialize)]
 pub(super) struct MediaQuery {
     ticket: Option<String>,
+    session: Option<String>,
 }
 
 async fn ticket(state: &MediaState, headers: &HeaderMap, resource: &str) -> ApiResult<String> {
@@ -244,8 +268,18 @@ pub(super) async fn authorize_media(
     query: &MediaQuery,
     resource: &str,
 ) -> ApiResult<()> {
+    let headers = ticket_headers(state, headers, query, resource).await?;
+    authorize(state, &headers, Permission::ViewData).await
+}
+
+async fn ticket_headers(
+    state: &MediaState,
+    headers: &HeaderMap,
+    query: &MediaQuery,
+    resource: &str,
+) -> ApiResult<HeaderMap> {
     let Some(id) = &query.ticket else {
-        return authorize(state, headers, Permission::ViewData).await;
+        return Ok(headers.clone());
     };
     let mut headers = HeaderMap::new();
     {
@@ -263,14 +297,51 @@ pub(super) async fn authorize_media(
             headers.insert(header::AUTHORIZATION, value.clone());
         }
     }
-    authorize(state, &headers, Permission::ViewData).await
+    Ok(headers)
+}
+
+pub(super) async fn authorize_preview(state: &MediaState, headers: &HeaderMap) -> ApiResult<()> {
+    let p = crate::web::authorize_headers(&state.app, headers, Permission::ViewData).await?;
+    if p.can_manage_stream() || p.permissions.send_commands {
+        Ok(())
+    } else {
+        Err(error(
+            StatusCode::FORBIDDEN,
+            "Live preview requires operator or stream-master access",
+        ))
+    }
+}
+pub(super) async fn authorize_preview_media(
+    state: &MediaState,
+    headers: &HeaderMap,
+    query: &MediaQuery,
+    resource: &str,
+) -> ApiResult<()> {
+    authorize_preview(
+        state,
+        &ticket_headers(state, headers, query, resource).await?,
+    )
+    .await
+}
+
+pub(super) async fn preview_owner(
+    state: &MediaState,
+    headers: &HeaderMap,
+    query: &MediaQuery,
+    resource: &str,
+) -> ApiResult<String> {
+    let headers = ticket_headers(state, headers, query, resource).await?;
+    authorize_preview(state, &headers).await?;
+    let p = crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await?;
+    Ok(p.username.unwrap_or_default())
 }
 
 async fn live_streams(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers, Permission::ViewData).await?;
+    let principal =
+        crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await?;
     let presentation = read_presentation(&state).await?;
     // Receiver outages still return a valid contract so Mission can show Vehicle.
     let streams = match list_streams(State(state.clone()), headers.clone()).await {
@@ -278,6 +349,8 @@ async fn live_streams(
         Err(_) => Vec::new(),
     };
     let mut feeds = Vec::new();
+    let program_ticket = ticket(&state, &headers, "program").await?;
+    let program_url = format!("/api/media-assets/program?ticket={program_ticket}");
     for stream in streams {
         let ticket = ticket(&state, &headers, &format!("stream:{}", stream.id)).await?;
         feeds.push(serde_json::json!({
@@ -301,6 +374,9 @@ async fn live_streams(
         axum::Json(serde_json::json!({
             "title": presentation.title, "default_stream_id": default_id, "streams": feeds,
             "stats": presentation.stats, "broadcast": presentation.broadcast,
+            "program_url": program_url,
+            "can_manage_stream": principal.can_manage_stream(),
+            "can_preview_live": principal.can_manage_stream() || principal.permissions.send_commands,
         })),
     )
         .into_response())
@@ -313,20 +389,14 @@ async fn control_broadcast(
 ) -> ApiResult<axum::Json<Broadcast>> {
     let principal =
         crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await?;
-    if principal.anonymous
-        || !(principal.session_type.as_deref() == Some("stream_master")
-            || principal
-                .command_access
-                .allowed_commands
-                .iter()
-                .any(|cmd| cmd == "StreamControl"))
-    {
+    if !principal.can_manage_stream() {
         return Err(error(
             StatusCode::FORBIDDEN,
             "Stream-master permission required",
         ));
     }
     if broadcast.label.len() > 200
+        || !(3..=60).contains(&broadcast.delay_seconds)
         || !["hero", "grid"].contains(&broadcast.layout.as_str())
         || broadcast.hidden_stream_ids.len() > 1000
     {
@@ -376,7 +446,7 @@ async fn vehicle(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> Ap
         }
     }
     if vehicle.renderer_url.is_empty() {
-        vehicle.renderer_url = "/assets/model-viewer.min.js".into();
+        vehicle.renderer_url = "/assets/three/vehicle-renderer.js".into();
     }
     if vehicle.title.is_empty() {
         vehicle.title = "Rocket".into();
@@ -389,6 +459,45 @@ async fn vehicle(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> Ap
     if vehicle.model_url.is_empty() {
         vehicle.model_url = "/assets/models/vehicle.glb".into();
         vehicle.model_alt = "Minimal two-stage launch vehicle".into();
+        if vehicle.motions.is_empty() {
+            vehicle.motions = vec![
+                Motion {
+                    node: "motor-flame".into(),
+                    transform: "visible".into(),
+                    axis: [0.0, 1.0, 0.0],
+                    from: 0.0,
+                    to: 1.0,
+                    binding: None,
+                    phase_values: BTreeMap::from([("*".into(), 0.0), ("Ascent".into(), 1.0)]),
+                },
+                Motion {
+                    node: "drogue-parachute".into(),
+                    transform: "scale".into(),
+                    axis: [1.0, 1.0, 1.0],
+                    from: 0.001,
+                    to: 1.0,
+                    binding: None,
+                    phase_values: BTreeMap::from([
+                        ("*".into(), 0.0),
+                        ("ParachuteDeploy".into(), 1.0),
+                    ]),
+                },
+                Motion {
+                    node: "main-parachute".into(),
+                    transform: "scale".into(),
+                    axis: [1.0, 1.0, 1.0],
+                    from: 0.001,
+                    to: 1.0,
+                    binding: None,
+                    phase_values: BTreeMap::from([
+                        ("*".into(), 0.0),
+                        ("Descent".into(), 1.0),
+                        ("Landed".into(), 1.0),
+                        ("Recovery".into(), 1.0),
+                    ]),
+                },
+            ];
+        }
         vehicle.stages = vec![
             Stage {
                 id: "booster".into(),
@@ -421,7 +530,26 @@ async fn save_vehicle(
     axum::Json(vehicle): axum::Json<Vehicle>,
 ) -> ApiResult<StatusCode> {
     authorize(&state, &headers, Permission::SendCommands).await?;
-    if !vehicle.model_url.is_empty() {
+    if vehicle.motions.len() > 128
+        || vehicle.motions.iter().any(|m| {
+            m.node.is_empty()
+                || m.node.len() > 128
+                || !["rotate", "translate", "scale", "visible"].contains(&m.transform.as_str())
+                || !m.from.is_finite()
+                || !m.to.is_finite()
+                || m.axis.iter().any(|x| !x.is_finite())
+                || m.phase_values.values().any(|x| !x.is_finite())
+        })
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "Invalid model motion mapping",
+        ));
+    }
+    if !vehicle.model_url.is_empty()
+        && !["/assets/models/vehicle.glb", "/assets/models/gse-site.glb"]
+            .contains(&vehicle.model_url.as_str())
+    {
         let path = vehicle
             .model_url
             .strip_prefix("/api/stage-models/")
@@ -452,6 +580,34 @@ async fn save_vehicle(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn save_vehicle_post(
+    state: State<Arc<MediaState>>,
+    headers: HeaderMap,
+    body: axum::Json<Vehicle>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    save_vehicle(state, headers, body).await?;
+    Ok(axum::Json(serde_json::json!({"saved":true})))
+}
+
+async fn three_asset(Path(file): Path<String>) -> ApiResult<Response> {
+    let bytes: &'static [u8] = match file.as_str() {
+        "vehicle-renderer.js" => include_bytes!("../../assets/three/vehicle-renderer.js"),
+        "three.module.js" => include_bytes!("../../assets/three/three.module.js"),
+        "three.core.js" => include_bytes!("../../assets/three/three.core.js"),
+        "GLTFLoader.js" => include_bytes!("../../assets/three/GLTFLoader.js"),
+        "BufferGeometryUtils.js" => include_bytes!("../../assets/three/BufferGeometryUtils.js"),
+        _ => return Err(error(StatusCode::NOT_FOUND, "Unknown renderer asset")),
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/javascript"),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 async fn player(
     State(state): State<Arc<MediaState>>,
     Path(id): Path<String>,
@@ -459,7 +615,7 @@ async fn player(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     check_id(&id)?;
-    authorize_media(&state, &headers, &query, &format!("stream:{id}")).await?;
+    authorize_preview_media(&state, &headers, &query, &format!("stream:{id}")).await?;
     Ok((
         [
             (header::CACHE_CONTROL, "no-store"),

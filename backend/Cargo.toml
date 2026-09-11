@@ -36,4 +36,4 @@ reqwest = { version = "0.13.5", default-features = true, features = ["json", "ru
 whatlang = "0.18.0"
 flexi_logger = "0.31.10"
 log = "0.4.34"
-time = { version = "0.3.55", features = ["formatting", "macros"] }
+time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }

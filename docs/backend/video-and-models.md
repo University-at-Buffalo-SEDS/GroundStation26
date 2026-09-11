@@ -2,7 +2,7 @@
 
 The ground station receives H.264 over RTSP/TCP on **port 8554**, with a unique
 path per camera (`front`, `side`, `aft`, etc.). MediaMTX relays encoded video to
-WebRTC browsers without transcoding. The existing frontend's **Mission** and
+live WebRTC previews and a [delayed HLS audience program](broadcast-studio.md) without transcoding. The frontend's **Mission** and
 **Vehicle** tabs consume `/api/live_streams` and `/api/vehicle_visualization` using
 the contract in `../Seds-Ground-Station-Frontend/docs/backend-api.md`. Both tabs are
 enabled in the bundled layouts. Open **`https://GROUND_STATION_IP:3000/media`** for
@@ -150,7 +150,7 @@ the backend's bundled renderer. Animation names must match clips in your GLB.
 
 `POST /api/live_streams/control` accepts the frontend broadcast object (label,
 featured_stream_id, hidden_stream_ids, layout, revision). Only authenticated
-`stream_master` sessions or sessions explicitly allowed `StreamControl` can edit
+`stream_master`/`stream_admin` account roles or legacy explicit `StreamControl` grants can edit
 it; other sessions receive 403. Revisions increment on every save; stale edits
 receive 409. Broadcast and vehicle configuration persist together in
 `backend/data/stage_models/_presentation.json`. Its optional `title`,

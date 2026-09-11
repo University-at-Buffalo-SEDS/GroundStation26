@@ -21,7 +21,7 @@ function scene(){
   const rocket=(x=0,z=0)=>{cylinder('booster',white,[x,2.25,z],.28,3.6);cylinder('interstage',black,[x,4.12,z],.28,.18);cylinder('sustainer',white,[x,5.35,z],.28,2.25);node('nose','cone',white,[x,7,z],[.28,1.05,.28]);cylinder('engine',steel,[x,.33,z],.2,.25);for(const angle of [0,Math.PI/2,Math.PI,Math.PI*1.5]){const dx=Math.cos(angle),dz=Math.sin(angle);box('fin',black,[x+dx*.38,.9,z+dz*.38],[Math.abs(dx)*.38+.045,.7,Math.abs(dz)*.38+.045]);}};
   const animate=(name,nodeId,points)=>{const input=accessor([0,1,2,3],1),out=accessor(points.flat(),3);doc.animations.push({name,samplers:[{input,output:out,interpolation:'LINEAR'}],channels:[{sampler:0,target:{node:nodeId,path:'translation'}}]});};
   const save=name=>{let binary=Buffer.concat(chunks);doc.buffers=[{byteLength:binary.length}];let json=Buffer.from(JSON.stringify(doc));json=Buffer.concat([json,Buffer.alloc((4-json.length%4)%4,32)]);binary=Buffer.concat([binary,Buffer.alloc((4-binary.length%4)%4)]);const header=Buffer.alloc(12);header.write('glTF');header.writeUInt32LE(2,4);header.writeUInt32LE(12+8+json.length+8+binary.length,8);const chunk=(bytes,type)=>{const h=Buffer.alloc(8);h.writeUInt32LE(bytes.length);h.write(type,4);return Buffer.concat([h,bytes]);};fs.writeFileSync(path.join(output,name),Buffer.concat([header,chunk(json,'JSON'),chunk(binary,'BIN\0')]));console.log(`${name}: ${doc.nodes.length} nodes, ${doc.animations.length} clips`);};
-  return {doc,material,white,black,steel,blue,green,box,cylinder,pipe,rocket,animate,save};
+  return {doc,node,material,white,black,steel,blue,green,box,cylinder,pipe,rocket,animate,save};
 }
 const site=scene();
 site.box('pad',site.black,[0,-.1,0],[10,.2,7]);
@@ -40,5 +40,27 @@ const marker=site.cylinder('sequence activity',site.blue,[-3,.47,-1],.075,.11);
 site.animate('nitrogen-test',marker,[[-3,.47,-1],[-3,.47,1.5],[-1,.47,1.5],[-3,.47,-1]]);
 site.animate('nitrous-fill',marker,[[-1.4,.55,-1],[-1.4,.55,.95],[2,.55,1.5],[-1.4,.55,-1]]);
 site.animate('dumping',marker,[[2,.5,1.5],[3.8,.5,2.2],[3.8,2.9,2.2],[2,.5,1.5]]);
+// Named level indicators are driven only by configured measured-level bindings.
+for(const [name,x,z,height,color]of [['nitrogen-level',-3,-.51,2.7,site.blue],['nitrous-level',-1.4,-.29,3.5,site.green]]){
+ const indicator=site.box(name+'-indicator',color,[x,height/2+.2,z],[.09,height,.025]);group(site,name,[indicator],[x,.2,z]);
+}
 site.save('gse-site.glb');
-const rocket=scene();rocket.rocket();rocket.save('vehicle.glb');
+const rocket=scene();rocket.rocket();
+function group(s,name,children,origin=[0,0,0]){
+  const index=s.doc.nodes.length;s.doc.nodes.push({name,translation:origin,children});
+  for(const child of children){const n=s.doc.nodes[child];n.translation=n.translation.map((v,i)=>v-origin[i]);}
+  s.doc.scenes[0].nodes=s.doc.scenes[0].nodes.filter(n=>!children.includes(n));s.doc.scenes[0].nodes.push(index);return index;
+}
+const fins=rocket.doc.nodes.flatMap((n,i)=>n.name==='fin'?[i]:[]).map((i,n)=>group(rocket,'fin-pivot-'+n,[i],rocket.doc.nodes[i].translation.slice()));
+const flameMat=rocket.material('exhaust',[1,.48,.15],0,.8);
+const flame=rocket.node('motor-flame','cone',flameMat,[0,-.35,0],[.22,1,.22],[1,0,0,0]);
+const engine=group(rocket,'gimbal-pivot',[4,flame],[0,.45,0]);
+group(rocket,'booster-stage',[0,engine,...fins]);
+group(rocket,'sustainer-stage',[1,2,3]);
+for(let i=0;i<4;i++){const a=i*Math.PI/2,at=[Math.cos(a)*.32,4.6,Math.sin(a)*.32];const panel=rocket.box('airbrake-panel-'+i,rocket.black,at,[.18,.42,.035]);group(rocket,'airbrake-pivot-'+i,[panel],at);}
+for(const [name,y,r]of [['drogue',9,.7],['main',11,1.7]]){
+ const nodes=[rocket.node(name+'-canopy','cone',rocket.white,[0,y,0],[r,.45,r])];
+ for(let i=0;i<4;i++){const a=i*Math.PI/2;nodes.push(rocket.pipe(name+'-line',rocket.steel,[0,7.4,0],[Math.cos(a)*r,y-.22,Math.sin(a)*r],.009));}
+ group(rocket,name+'-parachute',nodes,[0,7.4,0]);
+}
+rocket.save('vehicle.glb');

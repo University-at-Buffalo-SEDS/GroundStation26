@@ -1,0 +1,56 @@
+// Run against the loopback-only synthetic fixture; see docs/backend/broadcast-studio.md.
+const fs=require('node:fs'),assert=require('node:assert/strict');
+const base='http://127.0.0.1:19090';
+const pause=ms=>new Promise(r=>setTimeout(r,ms));
+async function api(path,token,body){return fetch(base+path,{method:body?'POST':'GET',headers:{...(token?{Authorization:'Bearer synthetic-'+token}:{}),...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})});}
+async function until(fn,timeout=90000){const stop=Date.now()+timeout;let v;while(Date.now()<stop){v=await fn();if(v)return v;await pause(500);}throw Error('Timed out');}
+(async()=>{
+ await until(async()=>{try{return(await api('/api/live_streams')).ok;}catch{return false;}});
+ const contract=await(await api('/api/live_streams')).json();assert.equal(contract.can_preview_live,false);
+ assert.equal((await api('/api/stream-roles','producer')).status,403);
+ let cfg=(await(await api('/api/live_streams','producer')).json()).broadcast;
+ assert.equal((await api('/api/live_streams/control','viewer',cfg)).status,403);
+ assert.equal((await api('/api/live_streams/control','producer',{...cfg,delay_seconds:61})).status,400);
+ let r=await api('/api/live_streams/control','producer',{...cfg,featured_stream_id:'front',label:'Delay integration',delay_seconds:10});assert.equal(r.status,200);cfg=await r.json();
+ assert.equal((await api('/api/live_streams/control','producer',{...cfg,revision:0})).status,409);
+ assert.equal((await api('/api/stream-roles','administrator',{username:'viewer',stream_master:true})).status,200);
+ assert.equal((await(await api('/api/live_streams','viewer')).json()).can_manage_stream,true);
+ assert.equal((await api('/api/stream-roles','administrator',{username:'viewer',stream_master:false})).status,200);
+ assert.equal((await(await api('/api/live_streams','viewer')).json()).can_manage_stream,false);
+ assert.equal((await fetch(base+'/api/video/streams/front/whep',{method:'POST',headers:{'Content-Type':'application/sdp'},body:'offer'})).status,403);
+ console.log('PASS: role grant/revoke, viewer denial, live-preview restriction, revision conflicts and delay limits');
+ const pages=await(await fetch('http://127.0.0.1:19101/json')).json();const ws=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);await new Promise(r=>ws.onopen=r);let id=0;const pending=new Map();
+ ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id){pending.get(m.id)(m);pending.delete(m.id);}};
+ const call=(method,params={})=>new Promise(r=>{pending.set(++id,r);ws.send(JSON.stringify({id,method,params}));});
+ const evaluate=async expression=>{const r=await call('Runtime.evaluate',{expression,returnByValue:true});if(r.result.exceptionDetails)return null;return r.result.result.value;};
+ await call('Emulation.setDeviceMetricsOverride',{width:1280,height:720,deviceScaleFactor:1,mobile:false});
+ await call('Page.navigate',{url:base+contract.program_url});
+ await until(()=>evaluate("typeof displayed!=='undefined'&&displayed==='front'"));
+ const ages=await evaluate("[...players.values()].map(p=>({age:(serverNow()-p.hls.playingDate?.getTime())/1000,ready:p.ready,frames:p.video.getVideoPlaybackQuality().totalVideoFrames}))");
+ assert.ok(ages.every(p=>p.ready&&p.frames>0&&p.age>=10&&p.age<16),JSON.stringify(ages));
+ console.log('PASS: real browser decodes both feeds at enforced delay',ages);
+ const state=await(await fetch(base+contract.program_url.replace('/program?','/program/state?'))).json();
+ const mediaUrl=state.streams.find(s=>s.id==='front').url;
+ const master=await(await fetch(mediaUrl.startsWith('/')?base+mediaUrl:mediaUrl)).text();
+ const playlist=master.split('\n').find(l=>l&&!l.startsWith('#'));
+ const playlistUrl=new URL(playlist,base+mediaUrl);
+ const delayed=await(await fetch(playlistUrl)).text();assert.ok(delayed.includes('#EXTINF'));
+ const upstream=await(await fetch('http://127.0.0.1:19998/front/'+playlistUrl.pathname.split('/').pop()+'?cookieCheck=1&session='+playlistUrl.searchParams.get('session'),{headers:{Authorization:'Basic '+Buffer.from('groundstation:test-only').toString('base64')}})).text();
+ const future=upstream.split('\n').filter(l=>l&&!l.startsWith('#')).pop();
+ const forbidden=new URL(future,playlistUrl);forbidden.search=playlistUrl.search;assert.equal((await fetch(forbidden)).status,403);
+ console.log('PASS: guessing the latest unreleased segment is rejected server-side');
+ cfg=await(await api('/api/live_streams/control','producer',{...cfg,featured_stream_id:'side'})).json();
+ await until(()=>evaluate("displayed==='side'"),10000);console.log('PASS: producer cut switches the delayed program');
+ await pause(800);const shot=await call('Page.captureScreenshot',{format:'png'});fs.writeFileSync(process.env.GS_MEDIA_TEST_DIR+'/program.png',Buffer.from(shot.result.data,'base64'));
+ cfg=await(await api('/api/live_streams/control','producer',{...cfg,delay_seconds:20})).json();
+ await until(()=>evaluate("state.broadcast.delay_seconds===20&&[...players.values()].every(p=>p.ready&&(serverNow()-p.hls.playingDate.getTime())/1000>=20)"));
+ console.log('PASS: changing delay rebuilds playback without falling back to live');
+ cfg=await(await api('/api/live_streams/control','producer',{...cfg,layout:'grid'})).json();
+ await until(()=>evaluate("state.broadcast.layout==='grid'&&[...players.values()].every(p=>p.ready&&p.video.style.opacity==='1')"),10000);
+ cfg=await(await api('/api/live_streams/control','producer',{...cfg,layout:'hero',hidden_stream_ids:['front'],featured_stream_id:'side'})).json();
+ await until(()=>evaluate("!players.has('front')&&displayed==='side'"),10000);
+ console.log('PASS: grid layout and hiding cameras update the audience program');
+ assert.equal((await fetch(base+'/api/stage-models/test/test',{method:'PUT',headers:{Authorization:'Bearer synthetic-producer'},body:'invalid'})).status,403);
+ console.log('PASS: stream-master role does not authorize model/hardware configuration');
+ ws.close();
+})().catch(e=>{console.error(e);process.exit(1);});

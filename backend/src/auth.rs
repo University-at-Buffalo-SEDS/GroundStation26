@@ -105,8 +105,18 @@ pub struct PasswordHashRecord {
     pub hash_b64: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamRole {
+    StreamMaster,
+    StreamAdmin,
+    StreamViewer,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
+    #[serde(default)]
+    pub roles: Vec<StreamRole>,
     pub username: String,
     pub password: PasswordHashRecord,
     #[serde(default)]
@@ -150,6 +160,7 @@ impl Default for UsersFile {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStatus {
+    pub roles: Vec<StreamRole>,
     pub authenticated: bool,
     pub username: Option<String>,
     pub permissions: Permissions,
@@ -163,6 +174,7 @@ pub struct SessionStatus {
 
 #[derive(Debug, Clone)]
 pub struct AuthPrincipal {
+    pub roles: Vec<StreamRole>,
     pub username: Option<String>,
     pub permissions: Permissions,
     pub expires_at_ms: Option<i64>,
@@ -173,8 +185,24 @@ pub struct AuthPrincipal {
 }
 
 impl AuthPrincipal {
+    pub fn can_manage_stream(&self) -> bool {
+        if self.roles.contains(&StreamRole::StreamViewer)
+            && !self.roles.contains(&StreamRole::StreamAdmin)
+        {
+            return false;
+        }
+        !self.anonymous
+            && (self.roles.contains(&StreamRole::StreamMaster)
+                || self.roles.contains(&StreamRole::StreamAdmin)
+                || self
+                    .command_access
+                    .allowed_commands
+                    .iter()
+                    .any(|c| c == "StreamControl"))
+    }
     pub fn session_status(&self) -> SessionStatus {
         SessionStatus {
+            roles: self.roles.clone(),
             authenticated: !self.anonymous,
             username: self.username.clone(),
             permissions: self.permissions,
@@ -202,6 +230,45 @@ fn configured_user_access(
         .find(|user| user.username.eq_ignore_ascii_case(username))
         .map(|user| (user.command_access.clone(), user.calibration_access))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod stream_role_tests {
+    use super::*;
+    fn principal(roles: Vec<StreamRole>, anonymous: bool) -> AuthPrincipal {
+        AuthPrincipal {
+            roles,
+            username: Some("producer".into()),
+            permissions: Permissions {
+                view_data: true,
+                send_commands: false,
+            },
+            expires_at_ms: None,
+            anonymous,
+            session_type: Some("session".into()),
+            command_access: CommandAccess::default(),
+            calibration_access: CalibrationAccess::default(),
+        }
+    }
+    #[test]
+    fn stream_master_is_independent_of_hardware_permissions() {
+        let p = principal(vec![StreamRole::StreamMaster], false);
+        assert!(p.can_manage_stream());
+        assert!(!p.allows_command_name("StartFill"));
+        assert_eq!(p.session_status().roles, vec![StreamRole::StreamMaster]);
+    }
+    #[test]
+    fn anonymous_and_ordinary_viewers_cannot_direct() {
+        assert!(!principal(vec![], false).can_manage_stream());
+        assert!(!principal(vec![StreamRole::StreamMaster], true).can_manage_stream());
+    }
+    #[test]
+    fn explicit_viewer_revokes_legacy_grant_without_broadening_commands() {
+        let mut p = principal(vec![StreamRole::StreamViewer], false);
+        p.command_access.allowed_commands = vec!["StreamControl".into()];
+        assert!(!p.can_manage_stream());
+        assert_eq!(p.command_access.allowed_commands, vec!["StreamControl"]);
+    }
 }
 
 #[derive(Debug)]
@@ -453,9 +520,15 @@ impl AuthManager {
                 .load_users_file()
                 .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
             let username = row.get::<String, _>("username");
+            let user = config
+                .users
+                .iter()
+                .find(|u| u.username.eq_ignore_ascii_case(&username) && !u.disabled)
+                .ok_or_else(|| AuthFailure::Unauthorized("Account disabled or removed".into()))?;
             let (command_access, calibration_access) = configured_user_access(&config, &username);
 
             return Ok(AuthPrincipal {
+                roles: user.roles.clone(),
                 username: Some(username),
                 permissions,
                 expires_at_ms: Some(expires_at_ms),
@@ -477,6 +550,7 @@ impl AuthManager {
         }
 
         Ok(AuthPrincipal {
+            roles: Vec::new(),
             username: None,
             permissions,
             expires_at_ms: None,
@@ -499,6 +573,7 @@ impl AuthManager {
                     AuthFailure::Internal(format!("failed to load users.json: {e}"))
                 })?;
                 Ok(AuthPrincipal {
+                    roles: Vec::new(),
                     username: None,
                     permissions: config.anonymous.normalized(),
                     expires_at_ms: None,
@@ -561,6 +636,7 @@ async fn create_session_for_user(
     Ok(LoginResponse {
         token,
         session: AuthPrincipal {
+            roles: user.roles.clone(),
             username: Some(user.username.clone()),
             permissions,
             expires_at_ms: Some(expires_at_ms),

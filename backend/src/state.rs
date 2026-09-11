@@ -1557,7 +1557,7 @@ fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::auth::AuthManager;
     use crate::fill_targets;
@@ -2098,7 +2098,7 @@ mod tests {
         assert_eq!(crate::gse::panel_name(&state, "Dump"), "Dump");
     }
 
-    async fn test_app_state() -> Arc<AppState> {
+    pub(crate) async fn test_app_state() -> Arc<AppState> {
         let db = SqlitePool::connect("sqlite::memory:")
             .await
             .expect("failed to open in-memory telemetry db");

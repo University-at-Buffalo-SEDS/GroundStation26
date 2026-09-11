@@ -1,0 +1,65 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Delayed program</title>
+<style>html,body{margin:0;width:100%;height:100%;background:#080d15;color:white;font:14px system-ui;overflow:hidden}#stage{position:absolute;inset:0}video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;opacity:0;transition:opacity .55s ease;background:#080d15}#banner{position:absolute;bottom:0;left:0;right:0;padding:14px 18px;background:#080d15e8;display:flex;gap:24px;flex-wrap:wrap;font-variant-numeric:tabular-nums;z-index:30}#status{position:absolute;inset:0;display:grid;place-items:center;background:#080d15;z-index:20}#status:empty{display:none}.name{font-size:10px;color:#9aaebb;text-transform:uppercase;letter-spacing:.12em}.value{margin-top:4px}@media(prefers-reduced-motion:reduce){video{transition:none}}</style>
+<div id="stage"></div><div id="status" role="status">Building delayed program buffer…</div><div id="banner"></div><script src="/assets/hls.min.js"></script>
+<script>
+'use strict';
+const stage=document.querySelector('#stage'),status=document.querySelector('#status'),banner=document.querySelector('#banner');
+const ticket=new URLSearchParams(location.search).get('ticket'),players=new Map();
+let state,clockOffset=0,lastPoll=0,displayed='',stopped=false,generation=0;
+const serverNow=()=>Date.now()+clockOffset;
+function remove(id){const p=players.get(id);if(p){p.hls.destroy();p.video.remove();players.delete(id);}}
+function create(feed){
+ const video=document.createElement('video');video.muted=true;video.playsInline=true;video.preload='auto';video.setAttribute('aria-label',feed.label);stage.append(video);
+ const hls=new Hls({autoStartLoad:true,lowLatencyMode:false,maxBufferLength:12,maxMaxBufferLength:20,backBufferLength:5,liveSyncDuration:3,liveMaxLatencyDuration:85,maxLiveSyncPlaybackRate:1,enableWorker:true});
+ const p={video,hls,details:null,started:false,ready:false,failed:false,lastFrame:0};players.set(feed.id,p);
+ hls.on(Hls.Events.LEVEL_LOADED,(_,data)=>{p.details=data.details;});
+ hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal){p.failed=true;video.style.opacity=0;}});
+ hls.attachMedia(video);hls.loadSource(feed.url);
+ if(video.requestVideoFrameCallback){const frame=()=>{p.lastFrame=performance.now();if(!stopped&&players.get(feed.id)===p)video.requestVideoFrameCallback(frame);};video.requestVideoFrameCallback(frame);}
+}
+function card(name,value){const card=document.createElement('div'),a=document.createElement('div'),b=document.createElement('div');a.className='name';b.className='value';a.textContent=name;b.textContent=value;card.append(a,b);banner.append(card);}
+function drawBanner(){banner.replaceChildren();card('Mission',state.broadcast.label||'Program');card('Video delay',state.broadcast.delay_seconds+' s');const telemetry=state.telemetry;if(!telemetry){card('Telemetry','Buffering delayed telemetry');return;}card('Flight phase',telemetry.phase);for(const stat of telemetry.stats){card(stat.label,stat.value==null?'—':Number(stat.value).toFixed(stat.precision)+' '+stat.unit);}}
+async function poll(){
+ try{
+  const start=Date.now(),r=await fetch('/api/media-assets/program/state?ticket='+encodeURIComponent(ticket),{cache:'no-store'});if(!r.ok)throw Error('Program unavailable');const next=await r.json();clockOffset=next.server_now_ms-(start+Date.now())/2;
+  if(state&&next.broadcast.delay_seconds!==state.broadcast.delay_seconds){for(const id of [...players.keys()])remove(id);displayed='';generation++;}
+  state=next;lastPoll=performance.now();
+  const ids=new Set(state.streams.map(s=>s.id));for(const id of [...players.keys()])if(!ids.has(id))remove(id);
+  for(const feed of state.streams){if(players.get(feed.id)?.failed)remove(feed.id);if(!players.has(feed.id))create(feed);}
+  drawBanner();
+ }catch(e){status.textContent='Program unavailable — delayed feed paused';lastPoll=0;}
+ if(!stopped)setTimeout(poll,500);
+}
+function render(){
+ if(stopped)return;
+ if(!state||!lastPoll||performance.now()-lastPoll>2500){for(const p of players.values()){p.video.pause();p.video.style.opacity=0;}return;}
+ const target=serverNow()-state.broadcast.delay_seconds*1000-2500;
+ for(const p of players.values()){
+  p.ready=false;const fragments=p.details?.fragments||[];
+  const f=fragments.find(f=>f.programDateTime!=null&&f.programDateTime<=target&&f.endProgramDateTime>target);
+  if(!f){p.video.pause();p.video.style.opacity=0;continue;}
+  const desired=f.start+(target-f.programDateTime)/1000;
+  if(!p.started){p.started=true;p.hls.startLoad(desired);}
+  const playing=p.hls.playingDate?.getTime();
+  if(playing==null||Math.abs(playing-target)>750){try{p.video.currentTime=desired;}catch{}p.video.style.opacity=0;}
+  const time=p.hls.playingDate?.getTime();
+  const frameFresh=!p.video.requestVideoFrameCallback||performance.now()-p.lastFrame<1500;
+  p.ready=!p.failed&&time!=null&&Math.abs(time-target)<750&&p.video.readyState>=2&&!p.video.seeking&&frameFresh;
+  p.video.play().catch(()=>{});
+ }
+ const preferred=players.has(state.broadcast.featured_stream_id)?state.broadcast.featured_stream_id:state.streams[0]?.id;
+ if(state.broadcast.layout==='grid'){
+  const entries=[...players.entries()],columns=entries.length<=1?1:entries.length<=4?2:3,rows=Math.ceil(entries.length/columns);let ready=0;
+  entries.forEach(([id,p],i)=>{p.video.style.zIndex='1';p.video.style.width=100/columns+'%';p.video.style.height=100/rows+'%';p.video.style.left=(i%columns)*100/columns+'%';p.video.style.top=Math.floor(i/columns)*100/rows+'%';p.video.style.opacity=p.ready?'1':'0';if(p.ready)ready++;});
+  status.textContent=ready?'':'Building delayed program buffer…';displayed='';
+ }else{
+  for(const p of players.values()){p.video.style.width='100%';p.video.style.height='100%';p.video.style.left='0';p.video.style.top='0';}
+  displayed=players.get(preferred)?.ready?preferred:'';
+  for(const [id,p]of players){p.video.style.zIndex=id===displayed?'2':'1';p.video.style.opacity=id===displayed&&p.ready?'1':'0';}
+  status.textContent=players.get(displayed)?.ready?'':'Building delayed program buffer…';
+ }
+}
+const timer=setInterval(render,100);
+if(!Hls.isSupported()){status.textContent='This browser needs Media Source Extensions for synchronized delayed video. Use a supported current browser; live fallback is disabled.';}else{poll();}
+window.addEventListener('pagehide',()=>{stopped=true;clearInterval(timer);for(const id of [...players.keys()])remove(id);});
+</script></html>

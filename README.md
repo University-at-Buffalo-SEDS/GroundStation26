@@ -4,6 +4,8 @@ Live multi-camera video, the Raspberry Pi sender daemon, and rocket stage model
 storage are documented in [Video and stage models](docs/backend/video-and-models.md).
 Grouped valve actions, nitrogen testing, pressure calibration and the fill-equipment
 scene are documented in [GSE sequences](docs/backend/gse-sequences.md).
+Stream-manager roles and delayed audience video are covered in [Broadcast studio](docs/backend/broadcast-studio.md);
+named-part animation is covered in [Model animations](docs/backend/model-animations.md).
 
 ## Dependencies
 
