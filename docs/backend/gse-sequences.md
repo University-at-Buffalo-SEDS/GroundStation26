@@ -118,6 +118,28 @@ The main dashboard instead uses the bundled Three.js named-node renderer (MIT).
 Uploaded models using compression may need additional decoder assets.
 # HITL button availability
 
+HITL adds illuminated `ToggleGroundStationControl` (**Ground station control**),
+default ON on backend restart. It is an authenticated command like Button
+Interlock; its state is authoritative in the action policy. It controls automatic
+cutoff for the one-button Start Fill, not arbitrary manual valve actions.
+Regular/test-fire one-button fills always use automatic cutoff.
+
+The cutoff uses the main fill's signed nitrous mass target and
+`GS_SEQUENCE_NITROUS_WEIGHT_RISE_EPSILON_KG` (default 0.03 kg), including its
+99.5% threshold. Reaching that target closes immediately; alternatively, the main
+pressure minimum and pressure/weight plateau rule stop filling after
+`GS_SEQUENCE_NITROUS_LEVEL_SEC` (default 3 seconds). It uses the same shared
+plateau calculation as the main sequence. It does not leave a supply open while
+waiting for a weight plateau after reaching target.
+
+Automatic cutoff requests Pause Fill (supplies, pilot, dump and vent closed),
+then waits for acknowledgements. Fresh calibrated loadcell data (at most 2 seconds
+old) is required before starting; losing it during automatic filling faults and
+closes supplies. OFF disables only this weight/plateau cutoff; nitrogen-test,
+pressure-ceiling, PT freshness and interlock checks remain. OFF requires the
+operator to stop fill. Switching ON during filling immediately evaluates the
+current weight; switching modes resets accumulated plateau time.
+
 The action panel places sequence actions first and groups Igniter/Igniter Sequence
 with manual valve controls. Only Valve Self-test uses the confirmation checkbox.
 In HITL, sequence request buttons follow the manual-button interlock; they do not

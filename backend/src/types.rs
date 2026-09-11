@@ -36,6 +36,8 @@ pub enum TelemetryCommand {
     #[cfg(feature = "hitl_mode")]
     ToggleButtonInterlock,
     #[cfg(feature = "hitl_mode")]
+    ToggleGroundStationControl,
+    #[cfg(feature = "hitl_mode")]
     ToggleLaunchInterlock,
     #[cfg(feature = "hitl_mode")]
     TogglePhysicalLaunchMode,

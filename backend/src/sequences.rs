@@ -584,6 +584,8 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ToggleButtonInterlock => "ToggleButtonInterlock",
         #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ToggleGroundStationControl => "ToggleGroundStationControl",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ToggleLaunchInterlock => "ToggleLaunchInterlock",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::TogglePhysicalLaunchMode => "TogglePhysicalLaunchMode",
@@ -692,6 +694,7 @@ pub fn all_command_names() -> Vec<&'static str> {
         "RevokeValidateMeasms",
         "GroundStationLaunch",
         "ToggleButtonInterlock",
+        "ToggleGroundStationControl",
         "ToggleLaunchInterlock",
         "TogglePhysicalLaunchMode",
         "ToggleAvBayUnderglow",
@@ -1049,6 +1052,76 @@ fn mass_target_reached(current_mass_kg: f32, target_mass_kg: f32, epsilon_kg: f3
     } else {
         current_mass_kg - epsilon_kg <= target_mass_kg
     }
+}
+
+/// The one-button GSE fill uses the same thresholds and signed mass target as
+/// the main fill: immediate target cutoff, or a pressure/weight plateau.
+pub(crate) struct FillCutoff {
+    cfg: SequenceConfig,
+    previous: Option<(f32, f32)>,
+    level_since: Option<Instant>,
+}
+impl Default for FillCutoff {
+    fn default() -> Self {
+        Self {
+            cfg: SequenceConfig::from_env(),
+            previous: None,
+            level_since: None,
+        }
+    }
+}
+impl FillCutoff {
+    pub fn reset(&mut self) {
+        self.previous = None;
+        self.level_since = None;
+    }
+    pub fn reached(&mut self, now: Instant, mass: f32, pressure: f32, target: f32) -> bool {
+        if !mass.is_finite() || !pressure.is_finite() || !target.is_finite() || target == 0.0 {
+            self.reset();
+            return false;
+        }
+        if mass_target_reached(mass, target, self.cfg.nitrous_weight_rise_epsilon_kg)
+            || loadcell::fill_percent(target, mass) >= 99.5
+        {
+            return true;
+        }
+        let mut previous_mass = self.previous.map(|(m, _)| m);
+        let mut previous_pressure = self.previous.map(|(_, p)| p);
+        let reached = nitrous_plateau(
+            &self.cfg,
+            now,
+            pressure,
+            Some(mass),
+            &mut previous_pressure,
+            &mut previous_mass,
+            &mut self.level_since,
+        );
+        self.previous = Some((mass, pressure));
+        reached
+    }
+}
+
+fn nitrous_plateau(
+    cfg: &SequenceConfig,
+    now: Instant,
+    pressure: f32,
+    mass: Option<f32>,
+    previous_pressure: &mut Option<f32>,
+    previous_mass: &mut Option<f32>,
+    level_since: &mut Option<Instant>,
+) -> bool {
+    let rising = previous_pressure.is_some_and(|p| pressure > p + cfg.nitrous_rise_epsilon_psi);
+    let weight_rising = match (*previous_mass, mass) {
+        (Some(prev), Some(cur)) => cur > prev + cfg.nitrous_weight_rise_epsilon_kg,
+        _ => false,
+    };
+    *previous_pressure = Some(pressure);
+    *previous_mass = mass;
+    if pressure < cfg.nitrous_pressure_min_psi || rising || weight_rising {
+        *level_since = None;
+        return false;
+    }
+    now.saturating_duration_since(*level_since.get_or_insert(now)) >= cfg.nitrous_level_duration
 }
 
 fn mass_target_within_tolerance(
@@ -1492,31 +1565,15 @@ fn update_sequence_runtime(
                 return;
             };
 
-            if !at_or_above(Some(current_pressure), cfg.nitrous_pressure_min_psi) {
-                runtime.nitrous_level_since = None;
-                runtime.last_nitrous_pressure_psi = Some(current_pressure);
-                runtime.last_nitrous_mass_kg = current_mass_kg;
-                return;
-            }
-
-            let rising = runtime
-                .last_nitrous_pressure_psi
-                .is_some_and(|prev| current_pressure > prev + cfg.nitrous_rise_epsilon_psi);
-            let weight_rising = match (runtime.last_nitrous_mass_kg, current_mass_kg) {
-                (Some(prev), Some(cur)) => cur > prev + cfg.nitrous_weight_rise_epsilon_kg,
-                _ => false,
-            };
-
-            runtime.last_nitrous_pressure_psi = Some(current_pressure);
-            runtime.last_nitrous_mass_kg = current_mass_kg;
-
-            if rising || weight_rising {
-                runtime.nitrous_level_since = None;
-                return;
-            }
-
-            let leveled_since = runtime.nitrous_level_since.get_or_insert(now);
-            if now.saturating_duration_since(*leveled_since) >= cfg.nitrous_level_duration {
+            if nitrous_plateau(
+                cfg,
+                now,
+                current_pressure,
+                current_mass_kg,
+                &mut runtime.last_nitrous_pressure_psi,
+                &mut runtime.last_nitrous_mass_kg,
+                &mut runtime.nitrous_level_since,
+            ) {
                 runtime.notified_close_nitrous = false;
                 if !runtime.auto_close_nitrous_sent {
                     match state.cmd_tx.try_send(TelemetryCommand::NitrousClose) {
@@ -2274,6 +2331,24 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn one_button_fill_uses_main_target_and_plateau_rules() {
+        let mut monitor = super::FillCutoff::default();
+        monitor.cfg.nitrous_weight_rise_epsilon_kg = 0.03;
+        monitor.cfg.nitrous_pressure_min_psi = 100.0;
+        monitor.cfg.nitrous_rise_epsilon_psi = 1.0;
+        monitor.cfg.nitrous_level_duration = std::time::Duration::from_secs(3);
+        let now = std::time::Instant::now();
+        assert!(monitor.reached(now, 10.0, 90.0, 10.0));
+        assert!(monitor.reached(now, -10.0, 90.0, -10.0));
+        monitor.reset();
+        assert!(!monitor.reached(now, 5.0, 110.0, 10.0));
+        assert!(!monitor.reached(now + std::time::Duration::from_secs(2), 5.0, 110.0, 10.0));
+        assert!(monitor.reached(now + std::time::Duration::from_secs(3), 5.0, 110.0, 10.0));
+        assert!(!monitor.reached(now + std::time::Duration::from_secs(4), 6.0, 110.0, 10.0));
+        assert!(!monitor.reached(now + std::time::Duration::from_secs(5), 6.0, 90.0, 10.0));
+        assert!(!monitor.reached(now, f32::NAN, 110.0, 10.0));
+    }
     use super::*;
 
     #[cfg(feature = "test_fire_mode")]

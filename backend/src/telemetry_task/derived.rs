@@ -593,6 +593,7 @@ pub(super) async fn emit_derived_loadcell_rows(
             loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
                 let mut latest = state.latest_fill_mass_kg.lock().unwrap();
                 *latest = None;
+                state.gse.lock().unwrap().observe_mass(None);
             }
             loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
                 state.gse.lock().unwrap().observe_pressure(None);
@@ -612,6 +613,7 @@ pub(super) async fn emit_derived_loadcell_rows(
             {
                 let mut latest = state.latest_fill_mass_kg.lock().unwrap();
                 *latest = Some(calibrated_value);
+                state.gse.lock().unwrap().observe_mass(Some(calibrated_value));
             }
             vec![
                 (

@@ -878,6 +878,10 @@ pub async fn telemetry_task(
                                 gs_debug_println!("HITL button interlock toggled: {enabled}");
                         }
                         #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::ToggleGroundStationControl => {
+                            // Consumed by gse::handle_command before this match.
+                        }
+                        #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::ToggleLaunchInterlock => {
                                 let enabled = state.toggle_hitl_launch_interlock();
                                 sequences::refresh_action_policy_now(&state);

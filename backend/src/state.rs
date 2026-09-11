@@ -1263,6 +1263,7 @@ impl AppState {
                     | TelemetryCommand::PauseWritingDb
                     | TelemetryCommand::StopWritingDb
                     | TelemetryCommand::ToggleButtonInterlock
+                    | TelemetryCommand::ToggleGroundStationControl
                     | TelemetryCommand::ToggleLaunchInterlock
                     | TelemetryCommand::TogglePhysicalLaunchMode
                     | TelemetryCommand::ToggleAvBayUnderglow

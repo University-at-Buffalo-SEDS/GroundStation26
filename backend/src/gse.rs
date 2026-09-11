@@ -30,6 +30,9 @@ pub struct Runtime {
     clock: Instant,
     pressure: Option<Sample>,
     valves: [Option<ValveState>; 5],
+    mass: Option<Sample>,
+    fill_cutoff: crate::sequences::FillCutoff,
+    ground_station_control: bool,
 }
 impl Default for Runtime {
     fn default() -> Self {
@@ -38,10 +41,23 @@ impl Default for Runtime {
             clock: Instant::now(),
             pressure: None,
             valves: [None; 5],
+            mass: None,
+            fill_cutoff: Default::default(),
+            ground_station_control: true,
         }
     }
 }
 impl Runtime {
+    fn fresh_mass(&self, now_ms: u64) -> Option<Sample> {
+        self.mass
+            .filter(|m| m.at_ms <= now_ms && now_ms - m.at_ms <= 2000)
+    }
+    pub fn observe_mass(&mut self, value: Option<f32>) {
+        self.mass = value.filter(|v| v.is_finite()).map(|value| Sample {
+            value,
+            at_ms: self.now(),
+        });
+    }
     fn now(&self) -> u64 {
         self.clock.elapsed().as_millis() as u64
     }
@@ -209,6 +225,18 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
             }),
         });
     }
+    #[cfg(feature = "hitl_mode")]
+    {
+        policy
+            .controls
+            .retain(|c| c.cmd != "ToggleGroundStationControl");
+        policy.controls.push(ActionControl {
+            cmd: "ToggleGroundStationControl".into(),
+            enabled: true,
+            blink: BlinkMode::None,
+            actuated: Some(rt.ground_station_control),
+        });
+    }
     if rt.engine.active() {
         for c in &mut policy.controls {
             if [
@@ -281,13 +309,36 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
     }
 }
 pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
+    #[cfg(feature = "hitl_mode")]
+    if matches!(cmd, TelemetryCommand::ToggleGroundStationControl) {
+        let enabled = {
+            let mut rt = state.gse.lock().unwrap();
+            rt.ground_station_control = !rt.ground_station_control;
+            rt.fill_cutoff.reset();
+            rt.ground_station_control
+        };
+        state.add_notification(if enabled {
+            "Ground station automatic fill cutoff enabled"
+        } else {
+            "Ground station automatic fill cutoff disabled; operator must stop filling"
+        });
+        crate::sequences::refresh_action_policy_now(state);
+        return true;
+    }
     if let Some(action) = action(cmd) {
         let is_prelaunch = prelaunch(state);
         let policy = state.action_policy_snapshot();
         let result = {
             let mut rt = state.gse.lock().unwrap();
             let input = rt.input(is_prelaunch, interlock(state, &policy));
-            rt.engine.request(action, input)
+            if action == Action::StartFill
+                && rt.ground_station_control
+                && rt.fresh_mass(input.now_ms).is_none()
+            {
+                Err("Automatic fill requires fresh calibrated fill weight before starting".into())
+            } else {
+                rt.engine.request(action, input)
+            }
         };
         match result {
             Ok(effects) => apply(state, effects),
@@ -312,10 +363,39 @@ pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
 }
 pub fn tick(state: &Arc<AppState>, interlock: bool) {
     let is_prelaunch = prelaunch(state);
+    let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
     let effects = {
         let mut rt = state.gse.lock().unwrap();
         let input = rt.input(is_prelaunch, interlock);
-        rt.engine.tick(input)
+        let effects = rt.engine.tick(input);
+        if rt.engine.status.phase != Phase::Filling || !rt.ground_station_control {
+            rt.fill_cutoff.reset();
+            effects
+        } else {
+            let mass = rt.fresh_mass(input.now_ms);
+            match (mass, input.pressure) {
+                (Some(m), Some(p)) => {
+                    if rt
+                        .fill_cutoff
+                        .reached(Instant::now(), m.value, p.value, target)
+                    {
+                        match rt.engine.request(Action::PauseFill, input) {
+                            Ok(mut stopped) => {
+                                stopped.notification = Some("Automatic fill cutoff: target weight reached or fill stabilized. Closing supplies and vent; waiting for valve acknowledgements.".into());
+                                stopped
+                            }
+                            Err(_) => effects,
+                        }
+                    } else {
+                        effects
+                    }
+                }
+                _ => rt.engine.fault(
+                    input.now_ms,
+                    "Automatic fill stopped: fresh calibrated fill weight is required",
+                ),
+            }
+        }
     };
     apply(state, effects);
 }
@@ -434,6 +514,22 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_fill_defaults_on_and_rejects_stale_or_invalid_weight() {
+        let mut rt = Runtime::default();
+        assert!(rt.ground_station_control);
+        assert!(rt.fresh_mass(0).is_none());
+        rt.observe_mass(Some(f32::NAN));
+        assert!(rt.mass.is_none());
+        rt.mass = Some(Sample {
+            value: 10.0,
+            at_ms: 100,
+        });
+        assert!(rt.fresh_mass(2100).is_some());
+        assert!(rt.fresh_mass(2101).is_none());
+        assert!(rt.fresh_mass(99).is_none());
+    }
 
     #[test]
     fn button_availability_does_not_bypass_sequence_safety() {

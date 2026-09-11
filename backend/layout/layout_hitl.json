@@ -179,6 +179,15 @@
         "group": "Flight controls"
       },
       {
+        "label": "Ground station control",
+        "cmd": "ToggleGroundStationControl",
+        "border": "#38bdf8",
+        "bg": "#082f49",
+        "fg": "#e0f2fe",
+        "illuminated": true,
+        "group": "Flight controls"
+      },
+      {
         "label": "Launch Interlock",
         "cmd": "ToggleLaunchInterlock",
         "border": "#0284c7",
