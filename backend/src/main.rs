@@ -1053,6 +1053,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 if expected.is_subset(&discovered) {
+                    assert_eq!(validation_router.preferred_discovery_master().as_deref(), Some("GS"));
+                    log::info!("full-bay preferred discovery master GS verified after named discovery");
                     validation_discovery_ready.store(true, Ordering::Release);
                     log::info!(
                         "full-bay named discovery ready: {}",

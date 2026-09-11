@@ -197,10 +197,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/network_time", get(get_network_time))
         .route("/api/launch_clock", get(get_launch_clock))
         .route("/api/network_topology", get(get_network_topology))
-        .route(
-            "/api/network_variables/telemetry_rates",
-            get(get_telemetry_rates).post(set_telemetry_rates),
-        )
         .route("/api/firmware/targets", get(get_firmware_targets))
         .route("/api/firmware/updates", get(get_firmware_updates))
         .route("/api/firmware/updates/{id}", get(get_firmware_update))
@@ -1452,56 +1448,6 @@ async fn get_network_topology(
     }
     Json(state.network_topology_snapshot(crate::telemetry_task::get_current_timestamp_ms()))
         .into_response()
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-struct TelemetryRates {
-    rf_hz: f32,
-    flight_hz: f32,
-}
-
-async fn get_telemetry_rates(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
-        return response;
-    }
-    Json(TelemetryRates {
-        rf_hz: crate::network_variables::rf_telemetry_rate_hz(),
-        flight_hz: crate::network_variables::fc_telemetry_rate_hz(),
-    })
-    .into_response()
-}
-
-async fn set_telemetry_rates(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(rates): Json<TelemetryRates>,
-) -> impl IntoResponse {
-    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
-        return response;
-    }
-    let Some(router) = state.topology_router.get() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "router unavailable").into_response();
-    };
-    if !rates.rf_hz.is_finite()
-        || !rates.flight_hz.is_finite()
-        || !(0.1..=20.0).contains(&rates.rf_hz)
-        || !(0.1..=20.0).contains(&rates.flight_hz)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            "rates must be between 0.1 and 20 Hz",
-        )
-            .into_response();
-    }
-    if let Err(error) = crate::network_variables::set_rf_telemetry_rate_hz(router, rates.rf_hz)
-        .and_then(|()| crate::network_variables::set_fc_telemetry_rate_hz(router, rates.flight_hz))
-    {
-        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
-    }
-    Json(rates).into_response()
 }
 
 #[derive(Serialize)]

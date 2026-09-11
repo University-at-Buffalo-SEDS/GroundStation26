@@ -509,16 +509,8 @@ Frontend expectations:
 
 ## Optional or Feature-Specific HTTP Endpoints
 
-### `GET` / `POST /api/network_variables/telemetry_rates`
-
-Purpose:
-
-- Read or update retained RF Board and Flight Computer publication rates.
-
-The JSON body and response are `{ "rf_hz": number, "flight_hz": number }`.
-Both values must be finite and between 0.1 and 20 Hz. A successful update is
-cached on disk and published through SEDSNet managed variables, so it survives
-a GroundStation restart and is reacquired when either board rejoins.
+Telemetry rates are compile-time board settings, not managed network variables.
+There is no telemetry-rate HTTP endpoint.
 
 ### Calibration mutation endpoints
 

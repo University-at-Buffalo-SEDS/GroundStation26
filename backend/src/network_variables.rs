@@ -13,8 +13,6 @@ const DEFAULT_CACHE_PATH: &str = "backend/data/network_variables.json";
 const UNDERGLOW_TYPE: &str = "AV_BAY_UNDERGLOW";
 const FLIGHT_BUZZER_TYPE: &str = "FLIGHT_BUZZER";
 const FLIGHT_STATE_TYPE: &str = "FLIGHT_STATE";
-const RF_RATE_TYPE: &str = "RF_TELEMETRY_RATE_HZ";
-const FC_RATE_TYPE: &str = "FC_TELEMETRY_RATE_HZ";
 const DAQ_CALIBRATION_TYPE: &str = "DAQ_LOADCELL_CALIBRATION";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -25,17 +23,6 @@ struct PersistentVariables {
     flight_buzzer: bool,
     #[serde(default)]
     flight_state: u8,
-    #[serde(default = "default_rf_rate_hz")]
-    rf_telemetry_rate_hz: f32,
-    #[serde(default = "default_fc_rate_hz")]
-    fc_telemetry_rate_hz: f32,
-}
-
-const fn default_rf_rate_hz() -> f32 {
-    1.0
-}
-const fn default_fc_rate_hz() -> f32 {
-    1.0
 }
 
 struct VariableStore {
@@ -72,8 +59,6 @@ fn load(path: &Path) -> PersistentVariables {
             .and_then(|value| value.parse::<u8>().ok())
             .filter(|value| *value <= 15)
             .unwrap_or(0),
-        rf_telemetry_rate_hz: default_rf_rate_hz(),
-        fc_telemetry_rate_hz: default_fc_rate_hz(),
     }
 }
 
@@ -124,8 +109,6 @@ pub fn initialize(router: &Router) -> Result<()> {
         UNDERGLOW_TYPE,
         FLIGHT_BUZZER_TYPE,
         FLIGHT_STATE_TYPE,
-        RF_RATE_TYPE,
-        FC_RATE_TYPE,
         DAQ_CALIBRATION_TYPE,
     ] {
         router.enable_network_variable(
@@ -180,8 +163,6 @@ pub fn initialize(router: &Router) -> Result<()> {
         u8::from(flight_buzzer_enabled()),
     )?)?;
     router.seed_managed_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?)?;
-    router.seed_managed_variable(rate_packet(RF_RATE_TYPE, rf_telemetry_rate_hz())?)?;
-    router.seed_managed_variable(rate_packet(FC_RATE_TYPE, fc_telemetry_rate_hz())?)?;
     router.seed_managed_variable(calibration_packet(&crate::loadcell::load_or_default())?)?;
     Ok(())
 }
@@ -198,8 +179,6 @@ pub fn publish_current(router: &Router) -> Result<()> {
         u8::from(flight_buzzer_enabled()),
     )?)?;
     router.set_network_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?)?;
-    router.set_network_variable(rate_packet(RF_RATE_TYPE, rf_telemetry_rate_hz())?)?;
-    router.set_network_variable(rate_packet(FC_RATE_TYPE, fc_telemetry_rate_hz())?)?;
     router.set_network_variable(calibration_packet(&crate::loadcell::load_or_default())?)?;
     Ok(())
 }
@@ -262,18 +241,6 @@ pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
     Ok(())
 }
 
-fn rate_packet(data_type: &str, rate_hz: f32) -> Result<Packet> {
-    anyhow::ensure!(
-        rate_hz.is_finite() && (0.1..=20.0).contains(&rate_hz),
-        "telemetry rate must be between 0.1 and 20 Hz"
-    );
-    packet_bytes(
-        data_type,
-        "GROUND_STATION",
-        Arc::from(rate_hz.to_le_bytes()),
-    )
-}
-
 fn calibration_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Packet> {
     let values = [
         cfg.ch1.m.unwrap_or(1.0),
@@ -297,32 +264,6 @@ pub fn set_daq_calibration(
     cfg: &crate::loadcell::LoadcellCalibrationFile,
 ) -> Result<()> {
     router.set_network_variable(calibration_packet(cfg)?)?;
-    Ok(())
-}
-
-pub fn set_rf_telemetry_rate_hz(router: &Router, rate_hz: f32) -> Result<()> {
-    let update = rate_packet(RF_RATE_TYPE, rate_hz)?;
-    {
-        let mut guard = store()
-            .lock()
-            .expect("network-variable store lock poisoned");
-        guard.values.rf_telemetry_rate_hz = rate_hz;
-        persist(&guard.path, guard.values)?;
-    }
-    router.set_network_variable(update)?;
-    Ok(())
-}
-
-pub fn set_fc_telemetry_rate_hz(router: &Router, rate_hz: f32) -> Result<()> {
-    let update = rate_packet(FC_RATE_TYPE, rate_hz)?;
-    {
-        let mut guard = store()
-            .lock()
-            .expect("network-variable store lock poisoned");
-        guard.values.fc_telemetry_rate_hz = rate_hz;
-        persist(&guard.path, guard.values)?;
-    }
-    router.set_network_variable(update)?;
     Ok(())
 }
 
@@ -364,26 +305,23 @@ pub fn flight_state() -> u8 {
         .flight_state
 }
 
-pub fn rf_telemetry_rate_hz() -> f32 {
-    store()
-        .lock()
-        .expect("network-variable store lock poisoned")
-        .values
-        .rf_telemetry_rate_hz
-}
-
-pub fn fc_telemetry_rate_hz() -> f32 {
-    store()
-        .lock()
-        .expect("network-variable store lock poisoned")
-        .values
-        .fc_telemetry_rate_hz
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use sedsnet::router::{EndpointHandler, RouterConfig};
+
+    #[test]
+    fn legacy_rate_cache_preserves_only_runtime_settings() {
+        let values: PersistentVariables = serde_json::from_str(
+            r#"{"av_bay_underglow":true,"flight_buzzer":true,"flight_state":6,"rf_telemetry_rate_hz":2,"fc_telemetry_rate_hz":4}"#,
+        ).unwrap();
+        assert!(values.av_bay_underglow);
+        assert!(values.flight_buzzer);
+        assert_eq!(values.flight_state, 6);
+        let saved = serde_json::to_value(values).unwrap();
+        assert!(saved.get("rf_telemetry_rate_hz").is_none());
+        assert!(saved.get("fc_telemetry_rate_hz").is_none());
+    }
 
     #[test]
     fn missing_cache_defaults_to_off() {
@@ -404,16 +342,12 @@ mod tests {
                 av_bay_underglow: true,
                 flight_buzzer: true,
                 flight_state: 6,
-                rf_telemetry_rate_hz: 2.0,
-                fc_telemetry_rate_hz: 4.0,
             },
         )
         .unwrap();
         assert!(load(&path).av_bay_underglow);
         assert!(load(&path).flight_buzzer);
         assert_eq!(load(&path).flight_state, 6);
-        assert_eq!(load(&path).rf_telemetry_rate_hz, 2.0);
-        assert_eq!(load(&path).fc_telemetry_rate_hz, 4.0);
         fs::remove_file(path).unwrap();
     }
 
@@ -525,18 +459,6 @@ mod tests {
             &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")]
         );
         assert_eq!(packet.payload(), &[1]);
-    }
-
-    #[test]
-    fn telemetry_rate_packets_are_bounded_and_little_endian() {
-        crate::telemetry_schema::initialize().unwrap();
-        for rate in [0.1_f32, 1.0, 20.0] {
-            let packet = rate_packet(RF_RATE_TYPE, rate).unwrap();
-            assert_eq!(packet.payload(), rate.to_le_bytes());
-        }
-        assert!(rate_packet(RF_RATE_TYPE, 0.09).is_err());
-        assert!(rate_packet(RF_RATE_TYPE, 20.01).is_err());
-        assert!(rate_packet(RF_RATE_TYPE, f32::NAN).is_err());
     }
 
     #[test]
