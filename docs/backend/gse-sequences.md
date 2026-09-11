@@ -1,5 +1,11 @@
 # Ground support equipment sequences
 
+Routine pause, cancel, nitrogen-pass and self-test completion notifications use
+`persistent: false`; sequence faults remain persistent until acknowledged.
+HTTP/WebSocket notification snapshots restore existing entries, not new events.
+Clients should deduplicate by `(id, timestamp_ms)` per backend and avoid replaying
+already-seen transient notices on reload, without hiding unresolved faults.
+
 The Actions tab keeps its original controls and contains the new **GSE sequence
 actions** in the main button area. Individual valves remain in the **Manual GSE
 valves** group. Ground setup (equipment scene, pressure/noise status, settings and
@@ -117,6 +123,13 @@ The equipment preview's bundled model-viewer 4.3.1 is Apache-2.0 licensed; see
 The main dashboard instead uses the bundled Three.js named-node renderer (MIT).
 Uploaded models using compression may need additional decoder assets.
 # HITL button availability
+
+HITL sequence requests are permitted throughout Startup, Idle, PreFill, FillTest,
+NitrogenFill, NitrousFill and Armed. Launch and later (and Aborted) disable them.
+This flight-state allowance does not bypass engine prerequisites: fresh telemetry,
+pressure limits, nitrogen-test completion before fill, and self-test confirmation
+remain required. Enabled sequence buttons are illuminated as a readiness indicator;
+backend `actuated` still reports actual sequence status, not mere availability.
 
 The backend layout now includes all five GSE sequence action definitions and
 adds their command IDs to prelaunch state widgets that contain manual valves.

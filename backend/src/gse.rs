@@ -86,8 +86,15 @@ impl Runtime {
     }
 }
 fn prelaunch(state: &AppState) -> bool {
+    prelaunch_flight_state(*state.state.lock().unwrap())
+}
+fn prelaunch_flight_state(state: FlightState) -> bool {
+    #[cfg(feature = "hitl_mode")]
+    if matches!(state, FlightState::Startup | FlightState::Armed) {
+        return true;
+    }
     matches!(
-        *state.state.lock().unwrap(),
+        state,
         FlightState::Idle
             | FlightState::PreFill
             | FlightState::FillTest
@@ -155,7 +162,7 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
             let _ = (action, is_prelaunch);
             // Admit the request, not the actuation: handle_command still
             // enforces every engine prerequisite before emitting effects.
-            return Some(interlock(state, &policy));
+            return Some(is_prelaunch && interlock(state, &policy));
         }
         #[cfg(not(feature = "hitl_mode"))]
         return Some(
@@ -194,7 +201,8 @@ fn interlock(state: &AppState, policy: &ActionPolicyMsg) -> bool {
 fn sequence_button_enabled(engine: &Engine, action: Action, input: Inputs) -> bool {
     #[cfg(feature = "hitl_mode")]
     {
-        input.interlock
+        input.prelaunch
+            && input.interlock
             && (action != Action::SelfTest
                 || (engine.config.dry_self_test_confirmed
                     && !engine.status.self_test_locked
@@ -305,7 +313,11 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
         }
     }
     if let Some(message) = effects.notification {
-        state.add_notification(message);
+        // Completed state transitions are informational, not unresolved alarms.
+        // Keep faults persistent until acknowledged, but do not replay ordinary
+        // pause/cancel/pass/self-test notices every time a client reconnects.
+        let persistent = state.gse.lock().unwrap().engine.status.phase == Phase::Fault;
+        state.add_notification_with_persistence(message, persistent);
     }
 }
 pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
@@ -514,6 +526,44 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hitl_covers_all_prelaunch_states_but_never_flight_or_recovery() {
+        for state in [
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::NitrousFill,
+        ] {
+            assert!(prelaunch_flight_state(state));
+        }
+        for state in [FlightState::Startup, FlightState::Armed] {
+            assert_eq!(prelaunch_flight_state(state), cfg!(feature = "hitl_mode"));
+        }
+        for state in [
+            FlightState::Launch,
+            FlightState::Ascent,
+            FlightState::Coast,
+            FlightState::Apogee,
+            FlightState::ParachuteDeploy,
+            FlightState::Descent,
+            FlightState::Landed,
+            FlightState::Recovery,
+            FlightState::Aborted,
+        ] {
+            assert!(!prelaunch_flight_state(state));
+        }
+        #[cfg(feature = "hitl_mode")]
+        for (_, action) in ACTIONS {
+            let rt = Runtime::default();
+            assert!(!sequence_button_enabled(
+                &rt.engine,
+                action,
+                rt.input(false, true)
+            ));
+        }
+    }
 
     #[test]
     fn automatic_fill_defaults_on_and_rejects_stale_or_invalid_weight() {
