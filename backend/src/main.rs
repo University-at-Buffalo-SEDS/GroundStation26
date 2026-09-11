@@ -1207,7 +1207,23 @@ async fn main() -> anyhow::Result<()> {
                             })
                             .map(|entry| (entry.sender_id, entry.packet_count))
                             .collect::<Vec<_>>();
-                        if attributed.len() == expected.len() {
+                        let graph = validation_state
+                            .network_topology_snapshot(get_current_timestamp_ms());
+                        let graph_attributed = expected
+                            .iter()
+                            .filter_map(|sender| {
+                                let board = Board::from_sender_id(sender)?;
+                                let node = graph.nodes.iter().find(|node| {
+                                    node.sender_id.as_deref() == Some(sender.as_str())
+                                })?;
+                                let packets = node.stats?.packets_received;
+                                (node.label == board.as_str() && packets > 0)
+                                    .then(|| format!("{sender}={}:rx={packets}", node.label))
+                            })
+                            .collect::<Vec<_>>();
+                        if attributed.len() == expected.len()
+                            && graph_attributed.len() == expected.len()
+                        {
                             log::info!(
                                 "full-bay per-board traffic attribution ready: {}",
                                 attributed
@@ -1215,6 +1231,10 @@ async fn main() -> anyhow::Result<()> {
                                     .map(|(sender, packets)| format!("{sender}={packets}"))
                                     .collect::<Vec<_>>()
                                     .join(",")
+                            );
+                            log::info!(
+                                "full-bay network graph attribution ready: {}",
+                                graph_attributed.join(",")
                             );
                             break;
                         }
@@ -1228,8 +1248,24 @@ async fn main() -> anyhow::Result<()> {
                                 .collect::<BTreeSet<_>>();
                             let missing =
                                 expected.difference(&observed).cloned().collect::<Vec<_>>();
+                            let graph_missing = expected
+                                .iter()
+                                .filter(|sender| {
+                                    let Some(board) = Board::from_sender_id(sender) else {
+                                        return true;
+                                    };
+                                    !graph.nodes.iter().any(|node| {
+                                        node.sender_id.as_deref() == Some(sender.as_str())
+                                            && node.label == board.as_str()
+                                            && node.stats.is_some_and(|stats| {
+                                                stats.packets_received > 0
+                                            })
+                                    })
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
                             log::error!(
-                                "full-bay per-board traffic attribution timed out; missing={missing:?}"
+                                "full-bay per-board traffic attribution timed out; missing={missing:?} graph_missing={graph_missing:?}"
                             );
                             break;
                         }
