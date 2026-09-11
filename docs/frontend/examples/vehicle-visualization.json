@@ -1,0 +1,74 @@
+{
+  "title": "Rocket",
+  "model_url": "/assets/models/vehicle.glb",
+  "renderer_url": "/assets/three/vehicle-renderer.js",
+  "model_alt": "Single-stage rocket with aft fins",
+  "camera_orbit": "",
+  "phase_animations": {},
+  "attitude": {
+    "roll": null,
+    "pitch": null,
+    "yaw": null
+  },
+  "stages": [
+    {
+      "id": "stage-1",
+      "label": "Single stage",
+      "separation": null,
+      "components": []
+    }
+  ],
+  "ground_systems": [],
+  "motions": [
+    {
+      "node": "motor-flame",
+      "transform": "visible",
+      "axis": [
+        0,
+        1,
+        0
+      ],
+      "from": 0,
+      "to": 1,
+      "binding": null,
+      "phase_values": {
+        "*": 0,
+        "Ascent": 1
+      }
+    },
+    {
+      "node": "drogue-parachute",
+      "transform": "scale",
+      "axis": [
+        1,
+        1,
+        1
+      ],
+      "from": 0.001,
+      "to": 1,
+      "binding": null,
+      "phase_values": {
+        "*": 0,
+        "ParachuteDeploy": 1
+      }
+    },
+    {
+      "node": "main-parachute",
+      "transform": "scale",
+      "axis": [
+        1,
+        1,
+        1
+      ],
+      "from": 0.001,
+      "to": 1,
+      "binding": null,
+      "phase_values": {
+        "*": 0,
+        "Descent": 1,
+        "Landed": 1,
+        "Recovery": 1
+      }
+    }
+  ]
+}

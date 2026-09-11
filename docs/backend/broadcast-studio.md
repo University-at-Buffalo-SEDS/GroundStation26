@@ -91,8 +91,17 @@ retain their normal live operations/recovery interface.
 
 ## Deployment and limits
 
-Rebuild the backend/frontend and recreate the video service with
-`docker compose -f docker-compose.yml -f docker-compose.video.yml up -d --build`.
+Build matching backend/frontend dev versions and recreate the video service:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.video.yml build --build-arg FRONTEND_DEV=TRUE
+docker compose -f docker-compose.yml -f docker-compose.video.yml up -d --no-build
+```
+
+For native builds use `python3 build.py --frontend-dev`. Without the frontend-dev
+selection, the build helper/Dockerfile selects the stable frontend branch, which may
+not implement these contracts yet. Supply `GS_VIDEO_HOST` and `GS_VIDEO_PASSWORD`
+as described in the [receiver setup](video-and-models.md).
 Native installations set `GS_VIDEO_HLS_URL` (default `http://127.0.0.1:8888`) and use
 the updated `backend/config/mediamtx.yml`. HLS uses internal port 8888, not a new
 public port. The bundled HLS.js 1.6.13 is BSD-2-Clause licensed (`backend/assets/hls.LICENSE`).
@@ -111,6 +120,8 @@ consume viewer bandwidth, even in hero mode. The existing per-path reader cap re
 ## API
 
 - `GET /api/live_streams`: adds `program_url`, `can_manage_stream`, `can_preview_live`.
+- `GET /api/dashboard_status`: live `{phase,t_clock,stats}`, viewing permission required;
+  never use it as a streamer fallback.
 - `POST /api/live_streams/control`: existing broadcast fields plus `delay_seconds`;
   invalid limits return 400, unauthorized changes 403, stale revisions 409.
 - `GET /api/stream-roles`: stream-admin-only sanitized account/role list.

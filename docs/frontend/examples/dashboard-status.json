@@ -1,0 +1,42 @@
+{
+  "phase": "Ascent",
+  "t_clock": "T+ 00:15.25",
+  "stats": [
+    {
+      "label": "Altitude",
+      "value": 125,
+      "unit": "m",
+      "precision": 1
+    },
+    {
+      "label": "Latitude",
+      "value": 42,
+      "unit": "°",
+      "precision": 5
+    },
+    {
+      "label": "Longitude",
+      "value": -78,
+      "unit": "°",
+      "precision": 5
+    },
+    {
+      "label": "Tank pressure",
+      "value": null,
+      "unit": "psi",
+      "precision": 1
+    },
+    {
+      "label": "Fill mass",
+      "value": 6,
+      "unit": "kg",
+      "precision": 1
+    },
+    {
+      "label": "Fill level",
+      "value": 60,
+      "unit": "%",
+      "precision": 1
+    }
+  ]
+}

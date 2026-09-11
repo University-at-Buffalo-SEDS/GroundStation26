@@ -129,5 +129,5 @@ If one side is still on the old fixed-frame transport, the link will not decode 
 
 ## References
 
-- Ground Station Rust host transport: [comms.rs](/Users/rylan/Documents/GitKraken/GroundStation26/backend/src/comms.rs)
+- Ground Station Rust host transport: [comms.rs](../../backend/src/comms.rs)
 - Python host tools: `/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py`

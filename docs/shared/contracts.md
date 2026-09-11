@@ -3,12 +3,19 @@
 This document describes the role of the shared crate and the contracts it creates between frontend, backend, and other
 tooling.
 
-## Shared Crate
+## Source of truth
 
-- `shared/Cargo.toml`
-  Cargo manifest for the shared Rust crate.
-- `shared/src/lib.rs`
-  Shared enums and DTOs used across frontend and backend.
+- `shared/gse_sequence/src/lib.rs`: shared, hardware-independent GSE sequence logic.
+- `backend/src/types.rs` and `backend/src/telemetry_db.rs`: backend telemetry,
+  flight-state, board and launch-clock wire types.
+- `backend/src/auth.rs`: session, permission and stream-role wire types.
+- `backend/src/media/contract.rs` and `backend/src/media/program.rs`: model,
+  broadcast, role-management and dashboard-status contracts.
+- The sibling frontend defines matching deserializers in `src/auth.rs` and
+  `src/telemetry_dashboard/`; examples live in its `docs/api-examples/`.
+
+There is no workspace-wide shared DTO crate at `shared/src/lib.rs`. Both sides'
+serialized shapes must be kept compatible and example fixtures checked when changed.
 
 ## Why This Crate Exists
 
@@ -21,7 +28,25 @@ The frontend and backend must agree on:
 - telemetry row shape
 - launch-clock DTO shape and monotonic countdown/T-plus semantics
 
-The shared crate keeps those contracts in one place so serde, command dispatch, and layout/state rendering stay aligned.
+These source modules and documented fixtures must stay aligned across repositories.
+
+## Dashboard, program and model contracts
+
+`/api/dashboard_status` serves live `{phase,t_clock,stats}` to the primary model
+dashboard. `/api/media-assets/program/state` serves editorial camera/layout state
+plus delayed telemetry to the streamer iframe. The latter must never substitute
+current dashboard values when its history is warming or unavailable. Both display
+nullable server-resolved statistics; bindings belong to backend `_presentation.json`.
+
+`/api/live_streams` capabilities are authoritative: `can_manage_stream` controls
+broadcast editing, `can_preview_live` controls access to undelayed camera feeds, and
+`program_url` is a scoped audience URL. Account `roles` are independent of
+`session_type` and hardware `send_commands`. Explicit `stream_viewer` overrides
+legacy `StreamControl` except for a stream admin. See [broadcast rules](../backend/broadcast-studio.md).
+
+The built-in vehicle is single-stage (`stage-1`) with aft fins only; stage/model
+storage still supports custom multi-stage profiles. Asset tickets are transport
+capabilities, not configuration values to persist or permission grants to edit models.
 
 ## Important Shared Types
 

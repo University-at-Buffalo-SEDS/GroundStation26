@@ -2,6 +2,19 @@
 
 ## Mission video and vehicle models
 
+Dashboard is the primary single-stage model view; the separate Vehicle tab has been
+removed. Settings → General → Viewing mode → Ground Station view restores instruments
+and controls on that device. Streamer is available to any viewer from the same settings
+section; **Exit streamer** returns to Dashboard. Neither mode grants command access.
+
+`GET /api/dashboard_status` requires `ViewData`, returns `{phase,t_clock,stats}`, and
+is polled approximately every 500 ms. Each stat is `{label,value,unit,precision}`;
+backend bindings resolve the value, with missing/stale (>5 s) samples represented by
+null. Three fields cycle about every five seconds beside state and T clock. Defaults
+are RF GPS altitude/latitude/longitude, calibrated tank pressure, fill mass and fill
+percentage. Configure them in backend `_presentation.json`, not in a user-facing editor.
+Streamer uses the same fields from delayed snapshots, never this live endpoint.
+
 The media endpoints follow the sibling frontend's `docs/backend-api.md`:
 `GET /api/live_streams`, `POST /api/live_streams/control`, and
 `GET /api/vehicle_visualization`. Streams use `kind: "webrtc"` and a backend-hosted
@@ -23,6 +36,12 @@ bindings. The bundled offline renderer implements rotation, translation, scale a
 visibility with interpolation. `POST /api/vehicle_visualization` saves configuration
 with hardware/configuration permission, returning `{ "saved": true }`; the existing
 PUT returns 204. See [model mappings](../backend/model-animations.md).
+
+Machine-readable examples are in [examples](examples/README.md), mirrored in the
+sibling frontend's `docs/api-examples/`. Backend binding/profile configuration is
+illustrated by [presentation.example.json](../backend/presentation.example.json).
+Its custom settings must be merged into an existing profile, not blindly copied
+over broadcast revisions, model selection or operator labels.
 
 This document describes the backend surface the Dioxus frontend depends on to boot, seed state, remain connected, and
 render the dashboard correctly.

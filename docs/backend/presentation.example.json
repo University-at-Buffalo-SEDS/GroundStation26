@@ -1,0 +1,162 @@
+{
+  "title": "Flight Test 1",
+  "stream_labels": {
+    "pad-wide": "Pad wide"
+  },
+  "stats": [
+    {
+      "label": "Altitude",
+      "binding": {
+        "data_type": "GPS_DATA",
+        "sender_id": "RF",
+        "index": 2,
+        "scale": 1,
+        "offset": 0
+      },
+      "unit": "m",
+      "precision": 1
+    },
+    {
+      "label": "Latitude",
+      "binding": {
+        "data_type": "GPS_DATA",
+        "sender_id": "RF",
+        "index": 0,
+        "scale": 1,
+        "offset": 0
+      },
+      "unit": "°",
+      "precision": 5
+    },
+    {
+      "label": "Longitude",
+      "binding": {
+        "data_type": "GPS_DATA",
+        "sender_id": "RF",
+        "index": 1,
+        "scale": 1,
+        "offset": 0
+      },
+      "unit": "°",
+      "precision": 5
+    },
+    {
+      "label": "Tank pressure",
+      "binding": {
+        "data_type": "PRESSURE_TRANSDUCER_CALIBRATED",
+        "sender_id": null,
+        "index": 0,
+        "scale": 1,
+        "offset": 0
+      },
+      "unit": "psi",
+      "precision": 1
+    },
+    {
+      "label": "Fill mass",
+      "binding": {
+        "data_type": "LOADCELL_WEIGHT_KG",
+        "sender_id": null,
+        "index": 0,
+        "scale": 1,
+        "offset": 0
+      },
+      "unit": "kg",
+      "precision": 1
+    },
+    {
+      "label": "Fill level",
+      "binding": {
+        "data_type": "LOADCELL_FILL_PERCENT",
+        "sender_id": null,
+        "index": 0,
+        "scale": 1,
+        "offset": 0
+      },
+      "unit": "%",
+      "precision": 1
+    }
+  ],
+  "broadcast": {
+    "label": "Flight Test 1",
+    "featured_stream_id": "pad-wide",
+    "hidden_stream_ids": [],
+    "layout": "hero",
+    "delay_seconds": 10,
+    "revision": 1
+  },
+  "vehicle": {
+    "title": "Rocket",
+    "model_url": "/assets/models/vehicle.glb",
+    "renderer_url": "/assets/three/vehicle-renderer.js",
+    "model_alt": "Single-stage rocket with aft fins",
+    "camera_orbit": "",
+    "phase_animations": {},
+    "attitude": {
+      "roll": null,
+      "pitch": null,
+      "yaw": null
+    },
+    "stages": [
+      {
+        "id": "stage-1",
+        "label": "Single stage",
+        "separation": null,
+        "components": []
+      }
+    ],
+    "ground_systems": [],
+    "motions": [
+      {
+        "node": "motor-flame",
+        "transform": "visible",
+        "axis": [
+          0,
+          1,
+          0
+        ],
+        "from": 0,
+        "to": 1,
+        "binding": null,
+        "phase_values": {
+          "*": 0,
+          "Ascent": 1
+        }
+      },
+      {
+        "node": "drogue-parachute",
+        "transform": "scale",
+        "axis": [
+          1,
+          1,
+          1
+        ],
+        "from": 0.001,
+        "to": 1,
+        "binding": null,
+        "phase_values": {
+          "*": 0,
+          "ParachuteDeploy": 1
+        }
+      },
+      {
+        "node": "main-parachute",
+        "transform": "scale",
+        "axis": [
+          1,
+          1,
+          1
+        ],
+        "from": 0.001,
+        "to": 1,
+        "binding": null,
+        "phase_values": {
+          "*": 0,
+          "Descent": 1,
+          "Landed": 1,
+          "Recovery": 1
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "broadcast": {
+    "label": "Flight Test 1",
+    "featured_stream_id": "pad-wide",
+    "hidden_stream_ids": [],
+    "layout": "hero",
+    "delay_seconds": 10,
+    "revision": 1
+  },
+  "streams": [
+    {
+      "id": "pad-wide",
+      "label": "Pad wide",
+      "url": "/api/media-assets/hls/pad-wide/index.m3u8?ticket=EXAMPLE_STREAM_TICKET"
+    }
+  ],
+  "server_now_ms": 1800000000000,
+  "telemetry": {
+    "phase": "Ascent",
+    "t_clock": "T+ 00:15.25",
+    "stats": [
+      {
+        "label": "Altitude",
+        "value": 125,
+        "unit": "m",
+        "precision": 1
+      },
+      {
+        "label": "Latitude",
+        "value": 42,
+        "unit": "°",
+        "precision": 5
+      },
+      {
+        "label": "Longitude",
+        "value": -78,
+        "unit": "°",
+        "precision": 5
+      },
+      {
+        "label": "Tank pressure",
+        "value": null,
+        "unit": "psi",
+        "precision": 1
+      },
+      {
+        "label": "Fill mass",
+        "value": 6,
+        "unit": "kg",
+        "precision": 1
+      },
+      {
+        "label": "Fill level",
+        "value": 60,
+        "unit": "%",
+        "precision": 1
+      }
+    ]
+  }
+}

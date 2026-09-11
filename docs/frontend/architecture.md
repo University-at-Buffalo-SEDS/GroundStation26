@@ -5,6 +5,26 @@ responsibilities.
 
 ## Runtime Shape
 
+The current UI lives in the sibling `Seds-Ground-Station-Frontend` repository.
+Historical `frontend/src/...` paths below refer to that repository's `src/...`.
+
+## Model dashboard and broadcast ownership
+
+- `telemetry_dashboard/model_dashboard.rs` composes the primary model view and
+  server-resolved `/api/dashboard_status` bar, cycling three fields around every 5 s.
+- `vehicle_tab.rs` renders backend-selected GLB/node mappings; no binding editor is
+  exposed to users. The default has one stage and aft fins, with custom profiles supported.
+- `dashboard_component.rs` routes Dashboard to the model by default, or StateTab
+  when the device's Ground Station view setting is enabled; there is no Vehicle tab.
+- `dashboard_connection.rs` owns scoped view preferences and primary tab ordering.
+- `layout_settings_tab.rs` exposes Ground Station view and Streamer in General →
+  Viewing mode. Streamer is available to viewers; mode selection grants no privileges.
+- `live_stream_tab.rs` selects live previews versus the audience program using backend
+  capability flags. `stream_studio.rs` handles permitted broadcast edits and admin role assignment.
+- The audience iframe is backend-hosted (`media/program.html`), uses delayed HLS and
+  delayed telemetry, and implements camera fades/visibility/layout. It must not consume
+  the live dashboard-status endpoint. See [API contract](api.md).
+
 The frontend is a Dioxus application that supports:
 
 - web via `wasm32`

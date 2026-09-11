@@ -1,0 +1,67 @@
+{
+  "title": "Flight Test 1",
+  "default_stream_id": "pad-wide",
+  "program_url": "/api/media-assets/program?ticket=EXAMPLE_PROGRAM_TICKET",
+  "can_manage_stream": true,
+  "can_preview_live": true,
+  "streams": [
+    {
+      "id": "pad-wide",
+      "label": "pad-wide",
+      "url": "/api/media-assets/streams/pad-wide?ticket=EXAMPLE_PAD_WIDE_TICKET",
+      "kind": "webrtc",
+      "poster_url": "",
+      "online": true
+    },
+    {
+      "id": "tower",
+      "label": "tower",
+      "url": "/api/media-assets/streams/tower?ticket=EXAMPLE_TOWER_TICKET",
+      "kind": "webrtc",
+      "poster_url": "",
+      "online": true
+    },
+    {
+      "id": "onboard",
+      "label": "onboard",
+      "url": "/api/media-assets/streams/onboard?ticket=EXAMPLE_ONBOARD_TICKET",
+      "kind": "webrtc",
+      "poster_url": "",
+      "online": false
+    }
+  ],
+  "stats": [
+    {
+      "label": "Altitude",
+      "binding": {
+        "data_type": "GPS_DATA",
+        "sender_id": "RF",
+        "index": 2,
+        "scale": 1,
+        "offset": 0
+      },
+      "unit": "m",
+      "precision": 1
+    },
+    {
+      "label": "Tank pressure",
+      "binding": {
+        "data_type": "PRESSURE_TRANSDUCER_CALIBRATED",
+        "sender_id": null,
+        "index": 0,
+        "scale": 1,
+        "offset": 0
+      },
+      "unit": "psi",
+      "precision": 1
+    }
+  ],
+  "broadcast": {
+    "label": "Flight Test 1",
+    "featured_stream_id": "pad-wide",
+    "hidden_stream_ids": [],
+    "layout": "hero",
+    "delay_seconds": 10,
+    "revision": 1
+  }
+}

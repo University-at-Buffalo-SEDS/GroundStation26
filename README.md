@@ -7,6 +7,12 @@ scene are documented in [GSE sequences](docs/backend/gse-sequences.md).
 Stream-manager roles and delayed audience video are covered in [Broadcast studio](docs/backend/broadcast-studio.md);
 named-part animation is covered in [Model animations](docs/backend/model-animations.md).
 
+The default Dashboard is the single-stage model with cycling backend-defined data.
+Settings → General → Viewing mode selects Ground Station view or delayed Streamer
+mode. Deploy matching frontend/backend `dev` builds (`--frontend-dev`); see the
+[contract examples](docs/frontend/examples/README.md) and
+[backend presentation profile](docs/backend/presentation.example.json).
+
 ## Dependencies
 
 - Rust: install from https://rustup.rs/

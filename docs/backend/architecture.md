@@ -17,6 +17,26 @@ Most backend subsystems coordinate through `AppState`.
 
 ## File-by-File Ownership
 
+### Media and presentation
+
+- `backend/src/media.rs`: authenticated camera discovery, WebRTC signaling, tracked
+  preview sessions and per-stage GLB storage.
+- `backend/src/media/contract.rs`: backend-owned presentation/profile schema,
+  single-stage defaults, real telemetry stat bindings, scoped asset tickets and
+  revision-checked broadcast edits.
+- `backend/src/media/program.rs`: server-resolved live dashboard snapshots, delayed
+  audience history, HLS release enforcement and stream-admin role assignment.
+- `backend/src/media/program.html`: audience player, 550 ms camera fades, cycling
+  delayed telemetry and T clock; unavailable timing fails closed.
+- `backend/src/auth.rs`: `roles` on account/session principals, independent of
+  hardware command permission. Roles are rechecked when authorizing existing sessions.
+- `backend/config/mediamtx.yml` / `docker-compose.video.yml`: RTSP ingest and internal
+  HLS/WebRTC relay. No camera transcoding is performed by the backend.
+
+Profiles persist in `backend/data/stage_models/_presentation.json` (or the directory
+selected by `GS_STAGE_MODELS_DIR`). End users do not edit bindings in the UI.
+See [media deployment](video-and-models.md) and [broadcast contracts](broadcast-studio.md).
+
 ### `backend/src/main.rs`
 
 Role:

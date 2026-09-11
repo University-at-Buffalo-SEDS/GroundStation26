@@ -1,0 +1,23 @@
+[
+  {
+    "username": "administrator",
+    "roles": [
+      "stream_admin"
+    ],
+    "disabled": false
+  },
+  {
+    "username": "producer",
+    "roles": [
+      "stream_master"
+    ],
+    "disabled": false
+  },
+  {
+    "username": "viewer",
+    "roles": [
+      "stream_viewer"
+    ],
+    "disabled": false
+  }
+]

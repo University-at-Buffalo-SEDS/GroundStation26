@@ -5,12 +5,12 @@ boundaries.
 
 ## Top-Level Components
 
-- `frontend/`
-  Native and web operator UI built with Dioxus.
+- Sibling `Seds-Ground-Station-Frontend` repository
+  Native and web Dioxus UI; the root build helper selects/clones its release or dev branch.
 - `backend/`
   Axum server, telemetry ingest, persistence, sequencing, and hardware/radio control.
-- `shared/`
-  Shared Rust contract types.
+- `shared/gse_sequence/`
+  Hardware-independent GSE sequence logic; HTTP/WebSocket DTOs are mirrored across repositories.
 - `map_downloader/`
   Utility crate for map-related workflows.
 
@@ -23,6 +23,19 @@ boundaries.
 5. The frontend renders that state and sends commands back.
 
 ## Build Boundaries
+
+For these contracts on `dev`, build with `python3 build.py --frontend-dev` (or
+`python3 build.py docker --frontend-dev`) so the cached frontend checkout uses `dev`.
+The default build selects the stable frontend branch and may not include the new UI.
+Direct Docker builds use `--build-arg FRONTEND_DEV=TRUE`. Deploy both sides together
+and recreate the video relay using its updated configuration.
+
+The primary Dashboard is a single-stage model view. Ground Station view is a local
+settings toggle for the instrument/control dashboard. Streamer is a separate delayed
+audience program available to all viewers, with manager/admin roles required only
+for editing or role assignment. Backend bindings supply cycling data and T clock;
+the audience uses delayed snapshots, not live control data. See the
+[broadcast guide](../backend/broadcast-studio.md) for setup and limitations.
 
 - `build.py`
   Repository-level wrapper. Keeps old entry points but delegates actual work.
@@ -78,8 +91,9 @@ They are intentionally decoupled in these ways:
 
 ### Shared files
 
-- `shared/src/lib.rs`
-  cross-process contracts
+- `shared/gse_sequence/src/lib.rs`
+  hardware-independent sequence logic; mirrored API types are documented in
+  [Shared contracts](../shared/contracts.md).
 
 ## Operational Notes
 

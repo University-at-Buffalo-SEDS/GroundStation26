@@ -5,10 +5,20 @@ independently.
 
 ## Structure
 
+- [Dashboard and media API contract](frontend/api.md): primary model view,
+  backend-owned statistics, permissions and live/delayed data boundaries.
+- [Broadcast studio](backend/broadcast-studio.md): stream roles, viewing modes,
+  audience delay, API behavior and integration checks.
+- [Video and stage models](backend/video-and-models.md): receiver/sender deployment
+  and model administration.
+- [Model animations](backend/model-animations.md): single-stage default and backend
+  binding configuration; custom multi-stage profiles remain supported.
+- [GSE sequences](backend/gse-sequences.md): grouped control and equipment scene.
+
 - `docs/frontend/api.md`
   Frontend-facing API contract, endpoint details, websocket message shapes, bootstrap flow, and backend expectations.
 - `docs/frontend/architecture.md`
-  Frontend runtime architecture and file-by-file ownership for `frontend/src`.
+  Frontend runtime architecture and file-by-file ownership for the sibling UI repository's `src`.
 - `docs/backend/architecture.md`
   Backend runtime architecture and file-by-file ownership for `backend/src`.
 - `docs/backend/i2c.md`
