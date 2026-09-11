@@ -63,6 +63,18 @@ pub struct BoardStatus {
     pub warned: bool,
 }
 
+impl BoardStatus {
+    /// Route age must never replace more recent packet evidence. In particular,
+    /// iterating several routes on one relay must not make the oldest win.
+    fn observe_route_age(&mut self, now: std::time::Instant, age_ms: u64) {
+        if let Some(observed) = now.checked_sub(std::time::Duration::from_millis(age_ms)) {
+            self.last_seen_instant = Some(
+                self.last_seen_instant.map_or(observed, |existing| existing.max(observed)),
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     /// Optional ring buffer for full telemetry packets (not JSON)
@@ -606,9 +618,7 @@ impl AppState {
                     .map(|existing| existing.max(route_last_seen_ms))
                     .unwrap_or(route_last_seen_ms),
             );
-            status.last_seen_instant = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_millis(route.age_ms))
-                .or_else(|| Some(std::time::Instant::now()));
+            status.observe_route_age(std::time::Instant::now(), route.age_ms);
             status.warned = false;
         }
         drop(map);
@@ -1933,6 +1943,32 @@ pub(crate) mod tests {
         assert!(!rf.seen);
         assert_eq!(rf.packet_count, 1);
         assert_eq!(rf.last_seen_ms, Some(1_000));
+    }
+
+    #[tokio::test]
+    async fn old_routes_do_not_age_active_gateway_or_revive_expired_gateway() {
+        let state = test_app_state().await;
+        state.mark_board_seen(Board::GatewayBoard.sender_id(), 1_000);
+        {
+            let mut statuses = state.board_status.lock().unwrap();
+            let gateway = statuses.get_mut(&Board::GatewayBoard).unwrap();
+            let received = gateway.last_seen_instant;
+            gateway.observe_route_age(std::time::Instant::now(), BOARD_SEEN_TIMEOUT_MS + 10_000);
+            assert_eq!(gateway.last_seen_instant, received);
+        }
+        let gateway = |snapshot: BoardStatusMsg| snapshot.boards.into_iter()
+            .find(|entry| entry.board == Board::GatewayBoard).unwrap();
+        assert!(gateway(state.board_status_snapshot(1_000)).seen);
+        {
+            let mut statuses = state.board_status.lock().unwrap();
+            let status = statuses.get_mut(&Board::GatewayBoard).unwrap();
+            status.last_seen_instant = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(BOARD_SEEN_TIMEOUT_MS + 1_000));
+            status.observe_route_age(std::time::Instant::now(), BOARD_SEEN_TIMEOUT_MS + 10_000);
+        }
+        let expired = gateway(state.board_status_snapshot(60_000));
+        assert!(!expired.seen);
+        assert_eq!(expired.packet_count, 1);
     }
 
     #[test]
