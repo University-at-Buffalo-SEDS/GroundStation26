@@ -23,11 +23,6 @@ pub enum TelemetryCommand {
     StopWritingDb,
     ResetSim,
     ContinueFillSequence,
-    StartFill,
-    PauseFill,
-    CancelFill,
-    ValveSelfTest,
-    NitrogenTest,
     MonitorAltitude,
     RevokeMonitorAltitude,
     ConsecutiveSamples,
@@ -84,6 +79,11 @@ pub enum TelemetryCommand {
     ReinitAfter26,
     #[cfg(feature = "hitl_mode")]
     ReinitAfter44,
+    StartFill,
+    PauseFill,
+    CancelFill,
+    ValveSelfTest,
+    NitrogenTest,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]

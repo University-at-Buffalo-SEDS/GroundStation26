@@ -2017,6 +2017,66 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[cfg(not(feature = "hitl_mode"))]
+    async fn gse_actions_cannot_bypass_software_or_key_interlocks() {
+        let state = test_app_state().await;
+        *state.state.lock().unwrap() = FlightState::Idle;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.engine.config.pressure_ceiling_psi = Some(200.0);
+            rt.engine.config.maximum_zero_offset_psi = Some(3.0);
+            rt.observe_pressure(Some(0.0));
+        }
+        for (key, software) in [(false, true), (true, false), (true, true)] {
+            let mut policy = state.action_policy.lock().unwrap();
+            policy.key_enabled = key;
+            policy.software_buttons_enabled = software;
+            drop(policy);
+            assert_eq!(
+                state.is_command_allowed(&TelemetryCommand::NitrogenTest),
+                key && software
+            );
+            assert!(state.is_command_allowed(&TelemetryCommand::CancelFill));
+        }
+    }
+
+    #[tokio::test]
+    async fn gse_active_sequence_blocks_manual_and_ignition_controls() {
+        let state = test_app_state().await;
+        *state.state.lock().unwrap() = FlightState::Idle;
+        state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Filling;
+        for cmd in [
+            TelemetryCommand::Dump,
+            TelemetryCommand::Pilot,
+            TelemetryCommand::Nitrous,
+            TelemetryCommand::Nitrogen,
+            TelemetryCommand::Launch,
+            TelemetryCommand::Igniter,
+            TelemetryCommand::Postinit,
+            TelemetryCommand::RetractPlumbing,
+        ] {
+            assert!(!state.is_command_allowed(&cmd));
+        }
+        assert!(state.is_command_allowed(&TelemetryCommand::CancelFill));
+    }
+
+    #[tokio::test]
+    async fn gse_panel_group_mapping_can_be_restored_to_manual() {
+        let state = test_app_state().await;
+        for (manual, sequence) in [
+            ("Dump", "CancelFill"),
+            ("NormallyOpen", "PauseFill"),
+            ("Pilot", "ValveSelfTest"),
+            ("Nitrogen", "NitrogenTest"),
+            ("Nitrous", "StartFill"),
+        ] {
+            assert_eq!(crate::gse::panel_name(&state, manual), sequence);
+        }
+        state.gse.lock().unwrap().engine.config.grouped_panel = false;
+        assert_eq!(crate::gse::panel_name(&state, "Dump"), "Dump");
+    }
+
     async fn test_app_state() -> Arc<AppState> {
         let db = SqlitePool::connect("sqlite::memory:")
             .await

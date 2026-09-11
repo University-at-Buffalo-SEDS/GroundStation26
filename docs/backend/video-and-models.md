@@ -145,8 +145,8 @@ does not assemble multiple stage files into one scene.
 including attitude bindings, stage components, ground systems, and phase animation
 names. For selection, use `model_url: "/api/stage-models/STAGE/NAME"`; the GET
 response converts this to a browser-readable URL. Configure `renderer_url` to a
-self-hosted model-viewer ES module for offline rendering; leaving it empty uses
-the frontend's existing CDN fallback. Animation names must match clips in your GLB.
+self-hosted model-viewer ES module for offline rendering; leaving it empty selects
+the backend's bundled renderer. Animation names must match clips in your GLB.
 
 `POST /api/live_streams/control` accepts the frontend broadcast object (label,
 featured_stream_id, hidden_stream_ids, layout, revision). Only authenticated

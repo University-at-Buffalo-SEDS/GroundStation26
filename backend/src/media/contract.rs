@@ -121,6 +121,18 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
         .route("/api/vehicle_visualization", get(vehicle).put(save_vehicle))
         .route("/api/media-assets/streams/{id}", get(player))
         .route(
+            "/assets/model-viewer.min.js",
+            get(|| async {
+                (
+                    [
+                        (header::CONTENT_TYPE, "text/javascript"),
+                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                    ],
+                    include_bytes!("../../assets/model-viewer.min.js").as_slice(),
+                )
+            }),
+        )
+        .route(
             "/assets/models/gse-site.glb",
             get(|| async {
                 (
@@ -362,6 +374,9 @@ async fn vehicle(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> Ap
                 components: Vec::new(),
             });
         }
+    }
+    if vehicle.renderer_url.is_empty() {
+        vehicle.renderer_url = "/assets/model-viewer.min.js".into();
     }
     if vehicle.title.is_empty() {
         vehicle.title = "Rocket".into();

@@ -27,7 +27,7 @@ const site=scene();
 site.box('pad',site.black,[0,-.1,0],[10,.2,7]);
 site.rocket(2,0);
 for(const x of [2.9,3.65])for(const z of [-.8,.1])site.box('tower upright',site.steel,[x,3.9,z],[.1,8,.1]);
-for(let y=.5;y<8;y+=.8){site.box('tower rail',site.steel,[3.28,y,-.8],[.85,.06,.06]);site.pipe('tower brace',site.steel,[2.9,y,-.8],[3.65,y+.8,-.8],.025);}
+for(let y=.5;y+.8<=7.9;y+=.8){site.box('tower rail',site.steel,[3.28,y,-.8],[.85,.06,.06]);site.pipe('tower brace',site.steel,[2.9,y,-.8],[3.65,y+.8,-.8],.025);}
 site.box('umbilical boom',site.white,[2.7,5.2,-.3],[1.8,.12,.12]);
 for(const [name,x,color,radius,height]of [['nitrogen vessel',-3,site.blue,.48,2.7],['nitrous vessel',-1.4,site.green,.7,3.5]]){
 site.cylinder(name,site.white,[x,height/2+.2,-1],radius,height);site.cylinder(name+' band',color,[x,1.2,-1],radius+.008,.12);site.box(name+' foot',site.steel,[x,.1,-1],[radius*2.3,.2,radius*2.3]);}

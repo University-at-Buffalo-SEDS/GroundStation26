@@ -111,7 +111,8 @@
         "border": "#10b981",
         "bg": "#06261d",
         "fg": "#d1fae5",
-        "illuminated": true
+        "illuminated": true,
+        "group": "Recording"
       },
       {
         "label": "Start DB Last 2 Min",
@@ -119,7 +120,8 @@
         "border": "#14b8a6",
         "bg": "#042f2e",
         "fg": "#ccfbf1",
-        "illuminated": true
+        "illuminated": true,
+        "group": "Recording"
       },
       {
         "label": "Pause DB",
@@ -127,7 +129,8 @@
         "border": "#f59e0b",
         "bg": "#3b2203",
         "fg": "#fef3c7",
-        "illuminated": true
+        "illuminated": true,
+        "group": "Recording"
       },
       {
         "label": "Stop DB",
@@ -136,15 +139,15 @@
         "bg": "#3f0b13",
         "fg": "#fee2e2",
         "illuminated": true,
-        "new_row_after": true,
-        "spacer_row_after": true
+        "group": "Recording"
       },
       {
         "label": "Postinit",
         "cmd": "Postinit",
         "border": "#38bdf8",
         "bg": "#082f49",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Launch",
@@ -152,14 +155,7 @@
         "border": "#22c55e",
         "bg": "#022c22",
         "fg": "#bbf7d0",
-        "spacer_row_before": true
-      },
-      {
-        "label": "Dump",
-        "cmd": "Dump",
-        "border": "#ef4444",
-        "bg": "#450a0a",
-        "fg": "#fecaca"
+        "group": "Flight controls"
       },
       {
         "label": "Igniter",
@@ -167,56 +163,71 @@
         "border": "#60a5fa",
         "bg": "#0b1220",
         "fg": "#bfdbfe",
-        "spacer_after": true
-      },
-      {
-        "label": "Pilot",
-        "cmd": "Pilot",
-        "border": "#a78bfa",
-        "bg": "#111827",
-        "fg": "#ddd6fe"
-      },
-      {
-        "label": "Vent",
-        "cmd": "NormallyOpen",
-        "border": "#f97316",
-        "bg": "#1f2937",
-        "fg": "#ffedd5"
-      },
-      {
-        "label": "Nitrogen",
-        "cmd": "Nitrogen",
-        "border": "#22d3ee",
-        "bg": "#0b1220",
-        "fg": "#cffafe"
-      },
-      {
-        "label": "Nitrous",
-        "cmd": "Nitrous",
-        "border": "#a3e635",
-        "bg": "#111827",
-        "fg": "#ecfccb"
+        "group": "Flight controls"
       },
       {
         "label": "Fill Lines",
         "cmd": "RetractPlumbing",
         "border": "#eab308",
         "bg": "#1f2937",
-        "fg": "#fef9c3"
+        "fg": "#fef9c3",
+        "group": "Flight controls"
       },
       {
         "label": "Flight State +1",
         "cmd": "AdvanceFlightState",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Flight State -1",
         "cmd": "RewindFlightState",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
+      },
+      {
+        "label": "Dump",
+        "cmd": "Dump",
+        "border": "#ef4444",
+        "bg": "#450a0a",
+        "fg": "#fecaca",
+        "group": "Manual GSE valves"
+      },
+      {
+        "label": "Pilot",
+        "cmd": "Pilot",
+        "border": "#a78bfa",
+        "bg": "#111827",
+        "fg": "#ddd6fe",
+        "group": "Manual GSE valves"
+      },
+      {
+        "label": "Vent",
+        "cmd": "NormallyOpen",
+        "border": "#f97316",
+        "bg": "#1f2937",
+        "fg": "#ffedd5",
+        "group": "Manual GSE valves"
+      },
+      {
+        "label": "Nitrogen",
+        "cmd": "Nitrogen",
+        "border": "#22d3ee",
+        "bg": "#0b1220",
+        "fg": "#cffafe",
+        "group": "Manual GSE valves"
+      },
+      {
+        "label": "Nitrous",
+        "cmd": "Nitrous",
+        "border": "#a3e635",
+        "bg": "#111827",
+        "fg": "#ecfccb",
+        "group": "Manual GSE valves"
       }
     ],
     "disable_actions_by_default": true,

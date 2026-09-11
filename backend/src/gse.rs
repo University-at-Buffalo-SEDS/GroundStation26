@@ -91,7 +91,10 @@ pub fn initialize(state: &AppState) {
         .map_err(|e| e.to_string())
         .and_then(|b| serde_json::from_slice::<Config>(&b).map_err(|e| e.to_string()))
     {
-        Ok(config) => state.gse.lock().unwrap().engine.config = config,
+        Ok(mut config) => {
+            config.dry_self_test_confirmed = false;
+            state.gse.lock().unwrap().engine.config = config;
+        }
         Err(err) => log::warn!(
             "GSE configuration not loaded; automatic actions require configuration: {err}"
         ),
@@ -133,14 +136,17 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
     if let Some(action) = action(cmd) {
         return Some(
             rt.engine
-                .allows(action, rt.input(is_prelaunch, policy.key_enabled)),
+                .allows(action, rt.input(is_prelaunch, interlock(state, &policy))),
         );
     }
     if rt.engine.active()
-        && (valve_command(cmd)
+        && (["GroundStationLaunch", "IgniterSequence"]
+            .contains(&crate::sequences::command_name(cmd))
+            || valve_command(cmd)
             || matches!(
                 cmd,
                 TelemetryCommand::Launch
+                    | TelemetryCommand::Igniter
                     | TelemetryCommand::Postinit
                     | TelemetryCommand::RetractPlumbing
             ))
@@ -149,10 +155,22 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
     }
     None
 }
+fn interlock(state: &AppState, policy: &ActionPolicyMsg) -> bool {
+    #[cfg(feature = "hitl_mode")]
+    {
+        let _ = policy;
+        state.hitl_button_interlock_satisfied()
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        let _ = state;
+        policy.key_enabled && policy.software_buttons_enabled
+    }
+}
 pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     let is_prelaunch = prelaunch(state);
     let rt = state.gse.lock().unwrap();
-    let input = rt.input(is_prelaunch, policy.key_enabled);
+    let input = rt.input(is_prelaunch, interlock(state, policy));
     for (cmd, action) in ACTIONS {
         let enabled = rt.engine.allows(action, input);
         policy.controls.retain(|c| c.cmd != cmd);
@@ -178,6 +196,8 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
                 "Nitrous",
                 "Launch",
                 "GroundStationLaunch",
+                "Igniter",
+                "IgniterSequence",
                 "Postinit",
                 "RetractPlumbing",
             ]
@@ -217,7 +237,8 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
                     state.add_notification(
                         "GSE command transport failed. Verify supply valves are closed.",
                     );
-                    break;
+                    crate::telemetry_task::flush_command_tx(router, "GSE supply close recovery");
+                    return;
                 }
                 state.set_pending_umbilical_valve_state(KEYS[index], open);
             }
@@ -227,6 +248,9 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
             let now = rt.now();
             rt.engine
                 .fault(now, "No hardware command router is available");
+            drop(rt);
+            state.add_notification("GSE sequence failed: no hardware command router is available");
+            return;
         }
     }
     if let Some(message) = effects.notification {
@@ -239,7 +263,7 @@ pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
         let policy = state.action_policy_snapshot();
         let result = {
             let mut rt = state.gse.lock().unwrap();
-            let input = rt.input(is_prelaunch, policy.key_enabled);
+            let input = rt.input(is_prelaunch, interlock(state, &policy));
             rt.engine.request(action, input)
         };
         match result {
@@ -315,7 +339,7 @@ async fn save_config(
     {
         return e;
     }
-    if let Err(err) = config.validate() {
+    if let Err(err) = config.validate_settings() {
         return (StatusCode::BAD_REQUEST, err).into_response();
     }
     let path = config_path();

@@ -27,6 +27,24 @@ impl Default for Config {
     }
 }
 impl Config {
+    /// Incomplete limits may be saved, but cannot enable automatic operations.
+    pub fn validate_settings(&self) -> Result<(), String> {
+        if !self.nitrogen_target_psi.is_finite()
+            || self.nitrogen_target_psi <= 0.0
+            || self
+                .pressure_ceiling_psi
+                .is_some_and(|v| !v.is_finite() || v <= 0.0)
+            || self
+                .maximum_zero_offset_psi
+                .is_some_and(|v| !v.is_finite() || v < 0.0)
+        {
+            return Err("Pressure settings must be finite and nonnegative; target and ceiling must be positive".into());
+        }
+        if self.pressure_ceiling_psi.is_some() && self.maximum_zero_offset_psi.is_some() {
+            self.validate()?;
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<(), String> {
         let ceiling = self
             .pressure_ceiling_psi
@@ -526,27 +544,28 @@ impl Engine {
                 if elapsed > 5000 && !self.confirmed(input) {
                     return self.fault(input.now_ms, "Nitrogen close acknowledgement timed out");
                 }
-                if elapsed >= 2000 && self.confirmed(input) {
-                    if let Some(mean) = self.sample_mean(input.now_ms.saturating_sub(1000)) {
-                        let baseline = self.status.baseline.as_ref().unwrap();
-                        if mean
-                            < baseline.average_psi + self.status.current_step_psi
-                                - 3.0
-                                - baseline.noise_psi
-                        {
-                            return self.fault(
-                                input.now_ms,
-                                "Pressure fell below the test step while settling",
-                            );
-                        }
-                        self.hold_reference = Some(mean);
-                        self.hold_samples = 0;
-                        self.transition(
-                            Phase::Holding,
+                if elapsed >= 2000
+                    && self.confirmed(input)
+                    && let Some(mean) = self.sample_mean(input.now_ms.saturating_sub(1000))
+                {
+                    let baseline = self.status.baseline.as_ref().unwrap();
+                    if mean
+                        < baseline.average_psi + self.status.current_step_psi
+                            - 3.0
+                            - baseline.noise_psi
+                    {
+                        return self.fault(
                             input.now_ms,
-                            "Checking for pressure loss over 5 seconds",
+                            "Pressure fell below the test step while settling",
                         );
                     }
+                    self.hold_reference = Some(mean);
+                    self.hold_samples = 0;
+                    self.transition(
+                        Phase::Holding,
+                        input.now_ms,
+                        "Checking for pressure loss over 5 seconds",
+                    );
                 }
             }
             Phase::Holding => {
@@ -565,6 +584,10 @@ impl Engine {
                 if elapsed >= 5000 {
                     if self.hold_samples < 10 {
                         return self.fault(input.now_ms, "Too few samples to verify pressure hold");
+                    }
+                    let hold_mean = self.sample_mean(self.phase_since).unwrap();
+                    if self.hold_reference.unwrap() - hold_mean > 3.0 {
+                        return self.fault(input.now_ms, "Sustained mean pressure loss exceeds 3 psi; leak or inconclusive noisy hold, test not passed");
                     }
                     if self.status.current_step_psi >= self.config.nitrogen_target_psi {
                         return self.configure(
@@ -591,8 +614,19 @@ impl Engine {
                         "Tank did not return to its zero-pressure band",
                     );
                 }
-                if self.confirmed(input) && self.status.baseline.as_ref().unwrap().is_zero(pressure)
-                {
+                let zero = self.status.baseline.as_ref().unwrap();
+                let window: Vec<_> = self
+                    .samples
+                    .iter()
+                    .filter(|s| s.at_ms >= input.now_ms.saturating_sub(1000))
+                    .collect();
+                let empty = elapsed >= 1000
+                    && window.len() >= 10
+                    && window
+                        .first()
+                        .is_some_and(|s| input.now_ms.saturating_sub(s.at_ms) >= 900)
+                    && window.iter().all(|s| zero.is_zero(s.value));
+                if self.confirmed(input) && empty && zero.is_zero(pressure) {
                     self.status.nitrogen_passed = true;
                     self.transition(
                         Phase::Passed,
@@ -621,13 +655,11 @@ impl Engine {
                     "Nitrous fill in progress",
                 );
             }
-            Phase::Filling => {
-                if elapsed > 5000 && !self.confirmed(input) {
-                    return self.fault(
-                        input.now_ms,
-                        "Fill valve state does not match the requested configuration",
-                    );
-                }
+            Phase::Filling if elapsed > 5000 && !self.confirmed(input) => {
+                return self.fault(
+                    input.now_ms,
+                    "Fill valve state does not match the requested configuration",
+                );
             }
             _ => {}
         }
@@ -732,6 +764,62 @@ mod tests {
         let mut rig = Rig::new();
         rig.engine.config.pressure_ceiling_psi = None;
         assert!(!rig.engine.allows(Action::NitrogenTest, rig.input()));
+    }
+    #[test]
+    fn zero_centered_three_psi_noise_is_measured() {
+        let mut rig = Rig::new();
+        rig.engine.config.maximum_zero_offset_psi = Some(3.0);
+        rig.pressure = 0.0;
+        rig.request(Action::NitrogenTest);
+        rig.tick();
+        for i in 0..50 {
+            rig.pressure = if i % 2 == 0 { -3.0 } else { 3.0 };
+            rig.tick();
+        }
+        let baseline = rig.engine.status.baseline.as_ref().unwrap();
+        assert_eq!(baseline.average_psi, 0.0);
+        assert_eq!(baseline.noise_psi, 3.0);
+        assert!(baseline.is_zero(-3.0) && baseline.is_zero(3.0));
+    }
+    #[test]
+    fn interlock_loss_and_pressure_ceiling_close_supplies() {
+        for lose_interlock in [false, true] {
+            let mut rig = Rig::new();
+            rig.baseline();
+            rig.until(Phase::Raising);
+            let mut input = rig.input();
+            if lose_interlock {
+                input.interlock = false;
+            } else {
+                input.pressure.as_mut().unwrap().value = 200.0;
+            }
+            let effects = rig.engine.tick(input);
+            rig.effects(effects);
+            assert_eq!(rig.engine.status.phase, Phase::Fault);
+            assert_eq!(rig.valves, RELIEVED);
+            assert!(!rig.engine.status.nitrogen_passed);
+        }
+    }
+    #[test]
+    fn sustained_small_drop_inside_extrema_envelope_cannot_pass() {
+        let mut rig = Rig::new();
+        rig.baseline();
+        rig.until(Phase::Raising);
+        rig.pressure = 55.0;
+        rig.until(Phase::Holding);
+        rig.pressure = 51.0;
+        rig.until(Phase::Fault);
+        assert!(!rig.engine.status.nitrogen_passed);
+        assert_eq!(rig.valves, RELIEVED);
+    }
+    #[test]
+    fn incomplete_settings_can_select_manual_panel_without_enabling_automation() {
+        let config = Config {
+            grouped_panel: false,
+            ..Config::default()
+        };
+        assert!(config.validate_settings().is_ok());
+        assert!(config.validate().is_err());
     }
     #[test]
     fn noise_floor_keeps_average_and_extrema() {

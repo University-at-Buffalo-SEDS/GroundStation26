@@ -115,7 +115,8 @@
         "border": "#10b981",
         "bg": "#06261d",
         "fg": "#d1fae5",
-        "illuminated": true
+        "illuminated": true,
+        "group": "Recording"
       },
       {
         "label": "Start DB Last 2 Min",
@@ -123,7 +124,8 @@
         "border": "#14b8a6",
         "bg": "#042f2e",
         "fg": "#ccfbf1",
-        "illuminated": true
+        "illuminated": true,
+        "group": "Recording"
       },
       {
         "label": "Pause DB",
@@ -131,7 +133,8 @@
         "border": "#f59e0b",
         "bg": "#3b2203",
         "fg": "#fef3c7",
-        "illuminated": true
+        "illuminated": true,
+        "group": "Recording"
       },
       {
         "label": "Stop DB",
@@ -140,15 +143,15 @@
         "bg": "#3f0b13",
         "fg": "#fee2e2",
         "illuminated": true,
-        "new_row_after": true,
-        "spacer_row_after": true
+        "group": "Recording"
       },
       {
         "label": "Postinit",
         "cmd": "Postinit",
         "border": "#38bdf8",
         "bg": "#082f49",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Launch",
@@ -156,14 +159,15 @@
         "border": "#22c55e",
         "bg": "#022c22",
         "fg": "#bbf7d0",
-        "spacer_row_before": true
+        "group": "Flight controls"
       },
       {
         "label": "GS Launch",
         "cmd": "GroundStationLaunch",
         "border": "#16a34a",
         "bg": "#052e16",
-        "fg": "#dcfce7"
+        "fg": "#dcfce7",
+        "group": "Flight controls"
       },
       {
         "label": "Button Interlock",
@@ -171,7 +175,8 @@
         "border": "#0ea5e9",
         "bg": "#082f49",
         "fg": "#e0f2fe",
-        "illuminated": true
+        "illuminated": true,
+        "group": "Flight controls"
       },
       {
         "label": "Launch Interlock",
@@ -179,7 +184,8 @@
         "border": "#0284c7",
         "bg": "#082f49",
         "fg": "#e0f2fe",
-        "illuminated": true
+        "illuminated": true,
+        "group": "Flight controls"
       },
       {
         "label": "Launch Btn -> GS",
@@ -187,14 +193,16 @@
         "border": "#14b8a6",
         "bg": "#042f2e",
         "fg": "#ccfbf1",
-        "illuminated": true
+        "illuminated": true,
+        "group": "Flight controls"
       },
       {
         "label": "Reset Launch LED",
         "cmd": "ResetLaunchLatch",
         "border": "#f59e0b",
         "bg": "#3b2203",
-        "fg": "#fef3c7"
+        "fg": "#fef3c7",
+        "group": "Flight controls"
       },
       {
         "label": "AV Bay Underglow",
@@ -202,7 +210,8 @@
         "border": "#3b82f6",
         "bg": "#172554",
         "fg": "#dbeafe",
-        "illuminated": true
+        "illuminated": true,
+        "group": "Flight controls"
       },
       {
         "label": "Flight Buzzer",
@@ -210,14 +219,8 @@
         "border": "#a855f7",
         "bg": "#2e1065",
         "fg": "#f3e8ff",
-        "illuminated": true
-      },
-      {
-        "label": "Dump",
-        "cmd": "Dump",
-        "border": "#ef4444",
-        "bg": "#450a0a",
-        "fg": "#fecaca"
+        "illuminated": true,
+        "group": "Flight controls"
       },
       {
         "label": "Igniter",
@@ -225,224 +228,263 @@
         "border": "#60a5fa",
         "bg": "#0b1220",
         "fg": "#bfdbfe",
-        "spacer_after": true
+        "group": "Flight controls"
       },
       {
         "label": "Igniter Seq",
         "cmd": "IgniterSequence",
         "border": "#38bdf8",
         "bg": "#082f49",
-        "fg": "#e0f2fe"
-      },
-      {
-        "label": "Pilot",
-        "cmd": "Pilot",
-        "border": "#a78bfa",
-        "bg": "#111827",
-        "fg": "#ddd6fe"
-      },
-      {
-        "label": "Vent",
-        "cmd": "NormallyOpen",
-        "border": "#f97316",
-        "bg": "#1f2937",
-        "fg": "#ffedd5"
-      },
-      {
-        "label": "Nitrogen",
-        "cmd": "Nitrogen",
-        "border": "#22d3ee",
-        "bg": "#0b1220",
-        "fg": "#cffafe"
-      },
-      {
-        "label": "Nitrous",
-        "cmd": "Nitrous",
-        "border": "#a3e635",
-        "bg": "#111827",
-        "fg": "#ecfccb"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Fill Lines",
         "cmd": "RetractPlumbing",
         "border": "#eab308",
         "bg": "#1f2937",
-        "fg": "#fef9c3"
+        "fg": "#fef9c3",
+        "group": "Flight controls"
       },
       {
         "label": "Flight State +1",
         "cmd": "AdvanceFlightState",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Flight State -1",
         "cmd": "RewindFlightState",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Deploy Parachute",
         "cmd": "DeployParachute",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Expand Parachute",
         "cmd": "ExpandParachute",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Reinit Sensors",
         "cmd": "ReinitSensors",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Evaluation Relax",
         "cmd": "EvaluationRelax",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Evaluation Focus",
         "cmd": "EvaluationFocus",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Evaluation Abort",
         "cmd": "EvaluationAbort",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Reinit Barometer",
         "cmd": "ReinitBarometer",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Enable IMU",
         "cmd": "EnableIMU",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Disable IMU",
         "cmd": "DisableIMU",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Monitor Altitude",
         "cmd": "MonitorAltitude",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Revoke Monitor Alt",
         "cmd": "RevokeMonitorAltitude",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Consecutive Samples",
         "cmd": "ConsecutiveSamples",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Revoke Consecutive",
         "cmd": "RevokeConsecutiveSamples",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Reset Failures",
         "cmd": "ResetFailures",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Revoke Reset Fail",
         "cmd": "RevokeResetFailures",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Validate Measms",
         "cmd": "ValidateMeasms",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Revoke Validate",
         "cmd": "RevokeValidateMeasms",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Abort After 15",
         "cmd": "AbortAfter15",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Abort After 40",
         "cmd": "AbortAfter40",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Abort After 70",
         "cmd": "AbortAfter70",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Reinit After 12",
         "cmd": "ReinitAfter12",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Reinit After 26",
         "cmd": "ReinitAfter26",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
       },
       {
         "label": "Reinit After 44",
         "cmd": "ReinitAfter44",
         "border": "#38bdf8",
         "bg": "#0b1220",
-        "fg": "#e0f2fe"
+        "fg": "#e0f2fe",
+        "group": "Flight controls"
+      },
+      {
+        "label": "Dump",
+        "cmd": "Dump",
+        "border": "#ef4444",
+        "bg": "#450a0a",
+        "fg": "#fecaca",
+        "group": "Manual GSE valves"
+      },
+      {
+        "label": "Pilot",
+        "cmd": "Pilot",
+        "border": "#a78bfa",
+        "bg": "#111827",
+        "fg": "#ddd6fe",
+        "group": "Manual GSE valves"
+      },
+      {
+        "label": "Vent",
+        "cmd": "NormallyOpen",
+        "border": "#f97316",
+        "bg": "#1f2937",
+        "fg": "#ffedd5",
+        "group": "Manual GSE valves"
+      },
+      {
+        "label": "Nitrogen",
+        "cmd": "Nitrogen",
+        "border": "#22d3ee",
+        "bg": "#0b1220",
+        "fg": "#cffafe",
+        "group": "Manual GSE valves"
+      },
+      {
+        "label": "Nitrous",
+        "cmd": "Nitrous",
+        "border": "#a3e635",
+        "bg": "#111827",
+        "fg": "#ecfccb",
+        "group": "Manual GSE valves"
       }
     ],
     "disable_actions_by_default": true

@@ -656,3 +656,17 @@ channels, or wrong state.
 - If `/api/layout` fails, the dashboard cannot safely render its configured structure.
 - If `/api/network_time` fails, the detailed diagnostics lose RTT and clock-delta visibility.
 - If `/api/action_policy` and websocket policy updates fail, the frontend may show controls in the wrong enabled state.
+# GSE sequence integration
+
+`GET /api/gse/status` returns `phase`, `message`, `nitrogen_passed`,
+`self_test_locked`, `current_step_psi`, nullable `pressure_psi`, nullable `baseline`
+(average/min/max/noise in psi and sample count), and five nullable boolean `valves`
+ordered pilot, vent, dump, nitrogen, nitrous. Poll every 500 ms while visible.
+
+`GET /api/gse/config` and authenticated `POST`/`PUT` expose `nitrogen_target_psi`,
+nullable `pressure_ceiling_psi`, nullable `maximum_zero_offset_psi`, `grouped_panel`,
+and runtime-only `dry_self_test_confirmed`. Edits are rejected during sequencing.
+New command names are `StartFill`, `PauseFill`, `CancelFill`, `ValveSelfTest`, and
+`NitrogenTest`; use existing action policy and command permissions, never direct
+browser valve sequencing. Action layout entries accept an optional `group` string.
+See [sequence behavior and limits](../backend/gse-sequences.md).
