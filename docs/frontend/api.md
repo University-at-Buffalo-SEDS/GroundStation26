@@ -720,3 +720,15 @@ New command names are `StartFill`, `PauseFill`, `CancelFill`, `ValveSelfTest`, a
 `NitrogenTest`; use existing action policy and command permissions, never direct
 browser valve sequencing. Action layout entries accept an optional `group` string.
 See [sequence behavior and limits](../backend/gse-sequences.md).
+# Prelaunch model selection
+
+`GET /api/vehicle_visualization` and delayed program `model` include
+`ground_model_url`. The stock rocket defaults this to
+`/assets/models/gse-site.glb` (tanks, manifold, plumbing, tower, and rocket).
+Use this scene during Startup/Idle/PreFill/FillTest/NitrogenFill/NitrousFill/Armed;
+use `model_url` at Launch and later. Unknown phases show the rocket only.
+The delayed program selects using delayed telemetry, never current live phase.
+Ground scenes remain upright and do not receive rocket-only node transforms.
+Vehicle configuration writes currently accept the bundled ground URL or an empty
+value; custom stored rocket models continue to use the existing model URL contract.
+Empty stage component cards are not displayed; bindings remain backend-owned.

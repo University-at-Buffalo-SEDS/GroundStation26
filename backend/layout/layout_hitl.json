@@ -228,7 +228,7 @@
         "border": "#60a5fa",
         "bg": "#0b1220",
         "fg": "#bfdbfe",
-        "group": "Flight controls"
+        "group": "Manual GSE valves"
       },
       {
         "label": "Igniter Seq",
@@ -236,7 +236,7 @@
         "border": "#38bdf8",
         "bg": "#082f49",
         "fg": "#e0f2fe",
-        "group": "Flight controls"
+        "group": "Manual GSE valves"
       },
       {
         "label": "Fill Lines",

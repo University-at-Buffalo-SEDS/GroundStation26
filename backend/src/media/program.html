@@ -16,9 +16,11 @@ function modelDisplay(videoReady){
  if(videoReady){holder.replaceChildren();}else{
   let model=holder.querySelector('gs-vehicle-viewer');if(!model){model=document.createElement('gs-vehicle-viewer');holder.append(model);}
   const config=state?.model;
-  const src=config?.model_url||'/assets/models/vehicle.glb';if(model.getAttribute('src')!==src)model.setAttribute('src',src);
+  const ground=['Startup','Idle','PreFill','FillTest','NitrogenFill','NitrousFill','Armed'].includes(telemetry?.phase)&&config?.ground_model_url;
+  const src=(ground?config.ground_model_url:config?.model_url)||'/assets/models/vehicle.glb';if(model.getAttribute('src')!==src)model.setAttribute('src',src);
   const neutral={motions:(config?.motions||[{node:'motor-flame',transform:'visible',axis:[0,1,0],from:0,to:1},{node:'main-parachute',transform:'scale',axis:[1,1,1],from:.001,to:1},{node:'drogue-parachute',transform:'scale',axis:[1,1,1],from:.001,to:1}]).map(m=>({...m,value:0})),clip:'',attitude:[0,0,0]};
-  model.setAttribute('data-state',JSON.stringify(telemetry?.model_state||neutral));
+  const groundState={motions:[],attitude:[0,0,0],clip:telemetry?.phase==='NitrogenFill'?'nitrogen-test':telemetry?.phase==='NitrousFill'?'nitrous-fill':''};
+  model.setAttribute('data-state',JSON.stringify(ground?groundState:telemetry?.model_state||neutral));
  }
  const phase=telemetry?.phase||'Unknown';document.querySelector('#rocket-phase').textContent=phase;
  document.querySelector('#flame').style.display=phase==='Ascent'?'':'none';

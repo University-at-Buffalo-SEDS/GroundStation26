@@ -262,6 +262,18 @@ impl Engine {
     }
     pub fn request(&mut self, action: Action, input: Inputs) -> Result<Effects, String> {
         if !self.allows(action, input) {
+            if !input.prelaunch {
+                return Err("GSE action blocked: vehicle is not in a prelaunch state".into());
+            }
+            if !input.interlock {
+                return Err("GSE action blocked: enable the key/software interlock".into());
+            }
+            if !matches!(action, Action::PauseFill | Action::CancelFill) {
+                self.config.validate()?;
+                if Self::fresh_pressure(input).is_none() {
+                    return Err("GSE action blocked: a fresh tank PT sample is required".into());
+                }
+            }
             return Err(
                 "GSE action blocked: check limits, fresh PT, sequence state and interlocks".into(),
             );

@@ -116,3 +116,14 @@ The equipment preview's bundled model-viewer 4.3.1 is Apache-2.0 licensed; see
 `backend/assets/model-viewer.LICENSE`. Built-in uncompressed models require no CDN.
 The main dashboard instead uses the bundled Three.js named-node renderer (MIT).
 Uploaded models using compression may need additional decoder assets.
+# HITL button availability
+
+The action panel places sequence actions first and groups Igniter/Igniter Sequence
+with manual valve controls. Only Valve Self-test uses the confirmation checkbox.
+In HITL, sequence request buttons follow the manual-button interlock; they do not
+require a successful nitrogen test, fresh PT, or configured pressure limits merely
+to be clickable. This is **not** an execution bypass: the backend engine validates
+all normal prerequisites before emitting any valve commands and reports a rejected
+start as a notification. Regular and test-fire builds retain sequenced availability.
+Missing pressure ceiling/empty-tank offset limits must still be configured by the
+backend operator; clicking a button does not supply or override them.

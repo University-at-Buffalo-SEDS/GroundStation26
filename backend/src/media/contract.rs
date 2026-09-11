@@ -124,6 +124,7 @@ struct Vehicle {
     motions: Vec<Motion>,
     title: String,
     model_url: String,
+    ground_model_url: String,
     renderer_url: String,
     model_alt: String,
     camera_orbit: String,
@@ -517,6 +518,9 @@ async fn load_vehicle(state: Arc<MediaState>, headers: HeaderMap) -> ApiResult<V
         vehicle.model_url = format!("/api/stage-models/{}/{}", model.stage, model.name);
     }
     if vehicle.model_url.is_empty() || vehicle.model_url == "/assets/models/vehicle.glb" {
+        if vehicle.ground_model_url.is_empty() {
+            vehicle.ground_model_url = "/assets/models/gse-site.glb".into();
+        }
         vehicle.model_url = "/assets/models/vehicle.glb".into();
         vehicle.model_alt = "Single-stage rocket with aft fins".into();
         vehicle.motions.retain(|motion| {
@@ -586,6 +590,11 @@ async fn save_vehicle(
     axum::Json(vehicle): axum::Json<Vehicle>,
 ) -> ApiResult<StatusCode> {
     authorize(&state, &headers, Permission::SendCommands).await?;
+    if !vehicle.ground_model_url.is_empty()
+        && vehicle.ground_model_url != "/assets/models/gse-site.glb"
+    {
+        return Err(error(StatusCode::BAD_REQUEST, "Select the bundled ground site model"));
+    }
     if vehicle.motions.len() > 128
         || vehicle.motions.iter().any(|m| {
             m.node.is_empty()
@@ -721,6 +730,7 @@ mod tests {
         let wire = serde_json::to_value(config).unwrap();
         for key in [
             "model_url",
+            "ground_model_url",
             "renderer_url",
             "phase_animations",
             "attitude",

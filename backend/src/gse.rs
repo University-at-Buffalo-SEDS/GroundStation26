@@ -134,6 +134,14 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
     let policy = state.action_policy_snapshot();
     let rt = state.gse.lock().unwrap();
     if let Some(action) = action(cmd) {
+        #[cfg(feature = "hitl_mode")]
+        {
+            let _ = (action, is_prelaunch);
+            // Admit the request, not the actuation: handle_command still
+            // enforces every engine prerequisite before emitting effects.
+            return Some(interlock(state, &policy));
+        }
+        #[cfg(not(feature = "hitl_mode"))]
         return Some(
             rt.engine
                 .allows(action, rt.input(is_prelaunch, interlock(state, &policy))),
@@ -167,12 +175,27 @@ fn interlock(state: &AppState, policy: &ActionPolicyMsg) -> bool {
         policy.key_enabled && policy.software_buttons_enabled
     }
 }
+fn sequence_button_enabled(engine: &Engine, action: Action, input: Inputs) -> bool {
+    #[cfg(feature = "hitl_mode")]
+    {
+        input.interlock
+            && (action != Action::SelfTest
+                || (engine.config.dry_self_test_confirmed
+                    && !engine.status.self_test_locked
+                    && !engine.active()))
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    engine.allows(action, input)
+}
+
 pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     let is_prelaunch = prelaunch(state);
     let rt = state.gse.lock().unwrap();
     let input = rt.input(is_prelaunch, interlock(state, policy));
     for (cmd, action) in ACTIONS {
-        let enabled = rt.engine.allows(action, input);
+        // HITL buttons accept a sequence request whenever manual controls are
+        // unlocked. Execution still goes through Engine::allows/request below.
+        let enabled = sequence_button_enabled(&rt.engine, action, input);
         policy.controls.retain(|c| c.cmd != cmd);
         policy.controls.push(ActionControl {
             cmd: cmd.into(),
@@ -406,4 +429,53 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         return e;
     }
     Json(state.gse.lock().unwrap().engine.status.clone()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn button_availability_does_not_bypass_sequence_safety() {
+        let mut rt = Runtime::default();
+        let input = rt.input(true, true);
+        for (_, action) in ACTIONS {
+            #[cfg(feature = "hitl_mode")]
+            assert_eq!(
+                sequence_button_enabled(&rt.engine, action, input),
+                action != Action::SelfTest
+            );
+            #[cfg(not(feature = "hitl_mode"))]
+            assert_eq!(
+                sequence_button_enabled(&rt.engine, action, input),
+                rt.engine.allows(action, input)
+            );
+        }
+        let before = rt.engine.status.phase;
+        assert!(
+            rt.engine
+                .request(Action::NitrogenTest, input)
+                .unwrap_err()
+                .contains("pressure ceiling")
+        );
+        assert_eq!(rt.engine.status.phase, before);
+        rt.engine.config.dry_self_test_confirmed = true;
+        #[cfg(feature = "hitl_mode")]
+        {
+            assert!(sequence_button_enabled(&rt.engine, Action::SelfTest, input));
+            rt.engine.status.self_test_locked = true;
+            assert!(!sequence_button_enabled(
+                &rt.engine,
+                Action::SelfTest,
+                input
+            ));
+            for (_, action) in ACTIONS {
+                assert!(!sequence_button_enabled(
+                    &rt.engine,
+                    action,
+                    rt.input(true, false)
+                ));
+            }
+        }
+    }
 }

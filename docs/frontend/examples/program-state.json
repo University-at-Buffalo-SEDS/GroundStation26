@@ -107,6 +107,7 @@
   "model": {
     "title": "Rocket",
     "model_url": "/assets/models/vehicle.glb",
+    "ground_model_url": "/assets/models/gse-site.glb",
     "renderer_url": "/assets/three/vehicle-renderer.js",
     "model_alt": "Single-stage rocket with aft fins",
     "camera_orbit": "",
