@@ -13,6 +13,7 @@ hitl_mode = []
 test_fire_mode = []
 
 [dependencies]
+gse_sequence = { path = "../shared/gse_sequence" }
 axum = { workspace = true, features = ["ws"] }
 tokio.workspace = true
 serde_json.workspace = true

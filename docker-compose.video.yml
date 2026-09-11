@@ -1,0 +1,30 @@
+# docker compose -f docker-compose.yml -f docker-compose.video.yml up -d
+services:
+  web:
+    environment:
+      GS_VIDEO_API_URL: http://video:9997
+      GS_VIDEO_WEBRTC_URL: http://video:8889
+      GS_VIDEO_PASSWORD: ${GS_VIDEO_PASSWORD:?Set GS_VIDEO_PASSWORD to a strong secret}
+    depends_on:
+      - video
+  video:
+    image: bluenviron/mediamtx:1.21.0
+    restart: unless-stopped
+    ports:
+      - "8554:8554/tcp"
+      - "8189:8189/udp"
+      - "8189:8189/tcp"
+    environment:
+      MTX_WEBRTCADDITIONALHOSTS: ${GS_VIDEO_HOST:?Set GS_VIDEO_HOST to the ground station LAN IP}
+      MTX_AUTHINTERNALUSERS_0_USER: camera
+      MTX_AUTHINTERNALUSERS_0_PASS: ${GS_VIDEO_PASSWORD}
+      MTX_AUTHINTERNALUSERS_0_PERMISSIONS_0_ACTION: publish
+      MTX_AUTHINTERNALUSERS_1_USER: groundstation
+      MTX_AUTHINTERNALUSERS_1_PASS: ${GS_VIDEO_PASSWORD}
+      MTX_AUTHINTERNALUSERS_1_PERMISSIONS_0_ACTION: read
+      MTX_AUTHINTERNALUSERS_1_PERMISSIONS_1_ACTION: api
+    volumes:
+      - ./backend/config/mediamtx.yml:/mediamtx.yml:ro
+    networks:
+      - internal
+      - external

@@ -1,0 +1,33 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Live camera</title>
+<style>html,body{margin:0;width:100%;height:100%;background:#080d15;color:white;font:14px system-ui}video{width:100%;height:100%;object-fit:contain}p{position:absolute;bottom:12px;left:12px;background:#10151dcc;padding:8px;border-radius:5px}</style>
+<video autoplay muted playsinline controls></video><p role="status">Connecting…</p>
+<script>
+'use strict';
+const video=document.querySelector('video'), status=document.querySelector('p');
+const id=location.pathname.split('/').pop(), ticket=new URLSearchParams(location.search).get('ticket');
+const access=path=>path+(ticket?'?ticket='+encodeURIComponent(ticket):'');
+let pc,session,closed=false,retry,watchdog;
+async function cleanup(){clearTimeout(watchdog);if(pc){pc.onconnectionstatechange=null;pc.close();pc=null;}if(session){const url=session;session=null;fetch(access(url),{method:'DELETE',keepalive:true}).catch(()=>{});}}
+function restart(message){if(closed||retry)return;status.hidden=false;status.textContent=message;cleanup();retry=setTimeout(()=>{retry=null;connect();},3000);}
+async function connect(){
+  if(closed)return;
+  const peer=new RTCPeerConnection({iceServers:[]});pc=peer;
+  watchdog=setTimeout(()=>restart('Connection timed out. Retrying…'),20000);
+  peer.addTransceiver('video',{direction:'recvonly'});
+  peer.ontrack=e=>{video.srcObject=new MediaStream([e.track]);};
+  peer.onconnectionstatechange=()=>{if(peer.connectionState==='connected'){clearTimeout(watchdog);status.hidden=true;}else if(['failed','disconnected'].includes(peer.connectionState))restart('Reconnecting…');};
+  try{
+    await peer.setLocalDescription(await peer.createOffer());
+    await new Promise((resolve,reject)=>{if(peer.iceGatheringState==='complete')return resolve();const timeout=setTimeout(()=>reject(Error('ICE gathering timeout')),8000);peer.onicegatheringstatechange=()=>{if(peer.iceGatheringState==='complete'){clearTimeout(timeout);resolve();}};});
+    if(closed||pc!==peer)return;
+    const response=await fetch(access('/api/video/streams/'+encodeURIComponent(id)+'/whep'),{method:'POST',headers:{'Content-Type':'application/sdp'},body:peer.localDescription.sdp});
+    if(!response.ok)throw Error(await response.text());
+    const url=response.headers.get('Location');
+    if(closed||pc!==peer){fetch(access(url),{method:'DELETE'}).catch(()=>{});return;}
+    session=url;
+    await peer.setRemoteDescription({type:'answer',sdp:await response.text()});
+  }catch(err){if(pc===peer)restart(err.message);}
+}
+window.addEventListener('pagehide',()=>{closed=true;clearTimeout(retry);cleanup();});
+connect();
+</script></html>

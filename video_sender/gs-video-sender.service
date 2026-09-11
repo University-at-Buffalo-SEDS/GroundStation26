@@ -1,0 +1,31 @@
+[Unit]
+Description=Ground station Raspberry Pi video sender
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=gs-video
+Group=gs-video
+SupplementaryGroups=video render
+EnvironmentFile=/etc/gs-video-sender/environment
+ExecStart=/usr/local/bin/gs-video-sender daemon /var/lib/gs-video-sender/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=gs-video-sender
+RuntimeDirectoryMode=0750
+StateDirectory=gs-video-sender
+StateDirectoryMode=0750
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/gs-video-sender /run/gs-video-sender
+
+[Install]
+WantedBy=multi-user.target

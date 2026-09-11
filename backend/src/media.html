@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ground station · Video & stage models</title>
+<style>
+  :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #10151d; color: #e8eef7; }
+  body { max-width: 1440px; margin: auto; padding: 24px; }
+  a { color: #87cfff; } h1 { font-size: 1.7rem; } h2 { margin-top: 32px; }
+  input, button { font: inherit; padding: 9px; border: 1px solid #526176; border-radius: 5px; background: #202c3b; color: inherit; }
+  button { cursor: pointer; } button:disabled { opacity: .5; }
+  form { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+  label { display: grid; gap: 6px; } p { color: #bac9dc; }
+  #cameras { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: 18px; }
+  article { background: #1b2634; padding: 14px; border-radius: 8px; }
+  video { width: 100%; aspect-ratio: 16 / 9; background: black; }
+  article h3 { margin-top: 0; } #message { min-height: 1.5em; color: #ffcb80; }
+  li { margin: 12px 0; } li button { margin-left: 16px; }
+</style>
+<a href="/dashboard">← Dashboard</a>
+<h1>Video & stage models</h1>
+<form id="login">
+  <label>Username<input id="username" autocomplete="username" required></label>
+  <label>Password<input id="password" type="password" autocomplete="current-password" required></label>
+  <button>Sign in</button><button id="logout" type="button">Sign out</button>
+</form>
+<p id="message" role="status" aria-live="polite"></p>
+<h2>Live cameras</h2>
+<p id="video-status">Connecting to video receiver…</p>
+<div id="cameras"></div>
+<h2>Rocket stage models</h2>
+<p>Store GLB 2.0 files by stage and model name (up to 64 MiB). Reusing both names replaces that model.</p>
+<form id="upload">
+  <label>Stage<input id="stage" placeholder="booster" pattern="[A-Za-z0-9_-]{1,64}" required></label>
+  <label>Model name<input id="model-name" placeholder="flight-config" pattern="[A-Za-z0-9_-]{1,64}" required></label>
+  <label>3D file<input id="model-file" type="file" accept=".glb" required></label>
+  <button id="save">Upload model</button>
+</form>
+<ul id="models"></ul>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+let token = '', generation = 0;
+const cameras = new Map();
+function notice(text) { $('message').textContent = text; }
+async function api(path, options = {}) {
+  const headers = new Headers(options.headers);
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  const response = await fetch(path, {...options, headers});
+  if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
+  return response;
+}
+const b64 = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes)));
+const urlB64 = bytes => b64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64 = value => Uint8Array.from(atob(value), c => c.charCodeAt(0));
+const encode = value => new TextEncoder().encode(value);
+$('login').onsubmit = async event => {
+  event.preventDefault();
+  try {
+    if (!crypto.subtle) throw new Error('Sign-in requires HTTPS (or localhost).');
+    const username = $('username').value.trim().toLowerCase();
+    const challenge = await (await api('/api/auth/challenge', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({username})})).json();
+    if (challenge.algorithm !== 'pbkdf2_sha256') throw new Error('Unsupported password algorithm');
+    const key = await crypto.subtle.importKey('raw', encode($('password').value), 'PBKDF2', false, ['deriveBits']);
+    $('password').value = '';
+    const verifier = await crypto.subtle.deriveBits({name: 'PBKDF2', hash: 'SHA-256', salt: unb64(challenge.salt_b64), iterations: challenge.iterations}, key, 256);
+    const client_nonce_b64 = urlB64(crypto.getRandomValues(new Uint8Array(32)));
+    const payload = {username, challenge_id: challenge.challenge_id, server_nonce_b64: challenge.server_nonce_b64, client_nonce_b64, remember_me: false};
+    const signingKey = await crypto.subtle.importKey('raw', verifier, {name: 'HMAC', hash: 'SHA-256'}, false, ['sign']);
+    const proof_b64 = urlB64(await crypto.subtle.sign('HMAC', signingKey, encode(JSON.stringify(payload))));
+    const result = await (await api('/api/auth/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({username, challenge_id: challenge.challenge_id, client_nonce_b64, remember_me: false, proof_b64})})).json();
+    stopAll(); token = result.token; notice(`Signed in as ${username}`); await refresh();
+  } catch (err) { notice(err.message); }
+};
+$('logout').onclick = async () => {
+  try { if (token) await api('/api/auth/logout', {method: 'POST'}); }
+  catch (err) { notice(err.message); }
+  finally { stopAll(); token = ''; $('models').replaceChildren(); notice('Signed out'); }
+};
+function stopCamera(camera) {
+  camera.closed = true;
+  camera.pc?.close();
+  if (camera.session) api(camera.session, {method: 'DELETE'}).catch(() => {});
+  camera.card.remove();
+}
+function stopAll() { generation++; for (const camera of cameras.values()) stopCamera(camera); cameras.clear(); }
+async function connect(camera) {
+  const pc = new RTCPeerConnection({iceServers: []}); camera.pc = pc;
+  pc.addTransceiver('video', {direction: 'recvonly'});
+  pc.ontrack = event => { camera.video.srcObject = new MediaStream([event.track]); };
+  pc.onconnectionstatechange = () => {
+    camera.status.textContent = pc.connectionState;
+    if (['failed', 'closed'].includes(pc.connectionState) && !camera.closed) camera.failed = true;
+  };
+  try {
+    await pc.setLocalDescription(await pc.createOffer());
+    // Send a complete offer; this client does not require trickle-ICE PATCH requests.
+    await new Promise((resolve, reject) => {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      const timeout = setTimeout(() => { pc.onicegatheringstatechange = null; reject(new Error('ICE gathering timed out')); }, 8000);
+      pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') { clearTimeout(timeout); pc.onicegatheringstatechange = null; resolve(); } };
+    });
+    if (camera.closed) return;
+    const response = await api(`/api/video/streams/${camera.id}/whep`, {method: 'POST', headers: {'Content-Type': 'application/sdp'}, body: pc.localDescription.sdp});
+    camera.session = response.headers.get('Location');
+    if (camera.closed) { if (camera.session) api(camera.session, {method: 'DELETE'}).catch(() => {}); return; }
+    await pc.setRemoteDescription({type: 'answer', sdp: await response.text()});
+  } catch (err) { pc.close(); camera.failed = true; camera.status.textContent = err.message; }
+}
+function addCamera(id) {
+  const card = document.createElement('article'), title = document.createElement('h3');
+  title.textContent = id;
+  const video = document.createElement('video'); video.autoplay = true; video.muted = true; video.playsInline = true; video.controls = true;
+  const status = document.createElement('p'); status.textContent = 'Connecting…';
+  card.append(title, video, status); $('cameras').append(card);
+  const camera = {id, card, video, status, closed: false, failed: false}; cameras.set(id, camera); connect(camera);
+}
+async function refreshVideo() {
+  const current = generation;
+  try {
+    const streams = await (await api('/api/video/streams')).json();
+    if (current !== generation) return;
+    const live = new Set(streams.filter(s => s.live).map(s => s.id));
+    for (const [id, camera] of cameras) if (!live.has(id) || camera.failed) { stopCamera(camera); cameras.delete(id); }
+    for (const id of live) if (!cameras.has(id)) addCamera(id);
+    $('video-status').textContent = live.size ? `${live.size} camera feed(s)` : 'Waiting for cameras to publish to RTSP port 8554.';
+  } catch (err) { if (current === generation) { for (const camera of cameras.values()) stopCamera(camera); cameras.clear(); $('video-status').textContent = err.message; } }
+}
+async function refreshModels() {
+  const current = generation;
+  const models = await (await api('/api/stage-models')).json();
+  if (current !== generation) return;
+  $('models').replaceChildren();
+  if (!models.length) { const empty = document.createElement('li'); empty.textContent = 'No stage models uploaded yet.'; $('models').append(empty); }
+  for (const model of models) {
+    const item = document.createElement('li'), button = document.createElement('button');
+    item.textContent = `${model.stage} / ${model.name} · ${(model.size_bytes / 1048576).toFixed(2)} MiB`;
+    button.textContent = 'Download'; button.onclick = async () => {
+      try {
+        const blob = await (await api(`/api/stage-models/${model.stage}/${model.name}`)).blob();
+        const url = URL.createObjectURL(blob), link = document.createElement('a'); link.href = url; link.download = `${model.stage}-${model.name}.glb`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (err) { notice(err.message); }
+    };
+    const select = document.createElement('button'); select.textContent = 'Use in Vehicle view';
+    select.onclick = async () => {
+      try {
+        const config = await (await api('/api/vehicle_visualization')).json();
+        config.model_url = `/api/stage-models/${model.stage}/${model.name}`;
+        await api('/api/vehicle_visualization', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config)});
+        notice('Vehicle model selected. Reopen the Vehicle tab to load it.');
+      } catch (err) { notice(err.message); }
+    };
+    item.append(button, select); $('models').append(item);
+  }
+}
+$('upload').onsubmit = async event => {
+  event.preventDefault(); const file = $('model-file').files[0];
+  if (!file || file.size > 64 * 1048576) return notice('Choose a GLB file no larger than 64 MiB.');
+  $('save').disabled = true;
+  try {
+    await api(`/api/stage-models/${encodeURIComponent($('stage').value)}/${encodeURIComponent($('model-name').value)}`, {method: 'PUT', headers: {'Content-Type': 'model/gltf-binary'}, body: file});
+    notice('Model saved'); await refreshModels();
+  } catch (err) { notice(err.message); } finally { $('save').disabled = false; }
+};
+async function refresh() { await Promise.all([refreshVideo(), refreshModels().catch(err => notice(err.message))]); }
+async function poll() { await refreshVideo(); setTimeout(poll, 5000); }
+refreshModels().catch(err => notice(err.message)); poll();
+window.addEventListener('pagehide', stopAll);
+</script>
+</html>

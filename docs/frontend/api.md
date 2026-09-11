@@ -1,5 +1,16 @@
 # Frontend API Contract
 
+## Mission video and vehicle models
+
+The media endpoints follow the sibling frontend's `docs/backend-api.md`:
+`GET /api/live_streams`, `POST /api/live_streams/control`, and
+`GET /api/vehicle_visualization`. Streams use `kind: "webrtc"` and a backend-hosted
+iframe player. Stream and model asset URLs carry scoped, expiring tickets so
+HTML elements do not need bearer headers. Broadcast control requires an
+authenticated `stream_master` session or explicit `StreamControl` permission,
+persists its revision, and rejects stale updates. Existing telemetry payloads and
+bindings are unchanged. See [setup and API details](../backend/video-and-models.md).
+
 This document describes the backend surface the Dioxus frontend depends on to boot, seed state, remain connected, and
 render the dashboard correctly.
 
@@ -448,6 +459,17 @@ Frontend expectations:
 
 ## Optional or Feature-Specific HTTP Endpoints
 
+### `GET` / `POST /api/network_variables/telemetry_rates`
+
+Purpose:
+
+- Read or update retained RF Board and Flight Computer publication rates.
+
+The JSON body and response are `{ "rf_hz": number, "flight_hz": number }`.
+Both values must be finite and between 0.1 and 20 Hz. A successful update is
+cached on disk and published through SEDSNet managed variables, so it survives
+a GroundStation restart and is reacquired when either board rejoins.
+
 ### Calibration mutation endpoints
 
 - `GET /api/calibration`
@@ -465,6 +487,11 @@ Legacy aliases still exposed:
 - `POST /api/loadcell_calibration/refit`
 
 These are required for the calibration tab to be interactive.
+
+Successful load-cell calibration changes also publish the four linear
+coefficients through the retained `DAQ_LOADCELL_CALIBRATION` network variable.
+DAQ persists the value and starts a new SD log before recording samples with
+the new calibration.
 
 Calibration documents keep legacy fields for `ch1` and `iadc`. Additional channels use
 `extra_channels[channel_id]` with generic `linear`, `zero_raw`, `points`, and `fit` fields. Generic

@@ -614,6 +614,21 @@
       "endpoints": [
         "FLIGHT_CONTROLLER"
       ]
+    },
+    {
+      "name": "RF_TELEMETRY_RATE_HZ", "doc": "RF telemetry emission rate in Hz.",
+      "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
+      "element": {"kind": "Static", "data_type": "Float32", "count": 1}, "endpoints": ["GROUND_STATION"]
+    },
+    {
+      "name": "FC_TELEMETRY_RATE_HZ", "doc": "Flight Computer telemetry emission rate in Hz.",
+      "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
+      "element": {"kind": "Static", "data_type": "Float32", "count": 1}, "endpoints": ["GROUND_STATION"]
+    },
+    {
+      "name": "DAQ_LOADCELL_CALIBRATION", "doc": "DAQ calibration [KG1000 slope, KG1000 intercept, IADC slope, IADC intercept].",
+      "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
+      "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["SD_CARD"]
     }
   ]
 }

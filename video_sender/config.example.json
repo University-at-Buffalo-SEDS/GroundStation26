@@ -1,0 +1,16 @@
+{
+  "host": "192.168.1.100",
+  "port": 8554,
+  "username": "camera",
+  "streams": [
+    {
+      "id": "front",
+      "camera": 0,
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "bitrate": 2000000,
+      "enabled": true
+    }
+  ]
+}

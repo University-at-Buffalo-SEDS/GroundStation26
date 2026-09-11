@@ -1,0 +1,11 @@
+[package]
+name = "gs-video-sender"
+version = "0.1.0"
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

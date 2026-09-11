@@ -1,11 +1,14 @@
 # Ground Station 2026
 
+Live multi-camera video, the Raspberry Pi sender daemon, and rocket stage model
+storage are documented in [Video and stage models](docs/backend/video-and-models.md).
+
 ## Dependencies
 
 - Rust: install from https://rustup.rs/
 - `dioxus-cli`: install with `cargo install dioxus-cli`
-- SEDSNet v4.0.23 from crates.io (the workspace lockfile fixes the exact tested
-  release)
+- SEDSNet v4.0.27 from crates.io. The untracked workspace lockfile is local
+  build state; releases are qualified against the current stable `4` series.
 
 The frontend uses Dioxus. No separate WASM toolchain workflow is needed beyond the Rust targets used by `build.py`.
 
@@ -108,7 +111,8 @@ Mode notes:
 
 The backend is a normal SEDSNet endpoint and discovers subscribers and routes by
 schema data type. It does not broadcast every value to both physical links.
-Managed underglow, startup-buzzer, and flight-state values are cached on disk;
+Managed underglow, startup-buzzer, flight-state, RF/FC telemetry-rate, and DAQ
+calibration values are cached on disk;
 their last authoritative values are restored when GroundStation restarts and
 are resynchronized when boards join or reboot.
 

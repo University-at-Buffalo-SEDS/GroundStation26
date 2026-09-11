@@ -552,6 +552,9 @@ pub async fn telemetry_task(
                         continue;
                     }
                     state.record_command_accepted(&cmd, get_current_timestamp_ms());
+                    if crate::gse::handle_command(&state, &cmd) {
+                        continue;
+                    }
                     if matches!(cmd, TelemetryCommand::Abort) {
                         state.set_abort_indicator_latched(true);
                         sequences::refresh_action_policy_now(&state);
@@ -561,6 +564,9 @@ pub async fn telemetry_task(
                         continue;
                     }
                     match cmd {
+                        TelemetryCommand::StartFill | TelemetryCommand::PauseFill
+                        | TelemetryCommand::CancelFill | TelemetryCommand::ValveSelfTest
+                        | TelemetryCommand::NitrogenTest => unreachable!("GSE commands handled before dispatch"),
                         TelemetryCommand::Dump => {
                                 let key = ValveBoardCommands::DumpOpen as u8;
                                 let is_on = effective_umbilical_valve_state(&state, key).unwrap_or(false);
@@ -1555,7 +1561,10 @@ async fn handle_packet(
                     key_on,
                     crate::state::UMBILICAL_PENDING_VALVE_TIMEOUT,
                 );
-                if key_cmd_id == ValveBoardCommands::PilotOpen as u8 && key_on {
+                if key_cmd_id == ValveBoardCommands::PilotOpen as u8
+                    && key_on
+                    && !crate::gse::active(state)
+                {
                     transition_launch_clock_to_t_plus_from_pilot_open(state);
                 }
                 sequences::refresh_action_policy_now(state);
@@ -3796,6 +3805,7 @@ mod tests {
             umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+            gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
             shutdown_tx,

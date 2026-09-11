@@ -72,7 +72,12 @@ const I2C_FLAG_START: u8 = 0x01;
 #[cfg(target_os = "linux")]
 const I2C_FLAG_END: u8 = 0x02;
 #[cfg(target_os = "linux")]
-const I2C_PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_millis(50);
+// This is an inactivity timeout, not a limit on the total transfer duration.
+// A maximum-size SEDSNet topology uses hundreds of 14-byte Pico-Fi slots and
+// can legitimately take much longer than 50 ms to cross Linux I2C.  Expiring
+// from the first slot silently discarded discovery while small telemetry kept
+// working, leaving only chatty boards visible at GroundStation.
+const I2C_PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[cfg(feature = "testing")]
 const DUMMY_ROCKET_TIMESYNC_SOURCES: &[&str] = &["RF", "FC", "PB"];
@@ -1174,7 +1179,7 @@ struct I2cRxAssembly {
     total_len: usize,
     next_offset: usize,
     payload: Vec<u8>,
-    started_at: Instant,
+    last_activity_at: Instant,
 }
 
 #[cfg(target_os = "linux")]
@@ -1203,13 +1208,21 @@ impl I2cRxAssembly {
             total_len,
             next_offset: slot.data.len(),
             payload,
-            started_at: Instant::now(),
+            last_activity_at: Instant::now(),
         })
     }
 
     fn push(
         &mut self,
         slot: &I2cMailboxSlot,
+    ) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
+        self.push_at(slot, Instant::now())
+    }
+
+    fn push_at(
+        &mut self,
+        slot: &I2cMailboxSlot,
+        now: Instant,
     ) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
         if slot.kind != self.kind {
             return Err(std::io::Error::other("i2c transfer kind changed mid-stream").into());
@@ -1233,6 +1246,7 @@ impl I2cRxAssembly {
             self.payload.extend_from_slice(&slot.data);
             self.next_offset += slot.data.len();
         }
+        self.last_activity_at = now;
         if slot.flags & I2C_FLAG_END != 0 {
             if self.payload.len() != self.total_len {
                 return Err(std::io::Error::other(format!(
@@ -1245,6 +1259,10 @@ impl I2cRxAssembly {
             return Ok(Some(std::mem::take(&mut self.payload)));
         }
         Ok(None)
+    }
+
+    fn inactive_at(&self, now: Instant) -> bool {
+        now.duration_since(self.last_activity_at) >= I2C_PARTIAL_PACKET_TIMEOUT
     }
 }
 
@@ -1637,9 +1655,11 @@ impl I2cComms {
             return Ok(None);
         }
 
-        if self.rx_assembly.as_ref().is_some_and(|assembly| {
-            Instant::now().duration_since(assembly.started_at) >= I2C_PARTIAL_PACKET_TIMEOUT
-        }) {
+        if self
+            .rx_assembly
+            .as_ref()
+            .is_some_and(|assembly| assembly.inactive_at(Instant::now()))
+        {
             self.rx_assembly = None;
         }
 
@@ -2501,6 +2521,41 @@ mod tests {
         let mut assembly = I2cRxAssembly::new(&first).unwrap();
         let payload = assembly.push(&second).unwrap().unwrap();
         assert_eq!(payload, b"abcdefghijklmnopqrst");
+    }
+
+    #[test]
+    fn i2c_rx_assembly_timeout_tracks_slot_activity_not_total_duration() {
+        let first = decode_i2c_slot(&encode_i2c_slot(
+            I2C_KIND_DATA,
+            I2C_FLAG_START,
+            19,
+            0,
+            28,
+            b"abcdefghijklmn",
+        ))
+        .unwrap()
+        .unwrap();
+        let second = decode_i2c_slot(&encode_i2c_slot(
+            I2C_KIND_DATA,
+            0,
+            19,
+            14,
+            28,
+            b"opqrstuvwxyz12",
+        ))
+        .unwrap()
+        .unwrap();
+
+        let mut assembly = I2cRxAssembly::new(&first).unwrap();
+        let old_start = Instant::now() - I2C_PARTIAL_PACKET_TIMEOUT * 4;
+        assembly.last_activity_at = old_start;
+        let active_now = Instant::now();
+        assert!(assembly.push_at(&second, active_now).unwrap().is_none());
+        assert!(
+            !assembly
+                .inactive_at(active_now + I2C_PARTIAL_PACKET_TIMEOUT - Duration::from_millis(1))
+        );
+        assert!(assembly.inactive_at(active_now + I2C_PARTIAL_PACKET_TIMEOUT));
     }
 
     #[test]

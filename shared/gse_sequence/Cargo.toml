@@ -1,0 +1,8 @@
+[package]
+name = "gse_sequence"
+version = "0.1.0"
+edition.workspace = true
+license-file.workspace = true
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,26 @@
+# Used with docker-compose.video.yml. Native installations must supply
+# indexed MTX_AUTHINTERNALUSERS_* variables and MTX_WEBRTCADDITIONALHOSTS.
+logLevel: info
+rtsp: true
+rtspAddress: :8554
+rtspTransports: [tcp]
+rtmp: false
+hls: false
+srt: false
+moq: false
+playback: false
+api: true
+apiAddress: :9997
+webrtc: true
+webrtcAddress: :8889
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189
+webrtcIPsFromInterfaces: false
+# Fail closed until credentials are configured by the deployment.
+authInternalUsers: []
+pathDefaults:
+  source: publisher
+  overridePublisher: false
+  maxReaders: 16
+paths:
+  "~^[A-Za-z0-9_-]{1,64}$": {}

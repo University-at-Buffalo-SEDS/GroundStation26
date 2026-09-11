@@ -595,6 +595,7 @@ pub(super) async fn emit_derived_loadcell_rows(
                 *latest = None;
             }
             loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
+                state.gse.lock().unwrap().observe_pressure(None);
                 let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
                 *pressure = None;
             }
@@ -624,6 +625,11 @@ pub(super) async fn emit_derived_loadcell_rows(
             ]
         }
         loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
+            state
+                .gse
+                .lock()
+                .unwrap()
+                .observe_pressure(Some(calibrated_value));
             {
                 let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
                 *pressure = Some(calibrated_value);

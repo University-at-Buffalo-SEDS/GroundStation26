@@ -197,6 +197,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/network_time", get(get_network_time))
         .route("/api/launch_clock", get(get_launch_clock))
         .route("/api/network_topology", get(get_network_topology))
+        .route(
+            "/api/network_variables/telemetry_rates",
+            get(get_telemetry_rates).post(set_telemetry_rates),
+        )
         .route("/api/firmware/targets", get(get_firmware_targets))
         .route("/api/firmware/updates", get(get_firmware_updates))
         .route("/api/firmware/updates/{id}", get(get_firmware_update))
@@ -230,6 +234,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
         .route("/favicon.ico", get(get_favicon))
         .route("/valvestate", get(get_valve_state))
+        .merge(crate::media::router(state.clone()))
+        .merge(crate::gse::routes())
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
         .with_state(state)
@@ -255,7 +261,7 @@ fn auth_failure_response(err: AuthFailure) -> axum::response::Response {
 }
 
 /// Authorizes an HTTP request against the required permission set.
-async fn authorize_headers(
+pub(crate) async fn authorize_headers(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     required: Permission,
@@ -626,6 +632,18 @@ async fn get_loadcell_calibration(
     Json(state.loadcell_calibration.lock().unwrap().clone()).into_response()
 }
 
+fn publish_daq_calibration(
+    state: &AppState,
+    calibration: &loadcell::LoadcellCalibrationFile,
+) -> Result<(), String> {
+    let router = state
+        .topology_router
+        .get()
+        .ok_or_else(|| "SEDSNet router is not ready".to_string())?;
+    crate::network_variables::set_daq_calibration(router, calibration)
+        .map_err(|error| format!("publish DAQ calibration: {error}"))
+}
+
 /// Replaces the loadcell calibration file in memory and on disk.
 async fn set_loadcell_calibration(
     State(state): State<Arc<AppState>>,
@@ -646,6 +664,9 @@ async fn set_loadcell_calibration(
     }
     if let Err(err) = loadcell::save(&cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+    }
+    if let Err(err) = publish_daq_calibration(&state, &cfg) {
+        return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
     }
     state.broadcast_fill_targets_snapshot();
     Json(cfg).into_response()
@@ -672,6 +693,9 @@ async fn capture_loadcell_zero(
     if let Err(err) = loadcell::save(&updated) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
     }
+    if let Err(err) = publish_daq_calibration(&state, &updated) {
+        return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
+    }
     state.broadcast_fill_targets_snapshot();
     Json(updated).into_response()
 }
@@ -696,6 +720,9 @@ async fn capture_loadcell_span(
     };
     if let Err(err) = loadcell::save(&updated) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+    }
+    if let Err(err) = publish_daq_calibration(&state, &updated) {
+        return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
     }
     state.broadcast_fill_targets_snapshot();
     Json(updated).into_response()
@@ -1391,7 +1418,6 @@ async fn apply_flight_setup(
     let Some(router) = state.topology_router.get() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "router unavailable").into_response();
     };
-
     match router.log_queue(
         crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
         &payload,
@@ -1426,6 +1452,56 @@ async fn get_network_topology(
     }
     Json(state.network_topology_snapshot(crate::telemetry_task::get_current_timestamp_ms()))
         .into_response()
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+struct TelemetryRates {
+    rf_hz: f32,
+    flight_hz: f32,
+}
+
+async fn get_telemetry_rates(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(TelemetryRates {
+        rf_hz: crate::network_variables::rf_telemetry_rate_hz(),
+        flight_hz: crate::network_variables::fc_telemetry_rate_hz(),
+    })
+    .into_response()
+}
+
+async fn set_telemetry_rates(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(rates): Json<TelemetryRates>,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
+        return response;
+    }
+    let Some(router) = state.topology_router.get() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "router unavailable").into_response();
+    };
+    if !rates.rf_hz.is_finite()
+        || !rates.flight_hz.is_finite()
+        || !(0.1..=20.0).contains(&rates.rf_hz)
+        || !(0.1..=20.0).contains(&rates.flight_hz)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "rates must be between 0.1 and 20 Hz",
+        )
+            .into_response();
+    }
+    if let Err(error) = crate::network_variables::set_rf_telemetry_rate_hz(router, rates.rf_hz)
+        .and_then(|()| crate::network_variables::set_fc_telemetry_rate_hz(router, rates.flight_hz))
+    {
+        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
+    Json(rates).into_response()
 }
 
 #[derive(Serialize)]

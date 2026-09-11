@@ -133,6 +133,7 @@ pub struct AppState {
 
     /// Latest fuel tank pressure (psi)
     pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
+    pub gse: Arc<Mutex<crate::gse::Runtime>>,
 
     /// Latest calibrated fill-mass estimate from 1000kg loadcell.
     pub latest_fill_mass_kg: Arc<Mutex<Option<f32>>>,
@@ -559,6 +560,30 @@ impl AppState {
             status.last_seen_instant = Some(std::time::Instant::now());
             status.warned = false;
         }
+        // A constrained embedded bridge may export a downstream board only
+        // as a named graph connection. That still proves a live discovered
+        // route and must keep the board visible even when its detailed node
+        // record was compacted to conserve MCU memory.
+        for sender_id in snapshot
+            .links
+            .iter()
+            .flat_map(|link| [&link.source, &link.target])
+        {
+            let Some(board) = Board::from_sender_id(canonical_sender_id(sender_id)) else {
+                continue;
+            };
+            if board == Board::GroundStation {
+                continue;
+            }
+            let Some(status) = map.get_mut(&board) else {
+                continue;
+            };
+            saw_active_route = true;
+            force_broadcast |= status.last_seen_ms.is_none();
+            status.last_seen_ms = Some(now_ms);
+            status.last_seen_instant = Some(std::time::Instant::now());
+            status.warned = false;
+        }
         for route in snapshot.routes {
             saw_active_route = true;
             let relay_board = match route.side_name.as_str() {
@@ -721,10 +746,25 @@ impl AppState {
         let exported = router.export_topology();
         let runtime = router.export_runtime_stats();
         let local_sender = router.sender().to_string();
-        let status = if simulated {
-            NetworkTopologyStatus::Simulated
-        } else {
-            NetworkTopologyStatus::Online
+        let board_status = self.board_status_snapshot(now_ms);
+        let node_status = |sender_id: &str| {
+            if sender_id == local_sender {
+                return if simulated {
+                    NetworkTopologyStatus::Simulated
+                } else {
+                    NetworkTopologyStatus::Online
+                };
+            }
+            match Board::from_sender_id(canonical_sender_id(sender_id)).and_then(|board| {
+                board_status
+                    .boards
+                    .iter()
+                    .find(|entry| entry.board == board)
+            }) {
+                Some(entry) if !entry.seen => NetworkTopologyStatus::Offline,
+                _ if simulated => NetworkTopologyStatus::Simulated,
+                _ => NetworkTopologyStatus::Online,
+            }
         };
         let local_stats = NetworkTopologyStats {
             packets_sent: runtime.sides.iter().map(|side| side.tx_packets).sum(),
@@ -784,7 +824,7 @@ impl AppState {
                     } else {
                         NetworkTopologyNodeKind::Board
                     },
-                    status,
+                    status: node_status(&board.sender_id),
                     group: if is_local { "local" } else { "board" }.to_string(),
                     sender_id: Some(board.sender_id.clone()),
                     endpoints,
@@ -807,15 +847,60 @@ impl AppState {
         let mut links = exported
             .links
             .iter()
-            .map(|link| NetworkTopologyLink {
-                source: node_id(&link.source),
-                target: node_id(&link.target),
-                label: Some("network".to_string()),
-                status,
+            .map(|link| {
+                let source_status = node_status(&link.source);
+                let target_status = node_status(&link.target);
+                NetworkTopologyLink {
+                    source: node_id(&link.source),
+                    target: node_id(&link.target),
+                    label: Some("network".to_string()),
+                    status: if source_status == NetworkTopologyStatus::Offline
+                        || target_status == NetworkTopologyStatus::Offline
+                    {
+                        NetworkTopologyStatus::Offline
+                    } else if simulated {
+                        NetworkTopologyStatus::Simulated
+                    } else {
+                        NetworkTopologyStatus::Online
+                    },
+                }
             })
             .collect::<Vec<_>>();
         links.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
         links.dedup_by(|a, b| a.source == b.source && a.target == b.target);
+
+        // Keep the graph structurally complete when a memory-constrained
+        // bridge exports only a connection name for a downstream router.
+        // SEDSNet uses that stable name to resolve compact application/ACK
+        // senders, and the UI should represent the same discovered node.
+        let referenced_sender_ids = exported
+            .links
+            .iter()
+            .flat_map(|link| [&link.source, &link.target])
+            .cloned()
+            .collect::<Vec<_>>();
+        for sender_id in referenced_sender_ids {
+            let id = node_id(&sender_id);
+            if nodes.iter().any(|node| node.id == id) {
+                continue;
+            }
+            let label = Board::from_sender_id(canonical_sender_id(&sender_id))
+                .map(|known| known.as_str().to_string())
+                .unwrap_or_else(|| sender_id.clone());
+            nodes.push(NetworkTopologyNode {
+                id,
+                label,
+                kind: NetworkTopologyNodeKind::Board,
+                status: node_status(&sender_id),
+                group: "board".to_string(),
+                sender_id: Some(sender_id),
+                endpoints: Vec::new(),
+                show_in_details: true,
+                detail: None,
+                stats: None,
+            });
+        }
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
 
         NetworkTopologyMsg {
             generated_ms: now_ms,
@@ -827,6 +912,7 @@ impl AppState {
 
     /// Stores the most recent commanded umbilical valve state by command id.
     pub fn set_umbilical_valve_state(&self, cmd_id: u8, on: bool) {
+        self.gse.lock().unwrap().observe_valve(cmd_id, on);
         let mut map = self.umbilical_valve_states.lock().unwrap();
         map.insert(cmd_id, on);
     }
@@ -1129,6 +1215,7 @@ impl AppState {
                 _ => {}
             }
         }
+        crate::gse::decorate_policy(self, &mut policy);
         let mut slot = self.action_policy.lock().unwrap();
         if *slot == policy {
             return;
@@ -1156,6 +1243,9 @@ impl AppState {
 
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
+        if let Some(allowed) = crate::gse::command_allowed(self, cmd) {
+            return allowed;
+        }
         #[cfg(feature = "hitl_mode")]
         {
             let exempt = matches!(
@@ -1365,6 +1455,7 @@ impl AppState {
             status.warned = false;
         }
         *self.latest_fuel_tank_pressure.lock().unwrap() = None;
+        *self.gse.lock().unwrap() = crate::gse::Runtime::default();
         *self.latest_fill_mass_kg.lock().unwrap() = None;
         self.last_command_ms.lock().unwrap().clear();
         self.fill_sequence_continue_requests
@@ -1468,6 +1559,7 @@ mod tests {
     use crate::loadcell;
     use crate::ring_buffer::RingBuffer;
     use crate::telemetry_db::{DbQueueItem, RecordingModeWire, RecordingStatusMsg};
+    use sedsnet::discovery::{TopologyBoardNode, build_discovery_topology};
     use sedsnet::router::{EndpointHandler, RouterConfig, RouterSideId, RouterSideOptions};
     use sqlx::SqlitePool;
     use std::path::PathBuf;
@@ -1582,6 +1674,78 @@ mod tests {
             .find(|entry| entry.board == Board::ValveBoard)
             .expect("Valve board status missing");
         assert!(valve_status.seen);
+
+        {
+            let mut statuses = state.board_status.lock().unwrap();
+            statuses
+                .get_mut(&Board::ValveBoard)
+                .expect("Valve status missing")
+                .last_seen_instant = Some(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(BOARD_SEEN_TIMEOUT_MS + 1))
+                    .unwrap(),
+            );
+        }
+        let stale_snapshot = state.network_topology_snapshot(20_000);
+        let stale_valve = stale_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.sender_id.as_deref() == Some(Board::ValveBoard.sender_id()))
+            .expect("stale Valve node disappeared from topology history");
+        assert_eq!(stale_valve.status, NetworkTopologyStatus::Offline);
+        assert!(stale_snapshot.links.iter().any(|link| {
+            (link.source == stale_valve.id || link.target == stale_valve.id)
+                && link.status == NetworkTopologyStatus::Offline
+        }));
+    }
+
+    #[tokio::test]
+    async fn connection_only_gateway_topology_keeps_actuator_and_daq_visible() {
+        let state = test_app_state().await;
+        let ground = Arc::new(Router::new(
+            RouterConfig::new([]).with_sender(Board::GroundStation.sender_id()),
+        ));
+        let ingress = ground.add_side_packet("umbilical_comms", |_pkt| Ok(()));
+        state
+            .topology_router
+            .set(ground.clone())
+            .expect("failed to set topology router");
+
+        let topology = build_discovery_topology(
+            Board::GatewayBoard.sender_id(),
+            1,
+            &[TopologyBoardNode {
+                sender_id: Board::GatewayBoard.sender_id().to_string(),
+                reachable_endpoints: Vec::new(),
+                reachable_timesync_sources: Vec::new(),
+                connections: vec![
+                    Board::ActuatorBoard.sender_id().to_string(),
+                    Board::DaqBoard.sender_id().to_string(),
+                    Board::ValveBoard.sender_id().to_string(),
+                ],
+            }],
+        )
+        .unwrap();
+        ground.rx_from_side(&topology, ingress).unwrap();
+        ground.process_all_queues().unwrap();
+
+        state.mark_discovered_relays_seen();
+        let snapshot = state.network_topology_snapshot(2_000);
+        for board in [Board::ActuatorBoard, Board::DaqBoard, Board::ValveBoard] {
+            assert!(
+                snapshot
+                    .nodes
+                    .iter()
+                    .any(|node| { node.sender_id.as_deref() == Some(board.sender_id()) })
+            );
+            assert!(
+                state
+                    .board_status_snapshot(2_000)
+                    .boards
+                    .iter()
+                    .any(|status| { status.board == board && status.seen })
+            );
+        }
     }
 
     #[tokio::test]
@@ -1601,10 +1765,7 @@ mod tests {
         let rf_radio_side_slot = gs_to_rf.clone();
         let rf_for_ground = rf.clone();
         let ground_side = ground.add_side_packed("rocket_comms", move |bytes| {
-            rf_for_ground.rx_packed_from_side(
-                bytes,
-                rf_radio_side_slot.lock().unwrap().unwrap(),
-            )
+            rf_for_ground.rx_packed_from_side(bytes, rf_radio_side_slot.lock().unwrap().unwrap())
         });
         let ground_for_rf = ground.clone();
         let rf_radio_side = rf.add_side_packed("radio", move |bytes| {
@@ -1616,10 +1777,7 @@ mod tests {
         let flight_side_slot = rf_to_flight.clone();
         let flight_for_rf = flight.clone();
         let rf_can_side = rf.add_side_packed("can", move |bytes| {
-            flight_for_rf.rx_packed_from_side(
-                bytes,
-                flight_side_slot.lock().unwrap().unwrap(),
-            )
+            flight_for_rf.rx_packed_from_side(bytes, flight_side_slot.lock().unwrap().unwrap())
         });
         let rf_for_flight = rf.clone();
         let flight_side = flight.add_side_packed("can", move |bytes| {
@@ -1642,12 +1800,17 @@ mod tests {
         }
 
         let snapshot = state.network_topology_snapshot(2_000);
-        assert!(snapshot.nodes.iter().any(|node| {
-            node.sender_id.as_deref() == Some(Board::RFBoard.sender_id())
-        }));
-        assert!(snapshot.nodes.iter().any(|node| {
-            node.sender_id.as_deref() == Some(Board::FlightComputer.sender_id())
-        }));
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .any(|node| { node.sender_id.as_deref() == Some(Board::RFBoard.sender_id()) })
+        );
+        assert!(
+            snapshot.nodes.iter().any(|node| {
+                node.sender_id.as_deref() == Some(Board::FlightComputer.sender_id())
+            })
+        );
         let rf_id = "board_rf";
         let flight_id = "board_fc";
         assert!(snapshot.links.iter().any(|link| {
@@ -1912,6 +2075,7 @@ mod tests {
             umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+            gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
             shutdown_tx,

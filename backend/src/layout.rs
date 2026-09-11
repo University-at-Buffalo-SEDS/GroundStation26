@@ -32,6 +32,8 @@ fn default_main_tabs() -> Vec<String> {
         "state".to_string(),
         "connection-status".to_string(),
         "map".to_string(),
+        "mission".to_string(),
+        "vehicle".to_string(),
         "actions".to_string(),
         "firmware-update".to_string(),
         "calibration".to_string(),
@@ -486,6 +488,8 @@ fn default_fill_targets_require_actions_enabled() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionSpec {
+    #[serde(default)]
+    pub group: String,
     pub label: String,
     pub cmd: String,
     pub border: String,
@@ -687,6 +691,7 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
     layout.actions_tab.actions.insert(
         0,
         ActionSpec {
+            group: "Recording".into(),
             label: "Reset Sim".to_string(),
             cmd: "ResetSim".to_string(),
             border: "#38bdf8".to_string(),

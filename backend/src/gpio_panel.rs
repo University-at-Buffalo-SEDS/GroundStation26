@@ -392,7 +392,10 @@ where
             }
             return;
         }
-        if tx.try_send(cmd.clone()).is_err() {
+        if tx
+            .try_send(crate::gse::panel_command(&state, cmd.clone()))
+            .is_err()
+        {
             eprintln!("GPIO button pin {pin}: failed to send command");
         }
     })?;
@@ -422,7 +425,7 @@ fn gpio_led_task(
         let now_ms = crate::telemetry_task::get_current_timestamp_ms();
 
         let policy = state.action_policy_snapshot();
-        let actions = allowed_from_policy(&policy);
+        let actions = allowed_from_policy(&state, &policy);
 
         {
             let mut slot = allowed.lock().unwrap();
@@ -505,8 +508,9 @@ fn gpio_led_task(
     }
 }
 
-fn allowed_from_policy(policy: &ActionPolicyMsg) -> AllowedActions {
+fn allowed_from_policy(state: &AppState, policy: &ActionPolicyMsg) -> AllowedActions {
     let enabled = |cmd: &str| {
+        let cmd = crate::gse::panel_name(state, cmd);
         policy
             .controls
             .iter()
@@ -528,6 +532,8 @@ fn allowed_from_policy(policy: &ActionPolicyMsg) -> AllowedActions {
 }
 
 fn led_for(state: &AppState, policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -> f64 {
+    let mapped = crate::gse::panel_name(state, cmd);
+    let cmd = mapped.as_str();
     if cmd == "Launch" && state.launch_indicator_latched() {
         return 1.0;
     }

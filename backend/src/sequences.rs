@@ -566,6 +566,11 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::StopWritingDb => "StopWritingDb",
         TelemetryCommand::ResetSim => "ResetSim",
         TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
+        TelemetryCommand::StartFill => "StartFill",
+        TelemetryCommand::PauseFill => "PauseFill",
+        TelemetryCommand::CancelFill => "CancelFill",
+        TelemetryCommand::ValveSelfTest => "ValveSelfTest",
+        TelemetryCommand::NitrogenTest => "NitrogenTest",
         TelemetryCommand::MonitorAltitude => "MonitorAltitude",
         TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
         TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
@@ -2093,6 +2098,7 @@ pub fn start_sequence_task(
     state: Arc<AppState>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
+    crate::gse::initialize(&state);
     let cfg = SequenceConfig::from_env();
     if cfg!(feature = "hitl_mode") {
         return tokio::spawn(async move {
@@ -2101,6 +2107,8 @@ pub fn start_sequence_task(
                 tokio::select! {
                     _ = tick.tick() => {
                         state.expire_pending_umbilical_valve_states(UMBILICAL_PENDING_VALVE_TIMEOUT);
+                        #[cfg(feature = "hitl_mode")]
+                        crate::gse::tick(&state, state.hitl_button_interlock_satisfied());
                         let valves = ValveSnapshot::read(&state);
                         state.set_action_policy(hitl_action_policy(valves));
                     }
@@ -2186,7 +2194,8 @@ pub fn start_sequence_task(
                 }
             }
 
-            if sequence_active {
+            crate::gse::tick(&state, key_enabled && software_buttons_enabled);
+            if sequence_active && !crate::gse::claimed(&state) {
                 update_sequence_runtime(
                     &state,
                     &mut runtime,
@@ -2197,8 +2206,10 @@ pub fn start_sequence_task(
                     now,
                 );
             }
-            flight_state =
-                maybe_drive_local_prelaunch_state(&state, &runtime, valves, flight_state);
+            if !crate::gse::claimed(&state) {
+                flight_state =
+                    maybe_drive_local_prelaunch_state(&state, &runtime, valves, flight_state);
+            }
             state.set_sequence_policy_state(runtime.policy_state());
             let policy = build_policy(
                 &state,
@@ -2242,7 +2253,9 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
         runtime = SequenceRuntime::default();
         state.set_sequence_policy_state(runtime.policy_state());
     }
-    flight_state = maybe_drive_local_prelaunch_state(state, &runtime, valves, flight_state);
+    if !crate::gse::claimed(state) {
+        flight_state = maybe_drive_local_prelaunch_state(state, &runtime, valves, flight_state);
+    }
     state.set_sequence_policy_state(runtime.policy_state());
     let policy = build_policy(
         state,

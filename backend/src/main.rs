@@ -19,11 +19,13 @@ mod flight_setup;
 mod flight_sim;
 mod gpio;
 mod gpio_panel;
+mod gse;
 mod i18n;
 mod layout;
 mod loadcell;
 mod logger;
 mod map;
+mod media;
 mod network_variables;
 mod ring_buffer;
 mod rocket_commands;
@@ -253,6 +255,10 @@ impl StreamRateProbe {
     }
 }
 
+fn request_startup_topology(router: &sedsnet::router::Router) -> sedsnet::TelemetryResult<()> {
+    router.request_topology()
+}
+
 #[cfg(test)]
 mod router_link_policy_tests {
     use super::*;
@@ -291,6 +297,35 @@ mod router_link_policy_tests {
         assert!(!probe.observe(2_010, 750, 1_250, 2));
         assert!(probe.observe(3_020, 750, 1_250, 2));
         assert!(!probe.observe(5_000, 750, 1_250, 2));
+    }
+
+    #[test]
+    fn startup_topology_request_is_sent_on_every_physical_side() {
+        let router = sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]));
+        let left = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let right = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let left_tx = left.clone();
+        let right_tx = right.clone();
+        router.add_side_packed("rocket", move |bytes| {
+            left_tx.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        });
+        router.add_side_packed("fill", move |bytes| {
+            right_tx.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        });
+
+        request_startup_topology(&router).unwrap();
+        router.process_all_queues().unwrap();
+
+        for frames in [&left, &right] {
+            let frames = frames.lock().unwrap();
+            assert!(frames.iter().any(|frame| {
+                sedsnet::wire_format::unpack_packet(frame).is_ok_and(|packet| {
+                    packet.data_type() == sedsnet::config::DataType::DiscoveryTopologyRequest
+                })
+            }));
+        }
     }
 }
 
@@ -536,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
         umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+        gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
         shutdown_tx,
@@ -698,8 +734,6 @@ async fn main() -> anyhow::Result<()> {
                     pilot_open_ack_generation_handler.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            ground_station_handler_state_clone
-                .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
             let mut rb = ground_station_handler_state_clone
                 .ring_buffer
@@ -713,8 +747,6 @@ async fn main() -> anyhow::Result<()> {
     let flight_state_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("FLIGHT_STATE"),
         move |pkt: &Packet| {
-            flight_state_handler_state_clone
-                .mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             flight_state_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
             let mut rb = flight_state_handler_state_clone.ring_buffer.lock().unwrap();
             rb.push(pkt.clone());
@@ -725,7 +757,6 @@ async fn main() -> anyhow::Result<()> {
     let abort_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("ABORT"),
         move |pkt: &Packet| {
-            abort_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             abort_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
             abort_handler_state_clone.clear_launch_sequence_command_pending();
             abort_handler_state_clone.set_abort_indicator_latched(true);
@@ -747,7 +778,6 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("HEART_BEAT"),
         move |pkt: &Packet| {
-            heartbeat_handler_state_clone.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
             heartbeat_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
             let mut rb = heartbeat_handler_state_clone.ring_buffer.lock().unwrap();
             rb.push(pkt.clone());
@@ -774,7 +804,8 @@ async fn main() -> anyhow::Result<()> {
         heartbeat_handler,
         telemetry_error_handler,
     ])
-    .with_sender(Board::GroundStation.sender_id());
+    .with_sender(Board::GroundStation.sender_id())
+    .with_preferred_discovery_master(Board::GroundStation.sender_id());
     if telemetry_task::timesync_enabled() {
         cfg = cfg.with_timesync(TimeSyncConfig {
             role: TimeSyncRole::Source,
@@ -929,6 +960,15 @@ async fn main() -> anyhow::Result<()> {
     };
     if let Err(err) = initial_discovery {
         eprintln!("WARNING: failed to queue initial discovery announce: {err}");
+    }
+    // Announcing only teaches adjacent routers about GroundStation. It does
+    // not make a freshly restarted process recover topology that peers are
+    // advertising at their slow steady-state cadence. Request one bounded
+    // snapshot on every side at startup; discovered routers answer with their
+    // current transitive graph, so fill and AV-bay routes recover without a
+    // recurring broadcast/fanout workaround.
+    if let Err(err) = request_startup_topology(&router) {
+        eprintln!("WARNING: failed to request startup network topology: {err}");
     }
 
     // --- Background tasks ---
@@ -1147,6 +1187,45 @@ async fn main() -> anyhow::Result<()> {
                         {
                             break;
                         }
+                    }
+                    let traffic_deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        let attributed = expected
+                            .iter()
+                            .filter_map(|sender| {
+                                validation_router.client_stats(sender).and_then(|stats| {
+                                    (stats.packets_received > 0)
+                                        .then_some((sender.clone(), stats.packets_received))
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        if attributed.len() == expected.len() {
+                            log::info!(
+                                "full-bay per-board traffic attribution ready: {}",
+                                attributed
+                                    .iter()
+                                    .map(|(sender, packets)| format!("{sender}={packets}"))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            );
+                            break;
+                        }
+                        if Instant::now() >= traffic_deadline {
+                            let missing = expected
+                                .iter()
+                                .filter(|sender| {
+                                    validation_router
+                                        .client_stats(sender)
+                                        .is_none_or(|stats| stats.packets_received == 0)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            log::error!(
+                                "full-bay per-board traffic attribution timed out; missing={missing:?}"
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                     break;
                 }

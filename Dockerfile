@@ -33,12 +33,19 @@ COPY backend/layout backend/layout
 COPY backend/calibration backend/calibration
 COPY backend/comms backend/comms
 COPY backend/config backend/config
+COPY backend/assets backend/assets
 COPY backend/users backend/users
 COPY backend/build.py backend/
 
 # Map downloader crate
 COPY map_downloader/Cargo.toml map_downloader/
 COPY map_downloader/src map_downloader/src
+
+# Keep the workspace sender member available to Cargo during backend builds.
+COPY video_sender/Cargo.toml video_sender/
+COPY video_sender/src video_sender/src
+COPY video_sender/config.example.json video_sender/
+COPY shared/gse_sequence shared/gse_sequence
 
 # Top-level workspace manifest and main build script
 COPY Cargo.toml ./
