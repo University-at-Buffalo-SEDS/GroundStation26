@@ -1,8 +1,11 @@
 # Ground support equipment sequences
 
-The Actions tab contains a grouped **Reconfigure GSE** panel, a live equipment
-scene, pressure/noise status, and sequence settings. Individual valves remain in
-the **Manual GSE valves** group. Do not operate hardware from this software until
+The Actions tab keeps its original controls and contains the new **GSE sequence
+actions** in the main button area. Individual valves remain in the **Manual GSE
+valves** group. Ground setup (equipment scene, pressure/noise status, settings and
+checklist) appears in both Dashboard/state and Mission before launch. It is removed
+from Launch onward, leaving the rocket and flight/recovery information.
+Do not operate hardware from this software until
 qualified personnel have reviewed the plumbing, command mapping, pressure limits,
 and failure behavior, and completed an isolated-gas bench test. Software commands
 and board acknowledgements are not independent valve-position feedback. Mechanical
@@ -16,11 +19,27 @@ Commands use the existing authenticated WebSocket command channel and action pol
 Configuration persists in `backend/config/gse_sequence.json`, overridable with
 `GS_GSE_CONFIG`. Runtime calibration and nitrogen-pass status never survive restart.
 
-Set `nitrogen_target_psi`, `pressure_ceiling_psi`, and `maximum_zero_offset_psi` in
-the UI. The last two ship unset: automatic operations are unavailable until valid
+The only numeric GSE settings in the UI are `nitrogen_target_psi` (nitrogen maximum
+pressure) and `pressure_step_psi` (positive increment, default 50 psi). The last
+increment is capped at the target. Backend administrators configure
+`pressure_ceiling_psi`, `maximum_zero_offset_psi`, and `grouped_panel` in the backend
+configuration. The two safety bounds ship unset: automatic operations are unavailable until valid
 limits are supplied. Target plus zero allowance must be below the pressure ceiling.
 The ceiling is a software trip threshold, not a guarantee against overshoot.
-Incomplete settings can be saved to select manual panel mode without enabling tests.
+Removing those bounds from the UI does not remove their enforcement.
+
+The **Unlock dry valve self-test** checkbox sits with the main GSE action buttons.
+`POST /api/gse/self-test-confirmation` accepts/returns `{"confirmed":true}` or false,
+requires command permission and `ValveSelfTest` authorization, and returns 409 during
+an active sequence or when trying to unlock after nitrogen testing has started.
+Confirmation is not persisted across backend restarts and is consumed by a test.
+All existing PT, valve acknowledgement, interlock and sequence gates still apply.
+The UI's checkbox must also be checked before its self-test button is enabled.
+
+The ground checklist is a local, per-ground-station operator reminder, retained on
+that device when switching views. It has a reset button; reset before each operation.
+Checkmarks do not certify hardware state, synchronize across clients, unlock tests,
+or bypass backend interlocks.
 
 Calibration opens vent/dump, closes supplies/pilot, waits for acknowledgements, then
 collects five seconds of fresh PT samples (at least ten). It records average, min,
@@ -40,8 +59,9 @@ pressurized tank as empty. A PT reading alone cannot establish safe depressuriza
 | Nitrogen test | Closed | Closed | Closed | Controlled | Closed |
 | Self-test completion / nitrogen dump | Closed | Open | Open | Closed | Closed |
 
-The nitrogen test calibrates zero, closes all valves, and raises pressure in 50 psi
-steps, with a final smaller step to the configured target. Each step closes nitrogen,
+The nitrogen test calibrates zero, closes all valves, and raises pressure in configured
+`pressure_step_psi` increments (50 psi by default), with a final smaller step to the
+configured target. Each step closes nitrogen,
 allows at least two seconds to settle, and holds for five seconds. Rolling averages
 filter isolated noisy samples. A drop greater than 3 psi plus the two-reading noise
 envelope fails immediately; a sustained five-second mean loss greater than 3 psi

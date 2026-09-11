@@ -323,6 +323,37 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(get_config).put(save_config).post(save_config),
         )
         .route("/api/gse/status", get(status))
+        .route(
+            "/api/gse/self-test-confirmation",
+            axum::routing::post(self_test_confirmation),
+        )
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+struct SelfTestConfirmation {
+    confirmed: bool,
+}
+async fn self_test_confirmation(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<SelfTestConfirmation>,
+) -> Response {
+    let principal =
+        match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+    if !principal.allows_command_name("ValveSelfTest") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    {
+        let mut rt = state.gse.lock().unwrap();
+        if rt.engine.active() || (request.confirmed && rt.engine.status.self_test_locked) {
+            return (StatusCode::CONFLICT,"Self-test confirmation is locked during a sequence or after nitrogen testing starts").into_response();
+        }
+        rt.engine.config.dry_self_test_confirmed = request.confirmed;
+    }
+    crate::sequences::refresh_action_policy_now(&state);
+    Json(request).into_response()
 }
 async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(e) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {

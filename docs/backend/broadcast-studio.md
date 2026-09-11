@@ -73,11 +73,23 @@ requires the configured publisher credentials.
 
 The program preloads up to eight visible cameras and aligns them using HLS program
 date/time. A cut fades between already-decoding feeds over 550 ms. An unavailable
-target produces a buffering screen instead of silently showing live video. Delay
+target shows the full-size backend rocket model while buffering, never live video. Delay
 changes discard browser buffers and re-align; camera disconnects, missing timing
 anchors, and expired authentication fail closed. Keep ground-station time accurate
 (NTP). Timing reflects relay ingestion, not a camera shutter timestamp. The delay
 cannot retract frames already delivered under a previous, shorter setting.
+
+Streamer mode omits header and tab navigation entirely. Without active/decoded video,
+the backend-selected rocket model fills the scene; while video plays, a small 2D
+rocket appears in the corner. Flight phase, attitude and model motions use the delayed
+snapshot (`telemetry.model_state`), not live dashboard data. Before history warms or
+if it becomes unavailable, the model uses a neutral pose and displays unknown state.
+`program/state` includes static `model` configuration with scoped asset URLs even when
+the camera relay is offline. This does not bypass delay enforcement for video.
+
+Ground setup appears in both main Dashboard/state and Mission for operators before
+Launch. At Launch and later it is removed, leaving rocket flight/recovery views.
+Sequence buttons remain in the main Actions button section, not inside ground setup.
 
 Phase, T−/T+ launch clock and configured statistics use a bounded delayed snapshot history. The T clock is calculated at snapshot time and displayed beside the other program data; it never advances using the live clock. New viewers
 may initially see “Buffering delayed telemetry”; current telemetry is never substituted
@@ -107,7 +119,7 @@ the updated `backend/config/mediamtx.yml`. HLS uses internal port 8888, not a ne
 public port. The bundled HLS.js 1.6.13 is BSD-2-Clause licensed (`backend/assets/hls.LICENSE`).
 
 Delayed playback requires Media Source Extensions and H.264 support. A browser lacking
-those capabilities displays an explicit message, with no live fallback. Chrome desktop
+those capabilities shows the model instead, with no live-video fallback. Chrome desktop
 has been tested; actual Pi, Android and iOS/WebView validation remains a deployment
 requirement. This is an in-app/browser program suitable for browser-source capture;
 it does not publish to an external streaming service or provide synchronized audio.

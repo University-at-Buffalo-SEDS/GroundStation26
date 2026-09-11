@@ -7,6 +7,12 @@ Settings → General → Viewing mode → Ground Station view restores the instr
 and control dashboard on that device. The separate Vehicle tab and user-facing
 binding editor have been removed.
 
+Ground equipment/setup is visible in Dashboard/state and Mission only before Launch;
+the subsequent model views contain the rocket and flight/recovery data. Streamer
+uses this model full-size without active video and a simple 2D rocket inset with video.
+Its model motion/attitude state is resolved server-side and buffered with telemetry,
+so launch or recovery visuals cannot precede the delayed stream.
+
 Configure bindings in the backend's stage-model directory `_presentation.json`
 (`vehicle.motions`, `vehicle.attitude`, `vehicle.stages`, and `stats`). Backend
 administration tools may also use the authenticated vehicle configuration API;

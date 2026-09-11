@@ -487,6 +487,11 @@ async fn control_broadcast(
 }
 
 async fn vehicle(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> ApiResult<Response> {
+    let vehicle = load_vehicle(state, headers).await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], axum::Json(vehicle)).into_response())
+}
+
+async fn load_vehicle(state: Arc<MediaState>, headers: HeaderMap) -> ApiResult<Vehicle> {
     authorize(&state, &headers, Permission::ViewData).await?;
     let mut vehicle = read_presentation(&state).await?.vehicle;
     let models = list_models(State(state.clone()), headers.clone()).await?.0;
@@ -572,7 +577,7 @@ async fn vehicle(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> Ap
         let ticket = ticket(&state, &headers, &format!("model:{stage}:{name}")).await?;
         vehicle.model_url = format!("/api/media-assets/models/{stage}/{name}?ticket={ticket}");
     }
-    Ok(([(header::CACHE_CONTROL, "no-store")], axum::Json(vehicle)).into_response())
+    Ok(vehicle)
 }
 
 async fn save_vehicle(

@@ -1,5 +1,6 @@
 {
   "nitrogen_target_psi": 120.0,
+  "pressure_step_psi": 50.0,
   "pressure_ceiling_psi": null,
   "maximum_zero_offset_psi": null,
   "dry_self_test_confirmed": false,

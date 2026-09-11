@@ -2,6 +2,24 @@
 
 ## Mission video and vehicle models
 
+The Actions tab retains its manual controls and presents GSE sequence commands in
+the same main button area. Ground setup is shown in both Dashboard/state and Mission
+before Launch, then removed for flight/recovery. Its only numeric settings are
+nitrogen maximum pressure (`nitrogen_target_psi`) and pressure step (`pressure_step_psi`,
+default 50). Safety ceiling, zero-offset allowance and hardware panel mapping remain
+backend configuration. A local checkable/resettable checklist is informational only.
+
+`POST /api/gse/self-test-confirmation` accepts/returns `{confirmed:bool}`; it requires
+SendCommands plus ValveSelfTest authorization. It returns 409 during an active
+sequence or when requesting unlock after nitrogen testing begins. The explicit
+Actions checkbox and all backend interlocks must permit self-test. Confirmation is
+consumed by testing and is not persisted across backend restart.
+
+Streamer mode renders no header/tab navigation. Without playable video it displays
+the full-size backend model; with video it displays a corner 2D rocket. Program state
+now contains static `model` configuration and delayed `telemetry.model_state`
+(`motions`, `attitude`, `orbit`, `clip`). No live phase/binding data is substituted.
+
 Dashboard is the primary single-stage model view; the separate Vehicle tab has been
 removed. Settings → General → Viewing mode → Ground Station view restores instruments
 and controls on that device. Streamer is available to any viewer from the same settings

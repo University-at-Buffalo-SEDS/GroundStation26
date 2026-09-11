@@ -10,6 +10,7 @@ pub const FILL_READY: [bool; 5] = [false, true, false, false, false];
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub nitrogen_target_psi: f32,
+    pub pressure_step_psi: f32,
     pub pressure_ceiling_psi: Option<f32>,
     pub maximum_zero_offset_psi: Option<f32>,
     pub dry_self_test_confirmed: bool,
@@ -19,6 +20,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             nitrogen_target_psi: 120.0,
+            pressure_step_psi: 50.0,
             pressure_ceiling_psi: None,
             maximum_zero_offset_psi: None,
             dry_self_test_confirmed: false,
@@ -30,6 +32,8 @@ impl Config {
     /// Incomplete limits may be saved, but cannot enable automatic operations.
     pub fn validate_settings(&self) -> Result<(), String> {
         if !self.nitrogen_target_psi.is_finite()
+            || !self.pressure_step_psi.is_finite()
+            || self.pressure_step_psi <= 0.0
             || self.nitrogen_target_psi <= 0.0
             || self
                 .pressure_ceiling_psi
@@ -53,6 +57,8 @@ impl Config {
             .maximum_zero_offset_psi
             .ok_or("Set the maximum acceptable empty-tank PT offset")?;
         if !ceiling.is_finite()
+            || !self.pressure_step_psi.is_finite()
+            || self.pressure_step_psi <= 0.0
             || !zero.is_finite()
             || !self.nitrogen_target_psi.is_finite()
             || zero < 0.0
@@ -460,7 +466,10 @@ impl Engine {
                     samples: self.samples.len(),
                 });
                 self.self_index = 0;
-                self.status.current_step_psi = 50.0_f32.min(self.config.nitrogen_target_psi);
+                self.status.current_step_psi = self
+                    .config
+                    .pressure_step_psi
+                    .min(self.config.nitrogen_target_psi);
                 return self.configure(
                     if self.testing_valves {
                         Phase::SelfSetup
@@ -597,8 +606,9 @@ impl Engine {
                             "Nitrogen holds passed; dumping tank before enabling fill",
                         );
                     }
-                    self.status.current_step_psi =
-                        (self.status.current_step_psi + 50.0).min(self.config.nitrogen_target_psi);
+                    self.status.current_step_psi = (self.status.current_step_psi
+                        + self.config.pressure_step_psi)
+                        .min(self.config.nitrogen_target_psi);
                     return self.configure(
                         Phase::NitrogenSetup,
                         CLOSED,
@@ -696,6 +706,7 @@ mod tests {
             let mut engine = Engine::default();
             engine.config = Config {
                 nitrogen_target_psi: 120.0,
+                pressure_step_psi: 50.0,
                 pressure_ceiling_psi: Some(200.0),
                 maximum_zero_offset_psi: Some(8.0),
                 dry_self_test_confirmed: true,
@@ -875,6 +886,34 @@ mod tests {
         rig.request(Action::CancelFill);
         rig.tick();
         assert_eq!(rig.valves, RELIEVED);
+    }
+    #[test]
+    fn configured_pressure_steps_are_used_and_final_step_is_capped() {
+        let mut rig = Rig::new();
+        rig.engine.config.pressure_step_psi = 40.0;
+        rig.engine.config.nitrogen_target_psi = 90.0;
+        rig.baseline();
+        for target in [40.0, 80.0, 90.0] {
+            rig.until(Phase::Raising);
+            assert_eq!(rig.engine.status.current_step_psi, target);
+            rig.pressure = 5.0 + target;
+            rig.until(Phase::Holding);
+            for _ in 0..50 {
+                rig.tick();
+            }
+        }
+        assert_eq!(rig.engine.status.phase, Phase::Dumping);
+    }
+    #[test]
+    fn pressure_step_must_be_finite_and_positive() {
+        for step in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            let mut cfg = Rig::new().engine.config;
+            cfg.pressure_step_psi = step;
+            assert!(cfg.validate_settings().is_err());
+            assert!(cfg.validate().is_err());
+        }
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.pressure_step_psi, 50.0);
     }
     #[test]
     fn leak_beyond_noise_fails_and_closes_supplies() {

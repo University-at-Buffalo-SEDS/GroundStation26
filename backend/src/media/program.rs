@@ -81,7 +81,8 @@ async fn program_state(
     let presentation = read_presentation(&state).await?;
     let mut streams = Vec::new();
     for stream in fetch_streams(&state)
-        .await?
+        .await
+        .unwrap_or_default()
         .0
         .into_iter()
         .filter(|s| s.live && !presentation.broadcast.hidden_stream_ids.contains(&s.id))
@@ -90,8 +91,10 @@ async fn program_state(
         let access = ticket(&state, &headers, &format!("stream:{}", stream.id)).await?;
         streams.push(serde_json::json!({"id":stream.id,"label":presentation.stream_labels.get(&stream.id).unwrap_or(&stream.id),"url":format!("/api/media-assets/hls/{}/index.m3u8?ticket={access}",stream.id)}));
     }
+    let model = load_vehicle(state.clone(), headers.clone()).await?;
     let now = now_ms();
-    let snapshot = telemetry_snapshot(&state.app, &presentation, now);
+    let mut snapshot = telemetry_snapshot(&state.app, &presentation, now);
+    snapshot["model_state"] = model_snapshot(&state.app, &model, now);
     let mut history = state.program_history.lock().await;
     if history
         .back()
@@ -112,7 +115,34 @@ async fn program_state(
         .find(|(t, _)| *t <= target)
         .filter(|(t, _)| target.saturating_sub(*t) < 2000)
         .map(|(_, v)| v.clone());
-    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry}))).into_response())
+    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"model":model,"server_now_ms":now,"telemetry":telemetry}))).into_response())
+}
+
+fn model_snapshot(app: &AppState, model: &Vehicle, now: u64) -> serde_json::Value {
+    let phase = format!("{:?}", *app.state.lock().unwrap());
+    let rows = app.recent_telemetry_cache.lock().unwrap();
+    let value = |binding: &Binding| {
+        rows.iter()
+            .rev()
+            .find(|row| {
+                row.data_type == binding.data_type
+                    && binding
+                        .sender_id
+                        .as_ref()
+                        .is_none_or(|sender| sender == &row.sender_id)
+            })
+            .filter(|row| {
+                row.timestamp_ms >= 0 && now.saturating_sub(row.timestamp_ms as u64) < 5000
+            })
+            .and_then(|row| row.values.get(binding.index).copied().flatten())
+            .map(|v| v * binding.scale + binding.offset)
+            .filter(|v| v.is_finite())
+    };
+    let motions:Vec<_>=model.motions.iter().map(|motion|{
+        let v=if let Some(binding)=&motion.binding {value(binding)} else {motion.phase_values.get(&phase).or_else(||motion.phase_values.get("*")).copied()};
+        serde_json::json!({"node":motion.node,"transform":motion.transform,"axis":motion.axis,"from":motion.from,"to":motion.to,"value":v})
+    }).collect();
+    serde_json::json!({"motions":motions,"orbit":model.camera_orbit,"attitude":[model.attitude.pitch.as_ref().and_then(value),model.attitude.yaw.as_ref().and_then(value),model.attitude.roll.as_ref().and_then(value)],"clip":model.phase_animations.get(&phase).cloned().unwrap_or_default()})
 }
 async fn dashboard_status(
     State(state): State<Arc<MediaState>>,
@@ -524,6 +554,36 @@ async fn set_role(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn model_motion_uses_captured_phase_and_never_falls_back_for_missing_binding() {
+        let app = crate::state::tests::test_app_state().await;
+        *app.state.lock().unwrap() = crate::types::FlightState::Ascent;
+        let mut model = Vehicle::default();
+        model.motions.push(Motion {
+            node: "motor-flame".into(),
+            transform: "visible".into(),
+            axis: [0.0, 1.0, 0.0],
+            from: 0.0,
+            to: 1.0,
+            binding: None,
+            phase_values: BTreeMap::from([("*".into(), 0.0), ("Ascent".into(), 1.0)]),
+        });
+        let captured = model_snapshot(&app, &model, 100_000);
+        *app.state.lock().unwrap() = crate::types::FlightState::Coast;
+        assert_eq!(captured["motions"][0]["value"], 1.0);
+        assert_eq!(
+            model_snapshot(&app, &model, 100_500)["motions"][0]["value"],
+            0.0
+        );
+        model.motions[0].binding = Some(Binding {
+            data_type: "MISSING".into(),
+            sender_id: None,
+            index: 0,
+            scale: 1.0,
+            offset: 0.0,
+        });
+        assert!(model_snapshot(&app, &model, 100_500)["motions"][0]["value"].is_null());
+    }
     #[tokio::test]
     async fn dashboard_resolves_channels_and_marks_stale_samples_unknown() {
         let app = crate::state::tests::test_app_state().await;
