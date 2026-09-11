@@ -1006,6 +1006,7 @@ async fn main() -> anyhow::Result<()> {
     let full_bay_discovery_ready = Arc::new(AtomicBool::new(false));
     if let Ok(expected) = std::env::var("GS_SIM_EXPECT_DISCOVERY_NODES") {
         let validation_router = router.clone();
+        let validation_state = state.clone();
         let validation_discovery_ready = full_bay_discovery_ready.clone();
         let validation_pilot_ack_generation = pilot_open_ack_generation.clone();
         let validate_valve_roundtrip = std::env::var("GS_SIM_VALIDATE_VALVE_ROUNDTRIP")
@@ -1190,14 +1191,21 @@ async fn main() -> anyhow::Result<()> {
                     }
                     let traffic_deadline = Instant::now() + Duration::from_secs(30);
                     loop {
-                        let attributed = expected
-                            .iter()
-                            .filter_map(|sender| {
-                                validation_router.client_stats(sender).and_then(|stats| {
-                                    (stats.packets_received > 0)
-                                        .then_some((sender.clone(), stats.packets_received))
-                                })
+                        /* client_stats is link/announcer oriented: downstream
+                         * boards nested inside a router's topology legitimately
+                         * have no direct side counters. Use the application's
+                         * canonical per-sender packet observations here so this
+                         * assertion proves real board payloads reached GS rather
+                         * than crediting every board with its relay side total. */
+                        let status =
+                            validation_state.board_status_snapshot(get_current_timestamp_ms());
+                        let attributed = status
+                            .boards
+                            .into_iter()
+                            .filter(|entry| {
+                                expected.contains(&entry.sender_id) && entry.packet_count > 0
                             })
+                            .map(|entry| (entry.sender_id, entry.packet_count))
                             .collect::<Vec<_>>();
                         if attributed.len() == expected.len() {
                             log::info!(
@@ -1211,15 +1219,15 @@ async fn main() -> anyhow::Result<()> {
                             break;
                         }
                         if Instant::now() >= traffic_deadline {
-                            let missing = expected
-                                .iter()
-                                .filter(|sender| {
-                                    validation_router
-                                        .client_stats(sender)
-                                        .is_none_or(|stats| stats.packets_received == 0)
-                                })
-                                .cloned()
-                                .collect::<Vec<_>>();
+                            let observed = validation_state
+                                .board_status_snapshot(get_current_timestamp_ms())
+                                .boards
+                                .into_iter()
+                                .filter(|entry| entry.packet_count > 0)
+                                .map(|entry| entry.sender_id)
+                                .collect::<BTreeSet<_>>();
+                            let missing =
+                                expected.difference(&observed).cloned().collect::<Vec<_>>();
                             log::error!(
                                 "full-bay per-board traffic attribution timed out; missing={missing:?}"
                             );

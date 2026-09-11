@@ -793,13 +793,19 @@ impl AppState {
                 let stats = if is_local {
                     Some(local_stats)
                 } else {
-                    router
-                        .client_stats(&board.sender_id)
-                        .map(|stats| NetworkTopologyStats {
-                            packets_sent: stats.packets_sent,
-                            packets_received: stats.packets_received,
-                            bytes_sent: stats.bytes_sent,
-                            bytes_received: stats.bytes_received,
+                    /* A nested board does not own the GroundStation-facing
+                     * relay side, so SEDSNet side counters would attribute the
+                     * gateway/RF aggregate to every board on that side. Report
+                     * the canonical per-board observations instead. */
+                    board_status
+                        .boards
+                        .iter()
+                        .find(|entry| entry.sender_id == board.sender_id)
+                        .map(|entry| NetworkTopologyStats {
+                            packets_sent: 0,
+                            packets_received: entry.packet_count,
+                            bytes_sent: 0,
+                            bytes_received: 0,
                         })
                 };
                 let label = Board::from_sender_id(&board.sender_id)
@@ -1660,13 +1666,28 @@ mod tests {
 
         assert_eq!(ground.kind, NetworkTopologyNodeKind::Router);
         assert_eq!(valve.kind, NetworkTopologyNodeKind::Board);
-        assert!(valve.stats.is_some_and(|stats| stats.packets_received > 0));
+        assert_eq!(
+            valve.stats.map(|stats| stats.packets_received),
+            Some(0),
+            "discovery-side traffic must not be misreported as Valve payloads"
+        );
         assert!(snapshot.links.iter().any(|link| {
             (link.source == ground.id && link.target == valve.id)
                 || (link.source == valve.id && link.target == ground.id)
         }));
 
         state.mark_discovered_relays_seen();
+        state.mark_board_seen(Board::ValveBoard.sender_id(), 1_000);
+        let traffic_snapshot = state.network_topology_snapshot(1_000);
+        let valve_traffic = traffic_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.sender_id.as_deref() == Some(Board::ValveBoard.sender_id()))
+            .expect("valve router missing after payload observation");
+        assert_eq!(
+            valve_traffic.stats.map(|stats| stats.packets_received),
+            Some(1)
+        );
         let statuses = state.board_status_snapshot(1_000);
         let valve_status = statuses
             .boards
