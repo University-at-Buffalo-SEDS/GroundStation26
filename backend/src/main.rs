@@ -643,6 +643,10 @@ async fn main() -> anyhow::Result<()> {
     let power_seen_handler = power_seen.clone();
     let power_rate_reported = Arc::new(AtomicBool::new(false));
     let power_rate_reported_handler = power_rate_reported.clone();
+    let daq_loadcell_rate = Arc::new(Mutex::new(StreamRateProbe::default()));
+    let daq_loadcell_rate_handler = daq_loadcell_rate.clone();
+    let daq_loadcell_rate_reported = Arc::new(AtomicBool::new(false));
+    let daq_loadcell_rate_reported_handler = daq_loadcell_rate_reported.clone();
     let fill_telemetry_seen = Arc::new(Mutex::new(HashSet::<Board>::new()));
     let fill_telemetry_seen_handler = fill_telemetry_seen.clone();
     let abort_handler_state_clone = state.clone();
@@ -705,6 +709,19 @@ async fn main() -> anyhow::Result<()> {
                     );
                     if valid && !power_rate_reported_handler.swap(true, Ordering::AcqRel) {
                         log::info!("full-bay Power 5-second stream reached GroundStation");
+                    }
+                }
+                if board == Some(Board::DaqBoard)
+                    && pkt.data_type() == telemetry_schema::data_type("KG1000")
+                {
+                    let valid = daq_loadcell_rate_handler.lock().unwrap().observe(
+                        pkt.timestamp(),
+                        10,
+                        30,
+                        5,
+                    );
+                    if valid && !daq_loadcell_rate_reported_handler.swap(true, Ordering::AcqRel) {
+                        log::info!("full-bay DAQ calibrated loadcell 50 Hz stream reached GroundStation");
                     }
                 }
                 if let Some(
