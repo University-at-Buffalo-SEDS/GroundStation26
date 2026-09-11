@@ -4,6 +4,9 @@
 <div id="stage"></div><div id="model-stage"></div><div id="rocket-inset" aria-label="Delayed rocket state"><svg viewBox="0 0 100 180" role="img" aria-label="Single-stage rocket"><g id="chute" style="display:none"><path d="M10 32 Q50 -8 90 32Z" fill="#e5ecf2"/><path d="M10 32L50 63L90 32" fill="none" stroke="#99afc0"/></g><path d="M40 145L28 159V130L40 120M60 145L72 159V130L60 120" fill="#8498a8"/><path d="M40 145V68L50 45L60 68V145Z" fill="#e5ecf2"/><path id="flame" d="M42 148L50 175L58 148Z" fill="#ff984a" style="display:none"/></svg><div id="rocket-phase">Unknown</div></div><div id="status" role="status">Building delayed program buffer…</div><div id="banner"></div><script src="/assets/hls.min.js"></script><script type="module" src="/assets/three/vehicle-renderer.js"></script>
 <script>
 'use strict';
+// Isolate decoded-video stacking from the always-on-top inline SVG overlay.
+document.querySelector('#stage').style.isolation='isolate';
+document.querySelector('#rocket-inset').style.cssText+=';z-index:60;pointer-events:none;transform:translateZ(0);top:52px';
 const stage=document.querySelector('#stage'),status=document.querySelector('#status'),banner=document.querySelector('#banner');
 const ticket=new URLSearchParams(location.search).get('ticket'),players=new Map();
 let state,clockOffset=0,lastPoll=0,displayed='',stopped=false,generation=0;
@@ -12,17 +15,30 @@ function modelDisplay(videoReady){
  const holder=document.querySelector('#model-stage'),inset=document.querySelector('#rocket-inset');
  const fresh=state&&lastPoll&&performance.now()-lastPoll<=2500;
  const telemetry=fresh?state.telemetry:null;
+ const phase=telemetry?.phase||'Unknown';
+ const onGround=['Startup','Idle','PreFill','FillTest','NitrogenFill','NitrousFill','Armed'].includes(phase);
+ const svg=inset.querySelector('svg');
+ let equipment=svg.querySelector('#ground-equipment');
+ if(!equipment){
+  equipment=document.createElementNS('http://www.w3.org/2000/svg','g');equipment.id='ground-equipment';
+  equipment.innerHTML='<g fill="#d9e3ea" stroke="#7e96a8" stroke-width="2"><rect x="-100" y="100" width="24" height="55" rx="10"/><rect x="-66" y="82" width="28" height="73" rx="12"/><rect x="-91" y="160" width="58" height="12" rx="2"/></g><path d="M-88 155V165H-52V155M-52 155V165H40M81 160V45H94V160M81 65H94M81 90H94M81 115H94M81 140H94M81 70H61" fill="none" stroke="#7e96a8" stroke-width="3"/><path d="M-100 121H-76" stroke="#45a8ed" stroke-width="5"/><path d="M-66 110H-38" stroke="#49d1ac" stroke-width="5"/><path d="M-108 176H100" stroke="#7e96a8" stroke-width="3"/>';
+  svg.insertBefore(equipment,svg.firstChild);
+ }
+ equipment.style.display=onGround?'':'none';
+ svg.setAttribute('viewBox',onGround?'-110 0 215 180':'0 0 100 180');
+ inset.style.width=onGround?'170px':'90px';
+ inset.setAttribute('aria-label',onGround?'Delayed rocket and fill equipment':'Delayed rocket state');
  holder.style.display=videoReady?'none':'block';inset.style.display=videoReady?'block':'none';
  if(videoReady){holder.replaceChildren();}else{
   let model=holder.querySelector('gs-vehicle-viewer');if(!model){model=document.createElement('gs-vehicle-viewer');holder.append(model);}
   const config=state?.model;
-  const ground=['Startup','Idle','PreFill','FillTest','NitrogenFill','NitrousFill','Armed'].includes(telemetry?.phase)&&config?.ground_model_url;
-  const src=(ground?config.ground_model_url:config?.model_url)||'/assets/models/vehicle.glb';if(model.getAttribute('src')!==src)model.setAttribute('src',src);
+  const ground=onGround;
+  const src=(ground?(config?.ground_model_url||'/assets/models/gse-site.glb'):config?.model_url)||'/assets/models/vehicle.glb';if(model.getAttribute('src')!==src)model.setAttribute('src',src);
   const neutral={motions:(config?.motions||[{node:'motor-flame',transform:'visible',axis:[0,1,0],from:0,to:1},{node:'main-parachute',transform:'scale',axis:[1,1,1],from:.001,to:1},{node:'drogue-parachute',transform:'scale',axis:[1,1,1],from:.001,to:1}]).map(m=>({...m,value:0})),clip:'',attitude:[0,0,0]};
   const groundState={motions:[],attitude:[0,0,0],clip:telemetry?.phase==='NitrogenFill'?'nitrogen-test':telemetry?.phase==='NitrousFill'?'nitrous-fill':''};
   model.setAttribute('data-state',JSON.stringify(ground?groundState:telemetry?.model_state||neutral));
  }
- const phase=telemetry?.phase||'Unknown';document.querySelector('#rocket-phase').textContent=phase;
+ document.querySelector('#rocket-phase').textContent=phase;
  document.querySelector('#flame').style.display=phase==='Ascent'?'':'none';
  document.querySelector('#chute').style.display=['ParachuteDeploy','Descent','Landed','Recovery'].includes(phase)?'':'none';
 }

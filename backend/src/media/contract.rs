@@ -512,15 +512,16 @@ async fn load_vehicle(state: Arc<MediaState>, headers: HeaderMap) -> ApiResult<V
     if vehicle.title.is_empty() {
         vehicle.title = "Rocket".into();
     }
+    // The pad scene is independent of which uploaded rocket model is selected.
+    if vehicle.ground_model_url.is_empty() {
+        vehicle.ground_model_url = "/assets/models/gse-site.glb".into();
+    }
     if vehicle.model_url.is_empty()
         && let Some(model) = models.first()
     {
         vehicle.model_url = format!("/api/stage-models/{}/{}", model.stage, model.name);
     }
     if vehicle.model_url.is_empty() || vehicle.model_url == "/assets/models/vehicle.glb" {
-        if vehicle.ground_model_url.is_empty() {
-            vehicle.ground_model_url = "/assets/models/gse-site.glb".into();
-        }
         vehicle.model_url = "/assets/models/vehicle.glb".into();
         vehicle.model_alt = "Single-stage rocket with aft fins".into();
         vehicle.motions.retain(|motion| {

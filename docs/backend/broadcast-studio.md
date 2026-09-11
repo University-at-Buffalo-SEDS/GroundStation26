@@ -204,3 +204,11 @@ These checks do not certify real camera hardware or mobile playback.
 
 Implementation references: [MediaMTX configuration](https://mediamtx.org/docs/references/configuration-file)
 and [HLS.js program-date/time APIs](https://hlsjs.video-dev.org/api-docs/hls.js.hls).
+# Streamer model composition
+
+Before launch, the full-size fallback scene includes tanks, manifold, plumbing
+and tower, including when an uploaded rocket model is configured. With decoded
+video active, an inline 2D rocket/equipment inset is drawn above the isolated video
+layer. At Launch and later, ground equipment disappears from both presentations.
+The 2D inset sits below the frontend's exit control. Scene selection always uses
+delayed program telemetry; an unknown/buffering phase does not invent pad state.

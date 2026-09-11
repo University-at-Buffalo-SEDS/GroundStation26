@@ -19,10 +19,15 @@ const wait=ms=>new Promise(r=>setTimeout(r,ms));
  let ground=false;
  for(let i=0;i<80;i++){await wait(250);ground=await evaluate("!!document.querySelector('#model-stage gs-vehicle-viewer')?.model?.getObjectByName('fill_manifold')");if(ground)break;}
  assert.ok(ground,'Prelaunch fallback includes real fill equipment');
+ const groundInset=await evaluate("(()=>{lastPoll=performance.now();modelDisplay(true);return {visible:getComputedStyle(document.querySelector('#rocket-inset')).display,equipment:getComputedStyle(document.querySelector('#ground-equipment')).display,stack:getComputedStyle(document.querySelector('#stage')).isolation};})()");
+ assert.equal(groundInset.visible,'block');
+ assert.notEqual(groundInset.equipment,'none');
+ assert.equal(groundInset.stack,'isolate');
  await evaluate("state.telemetry={phase:'Launch'};lastPoll=performance.now();modelDisplay(false)");
  let flight=false;
  for(let i=0;i<80;i++){await wait(250);flight=await evaluate("(()=>{const m=document.querySelector('#model-stage gs-vehicle-viewer')?.model;return !!m?.getObjectByName('stage-1')&&!m.getObjectByName('fill_manifold')})()");if(flight)break;}
  assert.ok(flight,'Launch removes the pad, tower and tanks');
+ assert.equal(await evaluate("getComputedStyle(document.querySelector('#ground-equipment')).display"),'none');
  const result=await evaluate("(()=>{clearInterval(timer);stopped=true;state.telemetry={phase:'Ascent'};lastPoll=performance.now();modelDisplay(true);return {corner:document.querySelector('#rocket-inset').style.display,full:document.querySelector('#model-stage').style.display,flame:document.querySelector('#flame').style.display,phase:document.querySelector('#rocket-phase').textContent};})()");
  assert.equal(result.corner,'block');assert.equal(result.full,'none');assert.equal(result.flame,'');assert.equal(result.phase,'Ascent');
  assert.equal(await evaluate("(()=>{state.telemetry=null;modelDisplay(true);return document.querySelector('#rocket-phase').textContent;})()"),'Unknown');
