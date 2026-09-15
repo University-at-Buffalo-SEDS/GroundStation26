@@ -1,5 +1,10 @@
 # Ground Station 2026
 
+The backend listens on `0.0.0.0:3000` by default. Set `GS_BIND_ADDRESS` (for
+example `127.0.0.1:13000`) to run an independent test instance without a port
+collision. Clients must use the selected address. This is particularly useful
+for concurrent Docker simulations using host networking.
+
 Live multi-camera video, the Raspberry Pi sender daemon, and rocket stage model
 storage are documented in [Video and stage models](docs/backend/video-and-models.md).
 Grouped valve actions, nitrogen testing, pressure calibration and the fill-equipment
@@ -17,8 +22,8 @@ mode. Deploy matching frontend/backend `dev` builds (`--frontend-dev`); see the
 
 - Rust: install from https://rustup.rs/
 - `dioxus-cli`: install with `cargo install dioxus-cli`
-- SEDSNet v4.0.27 from crates.io. The untracked workspace lockfile is local
-  build state; releases are qualified against the current stable `4` series.
+- SEDSNet v4.0.28, pinned from crates.io. The untracked workspace lockfile is local
+  build state; this release uses the same networking version as the firmware.
 
 The frontend uses Dioxus. No separate WASM toolchain workflow is needed beyond the Rust targets used by `build.py`.
 

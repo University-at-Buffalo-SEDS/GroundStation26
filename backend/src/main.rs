@@ -300,6 +300,19 @@ mod router_link_policy_tests {
     }
 
     #[test]
+    fn flight_stream_gate_requires_five_hz_not_one_hz() {
+        let mut probe = StreamRateProbe::default();
+        for timestamp in [0, 1000, 2000, 3000, 4000, 5000] {
+            assert!(!probe.observe(timestamp, 150, 250, 5));
+        }
+        for timestamp in [5211, 5422, 5633, 5844] {
+            assert!(!probe.observe(timestamp, 150, 250, 5));
+        }
+        assert!(probe.observe(6055, 150, 250, 5));
+        assert!(!probe.observe(7055, 150, 250, 5));
+    }
+
+    #[test]
     fn startup_topology_request_is_sent_on_every_physical_side() {
         let router = sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]));
         let left = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -637,6 +650,8 @@ async fn main() -> anyhow::Result<()> {
     let fc_sensor_rate_handler = fc_sensor_rate.clone();
     let fc_sensor_rate_reported = Arc::new(AtomicBool::new(false));
     let fc_sensor_rate_reported_handler = fc_sensor_rate_reported.clone();
+    let fc_barometer_rate = Mutex::new(StreamRateProbe::default());
+    let fc_barometer_rate_reported = AtomicBool::new(false);
     let power_sensor_rate = Arc::new(Mutex::new(StreamRateProbe::default()));
     let power_sensor_rate_handler = power_sensor_rate.clone();
     let power_seen = Arc::new(AtomicBool::new(false));
@@ -661,6 +676,7 @@ async fn main() -> anyhow::Result<()> {
                     ground_station_handler_state_clone.board_from_network_sender(pkt.sender());
                 if pkt.data_type() == telemetry_schema::data_type("GPS_SATELLITE_NUMBER")
                     || pkt.data_type() == telemetry_schema::data_type("IMU_DATA")
+                    || pkt.data_type() == telemetry_schema::data_type("BAROMETER_DATA")
                     || pkt.data_type() == telemetry_schema::data_type("BATTERY_VOLTAGE")
                 {
                     log::info!(
@@ -687,12 +703,24 @@ async fn main() -> anyhow::Result<()> {
                 {
                     let valid = fc_sensor_rate_handler.lock().unwrap().observe(
                         pkt.timestamp(),
-                        750,
-                        1_250,
-                        2,
+                        150,
+                        250,
+                        5,
                     );
                     if valid && !fc_sensor_rate_reported_handler.swap(true, Ordering::AcqRel) {
-                        log::info!("full-bay Flight sensor 1 Hz stream reached GroundStation");
+                        log::info!("full-bay Flight sensor 5 Hz stream reached GroundStation");
+                    }
+                }
+                if board == Some(Board::FlightComputer)
+                    && pkt.data_type() == telemetry_schema::data_type("BAROMETER_DATA")
+                {
+                    let valid =
+                        fc_barometer_rate
+                            .lock()
+                            .unwrap()
+                            .observe(pkt.timestamp(), 150, 250, 5);
+                    if valid && !fc_barometer_rate_reported.swap(true, Ordering::AcqRel) {
+                        log::info!("full-bay Flight barometer 5 Hz stream reached GroundStation");
                     }
                 }
                 if board == Some(Board::PowerBoard)
@@ -721,7 +749,7 @@ async fn main() -> anyhow::Result<()> {
                         5,
                     );
                     if valid && !daq_loadcell_rate_reported_handler.swap(true, Ordering::AcqRel) {
-                        log::info!("full-bay DAQ calibrated loadcell 50 Hz stream reached GroundStation");
+                        log::info!("full-bay DAQ raw loadcell 50 Hz stream reached GroundStation");
                     }
                 }
                 if let Some(
@@ -1041,6 +1069,7 @@ async fn main() -> anyhow::Result<()> {
                 .filter(|name| !name.is_empty())
                 .map(str::to_owned)
                 .collect::<BTreeSet<_>>();
+            let mut discovery_waits = 0u32;
             loop {
                 let topology = validation_router.export_topology();
                 let mut discovered = BTreeSet::new();
@@ -1053,8 +1082,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 if expected.is_subset(&discovered) {
-                    assert_eq!(validation_router.preferred_discovery_master().as_deref(), Some("GS"));
-                    log::info!("full-bay preferred discovery master GS verified after named discovery");
+                    assert_eq!(
+                        validation_router.preferred_discovery_master().as_deref(),
+                        Some("GS")
+                    );
+                    log::info!(
+                        "full-bay preferred discovery master GS verified after named discovery"
+                    );
                     validation_discovery_ready.store(true, Ordering::Release);
                     log::info!(
                         "full-bay named discovery ready: {}",
@@ -1226,8 +1260,8 @@ async fn main() -> anyhow::Result<()> {
                             })
                             .map(|entry| (entry.sender_id, entry.packet_count))
                             .collect::<Vec<_>>();
-                        let graph = validation_state
-                            .network_topology_snapshot(get_current_timestamp_ms());
+                        let graph =
+                            validation_state.network_topology_snapshot(get_current_timestamp_ms());
                         let graph_attributed = expected
                             .iter()
                             .filter_map(|sender| {
@@ -1276,9 +1310,9 @@ async fn main() -> anyhow::Result<()> {
                                     !graph.nodes.iter().any(|node| {
                                         node.sender_id.as_deref() == Some(sender.as_str())
                                             && node.label == board.as_str()
-                                            && node.stats.is_some_and(|stats| {
-                                                stats.packets_received > 0
-                                            })
+                                            && node
+                                                .stats
+                                                .is_some_and(|stats| stats.packets_received > 0)
                                     })
                                 })
                                 .cloned()
@@ -1291,6 +1325,14 @@ async fn main() -> anyhow::Result<()> {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                     break;
+                }
+                discovery_waits += 1;
+                if discovery_waits.is_multiple_of(100) {
+                    let missing = expected.difference(&discovered).collect::<Vec<_>>();
+                    let routes = validation_router.export_topology().routes;
+                    log::info!(
+                        "full-bay named discovery pending: missing={missing:?}; routes={routes:?}"
+                    );
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -1551,8 +1593,10 @@ async fn main() -> anyhow::Result<()> {
     // --- Webserver ---
     let app: Router = web::router(state.clone());
 
-    let addr = "0.0.0.0:3000";
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Separate host-network simulator runs must not contend for port 3000.
+    // Normal deployments retain the existing address unless explicitly set.
+    let addr = std::env::var("GS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:3000".to_owned());
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
     log::info!("web server listening on {addr}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(state.clone()))

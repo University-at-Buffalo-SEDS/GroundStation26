@@ -4435,6 +4435,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordered_valve_confirmations_accept_rebooted_source_clock() {
+        for (board, key) in [
+            (
+                Board::ActuatorBoard,
+                ActuatorBoardCommands::NitrogenOpen as u8,
+            ),
+            (Board::ValveBoard, ValveBoardCommands::PilotOpen as u8),
+        ] {
+            let (db_tx, _db_rx) = mpsc::channel(32);
+            let state = test_app_state(db_tx.clone()).await;
+            let overflow = test_db_overflow();
+            // Transport ordering belongs to SEDSNet. A board's clock may reset
+            // before time sync after reboot; don't suppress a valid confirmation.
+            for (stamp, on) in [(100, 1), (200, 0), (0, 1), (1, 0)] {
+                let pkt = Packet::new(
+                    crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                    board.sender_id(),
+                    stamp,
+                    Arc::from([key, on]),
+                )
+                .unwrap();
+                let rows = handle_packet(&state, &db_tx, &overflow, pkt).await;
+                assert!(!rows.is_empty());
+                assert_eq!(state.get_umbilical_valve_state(key), Some(on != 0));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn battery_voltage_db_bucketing_is_sender_aware() {
         let (db_tx, mut db_rx) = mpsc::channel(32);
         let state = test_app_state(db_tx.clone()).await;
