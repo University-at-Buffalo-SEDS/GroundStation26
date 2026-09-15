@@ -169,3 +169,15 @@ all normal prerequisites before emitting any valve commands and reports a reject
 start as a notification. Regular and test-fire builds retain sequenced availability.
 Missing pressure ceiling/empty-tank offset limits must still be configured by the
 backend operator; clicking a button does not supply or override them.
+# HITL operator recovery
+
+The Actions tab includes two independent, confirmation-protected recovery controls:
+
+- **Reset flight state to Idle** updates the shared, persisted flight-state network
+  variable through the normal backend path. It does not reset the T-clock or
+  close valves. Verify the physical system is safe before using it.
+- **Reset T-clock** clears the displayed launch-clock anchor without changing
+  flight state, recorded telemetry, calibration, or physical board sequences.
+
+Normal command authorization and button interlocks still apply. These are not
+  substitutes for Abort, and do not cancel a launch sequence running on a board.

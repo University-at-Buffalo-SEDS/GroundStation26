@@ -84,6 +84,44 @@ async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_st
 mod derived;
 use derived::*;
 
+#[cfg(feature = "hitl_mode")]
+fn reset_operator_flight_state(state: &Arc<AppState>) {
+    // Use the managed network variable and existing persistence path, not a
+    // frontend-only display override. Do not operate physical outputs here.
+    state.set_local_flight_state(FlightState::Idle);
+    sequences::refresh_action_policy_now(state);
+    state.broadcast_action_policy_snapshot();
+}
+
+#[cfg(all(test, feature = "hitl_mode"))]
+mod recovery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reset_state_preserves_clock_and_confirmed_valve_state() {
+        let state = crate::state::tests::test_app_state().await;
+        state.set_local_flight_state(FlightState::Recovery);
+        let clock = state.launch_clock_snapshot();
+        state.set_umbilical_valve_state(ActuatorBoardCommands::NitrousOpen as u8, true);
+        let mut updates = state.state_tx.subscribe();
+        reset_operator_flight_state(&state);
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+        assert_eq!(updates.try_recv().unwrap().state, FlightState::Idle);
+        assert_eq!(state.launch_clock_snapshot(), clock);
+        assert_eq!(state.get_umbilical_valve_state(ActuatorBoardCommands::NitrousOpen as u8), Some(true));
+    }
+
+    #[tokio::test]
+    async fn reset_clock_preserves_flight_state_and_broadcasts_idle_clock() {
+        let state = crate::state::tests::test_app_state().await;
+        state.set_local_flight_state(FlightState::Ascent);
+        let mut updates = state.launch_clock_tx.subscribe();
+        state.reset_launch_clock();
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Ascent);
+        assert_eq!(updates.try_recv().unwrap(), crate::telemetry_db::LaunchClockMsg::idle());
+    }
+}
+
 pub fn set_network_time_router(router: Arc<Router>) {
     let _ = NETWORK_TIME_ROUTER.set(router);
 }
@@ -933,6 +971,14 @@ pub async fn telemetry_task(
                                 sequences::refresh_action_policy_now(&state);
                                 state.broadcast_action_policy_snapshot();
                                 gs_debug_println!("Launch indicator latch reset");
+                        }
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::ResetFlightState => {
+                            reset_operator_flight_state(&state);
+                        }
+                        #[cfg(feature = "hitl_mode")]
+                        TelemetryCommand::ResetTClock => {
+                            state.reset_launch_clock();
                         }
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::AdvanceFlightState => {
@@ -4460,6 +4506,35 @@ mod tests {
                 let rows = handle_packet(&state, &db_tx, &overflow, pkt).await;
                 assert!(!rows.is_empty());
                 assert_eq!(state.get_umbilical_valve_state(key), Some(on != 0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_actuator_addresses_update_both_valves_without_hostname_lookup() {
+        let (db_tx, _db_rx) = mpsc::channel(32);
+        let state = test_app_state(db_tx.clone()).await;
+        let overflow = test_db_overflow();
+        for (key, command, channel) in [
+            (ActuatorBoardCommands::NitrogenOpen as u8, "Nitrogen", 4),
+            (ActuatorBoardCommands::NitrousOpen as u8, "Nitrous", 5),
+        ] {
+            // Include an address change and missing discovery entry. Status
+            // matching uses the wire command ID, never the discovery hostname.
+            for (sender, on) in [("@addr:483403151", 1u8), ("@addr:483403152", 0u8)] {
+                state.set_pending_umbilical_valve_state(key, on != 0);
+                let packet = Packet::new(
+                    crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                    sender, 1234, Arc::from([key, on]),
+                ).unwrap();
+                let rows = handle_packet(&state, &db_tx, &overflow, packet).await;
+                assert_eq!(rows[0].values[channel], Some(f32::from(on)));
+                assert_eq!(state.get_umbilical_valve_state(key), Some(on != 0));
+                assert_eq!(state.get_pending_umbilical_valve_state(key), None);
+                let control = state.action_policy_snapshot().controls.into_iter()
+                    .find(|control| control.cmd == command).unwrap();
+                assert_eq!(control.actuated, Some(on != 0));
             }
         }
     }

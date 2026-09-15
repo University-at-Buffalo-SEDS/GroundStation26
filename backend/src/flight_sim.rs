@@ -759,6 +759,8 @@ impl FlightSimState {
             | TelemetryCommand::ToggleAvBayUnderglow
             | TelemetryCommand::ToggleFlightBuzzer
             | TelemetryCommand::ResetLaunchLatch
+            | TelemetryCommand::ResetFlightState
+            | TelemetryCommand::ResetTClock
             | TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
             | TelemetryCommand::ReinitSensors

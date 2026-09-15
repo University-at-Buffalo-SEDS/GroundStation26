@@ -596,6 +596,10 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ResetLaunchLatch => "ResetLaunchLatch",
         #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ResetFlightState => "ResetFlightState",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ResetTClock => "ResetTClock",
+        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ExpandParachute => "ExpandParachute",
@@ -700,6 +704,8 @@ pub fn all_command_names() -> Vec<&'static str> {
         "ToggleAvBayUnderglow",
         "ToggleFlightBuzzer",
         "ResetLaunchLatch",
+        "ResetFlightState",
+        "ResetTClock",
         "DeployParachute",
         "ExpandParachute",
         "EvaluationRelax",

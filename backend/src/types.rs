@@ -48,6 +48,10 @@ pub enum TelemetryCommand {
     #[cfg(feature = "hitl_mode")]
     ResetLaunchLatch,
     #[cfg(feature = "hitl_mode")]
+    ResetFlightState,
+    #[cfg(feature = "hitl_mode")]
+    ResetTClock,
+    #[cfg(feature = "hitl_mode")]
     DeployParachute,
     #[cfg(feature = "hitl_mode")]
     ExpandParachute,

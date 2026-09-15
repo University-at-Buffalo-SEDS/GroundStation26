@@ -678,6 +678,20 @@ pub fn load_layout() -> Result<LayoutConfig, String> {
 
 fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
     ensure_gse_sequence_actions(layout);
+    #[cfg(feature = "hitl_mode")]
+    for (cmd, label) in [
+        ("ResetFlightState", "Reset flight state to Idle"),
+        ("ResetTClock", "Reset T-clock"),
+    ] {
+        if !layout.actions_tab.actions.iter().any(|action| action.cmd == cmd) {
+            layout.actions_tab.actions.push(
+                serde_json::from_value(serde_json::json!({
+                    "cmd": cmd, "label": label, "group": "Operator recovery",
+                    "border": "#f59e0b", "bg": "#451a03", "fg": "#fef3c7"
+                })).expect("valid operator recovery action"),
+            );
+        }
+    }
     if !crate::flight_sim::sim_mode_enabled() {
         return;
     }
