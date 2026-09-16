@@ -9,6 +9,7 @@ macro_rules! gs_debug_println {
 }
 
 mod auth;
+mod command_probe;
 mod comms;
 mod comms_config;
 #[cfg(feature = "testing")]
@@ -642,6 +643,8 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler_state_clone = state.clone();
     let pilot_open_ack_generation = Arc::new(AtomicU64::new(0));
     let pilot_open_ack_generation_handler = pilot_open_ack_generation.clone();
+    let command_status_probe = Arc::new(Mutex::new(command_probe::CommandProbe::default()));
+    let command_status_probe_handler = command_status_probe.clone();
     let rf_gps_rate = Arc::new(Mutex::new(StreamRateProbe::default()));
     let rf_gps_rate_handler = rf_gps_rate.clone();
     let rf_gps_rate_reported = Arc::new(AtomicBool::new(false));
@@ -775,7 +778,17 @@ async fn main() -> anyhow::Result<()> {
                     pkt.endpoints(),
                     pkt.payload()
                 );
-                if pkt.payload() == [ValveBoardCommands::PilotOpen as u8, 1].as_slice() {
+                let source =
+                    ground_station_handler_state_clone.board_from_network_sender(pkt.sender());
+                if let Some(source) = source {
+                    command_status_probe_handler
+                        .lock()
+                        .unwrap()
+                        .observe(source.sender_id(), pkt.payload());
+                }
+                if source == Some(Board::ValveBoard)
+                    && pkt.payload() == [ValveBoardCommands::PilotOpen as u8, 1].as_slice()
+                {
                     pilot_open_ack_generation_handler.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1507,7 +1520,7 @@ async fn main() -> anyhow::Result<()> {
         && let Ok(sample_path) = std::env::var("FIRMWARE_SIM_SAMPLE_FILE")
     {
         let soak_router = router.clone();
-        let soak_ack_generation = pilot_open_ack_generation.clone();
+        let soak_status = command_status_probe.clone();
         let soak_discovery_ready = full_bay_discovery_ready.clone();
         let command_samples = std::env::var("GS_SIM_SOAK_COMMAND_SAMPLES")
             .ok()
@@ -1520,12 +1533,19 @@ async fn main() -> anyhow::Result<()> {
             .filter(|samples| !samples.is_empty())
             .unwrap_or_else(|| (1..12).collect());
         tokio::spawn(async move {
+            // Capture before discovery: late discovery must not silently skip a
+            // required round. A host restart resumes the global test schedule.
+            let startup_sample = fs::read_to_string(&sample_path)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .unwrap_or(0);
             while !soak_discovery_ready.load(Ordering::Acquire) {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            let command_type = telemetry_schema::data_type("VALVE_COMMAND");
             let rounds = command_samples.len();
-            for (round_index, target_sample) in command_samples.into_iter().enumerate() {
+            for (round_index, target_sample) in
+                command_probe::remaining_rounds(&command_samples, startup_sample)
+            {
                 loop {
                     let observed_sample = fs::read_to_string(&sample_path)
                         .ok()
@@ -1537,44 +1557,51 @@ async fn main() -> anyhow::Result<()> {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
 
-                let generation_before = soak_ack_generation.load(Ordering::Acquire);
-                let started = Instant::now();
-                if let Err(error) =
-                    soak_router.log_queue(command_type, &[ValveBoardCommands::PilotOpen as u8])
-                {
-                    log::error!(
-                        "full-bay soak valve command round {}/{rounds} at sample {target_sample} failed to queue: {error}",
-                        round_index + 1
-                    );
-                    return;
-                }
-                flush_command_tx(&soak_router, "full-bay soak valve command tx");
-                let latency_limit_ms =
-                    validation_latency_limit_ms("GS_SIM_SOAK_COMMAND_ACK_MAX_LATENCY_MS", 2_500);
-                loop {
-                    if soak_ack_generation.load(Ordering::Acquire) > generation_before {
-                        let elapsed_ms = validation_elapsed_ms(started);
-                        if elapsed_ms > latency_limit_ms {
-                            log::error!(
-                                "full-bay soak valve command round {}/{rounds} at sample {target_sample} ACK exceeded latency bound: {elapsed_ms} ms > {latency_limit_ms} ms",
-                                round_index + 1
-                            );
-                            return;
-                        }
-                        log::info!(
-                            "full-bay soak valve command acknowledged: round {}/{rounds}, sample {target_sample}, latency {elapsed_ms} ms",
-                            round_index + 1
-                        );
-                        break;
-                    }
-                    if validation_elapsed_ms(started) > latency_limit_ms {
+                // Alternate states: periodic reports of the unchanged open
+                // state cannot stand in for execution of every command.
+                let open = round_index % 2 != 0;
+                for (slot, board, ty, command) in command_probe::validation_commands(open) {
+                    let generation_before = soak_status.lock().unwrap().generation(slot, open);
+                    let started = Instant::now();
+                    if let Err(error) =
+                        soak_router.log_queue(telemetry_schema::data_type(ty), &[command])
+                    {
                         log::error!(
-                            "full-bay soak valve command round {}/{rounds} at sample {target_sample} ACK timed out",
+                            "full-bay soak {board} command round {}/{rounds} at sample {target_sample} failed to queue: {error}",
                             round_index + 1
                         );
                         return;
                     }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    flush_command_tx(&soak_router, "full-bay soak valve command tx");
+                    let latency_limit_ms = validation_latency_limit_ms(
+                        "GS_SIM_SOAK_COMMAND_ACK_MAX_LATENCY_MS",
+                        2_500,
+                    );
+                    loop {
+                        if soak_status.lock().unwrap().generation(slot, open) > generation_before {
+                            let elapsed_ms = validation_elapsed_ms(started);
+                            if elapsed_ms > latency_limit_ms {
+                                log::error!(
+                                    "full-bay soak {board} command round {}/{rounds} at sample {target_sample} ACK exceeded latency bound: {elapsed_ms} ms > {latency_limit_ms} ms",
+                                    round_index + 1
+                                );
+                                return;
+                            }
+                            log::info!(
+                                "full-bay soak valve command acknowledged: board={board}, state={open}, round {}/{rounds}, sample {target_sample}, latency {elapsed_ms} ms",
+                                round_index + 1
+                            );
+                            break;
+                        }
+                        if validation_elapsed_ms(started) > latency_limit_ms {
+                            log::error!(
+                                "full-bay soak {board} command round {}/{rounds} at sample {target_sample} ACK timed out",
+                                round_index + 1
+                            );
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
                 }
             }
         });

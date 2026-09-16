@@ -22,7 +22,7 @@ mode. Deploy matching frontend/backend `dev` builds (`--frontend-dev`); see the
 
 - Rust: install from https://rustup.rs/
 - `dioxus-cli`: install with `cargo install dioxus-cli`
-- SEDSNet v4.0.29, pinned from crates.io. The untracked workspace lockfile is local
+- SEDSNet v4.0.31, pinned from crates.io. The untracked workspace lockfile is local
   build state; this release uses the same networking version as the firmware.
 
 The frontend uses Dioxus. No separate WASM toolchain workflow is needed beyond the Rust targets used by `build.py`.
