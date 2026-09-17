@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 pub const OTA_STREAM_PORT: u16 = 4510;
-pub const OTA_MAX_CHUNK: usize = 120;
+// All board receivers accept 112 bytes; also a multiple of H5's 16-byte
+// programming unit. 120-byte chunks fail the receiver bound/alignment checks.
+pub const OTA_MAX_CHUNK: usize = 112;
 pub const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 const LAUNCHCORE_DELTA_MAGIC: u32 = 0x4C43_4450;
@@ -735,6 +737,18 @@ mod tests {
             ("DAQB", Board::DaqBoard),
         ] {
             assert_eq!(parse_board_target(raw), Some(expected));
+        }
+    }
+
+    #[test]
+    fn ota_chunks_fit_receivers_and_flash_programming_units() {
+        assert_eq!(OTA_MAX_CHUNK, 112);
+        assert_eq!(OTA_MAX_CHUNK % 16, 0);
+        assert!(OTA_MAX_CHUNK + 5 <= 128);
+        let image = vec![0u8; 1001];
+        for (index, chunk) in image.chunks(OTA_MAX_CHUNK).enumerate() {
+            assert_eq!((index * OTA_MAX_CHUNK) % 16, 0);
+            assert!(chunk.len() <= 112);
         }
     }
 

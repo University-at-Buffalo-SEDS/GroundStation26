@@ -24,6 +24,7 @@ def normalize_permissions(value: dict[str, Any] | None) -> dict[str, bool]:
     perms = {
         "view_data": bool(value.get("view_data", False)),
         "send_commands": bool(value.get("send_commands", False)),
+        "set_system_time": bool(value.get("set_system_time", False)),
     }
     if perms["send_commands"]:
         perms["view_data"] = True
@@ -141,6 +142,7 @@ def upsert_user(
         calibration_edit: bool,
         disabled: bool,
         allowed_commands: list[str] | None,
+        set_system_time: bool | None = None,
 ) -> None:
     username = username.strip()
     if not username:
@@ -153,6 +155,10 @@ def upsert_user(
         {"view": calibration_view, "edit": calibration_edit}
     )
     existing = next((user for user in cfg["users"] if user["username"] == username), None)
+    permissions["set_system_time"] = (
+        bool(existing and existing["permissions"].get("set_system_time", False))
+        if set_system_time is None else set_system_time
+    )
     if existing is None:
         if password is None:
             raise ValueError("password is required when creating a user")
@@ -206,6 +212,7 @@ def print_summary(cfg: dict[str, Any]) -> None:
         print(
             f"  - {user['username']}: view_data={perms['view_data']} "
             f"send_commands={perms['send_commands']} disabled={user['disabled']} "
+            f"set_system_time={perms['set_system_time']} "
             f"allowed_commands={','.join(user['command_access']['allowed_commands']) or 'all'} "
             f"calibration_view={user['calibration_access']['view']} "
             f"calibration_edit={user['calibration_access']['edit']}"
@@ -254,6 +261,7 @@ def cli_mode(args: argparse.Namespace) -> int:
             password=password,
             view_data=args.view_data,
             send_commands=args.send_commands,
+            set_system_time=args.set_system_time,
             calibration_view=args.calibration_view,
             calibration_edit=args.calibration_edit,
             disabled=args.disabled,
@@ -294,6 +302,7 @@ def tui_mode(path: Path) -> int:
                 password = getpass.getpass("Password: ")
                 view_data = prompt_bool("Allow view data", True)
                 send_commands = prompt_bool("Allow send commands", False)
+                set_system_time = prompt_bool("Allow setting GroundStation system date/time", False)
                 calibration_view = prompt_bool("Allow calibration view", False)
                 calibration_edit = prompt_bool("Allow calibration edit", False)
                 disabled = prompt_bool("Disabled", False)
@@ -308,6 +317,7 @@ def tui_mode(path: Path) -> int:
                     password=password,
                     view_data=view_data,
                     send_commands=send_commands,
+                    set_system_time=set_system_time,
                     calibration_view=calibration_view,
                     calibration_edit=calibration_edit,
                     disabled=disabled,
@@ -324,6 +334,7 @@ def tui_mode(path: Path) -> int:
                 calibration = user["calibration_access"]
                 view_data = prompt_bool("Allow view data", perms["view_data"])
                 send_commands = prompt_bool("Allow send commands", perms["send_commands"])
+                set_system_time = prompt_bool("Allow setting GroundStation system date/time", perms["set_system_time"])
                 calibration_view = prompt_bool(
                     "Allow calibration view", calibration["view"]
                 )
@@ -342,6 +353,7 @@ def tui_mode(path: Path) -> int:
                     password=password or None,
                     view_data=view_data,
                     send_commands=send_commands,
+                    set_system_time=set_system_time,
                     calibration_view=calibration_view,
                     calibration_edit=calibration_edit,
                     disabled=disabled,
@@ -487,6 +499,7 @@ def gui_mode(path: Path) -> int:
     )
     user_view_var = tk.BooleanVar(value=True)
     user_send_var = tk.BooleanVar(value=False)
+    user_time_var = tk.BooleanVar(value=False)
     user_calibration_view_var = tk.BooleanVar(value=False)
     user_calibration_edit_var = tk.BooleanVar(value=False)
     user_disabled_var = tk.BooleanVar(value=False)
@@ -525,6 +538,7 @@ def gui_mode(path: Path) -> int:
         password_var.set("")
         user_view_var.set(bool(user["permissions"]["view_data"]))
         user_send_var.set(bool(user["permissions"]["send_commands"]))
+        user_time_var.set(bool(user["permissions"]["set_system_time"]))
         user_calibration_view_var.set(bool(user["calibration_access"]["view"]))
         user_calibration_edit_var.set(bool(user["calibration_access"]["edit"]))
         user_disabled_var.set(bool(user.get("disabled", False)))
@@ -569,6 +583,7 @@ def gui_mode(path: Path) -> int:
                 password=password or None,
                 view_data=user_view_var.get(),
                 send_commands=user_send_var.get(),
+                set_system_time=user_time_var.get(),
                 calibration_view=user_calibration_view_var.get(),
                 calibration_edit=user_calibration_edit_var.get(),
                 disabled=user_disabled_var.get(),
@@ -593,6 +608,7 @@ def gui_mode(path: Path) -> int:
         password_var.set("")
         user_view_var.set(True)
         user_send_var.set(False)
+        user_time_var.set(False)
         user_calibration_view_var.set(False)
         user_calibration_edit_var.set(False)
         user_disabled_var.set(False)
@@ -686,6 +702,9 @@ def gui_mode(path: Path) -> int:
     )
     ttk.Checkbutton(right, text="Disabled", variable=user_disabled_var).grid(
         row=4, column=0, sticky="w", pady=(0, 10)
+    )
+    ttk.Checkbutton(right, text="Set System Date/Time", variable=user_time_var).grid(
+        row=4, column=1, sticky="w", pady=(0, 10)
     )
     ttk.Label(right, text="Allowed Commands").grid(row=5, column=0, sticky="nw")
     user_commands_listbox = tk.Listbox(
@@ -842,6 +861,8 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--prompt-password", action="store_true")
         cmd.add_argument("--view-data", action="store_true")
         cmd.add_argument("--send-commands", action="store_true")
+        cmd.add_argument("--set-system-time", action=argparse.BooleanOptionalAction, default=None,
+                         help="Allow setting the GroundStation OS clock (default off; unchanged when editing unless specified)")
         cmd.add_argument("--calibration-view", action="store_true")
         cmd.add_argument("--calibration-edit", action="store_true")
         cmd.add_argument("--disabled", action="store_true")

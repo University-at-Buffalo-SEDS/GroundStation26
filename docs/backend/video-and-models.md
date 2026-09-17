@@ -1,5 +1,9 @@
 # Live video and stage models
 
+For test publishers, webcams, and instructions to find an existing receiver's
+secret, see the sender project's [macOS setup](../../video_sender/SETUP_MACOS.md)
+or [Linux setup](../../video_sender/SETUP_LINUX.md).
+
 The ground station receives H.264 over RTSP/TCP on **port 8554**, with a unique
 path per camera (`front`, `side`, `aft`, etc.). MediaMTX relays encoded video to
 live WebRTC previews and a [delayed HLS audience program](broadcast-studio.md) without transcoding.
@@ -26,6 +30,14 @@ headers, and one-second keyframe intervals. Encoded bytes pass directly through
 an OS pipe; FFmpeg uses stream copy. Rust does not replace the camera/codec stack.
 
 ## Ground station setup
+
+Native/systemd deployments now automatically install and supervise MediaMTX in
+`data/video` unless an external receiver is configured. See
+[native Ground Station receiver setup](../../video_sender/SETUP_GROUND_STATION.md)
+for Pi deployment, generated password lookup, and manual installation. This runs
+on the Ground Station machine, not on a camera publisher.
+
+### Docker deployment
 
 Set the ground station's reachable LAN IP and a shared secret:
 
@@ -55,7 +67,8 @@ login token, are reauthorized on access, and cannot grant upload/control access.
 Treat returned media URLs as private. RTSP is unencrypted: use the trusted camera
 network or a VPN.
 
-For a native backend, run MediaMTX with `backend/config/mediamtx.yml`, setting the
+To manage MediaMTX separately from a native backend, set `GS_VIDEO_MANAGED=0`
+and run MediaMTX with `backend/config/mediamtx.yml`, setting the
 indexed `MTX_AUTHINTERNALUSERS_*` environment variables shown in the Compose
 overlay and `MTX_WEBRTCADDITIONALHOSTS` to the LAN IP. Bind API/signaling to loopback
 with `MTX_APIADDRESS=127.0.0.1:9997`, `MTX_WEBRTCADDRESS=127.0.0.1:8889`, and

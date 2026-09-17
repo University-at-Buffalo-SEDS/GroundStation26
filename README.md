@@ -1,23 +1,23 @@
 # Ground Station 2026
 
-Recorded telemetry can be downloaded in every operating mode from
-**Data → Data capture · CSV downloads**; see [Data capture](docs/backend/data-capture.md).
+Recorded telemetry can be downloaded in every operating mode from **Data → Data capture · CSV downloads**;
+see [Data capture](docs/backend/data-capture.md).
 
-The backend listens on `0.0.0.0:3000` by default. Set `GS_BIND_ADDRESS` (for
-example `127.0.0.1:13000`) to run an independent test instance without a port
-collision. Clients must use the selected address. This is particularly useful
+The backend listens on `0.0.0.0:3000` by default. Set `GS_BIND_ADDRESS` (for example `127.0.0.1:13000`) to run an
+independent test instance without a port collision. Clients must use the selected address. This is particularly useful
 for concurrent Docker simulations using host networking.
 
-Live multi-camera video, the Raspberry Pi sender daemon, and rocket stage model
-storage are documented in [Video and stage models](docs/backend/video-and-models.md).
-Grouped valve actions, nitrogen testing, pressure calibration and the fill-equipment
-scene are documented in [GSE sequences](docs/backend/gse-sequences.md).
-Stream-manager roles and delayed audience video are covered in [Broadcast studio](docs/backend/broadcast-studio.md);
-named-part animation is covered in [Model animations](docs/backend/model-animations.md).
+Live multi-camera video, the Raspberry Pi sender daemon, and rocket stage model storage are documented
+in [Video and stage models](docs/backend/video-and-models.md). For macOS/Linux test publishers, webcams, secret lookup,
+and end-to-end playback checks, see [macOS and Linux video setup](docs/backend/mac-video-setup.md). Grouped valve
+actions, nitrogen testing, pressure calibration and the fill-equipment scene are documented
+in [GSE sequences](docs/backend/gse-sequences.md). Stream-manager roles and delayed audience video are covered
+in [Broadcast studio](docs/backend/broadcast-studio.md); named-part animation is covered
+in [Model animations](docs/backend/model-animations.md).
 
-The default Dashboard is the single-stage model with cycling backend-defined data.
-Settings → General → Viewing mode selects Ground Station view or delayed Streamer
-mode. Deploy matching frontend/backend `dev` builds (`--frontend-dev`); see the
+The default Dashboard is the single-stage model with cycling backend-defined data. Settings → General → Viewing mode
+selects Ground Station view or delayed Streamer mode. Deploy matching frontend/backend `dev` builds (`--frontend-dev`);
+see the
 [contract examples](docs/frontend/examples/README.md) and
 [backend presentation profile](docs/backend/presentation.example.json).
 
@@ -25,8 +25,8 @@ mode. Deploy matching frontend/backend `dev` builds (`--frontend-dev`); see the
 
 - Rust: install from https://rustup.rs/
 - `dioxus-cli`: install with `cargo install dioxus-cli`
-- SEDSNet v4.0.32, pinned from crates.io. The untracked workspace lockfile is local
-  build state; this release uses the same networking version as the firmware.
+- SEDSNet v4.0.32, pinned from crates.io. The untracked workspace lockfile is local build state; this release uses the
+  same networking version as the firmware.
 
 The frontend uses Dioxus. No separate WASM toolchain workflow is needed beyond the Rust targets used by `build.py`.
 
@@ -63,10 +63,9 @@ python3 build.py debug
 python3 build.py --frontend-dev
 ```
 
-`--frontend-dev` checks out the frontend's `dev` branch; the default frontend
-build uses its stable release branch. The cached checkout is fetched and reset
-to the selected remote branch, so an existing local branch is not assumed to
-have valid tracking metadata.
+`--frontend-dev` checks out the frontend's `dev` branch; the default frontend build uses its stable release branch. The
+cached checkout is fetched and reset to the selected remote branch, so an existing local branch is not assumed to have
+valid tracking metadata.
 
 Scoped build entry points:
 
@@ -127,25 +126,24 @@ Mode notes:
 - `hitl-mode` is for hardware-in-the-loop testing. It uses the HITL layout, ignores the key interlock, starts in
   `Startup`, and does not run the normal fill sequence state machine.
 
-The backend is a normal SEDSNet endpoint and discovers subscribers and routes by
-schema data type. It does not broadcast every value to both physical links.
-Managed underglow, startup-buzzer, flight-state, and DAQ
-calibration values are cached on disk;
-their last authoritative values are restored when GroundStation restarts and
-are resynchronized when boards join or reboot.
+The backend is a normal SEDSNet endpoint and discovers subscribers and routes by schema data type. It does not broadcast
+every value to both physical links. Managed underglow, startup-buzzer, flight-state, and DAQ calibration values are
+cached on disk; their last authoritative values are restored when GroundStation restarts and are resynchronized when
+boards join or reboot.
 
-Networking uses the published crates.io SEDSNet v4.0.33 release. Firmware send
-rates are configured with the board repositories' compile-time macros.
-Shutdown is latched: workers starting after the initial shutdown request still
-receive it, so a fast service stop cannot leave a late router or database
-worker waiting indefinitely. Backend tests cover the late-subscriber case in
-normal, HITL, and test-fire builds.
+Networking uses the published crates.io SEDSNet v4.0.33 release. Firmware send rates are configured with the board
+repositories' compile-time macros. Shutdown is latched: workers starting after the initial shutdown request still
+receive it, so a fast service stop cannot leave a late router or database worker waiting indefinitely. Backend tests
+cover the late-subscriber case in normal, HITL, and test-fire builds.
 
 ## Frontend / Backend Notes
 
 - For geolocation to work correctly in browsers, the backend should be behind HTTPS.
 - `docker-compose.yml` is set up for local TLS testing with a self-signed certificate.
-- The three bundled layouts (`layout.json`, `layout_hitl.json`, and `layout_test_fire.json`) define UI-only data display filter defaults. The frontend presents these as groundstation defaults and lets operators override filter kinds and tuning values locally. Loadcell display data is time-averaged while GPS and valve-state telemetry stay raw so saved telemetry remains unmodified.
+- The three bundled layouts (`layout.json`, `layout_hitl.json`, and `layout_test_fire.json`) define UI-only data display
+  filter defaults. The frontend presents these as groundstation defaults and lets operators override filter kinds and
+  tuning values locally. Loadcell display data is time-averaged while GPS and valve-state telemetry stay raw so saved
+  telemetry remains unmodified.
 
 ## Map Data
 

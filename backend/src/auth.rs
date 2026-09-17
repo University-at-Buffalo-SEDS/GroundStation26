@@ -29,6 +29,8 @@ pub struct Permissions {
     pub view_data: bool,
     #[serde(default)]
     pub send_commands: bool,
+    #[serde(default)]
+    pub set_system_time: bool,
 }
 
 impl Permissions {
@@ -44,6 +46,7 @@ impl Permissions {
         match required {
             Permission::ViewData => normalized.view_data,
             Permission::SendCommands => normalized.send_commands,
+            Permission::SetSystemTime => normalized.set_system_time,
         }
     }
 }
@@ -93,6 +96,7 @@ impl CalibrationAccess {
 pub enum Permission {
     ViewData,
     SendCommands,
+    SetSystemTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +246,7 @@ mod stream_role_tests {
             permissions: Permissions {
                 view_data: true,
                 send_commands: false,
+                set_system_time: false,
             },
             expires_at_ms: None,
             anonymous,
@@ -504,17 +509,12 @@ impl AuthManager {
                 ));
             }
 
-            let permissions = Permissions {
+            let mut permissions = Permissions {
                 view_data: row.get::<i64, _>("can_view_data") != 0,
                 send_commands: row.get::<i64, _>("can_send_commands") != 0,
+                set_system_time: false,
             }
             .normalized();
-
-            if !permissions.allows(required) {
-                return Err(AuthFailure::Forbidden(
-                    "session does not have the required permission".to_string(),
-                ));
-            }
 
             let config = self
                 .load_users_file()
@@ -525,6 +525,11 @@ impl AuthManager {
                 .iter()
                 .find(|u| u.username.eq_ignore_ascii_case(&username) && !u.disabled)
                 .ok_or_else(|| AuthFailure::Unauthorized("Account disabled or removed".into()))?;
+            // Read clock authority from the current account on every request.
+            permissions.set_system_time = user.permissions.set_system_time;
+            if !permissions.allows(required) {
+                return Err(AuthFailure::Forbidden("session does not have the required permission".into()));
+            }
             let (command_access, calibration_access) = configured_user_access(&config, &username);
 
             return Ok(AuthPrincipal {
@@ -542,7 +547,8 @@ impl AuthManager {
         let config = self
             .load_users_file()
             .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
-        let permissions = config.anonymous.normalized();
+        let mut permissions = config.anonymous.normalized();
+        permissions.set_system_time = false;
         if !permissions.allows(required) {
             return Err(AuthFailure::Unauthorized(
                 "authentication required".to_string(),

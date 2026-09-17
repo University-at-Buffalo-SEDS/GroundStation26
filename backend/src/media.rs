@@ -35,7 +35,7 @@ struct MediaState {
     preview_sessions: Mutex<Vec<(String, String, String)>>,
 }
 
-pub fn router(app: Arc<AppState>) -> Router<Arc<AppState>> {
+pub fn router(app: Arc<AppState>, relay_password: String) -> Router<Arc<AppState>> {
     let state = Arc::new(MediaState {
         app,
         client: reqwest::Client::builder()
@@ -49,7 +49,7 @@ pub fn router(app: Arc<AppState>) -> Router<Arc<AppState>> {
             .unwrap_or_else(|_| "http://127.0.0.1:8889".into()),
         hls_url: std::env::var("GS_VIDEO_HLS_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8888".into()),
-        relay_password: std::env::var("GS_VIDEO_PASSWORD").unwrap_or_default(),
+        relay_password,
         model_write: Mutex::new(()),
         presentation_write: Mutex::new(()),
         tickets: Mutex::new(Vec::new()),
@@ -448,7 +448,11 @@ mod tests {
             sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,allowed_commands_json,created_at_ms,expires_at_ms) VALUES(?,?,'session',1,0,'[]',0,9999999999999)")
                 .bind(format!("synthetic-{name}")).bind(name).execute(&app.auth_db).await.unwrap();
         }
-        let routes = router(app.clone()).with_state(app);
+        let routes = router(
+            app.clone(),
+            std::env::var("GS_VIDEO_PASSWORD").unwrap_or_default(),
+        )
+        .with_state(app);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:19090")
             .await
             .unwrap();

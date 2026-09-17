@@ -27,8 +27,11 @@ mod loadcell;
 mod logger;
 mod map;
 mod media;
+mod media_runtime;
 mod network_variables;
 mod recording_export;
+mod system_clock;
+mod recording_range;
 mod ring_buffer;
 mod rocket_commands;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
@@ -1619,7 +1622,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // --- Webserver ---
-    let app: Router = web::router(state.clone());
+    let mut video_runtime = media_runtime::VideoRuntime::start();
+    let app: Router = web::router(state.clone(), video_runtime.password.clone());
 
     // Separate host-network simulator runs must not contend for port 3000.
     // Normal deployments retain the existing address unless explicitly set.
@@ -1630,6 +1634,7 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal(state.clone()))
         .await?;
 
+    video_runtime.stop().await;
     // Ensure background tasks are signaled even if server exits unexpectedly.
     if state.request_shutdown() {
         log::info!("shutdown requested; draining background tasks");

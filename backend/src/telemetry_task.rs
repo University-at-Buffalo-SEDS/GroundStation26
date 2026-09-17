@@ -126,6 +126,10 @@ pub fn set_network_time_router(router: Arc<Router>) {
     let _ = NETWORK_TIME_ROUTER.set(router);
 }
 
+pub(crate) fn recording_network_utc_ms() -> Option<i64> {
+    NETWORK_TIME_ROUTER.get()?.network_time()?.unix_time_ms?.try_into().ok()
+}
+
 fn send_valve_launch_sequence_command(router: &Router) -> bool {
     let payload = [ValveBoardCommands::Sequence as u8];
     if let Err(e) = router.log_queue(

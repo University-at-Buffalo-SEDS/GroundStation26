@@ -33,17 +33,19 @@ struct Recording {
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/recordings", get(list))
+        .route("/api/recordings/csv", get(crate::recording_range::download))
+        .route("/api/system/time", get(crate::system_clock::status).post(crate::system_clock::sync))
         .route("/api/recordings/{id}/csv", get(download))
 }
 
-fn directory(state: &AppState) -> PathBuf {
+pub(crate) fn directory(state: &AppState) -> PathBuf {
     FsPath::new(&state.placeholder_db_path)
         .parent()
         .unwrap_or(FsPath::new("."))
         .to_path_buf()
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     id.strip_prefix("groundstation_recording_")
         .and_then(|s| s.strip_suffix(".db"))
         .is_some_and(|stamp| {
@@ -54,7 +56,7 @@ fn valid_id(id: &str) -> bool {
         })
 }
 
-async fn recording_path(root: &FsPath, id: &str) -> Result<PathBuf, StatusCode> {
+pub(crate) async fn recording_path(root: &FsPath, id: &str) -> Result<PathBuf, StatusCode> {
     if !valid_id(id) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -213,7 +215,7 @@ async fn download(
         .into_response()
 }
 
-fn text_cell(value: &str) -> String {
+pub(crate) fn text_cell(value: &str) -> String {
     // Quote CSV syntax and neutralize spreadsheet formulas in textual metadata.
     let formula = value.trim_start().starts_with(['=', '+', '-', '@']);
     format!(
@@ -249,12 +251,12 @@ async fn csv_page(db: &SqlitePool, last: i64, upper: i64) -> Result<(String, i64
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    struct TestDirectory(PathBuf);
+    pub(crate) struct TestDirectory(pub PathBuf);
     impl TestDirectory {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
                 "gs-csv-test-{}-{}",
                 std::process::id(),
@@ -273,7 +275,7 @@ mod tests {
         }
     }
 
-    async fn export_state(root: &FsPath, allow: bool) -> Arc<AppState> {
+    pub(crate) async fn export_state(root: &FsPath, allow: bool) -> Arc<AppState> {
         let mut state = crate::state::tests::test_app_state().await;
         crate::ensure_auth_sessions_table(&state.auth_db)
             .await
