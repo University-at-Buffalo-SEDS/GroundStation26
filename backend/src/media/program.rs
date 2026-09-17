@@ -7,6 +7,8 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
     Router::new()
         .route("/api/media-assets/program", get(page))
         .route("/api/media-assets/program/state", get(program_state))
+        .route("/api/media-assets/program/audio", get(program_audio))
+        .route("/assets/program-audio.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript")],include_str!("program-audio.js")) }))
         .route("/api/media-assets/hls/{id}/{file}", get(hls))
         .route("/api/stream-roles", get(roles).post(set_role))
         .route("/api/dashboard_status", get(dashboard_status))
@@ -116,6 +118,21 @@ async fn program_state(
         .filter(|(t, _)| target.saturating_sub(*t) < 2000)
         .map(|(_, v)| v.clone());
     Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"model":model,"server_now_ms":now,"telemetry":telemetry}))).into_response())
+}
+
+#[derive(Deserialize)]
+struct AudioCursor { #[serde(default)] after: u64 }
+
+async fn program_audio(State(state): State<Arc<MediaState>>, Query(query): Query<MediaQuery>,
+    Query(cursor): Query<AudioCursor>, headers: HeaderMap) -> ApiResult<Response> {
+    authorize_media(&state, &headers, &query, "program").await?;
+    let broadcast = read_presentation(&state).await?.broadcast;
+    let batch = if broadcast.comms_audio_enabled {
+        state.voice.audience_batch(cursor.after, broadcast.delay_seconds).await
+    } else {
+        serde_json::json!({"enabled":false,"generation":0,"cursor":0,"frames":[]})
+    };
+    Ok(([(header::CACHE_CONTROL,"no-store")], Json(batch)).into_response())
 }
 
 fn model_snapshot(app: &AppState, model: &Vehicle, now: u64) -> serde_json::Value {

@@ -31,6 +31,8 @@ pub struct Permissions {
     pub send_commands: bool,
     #[serde(default)]
     pub set_system_time: bool,
+    #[serde(default)]
+    pub voice_transmit: bool,
 }
 
 impl Permissions {
@@ -47,6 +49,7 @@ impl Permissions {
             Permission::ViewData => normalized.view_data,
             Permission::SendCommands => normalized.send_commands,
             Permission::SetSystemTime => normalized.set_system_time,
+            Permission::VoiceTransmit => normalized.view_data && normalized.voice_transmit,
         }
     }
 }
@@ -97,6 +100,7 @@ pub enum Permission {
     ViewData,
     SendCommands,
     SetSystemTime,
+    VoiceTransmit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +251,7 @@ mod stream_role_tests {
                 view_data: true,
                 send_commands: false,
                 set_system_time: false,
+                voice_transmit: false,
             },
             expires_at_ms: None,
             anonymous,
@@ -513,6 +518,7 @@ impl AuthManager {
                 view_data: row.get::<i64, _>("can_view_data") != 0,
                 send_commands: row.get::<i64, _>("can_send_commands") != 0,
                 set_system_time: false,
+                voice_transmit: false,
             }
             .normalized();
 
@@ -527,6 +533,7 @@ impl AuthManager {
                 .ok_or_else(|| AuthFailure::Unauthorized("Account disabled or removed".into()))?;
             // Read clock authority from the current account on every request.
             permissions.set_system_time = user.permissions.set_system_time;
+            permissions.voice_transmit = user.permissions.voice_transmit && user.permissions.view_data;
             if !permissions.allows(required) {
                 return Err(AuthFailure::Forbidden("session does not have the required permission".into()));
             }
@@ -549,6 +556,7 @@ impl AuthManager {
             .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
         let mut permissions = config.anonymous.normalized();
         permissions.set_system_time = false;
+        permissions.voice_transmit = false;
         if !permissions.allows(required) {
             return Err(AuthFailure::Unauthorized(
                 "authentication required".to_string(),
@@ -581,7 +589,7 @@ impl AuthManager {
                 Ok(AuthPrincipal {
                     roles: Vec::new(),
                     username: None,
-                    permissions: config.anonymous.normalized(),
+                    permissions: Permissions { voice_transmit: false, ..config.anonymous.normalized() },
                     expires_at_ms: None,
                     anonymous: true,
                     session_type: None,

@@ -1,6 +1,8 @@
 //! Authenticated WebRTC signaling, camera discovery and persistent per-stage GLB assets.
 #[path = "media/contract.rs"]
 mod contract;
+#[path = "media/recordings.rs"]
+mod recordings;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
@@ -28,6 +30,8 @@ struct MediaState {
     relay_password: String,
     model_write: Mutex<()>,
     models: PathBuf,
+    recordings: PathBuf,
+    voice: Arc<crate::voice::VoiceHub>,
     presentation_write: Mutex<()>,
     tickets: Mutex<Vec<contract::Ticket>>,
     program_history: Mutex<std::collections::VecDeque<(u64, serde_json::Value)>>,
@@ -35,7 +39,7 @@ struct MediaState {
     preview_sessions: Mutex<Vec<(String, String, String)>>,
 }
 
-pub fn router(app: Arc<AppState>, relay_password: String) -> Router<Arc<AppState>> {
+pub fn router(app: Arc<AppState>, relay_password: String, voice: Arc<crate::voice::VoiceHub>) -> Router<Arc<AppState>> {
     let state = Arc::new(MediaState {
         app,
         client: reqwest::Client::builder()
@@ -50,6 +54,8 @@ pub fn router(app: Arc<AppState>, relay_password: String) -> Router<Arc<AppState
         hls_url: std::env::var("GS_VIDEO_HLS_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8888".into()),
         relay_password,
+        voice,
+        recordings: recordings_directory(),
         model_write: Mutex::new(()),
         presentation_write: Mutex::new(()),
         tickets: Mutex::new(Vec::new()),
@@ -60,8 +66,11 @@ pub fn router(app: Arc<AppState>, relay_password: String) -> Router<Arc<AppState
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/stage_models")),
     });
+    let initial = state.clone();
+    tokio::spawn(async move { contract::initialize_voice_broadcast(&initial).await; });
     Router::new()
         .merge(contract::routes())
+        .merge(recordings::routes())
         .route("/api/video/streams", get(list_streams))
         .route(
             "/api/video/streams/{id}/whep",
@@ -80,6 +89,12 @@ pub fn router(app: Arc<AppState>, relay_password: String) -> Router<Arc<AppState
         )
         .with_state(state)
         .route("/media", get(|| async { Html(include_str!("media.html")) }))
+}
+
+pub(crate) fn recordings_directory() -> PathBuf {
+    std::env::var_os("GS_VIDEO_RECORDINGS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("backend/data/video_recordings"))
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
@@ -437,7 +452,7 @@ mod tests {
             ("administrator", vec!["stream_admin"]),
             ("viewer", vec![]),
         ];
-        let users:Vec<_>=accounts.iter().map(|(name,roles)|serde_json::json!({"username":name,"roles":roles,"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":false}})).collect();
+        let users:Vec<_>=accounts.iter().map(|(name,roles)|serde_json::json!({"username":name,"roles":roles,"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":false,"voice_transmit":*name!="viewer"}})).collect();
         std::fs::write(&path,serde_json::to_vec(&serde_json::json!({"anonymous":{"view_data":true,"send_commands":false},"users":users})).unwrap()).unwrap();
         let mut app = crate::state::tests::test_app_state().await;
         Arc::get_mut(&mut app).unwrap().auth = Arc::new(crate::auth::AuthManager::new(path));
@@ -448,10 +463,13 @@ mod tests {
             sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,allowed_commands_json,created_at_ms,expires_at_ms) VALUES(?,?,'session',1,0,'[]',0,9999999999999)")
                 .bind(format!("synthetic-{name}")).bind(name).execute(&app.auth_db).await.unwrap();
         }
+        let voice = Arc::new(crate::voice::VoiceHub::default());
         let routes = router(
             app.clone(),
             std::env::var("GS_VIDEO_PASSWORD").unwrap_or_default(),
+            voice.clone(),
         )
+        .merge(crate::voice::routes(app.clone(), voice))
         .with_state(app);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:19090")
             .await

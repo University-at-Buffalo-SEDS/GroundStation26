@@ -45,6 +45,7 @@ mod telemetry_task;
 mod test_fire_csv;
 mod types;
 mod web;
+mod voice;
 
 use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;

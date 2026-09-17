@@ -164,6 +164,10 @@ fn receiver_command(binary: &Path, config: &Path, password: &str, host: &str) ->
         .env("MTX_APIADDRESS", "127.0.0.1:9997")
         .env("MTX_WEBRTCADDRESS", "127.0.0.1:8889")
         .env("MTX_HLSADDRESS", "127.0.0.1:8888")
+        .env(
+            "MTX_PATHDEFAULTS_RECORDPATH",
+            crate::media::recordings_directory().join("%path/%Y-%m-%d_%H-%M-%S-%f"),
+        )
         .env("MTX_WEBRTCIPSFROMINTERFACES", "yes")
         .env("MTX_WEBRTCADDITIONALHOSTS", host)
         .env("MTX_AUTHINTERNALUSERS_0_USER", "camera")

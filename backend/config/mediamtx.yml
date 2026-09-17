@@ -28,5 +28,11 @@ pathDefaults:
   source: publisher
   overridePublisher: false
   maxReaders: 16
+  record: true
+  recordPath: ./backend/data/video_recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 1m
+  recordDeleteAfter: 0s
 paths:
   "~^[A-Za-z0-9_-]{1,64}$": {}

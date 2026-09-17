@@ -9,6 +9,7 @@ mod program;
 #[serde(default)]
 pub(super) struct Broadcast {
     delay_seconds: u32,
+    comms_audio_enabled: bool,
     label: String,
     featured_stream_id: String,
     hidden_stream_ids: Vec<String>,
@@ -20,6 +21,7 @@ impl Default for Broadcast {
     fn default() -> Self {
         Self {
             delay_seconds: 10,
+            comms_audio_enabled: false,
             label: String::new(),
             featured_stream_id: String::new(),
             hidden_stream_ids: Vec::new(),
@@ -252,6 +254,13 @@ async fn read_presentation(state: &MediaState) -> ApiResult<Presentation> {
     Ok(presentation)
 }
 
+pub(super) async fn initialize_voice_broadcast(state: &MediaState) {
+    let _guard = state.presentation_write.lock().await;
+    if let Ok(presentation) = read_presentation(state).await {
+        state.voice.set_broadcast(presentation.broadcast.comms_audio_enabled).await;
+    }
+}
+
 async fn write_presentation(state: &MediaState, value: &Presentation) -> ApiResult<()> {
     tokio::fs::create_dir_all(&state.models)
         .await
@@ -280,7 +289,7 @@ pub(super) struct MediaQuery {
     session: Option<String>,
 }
 
-async fn ticket(state: &MediaState, headers: &HeaderMap, resource: &str) -> ApiResult<String> {
+pub(super) async fn ticket(state: &MediaState, headers: &HeaderMap, resource: &str) -> ApiResult<String> {
     let authorization = headers.get(header::AUTHORIZATION).cloned();
     let mut tickets = state.tickets.lock().await;
     tickets.retain(|ticket| ticket.expires > Instant::now());
@@ -484,6 +493,7 @@ async fn control_broadcast(
         .ok_or_else(|| error(StatusCode::CONFLICT, "Broadcast revision exhausted"))?;
     presentation.broadcast = broadcast.clone();
     write_presentation(&state, &presentation).await?;
+    state.voice.set_broadcast(broadcast.comms_audio_enabled).await;
     Ok(axum::Json(broadcast))
 }
 

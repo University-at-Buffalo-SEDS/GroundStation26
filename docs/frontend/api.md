@@ -1,5 +1,26 @@
 # Frontend API Contract
 
+## Camera archives and crew voice
+
+Mission links to `/media#recordings-heading` for original camera recordings and
+`/radio` for browser voice. Both pages are served by the backend and sign in
+independently. Voice opens separately so it can remain connected during dashboard
+navigation. No radio hardware commands are involved.
+
+`GET /api/video/recordings?offset=0&limit=50` returns a paginated original MP4 list
+with scoped download/playback URLs; it requires live-preview access. See
+[recordings](../backend/video-recordings.md). `/api/voice/ws` authenticates a signed-in
+session with explicit `permissions.voice_transmit` and view access in its first
+message, relays bounded PCM frames, and provides
+a participant roster. See [voice protocol and controls](../backend/crew-voice.md).
+
+Broadcast settings now include `comms_audio_enabled` (default false). Stream
+managers can include delayed crew audio in the audience program; viewers get only
+playback/mute/volume controls. `/api/media-assets/program/audio` accepts a program
+ticket and an `after` cursor and releases audio only after the server's broadcast
+delay. It cannot be used to transmit. `/api/voice/status` reports current transmit
+permission and whether the crew audio is included in the broadcast.
+
 ## Live dashboard cadence
 
 Each `/api/dashboard_status` stat now includes backend-owned `binding` metadata

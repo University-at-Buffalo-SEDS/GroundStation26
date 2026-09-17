@@ -1,5 +1,8 @@
 # Live video and stage models
 
+Camera streams are now saved for later review; see [video recordings](video-recordings.md).
+For browser push-to-talk and open-mic calls, see [crew voice](crew-voice.md).
+
 For test publishers, webcams, and instructions to find an existing receiver's
 secret, see the sender project's [macOS setup](../../video_sender/SETUP_MACOS.md)
 or [Linux setup](../../video_sender/SETUP_LINUX.md).
@@ -207,7 +210,7 @@ returned `/api/media-assets/...` URLs include scoped tickets for media elements.
 No extension appears in model URLs.
 WHEP clients must gather ICE before posting; trickle-ICE PATCH is not implemented.
 The included client reconnects automatically. HLS segments are retained transiently
-for the audience delay; this is not durable video recording. See the
+for the audience delay; separate original MP4 recordings are retained on disk. See the
 [broadcast contract](broadcast-studio.md) for scoped program/HLS routes, role
 bootstrapping, revocation behavior, and delay limitations.
 

@@ -59,10 +59,11 @@ async function poll(){
   const start=Date.now(),r=await fetch('/api/media-assets/program/state?ticket='+encodeURIComponent(ticket),{cache:'no-store'});if(!r.ok)throw Error('Program unavailable');const next=await r.json();clockOffset=next.server_now_ms-(start+Date.now())/2;
   if(state&&next.broadcast.delay_seconds!==state.broadcast.delay_seconds){for(const id of [...players.keys()])remove(id);displayed='';generation++;}
   state=next;lastPoll=performance.now();
+  window.gsProgramAudioState={enabled:state.broadcast.comms_audio_enabled,delay:state.broadcast.delay_seconds,fresh:true};window.dispatchEvent(new CustomEvent("gs-program-audio-state",{detail:window.gsProgramAudioState}));
   const ids=new Set(state.streams.map(s=>s.id));for(const id of [...players.keys()])if(!ids.has(id))remove(id);
   for(const feed of state.streams){if(players.get(feed.id)?.failed)remove(feed.id);if(Hls.isSupported()&&!players.has(feed.id))create(feed);}
   drawBanner();
- }catch(e){status.textContent='Program unavailable — delayed feed paused';lastPoll=0;}
+ }catch(e){status.textContent='Program unavailable — delayed feed paused';lastPoll=0;window.gsProgramAudioState={enabled:false,fresh:false};window.dispatchEvent(new CustomEvent("gs-program-audio-state",{detail:window.gsProgramAudioState}));}
  if(!stopped)setTimeout(poll,500);
 }
 function render(){
@@ -97,4 +98,4 @@ function render(){
 const timer=setInterval(render,100);
 if(!Hls.isSupported()){status.textContent='This browser cannot play delayed video; showing the model.';}poll();
 window.addEventListener('pagehide',()=>{stopped=true;clearInterval(timer);for(const id of [...players.keys()])remove(id);});
-</script></html>
+</script><script type="module" src="/assets/program-audio.js"></script></html>

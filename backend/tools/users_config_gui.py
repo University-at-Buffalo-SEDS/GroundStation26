@@ -25,6 +25,7 @@ def normalize_permissions(value: dict[str, Any] | None) -> dict[str, bool]:
         "view_data": bool(value.get("view_data", False)),
         "send_commands": bool(value.get("send_commands", False)),
         "set_system_time": bool(value.get("set_system_time", False)),
+        "voice_transmit": bool(value.get("voice_transmit", False)),
     }
     if perms["send_commands"]:
         perms["view_data"] = True
@@ -143,6 +144,7 @@ def upsert_user(
         disabled: bool,
         allowed_commands: list[str] | None,
         set_system_time: bool | None = None,
+        voice_transmit: bool | None = None,
 ) -> None:
     username = username.strip()
     if not username:
@@ -158,6 +160,10 @@ def upsert_user(
     permissions["set_system_time"] = (
         bool(existing and existing["permissions"].get("set_system_time", False))
         if set_system_time is None else set_system_time
+    )
+    permissions["voice_transmit"] = (
+        bool(existing and existing["permissions"].get("voice_transmit", False))
+        if voice_transmit is None else voice_transmit
     )
     if existing is None:
         if password is None:
@@ -212,7 +218,7 @@ def print_summary(cfg: dict[str, Any]) -> None:
         print(
             f"  - {user['username']}: view_data={perms['view_data']} "
             f"send_commands={perms['send_commands']} disabled={user['disabled']} "
-            f"set_system_time={perms['set_system_time']} "
+            f"set_system_time={perms['set_system_time']} voice_transmit={perms['voice_transmit']} "
             f"allowed_commands={','.join(user['command_access']['allowed_commands']) or 'all'} "
             f"calibration_view={user['calibration_access']['view']} "
             f"calibration_edit={user['calibration_access']['edit']}"
@@ -246,6 +252,13 @@ def cli_mode(args: argparse.Namespace) -> int:
     elif args.command == "set-ttl":
         cfg["session_ttl_seconds"] = max(1, int(args.seconds))
         changed = True
+    elif args.command == "set-voice-permission":
+        user = next((u for u in cfg["users"] if u["username"].casefold() == args.username.casefold()), None)
+        if user is None:
+            print(f"user not found: {args.username}", file=sys.stderr)
+            return 1
+        user["permissions"]["voice_transmit"] = args.access == "allow"
+        changed = True
     elif args.command == "remove-user":
         if not remove_user(cfg, args.username):
             print(f"user not found: {args.username}", file=sys.stderr)
@@ -262,6 +275,7 @@ def cli_mode(args: argparse.Namespace) -> int:
             view_data=args.view_data,
             send_commands=args.send_commands,
             set_system_time=args.set_system_time,
+            voice_transmit=args.voice_transmit,
             calibration_view=args.calibration_view,
             calibration_edit=args.calibration_edit,
             disabled=args.disabled,
@@ -303,6 +317,7 @@ def tui_mode(path: Path) -> int:
                 view_data = prompt_bool("Allow view data", True)
                 send_commands = prompt_bool("Allow send commands", False)
                 set_system_time = prompt_bool("Allow setting GroundStation system date/time", False)
+                voice_transmit = prompt_bool("Allow crew voice transmission", False)
                 calibration_view = prompt_bool("Allow calibration view", False)
                 calibration_edit = prompt_bool("Allow calibration edit", False)
                 disabled = prompt_bool("Disabled", False)
@@ -318,6 +333,7 @@ def tui_mode(path: Path) -> int:
                     view_data=view_data,
                     send_commands=send_commands,
                     set_system_time=set_system_time,
+                    voice_transmit=voice_transmit,
                     calibration_view=calibration_view,
                     calibration_edit=calibration_edit,
                     disabled=disabled,
@@ -335,6 +351,7 @@ def tui_mode(path: Path) -> int:
                 view_data = prompt_bool("Allow view data", perms["view_data"])
                 send_commands = prompt_bool("Allow send commands", perms["send_commands"])
                 set_system_time = prompt_bool("Allow setting GroundStation system date/time", perms["set_system_time"])
+                voice_transmit = prompt_bool("Allow crew voice transmission", perms["voice_transmit"])
                 calibration_view = prompt_bool(
                     "Allow calibration view", calibration["view"]
                 )
@@ -354,6 +371,7 @@ def tui_mode(path: Path) -> int:
                     view_data=view_data,
                     send_commands=send_commands,
                     set_system_time=set_system_time,
+                    voice_transmit=voice_transmit,
                     calibration_view=calibration_view,
                     calibration_edit=calibration_edit,
                     disabled=disabled,
@@ -500,6 +518,7 @@ def gui_mode(path: Path) -> int:
     user_view_var = tk.BooleanVar(value=True)
     user_send_var = tk.BooleanVar(value=False)
     user_time_var = tk.BooleanVar(value=False)
+    user_voice_var = tk.BooleanVar(value=False)
     user_calibration_view_var = tk.BooleanVar(value=False)
     user_calibration_edit_var = tk.BooleanVar(value=False)
     user_disabled_var = tk.BooleanVar(value=False)
@@ -539,6 +558,7 @@ def gui_mode(path: Path) -> int:
         user_view_var.set(bool(user["permissions"]["view_data"]))
         user_send_var.set(bool(user["permissions"]["send_commands"]))
         user_time_var.set(bool(user["permissions"]["set_system_time"]))
+        user_voice_var.set(bool(user["permissions"]["voice_transmit"]))
         user_calibration_view_var.set(bool(user["calibration_access"]["view"]))
         user_calibration_edit_var.set(bool(user["calibration_access"]["edit"]))
         user_disabled_var.set(bool(user.get("disabled", False)))
@@ -584,6 +604,7 @@ def gui_mode(path: Path) -> int:
                 view_data=user_view_var.get(),
                 send_commands=user_send_var.get(),
                 set_system_time=user_time_var.get(),
+                voice_transmit=user_voice_var.get(),
                 calibration_view=user_calibration_view_var.get(),
                 calibration_edit=user_calibration_edit_var.get(),
                 disabled=user_disabled_var.get(),
@@ -609,6 +630,7 @@ def gui_mode(path: Path) -> int:
         user_view_var.set(True)
         user_send_var.set(False)
         user_time_var.set(False)
+        user_voice_var.set(False)
         user_calibration_view_var.set(False)
         user_calibration_edit_var.set(False)
         user_disabled_var.set(False)
@@ -703,9 +725,10 @@ def gui_mode(path: Path) -> int:
     ttk.Checkbutton(right, text="Disabled", variable=user_disabled_var).grid(
         row=4, column=0, sticky="w", pady=(0, 10)
     )
-    ttk.Checkbutton(right, text="Set System Date/Time", variable=user_time_var).grid(
-        row=4, column=1, sticky="w", pady=(0, 10)
-    )
+    account_permissions = ttk.Frame(right)
+    account_permissions.grid(row=4, column=1, sticky="w", pady=(0, 10))
+    ttk.Checkbutton(account_permissions, text="Set System Date/Time", variable=user_time_var).pack(anchor="w")
+    ttk.Checkbutton(account_permissions, text="Transmit Crew Voice", variable=user_voice_var).pack(anchor="w")
     ttk.Label(right, text="Allowed Commands").grid(row=5, column=0, sticky="nw")
     user_commands_listbox = tk.Listbox(
         right,
@@ -835,6 +858,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("list", help="Print current config")
+    voice = sub.add_parser("set-voice-permission", help="Change only an existing account's crew voice transmit permission")
+    voice.add_argument("username")
+    voice.add_argument("access", choices=["allow", "deny"])
 
     anon = sub.add_parser("set-anonymous", help="Set anonymous permissions")
     anon.add_argument("--view-data", action="store_true")
@@ -861,6 +887,8 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--prompt-password", action="store_true")
         cmd.add_argument("--view-data", action="store_true")
         cmd.add_argument("--send-commands", action="store_true")
+        cmd.add_argument("--voice-transmit", action=argparse.BooleanOptionalAction, default=None,
+                         help="Allow crew voice transmission (default off; preserved when editing unless specified)")
         cmd.add_argument("--set-system-time", action=argparse.BooleanOptionalAction, default=None,
                          help="Allow setting the GroundStation OS clock (default off; unchanged when editing unless specified)")
         cmd.add_argument("--calibration-view", action="store_true")

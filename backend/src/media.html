@@ -18,6 +18,7 @@
   li { margin: 12px 0; } li button { margin-left: 16px; }
 </style>
 <a href="/dashboard">← Dashboard</a>
+ · <a href="/radio" target="_blank" rel="noopener">Crew voice · push to talk</a>
 <h1>Video & stage models</h1>
 <form id="login">
   <label>Username<input id="username" autocomplete="username" required></label>
@@ -28,6 +29,13 @@
 <h2>Live cameras</h2>
 <p id="video-status">Connecting to video receiver…</p>
 <div id="cameras"></div>
+<h2 id="recordings-heading">Camera recordings</h2>
+<p>Original encoded camera video, saved on the Ground Station in approximately one-minute MP4 segments. The current segment becomes available after it stops updating. Recording times in filenames use the station's local time. Operator or stream-manager access is required.</p>
+<button id="recordings-refresh">Refresh recordings</button>
+<p id="recordings-status" role="status"></p>
+<video id="recording-player" controls playsinline hidden></video>
+<ul id="recordings"></ul>
+<button id="recordings-prev" disabled>Previous</button> <button id="recordings-next" disabled>Next</button>
 <h2>Rocket stage models</h2>
 <p>Store GLB 2.0 files by stage and model name (up to 64 MiB). Reusing both names replaces that model.</p>
 <form id="upload">
@@ -41,6 +49,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let token = '', generation = 0;
+let recordingOffset = 0;
 const cameras = new Map();
 function notice(text) { $('message').textContent = text; }
 async function api(path, options = {}) {
@@ -83,7 +92,7 @@ function stopCamera(camera) {
   if (camera.session) api(camera.session, {method: 'DELETE'}).catch(() => {});
   camera.card.remove();
 }
-function stopAll() { generation++; for (const camera of cameras.values()) stopCamera(camera); cameras.clear(); }
+function stopAll() { generation++; for (const camera of cameras.values()) stopCamera(camera); cameras.clear(); $('recording-player').pause(); $('recording-player').removeAttribute('src'); $('recording-player').load(); $('recording-player').hidden = true; $('recordings').replaceChildren(); $('recordings-status').textContent = ''; recordingOffset = 0; }
 async function connect(camera) {
   const pc = new RTCPeerConnection({iceServers: []}); camera.pc = pc;
   pc.addTransceiver('video', {direction: 'recvonly'});
@@ -153,6 +162,34 @@ async function refreshModels() {
     item.append(button, select); $('models').append(item);
   }
 }
+async function refreshRecordings() {
+  const current = generation;
+  try {
+    const page = await (await api(`/api/video/recordings?offset=${recordingOffset}&limit=50`)).json();
+    if (current !== generation) return;
+    $('recordings').replaceChildren();
+    $('recordings-status').textContent = page.total ? `${page.total} saved segment(s) · showing ${page.offset + 1}–${page.offset + page.recordings.length}` : 'No recordings yet. Start a camera publisher to begin recording.';
+    $('recordings-prev').disabled = recordingOffset === 0;
+    $('recordings-next').disabled = recordingOffset + page.recordings.length >= page.total;
+    for (const clip of page.recordings) {
+      const item = document.createElement('li');
+      item.textContent = `${clip.stream} / ${clip.file} · ${(clip.size_bytes / 1048576).toFixed(1)} MiB `;
+      if (clip.recently_updated) {
+        item.append(document.createTextNode(' · Still updating — refresh shortly'));
+      } else {
+        const play = document.createElement('button'); play.textContent = 'Play';
+        play.onclick = () => { $('recording-player').hidden = false; $('recording-player').src = clip.url; $('recording-player').play().catch(err => notice(err.message)); };
+        const download = document.createElement('a'); download.textContent = 'Download original'; download.href = clip.url; download.download = `${clip.stream}-${clip.file}`;
+        item.append(play, document.createTextNode(' '), download);
+      }
+      $('recordings').append(item);
+    }
+  } catch (err) { if (current === generation) { $('recordings').replaceChildren(); $('recordings-status').textContent = err.message; $('recordings-prev').disabled = true; $('recordings-next').disabled = true; } }
+}
+$('recordings-refresh').onclick = refreshRecordings;
+$('recordings-prev').onclick = () => { recordingOffset = Math.max(0, recordingOffset - 50); refreshRecordings(); };
+$('recordings-next').onclick = () => { recordingOffset += 50; refreshRecordings(); };
+$('recording-player').onerror = () => notice('Recording cannot be played yet, or its access link expired. Refresh recordings and retry; download the original if your browser does not support its codec.');
 $('upload').onsubmit = async event => {
   event.preventDefault(); const file = $('model-file').files[0];
   if (!file || file.size > 64 * 1048576) return notice('Choose a GLB file no larger than 64 MiB.');
@@ -162,9 +199,9 @@ $('upload').onsubmit = async event => {
     notice('Model saved'); await refreshModels();
   } catch (err) { notice(err.message); } finally { $('save').disabled = false; }
 };
-async function refresh() { await Promise.all([refreshVideo(), refreshModels().catch(err => notice(err.message))]); }
+async function refresh() { await Promise.all([refreshVideo(), refreshRecordings(), refreshModels().catch(err => notice(err.message))]); }
 async function poll() { await refreshVideo(); setTimeout(poll, 5000); }
-refreshModels().catch(err => notice(err.message)); poll();
+refreshModels().catch(err => notice(err.message)); refreshRecordings(); poll();
 window.addEventListener('pagehide', stopAll);
 </script>
 </html>

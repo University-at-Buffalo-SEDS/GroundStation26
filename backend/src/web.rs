@@ -143,6 +143,7 @@ fn wants_ndjson(headers: &HeaderMap) -> bool {
 
 /// Public router constructor
 pub fn router(state: Arc<AppState>, video_password: String) -> Router {
+    let voice = Arc::new(crate::voice::VoiceHub::default());
     let spa_index = ServeFile::new("./frontend/dist/public/index.html");
     let static_dir = ServeDir::new("./frontend/dist/public")
         .precompressed_br()
@@ -231,7 +232,8 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
         .route("/favicon.ico", get(get_favicon))
         .route("/valvestate", get(get_valve_state))
-        .merge(crate::media::router(state.clone(), video_password))
+        .merge(crate::media::router(state.clone(), video_password, voice.clone()))
+        .merge(crate::voice::routes(state.clone(), voice))
         .merge(crate::gse::routes())
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)

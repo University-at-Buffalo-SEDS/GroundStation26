@@ -6,6 +6,7 @@ services:
       GS_VIDEO_WEBRTC_URL: http://video:8889
       GS_VIDEO_HLS_URL: http://video:8888
       GS_VIDEO_PASSWORD: ${GS_VIDEO_PASSWORD:?Set GS_VIDEO_PASSWORD to a strong secret}
+      GS_VIDEO_RECORDINGS_DIR: /app/backend/data/video_recordings
     depends_on:
       - video
   video:
@@ -24,8 +25,10 @@ services:
       MTX_AUTHINTERNALUSERS_1_PASS: ${GS_VIDEO_PASSWORD}
       MTX_AUTHINTERNALUSERS_1_PERMISSIONS_0_ACTION: read
       MTX_AUTHINTERNALUSERS_1_PERMISSIONS_1_ACTION: api
+      MTX_PATHDEFAULTS_RECORDPATH: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
     volumes:
       - ./backend/config/mediamtx.yml:/mediamtx.yml:ro
+      - ./backend/data/video_recordings:/recordings
     networks:
       - internal
       - external

@@ -23,5 +23,21 @@ class ClockPermissionTests(unittest.TestCase):
         self.assertFalse(cfg["users"][0]["permissions"]["set_system_time"])
 
 
+class VoicePermissionTests(unittest.TestCase):
+    def test_explicit_grant_is_preserved_and_revocable(self):
+        self.assertFalse(users.normalize_permissions({"send_commands": True})["voice_transmit"])
+        cfg = {"users": []}
+        kwargs = dict(password="test-only", view_data=True, send_commands=False,
+                      calibration_view=False, calibration_edit=False, disabled=False,
+                      allowed_commands=[])
+        users.upsert_user(cfg, "crew", voice_transmit=True, **kwargs)
+        self.assertTrue(cfg["users"][0]["permissions"]["voice_transmit"])
+        kwargs["password"] = None
+        users.upsert_user(cfg, "crew", **kwargs)
+        self.assertTrue(cfg["users"][0]["permissions"]["voice_transmit"])
+        users.upsert_user(cfg, "crew", voice_transmit=False, **kwargs)
+        self.assertFalse(cfg["users"][0]["permissions"]["voice_transmit"])
+
+
 if __name__ == "__main__":
     unittest.main()

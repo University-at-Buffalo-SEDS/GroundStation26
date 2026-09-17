@@ -11,6 +11,8 @@ independently.
   audience delay, API behavior and integration checks.
 - [Video and stage models](backend/video-and-models.md): receiver/sender deployment
   and model administration.
+- [Camera recordings](backend/video-recordings.md): original MP4 storage, review, and downloads.
+- [Crew voice](backend/crew-voice.md): browser calls, push-to-talk, and microphone controls.
 - [Model animations](backend/model-animations.md): single-stage default and backend
   binding configuration; custom multi-stage profiles remain supported.
 - [GSE sequences](backend/gse-sequences.md): grouped control and equipment scene.
