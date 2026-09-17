@@ -539,6 +539,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fill_nitrogen_and_self_test_commands_remain_registered_in_every_mode() {
+        for (name, command, expected) in [
+            ("StartFill", TelemetryCommand::StartFill, Action::StartFill),
+            ("PauseFill", TelemetryCommand::PauseFill, Action::PauseFill),
+            ("CancelFill", TelemetryCommand::CancelFill, Action::CancelFill),
+            ("NitrogenTest", TelemetryCommand::NitrogenTest, Action::NitrogenTest),
+            ("ValveSelfTest", TelemetryCommand::ValveSelfTest, Action::SelfTest),
+        ] {
+            assert!(ACTIONS.contains(&(name, expected)));
+            assert_eq!(action(&command), Some(expected));
+        }
+    }
+
+    #[test]
     fn hitl_covers_all_prelaunch_states_but_never_flight_or_recovery() {
         for state in [
             FlightState::Idle,

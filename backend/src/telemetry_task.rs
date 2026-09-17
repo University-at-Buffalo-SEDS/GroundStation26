@@ -4358,13 +4358,19 @@ mod tests {
             .expect("battery packet should produce a raw row");
         assert_eq!(row.sender_id, "PB");
 
-        let mut saw_av_bay_percent = false;
-        for _ in 0..6 {
-            let derived = ws_rx.recv().await.expect("derived battery row missing");
+        // handle_packet has finished emitting rows. Do not wait for AV-bay
+        // derived rows in Test Fire, whose layout intentionally omits them.
+        let mut derived_rows = Vec::new();
+        while let Ok(derived) = ws_rx.try_recv() {
             assert_eq!(derived.sender_id, "PB");
-            saw_av_bay_percent |= derived.data_type == "AV_BAY_BATTERY_PERCENT";
+            derived_rows.push(derived);
         }
-        assert!(saw_av_bay_percent);
+        if cfg!(feature = "test_fire_mode") {
+            assert!(derived_rows.is_empty());
+        } else {
+            assert_eq!(derived_rows.len(), 6);
+            assert!(derived_rows.iter().any(|row| row.data_type == "AV_BAY_BATTERY_PERCENT"));
+        }
     }
 
     #[tokio::test]

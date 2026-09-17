@@ -953,7 +953,14 @@ impl AppState {
 
     /// Subscribes a task to the app-wide shutdown broadcast channel.
     pub fn shutdown_subscribe(&self) -> broadcast::Receiver<()> {
-        self.shutdown_tx.subscribe()
+        // Subscribe before checking the latch so a request racing with worker
+        // startup is either received normally or replayed below. Shutdown is
+        // idempotent; late workers must not wait forever for another request.
+        let receiver = self.shutdown_tx.subscribe();
+        if self.shutdown_requested.load(Ordering::SeqCst) {
+            let _ = self.shutdown_tx.send(());
+        }
+        receiver
     }
 
     /// Broadcasts a shutdown request to all long-running tasks.
@@ -1584,6 +1591,20 @@ pub(crate) mod tests {
     use tokio::sync::{Notify, broadcast, mpsc};
 
     #[tokio::test]
+    async fn shutdown_is_delivered_to_workers_subscribing_after_the_request() {
+        let state = test_app_state().await;
+        let mut early = state.shutdown_subscribe();
+        assert!(state.request_shutdown());
+        early.try_recv().expect("existing worker missed shutdown");
+        let mut late = state.shutdown_subscribe();
+        assert!(!state.request_shutdown(), "shutdown must remain idempotent");
+        tokio::time::timeout(std::time::Duration::from_millis(100), late.recv())
+            .await
+            .expect("late worker missed the latched shutdown request")
+            .expect("shutdown channel closed unexpectedly");
+    }
+
+    #[tokio::test]
     async fn pending_umbilical_valve_state_clears_after_mismatch_timeout() {
         let state = test_app_state().await;
         state.set_pending_umbilical_valve_state(42, true);
@@ -1775,8 +1796,15 @@ pub(crate) mod tests {
                     .board_status_snapshot(2_000)
                     .boards
                     .iter()
-                    .any(|status| { status.board == board && status.seen })
+                    .any(|status| {
+                        status.board == board && status.seen == !cfg!(feature = "test_fire_mode")
+                    })
             );
+            // Test Fire requires direct traffic rather than inferring health
+            // from discovery. In every mode a received packet marks it seen.
+            state.mark_board_seen(board.sender_id(), 2_001);
+            assert!(state.board_status_snapshot(2_001).boards.iter()
+                .any(|status| status.board == board && status.seen));
         }
     }
 
@@ -1907,7 +1935,16 @@ pub(crate) mod tests {
 
         state.mark_board_seen(&format!("@addr:{address}"), 1_234);
 
+        let tracked = state.board_status.lock().unwrap();
+        let flight = tracked.get(&Board::FlightComputer).unwrap();
+        assert_eq!(flight.packet_count, 1);
+        assert_eq!(flight.last_seen_ms, Some(1_234));
+        drop(tracked);
         let status = state.board_status_snapshot(1_234);
+        if cfg!(feature = "test_fire_mode") {
+            assert!(!status.boards.iter().any(|entry| entry.board == Board::FlightComputer));
+            return;
+        }
         let flight = status
             .boards
             .iter()
@@ -1920,13 +1957,14 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn stale_board_is_reported_disconnected_without_losing_history() {
         let state = test_app_state().await;
-        state.mark_board_seen(Board::RFBoard.sender_id(), 1_000);
+        // Gateway is displayed in every mode; Test Fire intentionally hides RF.
+        state.mark_board_seen(Board::GatewayBoard.sender_id(), 1_000);
 
         {
             let mut statuses = state.board_status.lock().unwrap();
             statuses
-                .get_mut(&Board::RFBoard)
-                .expect("RF status missing")
+                .get_mut(&Board::GatewayBoard)
+                .expect("Gateway status missing")
                 .last_seen_instant = Some(
                 std::time::Instant::now()
                     .checked_sub(std::time::Duration::from_millis(BOARD_SEEN_TIMEOUT_MS + 1))
@@ -1935,14 +1973,14 @@ pub(crate) mod tests {
         }
 
         let status = state.board_status_snapshot(20_000);
-        let rf = status
+        let gateway = status
             .boards
             .iter()
-            .find(|entry| entry.board == Board::RFBoard)
-            .expect("RF status missing");
-        assert!(!rf.seen);
-        assert_eq!(rf.packet_count, 1);
-        assert_eq!(rf.last_seen_ms, Some(1_000));
+            .find(|entry| entry.board == Board::GatewayBoard)
+            .expect("Gateway status missing");
+        assert!(!gateway.seen);
+        assert_eq!(gateway.packet_count, 1);
+        assert_eq!(gateway.last_seen_ms, Some(1_000));
     }
 
     #[tokio::test]

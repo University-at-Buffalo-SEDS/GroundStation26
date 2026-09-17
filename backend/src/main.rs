@@ -28,6 +28,7 @@ mod logger;
 mod map;
 mod media;
 mod network_variables;
+mod recording_export;
 mod ring_buffer;
 mod rocket_commands;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]

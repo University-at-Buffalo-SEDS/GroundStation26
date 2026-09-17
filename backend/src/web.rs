@@ -206,6 +206,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/firmware/flash/{board}", post(start_firmware_update))
         .route("/api/recording_status", get(get_recording_status))
+        .merge(crate::recording_export::routes())
         .route("/api/notifications", get(get_notifications))
         .route("/api/messages", get(get_messages))
         .route(

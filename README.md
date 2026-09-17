@@ -1,5 +1,8 @@
 # Ground Station 2026
 
+Recorded telemetry can be downloaded in every operating mode from
+**Data → Data capture · CSV downloads**; see [Data capture](docs/backend/data-capture.md).
+
 The backend listens on `0.0.0.0:3000` by default. Set `GS_BIND_ADDRESS` (for
 example `127.0.0.1:13000`) to run an independent test instance without a port
 collision. Clients must use the selected address. This is particularly useful
@@ -126,10 +129,17 @@ Mode notes:
 
 The backend is a normal SEDSNet endpoint and discovers subscribers and routes by
 schema data type. It does not broadcast every value to both physical links.
-Managed underglow, startup-buzzer, flight-state, RF/FC telemetry-rate, and DAQ
+Managed underglow, startup-buzzer, flight-state, and DAQ
 calibration values are cached on disk;
 their last authoritative values are restored when GroundStation restarts and
 are resynchronized when boards join or reboot.
+
+Networking uses the published crates.io SEDSNet v4.0.33 release. Firmware send
+rates are configured with the board repositories' compile-time macros.
+Shutdown is latched: workers starting after the initial shutdown request still
+receive it, so a fast service stop cannot leave a late router or database
+worker waiting indefinitely. Backend tests cover the late-subscriber case in
+normal, HITL, and test-fire builds.
 
 ## Frontend / Backend Notes
 
