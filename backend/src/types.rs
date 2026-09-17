@@ -231,6 +231,12 @@ pub struct NetworkTopologyNode {
     pub status: NetworkTopologyStatus,
     pub group: String,
     pub sender_id: Option<String>,
+    /// Last evidence from this sender, not a cached topology refresh.
+    #[serde(default)]
+    pub last_seen_ms: Option<u64>,
+    /// Monotonic age at snapshot time; independent of wall-clock corrections.
+    #[serde(default)]
+    pub age_ms: Option<u64>,
     #[serde(default)]
     pub endpoints: Vec<String>,
     #[serde(default = "default_true")]

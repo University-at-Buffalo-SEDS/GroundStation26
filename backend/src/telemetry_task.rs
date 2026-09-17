@@ -1727,6 +1727,7 @@ async fn handle_packet(
                 if matches!(
                     row_data_type.as_str(),
                     loadcell::RAW_LOADCELL_DATA_TYPE_1000KG
+                        | loadcell::RAW_LOADCELL_DATA_TYPE_50KG
                         | loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
                         | "FUEL_TANK_PRESSURE"
                 ) {
@@ -4090,6 +4091,41 @@ mod tests {
             serde_json::from_str::<Vec<Option<f32>>>(&writes[1].2).unwrap(),
             vec![Some(1.5), Some(-2.5), Some(3.5)]
         );
+    }
+
+    #[tokio::test]
+    async fn kg50_packet_records_raw_and_calibrated_without_changing_fill_mass() {
+        let (db_tx, mut db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        *state.latest_fill_mass_kg.lock().unwrap() = Some(123.0);
+        state.loadcell_calibration.lock().unwrap().extra_channels.insert("kg50".into(),
+            loadcell::GenericCalibrationChannel {
+                linear: loadcell::ChannelLinear { m: Some(2.0), b: Some(1.0) },
+                ..Default::default()
+            });
+        let mut ws_rx = state.ws_tx.subscribe();
+        let pkt = Packet::new(crate::telemetry_schema::data_type("KG50"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            Board::DaqBoard.sender_id(), 456_789, f32_payload(&[4.25])).unwrap();
+        let rows = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
+        assert_eq!(rows[0].data_type, "KG50");
+        assert_eq!(rows[0].values, vec![Some(4.25)]);
+        let calibrated = ws_rx.try_recv().unwrap();
+        assert_eq!(calibrated.data_type, loadcell::DERIVED_WEIGHT_50_DATA_TYPE);
+        assert_eq!(calibrated.values, vec![Some(9.5)]);
+        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(123.0));
+        for expected in ["KG50", loadcell::DERIVED_WEIGHT_50_DATA_TYPE] {
+            match db_rx.try_recv().unwrap() {
+                DbQueueItem::Write(DbWrite::Telemetry { data_type, source_timestamp_ms, .. }) => {
+                    assert_eq!(data_type, expected);
+                    assert_eq!(source_timestamp_ms, Some(456_789));
+                }
+                other => panic!("unexpected DB item: {other:?}"),
+            }
+        }
+        assert!(state.recent_telemetry_snapshot().iter().any(|r|
+            r.data_type == loadcell::DERIVED_WEIGHT_50_DATA_TYPE));
     }
 
     #[tokio::test]

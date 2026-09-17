@@ -56,11 +56,12 @@ try {
   await audience.addInitScript(()=>{
     window.programFrames=0;
     navigator.mediaDevices.getUserMedia=()=>{throw Error('audience must not request microphone access');};
-    const Node=window.AudioWorkletNode;
-    window.AudioWorkletNode=class extends Node {constructor(...args){super(...args);const send=this.port.postMessage.bind(this.port);this.port.postMessage=(m,...rest)=>{if(m.type==='audio')window.programFrames++;return send(m,...rest);};}};
+    const original=AudioBufferSourceNode.prototype.start;
+    AudioBufferSourceNode.prototype.start=function(...args){window.programFrames++;return original.apply(this,args);};
   });
   await audience.goto(origin+viewerConfig.program_url);
-  await audience.getByRole('button',{name:'Enable crew audio',exact:true}).click();
+  await audience.waitForFunction(()=>document.querySelector('#stream-sound button'));
+  if(await audience.getByRole('button',{name:'Unmute stream',exact:true}).count())await audience.getByRole('button',{name:'Unmute stream',exact:true}).click();
   await a.selectOption('#mode','open');
   await audience.waitForFunction(()=>programFrames>3,{},{timeout:15000});
   await a.click('#mute');

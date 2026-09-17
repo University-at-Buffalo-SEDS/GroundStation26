@@ -539,93 +539,50 @@ impl AppState {
         self.broadcast_board_status_snapshot(timestamp_ms, force_broadcast);
     }
 
-    /// Projects SEDSNet's learned topology into board liveness. Discovery
-    /// packets are consumed by the router itself, so they do not necessarily
-    /// reach an application packet tap. A board with an active learned route
-    /// is nevertheless detected and must appear in status/graph views.
+    /// Discovery proves liveness only for the actual announcer, at its observed
+    /// age. Nested topology nodes/connections are cached reachability, not new
+    /// traffic from those boards. Never refresh a leaf from its gateway's ping.
     pub fn mark_discovered_relays_seen(&self) {
         if cfg!(feature = "test_fire_mode") {
             return;
         }
         let now_ms = telemetry_task::get_current_timestamp_ms();
+        let now = std::time::Instant::now();
         let Some(router) = self.topology_router.get() else {
             return;
         };
         let snapshot = router.export_topology();
-        let mut saw_active_route = false;
         let mut force_broadcast = false;
         let mut map = self.board_status.lock().unwrap();
-        for router_node in &snapshot.routers {
-            let Some(board) = Board::from_sender_id(canonical_sender_id(&router_node.sender_id))
-            else {
-                continue;
-            };
-            if board == Board::GroundStation {
-                continue;
+        for route in &snapshot.routes {
+            for announcer in &route.announcers {
+                let Some(board) =
+                    Board::from_sender_id(canonical_sender_id(&announcer.sender_id))
+                else {
+                    continue;
+                };
+                if board == Board::GroundStation {
+                    continue;
+                }
+                let Some(status) = map.get_mut(&board) else {
+                    continue;
+                };
+                force_broadcast |= status.last_seen_ms.is_none();
+                let observed_ms = now_ms.saturating_sub(announcer.age_ms);
+                status.last_seen_ms = Some(
+                    status.last_seen_ms
+                        .filter(|existing| *existing <= now_ms)
+                        .map_or(observed_ms, |existing| existing.max(observed_ms)),
+                );
+                status.observe_route_age(now, announcer.age_ms);
+                if announcer.age_ms <= BOARD_SEEN_TIMEOUT_MS {
+                    status.warned = false;
+                }
             }
-            let Some(status) = map.get_mut(&board) else {
-                continue;
-            };
-            saw_active_route = true;
-            force_broadcast |= status.last_seen_ms.is_none();
-            status.last_seen_ms = Some(now_ms);
-            status.last_seen_instant = Some(std::time::Instant::now());
-            status.warned = false;
-        }
-        // A constrained embedded bridge may export a downstream board only
-        // as a named graph connection. That still proves a live discovered
-        // route and must keep the board visible even when its detailed node
-        // record was compacted to conserve MCU memory.
-        for sender_id in snapshot
-            .links
-            .iter()
-            .flat_map(|link| [&link.source, &link.target])
-        {
-            let Some(board) = Board::from_sender_id(canonical_sender_id(sender_id)) else {
-                continue;
-            };
-            if board == Board::GroundStation {
-                continue;
-            }
-            let Some(status) = map.get_mut(&board) else {
-                continue;
-            };
-            saw_active_route = true;
-            force_broadcast |= status.last_seen_ms.is_none();
-            status.last_seen_ms = Some(now_ms);
-            status.last_seen_instant = Some(std::time::Instant::now());
-            status.warned = false;
-        }
-        for route in snapshot.routes {
-            saw_active_route = true;
-            let relay_board = match route.side_name.as_str() {
-                "rocket_comms" => Some(Board::RFBoard),
-                "umbilical_comms" => Some(Board::GatewayBoard),
-                _ => None,
-            };
-            let Some(board) = relay_board else {
-                continue;
-            };
-            let Some(status) = map.get_mut(&board) else {
-                continue;
-            };
-            force_broadcast |= status.last_seen_ms.is_none();
-            let route_last_seen_ms = now_ms.saturating_sub(route.age_ms);
-            status.last_seen_ms = Some(
-                status
-                    .last_seen_ms
-                    .filter(|existing| *existing <= now_ms)
-                    .map(|existing| existing.max(route_last_seen_ms))
-                    .unwrap_or(route_last_seen_ms),
-            );
-            status.observe_route_age(std::time::Instant::now(), route.age_ms);
-            status.warned = false;
         }
         drop(map);
-        if saw_active_route {
-            self.mark_packet_received(now_ms);
-            self.broadcast_board_status_snapshot(now_ms, force_broadcast);
-        }
+        // Exporting cached topology is not a packet reception.
+        self.broadcast_board_status_snapshot(now_ms, force_broadcast);
     }
 
     fn broadcast_board_status_snapshot(&self, now_ms: u64, force: bool) {
@@ -757,6 +714,15 @@ impl AppState {
         let runtime = router.export_runtime_stats();
         let local_sender = router.sender().to_string();
         let board_status = self.board_status_snapshot(now_ms);
+        let node_timing = |sender_id: &str| {
+            if sender_id == local_sender {
+                return (Some(now_ms), Some(0));
+            }
+            Board::from_sender_id(canonical_sender_id(sender_id))
+                .and_then(|board| board_status.boards.iter().find(|entry| entry.board == board))
+                .map(|entry| (entry.last_seen_ms, entry.age_ms))
+                .unwrap_or((None, None))
+        };
         let node_status = |sender_id: &str| {
             if sender_id == local_sender {
                 return if simulated {
@@ -843,6 +809,8 @@ impl AppState {
                     status: node_status(&board.sender_id),
                     group: if is_local { "local" } else { "board" }.to_string(),
                     sender_id: Some(board.sender_id.clone()),
+                    last_seen_ms: node_timing(&board.sender_id).0,
+                    age_ms: node_timing(&board.sender_id).1,
                     endpoints,
                     show_in_details: true,
                     detail: stats.map(|stats| {
@@ -909,6 +877,8 @@ impl AppState {
                 kind: NetworkTopologyNodeKind::Board,
                 status: node_status(&sender_id),
                 group: "board".to_string(),
+                last_seen_ms: node_timing(&sender_id).0,
+                age_ms: node_timing(&sender_id).1,
                 sender_id: Some(sender_id),
                 endpoints: Vec::new(),
                 show_in_details: true,
@@ -1797,14 +1767,83 @@ pub(crate) mod tests {
                     .boards
                     .iter()
                     .any(|status| {
-                        status.board == board && status.seen == !cfg!(feature = "test_fire_mode")
+                        status.board == board && !status.seen
                     })
             );
-            // Test Fire requires direct traffic rather than inferring health
-            // from discovery. In every mode a received packet marks it seen.
+            // Cached connections identify the node, but only its own traffic
+            // establishes liveness. This applies in every operating mode.
             state.mark_board_seen(board.sender_id(), 2_001);
             assert!(state.board_status_snapshot(2_001).boards.iter()
                 .any(|status| status.board == board && status.seen));
+        }
+
+        // Reproduce a powered-off Valve while Gateway retains its topology.
+        let stale = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(BOARD_SEEN_TIMEOUT_MS + 1_000))
+            .unwrap();
+        state.board_status.lock().unwrap().get_mut(&Board::ValveBoard)
+            .unwrap().last_seen_instant = Some(stale);
+        let last_rx = state.last_packet_received_ms();
+        for _ in 0..10 {
+            state.mark_discovered_relays_seen();
+        }
+        assert_eq!(state.last_packet_received_ms(), last_rx,
+            "polling retained topology is not a newly received packet");
+        let statuses = state.board_status_snapshot(20_000);
+        let valve = statuses.boards.iter()
+            .find(|entry| entry.board == Board::ValveBoard).unwrap();
+        assert!(!valve.seen);
+        assert_eq!(valve.last_seen_ms, Some(2_001));
+        assert_eq!(valve.packet_count, 1);
+        assert_eq!(state.board_status.lock().unwrap().get(&Board::ValveBoard)
+            .unwrap().last_seen_instant, Some(stale));
+        let graph = state.network_topology_snapshot(20_000);
+        let valve_node = graph.nodes.iter()
+            .find(|node| node.sender_id.as_deref() == Some(Board::ValveBoard.sender_id()))
+            .unwrap();
+        assert_eq!(valve_node.status, NetworkTopologyStatus::Offline);
+        assert!(graph.links.iter().any(|link|
+            (link.source == valve_node.id || link.target == valve_node.id)
+                && link.status == NetworkTopologyStatus::Offline));
+        // An actual packet restores health without deleting learned topology.
+        state.mark_board_seen(Board::ValveBoard.sender_id(), 20_001);
+        assert!(state.board_status_snapshot(20_001).boards.iter()
+            .any(|entry| entry.board == Board::ValveBoard && entry.seen));
+    }
+
+    #[tokio::test]
+    async fn every_board_expires_independently_of_cached_topology_and_exports_its_age() {
+        for board in Board::ALL.iter().copied().filter(|board| *board != Board::GroundStation) {
+            let state = test_app_state().await;
+            let ground = Arc::new(Router::new(
+                RouterConfig::new([]).with_sender(Board::GroundStation.sender_id()),
+            ));
+            let ingress = ground.add_side_packet("test_link", |_pkt| Ok(()));
+            state.topology_router.set(ground.clone()).unwrap();
+            let bridge = if board == Board::GatewayBoard { Board::RFBoard } else { Board::GatewayBoard };
+            let topology = build_discovery_topology(bridge.sender_id(), 1, &[TopologyBoardNode {
+                sender_id: bridge.sender_id().to_string(),
+                reachable_endpoints: Vec::new(),
+                reachable_timesync_sources: Vec::new(),
+                connections: vec![board.sender_id().to_string()],
+            }]).unwrap();
+            ground.rx_from_side(&topology, ingress).unwrap();
+            ground.process_all_queues().unwrap();
+            state.mark_board_seen(board.sender_id(), 1234);
+            state.board_status.lock().unwrap().get_mut(&board).unwrap().last_seen_instant =
+                std::time::Instant::now().checked_sub(std::time::Duration::from_millis(20_000));
+            for _ in 0..5 { state.mark_discovered_relays_seen(); }
+            let graph = state.network_topology_snapshot(25_000);
+            let node = graph.nodes.iter().find(|node| node.sender_id.as_deref() == Some(board.sender_id())).unwrap();
+            assert_eq!(node.status, NetworkTopologyStatus::Offline, "{board:?}");
+            assert_eq!(node.last_seen_ms, Some(1234), "{board:?}");
+            assert!(node.age_ms.unwrap() >= 20_000, "{board:?}");
+            state.mark_board_seen(board.sender_id(), 25_001);
+            let graph = state.network_topology_snapshot(25_001);
+            let node = graph.nodes.iter().find(|node| node.sender_id.as_deref() == Some(board.sender_id())).unwrap();
+            assert_eq!(node.status, NetworkTopologyStatus::Online, "{board:?}");
+            assert_eq!(node.last_seen_ms, Some(25_001));
+            assert!(node.age_ms.unwrap() < BOARD_SEEN_TIMEOUT_MS);
         }
     }
 

@@ -629,6 +629,13 @@
       "name": "DAQ_LOADCELL_CALIBRATION", "doc": "DAQ calibration [KG1000 slope, KG1000 intercept, IADC slope, IADC intercept].",
       "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
       "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["SD_CARD"]
+    },
+    {
+      "name": "DAQ_KG50_CALIBRATION",
+      "doc": "KG50 calibration [c0,c1,c2,c3,c4,x0,tare]; kg=sum(ci*(raw-x0)^i)-tare.",
+      "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
+      "element": {"kind": "Static", "data_type": "Float32", "count": 7},
+      "endpoints": ["SD_CARD"]
     }
   ]
 }

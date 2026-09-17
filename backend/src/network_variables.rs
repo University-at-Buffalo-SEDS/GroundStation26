@@ -14,6 +14,7 @@ const UNDERGLOW_TYPE: &str = "AV_BAY_UNDERGLOW";
 const FLIGHT_BUZZER_TYPE: &str = "FLIGHT_BUZZER";
 const FLIGHT_STATE_TYPE: &str = "FLIGHT_STATE";
 const DAQ_CALIBRATION_TYPE: &str = "DAQ_LOADCELL_CALIBRATION";
+const DAQ_KG50_CALIBRATION_TYPE: &str = "DAQ_KG50_CALIBRATION";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 struct PersistentVariables {
@@ -110,6 +111,7 @@ pub fn initialize(router: &Router) -> Result<()> {
         FLIGHT_BUZZER_TYPE,
         FLIGHT_STATE_TYPE,
         DAQ_CALIBRATION_TYPE,
+        DAQ_KG50_CALIBRATION_TYPE,
     ] {
         router.enable_network_variable(
             crate::telemetry_schema::data_type(data_type),
@@ -163,7 +165,9 @@ pub fn initialize(router: &Router) -> Result<()> {
         u8::from(flight_buzzer_enabled()),
     )?)?;
     router.seed_managed_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?)?;
-    router.seed_managed_variable(calibration_packet(&crate::loadcell::load_or_default())?)?;
+    let calibration = crate::loadcell::load_or_default();
+    router.seed_managed_variable(calibration_packet(&calibration)?)?;
+    router.seed_managed_variable(kg50_calibration_packet(&calibration)?)?;
     Ok(())
 }
 
@@ -179,7 +183,7 @@ pub fn publish_current(router: &Router) -> Result<()> {
         u8::from(flight_buzzer_enabled()),
     )?)?;
     router.set_network_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?)?;
-    router.set_network_variable(calibration_packet(&crate::loadcell::load_or_default())?)?;
+    set_daq_calibration(router, &crate::loadcell::load_or_default())?;
     Ok(())
 }
 
@@ -259,11 +263,19 @@ fn calibration_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<
     packet_bytes(DAQ_CALIBRATION_TYPE, "SD_CARD", Arc::from(payload))
 }
 
+fn kg50_calibration_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Packet> {
+    let values = crate::loadcell::kg50_daq_coefficients(cfg).map_err(anyhow::Error::msg)?;
+    let payload: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    packet_bytes(DAQ_KG50_CALIBRATION_TYPE, "SD_CARD", Arc::from(payload))
+}
+
 pub fn set_daq_calibration(
     router: &Router,
     cfg: &crate::loadcell::LoadcellCalibrationFile,
 ) -> Result<()> {
+    let kg50 = kg50_calibration_packet(cfg)?;
     router.set_network_variable(calibration_packet(cfg)?)?;
+    router.set_network_variable(kg50)?;
     Ok(())
 }
 
@@ -459,6 +471,24 @@ mod tests {
             &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")]
         );
         assert_eq!(packet.payload(), &[1]);
+    }
+
+    #[test]
+    fn kg50_calibration_packet_has_separate_type_and_tare() {
+        crate::telemetry_schema::initialize().unwrap();
+        let mut cfg = crate::loadcell::LoadcellCalibrationFile::default();
+        cfg.extra_channels.insert("kg50".into(), crate::loadcell::GenericCalibrationChannel {
+            linear: crate::loadcell::ChannelLinear { m: Some(2.0), b: Some(1.0) },
+            zero_raw: Some(3.0),
+            ..Default::default()
+        });
+        let packet = kg50_calibration_packet(&cfg).unwrap();
+        assert_eq!(packet.data_type(), crate::telemetry_schema::data_type("DAQ_KG50_CALIBRATION"));
+        assert_eq!(packet.endpoints(), &[crate::telemetry_schema::endpoint("SD_CARD")]);
+        let decoded: Vec<f32> = packet.payload().chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        assert_eq!(decoded, vec![1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 7.0]);
+        assert_eq!(calibration_packet(&cfg).unwrap().payload().len(), 16);
     }
 
     #[test]

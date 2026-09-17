@@ -23,6 +23,7 @@ pub mod types {
     pub const BATTERY_VOLTAGE: DataType = DataType(104);
     pub const BATTERY_CURRENT: DataType = DataType(105);
     pub const KG1000: DataType = DataType(118);
+    pub const KG50: DataType = DataType(119);
     pub const GPS_SATELLITE_NUMBER: DataType = DataType(120);
     pub const ASCENT_STATE: DataType = DataType(123);
     pub const DESCENT_STATE: DataType = DataType(124);
@@ -186,6 +187,7 @@ pub fn initialize() -> anyhow::Result<()> {
                 ("BATTERY_VOLTAGE", types::BATTERY_VOLTAGE),
                 ("BATTERY_CURRENT", types::BATTERY_CURRENT),
                 ("KG1000", types::KG1000),
+                ("KG50", types::KG50),
                 ("GPS_SATELLITE_NUMBER", types::GPS_SATELLITE_NUMBER),
                 ("ASCENT_STATE", types::ASCENT_STATE),
                 ("DESCENT_STATE", types::DESCENT_STATE),

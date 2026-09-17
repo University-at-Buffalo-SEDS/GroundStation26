@@ -8,6 +8,8 @@ use std::path::PathBuf;
 pub const DEFAULT_FULL_MASS_KG: f32 = 10.0;
 pub const CALIBRATION_CAPTURE_TARGET_SAMPLES: usize = 200;
 pub const RAW_LOADCELL_DATA_TYPE_1000KG: &str = "KG1000";
+pub const RAW_LOADCELL_DATA_TYPE_50KG: &str = "KG50";
+pub const DERIVED_WEIGHT_50_DATA_TYPE: &str = "LOADCELL_50_WEIGHT_KG";
 pub const RAW_PRESSURE_TRANSDUCER_DATA_TYPE: &str = "IADC";
 pub const DERIVED_WEIGHT_DATA_TYPE: &str = "LOADCELL_WEIGHT_KG";
 pub const DERIVED_FILL_PERCENT_DATA_TYPE: &str = "LOADCELL_FILL_PERCENT";
@@ -221,6 +223,22 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                 }),
             },
             CalibrationSensorSpec {
+                id: "KG50".to_string(),
+                label: "50kg".to_string(),
+                data_type: "KG50".to_string(),
+                channel: "kg50".to_string(),
+                fit_color: "#f59e0b".to_string(),
+                raw_label: "Raw".to_string(),
+                expected_label: "kg".to_string(),
+                fit_modes: fit_modes.clone(),
+                formatter: Some(ValueFormatter {
+                    kind: None,
+                    precision: Some(7),
+                    prefix: None,
+                    suffix: None,
+                }),
+            },
+            CalibrationSensorSpec {
                 id: "IADC".to_string(),
                 label: "Tank Pressure".to_string(),
                 data_type: "FUEL_TANK_PRESSURE".to_string(),
@@ -402,6 +420,10 @@ fn sync_extra_channels_into_legacy(cfg: &mut LoadcellCalibrationFile) {
 }
 
 pub fn normalize_calibration(cfg: &mut LoadcellCalibrationFile) {
+    cfg.extra_channels.entry("kg50".into()).or_insert_with(|| GenericCalibrationChannel {
+        linear: ChannelLinear { m: Some(1.0), b: Some(0.0) },
+        ..Default::default()
+    });
     sync_legacy_channels_into_extra(cfg);
     sync_extra_channels_into_legacy(cfg);
     update_weights_kg(cfg);
@@ -1134,6 +1156,9 @@ pub fn calibrated_weight_kg(
 ) -> Option<f32> {
     match sensor_id {
         "KG1000" => calibrated_channel_value(cfg, "ch1", raw),
+        "KG50" => calibrated_channel_value(cfg, "kg50", raw).or_else(|| {
+            (!cfg.extra_channels.contains_key("kg50")).then_some(raw)
+        }),
         _ => None,
     }
 }
@@ -1144,10 +1169,44 @@ pub fn calibrated_sensor_value(
     raw: f32,
 ) -> Option<f32> {
     match sensor_id {
-        RAW_LOADCELL_DATA_TYPE_1000KG => calibrated_weight_kg(cfg, sensor_id, raw),
+        RAW_LOADCELL_DATA_TYPE_1000KG | RAW_LOADCELL_DATA_TYPE_50KG => calibrated_weight_kg(cfg, sensor_id, raw),
         RAW_PRESSURE_TRANSDUCER_DATA_TYPE => calibrated_channel_value(cfg, "iadc", raw),
         _ => None,
     }
+}
+
+/// Polynomial coefficients shared with DAQ SD logging: c0..c4, x0, tare.
+pub fn kg50_daq_coefficients(cfg: &LoadcellCalibrationFile) -> Result<[f32; 7], String> {
+    let Some(channel) = cfg.extra_channels.get("kg50") else {
+        return Ok([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    };
+    let mut c = [0.0; 7];
+    let fit = channel.fit.as_ref();
+    let degree = match fit.and_then(|f| f.fit_type.as_deref()) {
+        Some("poly4") => 4,
+        Some("poly3") => 3,
+        Some("poly2") => 2,
+        _ => 1,
+    };
+    if degree == 1 {
+        c[0] = channel.linear.b.unwrap_or(0.0);
+        c[1] = channel.linear.m.unwrap_or(1.0);
+    } else if let Some(fit) = fit {
+        let terms = [fit.a, fit.b, fit.c, fit.d, fit.e];
+        if terms[0].is_none() || terms[1].is_none() {
+            return Err("50 kg polynomial calibration is incomplete".into());
+        }
+        for i in 0..=degree { c[degree - i] = terms[i].unwrap_or(0.0); }
+        c[5] = fit.x0.unwrap_or(0.0);
+    }
+    if let Some(zero) = channel.zero_raw {
+        c[6] = eval_channel_base(&channel.linear, channel.fit.as_ref(), zero)
+            .ok_or("50 kg tare calibration is incomplete")?;
+    }
+    if !c.iter().all(|v| v.is_finite()) {
+        return Err("50 kg calibration contains a non-finite coefficient".into());
+    }
+    Ok(c)
 }
 
 pub fn active_fill_target_mass_kg(cfg: &FillTargetsConfig, flight_state: FlightState) -> f32 {
@@ -1181,6 +1240,35 @@ fn normalized_mass_target(target_mass_kg: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kg50_calibration_is_independent_and_matches_daq_polynomial_with_tare() {
+        let mut cfg = LoadcellCalibrationFile::default();
+        assert_eq!(calibrated_weight_kg(&cfg, "KG50", 2.0), Some(2.0));
+        cfg.extra_channels.insert("kg50".into(), GenericCalibrationChannel {
+            linear: ChannelLinear { m: Some(3.0), b: Some(4.0) },
+            zero_raw: Some(2.0),
+            ..Default::default()
+        });
+        assert_eq!(calibrated_weight_kg(&cfg, "KG50", 5.0), Some(9.0));
+        assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 5.0), Some(5.0));
+        for degree in 1..=4 {
+            cfg.extra_channels.get_mut("kg50").unwrap().fit = Some(FitMeta {
+                fit_type: Some(if degree == 1 { "linear".into() } else { format!("poly{degree}") }),
+                a: Some(0.5), b: Some(-2.0), c: Some(3.0), d: Some(4.0), e: Some(1.0),
+                x0: Some(1.0),
+            });
+            let c = kg50_daq_coefficients(&cfg).unwrap();
+            for raw in [-3.0, 0.0, 2.0, 5.0] {
+                let x = raw - c[5];
+                let sd = ((((c[4]*x+c[3])*x+c[2])*x+c[1])*x+c[0])-c[6];
+                assert_eq!(Some(sd), calibrated_weight_kg(&cfg, "KG50", raw));
+            }
+        }
+        let saved = serde_json::to_string(&cfg).unwrap();
+        let restored = serde_json::from_str(&saved).unwrap();
+        assert_eq!(kg50_daq_coefficients(&cfg), kg50_daq_coefficients(&restored));
+    }
 
     #[test]
     fn captured_zero_shifts_linear_output_without_refit() {

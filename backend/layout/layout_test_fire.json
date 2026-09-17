@@ -546,6 +546,7 @@
         "label": "Loadcell",
         "channels": [
           "1000kg",
+          "50kg",
           "Pressure Transducer"
         ],
         "subtabs": [
@@ -631,6 +632,80 @@
               {
                 "label": "Fill %",
                 "data_type": "LOADCELL_FILL_PERCENT",
+                "index": 0,
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              }
+            ],
+            "chart": {
+              "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "time_average",
+              "window_ms": 500
+            }
+          },
+          {
+            "id": "loadcell_50kg",
+            "label": "50kg",
+            "data_type": "KG50",
+            "channels": [
+              "50kg"
+            ],
+            "chart_groups": [
+              {
+                "title": "Raw",
+                "data_type": "KG50",
+                "labels": [
+                  "Raw"
+                ],
+                "channels": [
+                  0
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "title": "Calibrated",
+                "data_type": "LOADCELL_50_WEIGHT_KG",
+                "labels": [
+                  "Calibrated"
+                ],
+                "channels": [
+                  0
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              }
+            ],
+            "summary_items": [
+              {
+                "label": "Raw",
+                "data_type": "KG50",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 7
+                },
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "label": "Calibrated",
+                "data_type": "LOADCELL_50_WEIGHT_KG",
                 "index": 0,
                 "display_filter": {
                   "enabled": true,

@@ -36,6 +36,7 @@ pub async fn export_recording_csv(
         FROM telemetry
         WHERE data_type IN (
             'KG1000',
+            'KG50',
             'FUEL_TANK_PRESSURE',
             'IADC',
             'BATTERY_VOLTAGE',
@@ -55,15 +56,19 @@ pub async fn export_recording_csv(
     let mut writer = std::io::BufWriter::new(std::fs::File::create(csv_path)?);
     writeln!(
         writer,
-        "Rx_Timestamp,Header,Seq,Timestamp,1000kg Raw,Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated"
+        "Rx_Timestamp,Header,Seq,Timestamp,1000kg Raw,Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg Raw,50kg Calibrated"
     )?;
     writeln!(
         writer,
-        "CALIBRATION,,,,\"{}\",\"{}\",,,,,,",
+        "CALIBRATION,,,,\"{}\",\"{}\",,,,,,,,",
         linear_formula(calibration.ch1.m, calibration.ch1.b),
         linear_formula(calibration.iadc.m, calibration.iadc.b)
     )?;
 
+    let kg50 = crate::loadcell::kg50_daq_coefficients(calibration)
+        .map_err(anyhow::Error::msg)?;
+    writeln!(writer, "CALIBRATION_50KG,,,,,,,,,,,,\"c0={};c1={};c2={};c3={};c4={};x0={};tare={}\",",
+        kg50[0], kg50[1], kg50[2], kg50[3], kg50[4], kg50[5], kg50[6])?;
     let mut state = ExportState::default();
     let mut seq: u16 = 0;
     for row in rows {
@@ -81,6 +86,16 @@ pub async fn export_recording_csv(
             "PRESSURE_TRANSDUCER_CALIBRATED" => {
                 state.pressure_calibrated = first_value;
             }
+            "KG50" => {
+                let rx_timestamp: String = row.get("rx_timestamp");
+                let source_timestamp_ms: i64 = row.get("source_timestamp_ms");
+                let calibrated = first_value.and_then(|raw|
+                    crate::loadcell::calibrated_weight_kg(calibration, "KG50", raw));
+                writeln!(writer, "{},{},{},{},,,,,,,,,{},{}",
+                    rx_timestamp, TEST_FIRE_HEADER, seq % 256, source_timestamp_ms,
+                    display_opt(first_value), display_opt(calibrated))?;
+                seq = seq.wrapping_add(1);
+            }
             "KG1000" => {
                 let rx_timestamp: String = row.get("rx_timestamp");
                 let source_timestamp_ms: i64 = row.get("source_timestamp_ms");
@@ -91,7 +106,7 @@ pub async fn export_recording_csv(
                 let crc = crc16_ccitt_false(&parse_payload_json(&payload_json));
                 writeln!(
                     writer,
-                    "{},{},{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{},{},{},{},{},{},,",
                     rx_timestamp,
                     TEST_FIRE_HEADER,
                     seq % 256,
@@ -154,4 +169,43 @@ fn crc16_ccitt_false(bytes: &[u8]) -> u16 {
         }
     }
     crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn kg50_only_recording_exports_every_sample_with_its_timestamp() {
+        let dir = std::env::temp_dir().join(format!("gs-kg50-csv-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("recording.db");
+        let csv_path = dir.join("recording.csv");
+        let db = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db_path.display())).await.unwrap();
+        sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER, source_timestamp_ms INTEGER, data_type TEXT, values_json TEXT, payload_json TEXT)")
+            .execute(&db).await.unwrap();
+        for (i, raw) in [2.0, 3.0].iter().enumerate() {
+            sqlx::query("INSERT INTO telemetry VALUES (?, ?, ?, 'KG50', ?, '[]')")
+                .bind(i as i64).bind(10000_i64 + i as i64).bind(9000_i64 + i as i64)
+                .bind(format!("[{raw}]")).execute(&db).await.unwrap();
+        }
+        db.close().await;
+        let mut cfg = LoadcellCalibrationFile::default();
+        cfg.extra_channels.insert("kg50".into(), crate::loadcell::GenericCalibrationChannel {
+            linear: crate::loadcell::ChannelLinear { m: Some(2.0), b: Some(1.0) },
+            ..Default::default()
+        });
+        export_recording_csv(db_path.to_str().unwrap(), &csv_path, &cfg).await.unwrap();
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        let samples: Vec<Vec<&str>> = csv.lines().skip(3).map(|line| line.split(',').collect()).collect();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].len(), 14);
+        assert_eq!(samples[0][3], "9000");
+        assert_eq!(samples[0][12..], ["2", "5"]);
+        assert_eq!(samples[1][3], "9001");
+        assert_eq!(samples[1][12..], ["3", "7"]);
+        assert_eq!(samples[0][4], ""); // No fabricated 1000 kg readings.
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

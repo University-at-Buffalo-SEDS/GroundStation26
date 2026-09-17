@@ -36,6 +36,29 @@
       ]
     },
     {
+      "id": "KG50",
+      "label": "50kg",
+      "data_type": "KG50",
+      "channel": "kg50",
+      "fit_color": "#f59e0b",
+      "raw_label": "Raw",
+      "expected_label": "kg",
+      "formatter": {
+        "precision": 7
+      },
+      "fit_modes": [
+        "best",
+        "linear",
+        "linear_zero",
+        "parabolic",
+        "parabolic_zero",
+        "cubic",
+        "cubic_zero",
+        "quartic",
+        "quartic_zero"
+      ]
+    },
+    {
       "id": "IADC",
       "label": "Tank Pressure",
       "data_type": "FUEL_TANK_PRESSURE",

@@ -605,6 +605,9 @@ pub(super) async fn emit_derived_loadcell_rows(
         return;
     };
     let rows: Vec<(&str, Vec<Option<f32>>)> = match calibration_sensor_id {
+        loadcell::RAW_LOADCELL_DATA_TYPE_50KG => vec![(
+            loadcell::DERIVED_WEIGHT_50_DATA_TYPE, vec![Some(calibrated_value)],
+        )],
         loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
             let fill_targets = state.fill_targets_snapshot();
             let flight_state = *state.state.lock().unwrap();
