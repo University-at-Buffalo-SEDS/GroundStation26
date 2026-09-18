@@ -29,6 +29,19 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub fn pressure_limit(&self, target: f32, margin: f32) -> Result<f32, String> {
+        let limit = target + margin;
+        if !target.is_finite() || target <= 0.0 || !limit.is_finite() {
+            return Err("Pressure target must be finite and positive".into());
+        }
+        match self.pressure_ceiling_psi {
+            Some(cap) if !cap.is_finite() || cap <= 0.0 => {
+                Err("Hardware pressure ceiling must be finite and positive".into())
+            }
+            Some(cap) => Ok(limit.min(cap)),
+            None => Ok(limit),
+        }
+    }
     /// Incomplete limits may be saved, but cannot enable automatic operations.
     pub fn validate_settings(&self) -> Result<(), String> {
         if !self.nitrogen_target_psi.is_finite()
@@ -44,15 +57,13 @@ impl Config {
         {
             return Err("Pressure settings must be finite and nonnegative; target and ceiling must be positive".into());
         }
-        if self.pressure_ceiling_psi.is_some() && self.maximum_zero_offset_psi.is_some() {
+        if self.maximum_zero_offset_psi.is_some() {
             self.validate()?;
         }
         Ok(())
     }
     pub fn validate(&self) -> Result<(), String> {
-        let ceiling = self
-            .pressure_ceiling_psi
-            .ok_or("Set a pressure ceiling before running automatic GSE actions")?;
+        let ceiling = self.pressure_limit(self.nitrogen_target_psi, 100.0)?;
         let zero = self
             .maximum_zero_offset_psi
             .ok_or("Set the maximum acceptable empty-tank PT offset")?;
@@ -157,6 +168,9 @@ pub struct Effects {
 
 pub struct Engine {
     pub config: Config,
+    /// Supplied from the nitrous fill target before requesting StartFill.
+    pub nitrous_target_psi: f32,
+    nitrous_session: bool,
     pub status: Status,
     pub claimed: bool,
     phase_since: u64,
@@ -171,6 +185,8 @@ impl Default for Engine {
     fn default() -> Self {
         Self {
             config: Config::default(),
+            nitrous_target_psi: 745.0,
+            nitrous_session: false,
             status: Status {
                 phase: Phase::Idle,
                 message: "Ready for GSE checkout".into(),
@@ -231,7 +247,10 @@ impl Engine {
             }
             Action::NitrogenTest => !self.active(),
             Action::StartFill => {
-                self.status.nitrogen_passed
+                self.config
+                    .pressure_limit(self.nitrous_target_psi, 50.0)
+                    .is_ok_and(|limit| limit > self.nitrous_target_psi)
+                    && self.status.nitrogen_passed
                     && matches!(self.status.phase, Phase::Passed | Phase::Paused)
                     && self
                         .status
@@ -270,6 +289,14 @@ impl Engine {
             }
             if !matches!(action, Action::PauseFill | Action::CancelFill) {
                 self.config.validate()?;
+                if action == Action::StartFill {
+                    let limit = self.config.pressure_limit(self.nitrous_target_psi, 50.0)?;
+                    if limit <= self.nitrous_target_psi {
+                        return Err(
+                            "Nitrous target must be below the hardware pressure ceiling".into()
+                        );
+                    }
+                }
                 if Self::fresh_pressure(input).is_none() {
                     return Err("GSE action blocked: a fresh tank PT sample is required".into());
                 }
@@ -296,6 +323,7 @@ impl Engine {
                 "Pausing: closing all valves",
             ),
             Action::StartFill => {
+                self.nitrous_session = true;
                 self.status.self_test_locked = true;
                 self.configure(
                     Phase::FillSetup,
@@ -305,6 +333,7 @@ impl Engine {
                 )
             }
             Action::SelfTest | Action::NitrogenTest => {
+                self.nitrous_session = false;
                 self.status.nitrogen_passed = false;
                 self.status.baseline = None;
                 self.testing_valves = action == Action::SelfTest;
@@ -413,11 +442,13 @@ impl Engine {
         let Some(pressure) = Self::fresh_pressure(input) else {
             return self.fault(input.now_ms, "Tank pressure is missing, invalid or stale");
         };
-        if self
-            .config
-            .pressure_ceiling_psi
-            .is_none_or(|limit| pressure >= limit)
-        {
+        let limit = if self.nitrous_session {
+            self.config.pressure_limit(self.nitrous_target_psi, 50.0)
+        } else {
+            self.config
+                .pressure_limit(self.config.nitrogen_target_psi, 100.0)
+        };
+        if limit.is_err() || limit.is_ok_and(|limit| pressure >= limit) {
             return self.fault(input.now_ms, "Pressure ceiling reached");
         }
         let setup = matches!(
@@ -786,7 +817,45 @@ mod tests {
         assert!(Config::default().validate().is_err());
         let mut rig = Rig::new();
         rig.engine.config.pressure_ceiling_psi = None;
+        assert!(rig.engine.allows(Action::NitrogenTest, rig.input()));
+        rig.engine.config.maximum_zero_offset_psi = None;
         assert!(!rig.engine.allows(Action::NitrogenTest, rig.input()));
+    }
+    #[test]
+    fn relative_pressure_limits_fault_at_boundary_and_close_supplies() {
+        for (nitrous, target, margin) in [(false, 120.0, 100.0), (true, 745.0, 50.0)] {
+            let mut rig = Rig::new();
+            rig.engine.config.pressure_ceiling_psi = None;
+            rig.engine.nitrous_session = nitrous;
+            rig.engine.nitrous_target_psi = target;
+            rig.engine.status.phase = Phase::Paused;
+            rig.pressure = target + margin - 0.5;
+            rig.tick();
+            assert_eq!(rig.engine.status.phase, Phase::Paused);
+            rig.pressure = target + margin;
+            rig.tick();
+            assert_eq!(rig.engine.status.phase, Phase::Fault);
+            assert_eq!(rig.valves, RELIEVED);
+        }
+    }
+    #[test]
+    fn lower_hardware_cap_and_invalid_targets_cannot_be_bypassed() {
+        let config = Config {
+            pressure_ceiling_psi: Some(180.0),
+            ..Config::default()
+        };
+        assert_eq!(config.pressure_limit(120.0, 100.0).unwrap(), 180.0);
+        assert_eq!(config.pressure_limit(745.0, 50.0).unwrap(), 180.0);
+        for target in [f32::NAN, f32::INFINITY, -1.0, 0.0] {
+            assert!(config.pressure_limit(target, 50.0).is_err());
+        }
+        let mut rig = Rig::new();
+        rig.engine.nitrous_session = true;
+        rig.engine.status.phase = Phase::Filling;
+        rig.pressure = 200.0;
+        rig.tick();
+        assert_eq!(rig.engine.status.phase, Phase::Fault);
+        assert_eq!(rig.valves, RELIEVED);
     }
     #[test]
     fn zero_centered_three_psi_noise_is_measured() {
@@ -888,6 +957,8 @@ mod tests {
         rig.until(Phase::Passed);
         assert!(rig.engine.status.nitrogen_passed);
         assert!(!rig.engine.allows(Action::SelfTest, rig.input()));
+        // This fixture has a 200 psi hardware cap, so use a compatible fill target.
+        rig.engine.nitrous_target_psi = 140.0;
         rig.request(Action::StartFill);
         assert_eq!(rig.valves, FILL_READY);
         rig.tick();

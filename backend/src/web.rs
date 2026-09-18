@@ -71,6 +71,13 @@ fn software_command_dedup_ms() -> u64 {
         .unwrap_or(SOFTWARE_COMMAND_DEDUP_MS_DEFAULT)
 }
 
+// Debouncing measures elapsed time, never synchronized network/GPS time.
+// A backward clock correction must not suppress commands until it catches up.
+fn software_command_clock_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// Extracts the numeric telemetry payload from either the newer JSON column or the legacy blob.
 fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
     let values_from_json = row
@@ -232,7 +239,11 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
         .route("/favicon.ico", get(get_favicon))
         .route("/valvestate", get(get_valve_state))
-        .merge(crate::media::router(state.clone(), video_password, voice.clone()))
+        .merge(crate::media::router(
+            state.clone(),
+            video_password,
+            voice.clone(),
+        ))
         .merge(crate::voice::routes(state.clone(), voice))
         .merge(crate::gse::routes())
         // anything that doesn’t match the above routes goes to the static files
@@ -1231,7 +1242,8 @@ async fn get_flight_state(
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(state.local_flight_state_snapshot()),
-    ).into_response()
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -1241,18 +1253,45 @@ mod live_flight_state_tests {
     #[tokio::test]
     async fn http_flight_state_matches_runtime_with_empty_recording_history() {
         let mut state = crate::state::tests::test_app_state().await;
-        crate::ensure_auth_sessions_table(&state.auth_db).await.unwrap();
-        let auth_path = std::env::temp_dir().join(format!("gs-flight-state-test-{}-{}.json",
-            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        std::fs::write(&auth_path, r#"{"version":1,"anonymous":{"view_data":true,"send_commands":false},"users":[]}"#).unwrap();
-        Arc::get_mut(&mut state).unwrap().auth = Arc::new(crate::auth::AuthManager::new(auth_path.clone()));
-        for expected in [FlightState::ParachuteDeploy, FlightState::Startup, FlightState::Armed] {
+        crate::ensure_auth_sessions_table(&state.auth_db)
+            .await
+            .unwrap();
+        let auth_path = std::env::temp_dir().join(format!(
+            "gs-flight-state-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &auth_path,
+            r#"{"version":1,"anonymous":{"view_data":true,"send_commands":false},"users":[]}"#,
+        )
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().auth =
+            Arc::new(crate::auth::AuthManager::new(auth_path.clone()));
+        for expected in [
+            FlightState::ParachuteDeploy,
+            FlightState::Startup,
+            FlightState::Armed,
+        ] {
             *state.state.lock().unwrap() = expected;
-            let response = get_flight_state(State(state.clone()), HeaderMap::new()).await.into_response();
+            let response = get_flight_state(State(state.clone()), HeaderMap::new())
+                .await
+                .into_response();
             assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL], "no-store");
-            let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-            assert_eq!(serde_json::from_slice::<FlightState>(&body).unwrap(), expected);
+            assert_eq!(
+                response.headers()[axum::http::header::CACHE_CONTROL],
+                "no-store"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<FlightState>(&body).unwrap(),
+                expected
+            );
         }
         std::fs::remove_file(auth_path).unwrap();
     }
@@ -1655,7 +1694,7 @@ async fn send_command(
         );
         return (StatusCode::FORBIDDEN, "command disabled");
     }
-    let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+    let now_ms = software_command_clock_ms();
     if !state.record_software_command_if_fresh(&cmd, now_ms, software_command_dedup_ms()) {
         gs_debug_println!("Ignored duplicate software command {cmd:?}");
         return (StatusCode::OK, "duplicate ignored");
@@ -2242,7 +2281,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             );
                             continue;
                         }
-                        let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+                        let now_ms = software_command_clock_ms();
                         if !state_for_recv.record_software_command_if_fresh(
                             &cmd.cmd,
                             now_ms,

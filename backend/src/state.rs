@@ -69,7 +69,8 @@ impl BoardStatus {
     fn observe_route_age(&mut self, now: std::time::Instant, age_ms: u64) {
         if let Some(observed) = now.checked_sub(std::time::Duration::from_millis(age_ms)) {
             self.last_seen_instant = Some(
-                self.last_seen_instant.map_or(observed, |existing| existing.max(observed)),
+                self.last_seen_instant
+                    .map_or(observed, |existing| existing.max(observed)),
             );
         }
     }
@@ -556,8 +557,7 @@ impl AppState {
         let mut map = self.board_status.lock().unwrap();
         for route in &snapshot.routes {
             for announcer in &route.announcers {
-                let Some(board) =
-                    Board::from_sender_id(canonical_sender_id(&announcer.sender_id))
+                let Some(board) = Board::from_sender_id(canonical_sender_id(&announcer.sender_id))
                 else {
                     continue;
                 };
@@ -570,7 +570,8 @@ impl AppState {
                 force_broadcast |= status.last_seen_ms.is_none();
                 let observed_ms = now_ms.saturating_sub(announcer.age_ms);
                 status.last_seen_ms = Some(
-                    status.last_seen_ms
+                    status
+                        .last_seen_ms
                         .filter(|existing| *existing <= now_ms)
                         .map_or(observed_ms, |existing| existing.max(observed_ms)),
                 );
@@ -719,7 +720,12 @@ impl AppState {
                 return (Some(now_ms), Some(0));
             }
             Board::from_sender_id(canonical_sender_id(sender_id))
-                .and_then(|board| board_status.boards.iter().find(|entry| entry.board == board))
+                .and_then(|board| {
+                    board_status
+                        .boards
+                        .iter()
+                        .find(|entry| entry.board == board)
+                })
                 .map(|entry| (entry.last_seen_ms, entry.age_ms))
                 .unwrap_or((None, None))
         };
@@ -1561,6 +1567,24 @@ pub(crate) mod tests {
     use tokio::sync::{Notify, broadcast, mpsc};
 
     #[tokio::test]
+    async fn command_debounce_does_not_extend_on_rejected_clicks_or_block_close_and_abort() {
+        let state = test_app_state().await;
+        assert!(state.record_software_command_if_fresh(&TelemetryCommand::Nitrogen, 1000, 250));
+        for now in 1001..1250 {
+            assert!(!state.record_software_command_if_fresh(&TelemetryCommand::Nitrogen, now, 250));
+        }
+        assert!(state.record_software_command_if_fresh(
+            &TelemetryCommand::NitrogenClose,
+            1100,
+            250
+        ));
+        assert!(state.record_software_command_if_fresh(&TelemetryCommand::Nitrogen, 1250, 250));
+        for _ in 0..3 {
+            assert!(state.record_software_command_if_fresh(&TelemetryCommand::Abort, 1250, 250));
+        }
+    }
+
+    #[tokio::test]
     async fn shutdown_is_delivered_to_workers_subscribing_after_the_request() {
         let state = test_app_state().await;
         let mut early = state.shutdown_subscribe();
@@ -1766,81 +1790,141 @@ pub(crate) mod tests {
                     .board_status_snapshot(2_000)
                     .boards
                     .iter()
-                    .any(|status| {
-                        status.board == board && !status.seen
-                    })
+                    .any(|status| { status.board == board && !status.seen })
             );
             // Cached connections identify the node, but only its own traffic
             // establishes liveness. This applies in every operating mode.
             state.mark_board_seen(board.sender_id(), 2_001);
-            assert!(state.board_status_snapshot(2_001).boards.iter()
-                .any(|status| status.board == board && status.seen));
+            assert!(
+                state
+                    .board_status_snapshot(2_001)
+                    .boards
+                    .iter()
+                    .any(|status| status.board == board && status.seen)
+            );
         }
 
         // Reproduce a powered-off Valve while Gateway retains its topology.
         let stale = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_millis(BOARD_SEEN_TIMEOUT_MS + 1_000))
+            .checked_sub(std::time::Duration::from_millis(
+                BOARD_SEEN_TIMEOUT_MS + 1_000,
+            ))
             .unwrap();
-        state.board_status.lock().unwrap().get_mut(&Board::ValveBoard)
-            .unwrap().last_seen_instant = Some(stale);
+        state
+            .board_status
+            .lock()
+            .unwrap()
+            .get_mut(&Board::ValveBoard)
+            .unwrap()
+            .last_seen_instant = Some(stale);
         let last_rx = state.last_packet_received_ms();
         for _ in 0..10 {
             state.mark_discovered_relays_seen();
         }
-        assert_eq!(state.last_packet_received_ms(), last_rx,
-            "polling retained topology is not a newly received packet");
+        assert_eq!(
+            state.last_packet_received_ms(),
+            last_rx,
+            "polling retained topology is not a newly received packet"
+        );
         let statuses = state.board_status_snapshot(20_000);
-        let valve = statuses.boards.iter()
-            .find(|entry| entry.board == Board::ValveBoard).unwrap();
+        let valve = statuses
+            .boards
+            .iter()
+            .find(|entry| entry.board == Board::ValveBoard)
+            .unwrap();
         assert!(!valve.seen);
         assert_eq!(valve.last_seen_ms, Some(2_001));
         assert_eq!(valve.packet_count, 1);
-        assert_eq!(state.board_status.lock().unwrap().get(&Board::ValveBoard)
-            .unwrap().last_seen_instant, Some(stale));
+        assert_eq!(
+            state
+                .board_status
+                .lock()
+                .unwrap()
+                .get(&Board::ValveBoard)
+                .unwrap()
+                .last_seen_instant,
+            Some(stale)
+        );
         let graph = state.network_topology_snapshot(20_000);
-        let valve_node = graph.nodes.iter()
+        let valve_node = graph
+            .nodes
+            .iter()
             .find(|node| node.sender_id.as_deref() == Some(Board::ValveBoard.sender_id()))
             .unwrap();
         assert_eq!(valve_node.status, NetworkTopologyStatus::Offline);
-        assert!(graph.links.iter().any(|link|
-            (link.source == valve_node.id || link.target == valve_node.id)
-                && link.status == NetworkTopologyStatus::Offline));
+        assert!(graph.links.iter().any(|link| (link.source == valve_node.id
+            || link.target == valve_node.id)
+            && link.status == NetworkTopologyStatus::Offline));
         // An actual packet restores health without deleting learned topology.
         state.mark_board_seen(Board::ValveBoard.sender_id(), 20_001);
-        assert!(state.board_status_snapshot(20_001).boards.iter()
-            .any(|entry| entry.board == Board::ValveBoard && entry.seen));
+        assert!(
+            state
+                .board_status_snapshot(20_001)
+                .boards
+                .iter()
+                .any(|entry| entry.board == Board::ValveBoard && entry.seen)
+        );
     }
 
     #[tokio::test]
     async fn every_board_expires_independently_of_cached_topology_and_exports_its_age() {
-        for board in Board::ALL.iter().copied().filter(|board| *board != Board::GroundStation) {
+        for board in Board::ALL
+            .iter()
+            .copied()
+            .filter(|board| *board != Board::GroundStation)
+        {
             let state = test_app_state().await;
             let ground = Arc::new(Router::new(
                 RouterConfig::new([]).with_sender(Board::GroundStation.sender_id()),
             ));
             let ingress = ground.add_side_packet("test_link", |_pkt| Ok(()));
             state.topology_router.set(ground.clone()).unwrap();
-            let bridge = if board == Board::GatewayBoard { Board::RFBoard } else { Board::GatewayBoard };
-            let topology = build_discovery_topology(bridge.sender_id(), 1, &[TopologyBoardNode {
-                sender_id: bridge.sender_id().to_string(),
-                reachable_endpoints: Vec::new(),
-                reachable_timesync_sources: Vec::new(),
-                connections: vec![board.sender_id().to_string()],
-            }]).unwrap();
+            let bridge = if board == Board::GatewayBoard {
+                Board::RFBoard
+            } else {
+                Board::GatewayBoard
+            };
+            let topology = build_discovery_topology(
+                bridge.sender_id(),
+                1,
+                &[TopologyBoardNode {
+                    sender_id: bridge.sender_id().to_string(),
+                    reachable_endpoints: Vec::new(),
+                    reachable_timesync_sources: Vec::new(),
+                    connections: vec![board.sender_id().to_string()],
+                }],
+            )
+            .unwrap();
             ground.rx_from_side(&topology, ingress).unwrap();
             ground.process_all_queues().unwrap();
             state.mark_board_seen(board.sender_id(), 1234);
-            state.board_status.lock().unwrap().get_mut(&board).unwrap().last_seen_instant =
+            state
+                .board_status
+                .lock()
+                .unwrap()
+                .get_mut(&board)
+                .unwrap()
+                .last_seen_instant =
                 std::time::Instant::now().checked_sub(std::time::Duration::from_millis(20_000));
-            for _ in 0..5 { state.mark_discovered_relays_seen(); }
+            for _ in 0..5 {
+                state.mark_discovered_relays_seen();
+            }
             let graph = state.network_topology_snapshot(25_000);
-            let node = graph.nodes.iter().find(|node| node.sender_id.as_deref() == Some(board.sender_id())).unwrap();
+            let node = graph
+                .nodes
+                .iter()
+                .find(|node| node.sender_id.as_deref() == Some(board.sender_id()))
+                .unwrap();
             assert_eq!(node.status, NetworkTopologyStatus::Offline, "{board:?}");
             assert_eq!(node.last_seen_ms, Some(1234), "{board:?}");
             assert!(node.age_ms.unwrap() >= 20_000, "{board:?}");
             state.mark_board_seen(board.sender_id(), 25_001);
             let graph = state.network_topology_snapshot(25_001);
-            let node = graph.nodes.iter().find(|node| node.sender_id.as_deref() == Some(board.sender_id())).unwrap();
+            let node = graph
+                .nodes
+                .iter()
+                .find(|node| node.sender_id.as_deref() == Some(board.sender_id()))
+                .unwrap();
             assert_eq!(node.status, NetworkTopologyStatus::Online, "{board:?}");
             assert_eq!(node.last_seen_ms, Some(25_001));
             assert!(node.age_ms.unwrap() < BOARD_SEEN_TIMEOUT_MS);
@@ -1981,7 +2065,12 @@ pub(crate) mod tests {
         drop(tracked);
         let status = state.board_status_snapshot(1_234);
         if cfg!(feature = "test_fire_mode") {
-            assert!(!status.boards.iter().any(|entry| entry.board == Board::FlightComputer));
+            assert!(
+                !status
+                    .boards
+                    .iter()
+                    .any(|entry| entry.board == Board::FlightComputer)
+            );
             return;
         }
         let flight = status
@@ -2033,14 +2122,20 @@ pub(crate) mod tests {
             gateway.observe_route_age(std::time::Instant::now(), BOARD_SEEN_TIMEOUT_MS + 10_000);
             assert_eq!(gateway.last_seen_instant, received);
         }
-        let gateway = |snapshot: BoardStatusMsg| snapshot.boards.into_iter()
-            .find(|entry| entry.board == Board::GatewayBoard).unwrap();
+        let gateway = |snapshot: BoardStatusMsg| {
+            snapshot
+                .boards
+                .into_iter()
+                .find(|entry| entry.board == Board::GatewayBoard)
+                .unwrap()
+        };
         assert!(gateway(state.board_status_snapshot(1_000)).seen);
         {
             let mut statuses = state.board_status.lock().unwrap();
             let status = statuses.get_mut(&Board::GatewayBoard).unwrap();
-            status.last_seen_instant = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_millis(BOARD_SEEN_TIMEOUT_MS + 1_000));
+            status.last_seen_instant = std::time::Instant::now().checked_sub(
+                std::time::Duration::from_millis(BOARD_SEEN_TIMEOUT_MS + 1_000),
+            );
             status.observe_route_age(std::time::Instant::now(), BOARD_SEEN_TIMEOUT_MS + 10_000);
         }
         let expired = gateway(state.board_status_snapshot(60_000));
@@ -2181,15 +2276,24 @@ pub(crate) mod tests {
     async fn hitl_published_gse_buttons_follow_manual_valve_availability() {
         let state = test_app_state().await;
         for flight_state in [
-            FlightState::Startup, FlightState::Idle, FlightState::PreFill,
-            FlightState::FillTest, FlightState::NitrogenFill,
-            FlightState::NitrousFill, FlightState::Armed,
+            FlightState::Startup,
+            FlightState::Idle,
+            FlightState::PreFill,
+            FlightState::FillTest,
+            FlightState::NitrogenFill,
+            FlightState::NitrousFill,
+            FlightState::Armed,
         ] {
             *state.state.lock().unwrap() = flight_state;
             crate::sequences::refresh_action_policy_now(&state);
             let policy = state.action_policy_snapshot();
-            let enabled = |name: &str| policy.controls.iter()
-                .find(|control| control.cmd == name).is_some_and(|control| control.enabled);
+            let enabled = |name: &str| {
+                policy
+                    .controls
+                    .iter()
+                    .find(|control| control.cmd == name)
+                    .is_some_and(|control| control.enabled)
+            };
             assert!(policy.software_buttons_enabled);
             assert!(enabled("Dump"));
             for (name, cmd) in [
@@ -2204,10 +2308,21 @@ pub(crate) mod tests {
             assert!(enabled("ToggleGroundStationControl"));
             assert!(!enabled("ValveSelfTest"));
         }
-        state.gse.lock().unwrap().engine.config.dry_self_test_confirmed = true;
+        state
+            .gse
+            .lock()
+            .unwrap()
+            .engine
+            .config
+            .dry_self_test_confirmed = true;
         crate::sequences::refresh_action_policy_now(&state);
-        assert!(state.action_policy_snapshot().controls.iter()
-            .any(|control| control.cmd == "ValveSelfTest" && control.enabled));
+        assert!(
+            state
+                .action_policy_snapshot()
+                .controls
+                .iter()
+                .any(|control| control.cmd == "ValveSelfTest" && control.enabled)
+        );
     }
 
     #[tokio::test]

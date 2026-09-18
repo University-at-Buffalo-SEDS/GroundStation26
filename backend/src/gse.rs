@@ -340,8 +340,12 @@ pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
     if let Some(action) = action(cmd) {
         let is_prelaunch = prelaunch(state);
         let policy = state.action_policy_snapshot();
+        let nitrous_target = state.fill_targets_snapshot().nitrous.target_pressure_psi;
         let result = {
             let mut rt = state.gse.lock().unwrap();
+            if action == Action::StartFill && !rt.engine.active() {
+                rt.engine.nitrous_target_psi = nitrous_target;
+            }
             let input = rt.input(is_prelaunch, interlock(state, &policy));
             if action == Action::StartFill
                 && rt.ground_station_control
@@ -355,6 +359,7 @@ pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
         match result {
             Ok(effects) => apply(state, effects),
             Err(err) => {
+                state.gse.lock().unwrap().engine.status.message = err.clone();
                 state.add_notification(err);
             }
         }
@@ -531,6 +536,8 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         "prelaunch": prelaunch,
         "button_interlock_satisfied": interlock,
     });
+    response["configuration_error"] =
+        serde_json::json!(state.gse.lock().unwrap().engine.config.validate().err());
     Json(response).into_response()
 }
 
@@ -543,9 +550,21 @@ mod tests {
         for (name, command, expected) in [
             ("StartFill", TelemetryCommand::StartFill, Action::StartFill),
             ("PauseFill", TelemetryCommand::PauseFill, Action::PauseFill),
-            ("CancelFill", TelemetryCommand::CancelFill, Action::CancelFill),
-            ("NitrogenTest", TelemetryCommand::NitrogenTest, Action::NitrogenTest),
-            ("ValveSelfTest", TelemetryCommand::ValveSelfTest, Action::SelfTest),
+            (
+                "CancelFill",
+                TelemetryCommand::CancelFill,
+                Action::CancelFill,
+            ),
+            (
+                "NitrogenTest",
+                TelemetryCommand::NitrogenTest,
+                Action::NitrogenTest,
+            ),
+            (
+                "ValveSelfTest",
+                TelemetryCommand::ValveSelfTest,
+                Action::SelfTest,
+            ),
         ] {
             assert!(ACTIONS.contains(&(name, expected)));
             assert_eq!(action(&command), Some(expected));
@@ -627,7 +646,7 @@ mod tests {
             rt.engine
                 .request(Action::NitrogenTest, input)
                 .unwrap_err()
-                .contains("pressure ceiling")
+                .contains("empty-tank PT offset")
         );
         assert_eq!(rt.engine.status.phase, before);
         rt.engine.config.dry_self_test_confirmed = true;
