@@ -971,6 +971,83 @@ mod tests {
         assert_eq!(rig.valves, RELIEVED);
     }
     #[test]
+    fn nitrogen_pt_overshoot_settles_then_holds_before_each_next_level() {
+        let mut rig = Rig::new();
+        rig.pressure = 0.0;
+        rig.request(Action::NitrogenTest);
+        rig.until(Phase::Raising);
+        for target in [50.0, 100.0, 120.0] {
+            assert_eq!(rig.engine.status.current_step_psi, target);
+            assert!(rig.valves[3]);
+            // A real PT trace crosses the target between samples. Closing the
+            // supply is immediate; the overshoot must not become a leak baseline.
+            rig.pressure = target + 4.0;
+            rig.tick();
+            assert_eq!(rig.engine.status.phase, Phase::Settling);
+            assert_eq!(rig.valves, CLOSED);
+            for index in 0..19 {
+                rig.pressure = target
+                    + if index < 5 {
+                        3.5 - index as f32 * 0.3
+                    } else {
+                        2.0
+                    };
+                rig.tick();
+                assert_eq!(rig.engine.status.phase, Phase::Settling);
+                assert_eq!(rig.engine.status.current_step_psi, target);
+            }
+            rig.pressure = target + 2.0;
+            rig.tick();
+            assert_eq!(rig.engine.status.phase, Phase::Holding);
+            let reference = rig.engine.hold_reference.unwrap();
+            assert!((reference - (target + 2.0)).abs() < 0.1);
+            for index in 0..49 {
+                rig.pressure = target + 2.0 + if index % 2 == 0 { 0.1 } else { -0.1 };
+                rig.tick();
+                assert_eq!(rig.engine.status.phase, Phase::Holding);
+                assert_eq!(rig.valves, CLOSED);
+                assert_eq!(rig.engine.status.current_step_psi, target);
+                assert!(!rig.engine.status.nitrogen_passed);
+            }
+            rig.tick();
+            if target < 120.0 {
+                assert_eq!(rig.engine.status.phase, Phase::NitrogenSetup);
+                assert_eq!(rig.valves, CLOSED);
+                rig.tick();
+                assert_eq!(rig.engine.status.phase, Phase::Raising);
+            }
+        }
+        assert_eq!(rig.engine.status.phase, Phase::Dumping);
+        assert!(!rig.engine.status.nitrogen_passed);
+        rig.pressure = 0.0;
+        rig.until(Phase::Passed);
+        assert!(rig.engine.status.nitrogen_passed);
+    }
+
+    #[test]
+    fn nitrogen_pt_continuing_leak_after_overshoot_never_advances() {
+        let mut rig = Rig::new();
+        rig.pressure = 0.0;
+        rig.request(Action::NitrogenTest);
+        rig.until(Phase::Raising);
+        rig.pressure = 54.0;
+        rig.tick();
+        rig.pressure = 52.0;
+        rig.until(Phase::Holding);
+        for index in 1..=50 {
+            rig.pressure = 52.0 - index as f32 * 0.15;
+            rig.tick();
+            assert_eq!(rig.engine.status.current_step_psi, 50.0);
+            if rig.engine.status.phase == Phase::Fault {
+                break;
+            }
+        }
+        assert_eq!(rig.engine.status.phase, Phase::Fault);
+        assert!(!rig.engine.status.nitrogen_passed);
+        assert_eq!(rig.valves, RELIEVED);
+    }
+
+    #[test]
     fn configured_pressure_steps_are_used_and_final_step_is_capped() {
         let mut rig = Rig::new();
         rig.engine.config.pressure_step_psi = 40.0;

@@ -152,3 +152,45 @@ To use an existing native external receiver at the default loopback addresses, s
 `GS_VIDEO_MANAGED=0` and `GS_VIDEO_PASSWORD` in the backend service. Docker's video
 overlay already sets relay URLs and credentials and continues to manage its own
 MediaMTX container.
+
+
+## Video in the Linux native app (including Raspberry Pi)
+
+The native Linux UI uses WebKitGTK and GStreamer codecs installed on the machine
+**running the UI**. A working FFmpeg publisher or MediaMTX receiver does not prove
+that the native UI has an H.264 decoder. On Raspberry Pi OS/Ubuntu/Debian:
+
+```sh
+sudo apt update
+sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+gst-inspect-1.0 avdec_h264
+gst-inspect-1.0 h264parse
+```
+
+Quit and relaunch the native app after installing codecs. If the UI runs on the
+Pi, run these commands on the Pi; installing FFmpeg on a Mac does not install the
+Pi's WebKit codecs. The app's server URL must point to the Ground Station's HTTP(S)
+port, not MediaMTX's RTSP port. The station in this setup is `192.168.3.7`.
+
+Mission and Streamer now use the same buffered HLS program, including operators.
+There are no automatic unbuffered camera previews in Mission. HLS travels through
+the backend on the same HTTP(S) connection as the program, avoiding direct WebRTC
+ICE/UDP connectivity requirements. Use H.264 baseline/yuv420p with one-second
+keyframes as in the sender commands in these guides. On a slow native device,
+use the featured-camera layout (only one camera is decoded), and try 720p or lower.
+
+The rocket diagram is always in the program status bar, including during buffering
+and camera loss. The bar wraps on portrait screens without covering the picture.
+Crew comms, when enabled by the stream manager, use the same mute/volume control
+as camera audio. If autoplay is blocked, select **Unmute stream** once.
+
+If video still fails, compare the same station in a browser and collect:
+
+```sh
+sudo journalctl -u sed-ground-station.service -n 80 --no-pager
+sudo ss -ltnp 'sport = :8554'
+gst-inspect-1.0 avdec_h264
+```
+
+Also note the native player's status message. Redact secrets before sharing logs.
+See [WebKit's multimedia dependencies](https://docs.webkit.org/Ports/WebKitGTK%20and%20WPE%20WebKit/Multimedia.html).

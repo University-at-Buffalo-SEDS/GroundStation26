@@ -16,8 +16,9 @@ body{display:flex;flex-direction:column;overflow:auto}#viewport{position:relativ
 'use strict';
 const stage=document.querySelector('#stage'),status=document.querySelector('#status'),banner=document.querySelector('#banner');
 const ticket=new URLSearchParams(location.search).get('ticket'),players=new Map();
-let state,clockOffset=0,lastPoll=0,displayed='',stopped=false;
+let state,clockOffset=0,lastPoll=0,displayed='',stopped=false,lastVideoError='';
 const supportsVideo=typeof Hls!=='undefined'&&Hls.isSupported();
+const unsupportedVideo='H.264 playback unavailable. Linux native app: install GStreamer good/bad and libav codecs, then restart the app.';
 window.gsStreamSound={muted:true,volume:1};
 function sound(video){video.muted=window.gsStreamSound.muted;video.volume=window.gsStreamSound.volume;}
 window.addEventListener('gs-stream-sound',()=>{for(const p of players.values())sound(p.video);});
@@ -55,12 +56,12 @@ function modelDisplay(videoReady){
 }
 function remove(id){const p=players.get(id);if(p){p.hls.destroy();p.video.remove();players.delete(id);}}
 function create(feed){
- const video=document.createElement('video');sound(video);video.playsInline=true;video.preload='auto';video.setAttribute('aria-label',feed.label);stage.append(video);
+ const video=document.createElement('video');sound(video);video.playsInline=true;video.disableRemotePlayback=true;video.preload='auto';video.setAttribute('aria-label',feed.label);stage.append(video);
  const hls=new Hls({autoStartLoad:false,lowLatencyMode:false,maxBufferLength:12,maxMaxBufferLength:20,backBufferLength:5,liveSyncDuration:3,liveMaxLatencyDuration:85,maxLiveSyncPlaybackRate:1,enableWorker:true});
  const p={video,hls,details:null,started:false,ready:false,failed:false,lastFrame:0,lastSeek:-Infinity};players.set(feed.id,p);
  hls.on(Hls.Events.MANIFEST_PARSED,()=>hls.startLoad(-1));
  hls.on(Hls.Events.LEVEL_LOADED,(_,data)=>{p.details=data.details;});
- hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal){p.failed=true;video.style.opacity=0;}});
+ hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal){p.failed=true;video.style.opacity=0;lastVideoError=data.type===Hls.ErrorTypes.MEDIA_ERROR?'Video decoder failed — check H.264 codec support in the native app':'Video connection failed — retrying buffered stream';}});
  hls.attachMedia(video);hls.loadSource(feed.url);
  if(video.requestVideoFrameCallback){const frame=()=>{p.lastFrame=performance.now();if(!stopped&&players.get(feed.id)===p)video.requestVideoFrameCallback(frame);};video.requestVideoFrameCallback(frame);}
 }
@@ -102,15 +103,15 @@ function render(){
  if(state.broadcast.layout==='grid'){
   const entries=[...players.entries()],columns=stage.clientWidth<500?1:entries.length<=1?1:entries.length<=4?2:3,rows=Math.ceil(entries.length/columns);let ready=0;
   entries.forEach(([id,p],i)=>{p.video.style.zIndex='1';p.video.style.width=100/columns+'%';p.video.style.height=100/rows+'%';p.video.style.left=(i%columns)*100/columns+'%';p.video.style.top=Math.floor(i/columns)*100/rows+'%';p.video.style.opacity=p.ready?'1':'0';if(p.ready)ready++;});
-  status.textContent=!supportsVideo?'H.264 video playback unavailable in this browser':ready?'':state.streams.length?'Buffering delayed video — model view':'No active camera — model view';displayed='';modelDisplay(ready>0);
+  status.textContent=!supportsVideo?unsupportedVideo:ready?'':state.streams.length?(lastVideoError||'Buffering delayed video — model view'):'No active camera — model view';displayed='';modelDisplay(ready>0);
  }else{
   for(const p of players.values()){p.video.style.width='100%';p.video.style.height='100%';p.video.style.left='0';p.video.style.top='0';}
   displayed=players.get(preferred)?.ready?preferred:'';
   for(const [id,p]of players){p.video.style.zIndex=id===displayed?'2':'1';p.video.style.opacity=id===displayed&&p.ready?'1':'0';}
-  status.textContent=!supportsVideo?'H.264 video playback unavailable in this browser':players.get(displayed)?.ready?'':state.streams.length?'Buffering delayed video — model view':'No active camera — model view';modelDisplay(!!players.get(displayed)?.ready);
+  status.textContent=!supportsVideo?unsupportedVideo:players.get(displayed)?.ready?'':state.streams.length?(lastVideoError||'Buffering delayed video — model view'):'No active camera — model view';modelDisplay(!!players.get(displayed)?.ready);
  }
 }
 const timer=setInterval(render,100);
-if(!supportsVideo){status.textContent='This browser cannot play delayed video; showing the model.';}poll();
+if(!supportsVideo){status.textContent=unsupportedVideo;}poll();
 window.addEventListener('pagehide',()=>{stopped=true;clearInterval(timer);for(const id of [...players.keys()])remove(id);});
 </script><script type="module" src="/assets/program-audio.js"></script></html>

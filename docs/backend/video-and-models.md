@@ -186,7 +186,8 @@ receive 409. Broadcast and vehicle configuration persist together in
 `stream_labels`, and `stats` fields configure labels and backend-owned stat bindings.
 Empty/missing stats inherit six real telemetry fields; the bars cycle three at a time.
 GET `/api/live_streams` returns a valid empty stream list if the receiver is down,
-allowing the operator Mission view to fall back to the model. Audience/streamer playback
+allowing Mission and Streamer to show the delayed model. Both operators and viewers
+use the same buffered HLS program; Mission does not embed unbuffered previews. Playback
 buffers or displays an error rather than falling back to live video or live telemetry.
 
 | Endpoint | Behavior |

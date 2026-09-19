@@ -545,6 +545,232 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 mod tests {
     use super::*;
 
+    #[cfg(feature = "hitl_mode")]
+    type TestCommands = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+    #[cfg(feature = "hitl_mode")]
+    async fn button_test_state() -> (Arc<AppState>, TestCommands, Arc<sedsnet::router::Router>) {
+        let state = crate::state::tests::test_app_state().await;
+        *state.state.lock().unwrap() = FlightState::Idle;
+        let sent: TestCommands = Default::default();
+        let endpoints = [
+            ("VALVE_BOARD", "VALVE_COMMAND"),
+            ("ACTUATOR_BOARD", "ACTUATOR_COMMAND"),
+        ]
+        .map(|(endpoint, name)| {
+            let sent = sent.clone();
+            sedsnet::router::EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint(endpoint),
+                move |packet: &sedsnet::packet::Packet| {
+                    sent.lock()
+                        .unwrap()
+                        .push((name.into(), packet.payload().to_vec()));
+                    Ok(())
+                },
+            )
+        });
+        let peer = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new(endpoints).with_sender("GSE_TEST"),
+        ));
+        let router = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+        ));
+        let ground_weak = Arc::downgrade(&router);
+        let ground_ingress = Arc::new(std::sync::OnceLock::new());
+        let ingress = ground_ingress.clone();
+        let options = sedsnet::router::RouterSideOptions {
+            reliable_enabled: true,
+            link_local_enabled: true,
+            ..Default::default()
+        };
+        let peer_side = peer.add_side_packed_with_options(
+            "test_ground",
+            move |bytes| {
+                ground_weak
+                    .upgrade()
+                    .unwrap()
+                    .rx_packed_from_side(bytes, *ingress.get().unwrap())
+            },
+            options.clone(),
+        );
+        let receiver = peer.clone();
+        let ground_side = router.add_side_packed_with_options(
+            "test_fill",
+            move |bytes| receiver.rx_packed_from_side(bytes, peer_side),
+            options,
+        );
+        ground_ingress.set(ground_side).unwrap();
+        peer.announce_discovery().unwrap();
+        peer.process_all_queues_with_timeout(0).unwrap();
+        state.topology_router.set(router).unwrap();
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.engine.config.maximum_zero_offset_psi = Some(8.0);
+            rt.observe_pressure(Some(0.0));
+            rt.observe_mass(Some(0.0));
+        }
+        (state, sent, peer)
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    fn pump_test_link(state: &AppState, peer: &sedsnet::router::Router) {
+        // Ordered command delivery requires the receiver's protocol ACK queue
+        // to be serviced too, just as the board's telemetry worker does.
+        for _ in 0..20 {
+            peer.process_all_queues_with_timeout(0).unwrap();
+            state
+                .topology_router
+                .get()
+                .unwrap()
+                .process_all_queues_with_timeout(0)
+                .unwrap();
+        }
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    fn confirm_test_valves(state: &AppState, valves: [bool; 5]) {
+        let mut rt = state.gse.lock().unwrap();
+        for (key, open) in KEYS.into_iter().zip(valves) {
+            rt.observe_valve(key, open);
+        }
+        rt.observe_pressure(Some(0.0));
+        rt.observe_mass(Some(0.0));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "hitl_mode")]
+    async fn nitrogen_button_enters_baseline_and_requests_safe_valve_configuration() {
+        let (state, sent, peer) = button_test_state().await;
+        // Decode the command name emitted by the frontend button.
+        let cmd: TelemetryCommand = serde_json::from_str("\"NitrogenTest\"").unwrap();
+        assert_eq!(command_allowed(&state, &cmd), Some(true));
+        assert!(handle_command(&state, &cmd));
+        pump_test_link(&state, &peer);
+        assert_eq!(
+            state.gse.lock().unwrap().engine.status.phase,
+            Phase::BaselineSetup
+        );
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![
+                ("ACTUATOR_COMMAND".into(), vec![12]),
+                ("ACTUATOR_COMMAND".into(), vec![13]),
+                ("VALVE_COMMAND".into(), vec![3]),
+                ("VALVE_COMMAND".into(), vec![1]),
+                ("VALVE_COMMAND".into(), vec![2]),
+            ]
+        );
+        for (key, expected) in KEYS.into_iter().zip(gse_sequence::RELIEVED) {
+            assert_eq!(state.get_pending_umbilical_valve_state(key), Some(expected));
+        }
+        confirm_test_valves(&state, gse_sequence::RELIEVED);
+        tick(&state, true);
+        assert_eq!(
+            state.gse.lock().unwrap().engine.status.phase,
+            Phase::Baseline
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "hitl_mode")]
+    async fn fill_button_requires_nitrogen_pass_then_opens_only_after_confirmations_and_stops_at_mass()
+     {
+        let (state, sent, peer) = button_test_state().await;
+        let cmd: TelemetryCommand = serde_json::from_str("\"StartFill\"").unwrap();
+        assert!(handle_command(&state, &cmd));
+        pump_test_link(&state, &peer);
+        assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Idle);
+        assert!(state.get_pending_umbilical_valve_state(10).is_none());
+        assert!(sent.lock().unwrap().is_empty());
+        {
+            // The full nitrogen progression is covered by the sequence-engine test.
+            let mut rt = state.gse.lock().unwrap();
+            rt.engine.status.phase = Phase::Passed;
+            rt.engine.status.nitrogen_passed = true;
+            rt.engine.status.baseline = Some(gse_sequence::Baseline {
+                average_psi: 0.0,
+                min_psi: 0.0,
+                max_psi: 0.0,
+                noise_psi: 0.1,
+                samples: 50,
+            });
+        }
+        assert!(handle_command(&state, &cmd));
+        pump_test_link(&state, &peer);
+        {
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.engine.status.phase, Phase::FillSetup);
+            assert_eq!(
+                rt.engine.nitrous_target_psi,
+                state.fill_targets_snapshot().nitrous.target_pressure_psi
+            );
+        }
+        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+        tick(&state, true);
+        assert_eq!(
+            state.gse.lock().unwrap().engine.status.phase,
+            Phase::FillSetup
+        );
+        confirm_test_valves(&state, gse_sequence::FILL_READY);
+        tick(&state, true);
+        pump_test_link(&state, &peer);
+        assert_eq!(
+            state.gse.lock().unwrap().engine.status.phase,
+            Phase::Filling
+        );
+        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(true));
+        assert!(
+            sent.lock()
+                .unwrap()
+                .contains(&("ACTUATOR_COMMAND".into(), vec![10]))
+        );
+        let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
+        state.gse.lock().unwrap().observe_mass(Some(target));
+        tick(&state, true);
+        pump_test_link(&state, &peer);
+        assert_eq!(
+            state.gse.lock().unwrap().engine.status.phase,
+            Phase::PauseSetup
+        );
+        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .take(5)
+                .any(|(kind, data)| kind == "ACTUATOR_COMMAND" && data == &[13])
+        );
+        confirm_test_valves(&state, gse_sequence::CLOSED);
+        tick(&state, true);
+        assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Paused);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "hitl_mode")]
+    async fn button_rejections_are_visible_and_do_not_enqueue_valve_actions() {
+        for cmd in [TelemetryCommand::NitrogenTest, TelemetryCommand::StartFill] {
+            let (state, sent, peer) = button_test_state().await;
+            state
+                .gse
+                .lock()
+                .unwrap()
+                .engine
+                .config
+                .maximum_zero_offset_psi = None;
+            assert!(handle_command(&state, &cmd));
+            pump_test_link(&state, &peer);
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.engine.status.phase, Phase::Idle);
+            assert!(rt.engine.status.message.contains("empty-tank PT offset"));
+            drop(rt);
+            for key in KEYS {
+                assert!(state.get_pending_umbilical_valve_state(key).is_none());
+            }
+            assert!(sent.lock().unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn fill_nitrogen_and_self_test_commands_remain_registered_in_every_mode() {
         for (name, command, expected) in [

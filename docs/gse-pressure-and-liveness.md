@@ -30,3 +30,22 @@ Tests cover target boundaries, lower hardware caps, invalid targets, stale
 pressure, missing valve acknowledgements, command debounce, and expiration of
 every remote board. Hardware actuation and Raspberry Pi UI validation remain
 separate deployment checks.
+
+## Nitrogen and Auto Fill regression tests
+
+Run `cargo test -p gse_sequence` and
+`cargo test -p groundstation_backend --features hitl_mode`.
+The nitrogen PT trace exercises 50, 100 and 120 psi steps: each overshoots by
+4 psi, settles to target +2 psi during the two-second settling window, then
+holds with small noise for five seconds. It cannot advance during that hold.
+A continuing pressure decline after settling must fail without advancing.
+Completion still requires dumping back to the measured empty-tank band.
+
+Backend button tests decode the frontend command names, exercise the actual
+command handler and send valve commands through two in-memory SEDSNet routers
+with discovery and ordered protocol acknowledgements. Valve-state confirmations
+and PT/mass readings are supplied by the test, not physical hardware. Tests
+check setup commands, fill prerequisites, waiting for valve confirmations,
+opening nitrous, and closing at the target mass. Frontend unit tests check the
+button command names and WebSocket message payloads. These are software tests,
+not browser-driven clicks or qualification of a physical pressure system.

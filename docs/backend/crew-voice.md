@@ -31,9 +31,11 @@ in audience stream (delayed)**, then select **Apply broadcast settings**. This
 requires stream-manager/admin access and is off by default. Connected crew see a
 notice when their audio is included in the broadcast.
 
-In the audience program (including Streamer mode), viewers select **Enable crew
-audio** once to satisfy browser autoplay restrictions. They get mute and volume
-controls only. The audience player never requests a microphone or opens a
+In the audience program (including Streamer mode), crew comms play with the camera
+sound through one stream mute/volume control. Sound starts automatically when the
+webview allows it; otherwise select **Unmute stream** once. There is no separate
+crew-audio join or enable control for viewers. Receive-only playback also works
+on plain LAN HTTP; microphone transmission still requires HTTPS. The audience player never requests a microphone or opens a
 transmit socket. Normal audience view permissions, including configured guest
 viewing, apply; viewers do not need transmit permission.
 
