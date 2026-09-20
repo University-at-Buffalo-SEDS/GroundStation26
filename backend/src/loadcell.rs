@@ -1295,6 +1295,20 @@ mod tests {
     }
 
     #[test]
+    fn reversed_load_readings_are_not_clipped_at_132_kg() {
+        let mut cfg = LoadcellCalibrationFile::default();
+        // Coefficients reconstructed from the recording; mass must remain
+        // linear outside its observed -132.95 kg minimum. Only fill percentage
+        // is intentionally restricted to 0..100, never the measured mass.
+        cfg.ch1 = ChannelLinear { m: Some(9977.795), b: Some(-147.32314) };
+        let floor = calibrated_weight_kg(&cfg, "KG1000", 0.0014401439).unwrap();
+        assert!((floor + 132.95367).abs() < 0.001);
+        assert!(calibrated_weight_kg(&cfg, "KG1000", 0.0).unwrap() < -147.0);
+        assert!(calibrated_weight_kg(&cfg, "KG1000", -0.01).unwrap() < -247.0);
+        assert!(calibrated_weight_kg(&cfg, "KG1000", 0.04).unwrap() > 251.0);
+    }
+
+    #[test]
     fn captured_zero_shifts_polynomial_output_without_refit() {
         let mut cfg = LoadcellCalibrationFile::default();
         cfg.extra_channels.insert(

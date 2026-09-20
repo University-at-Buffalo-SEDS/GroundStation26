@@ -668,6 +668,7 @@ async fn save_vehicle_post(
 async fn three_asset(Path(file): Path<String>) -> ApiResult<Response> {
     let bytes: &'static [u8] = match file.as_str() {
         "vehicle-renderer.js" => include_bytes!("../../assets/three/vehicle-renderer.js"),
+        "software-renderer.js" => include_bytes!("../../assets/three/software-renderer.js"),
         "three.module.js" => include_bytes!("../../assets/three/three.module.js"),
         "three.core.js" => include_bytes!("../../assets/three/three.core.js"),
         "GLTFLoader.js" => include_bytes!("../../assets/three/GLTFLoader.js"),

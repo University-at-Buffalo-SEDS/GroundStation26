@@ -1,5 +1,13 @@
 # Ground Station 2026
 
+The frontend State tab includes a locally saved, per-user dashboard with Fill
+System and Avionics groups. Voice and recording tools stay embedded in the
+native client. Update both backend and frontend for the Pi-compatible 3D preview:
+the backend serves the model renderer and its Canvas2D wireframe fallback for
+devices without WebGL2. Verify both bundled GLB models with
+`node --test tests/software_model_renderer.mjs`. This software test does not
+replace checking performance in the Raspberry Pi native app.
+
 Recorded telemetry can be downloaded in every operating mode from **Data → Data capture · CSV downloads**;
 see [Data capture](docs/backend/data-capture.md).
 

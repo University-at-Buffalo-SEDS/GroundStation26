@@ -1,13 +1,17 @@
 import * as T from './three.module.js';
 import {GLTFLoader} from './GLTFLoader.js';
+import {SoftwareRenderer} from './software-renderer.js';
 // Explicit named-node transforms; no dependence on model-viewer's private scene graph.
 class VehicleViewer extends HTMLElement {
  static observedAttributes=['src','data-state'];
  connectedCallback(){
   if(this.renderer)return;
   this.style.display='block';this.style.touchAction='none';this.status=document.createElement('div');this.status.style.cssText='position:absolute;top:12px;left:12px;color:#b9cad7;font:12px system-ui;z-index:2';this.append(this.status);
-  try{this.renderer=new T.WebGLRenderer({alpha:true,antialias:true});}catch{this.status.textContent='3D unavailable: WebGL2 is required';return;}
-  this.renderer.setPixelRatio(Math.min(devicePixelRatio,2));this.renderer.toneMapping=T.ACESFilmicToneMapping;
+  this.software=false;
+  try{this.renderer=new T.WebGLRenderer({alpha:true,antialias:false});}catch{
+   try{this.renderer=new SoftwareRenderer();this.software=true;}catch{this.status.textContent='3D unavailable: neither WebGL2 nor Canvas2D is available';return;}
+  }
+  this.renderer.setPixelRatio(Math.min(devicePixelRatio,1.25));this.renderer.toneMapping=T.ACESFilmicToneMapping;
   this.append(this.renderer.domElement);this.scene=new T.Scene();this.root=new T.Group();this.scene.add(this.root);
   this.scene.add(new T.HemisphereLight(0xffffff,0x34404b,2.8));const light=new T.DirectionalLight(0xffffff,3);light.position.set(6,10,8);this.scene.add(light);
   this.camera=new T.PerspectiveCamera(38,1,.01,10000);this.theta=.6;this.phi=1.2;this.distance=14;this.center=new T.Vector3();
@@ -27,6 +31,7 @@ class VehicleViewer extends HTMLElement {
   }catch(e){this.status.textContent='Model could not load. Check the GLB and its assets.';this.dataset.loaded='false';}
  }
  frame(){
+  const now=performance.now();if(document.hidden||!this.isConnected||!this.clientWidth||!this.clientHeight||now-(this.lastFrame||0)<(this.software?1000/12:1000/30))return;this.lastFrame=now;
   if(!this.model)return;const dt=Math.min(this.clock.getDelta(),.1),state=this.state||{};
   if(state.orbit&&state.orbit!==this.orbit){const parts=state.orbit.trim().split(/\s+/);const theta=parseFloat(parts[0]),phi=parseFloat(parts[1]),radius=parseFloat(parts[2]);if(Number.isFinite(theta))this.theta=T.MathUtils.degToRad(theta);if(Number.isFinite(phi))this.phi=T.MathUtils.clamp(T.MathUtils.degToRad(phi),.1,3);if(Number.isFinite(radius)&&radius>0)this.distance=radius;this.orbit=state.orbit;}
   if(state.clip!==this.activeClip){this.mixer.stopAllAction();const clip=this.clips.find(c=>c.name===state.clip);if(clip)this.mixer.clipAction(clip).play();this.activeClip=state.clip;}
@@ -45,7 +50,7 @@ class VehicleViewer extends HTMLElement {
    if(motion.transform==='visible')node.visible=v>=.5;
   }
   this.driven=modified;
-  this.status.textContent=missing?missing+' mapped model node(s) missing':unknown?unknown+' component(s): no telemetry':'';
+  this.status.textContent=missing?missing+' mapped model node(s) missing':unknown?unknown+' component(s): no telemetry':this.software?'Compatibility preview: reduced-detail model':'';
   const a=state.attitude||[0,0,0];this.root.rotation.set(...a.map(v=>T.MathUtils.degToRad(v||0)));
   this.camera.position.set(this.center.x+this.distance*Math.sin(this.phi)*Math.sin(this.theta),this.center.y+this.distance*Math.cos(this.phi),this.center.z+this.distance*Math.sin(this.phi)*Math.cos(this.theta));this.camera.lookAt(this.center);this.renderer.render(this.scene,this.camera);
  }
