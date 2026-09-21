@@ -241,6 +241,7 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
         state.clear_launch_sequence_command_pending();
         return;
     }
+    crate::auto_zero::launch(&state);
     state.set_launch_indicator_latched(true);
     sequences::refresh_action_policy_now(&state);
     state.broadcast_action_policy_snapshot();
@@ -286,6 +287,8 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
     };
     let valve_command_sent = send_valve_launch_sequence_command(&router);
     if flight_command_sent || valve_command_sent {
+        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+        crate::auto_zero::launch(&state);
         state.set_launch_indicator_latched(true);
         sequences::refresh_action_policy_now(&state);
         state.broadcast_action_policy_snapshot();
@@ -594,6 +597,8 @@ pub async fn telemetry_task(
                         continue;
                     }
                     state.record_command_accepted(&cmd, get_current_timestamp_ms());
+                    state.auto_zero.lock().unwrap().cancel_for_command(&cmd);
+                    if crate::auto_zero::before_fill(&state, &cmd) { continue; }
                     if crate::gse::handle_command(&state, &cmd) {
                         continue;
                     }
@@ -1271,8 +1276,16 @@ async fn insert_db_batch_once(
     writes: &[DbWrite],
 ) -> Result<(), sqlx::Error> {
     let mut tx = db.begin().await?;
+    if writes.iter().any(|w| matches!(w, DbWrite::Calibration { .. })) {
+        sqlx::query("CREATE TABLE IF NOT EXISTS calibration_history (timestamp_ms INTEGER NOT NULL, sender_id TEXT NOT NULL, sensor_id TEXT NOT NULL, config_json TEXT NOT NULL, PRIMARY KEY(timestamp_ms,sender_id,sensor_id))").execute(&mut *tx).await?;
+    }
     for write in writes {
         match write {
+            DbWrite::Calibration { timestamp_ms, sender_id, sensor_id, config_json } => {
+                sqlx::query("INSERT OR REPLACE INTO calibration_history VALUES (?,?,?,?)")
+                    .bind(timestamp_ms).bind(sender_id).bind(sensor_id).bind(config_json)
+                    .execute(&mut *tx).await?;
+            }
             DbWrite::FlightState {
                 timestamp_ms,
                 state_code,
@@ -3863,6 +3876,7 @@ mod tests {
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
+            auto_zero: Default::default(),
             shutdown_tx,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             pending_db_writes: Arc::new(AtomicUsize::new(0)),
@@ -4094,7 +4108,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kg50_packet_records_raw_and_calibrated_without_changing_fill_mass() {
+    async fn selected_1000kg_fill_uses_absolute_mass_without_changing_recorded_weight() {
+        let (db_tx, _) = mpsc::channel(16);
+        let state = test_app_state(db_tx.clone()).await;
+        let mut targets = state.fill_targets_snapshot();
+        targets.fill_source = crate::fill_targets::FillSource::Kg1000Absolute;
+        state.set_fill_targets(targets);
+        let overflow = test_db_overflow();
+        let mut ws = state.ws_tx.subscribe();
+        let pkt = Packet::new(crate::telemetry_schema::data_type("KG1000"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            Board::DaqBoard.sender_id(), 123_400, f32_payload(&[-4.25])).unwrap();
+        let raw = handle_packet(&state, &db_tx, &overflow, pkt).await;
+        assert_eq!(raw[0].values, vec![Some(-4.25)]);
+        assert_eq!(ws.try_recv().unwrap().values, vec![Some(-4.25)]);
+        assert_eq!(ws.try_recv().unwrap().values, vec![Some(42.5)]);
+        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(4.25));
+        let pkt = Packet::new(crate::telemetry_schema::data_type("KG50"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            Board::DaqBoard.sender_id(), 123_500, f32_payload(&[20.])).unwrap();
+        handle_packet(&state, &db_tx, &overflow, pkt).await;
+        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(4.25));
+        let mut targets = state.fill_targets_snapshot();
+        targets.fill_source = crate::fill_targets::FillSource::Kg50;
+        state.set_fill_targets(targets);
+        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn stable_zero_and_disabled_auto_zero_do_not_delay_start_fill() {
+        let (db_tx, _) = mpsc::channel(4);
+        let state = test_app_state(db_tx).await;
+        let mut targets = state.fill_targets_snapshot();
+        targets.fill_source = crate::fill_targets::FillSource::Kg1000Absolute;
+        state.set_fill_targets(targets);
+        {
+            let mut rt = state.auto_zero.lock().unwrap();
+            *rt = crate::auto_zero::Runtime::testing(true);
+            for _ in 0..200 { rt.observe("KG1000", 0.1); }
+        }
+        assert!(!crate::auto_zero::before_fill(&state, &TelemetryCommand::StartFill));
+        assert!(!state.auto_zero.lock().unwrap().pending());
+        *state.auto_zero.lock().unwrap() = crate::auto_zero::Runtime::testing(false);
+        assert!(!crate::auto_zero::before_fill(&state, &TelemetryCommand::StartFill));
+        crate::auto_zero::launch(&state);
+        assert!(!state.auto_zero.lock().unwrap().pending());
+    }
+
+    #[tokio::test]
+    async fn launch_zero_capture_is_nonblocking_and_times_out_to_abort_without_samples() {
+        let (db_tx, _) = mpsc::channel(4);
+        let (state, mut commands) = test_app_state_with_cmd_rx(db_tx).await;
+        *state.auto_zero.lock().unwrap() = crate::auto_zero::Runtime::testing(true);
+        let start = std::time::Instant::now();
+        crate::auto_zero::launch(&state);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(state.auto_zero.lock().unwrap().pending());
+        let command = tokio::time::timeout(Duration::from_secs(6), commands.recv()).await.unwrap().unwrap();
+        assert!(matches!(command, TelemetryCommand::Abort));
+        assert!(!state.auto_zero.lock().unwrap().pending());
+    }
+
+    #[tokio::test]
+    async fn kg50_packet_records_raw_and_calibrated_and_updates_fill_mass() {
         let (db_tx, mut db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx.clone()).await;
         let db_overflow = test_db_overflow();
@@ -4114,8 +4190,8 @@ mod tests {
         let calibrated = ws_rx.try_recv().unwrap();
         assert_eq!(calibrated.data_type, loadcell::DERIVED_WEIGHT_50_DATA_TYPE);
         assert_eq!(calibrated.values, vec![Some(9.5)]);
-        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(123.0));
-        for expected in ["KG50", loadcell::DERIVED_WEIGHT_50_DATA_TYPE] {
+        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(9.5));
+        for expected in ["KG50", loadcell::DERIVED_WEIGHT_50_DATA_TYPE, loadcell::DERIVED_FILL_PERCENT_DATA_TYPE] {
             match db_rx.try_recv().unwrap() {
                 DbQueueItem::Write(DbWrite::Telemetry { data_type, source_timestamp_ms, .. }) => {
                     assert_eq!(data_type, expected);
@@ -4123,6 +4199,19 @@ mod tests {
                 }
                 other => panic!("unexpected DB item: {other:?}"),
             }
+        }
+        match db_rx.try_recv().unwrap() {
+            DbQueueItem::Write(write @ DbWrite::Calibration { .. }) => {
+                let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+                    .connect("sqlite::memory:").await.unwrap();
+                insert_db_batch_once(&db, &[write]).await.unwrap();
+                let json: String = sqlx::query_scalar("SELECT config_json FROM calibration_history WHERE sensor_id='KG50'")
+                    .fetch_one(&db).await.unwrap();
+                let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(metadata["calibration"]["extra_channels"]["kg50"]["linear"]["m"],2.0);
+                db.close().await;
+            }
+            other => panic!("missing recorded regression: {other:?}"),
         }
         assert!(state.recent_telemetry_snapshot().iter().any(|r|
             r.data_type == loadcell::DERIVED_WEIGHT_50_DATA_TYPE));
@@ -4155,7 +4244,7 @@ mod tests {
         assert_eq!(row.values, vec![Some(4.25)]);
 
         let mut broadcast_rows = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..1 {
             broadcast_rows.push(
                 ws_rx
                     .recv()
@@ -4171,16 +4260,13 @@ mod tests {
                 .map(|row| row.data_type.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
                 loadcell::DERIVED_WEIGHT_DATA_TYPE
             ]
         );
         assert_eq!(broadcast_rows[0].sender_id, Board::DaqBoard.sender_id());
-        assert_eq!(broadcast_rows[1].sender_id, Board::DaqBoard.sender_id());
-        assert_eq!(broadcast_rows[0].values, vec![Some(42.5)]);
-        assert_eq!(broadcast_rows[1].values, vec![Some(4.25)]);
+        assert_eq!(broadcast_rows[0].values, vec![Some(4.25)]);
         assert_eq!(broadcast_rows[0].timestamp_ms, row.timestamp_ms);
-        assert_eq!(broadcast_rows[1].timestamp_ms, row.timestamp_ms);
+        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), None);
 
         let cache = state.recent_telemetry_snapshot();
         assert!(
@@ -4189,13 +4275,14 @@ mod tests {
                 .any(|row| row.data_type == loadcell::DERIVED_WEIGHT_DATA_TYPE)
         );
         assert!(
+            !
             cache
                 .iter()
                 .any(|row| row.data_type == loadcell::DERIVED_FILL_PERCENT_DATA_TYPE)
         );
 
         let mut db_types = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             match db_rx
                 .recv()
                 .await
@@ -4212,7 +4299,6 @@ mod tests {
             db_types,
             vec![
                 loadcell::RAW_LOADCELL_DATA_TYPE_1000KG.to_string(),
-                loadcell::DERIVED_FILL_PERCENT_DATA_TYPE.to_string(),
                 loadcell::DERIVED_WEIGHT_DATA_TYPE.to_string(),
             ]
         );

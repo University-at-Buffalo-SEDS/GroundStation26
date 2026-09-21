@@ -436,7 +436,9 @@ pub fn save(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
     }
     let raw =
         serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize calibration: {e}"))?;
-    std::fs::write(&path, raw).map_err(|e| format!("write calibration {path:?}: {e}"))?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, raw).map_err(|e| format!("write calibration {path:?}: {e}"))?;
+    std::fs::rename(&temporary, &path).map_err(|e| format!("replace calibration {path:?}: {e}"))?;
     Ok(())
 }
 

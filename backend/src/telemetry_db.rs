@@ -13,6 +13,12 @@ pub const DEFAULT_TELEMETRY_DB_FILENAME: &str = "groundstation.db";
 
 #[derive(Debug, Clone)]
 pub enum DbWrite {
+    Calibration {
+        timestamp_ms: i64,
+        sender_id: String,
+        sensor_id: String,
+        config_json: String,
+    },
     FlightState {
         timestamp_ms: i64,
         state_code: i64,
@@ -43,6 +49,7 @@ impl DbWrite {
     pub fn timestamp_ms(&self) -> i64 {
         match self {
             Self::FlightState { timestamp_ms, .. }
+            | Self::Calibration { timestamp_ms, .. }
             | Self::Message { timestamp_ms, .. }
             | Self::Telemetry { timestamp_ms, .. }
             | Self::Alert { timestamp_ms, .. } => *timestamp_ms,

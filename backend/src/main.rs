@@ -9,6 +9,7 @@ macro_rules! gs_debug_println {
 }
 
 mod auth;
+mod auto_zero;
 mod command_probe;
 mod comms;
 mod comms_config;
@@ -30,6 +31,7 @@ mod media;
 mod media_runtime;
 mod network_variables;
 mod recording_export;
+mod recording_report;
 mod system_clock;
 mod recording_range;
 mod ring_buffer;
@@ -593,6 +595,7 @@ async fn main() -> anyhow::Result<()> {
         gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
+        auto_zero: Default::default(),
         shutdown_tx,
         shutdown_requested: Arc::new(AtomicBool::new(false)),
         pending_db_writes: Arc::new(AtomicUsize::new(0)),

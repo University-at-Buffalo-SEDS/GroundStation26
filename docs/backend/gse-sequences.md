@@ -57,6 +57,46 @@ pressurized tank as empty. A PT reading alone cannot establish safe depressuriza
 
 ## Actions
 
+### Fill source and automatic loadcell zero
+
+Actions provides a **Fill percentage and automatic cutoff source** selector:
+`kg50` (default, signed calibrated 50 kg value) or `kg1000_absolute` (absolute
+calibrated 1000 kg value). The selected channel drives both fill percentage and
+automatic mass cutoff. Raw and calibrated telemetry/logs retain their original
+sign; absolute-value mapping is only for fill control. Changing source clears
+the controller's previous mass until a fresh sample from the new source arrives.
+Source changes are rejected during an active fill or zero capture.
+
+The selector and both nitrogen/nitrous mass and pressure targets are saved in
+`backend/config/fill_targets.json` (`GS_FILL_TARGETS_CONFIG` override). They restore
+after restart. Files without a source field default to `kg50`.
+
+The Actions **Automatically zero loadcells** checkbox applies to Start Fill and
+HITL/Test Fire Launch. It defaults on, persists in `backend/config/auto_zero.json`
+(`GS_AUTO_ZERO_CONFIG` override), and requires command plus calibration-edit
+permission to change. It cannot change during fill, launch, or zero capture.
+Disabled means use the saved calibration/tare without automatic capture.
+
+- Start Fill checks the selected fill channel's last 200 samples, all received
+  within five seconds, with the newest less than 250 ms old. If already stable
+  within ±0.8 kg it proceeds immediately through the existing sequence gates.
+- Otherwise it collects 200 **new** samples before starting fill. Resuming a
+  paused fill never re-tares contents already added. Pause, Cancel, Abort, or
+  another accepted manual action cancels a pending fill capture.
+- Launch always captures the 1000 kg channel concurrently with the existing
+  countdown, limited to its first five seconds. It does not add a pre-countdown
+  delay. Timeout or failed stability requests Abort; operator/hardware safety
+  systems remain necessary because software cannot guarantee delivery of Abort.
+- The lowest and highest 5% of readings are excluded. The remaining 90% must
+  span no more than 0.8 kg, and their mean must remain within ±0.8 kg. Larger
+  offsets require inspection/manual tare, not automatic removal of actual load.
+- Successful capture saves the trimmed raw mean as the tare without changing
+  regression coefficients, then publishes the calibration to DAQ. Missing data,
+  movement, calibration changes, or save failures do not start a new fill.
+
+`GET /api/auto_zero` reads and `POST /api/auto_zero` saves `{"enabled":true}`.
+The existing `/api/fill_targets` payload now includes `fill_source`.
+
 | Action | Pilot | Vent | Dump | Nitrogen | Nitrous |
 | --- | --- | --- | --- | --- | --- |
 | Start fill (configuration first) | Closed | Open | Closed | Closed | Opens only after acknowledgements and zero PT |

@@ -578,6 +578,7 @@ pub(super) async fn emit_derived_loadcell_rows(
     db_overflow: &DbOverflow,
     sample: DerivedLoadcellSample<'_>,
 ) {
+    state.auto_zero.lock().unwrap().observe(sample.sensor_id, sample.raw_value);
     let calibration_sensor_id = if sample.sensor_id
         == &*crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE").as_str()
     {
@@ -586,11 +587,13 @@ pub(super) async fn emit_derived_loadcell_rows(
         sample.sensor_id
     };
     let cfg = state.loadcell_calibration.lock().unwrap().clone();
+    let fill_targets = state.fill_targets_snapshot();
+    let fill_source = fill_targets.fill_source;
     let Some(calibrated_value) =
         loadcell::calibrated_sensor_value(&cfg, calibration_sensor_id, sample.raw_value)
     else {
         match calibration_sensor_id {
-            loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
+            sensor if sensor == fill_source.sensor() => {
                 let mut latest = state.latest_fill_mass_kg.lock().unwrap();
                 *latest = None;
                 state.gse.lock().unwrap().observe_mass(None);
@@ -604,31 +607,9 @@ pub(super) async fn emit_derived_loadcell_rows(
         }
         return;
     };
-    let rows: Vec<(&str, Vec<Option<f32>>)> = match calibration_sensor_id {
-        loadcell::RAW_LOADCELL_DATA_TYPE_50KG => vec![(
-            loadcell::DERIVED_WEIGHT_50_DATA_TYPE, vec![Some(calibrated_value)],
-        )],
-        loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => {
-            let fill_targets = state.fill_targets_snapshot();
-            let flight_state = *state.state.lock().unwrap();
-            let target_mass_kg = loadcell::active_fill_target_mass_kg(&fill_targets, flight_state);
-            let percent = loadcell::fill_percent(target_mass_kg, calibrated_value);
-            {
-                let mut latest = state.latest_fill_mass_kg.lock().unwrap();
-                *latest = Some(calibrated_value);
-                state.gse.lock().unwrap().observe_mass(Some(calibrated_value));
-            }
-            vec![
-                (
-                    loadcell::DERIVED_WEIGHT_DATA_TYPE,
-                    vec![Some(calibrated_value)],
-                ),
-                (
-                    loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
-                    vec![Some(percent)],
-                ),
-            ]
-        }
+    let mut rows: Vec<(&str, Vec<Option<f32>>)> = match calibration_sensor_id {
+        loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => vec![(loadcell::DERIVED_WEIGHT_DATA_TYPE, vec![Some(calibrated_value)])],
+        loadcell::RAW_LOADCELL_DATA_TYPE_50KG => vec![(loadcell::DERIVED_WEIGHT_50_DATA_TYPE, vec![Some(calibrated_value)])],
         loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
             state
                 .gse
@@ -646,6 +627,18 @@ pub(super) async fn emit_derived_loadcell_rows(
         }
         _ => Vec::new(),
     };
+    if calibration_sensor_id == fill_source.sensor() {
+        // KG50 retains a raw display fallback for old layouts, but raw units
+        // without a saved calibration must never drive automatic mass cutoff.
+        let mass = if calibration_sensor_id == "KG50" && !cfg.extra_channels.contains_key("kg50") {
+            None
+        } else { Some(fill_source.mass(calibrated_value)) };
+        let flight_state = *state.state.lock().unwrap();
+        let target = loadcell::active_fill_target_mass_kg(&fill_targets, flight_state);
+        *state.latest_fill_mass_kg.lock().unwrap() = mass;
+        state.gse.lock().unwrap().observe_mass(mass);
+        rows.push((loadcell::DERIVED_FILL_PERCENT_DATA_TYPE, vec![mass.map(|mass| loadcell::fill_percent(target, mass))]));
+    }
 
     for (data_type, values) in rows {
         if should_persist_telemetry_sample(data_type, sample.sender_id, sample.ts_ms) {
@@ -673,6 +666,29 @@ pub(super) async fn emit_derived_loadcell_rows(
         };
         state.cache_recent_telemetry(row.clone());
         let _ = state.ws_tx.send(row);
+    }
+    // Keep actual calibration provenance, never reconstruct it from today's
+    // settings at export time. Periodic snapshots also cover pre-roll recording.
+    static RECORDED: OnceLock<Mutex<HashMap<String, (String, i64)>>> = OnceLock::new();
+    let config_json = serde_json::json!({"calibration":cfg,
+        "fill_targets":state.fill_targets_snapshot(),
+        "flight_state":format!("{:?}", *state.state.lock().unwrap())}).to_string();
+    let key = format!("{}:{:?}:{}:{}", state.placeholder_db_path,
+        state.recording_status_snapshot().db_path, sample.sender_id, calibration_sensor_id);
+    let changed = {
+        let mut last = RECORDED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        let changed = last.get(&key).is_none_or(|(value, ts)| value != &config_json || sample.ts_ms.saturating_sub(*ts) >= 10_000 || sample.ts_ms < *ts);
+        if changed {
+            if last.len() >= 128 { last.clear(); }
+            last.insert(key, (config_json.clone(), sample.ts_ms));
+        }
+        changed
+    };
+    if changed {
+        queue_db_write(state, db_tx, db_overflow, DbWrite::Calibration {
+            timestamp_ms:sample.ts_ms, sender_id:sample.sender_id.into(),
+            sensor_id:calibration_sensor_id.into(), config_json,
+        }).await;
     }
 }
 

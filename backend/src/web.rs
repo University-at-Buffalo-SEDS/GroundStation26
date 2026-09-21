@@ -172,6 +172,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/auth/logout", post(logout))
         .route("/api/recent", get(get_recent))
         .route("/api/command", post(send_command))
+        .route("/api/auto_zero", get(get_auto_zero).post(set_auto_zero))
         .route("/api/alerts", get(get_alerts))
         .route("/api/boards", get(get_boards))
         .route("/api/layout", get(get_layout))
@@ -1405,6 +1406,27 @@ async fn set_flight_setup(
     }
 }
 
+async fn get_auto_zero(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await { return response; }
+    Json(state.auto_zero.lock().unwrap().settings()).into_response()
+}
+
+async fn set_auto_zero(State(state): State<Arc<AppState>>, headers: HeaderMap,
+    Json(settings): Json<crate::auto_zero::Settings>) -> impl IntoResponse {
+    let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+        Ok(p) => p, Err(response) => return response,
+    };
+    if !principal_can_edit_calibration(&principal) { return calibration_edit_forbidden_response(); }
+    if crate::gse::active(&state) || matches!(state.launch_clock_snapshot().kind,
+        crate::telemetry_db::LaunchClockKind::TMinus | crate::telemetry_db::LaunchClockKind::TPlus) {
+        return (StatusCode::CONFLICT, "Automatic zero settings cannot change during fill or launch").into_response();
+    }
+    match state.auto_zero.lock().unwrap().configure(settings) {
+        Ok(()) => Json(settings).into_response(),
+        Err(e) => (StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
 /// Returns the persisted nitrogen/nitrous fill targets used by the local sequence logic.
 async fn get_fill_targets(
     State(state): State<Arc<AppState>>,
@@ -1428,6 +1450,10 @@ async fn set_fill_targets(
     };
     if !principal.permissions.send_commands {
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
+    }
+    if cfg.fill_source != state.fill_targets_snapshot().fill_source
+        && (crate::gse::active(&state) || state.auto_zero.lock().unwrap().pending()) {
+        return (StatusCode::CONFLICT, "Cancel the fill/zero capture before changing its loadcell source").into_response();
     }
     match fill_targets::save(&cfg) {
         Ok(()) => {

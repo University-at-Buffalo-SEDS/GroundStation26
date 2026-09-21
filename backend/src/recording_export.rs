@@ -33,6 +33,7 @@ struct Recording {
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/recordings", get(list))
+        .route("/api/recordings/report", get(crate::recording_report::report))
         .route("/api/recordings/csv", get(crate::recording_range::download))
         .route("/api/system/time", get(crate::system_clock::status).post(crate::system_clock::sync))
         .route("/api/recordings/{id}/csv", get(download))

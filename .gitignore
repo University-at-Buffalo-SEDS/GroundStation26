@@ -9,6 +9,7 @@ pkg/
 vendor/
 
 venv/
+.venv-reports/
 __pycache__/
 
 .DS_Store

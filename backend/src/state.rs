@@ -153,6 +153,7 @@ pub struct AppState {
 
     /// Loadcell calibration data loaded from JSON and editable at runtime.
     pub loadcell_calibration: Arc<Mutex<LoadcellCalibrationFile>>,
+    pub auto_zero: Arc<Mutex<crate::auto_zero::Runtime>>,
 
     /// Broadcast shutdown notifications to long-running background tasks.
     pub shutdown_tx: broadcast::Sender<()>,
@@ -663,8 +664,12 @@ impl AppState {
 
     /// Builds the board-health payload sent to the dashboard.
     pub fn board_status_snapshot(&self, now_ms: u64) -> BoardStatusMsg {
+        self.board_status_snapshot_filtered(now_ms, true)
+    }
+
+    fn board_status_snapshot_filtered(&self, now_ms: u64, filter_for_mode: bool) -> BoardStatusMsg {
         let map = self.board_status.lock().unwrap();
-        let visible_boards: Vec<Board> = if cfg!(feature = "test_fire_mode") {
+        let visible_boards: Vec<Board> = if filter_for_mode && cfg!(feature = "test_fire_mode") {
             vec![
                 Board::ValveBoard,
                 Board::GatewayBoard,
@@ -714,7 +719,9 @@ impl AppState {
         let exported = router.export_topology();
         let runtime = router.export_runtime_stats();
         let local_sender = router.sender().to_string();
-        let board_status = self.board_status_snapshot(now_ms);
+        // Hiding av-bay cards in Test Fire must not hide their live ages from
+        // topology, or cached discovery can incorrectly keep them online.
+        let board_status = self.board_status_snapshot_filtered(now_ms, false);
         let node_timing = |sender_id: &str| {
             if sender_id == local_sender {
                 return (Some(now_ms), Some(0));
@@ -1235,8 +1242,13 @@ impl AppState {
         if *slot == targets {
             return;
         }
+        let source_changed = slot.fill_source != targets.fill_source;
         *slot = targets;
         drop(slot);
+        if source_changed {
+            *self.latest_fill_mass_kg.lock().unwrap() = None;
+            self.gse.lock().unwrap().observe_mass(None);
+        }
         self.broadcast_fill_targets_snapshot();
     }
 
@@ -2422,6 +2434,7 @@ pub(crate) mod tests {
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
+            auto_zero: Default::default(),
             shutdown_tx,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             pending_db_writes: Arc::new(AtomicUsize::new(0)),
