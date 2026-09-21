@@ -636,6 +636,13 @@
       "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
       "element": {"kind": "Static", "data_type": "Float32", "count": 7},
       "endpoints": ["SD_CARD"]
+    },
+    {
+      "name": "DAQ_LOG_CLOCK",
+      "doc": "Retained DAQ session ID and T+120s close deadline, two little-endian u64 values; zeros reset recording.",
+      "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
+      "element": {"kind": "Static", "data_type": "UInt8", "count": 16},
+      "endpoints": ["SD_CARD"]
     }
   ]
 }

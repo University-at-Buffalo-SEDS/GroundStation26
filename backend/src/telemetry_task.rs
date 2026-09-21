@@ -241,6 +241,7 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
         state.clear_launch_sequence_command_pending();
         return;
     }
+    state.begin_daq_launch_log();
     crate::auto_zero::launch(&state);
     state.set_launch_indicator_latched(true);
     sequences::refresh_action_policy_now(&state);
@@ -3877,6 +3878,7 @@ mod tests {
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
             auto_zero: Default::default(),
+            daq_log_session: Default::default(),
             shutdown_tx,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             pending_db_writes: Arc::new(AtomicUsize::new(0)),

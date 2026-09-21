@@ -348,7 +348,11 @@ mod tests {
             rt.observe("KG1000", 0.0);
         }
         assert_eq!(rt.kg1000.len(), COUNT);
-        assert!(rt.samples("KG1000", Instant::now()).is_empty());
+        // Consecutive Instant::now() calls can share a clock tick. Use an
+        // explicit cutoff so this test does not depend on host clock precision.
+        let latest = rt.kg1000.back().unwrap().at;
+        assert!(!rt.samples("KG1000", latest).is_empty());
+        assert!(rt.samples("KG1000", latest + Duration::from_nanos(1)).is_empty());
         rt.pending = true;
         let old = rt.generation;
         rt.cancel();

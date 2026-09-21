@@ -596,6 +596,7 @@ async fn main() -> anyhow::Result<()> {
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
         auto_zero: Default::default(),
+        daq_log_session: Default::default(),
         shutdown_tx,
         shutdown_requested: Arc::new(AtomicBool::new(false)),
         pending_db_writes: Arc::new(AtomicUsize::new(0)),

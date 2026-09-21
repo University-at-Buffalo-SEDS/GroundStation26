@@ -24,6 +24,10 @@ struct PersistentVariables {
     flight_buzzer: bool,
     #[serde(default)]
     flight_state: u8,
+    #[serde(default)]
+    daq_log_clock: [u64; 2],
+    #[serde(default)]
+    daq_log_last_session: u64,
 }
 
 struct VariableStore {
@@ -60,6 +64,8 @@ fn load(path: &Path) -> PersistentVariables {
             .and_then(|value| value.parse::<u8>().ok())
             .filter(|value| *value <= 15)
             .unwrap_or(0),
+        daq_log_clock: [0, 0],
+        daq_log_last_session: 0,
     }
 }
 
@@ -112,6 +118,7 @@ pub fn initialize(router: &Router) -> Result<()> {
         FLIGHT_STATE_TYPE,
         DAQ_CALIBRATION_TYPE,
         DAQ_KG50_CALIBRATION_TYPE,
+        "DAQ_LOG_CLOCK",
     ] {
         router.enable_network_variable(
             crate::telemetry_schema::data_type(data_type),
@@ -168,6 +175,7 @@ pub fn initialize(router: &Router) -> Result<()> {
     let calibration = crate::loadcell::load_or_default();
     router.seed_managed_variable(calibration_packet(&calibration)?)?;
     router.seed_managed_variable(kg50_calibration_packet(&calibration)?)?;
+    router.seed_managed_variable(cached_daq_log_clock_packet()?)?;
     Ok(())
 }
 
@@ -184,6 +192,7 @@ pub fn publish_current(router: &Router) -> Result<()> {
     )?)?;
     router.set_network_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?)?;
     set_daq_calibration(router, &crate::loadcell::load_or_default())?;
+    router.set_network_variable(cached_daq_log_clock_packet()?)?;
     Ok(())
 }
 
@@ -279,6 +288,97 @@ pub fn set_daq_calibration(
     Ok(())
 }
 
+fn daq_log_clock_payload(
+    session: u64,
+    clock: &crate::telemetry_db::LaunchClockMsg,
+    wall_now: i64,
+    network_now: i64,
+) -> Result<Vec<u8>> {
+    use crate::telemetry_db::LaunchClockKind;
+    let deadline = if clock.kind == LaunchClockKind::Idle {
+        0
+    } else {
+        let anchor = clock
+            .anchor_timestamp_ms
+            .context("Launch clock has no anchor")?;
+        let countdown = if clock.kind == LaunchClockKind::TMinus {
+            clock.duration_ms.unwrap_or(0)
+        } else {
+            0
+        };
+        let deadline = network_now
+            .saturating_add(anchor.saturating_sub(wall_now))
+            .saturating_add(countdown)
+            .saturating_add(120_000);
+        anyhow::ensure!(
+            (315_532_800_000..4_354_819_200_000).contains(&deadline),
+            "Set GroundStation/network UTC before timestamped DAQ launch logging"
+        );
+        deadline as u64
+    };
+    let session = if deadline == 0 { 0 } else { session };
+    anyhow::ensure!(
+        deadline == 0 || session != 0,
+        "DAQ launch session must be nonzero"
+    );
+    Ok([session.to_le_bytes(), deadline.to_le_bytes()].concat())
+}
+
+fn cached_daq_log_clock_packet() -> Result<Packet> {
+    let values = store()
+        .lock()
+        .expect("network-variable store lock poisoned")
+        .values
+        .daq_log_clock;
+    packet_bytes(
+        "DAQ_LOG_CLOCK",
+        "SD_CARD",
+        Arc::from([values[0].to_le_bytes(), values[1].to_le_bytes()].concat()),
+    )
+}
+
+pub fn next_daq_log_session(anchor_ms: i64) -> u64 {
+    let values = store()
+        .lock()
+        .expect("network-variable store lock poisoned")
+        .values;
+    let last = values.daq_log_last_session.max(values.daq_log_clock[0]);
+    (anchor_ms.max(1) as u64).max(last.saturating_add(1))
+}
+
+pub fn set_daq_log_clock(
+    router: &Router,
+    session: u64,
+    clock: &crate::telemetry_db::LaunchClockMsg,
+) -> Result<()> {
+    let wall_now = get_current_timestamp_ms() as i64;
+    let network_now = router
+        .network_time()
+        .and_then(|t| t.unix_time_ms)
+        .map(|v| v as i64)
+        .unwrap_or(wall_now);
+    let payload = daq_log_clock_payload(session, clock, wall_now, network_now)?;
+    // Preserve the absolute deadline, not a fresh countdown on service restart.
+    // Drop the disk-cache lock before entering SEDSNet (callbacks may use it).
+    {
+        let mut guard = store()
+            .lock()
+            .expect("network-variable store lock poisoned");
+        guard.values.daq_log_clock = [
+            u64::from_le_bytes(payload[..8].try_into().unwrap()),
+            u64::from_le_bytes(payload[8..].try_into().unwrap()),
+        ];
+        guard.values.daq_log_last_session = guard.values.daq_log_last_session.max(session);
+        persist(&guard.path, guard.values)?;
+    }
+    router.set_network_variable(packet_bytes(
+        "DAQ_LOG_CLOCK",
+        "SD_CARD",
+        Arc::from(payload),
+    )?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 fn toggle_persisted(store: &mut VariableStore) -> Result<bool> {
     store.values.av_bay_underglow = !store.values.av_bay_underglow;
@@ -323,6 +423,155 @@ mod tests {
     use sedsnet::router::{EndpointHandler, RouterConfig};
 
     #[test]
+    fn daq_deadline_uses_t_zero_not_launch_button_or_reconnect_time() {
+        use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
+        let now = 1_800_000_000_000;
+        let clock = crate::state::launch_countdown_clock(now);
+        let decode = |bytes: Vec<u8>| -> (u64, u64) {
+            (
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            )
+        };
+        let expected = (17, (now + 130_000) as u64);
+        assert_eq!(
+            decode(daq_log_clock_payload(17, &clock, now, now).unwrap()),
+            expected
+        );
+        assert_eq!(
+            decode(daq_log_clock_payload(17, &clock, now + 50_000, now + 50_000).unwrap()),
+            expected
+        );
+        let pilot = LaunchClockMsg {
+            kind: LaunchClockKind::TPlus,
+            anchor_timestamp_ms: Some(now + 10_000),
+            duration_ms: None,
+        };
+        assert_eq!(
+            decode(daq_log_clock_payload(17, &pilot, now + 10_000, now + 10_000).unwrap()),
+            expected
+        );
+        assert_eq!(
+            decode(daq_log_clock_payload(17, &LaunchClockMsg::idle(), now, now).unwrap()),
+            (0, 0)
+        );
+        assert!(daq_log_clock_payload(0, &clock, now, now).is_err());
+        assert!(daq_log_clock_payload(17, &crate::state::launch_countdown_clock(0), 0, 0).is_err());
+    }
+
+    #[test]
+    fn daq_launch_cache_survives_groundstation_restart_without_extending_run() {
+        let path = std::env::temp_dir().join(format!("gs-daq-clock-{}.json", std::process::id()));
+        let values = PersistentVariables {
+            daq_log_clock: [123, 1_800_000_130_000],
+            ..Default::default()
+        };
+        persist(&path, values).unwrap();
+        assert_eq!(load(&path).daq_log_clock, values.daq_log_clock);
+        persist(&path, PersistentVariables::default()).unwrap();
+        assert_eq!(load(&path).daq_log_clock, [0, 0]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn daq_retained_launch_clock_recovers_after_either_router_restarts() {
+        crate::telemetry_schema::initialize().unwrap();
+        let ty = crate::telemetry_schema::data_type("DAQ_LOG_CLOCK");
+        let ground_link: Arc<Mutex<Option<Arc<Router>>>> = Default::default();
+        let daq_link: Arc<Mutex<Option<Arc<Router>>>> = Default::default();
+        let observed: Arc<Mutex<Vec<Vec<u8>>>> = Default::default();
+        let expected: Vec<u8> = [123u64.to_le_bytes(), 1_800_000_130_000u64.to_le_bytes()].concat();
+        let make_ground = || {
+            let r = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+            r.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
+                .unwrap();
+            r.seed_managed_variable(
+                packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(expected.clone())).unwrap(),
+            )
+            .unwrap();
+            let link = daq_link.clone();
+            r.add_side_packet("fill", move |p| {
+                let receiver = link.lock().unwrap().clone();
+                receiver.map_or(Ok(()), |r| r.rx_from_side(p, 0))
+            });
+            r
+        };
+        let make_daq = || {
+            let r = Arc::new(Router::new(RouterConfig::new([]).with_sender("DAQ")));
+            r.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+                .unwrap();
+            let observations = observed.clone();
+            r.on_network_variable_update(ty, move |p| {
+                observations.lock().unwrap().push(p.payload().to_vec());
+                Ok(())
+            })
+            .unwrap();
+            let link = ground_link.clone();
+            r.add_side_packet("can", move |p| {
+                let receiver = link.lock().unwrap().clone();
+                receiver.map_or(Ok(()), |r| r.rx_from_side(p, 0))
+            });
+            r
+        };
+        let mut ground = make_ground();
+        let mut daq = make_daq();
+        for round in 0..3 {
+            if round == 1 {
+                *ground_link.lock().unwrap() = None;
+                ground = make_ground();
+            }
+            if round == 2 {
+                *daq_link.lock().unwrap() = None;
+                daq = make_daq();
+            }
+            *ground_link.lock().unwrap() = Some(ground.clone());
+            *daq_link.lock().unwrap() = Some(daq.clone());
+            if round == 2 {
+                observed.lock().unwrap().clear();
+            }
+            ground.announce_discovery().unwrap();
+            daq.announce_discovery().unwrap();
+            daq.request_managed_variable(ty).unwrap();
+            for _ in 0..32 {
+                ground.process_all_queues().unwrap();
+                daq.process_all_queues().unwrap();
+            }
+            assert_eq!(
+                observed.lock().unwrap().last(),
+                Some(&expected),
+                "restart round {round}"
+            );
+            // Also prove the new GS instance can deliver a changed clock, not
+            // merely that DAQ still remembers the value from before restart.
+            let changed: Vec<u8> =
+                [124u64.to_le_bytes(), 1_800_000_140_000u64.to_le_bytes()].concat();
+            ground
+                .set_network_variable(
+                    packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(changed.clone())).unwrap(),
+                )
+                .unwrap();
+            for _ in 0..32 {
+                ground.process_all_queues().unwrap();
+                daq.process_all_queues().unwrap();
+            }
+            assert_eq!(observed.lock().unwrap().last(), Some(&changed));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            ground
+                .set_network_variable(
+                    packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(expected.clone())).unwrap(),
+                )
+                .unwrap();
+            for _ in 0..32 {
+                ground.process_all_queues().unwrap();
+                daq.process_all_queues().unwrap();
+            }
+        }
+        // Release simulated cable endpoints; callbacks must not leak routers.
+        *ground_link.lock().unwrap() = None;
+        *daq_link.lock().unwrap() = None;
+    }
+
+    #[test]
     fn legacy_rate_cache_preserves_only_runtime_settings() {
         let values: PersistentVariables = serde_json::from_str(
             r#"{"av_bay_underglow":true,"flight_buzzer":true,"flight_state":6,"rf_telemetry_rate_hz":2,"fc_telemetry_rate_hz":4}"#,
@@ -354,6 +603,8 @@ mod tests {
                 av_bay_underglow: true,
                 flight_buzzer: true,
                 flight_state: 6,
+                daq_log_clock: [0, 0],
+                daq_log_last_session: 0,
             },
         )
         .unwrap();
@@ -477,16 +728,31 @@ mod tests {
     fn kg50_calibration_packet_has_separate_type_and_tare() {
         crate::telemetry_schema::initialize().unwrap();
         let mut cfg = crate::loadcell::LoadcellCalibrationFile::default();
-        cfg.extra_channels.insert("kg50".into(), crate::loadcell::GenericCalibrationChannel {
-            linear: crate::loadcell::ChannelLinear { m: Some(2.0), b: Some(1.0) },
-            zero_raw: Some(3.0),
-            ..Default::default()
-        });
+        cfg.extra_channels.insert(
+            "kg50".into(),
+            crate::loadcell::GenericCalibrationChannel {
+                linear: crate::loadcell::ChannelLinear {
+                    m: Some(2.0),
+                    b: Some(1.0),
+                },
+                zero_raw: Some(3.0),
+                ..Default::default()
+            },
+        );
         let packet = kg50_calibration_packet(&cfg).unwrap();
-        assert_eq!(packet.data_type(), crate::telemetry_schema::data_type("DAQ_KG50_CALIBRATION"));
-        assert_eq!(packet.endpoints(), &[crate::telemetry_schema::endpoint("SD_CARD")]);
-        let decoded: Vec<f32> = packet.payload().chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        assert_eq!(
+            packet.data_type(),
+            crate::telemetry_schema::data_type("DAQ_KG50_CALIBRATION")
+        );
+        assert_eq!(
+            packet.endpoints(),
+            &[crate::telemetry_schema::endpoint("SD_CARD")]
+        );
+        let decoded: Vec<f32> = packet
+            .payload()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
         assert_eq!(decoded, vec![1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 7.0]);
         assert_eq!(calibration_packet(&cfg).unwrap().payload().len(), 16);
     }

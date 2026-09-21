@@ -340,7 +340,15 @@ async fn run_update_inner(
             .open_p2p_stream_to_hostname(board.sender_id(), OTA_STREAM_PORT, source_port)
             .map_err(|err| format!("failed to open OTA stream to {}: {err}", board.sender_id()))?;
         active_stream = Some(stream_id);
-        wait_for_connected(&mut event_rx, stream_id, board.sender_id()).await?;
+        wait_for_connected(&mut event_rx, stream_id, board.sender_id())
+            .await
+            .map_err(|error| {
+                if board == Board::FlightComputer {
+                    format!("{error}. FC must first receive the OTA-capable combined factory image over ST-Link; older firmware has no OTA receiver.")
+                } else {
+                    error
+                }
+            })?;
         check_cancel(cancel)?;
 
         MANAGER.update(
@@ -614,8 +622,8 @@ pub fn validate_firmware_filename(filename: &str) -> Result<String, String> {
 /// Returns whether the checked-in firmware for a board implements the live OTA stream service.
 pub fn supports_live_ota(board: Board) -> bool {
     // Audited against the sibling 2026 firmware repositories. These applications expose
-    // `Core/Src/ota_stream.c` on stream port 4510. The flight computer is intentionally kept
-    // unavailable until its application wires in the same receiver.
+    // `Core/Src/ota_stream.c` on stream port 4510. FC requires the initial wired
+    // migration to its 8-KiB bootloader / 16-KiB delta-staging layout.
     matches!(
         board,
         Board::RFBoard
@@ -624,6 +632,7 @@ pub fn supports_live_ota(board: Board) -> bool {
             | Board::GatewayBoard
             | Board::ActuatorBoard
             | Board::DaqBoard
+            | Board::FlightComputer
     )
 }
 
@@ -780,11 +789,11 @@ mod tests {
             Board::GatewayBoard,
             Board::ActuatorBoard,
             Board::DaqBoard,
+            Board::FlightComputer,
         ] {
             assert!(supports_live_ota(board), "{}", board.as_str());
         }
         assert!(!supports_live_ota(Board::GroundStation));
-        assert!(!supports_live_ota(Board::FlightComputer));
     }
 
     #[test]

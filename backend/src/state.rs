@@ -154,6 +154,7 @@ pub struct AppState {
     /// Loadcell calibration data loaded from JSON and editable at runtime.
     pub loadcell_calibration: Arc<Mutex<LoadcellCalibrationFile>>,
     pub auto_zero: Arc<Mutex<crate::auto_zero::Runtime>>,
+    pub daq_log_session: Arc<Mutex<u64>>,
 
     /// Broadcast shutdown notifications to long-running background tasks.
     pub shutdown_tx: broadcast::Sender<()>,
@@ -378,6 +379,8 @@ impl AppState {
         }
 
         *current = next.clone();
+        drop(current);
+        self.publish_daq_launch_clock(&next);
         let _ = self.launch_clock_tx.send(next);
     }
 
@@ -385,7 +388,32 @@ impl AppState {
         self.clear_launch_sequence_command_pending();
         let next = LaunchClockMsg::idle();
         *self.launch_clock.lock().unwrap() = next.clone();
+        self.publish_daq_launch_clock(&next);
         let _ = self.launch_clock_tx.send(next);
+    }
+
+    pub fn begin_daq_launch_log(&self) {
+        // Rotate at command acceptance, without starting the UI clock before
+        // Valve confirms the sequence. Its ACK/pilot report corrects T0 later.
+        self.publish_daq_launch_clock(&launch_countdown_clock(
+            telemetry_task::get_current_timestamp_ms() as i64,
+        ));
+    }
+
+    fn publish_daq_launch_clock(&self, clock: &LaunchClockMsg) {
+        let mut session = self.daq_log_session.lock().unwrap();
+        if clock.kind == LaunchClockKind::Idle {
+            *session = 0;
+        } else if *session == 0 {
+            *session = crate::network_variables::next_daq_log_session(
+                clock.anchor_timestamp_ms.unwrap_or(1),
+            );
+        }
+        if let Some(router) = self.topology_router.get() {
+            if let Err(error) = crate::network_variables::set_daq_log_clock(router, *session, clock) {
+                self.add_notification(format!("DAQ launch log clock could not be published: {error}"));
+            }
+        }
     }
 
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
@@ -2435,6 +2463,7 @@ pub(crate) mod tests {
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
             auto_zero: Default::default(),
+            daq_log_session: Default::default(),
             shutdown_tx,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             pending_db_writes: Arc::new(AtomicUsize::new(0)),
