@@ -139,3 +139,12 @@ at least five seconds for its modification time to settle, then run
 point to its `index.mjs`; `CHROME_BINARY` can select an installed Chrome executable.
 The test uses fake microphones and synthetic fixture sessions. Never run this
 fixture as a production service. Stop the fixture after testing.
+
+
+To check the buffered player independently of a station, install Playwright and
+FFmpeg and run `node tests/program_browser.mjs`. `PLAYWRIGHT_MODULE` and
+`CHROME_BINARY` select an existing Playwright installation and Chrome binary.
+The test generates temporary H.264/fMP4 segments and intercepts fixture requests;
+it starts no MediaMTX instance or hardware tasks. It checks advancing playback,
+portrait layout, the always-visible status-bar diagram, camera loss, delay changes,
+and unified audience sound without microphone access or AudioWorklet support.

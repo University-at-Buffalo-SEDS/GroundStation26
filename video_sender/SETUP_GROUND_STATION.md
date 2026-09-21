@@ -167,6 +167,10 @@ gst-inspect-1.0 avdec_h264
 gst-inspect-1.0 h264parse
 ```
 
+New `.deb` packages declare these playback dependencies. Install them with
+`sudo apt install ./PACKAGE.deb` so apt resolves dependencies; copying a binary or
+using an older package still needs the manual codec installation above.
+
 Quit and relaunch the native app after installing codecs. If the UI runs on the
 Pi, run these commands on the Pi; installing FFmpeg on a Mac does not install the
 Pi's WebKit codecs. The app's server URL must point to the Ground Station's HTTP(S)
