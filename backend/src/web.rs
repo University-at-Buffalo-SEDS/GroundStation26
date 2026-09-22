@@ -203,7 +203,6 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/calibration/long_zero", get(long_zero_status).post(long_zero_start))
         .route("/api/calibration/long_zero/stop", post(long_zero_stop))
         .route("/api/calibration/long_zero/apply", post(long_zero_apply))
-        .route("/api/calibration/thermal", get(thermal_calibration_page))
         .route("/api/calibration/capture_thermal_zero", post(capture_thermal_zero))
         .route("/api/calibration/capture_zero", post(capture_loadcell_zero))
         .route("/api/calibration/capture_span", post(capture_loadcell_span))
@@ -2558,10 +2557,6 @@ pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
 
     // 2) Insert into DB asynchronously (tracked for graceful shutdown)
     spawn_alert_insert(state, timestamp, "error", msg_string);
-}
-
-async fn thermal_calibration_page() -> axum::response::Html<&'static str> {
-    axum::response::Html(include_str!("thermal_calibration.html"))
 }
 
 #[derive(Deserialize)]

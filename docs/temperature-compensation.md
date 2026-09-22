@@ -55,9 +55,10 @@ Hardware timing and thermal performance still require bench validation.
 - SD file headers include thermal coefficients; diagnostic temperature rows and
   network temperature packets permit replay. Test-fire CSV uses recorded
   temperature for KG1000 compensation and includes an ADC temperature column.
-- The backend also provides `/api/calibration/thermal` and the authenticated
-  `/api/calibration/capture_thermal_zero` endpoint. The normal dashboard has the
-  same capture action; saved temperatures are preserved through UI edits.
+- Thermal capture, long-zero analysis, and the live compensation breakdown
+  stay in the app Calibration tab. Capture uses the authenticated
+  `/api/calibration/capture_thermal_zero` endpoint; there is no standalone
+  thermal calibration page. Saved temperatures are preserved through UI edits.
 
 ## Research and limitations
 
