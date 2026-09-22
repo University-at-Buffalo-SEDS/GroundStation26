@@ -638,6 +638,18 @@
                   "kind": "time_average",
                   "window_ms": 500
                 }
+              },
+              {
+                "label": "ADC die temperature",
+                "data_type": "DAQ_ADC_TEMPERATURE",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 2,
+                  "suffix": " °C"
+                },
+                "show_min_max": false
               }
             ],
             "chart": {
@@ -712,6 +724,18 @@
                   "kind": "time_average",
                   "window_ms": 500
                 }
+              },
+              {
+                "label": "ADC die temperature",
+                "data_type": "DAQ_ADC_TEMPERATURE",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 2,
+                  "suffix": " °C"
+                },
+                "show_min_max": false
               }
             ],
             "chart": {
