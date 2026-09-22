@@ -643,6 +643,9 @@
       "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
       "element": {"kind": "Static", "data_type": "UInt8", "count": 16},
       "endpoints": ["SD_CARD"]
-    }
+    },
+    {"name": "DAQ_ADC_TEMPERATURE", "doc": "MCP3564R die temperature in Celsius; NaN means unavailable.", "reliable": false, "reliable_mode": "Unordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 1}, "endpoints": ["GROUND_STATION"]},
+    {"name": "DAQ_THERMAL_CALIBRATION", "doc": "Raw offset compensation [KG1000 reference C, raw/C, KG50 reference C, raw/C]. Subtract slope*(T-reference) before mass calibration.", "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["SD_CARD"]},
+    {"name": "DAQ_FILTER_CALIBRATION", "doc": "Load-cell low-pass time constants [KG1000 ms, KG50 ms]; 0 disables, maximum 2000 ms.", "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 2}, "endpoints": ["SD_CARD"]}
   ]
 }

@@ -31,12 +31,14 @@ pub async fn export_recording_csv(
             COALESCE(source_timestamp_ms, timestamp_ms) AS source_timestamp_ms,
             strftime('%Y-%m-%dT%H:%M:%f', timestamp_ms / 1000.0, 'unixepoch') AS rx_timestamp,
             data_type,
+            sender_id,
             values_json,
             payload_json
         FROM telemetry
         WHERE data_type IN (
             'KG1000',
             'KG50',
+            'DAQ_ADC_TEMPERATURE',
             'FUEL_TANK_PRESSURE',
             'IADC',
             'BATTERY_VOLTAGE',
@@ -56,7 +58,7 @@ pub async fn export_recording_csv(
     let mut writer = std::io::BufWriter::new(std::fs::File::create(csv_path)?);
     writeln!(
         writer,
-        "Rx_Timestamp,Header,Seq,Timestamp,1000kg Raw,Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg Raw,50kg Calibrated"
+        "Rx_Timestamp,Header,Seq,Timestamp,1000kg Raw,Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg Raw,50kg Calibrated,ADC Temperature C"
     )?;
     writeln!(
         writer,
@@ -71,12 +73,20 @@ pub async fn export_recording_csv(
         kg50[0], kg50[1], kg50[2], kg50[3], kg50[4], kg50[5], kg50[6])?;
     let mut state = ExportState::default();
     let mut seq: u16 = 0;
+    let filters = crate::loadcell_zero::Service::default();
+    let mut temperatures: Vec<crate::types::TelemetryRow> = Vec::new();
     for row in rows {
         let data_type: String = row.get("data_type");
         let values = parse_values_json(row.get::<Option<String>, _>("values_json").as_deref());
         let first_value = values.first().copied().flatten();
 
         match data_type.as_str() {
+            "DAQ_ADC_TEMPERATURE" => {
+                let sender: String = row.get("sender_id");
+                temperatures.retain(|r| r.sender_id != sender);
+                temperatures.push(crate::types::TelemetryRow { timestamp_ms: row.get("timestamp_ms"),
+                    data_type, sender_id: sender, values });
+            }
             "FUEL_TANK_PRESSURE" | "IADC" => {
                 state.pressure_raw = first_value;
             }
@@ -89,11 +99,14 @@ pub async fn export_recording_csv(
             "KG50" => {
                 let rx_timestamp: String = row.get("rx_timestamp");
                 let source_timestamp_ms: i64 = row.get("source_timestamp_ms");
-                let calibrated = first_value.and_then(|raw|
-                    crate::loadcell::calibrated_weight_kg(calibration, "KG50", raw));
-                writeln!(writer, "{},{},{},{},,,,,,,,,{},{}",
+                let temperature = crate::loadcell::recent_adc_temperature(temperatures.iter(),
+                    &row.get::<String, _>("sender_id"), row.get("timestamp_ms"));
+                let calibrated = first_value.and_then(|raw| crate::loadcell::temperature_corrected_raw(calibration, "KG50", raw, temperature))
+                    .map(|raw| filters.filter(calibration, &row.get::<String, _>("sender_id"), "KG50", row.get("timestamp_ms"), raw))
+                    .and_then(|raw| crate::loadcell::calibrated_weight_kg(calibration, "KG50", raw));
+                writeln!(writer, "{},{},{},{},,,,,,,,,{},{},{}",
                     rx_timestamp, TEST_FIRE_HEADER, seq % 256, source_timestamp_ms,
-                    display_opt(first_value), display_opt(calibrated))?;
+                    display_opt(first_value), display_opt(calibrated), display_opt(temperature))?;
                 seq = seq.wrapping_add(1);
             }
             "KG1000" => {
@@ -101,12 +114,15 @@ pub async fn export_recording_csv(
                 let source_timestamp_ms: i64 = row.get("source_timestamp_ms");
                 let payload_json: String = row.get("payload_json");
                 let raw_loadcell = first_value.unwrap_or_default();
-                let calibrated =
-                    calibrated_loadcell(calibration, raw_loadcell).unwrap_or(raw_loadcell);
+                let temperature = crate::loadcell::recent_adc_temperature(temperatures.iter(),
+                    &row.get::<String, _>("sender_id"), row.get("timestamp_ms"));
+                let calibrated = crate::loadcell::temperature_corrected_raw(calibration, "KG1000", raw_loadcell, temperature)
+                    .map(|raw| filters.filter(calibration, &row.get::<String, _>("sender_id"), "KG1000", row.get("timestamp_ms"), raw))
+                    .and_then(|raw| calibrated_loadcell(calibration, raw));
                 let crc = crc16_ccitt_false(&parse_payload_json(&payload_json));
                 writeln!(
                     writer,
-                    "{},{},{},{},{},{},{},{},{},{},{},{},,",
+                    "{},{},{},{},{},{},{},{},{},{},{},{},,,{}",
                     rx_timestamp,
                     TEST_FIRE_HEADER,
                     seq % 256,
@@ -115,10 +131,11 @@ pub async fn export_recording_csv(
                     display_opt(state.pressure_raw),
                     display_opt(state.battery_voltage),
                     crc,
-                    calibrated,
+                    display_opt(calibrated),
                     0.0_f32,
-                    calibrated,
+                    display_opt(calibrated),
                     display_opt(state.pressure_calibrated),
+                    display_opt(temperature),
                 )?;
                 seq = seq.wrapping_add(1);
             }
@@ -183,10 +200,10 @@ mod tests {
         let db_path = dir.join("recording.db");
         let csv_path = dir.join("recording.csv");
         let db = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db_path.display())).await.unwrap();
-        sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER, source_timestamp_ms INTEGER, data_type TEXT, values_json TEXT, payload_json TEXT)")
+        sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER, source_timestamp_ms INTEGER, data_type TEXT, values_json TEXT, payload_json TEXT, sender_id TEXT)")
             .execute(&db).await.unwrap();
         for (i, raw) in [2.0, 3.0].iter().enumerate() {
-            sqlx::query("INSERT INTO telemetry VALUES (?, ?, ?, 'KG50', ?, '[]')")
+            sqlx::query("INSERT INTO telemetry VALUES (?, ?, ?, 'KG50', ?, '[]', 'DAQ')")
                 .bind(i as i64).bind(10000_i64 + i as i64).bind(9000_i64 + i as i64)
                 .bind(format!("[{raw}]")).execute(&db).await.unwrap();
         }

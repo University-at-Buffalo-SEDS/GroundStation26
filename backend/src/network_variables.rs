@@ -119,6 +119,8 @@ pub fn initialize(router: &Router) -> Result<()> {
         DAQ_CALIBRATION_TYPE,
         DAQ_KG50_CALIBRATION_TYPE,
         "DAQ_LOG_CLOCK",
+        "DAQ_THERMAL_CALIBRATION",
+        "DAQ_FILTER_CALIBRATION",
     ] {
         router.enable_network_variable(
             crate::telemetry_schema::data_type(data_type),
@@ -176,6 +178,8 @@ pub fn initialize(router: &Router) -> Result<()> {
     router.seed_managed_variable(calibration_packet(&calibration)?)?;
     router.seed_managed_variable(kg50_calibration_packet(&calibration)?)?;
     router.seed_managed_variable(cached_daq_log_clock_packet()?)?;
+    router.seed_managed_variable(thermal_packet(&calibration)?)?;
+    router.seed_managed_variable(filter_packet(&calibration)?)?;
     Ok(())
 }
 
@@ -254,10 +258,28 @@ pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
     Ok(())
 }
 
+fn filter_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Packet> {
+    crate::loadcell::validate_thermal(cfg).map_err(anyhow::Error::msg)?;
+    let payload: Vec<u8> = ["KG1000", "KG50"].iter().flat_map(|sensor|
+        cfg.noise.get(*sensor).map(|n| n.tau_ms).unwrap_or(0.).to_le_bytes()).collect();
+    packet_bytes("DAQ_FILTER_CALIBRATION", "SD_CARD", Arc::from(payload))
+}
+
+fn thermal_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Packet> {
+    crate::loadcell::validate_thermal(cfg).map_err(anyhow::Error::msg)?;
+    let mut payload = Vec::with_capacity(16);
+    for sensor in ["KG1000", "KG50"] {
+        let t = cfg.thermal.get(sensor).cloned().unwrap_or_default();
+        payload.extend_from_slice(&t.reference_c.to_le_bytes());
+        payload.extend_from_slice(&t.raw_per_c.to_le_bytes());
+    }
+    packet_bytes("DAQ_THERMAL_CALIBRATION", "SD_CARD", Arc::from(payload))
+}
+
 fn calibration_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Packet> {
     let values = [
         cfg.ch1.m.unwrap_or(1.0),
-        cfg.ch1.b.unwrap_or(0.0),
+        cfg.ch1.b.unwrap_or(0.0) - cfg.ch1_zero_raw.map(|z| cfg.ch1.m.unwrap_or(1.0)*z + cfg.ch1.b.unwrap_or(0.0)).unwrap_or(0.0),
         cfg.iadc.m.unwrap_or(1.0),
         cfg.iadc.b.unwrap_or(0.0),
     ];
@@ -282,9 +304,13 @@ pub fn set_daq_calibration(
     router: &Router,
     cfg: &crate::loadcell::LoadcellCalibrationFile,
 ) -> Result<()> {
+    let thermal = thermal_packet(cfg)?;
+    let filter = filter_packet(cfg)?;
     let kg50 = kg50_calibration_packet(cfg)?;
     router.set_network_variable(calibration_packet(cfg)?)?;
     router.set_network_variable(kg50)?;
+    router.set_network_variable(thermal)?;
+    router.set_network_variable(filter)?;
     Ok(())
 }
 
@@ -815,5 +841,21 @@ mod tests {
             peer.process_all_queues().unwrap();
         }
         assert_eq!(*observed.lock().unwrap(), vec![1, 0, 1]);
+    }
+}
+
+#[cfg(test)]
+mod thermal_wire_tests {
+    use super::*;
+    #[test]
+    fn thermal_payload_is_fixed_order_and_defaults_disabled() {
+        crate::telemetry_schema::initialize().unwrap();
+        let mut cfg = crate::loadcell::LoadcellCalibrationFile::default();
+        crate::loadcell::capture_thermal_zero(&mut cfg, "KG1000", 10., 20.).unwrap();
+        crate::loadcell::capture_thermal_zero(&mut cfg, "KG1000", 12., 30.).unwrap();
+        let p = thermal_packet(&cfg).unwrap();
+        assert_eq!(p.data_type(), crate::telemetry_schema::data_type("DAQ_THERMAL_CALIBRATION"));
+        let values: Vec<f32> = p.payload().chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        assert_eq!(values, vec![20., 0.2, 0., 0.]);
     }
 }

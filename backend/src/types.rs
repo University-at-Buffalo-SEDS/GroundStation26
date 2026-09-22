@@ -275,6 +275,8 @@ pub struct NetworkTopologyMsg {
     pub nodes: Vec<NetworkTopologyNode>,
     #[serde(default)]
     pub links: Vec<NetworkTopologyLink>,
+    #[serde(default)]
+    pub traffic: Option<NetworkTrafficSnapshot>,
 }
 
 fn default_true() -> bool {
@@ -310,4 +312,22 @@ pub struct TelemetryRow {
     #[serde(default)]
     pub sender_id: String,
     pub values: Vec<Option<f32>>,
+}
+
+/// Ground Station router counters, sampled before WebSocket batching.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]
+pub struct NetworkTrafficSnapshot {
+    pub interval_ms: u64,
+    pub sides: Vec<NetworkTrafficSide>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]
+pub struct NetworkTrafficSide {
+    pub side_id: usize,
+    pub name: String,
+    pub ingress_enabled: bool,
+    pub egress_enabled: bool,
+    pub totals: NetworkTopologyStats,
+    /// Absent until two samples exist, or if the side/counters reset.
+    pub delta: Option<NetworkTopologyStats>,
 }

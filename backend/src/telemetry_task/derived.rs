@@ -589,9 +589,15 @@ pub(super) async fn emit_derived_loadcell_rows(
     let cfg = state.loadcell_calibration.lock().unwrap().clone();
     let fill_targets = state.fill_targets_snapshot();
     let fill_source = fill_targets.fill_source;
-    let Some(calibrated_value) =
-        loadcell::calibrated_sensor_value(&cfg, calibration_sensor_id, sample.raw_value)
+    let temperature = loadcell::recent_adc_temperature(
+        state.recent_telemetry_cache.lock().unwrap().iter(), sample.sender_id, sample.ts_ms);
+    state.loadcell_processing.observe(sample.sender_id, calibration_sensor_id, sample.ts_ms, sample.raw_value, temperature);
+    let Some(calibrated_value) = loadcell::temperature_corrected_raw(
+        &cfg, calibration_sensor_id, sample.raw_value, temperature)
+        .map(|raw| state.loadcell_processing.filter(&cfg, sample.sender_id, calibration_sensor_id, sample.ts_ms, raw))
+        .and_then(|raw| loadcell::calibrated_sensor_value(&cfg, calibration_sensor_id, raw))
     else {
+        let _ = state.loadcell_processing.filter(&cfg, sample.sender_id, calibration_sensor_id, sample.ts_ms, f32::NAN);
         match calibration_sensor_id {
             sensor if sensor == fill_source.sensor() => {
                 let mut latest = state.latest_fill_mass_kg.lock().unwrap();

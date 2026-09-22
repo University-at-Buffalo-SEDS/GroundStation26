@@ -112,6 +112,13 @@ pub struct GenericCalibrationChannel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadcellCalibrationFile {
+    #[serde(default)]
+    pub noise: BTreeMap<String, NoiseCalibration>,
+    /// Captured ADC temperature and original raw value, retained with each cal point.
+    #[serde(default)]
+    pub temperature_captures: BTreeMap<String, Vec<TemperatureCapture>>,
+    #[serde(default)]
+    pub thermal: BTreeMap<String, ThermalCalibration>,
     #[serde(default = "default_calibration_version")]
     pub version: u32,
     #[serde(default)]
@@ -141,6 +148,9 @@ pub struct LoadcellCalibrationFile {
 impl Default for LoadcellCalibrationFile {
     fn default() -> Self {
         Self {
+            noise: BTreeMap::new(),
+            temperature_captures: BTreeMap::new(),
+            thermal: BTreeMap::new(),
             version: default_calibration_version(),
             full_mass_kg: Some(DEFAULT_FULL_MASS_KG),
             ch1: ChannelLinear {
@@ -1336,4 +1346,149 @@ mod tests {
         assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 2.0), Some(-5.0));
         assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 4.0), Some(7.0));
     }
+}
+
+/// ADC die temperature is a proxy. Fit only unloaded, thermally settled samples.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ThermalCalibration {
+    pub reference_c: f32,
+    pub raw_per_c: f32,
+    #[serde(default)]
+    pub points: Vec<[f32; 2]>, // [temperature C, unloaded raw]
+}
+
+fn thermal_key(sensor: &str) -> &str {
+    match sensor { "ch1" | "KG1000" => "KG1000", "kg50" => "KG50", _ => sensor }
+}
+
+pub fn temperature_corrected_raw(cfg: &LoadcellCalibrationFile, sensor: &str,
+                                 raw: f32, temperature: Option<f32>) -> Option<f32> {
+    if !raw.is_finite() { return None; }
+    let Some(t) = cfg.thermal.get(thermal_key(sensor)) else { return Some(raw); };
+    if t.raw_per_c == 0.0 { return Some(raw); }
+    let temperature = temperature.filter(|t| t.is_finite() && (-40.0..=125.0).contains(t))?;
+    let value = raw - t.raw_per_c * (temperature - t.reference_c);
+    value.is_finite().then_some(value)
+}
+
+pub fn validate_thermal(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
+    for (sensor, n) in &cfg.noise {
+        if !matches!(sensor.as_str(), "KG1000" | "KG50") || !n.tau_ms.is_finite() || !(0.0..=2000.0).contains(&n.tau_ms)
+            || !n.sigma_raw.is_finite() || n.sigma_raw < 0. || !n.residual_sigma_raw.is_finite() || n.residual_sigma_raw < 0. {
+            return Err("Invalid load-cell noise/filter calibration".into());
+        }
+    }
+    for (sensor, t) in &cfg.thermal {
+        if !matches!(sensor.as_str(), "KG1000" | "KG50") || !t.reference_c.is_finite()
+            || !(-40.0..=125.0).contains(&t.reference_c) || !t.raw_per_c.is_finite()
+            || t.points.len() > 64 || t.points.iter().any(|p| !p[0].is_finite()
+                || !(-40.0..=125.0).contains(&p[0]) || !p[1].is_finite()) {
+            return Err("Invalid load-cell thermal calibration".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn capture_thermal_zero(cfg: &mut LoadcellCalibrationFile, sensor: &str,
+                            raw: f32, temperature: f32) -> Result<(), String> {
+    let sensor = thermal_key(sensor);
+    if !matches!(sensor, "KG1000" | "KG50") || !raw.is_finite()
+        || !temperature.is_finite() || !(-40.0..=125.0).contains(&temperature) {
+        return Err("Invalid thermal zero sample".into());
+    }
+    let mut t = cfg.thermal.get(sensor).cloned().unwrap_or_default();
+    if t.points.len() >= 64 { return Err("At most 64 thermal points are supported".into()); }
+    t.points.push([temperature, raw]);
+    if t.points.len() == 1 {
+        t.reference_c = temperature;
+        t.raw_per_c = 0.0;
+    } else {
+        let lo = t.points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
+        let hi = t.points.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
+        if hi - lo < 5.0 { return Err("Use stabilized temperatures at least 5 C apart".into()); }
+        let n = t.points.len() as f64;
+        let mt = t.points.iter().map(|p| p[0] as f64).sum::<f64>() / n;
+        let mr = t.points.iter().map(|p| p[1] as f64).sum::<f64>() / n;
+        let numerator = t.points.iter().map(|p| (p[0] as f64-mt)*(p[1] as f64-mr)).sum::<f64>();
+        let denominator = t.points.iter().map(|p| (p[0] as f64-mt).powi(2)).sum::<f64>();
+        t.raw_per_c = (numerator / denominator) as f32;
+        if !t.raw_per_c.is_finite() { return Err("Thermal fit overflow".into()); }
+    }
+    cfg.thermal.insert(sensor.into(), t);
+    Ok(())
+}
+
+pub fn recent_adc_temperature<'a>(rows: impl DoubleEndedIterator<Item = &'a crate::types::TelemetryRow>, sender: &str, now_ms: i64) -> Option<f32> {
+    rows.rev().find(|row| row.data_type == "DAQ_ADC_TEMPERATURE"
+        && row.sender_id == sender && row.timestamp_ms <= now_ms
+        && now_ms.saturating_sub(row.timestamp_ms) <= 2000)
+        .and_then(|row| row.values.first().copied().flatten())
+        .filter(|v| v.is_finite() && (-40.0..=125.0).contains(v))
+}
+
+#[cfg(test)]
+mod thermal_tests {
+    use super::*;
+    #[test]
+    fn fit_corrects_both_directions_and_requires_temperature() {
+        let mut cfg = LoadcellCalibrationFile::default();
+        assert_eq!(temperature_corrected_raw(&cfg, "KG1000", 12.0, None), Some(12.0));
+        capture_thermal_zero(&mut cfg, "KG1000", 10.0, 20.0).unwrap();
+        assert!(capture_thermal_zero(&mut cfg, "KG1000", 11.0, 21.0).is_err());
+        capture_thermal_zero(&mut cfg, "KG1000", 12.0, 30.0).unwrap();
+        assert_eq!(temperature_corrected_raw(&cfg, "ch1", 12.0, Some(30.0)), Some(10.0));
+        assert_eq!(temperature_corrected_raw(&cfg, "KG1000", 8.0, Some(10.0)), Some(10.0));
+        assert_eq!(temperature_corrected_raw(&cfg, "KG1000", 12.0, None), None);
+        assert_eq!(temperature_corrected_raw(&cfg, "KG50", 12.0, None), Some(12.0));
+        assert!(capture_thermal_zero(&mut cfg, "KG50", f32::NAN, 20.0).is_err());
+        let restored: LoadcellCalibrationFile = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(restored.thermal["KG1000"].raw_per_c, 0.2);
+    }
+    #[test]
+    fn freshness_and_sender_are_required() {
+        let rows = vec![crate::types::TelemetryRow { timestamp_ms: 1000,
+            data_type: "DAQ_ADC_TEMPERATURE".into(), sender_id: "SD_CARD".into(), values: vec![Some(25.0)] }];
+        assert_eq!(recent_adc_temperature(rows.iter(), "SD_CARD", 2000), Some(25.0));
+        assert_eq!(recent_adc_temperature(rows.iter(), "OTHER", 2000), None);
+        assert_eq!(recent_adc_temperature(rows.iter(), "SD_CARD", 3001), None);
+        assert_eq!(recent_adc_temperature(rows.iter(), "SD_CARD", 999), None);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemperatureCapture {
+    pub expected: f32,
+    pub raw: f32,
+    pub temperature_c: Option<f32>,
+}
+
+pub fn record_capture_temperature(cfg: &mut LoadcellCalibrationFile, sensor: &str,
+                                  expected: f32, raw: f32, temperature_c: Option<f32>) {
+    let points = cfg.temperature_captures.entry(thermal_key(sensor).into()).or_default();
+    points.retain(|p| (p.expected - expected).abs() >= 1e-6);
+    points.push(TemperatureCapture { expected, raw, temperature_c });
+}
+
+#[cfg(test)]
+mod temperature_capture_tests {
+    use super::*;
+    #[test]
+    fn calibration_keeps_temperature_and_legacy_json_loads() {
+        let mut cfg = LoadcellCalibrationFile::default();
+        record_capture_temperature(&mut cfg, "ch1", 0., 0.01, Some(24.));
+        record_capture_temperature(&mut cfg, "ch1", 10., 0.04, Some(25.));
+        let saved: LoadcellCalibrationFile = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(saved.temperature_captures["KG1000"][0].temperature_c, Some(24.));
+        assert_eq!(saved.temperature_captures["KG1000"][1].raw, 0.04);
+        let old: LoadcellCalibrationFile = serde_json::from_str("{}").unwrap();
+        assert!(old.thermal.is_empty() && old.temperature_captures.is_empty());
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NoiseCalibration {
+    pub sigma_raw: f32,
+    pub residual_sigma_raw: f32,
+    pub tau_ms: f32,
+    pub session_id: String,
 }
