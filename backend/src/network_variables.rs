@@ -851,11 +851,12 @@ mod thermal_wire_tests {
     fn thermal_payload_is_fixed_order_and_defaults_disabled() {
         crate::telemetry_schema::initialize().unwrap();
         let mut cfg = crate::loadcell::LoadcellCalibrationFile::default();
-        crate::loadcell::capture_thermal_zero(&mut cfg, "KG1000", 10., 20.).unwrap();
-        crate::loadcell::capture_thermal_zero(&mut cfg, "KG1000", 12., 30.).unwrap();
+        for i in 0..6 {
+            crate::loadcell::capture_thermal_zero(&mut cfg, "KG1000", 10. + i as f32 * 0.5, 20. + i as f32 * 2.).unwrap();
+        }
         let p = thermal_packet(&cfg).unwrap();
         assert_eq!(p.data_type(), crate::telemetry_schema::data_type("DAQ_THERMAL_CALIBRATION"));
         let values: Vec<f32> = p.payload().chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        assert_eq!(values, vec![20., 0.2, 0., 0.]);
+        assert_eq!(values, vec![20., 0.25, 0., 0.]);
     }
 }

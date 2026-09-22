@@ -15,8 +15,9 @@ mass. A zero coefficient keeps legacy behavior.
 
 1. Update DAQ, GroundStation backend, and frontend together. Open Calibration.
 2. Unload the cell and let the board and cell reach a stable temperature.
-3. Click **Capture unloaded thermal point**. Repeat at another stabilized
-   temperature at least 5 C away. Additional points use a least-squares line.
+3. Click **Capture settled point**. Collect at least six settled points spanning
+   0.25 C or more, including intermediate temperatures. A consistent least-squares
+   slope qualifies the fit; repeat during cooling.
    Do not use loaded points to estimate zero drift.
 4. Recapture ordinary zero and known-mass points, fit, and Save. Live captures
    require fresh ADC temperature and DAQ readings; the saved
@@ -107,8 +108,8 @@ A monotonic warm-up can confound temperature with creep/time drift: capture
 heating AND cooling where possible and inspect the recorded residuals.
 
 At least 1000 accepted samples spanning 60 seconds are required to apply a
-result; drift fitting also requires 5 C of temperature coverage. Without that
-coverage, uncheck **Apply fitted temperature drift** to apply zero and noise
+result; drift fitting also requires six settled periods, at least 0.25 C coverage,
+and the fit-quality checks below. Without a qualified fit, uncheck **Apply fitted temperature drift** to apply zero and noise
 filtering only. Applying establishes the observed unloaded baseline as zero,
 saves the analysis-derived noise profile, and sends filter settings to DAQ.
 Verify an unloaded zero and known mass afterwards; recapture mass points if
@@ -158,8 +159,40 @@ measured ranges to the in-app status card. The capture POST independently checks
 the same criteria before saving the averaged point.
 
 Long captures retain all valid raw samples in CSV for noise analysis. Thermal
-fitting uses non-overlapping settled periods only, with at least two settled
-points spanning 5 °C; broad temperature coverage during continuous warm-up no
+fitting uses non-overlapping settled periods only, with at least six settled
+points and a qualified small-span fit; broad coverage during continuous warm-up no
 longer qualifies on its own. The report stores settled points and the settling
 message. Noise-only application remains available after 1000 samples and 60 s.
 Rebuild both the backend and frontend for the matching status and controls.
+
+
+## Small temperature spans and provisional geometry
+
+Long captures and manual settled points now share a fit-quality check instead of
+requiring 5 °C coverage. At least six settled periods spanning 0.25 °C are needed,
+including a point in the middle half of the range. The fitted slope must be
+nonzero and its approximate repeatability margin must be <=50% of its magnitude.
+The margin is 2.776 * sqrt(residual_sum_squares / (n-2) / temperature_sum_squares).
+These are engineering acceptance heuristics, not proof of thermal causality or a
+certified confidence interval: correlated drift and systematic effects are not
+included. Long captures still use nonoverlapping two-minute settled windows.
+A warning highlights strong temperature/time correlation. Repeat warming and
+cooling unloaded in the actual mounting; verify a known mass and use the fit near
+its measured range. A tared motor is not an unloaded cell. Raw CSV is unchanged.
+Manual points accumulate even when inconclusive and preserve the last correction
+and reference until a fit qualifies. Long-capture application remains explicit.
+Old reports are not reanalyzed automatically; start a new capture for this policy.
+
+The in-app geometry preview estimates a uniform steel cylinder's response to an
+ambient step: area = 2*pi*r*(r+height), tau = mass*heat_capacity/(h*area), and
+T(t) = ambient + (initial-ambient)*exp(-t/tau). The 74 mm diameter and 34 mm height
+use the DYLF-102 100–1000 kg envelope dimensions from the manufacturer:
+https://www.dysensor.com/Product/24.html . A solid envelope at nominal steel density
+7850 kg/m³ gives approximately 1.15 kg. Heat capacity 470 J/(kg K) and h=10 W/(m² K)
+are editable illustrative assumptions, not measured specifications of this cell.
+See NIST steel-property discussion: https://tsapps.nist.gov/publication/get_pdf.cfm?pub_id=101567 .
+The preview does not modify recorded temperatures, correction coefficients,
+settling eligibility, or DAQ settings. It omits mount conduction, radiation,
+cutouts, gradients and varying airflow. Use measured body temperature to validate
+it; the ADC die is not the model's ambient input. Preview settings are local to
+the mounted UI component, not saved calibration.

@@ -1399,19 +1399,14 @@ pub fn capture_thermal_zero(cfg: &mut LoadcellCalibrationFile, sensor: &str,
     let mut t = cfg.thermal.get(sensor).cloned().unwrap_or_default();
     if t.points.len() >= 64 { return Err("At most 64 thermal points are supported".into()); }
     t.points.push([temperature, raw]);
-    if t.points.len() == 1 {
+    // Keep the saved correction/reference while accumulating an inconclusive fit.
+    if !cfg.thermal.contains_key(sensor) {
         t.reference_c = temperature;
-        t.raw_per_c = 0.0;
-    } else {
-        let lo = t.points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
-        let hi = t.points.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
-        if hi - lo < 5.0 { return Err("Use stabilized temperatures at least 5 C apart".into()); }
-        let n = t.points.len() as f64;
-        let mt = t.points.iter().map(|p| p[0] as f64).sum::<f64>() / n;
-        let mr = t.points.iter().map(|p| p[1] as f64).sum::<f64>() / n;
-        let numerator = t.points.iter().map(|p| (p[0] as f64-mt)*(p[1] as f64-mr)).sum::<f64>();
-        let denominator = t.points.iter().map(|p| (p[0] as f64-mt).powi(2)).sum::<f64>();
-        t.raw_per_c = (numerator / denominator) as f32;
+    }
+    let points: Vec<_> = t.points.iter().map(|p| [p[0] as f64, p[1] as f64]).collect();
+    let quality = crate::thermal_fit::assess(&points);
+    if quality.ready {
+        t.raw_per_c = quality.slope as f32;
         if !t.raw_per_c.is_finite() { return Err("Thermal fit overflow".into()); }
     }
     cfg.thermal.insert(sensor.into(), t);
@@ -1430,19 +1425,36 @@ pub fn recent_adc_temperature<'a>(rows: impl DoubleEndedIterator<Item = &'a crat
 mod thermal_tests {
     use super::*;
     #[test]
+    fn inconclusive_points_preserve_existing_correction_and_small_span_can_fit() {
+        let mut cfg = LoadcellCalibrationFile::default();
+        cfg.thermal.insert("KG1000".into(), ThermalCalibration {
+            reference_c: 20., raw_per_c: 0.02, points: vec![],
+        });
+        for i in 0..5 {
+            capture_thermal_zero(&mut cfg, "KG1000", 0.2 + i as f32 * 0.001, 30. + i as f32 * 0.1).unwrap();
+            assert_eq!(cfg.thermal["KG1000"].reference_c, 20.);
+            assert_eq!(cfg.thermal["KG1000"].raw_per_c, 0.02);
+        }
+        capture_thermal_zero(&mut cfg, "KG1000", 0.205, 30.5).unwrap();
+        assert_eq!(cfg.thermal["KG1000"].points.len(), 6);
+        assert!((cfg.thermal["KG1000"].raw_per_c - 0.01).abs() < 1e-6);
+        assert_eq!(cfg.thermal["KG1000"].reference_c, 20.);
+    }
+    #[test]
     fn fit_corrects_both_directions_and_requires_temperature() {
         let mut cfg = LoadcellCalibrationFile::default();
         assert_eq!(temperature_corrected_raw(&cfg, "KG1000", 12.0, None), Some(12.0));
         capture_thermal_zero(&mut cfg, "KG1000", 10.0, 20.0).unwrap();
-        assert!(capture_thermal_zero(&mut cfg, "KG1000", 11.0, 21.0).is_err());
-        capture_thermal_zero(&mut cfg, "KG1000", 12.0, 30.0).unwrap();
+        for i in 1..=5 {
+            capture_thermal_zero(&mut cfg, "KG1000", 10.0 + i as f32 * 0.4, 20.0 + i as f32 * 2.).unwrap();
+        }
         assert_eq!(temperature_corrected_raw(&cfg, "ch1", 12.0, Some(30.0)), Some(10.0));
         assert_eq!(temperature_corrected_raw(&cfg, "KG1000", 8.0, Some(10.0)), Some(10.0));
         assert_eq!(temperature_corrected_raw(&cfg, "KG1000", 12.0, None), None);
         assert_eq!(temperature_corrected_raw(&cfg, "KG50", 12.0, None), Some(12.0));
         assert!(capture_thermal_zero(&mut cfg, "KG50", f32::NAN, 20.0).is_err());
         let restored: LoadcellCalibrationFile = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(restored.thermal["KG1000"].raw_per_c, 0.2);
+        assert!((restored.thermal["KG1000"].raw_per_c - 0.2).abs() < 1e-6);
     }
     #[test]
     fn freshness_and_sender_are_required() {

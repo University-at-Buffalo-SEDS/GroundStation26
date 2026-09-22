@@ -27,6 +27,7 @@ mod layout;
 mod loadcell;
 mod loadcell_zero;
 mod thermal_settling;
+mod thermal_fit;
 mod network_traffic;
 mod logger;
 mod map;

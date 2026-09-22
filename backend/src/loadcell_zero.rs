@@ -114,7 +114,8 @@ impl Moments {
                 0.
             },
             noise_ready: self.n >= 1000 && duration >= 60.,
-            thermal_ready: self.n >= 1000 && duration >= 60. && self.max_t - self.min_t >= 5.,
+            thermal_ready: false,
+            thermal_quality: Default::default(),
             settled_points: vec![],
             settling_message: String::new(),
         }
@@ -136,10 +137,11 @@ pub struct Report {
     pub noise_ready: bool,
     pub thermal_ready: bool,
     #[serde(default)]
+    pub thermal_quality: crate::thermal_fit::Quality,
+    #[serde(default)]
     pub settled_points: Vec<[f64; 2]>,
     #[serde(default)]
     pub settling_message: String,
-
 }
 #[derive(Default)]
 struct SettledFit {
@@ -151,37 +153,59 @@ struct SettledFit {
 }
 impl SettledFit {
     fn add(&mut self, sample: Sample, sensor: &str, cfg: &LoadcellCalibrationFile) {
-        let kg = if sensor == "KG50" && !cfg.extra_channels.contains_key("kg50") { None }
-            else { crate::loadcell::calibrated_weight_kg(cfg, sensor, sample.raw as f32).map(|v|v as f64) };
-        self.window.add(sample.timestamp_ms, sample.raw, sample.temperature, kg);
-        let bucket=sample.timestamp_ms/10_000;
-        if self.last_bucket == Some(bucket) { return; }
-        self.last_bucket=Some(bucket);
-        let settled=self.window.assess(sample.timestamp_ms, sensor);
-        self.message=settled.message;
-        if settled.ready && self.last_point_ms.is_none_or(|t| sample.timestamp_ms-t>=120_000) {
-            self.points.push([settled.temperature_c.unwrap(),settled.raw.unwrap()]);
-            self.last_point_ms=Some(sample.timestamp_ms);
+        let kg = if sensor == "KG50" && !cfg.extra_channels.contains_key("kg50") {
+            None
+        } else {
+            crate::loadcell::calibrated_weight_kg(cfg, sensor, sample.raw as f32).map(|v| v as f64)
+        };
+        self.window
+            .add(sample.timestamp_ms, sample.raw, sample.temperature, kg);
+        let bucket = sample.timestamp_ms / 10_000;
+        if self.last_bucket == Some(bucket) {
+            return;
+        }
+        self.last_bucket = Some(bucket);
+        let settled = self.window.assess(sample.timestamp_ms, sensor);
+        self.message = settled.message;
+        if settled.ready
+            && self
+                .last_point_ms
+                .is_none_or(|t| sample.timestamp_ms - t >= 120_000)
+        {
+            self.points
+                .push([settled.temperature_c.unwrap(), settled.raw.unwrap()]);
+            self.last_point_ms = Some(sample.timestamp_ms);
         }
     }
     fn report(&self, moments: &Moments) -> Report {
-        let mut r=moments.report();
-        r.settled_points=self.points.clone();
-        r.settling_message=self.message.clone();
-        let lo=self.points.iter().map(|p|p[0]).fold(f64::INFINITY,f64::min);
-        let hi=self.points.iter().map(|p|p[0]).fold(f64::NEG_INFINITY,f64::max);
-        r.thermal_ready=r.noise_ready && self.points.len()>=2 && hi-lo>=5.;
-        r.raw_per_c=0.;
-        if !r.thermal_ready { return r; }
-        let n=self.points.len() as f64;
-        let t=self.points.iter().map(|p|p[0]).sum::<f64>()/n;
-        let raw=self.points.iter().map(|p|p[1]).sum::<f64>()/n;
-        let slope=self.points.iter().map(|p|(p[0]-t)*(p[1]-raw)).sum::<f64>()
-            /self.points.iter().map(|p|(p[0]-t).powi(2)).sum::<f64>();
-        r.reference_c=t;r.zero_raw=raw;r.raw_per_c=slope;
-        r.residual_sigma_raw=((moments.cov[1][1]-2.*slope*moments.cov[0][1]+slope*slope*moments.cov[0][0]).max(0.)/moments.n.saturating_sub(2).max(1) as f64).sqrt();
-        r.adjacent_noise_sigma_raw=((moments.diff_yy-2.*slope*moments.diff_xy+slope*slope*moments.diff_xx).max(0.)/(2.*moments.differences.max(1) as f64)).sqrt();
-        r.residual_raw_per_hour=if moments.cov[2][2]>0. {3600.*(moments.cov[2][1]-slope*moments.cov[2][0])/moments.cov[2][2]} else {0.};
+        let mut r = moments.report();
+        r.settled_points = self.points.clone();
+        r.settling_message = self.message.clone();
+        r.thermal_quality = crate::thermal_fit::assess(&self.points);
+        r.thermal_ready = r.noise_ready && r.thermal_quality.ready;
+        r.raw_per_c = 0.;
+        if !r.thermal_ready {
+            return r;
+        }
+        let slope = r.thermal_quality.slope;
+        r.reference_c = r.thermal_quality.reference_c;
+        r.zero_raw = r.thermal_quality.zero_raw;
+        r.raw_per_c = slope;
+        r.residual_sigma_raw = ((moments.cov[1][1] - 2. * slope * moments.cov[0][1]
+            + slope * slope * moments.cov[0][0])
+            .max(0.)
+            / moments.n.saturating_sub(2).max(1) as f64)
+            .sqrt();
+        r.adjacent_noise_sigma_raw = ((moments.diff_yy - 2. * slope * moments.diff_xy
+            + slope * slope * moments.diff_xx)
+            .max(0.)
+            / (2. * moments.differences.max(1) as f64))
+            .sqrt();
+        r.residual_raw_per_hour = if moments.cov[2][2] > 0. {
+            3600. * (moments.cov[2][1] - slope * moments.cov[2][0]) / moments.cov[2][2]
+        } else {
+            0.
+        };
         r
     }
 }
@@ -226,9 +250,20 @@ impl Service {
     }
     #[cfg(test)]
     pub fn start(&self, sensor: &str, duration_s: u64, known_zero: bool) -> Result<Status, String> {
-        self.start_calibrated(sensor,duration_s,known_zero,LoadcellCalibrationFile::default())
+        self.start_calibrated(
+            sensor,
+            duration_s,
+            known_zero,
+            LoadcellCalibrationFile::default(),
+        )
     }
-    pub fn start_calibrated(&self, sensor: &str, duration_s: u64, known_zero: bool, cfg: LoadcellCalibrationFile) -> Result<Status, String> {
+    pub fn start_calibrated(
+        &self,
+        sensor: &str,
+        duration_s: u64,
+        known_zero: bool,
+        cfg: LoadcellCalibrationFile,
+    ) -> Result<Status, String> {
         if !known_zero
             || !matches!(sensor, "KG1000" | "KG50")
             || !(60..=86400).contains(&duration_s)
@@ -244,9 +279,15 @@ impl Service {
     }
     #[cfg(test)]
     fn start_in_dir(&self, sensor: &str, duration_s: u64, dir: PathBuf) -> Result<Status, String> {
-        self.start_in_dir_calibrated(sensor,duration_s,dir,LoadcellCalibrationFile::default())
+        self.start_in_dir_calibrated(sensor, duration_s, dir, LoadcellCalibrationFile::default())
     }
-    fn start_in_dir_calibrated(&self, sensor: &str, duration_s: u64, dir: PathBuf, cfg: LoadcellCalibrationFile) -> Result<Status, String> {
+    fn start_in_dir_calibrated(
+        &self,
+        sensor: &str,
+        duration_s: u64,
+        dir: PathBuf,
+        cfg: LoadcellCalibrationFile,
+    ) -> Result<Status, String> {
         let mut slot = self.session.lock().unwrap();
         if slot
             .as_ref()
@@ -415,7 +456,7 @@ impl Service {
         let r = &s.report;
         if thermal {
             if !r.thermal_ready {
-                return Err("Thermal fitting needs at least two settled periods spanning 5 C; hold both load and ADC temperature stable for two minutes at each temperature".into());
+                return Err(r.thermal_quality.message.clone());
             }
             // Preserve the existing reference so ordinary mass-fit coordinates do not shift.
             let reference = cfg
@@ -541,7 +582,7 @@ mod tests {
             }));
         }
         let r = m.report();
-        assert!(r.thermal_ready && r.noise_ready);
+        assert!(r.noise_ready && !r.thermal_ready);
         assert!((r.raw_per_c - 0.002).abs() < 1e-6);
         assert!((r.residual_sigma_raw - 0.001).abs() < 1e-5);
         assert!(r.adjacent_noise_sigma_raw > 0.001 && r.adjacent_noise_sigma_raw < 0.0015);
@@ -567,20 +608,29 @@ mod tests {
     }
     #[test]
     fn long_fit_uses_settled_plateaus_and_excludes_temperature_transition() {
-        let mut cfg=LoadcellCalibrationFile::default();
-        cfg.ch1.m=Some(1.);cfg.ch1.b=Some(0.);
-        let mut fit=SettledFit::default();let mut moments=Moments::default();
-        for i in 0..=4200 {
-            let temperature=if i<1800 {20.} else {30.};
+        let mut cfg = LoadcellCalibrationFile::default();
+        cfg.ch1.m = Some(1.);
+        cfg.ch1.b = Some(0.);
+        let mut fit = SettledFit::default();
+        let mut moments = Moments::default();
+        for i in 0..=18000 {
+            let temperature = 20. + (i / 1800) as f64 * 0.1;
             // Large lag error during the first minute at the new ADC temperature.
-            let raw=0.2+0.002*(temperature-20.)+if (1800..2400).contains(&i) {0.5} else {0.};
-            let sample=Sample { timestamp_ms:i*100,temperature,raw };
-            moments.add(sample);fit.add(sample,"KG1000",&cfg);
+            let raw = 0.2
+                + 0.002 * (temperature - 20.)
+                + if (1800..2400).contains(&i) { 0.5 } else { 0. };
+            let sample = Sample {
+                timestamp_ms: i * 100,
+                temperature,
+                raw,
+            };
+            moments.add(sample);
+            fit.add(sample, "KG1000", &cfg);
         }
-        let report=fit.report(&moments);
+        let report = fit.report(&moments);
         assert!(report.thermal_ready);
-        assert!((report.raw_per_c-0.002).abs()<1e-8);
-        assert!(report.settled_points.iter().all(|p|p[1]<0.3));
+        assert!((report.raw_per_c - 0.002).abs() < 1e-8);
+        assert!(report.settled_points.iter().all(|p| p[1] < 0.3));
     }
     #[test]
     fn smoothing_preserves_dc_steps_and_resets_on_gaps() {
@@ -654,8 +704,14 @@ mod lifecycle_tests {
         assert!(service.apply("wrong-id", &mut cfg, true, 100.).is_err());
         // Continuous warming is still recorded, but cannot supply a settled fit.
         assert!(!done.report.thermal_ready);
-        assert!(service.apply(&status.session_id, &mut cfg, true, 100.).is_err());
-        service.apply(&status.session_id, &mut cfg, false, 100.).unwrap();
+        assert!(
+            service
+                .apply(&status.session_id, &mut cfg, true, 100.)
+                .is_err()
+        );
+        service
+            .apply(&status.session_id, &mut cfg, false, 100.)
+            .unwrap();
         assert_eq!(cfg.noise["KG1000"].tau_ms, 100.);
         assert!(cfg.ch1_zero_raw.is_some());
         assert_eq!(cfg.temperature_captures["KG1000"][0].expected, 0.);
