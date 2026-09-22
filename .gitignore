@@ -23,3 +23,6 @@ __pycache__/
 Groundstation_26.mobileprovision
 /artifacts/
 Cargo.lock
+
+# Long unloaded characterization recordings (retained locally, not source).
+/backend/calibration/zero_captures/

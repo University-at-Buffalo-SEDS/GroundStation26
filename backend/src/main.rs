@@ -25,6 +25,7 @@ mod gse;
 mod i18n;
 mod layout;
 mod loadcell;
+mod loadcell_zero;
 mod logger;
 mod map;
 mod media;
@@ -594,7 +595,8 @@ async fn main() -> anyhow::Result<()> {
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
         gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
-        loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
+        loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
+            loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
         auto_zero: Default::default(),
         daq_log_session: Default::default(),
         shutdown_tx,

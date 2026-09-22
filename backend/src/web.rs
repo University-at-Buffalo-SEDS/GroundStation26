@@ -200,6 +200,11 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
             "/api/calibration",
             get(get_loadcell_calibration).post(set_loadcell_calibration),
         )
+        .route("/api/calibration/long_zero", get(long_zero_status).post(long_zero_start))
+        .route("/api/calibration/long_zero/stop", post(long_zero_stop))
+        .route("/api/calibration/long_zero/apply", post(long_zero_apply))
+        .route("/api/calibration/thermal", get(thermal_calibration_page))
+        .route("/api/calibration/capture_thermal_zero", post(capture_thermal_zero))
         .route("/api/calibration/capture_zero", post(capture_loadcell_zero))
         .route("/api/calibration/capture_span", post(capture_loadcell_span))
         .route("/api/calibration/refit", post(refit_loadcell_channel))
@@ -668,6 +673,9 @@ async fn set_loadcell_calibration(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    if let Err(err) = loadcell::validate_thermal(&cfg) {
+        return (StatusCode::BAD_REQUEST, err).into_response();
+    }
     loadcell::normalize_calibration(&mut cfg);
     {
         let mut slot = state.loadcell_calibration.lock().unwrap();
@@ -698,7 +706,13 @@ async fn capture_loadcell_zero(
     }
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
-        loadcell::capture_zero(&mut cfg, &req.sensor_id, req.raw);
+        let temperature = loadcell::recent_adc_temperature(state.recent_telemetry_cache.lock().unwrap().iter(),
+            "DAQ", time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1_000_000);
+        let Some(raw) = loadcell::temperature_corrected_raw(&cfg, &req.sensor_id, req.raw, temperature) else {
+            return (StatusCode::BAD_REQUEST, "Fresh ADC temperature and finite raw input required").into_response();
+        };
+        loadcell::record_capture_temperature(&mut cfg, &req.sensor_id, 0.0, req.raw, temperature);
+        loadcell::capture_zero(&mut cfg, &req.sensor_id, raw);
         cfg.clone()
     };
     if let Err(err) = loadcell::save(&updated) {
@@ -726,7 +740,13 @@ async fn capture_loadcell_span(
     }
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
-        loadcell::capture_span(&mut cfg, &req.sensor_id, req.raw, req.known_kg);
+        let temperature = loadcell::recent_adc_temperature(state.recent_telemetry_cache.lock().unwrap().iter(),
+            "DAQ", time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1_000_000);
+        let Some(raw) = loadcell::temperature_corrected_raw(&cfg, &req.sensor_id, req.raw, temperature) else {
+            return (StatusCode::BAD_REQUEST, "Fresh ADC temperature and finite raw input required").into_response();
+        };
+        loadcell::record_capture_temperature(&mut cfg, &req.sensor_id, req.known_kg, req.raw, temperature);
+        loadcell::capture_span(&mut cfg, &req.sensor_id, raw, req.known_kg);
         cfg.clone()
     };
     if let Err(err) = loadcell::save(&updated) {
@@ -2531,4 +2551,90 @@ pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
 
     // 2) Insert into DB asynchronously (tracked for graceful shutdown)
     spawn_alert_insert(state, timestamp, "error", msg_string);
+}
+
+async fn thermal_calibration_page() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("thermal_calibration.html"))
+}
+
+#[derive(Deserialize)]
+struct ThermalZeroReq { sensor_id: String }
+
+async fn capture_thermal_zero(State(state): State<Arc<AppState>>, headers: HeaderMap,
+    Json(req): Json<ThermalZeroReq>) -> axum::response::Response {
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(p) => p, Err(response) => return response,
+    };
+    if !principal_can_edit_calibration(&principal) { return calibration_edit_forbidden_response(); }
+    if !matches!(req.sensor_id.as_str(), "KG1000" | "KG50") {
+        return (StatusCode::BAD_REQUEST, "Select KG1000 or KG50").into_response();
+    }
+    let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+    let rows = state.recent_telemetry_snapshot();
+    let pairs: Vec<_> = rows.iter().filter(|r| r.sender_id == "DAQ"
+        && r.data_type == req.sensor_id && r.timestamp_ms <= now && now-r.timestamp_ms <= 1000)
+        .filter_map(|r| Some((r.values.first().copied().flatten()?.is_finite()
+            .then_some(r.values[0]?)?, loadcell::recent_adc_temperature(rows.iter(), "DAQ", r.timestamp_ms)?)))
+        .collect();
+    if pairs.len() < 20 {
+        return (StatusCode::BAD_REQUEST, "Need at least 20 fresh load-cell samples paired with ADC temperature").into_response();
+    }
+    let raw = (pairs.iter().map(|p| p.0 as f64).sum::<f64>() / pairs.len() as f64) as f32;
+    let temperature = (pairs.iter().map(|p| p.1 as f64).sum::<f64>() / pairs.len() as f64) as f32;
+    let updated = {
+        let mut slot = state.loadcell_calibration.lock().unwrap();
+        let mut cfg = slot.clone();
+        if let Err(err) = loadcell::capture_thermal_zero(&mut cfg, &req.sensor_id, raw, temperature) {
+            return (StatusCode::BAD_REQUEST, err).into_response();
+        }
+        if let Err(err) = loadcell::save(&cfg) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+        }
+        *slot = cfg.clone();
+        cfg
+    };
+    if let Err(err) = publish_daq_calibration(&state, &updated) {
+        return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
+    }
+    Json(updated).into_response()
+}
+
+#[derive(Deserialize)]
+struct LongZeroStart { sensor_id:String, duration_s:u64, known_zero:bool }
+#[derive(Deserialize)]
+struct LongZeroId { session_id:String }
+#[derive(Deserialize)]
+struct LongZeroApply { session_id:String, apply_thermal:bool, tau_ms:f32 }
+async fn long_zero_status(State(state):State<Arc<AppState>>, headers:HeaderMap) -> axum::response::Response {
+    if let Err(e)=authorize_headers(&state,&headers,Permission::ViewData).await {return e;}
+    Json(state.loadcell_processing.status()).into_response()
+}
+async fn long_zero_start(State(state):State<Arc<AppState>>, headers:HeaderMap, Json(req):Json<LongZeroStart>) -> axum::response::Response {
+    let p=match authorize_headers(&state,&headers,Permission::ViewData).await {Ok(p)=>p,Err(e)=>return e};
+    if !principal_can_edit_calibration(&p) {return calibration_edit_forbidden_response();}
+    match state.loadcell_processing.start(&req.sensor_id,req.duration_s,req.known_zero) {
+        Ok(s)=>Json(s).into_response(),Err(e)=>(StatusCode::BAD_REQUEST,e).into_response(),
+    }
+}
+async fn long_zero_stop(State(state):State<Arc<AppState>>, headers:HeaderMap, Json(req):Json<LongZeroId>) -> axum::response::Response {
+    let p=match authorize_headers(&state,&headers,Permission::ViewData).await {Ok(p)=>p,Err(e)=>return e};
+    if !principal_can_edit_calibration(&p) {return calibration_edit_forbidden_response();}
+    match state.loadcell_processing.stop(&req.session_id) {
+        Ok(())=>Json(state.loadcell_processing.status()).into_response(),Err(e)=>(StatusCode::BAD_REQUEST,e).into_response(),
+    }
+}
+async fn long_zero_apply(State(state):State<Arc<AppState>>, headers:HeaderMap, Json(req):Json<LongZeroApply>) -> axum::response::Response {
+    let p=match authorize_headers(&state,&headers,Permission::ViewData).await {Ok(p)=>p,Err(e)=>return e};
+    if !principal_can_edit_calibration(&p) {return calibration_edit_forbidden_response();}
+    let updated={
+        let mut slot=state.loadcell_calibration.lock().unwrap();let mut cfg=slot.clone();
+        if let Err(e)=state.loadcell_processing.apply(&req.session_id,&mut cfg,req.apply_thermal,req.tau_ms) {
+            return (StatusCode::BAD_REQUEST,e).into_response();
+        }
+        if let Err(e)=loadcell::save(&cfg) {return (StatusCode::INTERNAL_SERVER_ERROR,e).into_response();}
+        *slot=cfg.clone();cfg
+    };
+    if let Err(e)=publish_daq_calibration(&state,&updated) {return (StatusCode::SERVICE_UNAVAILABLE,e).into_response();}
+    state.broadcast_fill_targets_snapshot();
+    Json(updated).into_response()
 }

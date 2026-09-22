@@ -152,6 +152,7 @@ pub struct AppState {
     pub latest_fill_mass_kg: Arc<Mutex<Option<f32>>>,
 
     /// Loadcell calibration data loaded from JSON and editable at runtime.
+    pub loadcell_processing: Arc<crate::loadcell_zero::Service>,
     pub loadcell_calibration: Arc<Mutex<LoadcellCalibrationFile>>,
     pub auto_zero: Arc<Mutex<crate::auto_zero::Runtime>>,
     pub daq_log_session: Arc<Mutex<u64>>,
@@ -2461,6 +2462,7 @@ pub(crate) mod tests {
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
+            loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
             auto_zero: Default::default(),
             daq_log_session: Default::default(),
