@@ -602,6 +602,17 @@
                   "kind": "time_average",
                   "window_ms": 500
                 }
+              },
+              {
+                "title": "ADC die temperature (°C)",
+                "data_type": "DAQ_ADC_TEMPERATURE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "ADC die temperature (°C)"
+                ],
+                "channels": [
+                  0
+                ]
               }
             ],
             "summary_items": [
@@ -698,6 +709,17 @@
                   "kind": "time_average",
                   "window_ms": 500
                 }
+              },
+              {
+                "title": "ADC die temperature (°C)",
+                "data_type": "DAQ_ADC_TEMPERATURE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "ADC die temperature (°C)"
+                ],
+                "channels": [
+                  0
+                ]
               }
             ],
             "summary_items": [
