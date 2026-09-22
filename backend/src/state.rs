@@ -153,6 +153,7 @@ pub struct AppState {
 
     /// Loadcell calibration data loaded from JSON and editable at runtime.
     pub loadcell_processing: Arc<crate::loadcell_zero::Service>,
+    pub network_traffic: Arc<Mutex<crate::network_traffic::Sampler>>,
     pub loadcell_calibration: Arc<Mutex<LoadcellCalibrationFile>>,
     pub auto_zero: Arc<Mutex<crate::auto_zero::Runtime>>,
     pub daq_log_session: Arc<Mutex<u64>>,
@@ -743,10 +744,14 @@ impl AppState {
                 simulated,
                 nodes: Vec::new(),
                 links: Vec::new(),
+                traffic: None,
             };
         };
         let exported = router.export_topology();
+        let mut traffic_sampler = self.network_traffic.lock().unwrap();
         let runtime = router.export_runtime_stats();
+        let traffic = traffic_sampler.sample(std::time::Instant::now(), &runtime.sides);
+        drop(traffic_sampler);
         let local_sender = router.sender().to_string();
         // Hiding av-bay cards in Test Fire must not hide their live ages from
         // topology, or cached discovery can incorrectly keep them online.
@@ -935,6 +940,7 @@ impl AppState {
             simulated,
             nodes,
             links,
+            traffic: Some(traffic),
         }
     }
 
@@ -1731,6 +1737,16 @@ pub(crate) mod tests {
             .find(|node| node.sender_id.as_deref() == Some(Board::ValveBoard.sender_id()))
             .expect("valve router missing from discovered topology");
 
+        let traffic = snapshot.traffic.as_ref().expect("router traffic is exported");
+        let side = traffic.sides.iter().find(|side| side.side_id == ground_side).unwrap();
+        assert_eq!(side.name, "fill_link");
+        assert_eq!(Some(side.totals), ground.stats);
+        assert!(side.totals.packets_received > 0);
+        assert!(side.totals.bytes_received > 0);
+        assert!(side.delta.is_none(), "first sample has no rate yet");
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(encoded["traffic"]["sides"][0]["name"], "fill_link");
+
         assert_eq!(ground.kind, NetworkTopologyNodeKind::Router);
         assert_eq!(valve.kind, NetworkTopologyNodeKind::Board);
         assert_eq!(
@@ -2463,6 +2479,7 @@ pub(crate) mod tests {
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
+            network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
             auto_zero: Default::default(),
             daq_log_session: Default::default(),

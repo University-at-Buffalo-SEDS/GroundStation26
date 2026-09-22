@@ -26,6 +26,7 @@ mod i18n;
 mod layout;
 mod loadcell;
 mod loadcell_zero;
+mod network_traffic;
 mod logger;
 mod map;
 mod media;
@@ -596,7 +597,8 @@ async fn main() -> anyhow::Result<()> {
         gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
-            loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
+        network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
+        loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
         auto_zero: Default::default(),
         daq_log_session: Default::default(),
         shutdown_tx,

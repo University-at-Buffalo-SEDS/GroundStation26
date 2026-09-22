@@ -2191,6 +2191,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     if ws_out_tx.send(text).await.is_err() {
                         break;
                     }
+                    // Keep traffic rates current even when every router side is idle.
+                    let topology = WsOutMsg::NetworkTopology(state_for_send.network_topology_snapshot(
+                        crate::telemetry_task::get_current_timestamp_ms(),
+                    ));
+                    if ws_out_tx.send(serde_json::to_string(&topology).unwrap_or_default()).await.is_err() {
+                        break;
+                    }
                 }
 
                 recv = telemetry_rx.recv() => {
