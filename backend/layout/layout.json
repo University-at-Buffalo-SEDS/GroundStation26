@@ -965,6 +965,14 @@
                 ],
                 "channels": [
                   0
+                ],
+                "chart_series": [
+                  {
+                    "data_type": "DAQ_ADC_TEMPERATURE",
+                    "sender_id": "DAQ",
+                    "index": 0,
+                    "label": "ADC die temperature (°C)"
+                  }
                 ]
               }
             ],
@@ -1072,6 +1080,14 @@
                 ],
                 "channels": [
                   0
+                ],
+                "chart_series": [
+                  {
+                    "data_type": "DAQ_ADC_TEMPERATURE",
+                    "sender_id": "DAQ",
+                    "index": 0,
+                    "label": "ADC die temperature (°C)"
+                  }
                 ]
               }
             ],
