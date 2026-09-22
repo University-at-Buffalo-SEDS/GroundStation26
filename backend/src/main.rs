@@ -26,6 +26,7 @@ mod i18n;
 mod layout;
 mod loadcell;
 mod loadcell_zero;
+mod thermal_settling;
 mod network_traffic;
 mod logger;
 mod map;

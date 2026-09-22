@@ -140,3 +140,26 @@ ADC conversion associated with that queued sample. These are independent of
 thermal correction and smoothing. NaN Celsius marks invalid or stale temperature;
 do not treat an accompanying retained ADC code as a fresh valid reading.
 Slow temperature diagnostic rows and temperature telemetry are also recorded.
+
+## Settling before thermal fitting
+
+Thermal point capture now checks two minutes of contiguous telemetry. Ten-second
+means must stay within 0.05 kg for KG1000 (0.005 kg for KG50) and 0.2 °C ADC
+temperature. Mass is evaluated with the saved mass calibration, before thermal
+correction or smoothing; a valid mass calibration is required. Gaps over two
+seconds, missing temperatures, invalid values, or insufficient coverage reset
+or prevent qualification. These are software acceptance thresholds, not claims
+about sensor accuracy or proof of thermal equilibrium. A slow loadcell may need
+much longer to stabilize. Keep it physically unloaded and verify repeatability
+on cooling; ADC die temperature remains only a proxy.
+
+GET `/api/calibration/thermal_settling?sensor_id=KG1000` reports eligibility and
+measured ranges to the in-app status card. The capture POST independently checks
+the same criteria before saving the averaged point.
+
+Long captures retain all valid raw samples in CSV for noise analysis. Thermal
+fitting uses non-overlapping settled periods only, with at least two settled
+points spanning 5 °C; broad temperature coverage during continuous warm-up no
+longer qualifies on its own. The report stores settled points and the settling
+message. Noise-only application remains available after 1000 samples and 60 s.
+Rebuild both the backend and frontend for the matching status and controls.

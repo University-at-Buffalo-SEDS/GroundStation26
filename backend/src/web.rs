@@ -203,6 +203,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/calibration/long_zero", get(long_zero_status).post(long_zero_start))
         .route("/api/calibration/long_zero/stop", post(long_zero_stop))
         .route("/api/calibration/long_zero/apply", post(long_zero_apply))
+        .route("/api/calibration/thermal_settling", get(thermal_settling_status))
         .route("/api/calibration/capture_thermal_zero", post(capture_thermal_zero))
         .route("/api/calibration/capture_zero", post(capture_loadcell_zero))
         .route("/api/calibration/capture_span", post(capture_loadcell_span))
@@ -2562,6 +2563,18 @@ pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
 #[derive(Deserialize)]
 struct ThermalZeroReq { sensor_id: String }
 
+async fn thermal_settling_status(State(state): State<Arc<AppState>>, headers: HeaderMap,
+    axum::extract::Query(req): axum::extract::Query<ThermalZeroReq>) -> axum::response::Response {
+    if let Err(e) = authorize_headers(&state, &headers, Permission::ViewData).await { return e; }
+    if !matches!(req.sensor_id.as_str(), "KG1000" | "KG50") {
+        return (StatusCode::BAD_REQUEST, "Select KG1000 or KG50").into_response();
+    }
+    let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+    let rows = state.recent_telemetry_snapshot();
+    let cfg = state.loadcell_calibration.lock().unwrap().clone();
+    Json(crate::thermal_settling::from_rows(&rows, &cfg, &req.sensor_id, now)).into_response()
+}
+
 async fn capture_thermal_zero(State(state): State<Arc<AppState>>, headers: HeaderMap,
     Json(req): Json<ThermalZeroReq>) -> axum::response::Response {
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
@@ -2573,18 +2586,17 @@ async fn capture_thermal_zero(State(state): State<Arc<AppState>>, headers: Heade
     }
     let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
     let rows = state.recent_telemetry_snapshot();
-    let pairs: Vec<_> = rows.iter().filter(|r| r.sender_id == "DAQ"
-        && r.data_type == req.sensor_id && r.timestamp_ms <= now && now-r.timestamp_ms <= 1000)
-        .filter_map(|r| Some((r.values.first().copied().flatten()?.is_finite()
-            .then_some(r.values[0]?)?, loadcell::recent_adc_temperature(rows.iter(), "DAQ", r.timestamp_ms)?)))
-        .collect();
-    if pairs.len() < 20 {
-        return (StatusCode::BAD_REQUEST, "Need at least 20 fresh load-cell samples paired with ADC temperature").into_response();
+    let calibration = state.loadcell_calibration.lock().unwrap().clone();
+    let settling = crate::thermal_settling::from_rows(&rows, &calibration, &req.sensor_id, now);
+    if !settling.ready {
+        return (StatusCode::CONFLICT, settling.message).into_response();
     }
-    let raw = (pairs.iter().map(|p| p.0 as f64).sum::<f64>() / pairs.len() as f64) as f32;
-    let temperature = (pairs.iter().map(|p| p.1 as f64).sum::<f64>() / pairs.len() as f64) as f32;
+    let raw = settling.raw.unwrap() as f32;
+    let temperature = settling.temperature_c.unwrap() as f32;
     let updated = {
         let mut slot = state.loadcell_calibration.lock().unwrap();
+        let check = crate::thermal_settling::from_rows(&rows, &slot, &req.sensor_id, now);
+        if !check.ready { return (StatusCode::CONFLICT, check.message).into_response(); }
         let mut cfg = slot.clone();
         if let Err(err) = loadcell::capture_thermal_zero(&mut cfg, &req.sensor_id, raw, temperature) {
             return (StatusCode::BAD_REQUEST, err).into_response();
@@ -2614,7 +2626,7 @@ async fn long_zero_status(State(state):State<Arc<AppState>>, headers:HeaderMap) 
 async fn long_zero_start(State(state):State<Arc<AppState>>, headers:HeaderMap, Json(req):Json<LongZeroStart>) -> axum::response::Response {
     let p=match authorize_headers(&state,&headers,Permission::ViewData).await {Ok(p)=>p,Err(e)=>return e};
     if !principal_can_edit_calibration(&p) {return calibration_edit_forbidden_response();}
-    match state.loadcell_processing.start(&req.sensor_id,req.duration_s,req.known_zero) {
+    match state.loadcell_processing.start_calibrated(&req.sensor_id,req.duration_s,req.known_zero,state.loadcell_calibration.lock().unwrap().clone()) {
         Ok(s)=>Json(s).into_response(),Err(e)=>(StatusCode::BAD_REQUEST,e).into_response(),
     }
 }
