@@ -26,6 +26,15 @@
   <button>Sign in</button><button id="logout" type="button">Sign out</button>
 </form>
 <p id="message" role="status" aria-live="polite"></p>
+<section id="publisher" hidden>
+<h2>Use your camera as a stream source</h2>
+<p>Your camera becomes available to the Ground Station and may be recorded or selected for the audience broadcast. It stays on when you switch dashboard tabs. Stop sharing to release it.</p>
+<label>Camera<select id="publish-device"><option value="">System default</option></select></label>
+<button id="publish-devices">Refresh cameras</button>
+<button id="publish-start">Start sharing camera</button><button id="publish-stop" disabled>Stop sharing</button>
+<p id="publish-status" role="status">Camera off</p>
+<video id="publish-preview" autoplay playsinline muted hidden></video>
+</section>
 <h2>Live cameras</h2>
 <p id="video-status">Connecting to video receiver…</p>
 <div id="cameras"></div>
@@ -48,6 +57,7 @@
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
+const embedded = new URLSearchParams(location.search).get('embedded') === '1' && parent !== window;
 let token = '', generation = 0;
 let recordingOffset = 0;
 const cameras = new Map();
@@ -92,7 +102,7 @@ function stopCamera(camera) {
   if (camera.session) api(camera.session, {method: 'DELETE'}).catch(() => {});
   camera.card.remove();
 }
-function stopAll() { generation++; for (const camera of cameras.values()) stopCamera(camera); cameras.clear(); $('recording-player').pause(); $('recording-player').removeAttribute('src'); $('recording-player').load(); $('recording-player').hidden = true; $('recordings').replaceChildren(); $('recordings-status').textContent = ''; recordingOffset = 0; }
+function stopAll() { stopPublishing(); generation++; for (const camera of cameras.values()) stopCamera(camera); cameras.clear(); $('recording-player').pause(); $('recording-player').removeAttribute('src'); $('recording-player').load(); $('recording-player').hidden = true; $('recordings').replaceChildren(); $('recordings-status').textContent = ''; recordingOffset = 0; }
 async function connect(camera) {
   const pc = new RTCPeerConnection({iceServers: []}); camera.pc = pc;
   pc.addTransceiver('video', {direction: 'recvonly'});
@@ -186,6 +196,105 @@ async function refreshRecordings() {
     }
   } catch (err) { if (current === generation) { $('recordings').replaceChildren(); $('recordings-status').textContent = err.message; $('recordings-prev').disabled = true; $('recordings-next').disabled = true; } }
 }
+let publisher = null, canPublish = false;
+const publishNotice = text => { $('publish-status').textContent = text; };
+async function refreshPublishPermission() {
+  try {
+    const config = await (await api('/api/live_streams')).json();
+    canPublish = !!token && config.can_manage_stream === true;
+  } catch { canPublish = false; }
+  $('publisher').hidden = !canPublish;
+  if (!canPublish && publisher) stopPublishing('Camera stopped: publishing permission is unavailable.');
+}
+async function listPublishDevices() {
+  try {
+    const selected = $('publish-device').value;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    $('publish-device').replaceChildren(new Option('System default', ''));
+    devices.filter(d => d.kind === 'videoinput').forEach((d, i) => $('publish-device').add(new Option(d.label || `Camera ${i + 1}`, d.deviceId)));
+    if ([...$('publish-device').options].some(o => o.value === selected)) $('publish-device').value = selected;
+  } catch (error) { publishNotice(error.message); }
+}
+function stopPublishing(message = 'Camera off') {
+  const old = publisher; publisher = null;
+  if (old) {
+    clearInterval(old.heartbeat); old.pc?.close(); old.stream?.getTracks().forEach(track => track.stop());
+    if (old.location) fetch(old.location, {method: 'DELETE', headers: {Authorization: `Bearer ${old.token}`}, keepalive: true}).catch(() => {});
+  }
+  $('publish-preview').srcObject = null; $('publish-preview').hidden = true;
+  $('publish-start').disabled = false; $('publish-stop').disabled = true; $('publish-device').disabled = false;
+  publishNotice(message);
+}
+$('publish-devices').onclick = listPublishDevices;
+$('publish-stop').onclick = () => stopPublishing();
+$('publish-start').onclick = async () => {
+  if (publisher || !canPublish) return;
+  if (!isSecureContext || !navigator.mediaDevices?.getUserMedia) return publishNotice('Camera sharing requires HTTPS (or localhost).');
+  const current = {token}; publisher = current;
+  $('publish-start').disabled = true; $('publish-stop').disabled = false; $('publish-device').disabled = true;
+  publishNotice('Requesting camera access…');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({video: {deviceId: $('publish-device').value ? {exact: $('publish-device').value} : undefined}, audio: false});
+    if (publisher !== current) { stream.getTracks().forEach(track => track.stop()); return; }
+    current.stream = stream;
+    stream.getTracks().forEach(track => { track.onended = () => { if (publisher === current) stopPublishing('Camera disconnected.'); }; });
+    $('publish-preview').srcObject = stream; $('publish-preview').hidden = false;
+    const pc = new RTCPeerConnection({iceServers: []}); current.pc = pc;
+    // The delayed HLS program and MP4 recorder require a compatible video codec.
+    const codecs = RTCRtpSender.getCapabilities('video')?.codecs.filter(codec => codec.mimeType.toLowerCase() === 'video/h264') || [];
+    if (!codecs.length) throw new Error('This browser cannot publish H.264 video for the Ground Station.');
+    for (const track of stream.getTracks()) {
+      const transceiver = pc.addTransceiver(track, {direction: 'sendonly', streams: [stream]});
+      if (!transceiver.setCodecPreferences) throw new Error('Camera sharing requires a browser with video codec selection support.');
+      transceiver.setCodecPreferences(codecs);
+    }
+    pc.onconnectionstatechange = () => {
+      if (publisher !== current) return;
+      if (['failed', 'closed'].includes(pc.connectionState)) stopPublishing('Camera connection ended. Start sharing to reconnect.');
+      else publishNotice(pc.connectionState === 'connected' ? 'Sharing camera with the Ground Station' : `Camera ${pc.connectionState}…`);
+    };
+    await pc.setLocalDescription(await pc.createOffer());
+    await new Promise((resolve, reject) => {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      const timer = setTimeout(() => { pc.removeEventListener('icegatheringstatechange', changed); reject(new Error('Camera connection timed out.')); }, 15000);
+      function changed() { if (pc.iceGatheringState === 'complete') { clearTimeout(timer); pc.removeEventListener('icegatheringstatechange', changed); resolve(); } }
+      pc.addEventListener('icegatheringstatechange', changed);
+    });
+    if (publisher !== current) return;
+    const response = await api('/api/video/publish', {method: 'POST', headers: {'Content-Type': 'application/sdp'}, body: pc.localDescription.sdp});
+    const locationHeader = response.headers.get('Location');
+    if (!locationHeader) throw new Error('Missing camera session location.');
+    const locationURL = new URL(locationHeader, location.href);
+    if (locationURL.origin !== location.origin || !/^\/api\/video\/publish\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/.test(locationURL.pathname)) throw new Error('Invalid camera session location.');
+    current.location = locationURL.href;
+    if (publisher !== current) { await fetch(current.location, {method: 'DELETE', headers: {Authorization: `Bearer ${current.token}`}}); return; }
+    await pc.setRemoteDescription({type: 'answer', sdp: await response.text()});
+    current.heartbeat = setInterval(async () => {
+      if (publisher !== current || current.renewing) return;
+      current.renewing = true;
+      try { await api(current.location, {method: 'POST'}); }
+      catch (error) { if (publisher === current) stopPublishing(`Camera stopped: ${error.message}`); }
+      finally { current.renewing = false; }
+    }, 10000);
+    await listPublishDevices();
+  } catch (error) { if (publisher === current) stopPublishing(`Cannot share camera: ${error.message}`); }
+};
+if (embedded) {
+  $('login').style.display = 'none';
+  document.querySelectorAll('body > a').forEach(link => { link.hidden = true; });
+  notice('Waiting for the dashboard session…');
+  let receivedSession = false;
+  window.addEventListener('message', event => {
+    if (event.source !== parent || event.data?.type !== 'gs26-session' || typeof event.data.token !== 'string') return;
+    if (receivedSession && token === event.data.token) return;
+    receivedSession = true;
+    stopAll(); token = event.data.token;
+    notice(token ? 'Connected with your dashboard session.' : 'Sign in from the dashboard to use camera tools.');
+    if (token) refresh().catch(error => notice(error.message));
+    else { canPublish = false; $('publisher').hidden = true; $('models').replaceChildren(); }
+  });
+}
+
 $('recordings-refresh').onclick = refreshRecordings;
 $('recordings-prev').onclick = () => { recordingOffset = Math.max(0, recordingOffset - 50); refreshRecordings(); };
 $('recordings-next').onclick = () => { recordingOffset += 50; refreshRecordings(); };
@@ -199,9 +308,13 @@ $('upload').onsubmit = async event => {
     notice('Model saved'); await refreshModels();
   } catch (err) { notice(err.message); } finally { $('save').disabled = false; }
 };
-async function refresh() { await Promise.all([refreshVideo(), refreshRecordings(), refreshModels().catch(err => notice(err.message))]); }
-async function poll() { await refreshVideo(); setTimeout(poll, 5000); }
-refreshModels().catch(err => notice(err.message)); refreshRecordings(); poll();
+async function refresh() { await refreshPublishPermission(); await Promise.all([refreshVideo(), refreshRecordings(), refreshModels().catch(err => notice(err.message))]); }
+async function poll() {
+  if (!embedded || token) { await refreshVideo(); await refreshPublishPermission(); }
+  setTimeout(poll, 5000);
+}
+if (!embedded) { refreshModels().catch(err => notice(err.message)); refreshRecordings(); }
+poll();
 window.addEventListener('pagehide', stopAll);
 </script>
 </html>

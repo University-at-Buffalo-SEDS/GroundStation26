@@ -111,3 +111,21 @@ window.addEventListener('blur',release);
 document.addEventListener('visibilitychange',()=>{if(document.hidden)release();});
 window.addEventListener('pagehide',()=>leave());
 updateControls();
+
+// An embedded tool shares the dashboard session; no credentials are persisted.
+if (new URLSearchParams(location.search).get('embedded') === '1' && parent !== window) {
+  $('login').style.display = 'none';
+  document.querySelector('nav').style.display = 'none';
+  notice('Waiting for the dashboard session…');
+  let receivedSession = false;
+  window.addEventListener('message', event => {
+    if (event.source !== parent || event.data?.type !== 'gs26-session' || typeof event.data.token !== 'string') return;
+    if (!event.data.visible) release();
+    if (!receivedSession || token !== event.data.token) {
+      receivedSession = true;
+      leave(); token = event.data.token;
+      notice(token ? 'Dashboard session connected. Choose Join voice to enable your microphone.' : 'Sign in from the dashboard to join crew voice.');
+      updateControls();
+    }
+  });
+}

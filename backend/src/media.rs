@@ -3,6 +3,8 @@
 mod contract;
 #[path = "media/recordings.rs"]
 mod recordings;
+#[path = "media/publishing.rs"]
+mod publishing;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
@@ -37,6 +39,7 @@ struct MediaState {
     program_history: Mutex<std::collections::VecDeque<(u64, serde_json::Value)>>,
     hls_segments: Mutex<std::collections::HashMap<(String, String), u64>>,
     preview_sessions: Mutex<Vec<(String, String, String)>>,
+    publishers: Mutex<Vec<publishing::Publisher>>,
 }
 
 pub fn router(app: Arc<AppState>, relay_password: String, voice: Arc<crate::voice::VoiceHub>) -> Router<Arc<AppState>> {
@@ -62,15 +65,18 @@ pub fn router(app: Arc<AppState>, relay_password: String, voice: Arc<crate::voic
         program_history: Mutex::new(std::collections::VecDeque::new()),
         hls_segments: Mutex::new(std::collections::HashMap::new()),
         preview_sessions: Mutex::new(Vec::new()),
+        publishers: Mutex::new(Vec::new()),
         models: std::env::var_os("GS_STAGE_MODELS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/stage_models")),
     });
+    tokio::spawn(publishing::reap(state.clone()));
     let initial = state.clone();
     tokio::spawn(async move { contract::initialize_voice_broadcast(&initial).await; });
     Router::new()
         .merge(contract::routes())
         .merge(recordings::routes())
+        .merge(publishing::routes())
         .route("/api/video/streams", get(list_streams))
         .route(
             "/api/video/streams/{id}/whep",
