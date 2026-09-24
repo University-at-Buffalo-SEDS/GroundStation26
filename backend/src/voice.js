@@ -80,8 +80,8 @@ $('join').onclick=async()=>{
       }
       let m;try{m=JSON.parse(event.data);}catch{return;}
       if(m.type==='error'){leave(m.message);return;}
-      if(m.type==='broadcast_state')$('broadcast-notice').textContent=m.enabled?'Crew audio is included in the audience broadcast, with the program delay.':'Crew audio is not included in the audience broadcast.';
-      if(m.type==='joined'){s.ready=true;s.id=m.id;joining=false;transmit();notice('Connected to crew voice.');}
+      if(m.type==='broadcast_state')$('broadcast-notice').textContent=m.enabled?'Voice chat audio is included in the audience broadcast, with the program delay.':'Voice chat audio is not included in the audience broadcast.';
+      if(m.type==='joined'){s.ready=true;s.id=m.id;joining=false;transmit();notice('Connected to voice chat.');}
       if(m.type==='roster'){
         const next=new Set(m.peers.map(p=>p.id));
         for(const id of s.peers||[])if(!next.has(id))s.node.port.postMessage({type:'remove',id});s.peers=next;
@@ -124,7 +124,7 @@ if (new URLSearchParams(location.search).get('embedded') === '1' && parent !== w
     if (!receivedSession || token !== event.data.token) {
       receivedSession = true;
       leave(); token = event.data.token;
-      notice(token ? 'Dashboard session connected. Choose Join voice to enable your microphone.' : 'Sign in from the dashboard to join crew voice.');
+      notice(token ? 'Dashboard session connected. Choose Join voice to enable your microphone.' : 'Sign in from the dashboard to join voice chat.');
       updateControls();
     }
   });
