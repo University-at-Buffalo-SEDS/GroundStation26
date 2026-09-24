@@ -272,4 +272,52 @@ mod tests {
         assert_eq!(heartbeat["priority"], 255);
         assert_eq!(heartbeat["reliable"], false);
     }
+    #[test]
+    fn daq_analog_schema_and_layouts_share_the_wire_contract() {
+        initialize().unwrap();
+        let schema: serde_json::Value = serde_json::from_slice(SCHEMA_JSON).unwrap();
+        let entries = [
+            ("DAQ_SAR_VOLTAGES", 143, 8),
+            ("DAQ_SDADC_VOLTAGES", 144, 6),
+            ("DAQ_CURRENT_SENSE", 145, 4),
+            ("DAQ_POWER_MONITOR", 146, 4),
+        ];
+        for (name, id, count) in entries {
+            assert_eq!(data_type(name), DataType(id));
+            let ty = &schema["types"][(id - 100) as usize];
+            assert_eq!(ty["element"]["count"], count);
+            assert_eq!(ty["element"]["data_type"], "Float32");
+            assert_eq!(ty["endpoints"], serde_json::json!(["GROUND_STATION"]));
+        }
+        for text in [
+            include_str!("../layout/layout.json"),
+            include_str!("../layout/layout_test_fire.json"),
+            include_str!("../layout/layout_hitl.json"),
+        ] {
+            let layout: serde_json::Value = serde_json::from_str(text).unwrap();
+            let tab = layout["data_tab"]["tabs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == "DAQ_ANALOG")
+                .unwrap();
+            for ((name, _, count), sub) in entries.iter().zip(tab["subtabs"].as_array().unwrap()) {
+                assert_eq!(sub["data_type"], *name);
+                assert_eq!(
+                    sub["summary_items"].as_array().unwrap().len(),
+                    *count as usize
+                );
+                let mut indices = Vec::new();
+                for group in sub["chart_groups"].as_array().unwrap() {
+                    for series in group["chart_series"].as_array().unwrap() {
+                        assert_eq!(series["data_type"], *name);
+                        assert_eq!(series["sender_id"], "DAQ");
+                        indices.push(series["index"].as_u64().unwrap());
+                    }
+                }
+                indices.sort_unstable();
+                assert_eq!(indices, (0..*count as u64).collect::<Vec<_>>());
+            }
+        }
+    }
 }

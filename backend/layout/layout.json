@@ -957,11 +957,11 @@
                 }
               },
               {
-                "title": "ADC die temperature (°C)",
+                "title": "ADC die temperature (\u00b0C)",
                 "data_type": "DAQ_ADC_TEMPERATURE",
                 "sender_id": "DAQ",
                 "labels": [
-                  "ADC die temperature (°C)"
+                  "ADC die temperature (\u00b0C)"
                 ],
                 "channels": [
                   0
@@ -971,7 +971,7 @@
                     "data_type": "DAQ_ADC_TEMPERATURE",
                     "sender_id": "DAQ",
                     "index": 0,
-                    "label": "ADC die temperature (°C)"
+                    "label": "ADC die temperature (\u00b0C)"
                   }
                 ]
               }
@@ -1019,7 +1019,7 @@
                 "formatter": {
                   "kind": "number",
                   "precision": 2,
-                  "suffix": " °C"
+                  "suffix": " \u00b0C"
                 },
                 "show_min_max": false
               }
@@ -1072,11 +1072,11 @@
                 }
               },
               {
-                "title": "ADC die temperature (°C)",
+                "title": "ADC die temperature (\u00b0C)",
                 "data_type": "DAQ_ADC_TEMPERATURE",
                 "sender_id": "DAQ",
                 "labels": [
-                  "ADC die temperature (°C)"
+                  "ADC die temperature (\u00b0C)"
                 ],
                 "channels": [
                   0
@@ -1086,7 +1086,7 @@
                     "data_type": "DAQ_ADC_TEMPERATURE",
                     "sender_id": "DAQ",
                     "index": 0,
-                    "label": "ADC die temperature (°C)"
+                    "label": "ADC die temperature (\u00b0C)"
                   }
                 ]
               }
@@ -1124,7 +1124,7 @@
                 "formatter": {
                   "kind": "number",
                   "precision": 2,
-                  "suffix": " °C"
+                  "suffix": " \u00b0C"
                 },
                 "show_min_max": false
               }
@@ -1205,6 +1205,561 @@
         ],
         "chart": {
           "enabled": false
+        }
+      },
+      {
+        "id": "DAQ_ANALOG",
+        "label": "DAQ analog",
+        "channels": [
+          "SAR inputs",
+          "SDADC inputs",
+          "Current sensors",
+          "Power monitor"
+        ],
+        "subtabs": [
+          {
+            "id": "daq_sar_voltages",
+            "label": "SAR inputs",
+            "data_type": "DAQ_SAR_VOLTAGES",
+            "channels": [
+              "SAR 1 \u00b7 P9/3",
+              "SAR 2 \u00b7 P9/4",
+              "SAR 3 \u00b7 P3/3",
+              "SAR 4 \u00b7 P3/4",
+              "SAR 5 \u00b7 P2/3",
+              "SAR 6 \u00b7 P2/4",
+              "SAR 7 \u00b7 P1/3",
+              "SAR 8 \u00b7 P1/4"
+            ],
+            "chart_groups": [
+              {
+                "title": "SAR inputs (V)",
+                "data_type": "DAQ_SAR_VOLTAGES",
+                "sender_id": "DAQ",
+                "labels": [
+                  "SAR 1 \u00b7 P9/3",
+                  "SAR 2 \u00b7 P9/4",
+                  "SAR 3 \u00b7 P3/3",
+                  "SAR 4 \u00b7 P3/4",
+                  "SAR 5 \u00b7 P2/3",
+                  "SAR 6 \u00b7 P2/4",
+                  "SAR 7 \u00b7 P1/3",
+                  "SAR 8 \u00b7 P1/4"
+                ],
+                "channels": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6,
+                  7
+                ],
+                "chart_series": [
+                  {
+                    "data_type": "DAQ_SAR_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 0,
+                    "label": "SAR 1 \u00b7 P9/3"
+                  },
+                  {
+                    "data_type": "DAQ_SAR_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 1,
+                    "label": "SAR 2 \u00b7 P9/4"
+                  },
+                  {
+                    "data_type": "DAQ_SAR_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 2,
+                    "label": "SAR 3 \u00b7 P3/3"
+                  },
+                  {
+                    "data_type": "DAQ_SAR_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 3,
+                    "label": "SAR 4 \u00b7 P3/4"
+                  },
+                  {
+                    "data_type": "DAQ_SAR_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 4,
+                    "label": "SAR 5 \u00b7 P2/3"
+                  },
+                  {
+                    "data_type": "DAQ_SAR_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 5,
+                    "label": "SAR 6 \u00b7 P2/4"
+                  },
+                  {
+                    "data_type": "DAQ_SAR_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 6,
+                    "label": "SAR 7 \u00b7 P1/3"
+                  },
+                  {
+                    "data_type": "DAQ_SAR_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 7,
+                    "label": "SAR 8 \u00b7 P1/4"
+                  }
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "data_type": "DAQ_SAR_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 0,
+                "label": "SAR 1 \u00b7 P9/3",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SAR_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 1,
+                "label": "SAR 2 \u00b7 P9/4",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SAR_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 2,
+                "label": "SAR 3 \u00b7 P3/3",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SAR_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 3,
+                "label": "SAR 4 \u00b7 P3/4",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SAR_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 4,
+                "label": "SAR 5 \u00b7 P2/3",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SAR_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 5,
+                "label": "SAR 6 \u00b7 P2/4",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SAR_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 6,
+                "label": "SAR 7 \u00b7 P1/3",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SAR_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 7,
+                "label": "SAR 8 \u00b7 P1/4",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              }
+            ],
+            "chart": {
+              "enabled": true
+            }
+          },
+          {
+            "id": "daq_sdadc_voltages",
+            "label": "SDADC inputs",
+            "data_type": "DAQ_SDADC_VOLTAGES",
+            "channels": [
+              "CH2 \u00b7 P6/3",
+              "CH3 \u00b7 P6/4",
+              "CH4 \u00b7 P5/3",
+              "CH5 \u00b7 P5/4",
+              "HVAIN1 \u00b7 P4/3",
+              "HVAIN2 \u00b7 P4/4"
+            ],
+            "chart_groups": [
+              {
+                "title": "SDADC inputs (V)",
+                "data_type": "DAQ_SDADC_VOLTAGES",
+                "sender_id": "DAQ",
+                "labels": [
+                  "CH2 \u00b7 P6/3",
+                  "CH3 \u00b7 P6/4",
+                  "CH4 \u00b7 P5/3",
+                  "CH5 \u00b7 P5/4",
+                  "HVAIN1 \u00b7 P4/3",
+                  "HVAIN2 \u00b7 P4/4"
+                ],
+                "channels": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5
+                ],
+                "chart_series": [
+                  {
+                    "data_type": "DAQ_SDADC_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 0,
+                    "label": "CH2 \u00b7 P6/3"
+                  },
+                  {
+                    "data_type": "DAQ_SDADC_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 1,
+                    "label": "CH3 \u00b7 P6/4"
+                  },
+                  {
+                    "data_type": "DAQ_SDADC_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 2,
+                    "label": "CH4 \u00b7 P5/3"
+                  },
+                  {
+                    "data_type": "DAQ_SDADC_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 3,
+                    "label": "CH5 \u00b7 P5/4"
+                  },
+                  {
+                    "data_type": "DAQ_SDADC_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 4,
+                    "label": "HVAIN1 \u00b7 P4/3"
+                  },
+                  {
+                    "data_type": "DAQ_SDADC_VOLTAGES",
+                    "sender_id": "DAQ",
+                    "index": 5,
+                    "label": "HVAIN2 \u00b7 P4/4"
+                  }
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "data_type": "DAQ_SDADC_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 0,
+                "label": "CH2 \u00b7 P6/3",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SDADC_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 1,
+                "label": "CH3 \u00b7 P6/4",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SDADC_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 2,
+                "label": "CH4 \u00b7 P5/3",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SDADC_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 3,
+                "label": "CH5 \u00b7 P5/4",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SDADC_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 4,
+                "label": "HVAIN1 \u00b7 P4/3",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_SDADC_VOLTAGES",
+                "sender_id": "DAQ",
+                "index": 5,
+                "label": "HVAIN2 \u00b7 P4/4",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              }
+            ],
+            "chart": {
+              "enabled": true
+            }
+          },
+          {
+            "id": "daq_current_sense",
+            "label": "Current sensors",
+            "data_type": "DAQ_CURRENT_SENSE",
+            "channels": [
+              "J7 sensor voltage",
+              "J8 sensor voltage",
+              "J7 current",
+              "J8 current"
+            ],
+            "chart_groups": [
+              {
+                "title": "Current sensors (V)",
+                "data_type": "DAQ_CURRENT_SENSE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "J7 sensor voltage",
+                  "J8 sensor voltage"
+                ],
+                "channels": [
+                  0,
+                  1
+                ],
+                "chart_series": [
+                  {
+                    "data_type": "DAQ_CURRENT_SENSE",
+                    "sender_id": "DAQ",
+                    "index": 0,
+                    "label": "J7 sensor voltage"
+                  },
+                  {
+                    "data_type": "DAQ_CURRENT_SENSE",
+                    "sender_id": "DAQ",
+                    "index": 1,
+                    "label": "J8 sensor voltage"
+                  }
+                ]
+              },
+              {
+                "title": "Current sensors (A)",
+                "data_type": "DAQ_CURRENT_SENSE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "J7 current",
+                  "J8 current"
+                ],
+                "channels": [
+                  2,
+                  3
+                ],
+                "chart_series": [
+                  {
+                    "data_type": "DAQ_CURRENT_SENSE",
+                    "sender_id": "DAQ",
+                    "index": 2,
+                    "label": "J7 current"
+                  },
+                  {
+                    "data_type": "DAQ_CURRENT_SENSE",
+                    "sender_id": "DAQ",
+                    "index": 3,
+                    "label": "J8 current"
+                  }
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "data_type": "DAQ_CURRENT_SENSE",
+                "sender_id": "DAQ",
+                "index": 0,
+                "label": "J7 sensor voltage",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_CURRENT_SENSE",
+                "sender_id": "DAQ",
+                "index": 1,
+                "label": "J8 sensor voltage",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_CURRENT_SENSE",
+                "sender_id": "DAQ",
+                "index": 2,
+                "label": "J7 current",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_CURRENT_SENSE",
+                "sender_id": "DAQ",
+                "index": 3,
+                "label": "J8 current",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              }
+            ],
+            "chart": {
+              "enabled": true
+            }
+          },
+          {
+            "id": "daq_power_monitor",
+            "label": "Power monitor",
+            "data_type": "DAQ_POWER_MONITOR",
+            "channels": [
+              "VMON pin",
+              "IMON pin",
+              "VMAIN supply",
+              "Input current"
+            ],
+            "chart_groups": [
+              {
+                "title": "Power monitor (V)",
+                "data_type": "DAQ_POWER_MONITOR",
+                "sender_id": "DAQ",
+                "labels": [
+                  "VMON pin",
+                  "IMON pin",
+                  "VMAIN supply"
+                ],
+                "channels": [
+                  0,
+                  1,
+                  2
+                ],
+                "chart_series": [
+                  {
+                    "data_type": "DAQ_POWER_MONITOR",
+                    "sender_id": "DAQ",
+                    "index": 0,
+                    "label": "VMON pin"
+                  },
+                  {
+                    "data_type": "DAQ_POWER_MONITOR",
+                    "sender_id": "DAQ",
+                    "index": 1,
+                    "label": "IMON pin"
+                  },
+                  {
+                    "data_type": "DAQ_POWER_MONITOR",
+                    "sender_id": "DAQ",
+                    "index": 2,
+                    "label": "VMAIN supply"
+                  }
+                ]
+              },
+              {
+                "title": "Power monitor (A)",
+                "data_type": "DAQ_POWER_MONITOR",
+                "sender_id": "DAQ",
+                "labels": [
+                  "Input current"
+                ],
+                "channels": [
+                  3
+                ],
+                "chart_series": [
+                  {
+                    "data_type": "DAQ_POWER_MONITOR",
+                    "sender_id": "DAQ",
+                    "index": 3,
+                    "label": "Input current"
+                  }
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "data_type": "DAQ_POWER_MONITOR",
+                "sender_id": "DAQ",
+                "index": 0,
+                "label": "VMON pin",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_POWER_MONITOR",
+                "sender_id": "DAQ",
+                "index": 1,
+                "label": "IMON pin",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_POWER_MONITOR",
+                "sender_id": "DAQ",
+                "index": 2,
+                "label": "VMAIN supply",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              },
+              {
+                "data_type": "DAQ_POWER_MONITOR",
+                "sender_id": "DAQ",
+                "index": 3,
+                "label": "Input current",
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4
+                }
+              }
+            ],
+            "chart": {
+              "enabled": true
+            }
+          }
+        ],
+        "chart": {
+          "enabled": true
         }
       }
     ],
