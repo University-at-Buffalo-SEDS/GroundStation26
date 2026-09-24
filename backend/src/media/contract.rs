@@ -462,7 +462,7 @@ async fn control_broadcast(
     }
     if broadcast.label.len() > 200
         || !(3..=60).contains(&broadcast.delay_seconds)
-        || !["hero", "grid"].contains(&broadcast.layout.as_str())
+        || !["hero", "grid", "model", "grid-model"].contains(&broadcast.layout.as_str())
         || broadcast.hidden_stream_ids.len() > 1000
     {
         return Err(error(

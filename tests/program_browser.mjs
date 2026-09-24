@@ -26,7 +26,7 @@ try {
     if(path==='/program')return route.fulfill({contentType:'text/html',body:readFileSync('backend/src/media/program.html')});
     if(path==='/assets/hls.min.js')return route.fulfill({contentType:'text/javascript',body:readFileSync('backend/assets/hls.min.js')});
     if(path==='/assets/program-audio.js')return route.fulfill({contentType:'text/javascript',body:readFileSync('backend/src/media/program-audio.js')});
-    if(path==='/assets/three/vehicle-renderer.js')return route.fulfill({contentType:'text/javascript',body:''});
+    if(path==='/assets/three/vehicle-renderer.js')return route.fulfill({contentType:'text/javascript',body:"customElements.define('gs-vehicle-viewer',class extends HTMLElement{});"});
     if(path==='/api/media-assets/program/state') {
       if(offline)return route.fulfill({status:503,body:'offline'});
       return route.fulfill({json:{server_now_ms:Date.now(),broadcast:{delay_seconds:delay,comms_audio_enabled:true,label:'Test mission',featured_stream_id:'camera',layout},streams:live?['camera','other'].map(id=>({id,label:id,url:`/hls/${id}/index.m3u8`})):[],telemetry:{phase:'Idle',t_clock:'T− 00:10.00',stats:[{label:'Altitude',value:12,precision:1,unit:'m'}]}}});
@@ -66,9 +66,20 @@ try {
   await page.setViewportSize({width:360,height:800});layout='grid';
   await page.waitForFunction(()=>document.querySelectorAll('video').length===2&&[...document.querySelectorAll('video')].every(v=>v.style.opacity==='1'));
   assert.deepEqual(await page.locator('video').evaluateAll(v=>v.map(x=>x.style.width)),['100%','100%'],'portrait grid stacks cameras');
+  assert.equal(await page.locator('#model-stage').isVisible(),false,'camera grids do not show a 3D model by default');
+  layout='grid-model';
+  await page.waitForFunction(()=>document.querySelector('#model-stage').style.display==='block'&&document.querySelector('#model-stage').style.height.includes('33.3'));
+  assert.equal(await page.locator('video').count(),2,'model tile coexists with the camera feeds');
+  assert.equal(await page.locator('#model-stage gs-vehicle-viewer').count(),1);
+  layout='model';
+  await page.waitForFunction(()=>!document.querySelector('video')&&document.querySelector('#model-stage').style.height==='100%');
+  assert.equal(await page.locator('#model-stage').isVisible(),true,'operator may select a model-only view');
+  layout='hero';
+  await page.waitForFunction(()=>document.querySelectorAll('video').length===1&&document.querySelector('video').style.opacity==='1');
+  assert.equal(await page.locator('#model-stage').isVisible(),false);
   delay=10;await page.waitForTimeout(1600);
   await page.waitForFunction(()=>[...document.querySelectorAll('video')].some(v=>v.style.opacity==='1'));
-  live=false;await page.waitForFunction(()=>!document.querySelector('video'));await page.locator('#rocket-inset').waitFor({state:'visible'});
+  live=false;await page.waitForFunction(()=>!document.querySelector('video')&&document.querySelector('#model-stage').style.display==='block');await page.locator('#rocket-inset').waitFor({state:'visible'});
   offline=true;await page.waitForFunction(()=>document.querySelector('#status').textContent.includes('unavailable'));
   await page.locator('#rocket-inset').waitFor({state:'visible'});
   assert.equal(errors.length,0,errors.join('\n'));
