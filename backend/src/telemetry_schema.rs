@@ -320,4 +320,43 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn daq_analog_loadcells_preserve_raw_calibrated_and_temperature_bindings() {
+        for text in [
+            include_str!("../layout/layout.json"),
+            include_str!("../layout/layout_test_fire.json"),
+            include_str!("../layout/layout_hitl.json"),
+        ] {
+            let layout: serde_json::Value = serde_json::from_str(text).unwrap();
+            let tabs = layout["data_tab"]["tabs"].as_array().unwrap();
+            let original = tabs.iter().find(|t| t["id"] == "LOADCELL").unwrap();
+            let analog = tabs.iter().find(|t| t["id"] == "DAQ_ANALOG").unwrap();
+            for (source, target) in [
+                ("loadcell_1000kg", "daq_mcp_ch0"),
+                ("loadcell_50kg", "daq_mcp_ch1"),
+            ] {
+                let expected = original["subtabs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["id"] == source)
+                    .unwrap();
+                let actual = analog["subtabs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["id"] == target)
+                    .unwrap();
+                for field in [
+                    "data_type",
+                    "channels",
+                    "chart_groups",
+                    "summary_items",
+                    "chart",
+                ] {
+                    assert_eq!(actual[field], expected[field], "{target}: {field}");
+                }
+            }
+        }
+    }
 }

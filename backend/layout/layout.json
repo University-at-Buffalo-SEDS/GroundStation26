@@ -1756,6 +1756,241 @@
             "chart": {
               "enabled": true
             }
+          },
+          {
+            "id": "daq_mcp_ch0",
+            "label": "1000 kg \u00b7 MCP CH0 / P7",
+            "data_type": "KG1000",
+            "channels": [
+              "1000kg"
+            ],
+            "chart_groups": [
+              {
+                "title": "Raw",
+                "data_type": "KG1000",
+                "labels": [
+                  "Raw"
+                ],
+                "channels": [
+                  0
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "title": "Calibrated",
+                "data_type": "LOADCELL_WEIGHT_KG",
+                "labels": [
+                  "Calibrated"
+                ],
+                "channels": [
+                  0
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "title": "Fill %",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "labels": [
+                  "Fill %"
+                ],
+                "channels": [
+                  0
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "title": "ADC die temperature (\u00b0C)",
+                "data_type": "DAQ_ADC_TEMPERATURE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "ADC die temperature (\u00b0C)"
+                ],
+                "channels": [
+                  0
+                ],
+                "chart_series": [
+                  {
+                    "data_type": "DAQ_ADC_TEMPERATURE",
+                    "sender_id": "DAQ",
+                    "index": 0,
+                    "label": "ADC die temperature (\u00b0C)"
+                  }
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "label": "Raw",
+                "data_type": "KG1000",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 7
+                },
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "label": "Calibrated",
+                "data_type": "LOADCELL_WEIGHT_KG",
+                "index": 0,
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "label": "Fill %",
+                "data_type": "LOADCELL_FILL_PERCENT",
+                "index": 0,
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "label": "ADC die temperature",
+                "data_type": "DAQ_ADC_TEMPERATURE",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 2,
+                  "suffix": " \u00b0C"
+                },
+                "show_min_max": false
+              }
+            ],
+            "chart": {
+              "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "time_average",
+              "window_ms": 500
+            }
+          },
+          {
+            "id": "daq_mcp_ch1",
+            "label": "50 kg \u00b7 MCP CH1 / P8",
+            "data_type": "KG50",
+            "channels": [
+              "50kg"
+            ],
+            "chart_groups": [
+              {
+                "title": "Raw",
+                "data_type": "KG50",
+                "labels": [
+                  "Raw"
+                ],
+                "channels": [
+                  0
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "title": "Calibrated",
+                "data_type": "LOADCELL_50_WEIGHT_KG",
+                "labels": [
+                  "Calibrated"
+                ],
+                "channels": [
+                  0
+                ],
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "title": "ADC die temperature (\u00b0C)",
+                "data_type": "DAQ_ADC_TEMPERATURE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "ADC die temperature (\u00b0C)"
+                ],
+                "channels": [
+                  0
+                ],
+                "chart_series": [
+                  {
+                    "data_type": "DAQ_ADC_TEMPERATURE",
+                    "sender_id": "DAQ",
+                    "index": 0,
+                    "label": "ADC die temperature (\u00b0C)"
+                  }
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "label": "Raw",
+                "data_type": "KG50",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 7
+                },
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "label": "Calibrated",
+                "data_type": "LOADCELL_50_WEIGHT_KG",
+                "index": 0,
+                "display_filter": {
+                  "enabled": true,
+                  "kind": "time_average",
+                  "window_ms": 500
+                }
+              },
+              {
+                "label": "ADC die temperature",
+                "data_type": "DAQ_ADC_TEMPERATURE",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 2,
+                  "suffix": " \u00b0C"
+                },
+                "show_min_max": false
+              }
+            ],
+            "chart": {
+              "enabled": true
+            },
+            "display_filter": {
+              "enabled": true,
+              "kind": "time_average",
+              "window_ms": 500
+            }
           }
         ],
         "chart": {
