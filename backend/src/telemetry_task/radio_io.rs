@@ -209,8 +209,15 @@ pub(super) fn spawn_comms_worker_threads(
                         }
                     }
                 }
+                let busy = comms.receive_budget_exhausted();
                 drop(comms);
-                thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
+                // Release the shared I2C lock between bounded bursts so TX can
+                // compete. Do not add a millisecond of latency to busy RX.
+                if busy {
+                    thread::yield_now();
+                } else {
+                    thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
+                }
             }
         })?;
 

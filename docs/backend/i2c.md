@@ -1,5 +1,9 @@
 # Backend I2C Transport
 
+For the efficient complete-packet protocol and paired 1 MHz deployment, see
+[I2C v2 deployment](i2c-v2.md). The format below is retained as protocol_version 1
+for staged upgrades; select protocol_version 2 only after flashing the Pico.
+
 This document describes the chunked I2C packet transport used by the Ground Station backend and the Pico firmware currently deployed on the fill-system side.
 
 ## Scope

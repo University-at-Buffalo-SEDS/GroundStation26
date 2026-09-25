@@ -1,3 +1,6 @@
+#[path = "i2c_packet.rs"]
+#[allow(dead_code)]
+mod i2c_packet;
 use crate::comms_config::{
     CanLinkConfig, CommsLinkConfig, I2cLinkConfig, SerialLinkConfig, SerialProtocol, SpiLinkConfig,
 };
@@ -88,6 +91,10 @@ const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GB", "VB", "AB", "DAQ"];
 //  Comms Device Trait
 // ======================================================================
 pub trait CommsDevice: Send {
+    /// True only when the last bounded receive exhausted its work budget.
+    fn receive_budget_exhausted(&self) -> bool {
+        false
+    }
     fn recv_packet(
         &mut self,
         router: &Router,
@@ -1519,6 +1526,11 @@ impl CommsDevice for UartComms {
 // framing model used by older host experiments.
 
 pub struct I2cComms {
+    rx_budget_exhausted: bool,
+    #[cfg(target_os = "linux")]
+    protocol_version: u8,
+    #[cfg(target_os = "linux")]
+    v2_ready: bool,
     #[cfg(target_os = "linux")]
     inner: Option<File>,
     /// Simulation-only transaction endpoint. This preserves the production
@@ -1541,6 +1553,10 @@ pub struct I2cComms {
 
 impl I2cComms {
     pub fn open(cfg: &I2cLinkConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            matches!(cfg.protocol_version, 1 | 2),
+            "I2C protocol_version must be 1 or 2"
+        );
         #[cfg(target_os = "linux")]
         {
             if let Some(socket) = std::env::var_os("GS_SIMULATED_I2C_SOCKET") {
@@ -1551,6 +1567,9 @@ impl I2cComms {
                     )
                 })?;
                 return Ok(Self {
+                    rx_budget_exhausted: false,
+                    protocol_version: cfg.protocol_version,
+                    v2_ready: false,
                     inner: None,
                     simulated: Some(simulated),
                     side_id: None,
@@ -1564,6 +1583,9 @@ impl I2cComms {
             let path = format!("/dev/i2c-{}", cfg.bus);
             let inner = OpenOptions::new().read(true).write(true).open(&path)?;
             Ok(Self {
+                rx_budget_exhausted: false,
+                protocol_version: cfg.protocol_version,
+                v2_ready: false,
                 inner: Some(inner),
                 simulated: None,
                 side_id: None,
@@ -1579,6 +1601,54 @@ impl I2cComms {
             let _ = cfg;
             anyhow::bail!("I2C comms support is only implemented on Linux")
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ensure_v2(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !self.v2_ready {
+            self.transfer_write(&i2c_packet::SELECT)?;
+            let mut reply = [0; i2c_packet::HEADER_LEN];
+            self.transfer_read(&mut reply)?;
+            i2c_packet::decode(&reply).map_err(std::io::Error::other)?;
+            // This peek retains any pending packet on the Pico.
+            self.v2_ready = true;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_v2(&mut self) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
+        self.ensure_v2()?;
+        let mut header = [0; i2c_packet::HEADER_LEN];
+        self.transfer_read(&mut header)?;
+        let (kind, len) = i2c_packet::decode(&header).map_err(std::io::Error::other)?;
+        if kind == i2c_packet::IDLE {
+            return Ok(None);
+        }
+        if len == 0 {
+            return Err("empty non-idle I2C v2 packet".into());
+        }
+        let mut frame = vec![0; i2c_packet::HEADER_LEN + len];
+        self.transfer_read(&mut frame)?;
+        if frame[..i2c_packet::HEADER_LEN] != header {
+            return Err("I2C v2 packet changed after peek".into());
+        }
+        let (kind, payload) = i2c_packet::packet(&frame).map_err(std::io::Error::other)?;
+        if kind != i2c_packet::DATA {
+            return Err("unexpected I2C v2 command/error response".into());
+        }
+        Ok(Some(payload.to_vec()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_v2(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.ensure_v2()?;
+        let header =
+            i2c_packet::header(i2c_packet::DATA, payload.len()).map_err(std::io::Error::other)?;
+        let mut frame = Vec::with_capacity(header.len() + payload.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(payload);
+        self.transfer_write(&frame)
     }
 
     #[cfg(target_os = "linux")]
@@ -1692,7 +1762,12 @@ impl I2cComms {
     #[cfg(target_os = "linux")]
     fn transfer_write(&mut self, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         if let Some(simulated) = self.simulated.as_mut() {
-            simulated.write_all(&[b'W'])?;
+            if self.protocol_version == 2 {
+                simulated.write_all(&[b'w'])?;
+                simulated.write_all(&(data.len() as u16).to_le_bytes())?;
+            } else {
+                simulated.write_all(&[b'W'])?;
+            }
             simulated.write_all(data)?;
             simulated.flush()?;
             let mut status = [0u8; 1];
@@ -1714,7 +1789,12 @@ impl I2cComms {
     #[cfg(target_os = "linux")]
     fn transfer_read(&mut self, data: &mut [u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         if let Some(simulated) = self.simulated.as_mut() {
-            simulated.write_all(&[b'R'])?;
+            if self.protocol_version == 2 {
+                simulated.write_all(&[b'r'])?;
+                simulated.write_all(&(data.len() as u16).to_le_bytes())?;
+            } else {
+                simulated.write_all(&[b'R'])?;
+            }
             simulated.flush()?;
             simulated.read_exact(data)?;
             return Ok(());
@@ -1748,20 +1828,48 @@ impl I2cComms {
 }
 
 impl CommsDevice for I2cComms {
+    fn receive_budget_exhausted(&self) -> bool {
+        self.rx_budget_exhausted
+    }
     fn recv_packet(
         &mut self,
         router: &Router,
         packet_tap: &mut dyn FnMut(&Packet),
     ) -> TelemetryResult<()> {
+        self.rx_budget_exhausted = false;
         let side_id = self
             .side_id
             .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
 
         #[cfg(target_os = "linux")]
         {
-            for _ in 0..i2c_rx_poll_burst() {
+            if self.protocol_version == 2 {
+                for index in 0..i2c_rx_poll_burst() {
+                    match self.read_v2() {
+                        Ok(Some(payload)) => {
+                            self.rx_budget_exhausted = index + 1 == i2c_rx_poll_burst();
+                            queue_uart_router_payload(
+                                router,
+                                side_id,
+                                &payload,
+                                &SerialProtocol::RawUart,
+                                packet_tap,
+                            )?;
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            self.v2_ready = false;
+                            eprintln!("I2C v2 receive failed: {err}");
+                            return Err(TelemetryError::HandlerError("I2C v2 receive failed"));
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            for index in 0..i2c_rx_poll_burst() {
                 match self.read_slot() {
                     Ok(Some(slot)) => {
+                        self.rx_budget_exhausted = index + 1 == i2c_rx_poll_burst();
                         let assembled = match self.ingest_rx_slot(slot) {
                             Ok(assembled) => assembled,
                             Err(err) => {
@@ -1816,6 +1924,13 @@ impl CommsDevice for I2cComms {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(target_os = "linux")]
         {
+            if self.protocol_version == 2 {
+                let result = self.write_v2(payload);
+                if result.is_err() {
+                    self.v2_ready = false;
+                }
+                return result;
+            }
             let framed = build_raw_uart_frame(payload)?;
             self.write_payload(I2C_KIND_DATA, &framed)
         }
@@ -2989,4 +3104,108 @@ fn can_write_frame(fd: RawFd, frame: &CanFrame) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod i2c_v2_transaction_tests {
+    use super::*;
+    fn mock_bus(socket: UnixStream) -> I2cComms {
+        I2cComms {
+            rx_budget_exhausted: false,
+            protocol_version: 2,
+            v2_ready: false,
+            inner: None,
+            simulated: Some(socket),
+            side_id: None,
+            addr: 0x55,
+            chunk_delay: Duration::ZERO,
+            initial_wait: Duration::ZERO,
+            tx_transfer_id: 1,
+            rx_assembly: None,
+        }
+    }
+    #[test]
+    fn complete_packets_cross_variable_transactions_without_padding_or_batching() {
+        for len in [1, 35, 128, 1024, i2c_packet::MAX_PAYLOAD] {
+            let (client, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let fixture = vec![0xA5; len];
+            let expected = fixture.clone();
+            let server = std::thread::spawn(move || {
+                let mut mailbox = i2c_packet::Mailbox::new();
+                mailbox.stage(i2c_packet::DATA, &expected).unwrap();
+                let mut data_writes = 0;
+                let mut body_reads = 0;
+                let mut read_lengths = Vec::new();
+                loop {
+                    let mut op = [0; 1];
+                    if peer.read_exact(&mut op).is_err() {
+                        break;
+                    }
+                    let mut length = [0; 2];
+                    peer.read_exact(&mut length).unwrap();
+                    let n = u16::from_le_bytes(length) as usize;
+                    match op[0] {
+                        b'w' => {
+                            let mut bytes = vec![0; n];
+                            peer.read_exact(&mut bytes).unwrap();
+                            if bytes != i2c_packet::SELECT {
+                                assert_eq!(
+                                    i2c_packet::packet(&bytes).unwrap(),
+                                    (i2c_packet::DATA, &expected[..])
+                                );
+                                data_writes += 1;
+                            }
+                            peer.write_all(&[0]).unwrap();
+                        }
+                        b'r' => {
+                            read_lengths.push(n);
+                            let mut bytes = mailbox.header().to_vec();
+                            if n > 4 {
+                                bytes.extend_from_slice(mailbox.payload());
+                                body_reads += 1;
+                            }
+                            assert_eq!(bytes.len(), n);
+                            peer.write_all(&bytes).unwrap();
+                            if n > 4 {
+                                mailbox.complete_body(true);
+                            }
+                        }
+                        _ => panic!("unexpected operation"),
+                    }
+                }
+                assert_eq!(data_writes, 1);
+                assert_eq!(body_reads, 1);
+                assert_eq!(read_lengths, vec![4, 4, 4 + len, 4]);
+            });
+            let mut bus = mock_bus(client);
+            bus.write_v2(&fixture).unwrap();
+            assert_eq!(bus.read_v2().unwrap(), Some(fixture));
+            assert_eq!(bus.read_v2().unwrap(), None);
+            drop(bus);
+            server.join().unwrap();
+        }
+    }
+    #[test]
+    fn legacy_peer_is_rejected_before_sending_data() {
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut select = [0; 7];
+            peer.read_exact(&mut select).unwrap();
+            assert_eq!(&select, &[b'w', 4, 0, 0xD2, 0, 0, 0]);
+            peer.write_all(&[0]).unwrap();
+            let mut read = [0; 3];
+            peer.read_exact(&mut read).unwrap();
+            peer.write_all(&[0x49, 0x32, 1, 1]).unwrap();
+        });
+        let mut bus = mock_bus(client);
+        assert!(
+            bus.write_v2(b"must not send")
+                .unwrap_err()
+                .to_string()
+                .contains("firmware required")
+        );
+        assert!(!bus.v2_ready);
+        server.join().unwrap();
+    }
 }

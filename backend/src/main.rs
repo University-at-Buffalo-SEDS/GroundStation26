@@ -292,6 +292,7 @@ mod router_link_policy_tests {
     fn pico_fi_i2c_uses_transport_delivery_without_hop_retries() {
         let link = CommsLinkConfig::I2c {
             i2c: crate::comms_config::I2cLinkConfig {
+                protocol_version: 1,
                 bus: 1,
                 addr: 0x17,
                 chunk_delay_ms: 1,

@@ -50,6 +50,9 @@ pub struct CanLinkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct I2cLinkConfig {
+    /// 1 = legacy slots; 2 = complete packets (requires updated Pico firmware).
+    #[serde(default = "default_i2c_protocol_version")]
+    pub protocol_version: u8,
     #[serde(default = "default_i2c_bus")]
     pub bus: u8,
     #[serde(default = "default_i2c_addr")]
@@ -96,6 +99,10 @@ pub struct CommsLinksConfig {
     pub version: u32,
     pub av_bay: CommsLinkConfig,
     pub fill_box: CommsLinkConfig,
+}
+
+fn default_i2c_protocol_version() -> u8 {
+    1
 }
 
 fn default_config_version() -> u32 {
@@ -419,6 +426,7 @@ mod tests {
     fn fill_simulator_override_preserves_gateway_uart_baud_rate() {
         let mut fill = CommsLinkConfig::I2c {
             i2c: I2cLinkConfig {
+                protocol_version: 1,
                 bus: 1,
                 addr: 0x55,
                 chunk_delay_ms: 0,
@@ -477,6 +485,7 @@ mod tests {
         };
         let i2c = CommsLinkConfig::I2c {
             i2c: I2cLinkConfig {
+                protocol_version: 1,
                 bus: 1,
                 addr: 0x55,
                 chunk_delay_ms: 0,
