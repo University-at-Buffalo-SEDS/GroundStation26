@@ -498,13 +498,64 @@ pub fn selected_kg50_value(input: Kg50Input, data_type: &str, values: &[Option<f
     }.filter(|v| v.is_finite())
 }
 
+/// A UI save is explicitly scoped to one calibration channel. Everything else
+/// comes from the authoritative current file, never the client's cached copy.
+#[derive(Debug, Deserialize)]
+pub struct CalibrationUpdate {
+    pub channel: String,
+    pub calibration: LoadcellCalibrationFile,
+}
+
+pub fn merge_channel_update(current: &LoadcellCalibrationFile, update: &CalibrationUpdate) -> Result<LoadcellCalibrationFile, String> {
+    let channel = update.channel.as_str();
+    let sensor = match channel {
+        "ch1" => "KG1000", "kg50" => "KG50", "iadc" => "IADC",
+        _ => return Err("Unknown calibration channel".into()),
+    };
+    if channel == "kg50" && update.calibration.kg50_input != current.kg50_input {
+        return Err("50 kg input changed; reload calibration before saving".into());
+    }
+    let incoming = &update.calibration;
+    let mut result = current.clone();
+    // An omitted selected channel means an explicit reset. Keep an empty entry
+    // so normalization cannot resurrect its old legacy slope, zero or points.
+    result.extra_channels.insert(channel.into(), incoming.extra_channels.get(channel).cloned().unwrap_or_default());
+    result.thermal.remove(sensor);
+    if let Some(value) = incoming.thermal.get(sensor) { result.thermal.insert(sensor.into(), value.clone()); }
+    result.noise.remove(sensor);
+    if let Some(value) = incoming.noise.get(sensor) { result.noise.insert(sensor.into(), value.clone()); }
+    result.temperature_captures.remove(sensor);
+    if let Some(value) = incoming.temperature_captures.get(sensor) { result.temperature_captures.insert(sensor.into(), value.clone()); }
+    // Make the selected authoritative generic channel agree with legacy fields
+    // before migration normalization (including explicit zero/fit removal).
+    sync_extra_channels_into_legacy(&mut result);
+    normalize_calibration(&mut result);
+    validate_thermal(&result)?;
+    Ok(result)
+}
+
 pub fn save(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
-    let path = calibration_path();
+    save_at(cfg, &calibration_path())
+}
+
+fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all({parent:?}): {e}"))?;
     }
     let raw =
         serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize calibration: {e}"))?;
+    if let Ok(previous) = std::fs::read(&path) {
+        if previous == raw.as_bytes() { return Ok(()); }
+        let backups = path.parent().unwrap_or(std::path::Path::new(".")).join("calibration_backups");
+        std::fs::create_dir_all(&backups).map_err(|e| format!("create calibration backups: {e}"))?;
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?.as_nanos();
+        let backup = backups.join(format!("{}-{stamp}.json", path.file_stem().unwrap_or_default().to_string_lossy()));
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&backup)
+            .map_err(|e| format!("create calibration backup: {e}"))?;
+        file.write_all(&previous).map_err(|e| format!("save calibration backup: {e}"))?;
+    }
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, raw).map_err(|e| format!("write calibration {path:?}: {e}"))?;
     std::fs::rename(&temporary, &path).map_err(|e| format!("replace calibration {path:?}: {e}"))?;
@@ -1592,5 +1643,62 @@ mod kg50_input_tests {
         assert_eq!(selected_kg50_value(Kg50Input::Amp2, "DAQ_KG50_SELECTED", &[Some(1.0),Some(2.0)]), None);
         assert_eq!(selected_kg50_value(Kg50Input::P6Differential, "DAQ_KG50_SELECTED", &[Some(1.0),Some(0.02)]), Some(0.02));
         assert_eq!(selected_kg50_value(Kg50Input::P6Differential, "DAQ_KG50_SELECTED", &[Some(0.0),Some(0.02)]), None);
+    }
+}
+
+#[cfg(test)]
+mod channel_save_tests {
+    use super::*;
+    fn json(cfg: &LoadcellCalibrationFile) -> serde_json::Value { serde_json::to_value(cfg).unwrap() }
+    #[test]
+    fn stale_save_and_reset_preserve_the_other_loadcell_in_both_directions() {
+        let mut current = LoadcellCalibrationFile::default();
+        normalize_calibration(&mut current);
+        current.extra_channels.get_mut("ch1").unwrap().linear.m = Some(1234.0);
+        current.extra_channels.get_mut("ch1").unwrap().zero_raw = Some(0.03);
+        current.extra_channels.get_mut("ch1").unwrap().points.push(CalibrationPoint { expected: 8.0, raw: 0.04 });
+        current.thermal.insert("KG1000".into(), ThermalCalibration::default());
+        sync_extra_channels_into_legacy(&mut current);
+        let original = json(&current);
+        let mut stale = LoadcellCalibrationFile::default();
+        normalize_calibration(&mut stale);
+        stale.extra_channels.get_mut("kg50").unwrap().linear.m = Some(5678.0);
+        let saved = merge_channel_update(&current, &CalibrationUpdate { channel: "kg50".into(), calibration: stale }).unwrap();
+        assert_eq!(json(&saved)["extra_channels"]["ch1"], original["extra_channels"]["ch1"]);
+        assert_eq!(json(&saved)["thermal"]["KG1000"], original["thermal"]["KG1000"]);
+        assert_eq!(saved.ch1.m, Some(1234.0));
+        assert_eq!(saved.extra_channels["kg50"].linear.m, Some(5678.0));
+        let reset = merge_channel_update(&saved, &CalibrationUpdate { channel: "ch1".into(), calibration: LoadcellCalibrationFile::default() }).unwrap();
+        assert_eq!(json(&reset)["extra_channels"]["kg50"], json(&saved)["extra_channels"]["kg50"]);
+        assert!(reset.ch1.m.is_none() && reset.ch1_zero_raw.is_none() && reset.points_ch1.is_empty());
+    }
+    #[test]
+    fn saving_backs_up_the_previous_file_and_unchanged_saves_do_not_add_backups() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("gs-calibration-backup-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("calibration.json");
+        let mut cfg = LoadcellCalibrationFile::default();
+        save_at(&cfg, &path).unwrap();
+        let previous = std::fs::read(&path).unwrap();
+        cfg.ch1.m = Some(100.0);
+        save_at(&cfg, &path).unwrap();
+        let backups: Vec<_> = std::fs::read_dir(dir.join("calibration_backups")).unwrap().collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(backups[0].as_ref().unwrap().path()).unwrap(), previous);
+        save_at(&cfg, &path).unwrap();
+        assert_eq!(std::fs::read_dir(dir.join("calibration_backups")).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn unscoped_save_is_rejected_and_source_guard_applies_only_to_kg50() {
+        assert!(serde_json::from_value::<CalibrationUpdate>(json(&LoadcellCalibrationFile::default())).is_err());
+        let mut current = LoadcellCalibrationFile::default();
+        switch_kg50_input(&mut current, Kg50Input::P6Differential);
+        let stale = LoadcellCalibrationFile::default();
+        assert!(merge_channel_update(&current, &CalibrationUpdate { channel: "kg50".into(), calibration: stale.clone() }).is_err());
+        let saved = merge_channel_update(&current, &CalibrationUpdate { channel: "ch1".into(), calibration: stale }).unwrap();
+        assert_eq!(saved.kg50_input, Kg50Input::P6Differential);
+        assert_eq!(json(&saved)["kg50_input_profiles"], json(&current)["kg50_input_profiles"]);
     }
 }

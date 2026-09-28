@@ -661,12 +661,13 @@ fn publish_daq_calibration(
         .map_err(|error| format!("publish DAQ calibration: {error}"))
 }
 
-/// Replaces the loadcell calibration file in memory and on disk.
+/// Saves only the explicitly selected channel; unscoped snapshot replacement
+/// is rejected by deserialization, including requests from older frontends.
 async fn set_loadcell_calibration(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(mut cfg): Json<loadcell::LoadcellCalibrationFile>,
-) -> impl IntoResponse {
+    Json(update): Json<loadcell::CalibrationUpdate>,
+) -> axum::response::Response {
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -674,24 +675,18 @@ async fn set_loadcell_calibration(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
-    {
-        let current = state.loadcell_calibration.lock().unwrap();
-        if cfg.kg50_input != current.kg50_input {
-            return (StatusCode::CONFLICT, "50 kg input changed; reload calibration before saving").into_response();
+    let cfg = {
+        let mut current = state.loadcell_calibration.lock().unwrap();
+        let cfg = match loadcell::merge_channel_update(&current, &update) {
+            Ok(cfg) => cfg,
+            Err(err) => return (StatusCode::CONFLICT, err).into_response(),
+        };
+        if let Err(err) = loadcell::save(&cfg) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
         }
-        cfg.kg50_input_profiles = current.kg50_input_profiles.clone();
-    }
-    if let Err(err) = loadcell::validate_thermal(&cfg) {
-        return (StatusCode::BAD_REQUEST, err).into_response();
-    }
-    loadcell::normalize_calibration(&mut cfg);
-    {
-        let mut slot = state.loadcell_calibration.lock().unwrap();
-        *slot = cfg.clone();
-    }
-    if let Err(err) = loadcell::save(&cfg) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
-    }
+        *current = cfg.clone();
+        cfg
+    };
     if let Err(err) = publish_daq_calibration(&state, &cfg) {
         return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
     }
