@@ -200,6 +200,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
             "/api/calibration",
             get(get_loadcell_calibration).post(set_loadcell_calibration),
         )
+        .route("/api/calibration/kg50_input", post(set_kg50_input))
         .route("/api/calibration/long_zero", get(long_zero_status).post(long_zero_start))
         .route("/api/calibration/long_zero/stop", post(long_zero_stop))
         .route("/api/calibration/long_zero/apply", post(long_zero_apply))
@@ -673,6 +674,13 @@ async fn set_loadcell_calibration(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    {
+        let current = state.loadcell_calibration.lock().unwrap();
+        if cfg.kg50_input != current.kg50_input {
+            return (StatusCode::CONFLICT, "50 kg input changed; reload calibration before saving").into_response();
+        }
+        cfg.kg50_input_profiles = current.kg50_input_profiles.clone();
+    }
     if let Err(err) = loadcell::validate_thermal(&cfg) {
         return (StatusCode::BAD_REQUEST, err).into_response();
     }
@@ -688,6 +696,48 @@ async fn set_loadcell_calibration(
         return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
     }
     state.broadcast_fill_targets_snapshot();
+    Json(cfg).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct Kg50InputRequest { input: loadcell::Kg50Input }
+
+async fn set_kg50_input(
+    State(state): State<Arc<AppState>>, headers: HeaderMap,
+    Json(req): Json<Kg50InputRequest>,
+) -> axum::response::Response {
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(p) => p, Err(r) => return r,
+    };
+    if !principal_can_edit_calibration(&principal) { return calibration_edit_forbidden_response(); }
+    if state.loadcell_processing.status().running {
+        return (StatusCode::CONFLICT, "Stop the zero capture before changing input").into_response();
+    }
+    if state.recording_status_snapshot().mode != crate::telemetry_db::RecordingModeWire::Idle {
+        return (StatusCode::CONFLICT, "Stop recording before changing the physical load-cell input").into_response();
+    }
+    let mut cfg = state.loadcell_calibration.lock().unwrap().clone();
+    if cfg.kg50_input == req.input {
+        if let Err(err) = publish_daq_calibration(&state, &cfg) { return (StatusCode::SERVICE_UNAVAILABLE, err).into_response(); }
+        return Json(cfg).into_response();
+    }
+    loadcell::switch_kg50_input(&mut cfg, req.input);
+    if let Err(err) = loadcell::save(&cfg) { return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(); }
+    *state.loadcell_calibration.lock().unwrap() = cfg.clone();
+    state.loadcell_processing.reset_kg50_input();
+    state.auto_zero.lock().unwrap().reset_kg50_input();
+    state.recent_telemetry_cache.lock().unwrap().retain(|r| !matches!(r.data_type.as_str(), "KG50" | "LOADCELL_50_WEIGHT_KG" | "LOADCELL_FILL_PERCENT"));
+    *state.latest_fill_mass_kg.lock().unwrap() = None;
+    state.gse.lock().unwrap().observe_mass(None);
+    for data_type in ["KG50", "LOADCELL_50_WEIGHT_KG", "LOADCELL_FILL_PERCENT"] {
+        let row = crate::types::TelemetryRow { timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+            data_type: data_type.into(), sender_id: "DAQ".into(), values: vec![None] };
+        state.cache_recent_telemetry(row.clone());
+        let _ = state.ws_tx.send(row);
+    }
+    if let Err(err) = publish_daq_calibration(&state, &cfg) {
+        return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
+    }
     Json(cfg).into_response()
 }
 

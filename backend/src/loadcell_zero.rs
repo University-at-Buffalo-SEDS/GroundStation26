@@ -236,6 +236,16 @@ pub struct Service {
     filters: Mutex<BTreeMap<String, Filter>>,
 }
 impl Service {
+    pub fn reset_kg50_input(&self) {
+        self.filters.lock().unwrap().remove("KG50");
+        let mut slot = self.session.lock().unwrap();
+        if slot.as_ref().is_some_and(|s| s.status.lock().unwrap().sensor_id == "KG50") {
+            // Source switching is rejected while capture is running. Retain the
+            // CSV on disk but prevent applying an old-source completed report.
+            *slot = None;
+        }
+    }
+
     pub fn status(&self) -> Status {
         self.session
             .lock()

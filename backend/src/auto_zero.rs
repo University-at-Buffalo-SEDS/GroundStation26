@@ -43,6 +43,11 @@ fn path() -> std::path::PathBuf {
         })
 }
 impl Runtime {
+    pub fn reset_kg50_input(&mut self) {
+        self.cancel();
+        self.kg50.clear();
+    }
+
     pub fn pending(&self) -> bool {
         self.pending
     }

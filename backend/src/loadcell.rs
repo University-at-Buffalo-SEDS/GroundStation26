@@ -110,8 +110,28 @@ pub struct GenericCalibrationChannel {
     pub fit: Option<FitMeta>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kg50Input { #[default] Amp2, P6Differential }
+impl Kg50Input {
+    pub fn wire(self) -> u8 { if self == Self::P6Differential { 1 } else { 0 } }
+    fn key(self) -> &'static str { if self == Self::P6Differential { "p6_differential" } else { "amp2" } }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Kg50InputProfile {
+    channel: Option<GenericCalibrationChannel>,
+    thermal: Option<ThermalCalibration>,
+    noise: Option<NoiseCalibration>,
+    captures: Vec<TemperatureCapture>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadcellCalibrationFile {
+    #[serde(default)]
+    pub kg50_input: Kg50Input,
+    #[serde(default)]
+    pub kg50_input_profiles: BTreeMap<String, Kg50InputProfile>,
     #[serde(default)]
     pub noise: BTreeMap<String, NoiseCalibration>,
     /// Captured ADC temperature and original raw value, retained with each cal point.
@@ -148,6 +168,8 @@ pub struct LoadcellCalibrationFile {
 impl Default for LoadcellCalibrationFile {
     fn default() -> Self {
         Self {
+            kg50_input: Kg50Input::default(),
+            kg50_input_profiles: BTreeMap::new(),
             noise: BTreeMap::new(),
             temperature_captures: BTreeMap::new(),
             thermal: BTreeMap::new(),
@@ -430,13 +452,50 @@ fn sync_extra_channels_into_legacy(cfg: &mut LoadcellCalibrationFile) {
 }
 
 pub fn normalize_calibration(cfg: &mut LoadcellCalibrationFile) {
+    if cfg.kg50_input == Kg50Input::Amp2 {
     cfg.extra_channels.entry("kg50".into()).or_insert_with(|| GenericCalibrationChannel {
         linear: ChannelLinear { m: Some(1.0), b: Some(0.0) },
         ..Default::default()
     });
+    }
     sync_legacy_channels_into_extra(cfg);
     sync_extra_channels_into_legacy(cfg);
     update_weights_kg(cfg);
+}
+
+/// Switch calibration coordinates with the physical input, retaining both profiles.
+pub fn switch_kg50_input(cfg: &mut LoadcellCalibrationFile, input: Kg50Input) {
+    if input == cfg.kg50_input { return; }
+    let previous = Kg50InputProfile {
+        channel: cfg.extra_channels.remove("kg50"),
+        thermal: cfg.thermal.remove("KG50"),
+        noise: cfg.noise.remove("KG50"),
+        captures: cfg.temperature_captures.remove("KG50").unwrap_or_default(),
+    };
+    cfg.kg50_input_profiles.insert(cfg.kg50_input.key().into(), previous);
+    let next = cfg.kg50_input_profiles.remove(input.key()).unwrap_or_default();
+    if let Some(v) = next.channel { cfg.extra_channels.insert("kg50".into(), v); }
+    if let Some(v) = next.thermal { cfg.thermal.insert("KG50".into(), v); }
+    if let Some(v) = next.noise { cfg.noise.insert("KG50".into(), v); }
+    cfg.temperature_captures.insert("KG50".into(), next.captures);
+    cfg.kg50_input = input;
+    normalize_calibration(cfg);
+}
+
+/// DAQ's legacy calibration packets apply only to physical AMP2 SD records.
+/// P6 SD records keep differential volts; its mass calibration is backend-owned.
+pub fn amp2_calibration(cfg: &LoadcellCalibrationFile) -> LoadcellCalibrationFile {
+    let mut result = cfg.clone();
+    switch_kg50_input(&mut result, Kg50Input::Amp2);
+    result
+}
+
+pub fn selected_kg50_value(input: Kg50Input, data_type: &str, values: &[Option<f32>]) -> Option<f32> {
+    match (input, data_type) {
+        (Kg50Input::Amp2, "KG50") => values.first().copied().flatten(),
+        (Kg50Input::P6Differential, "DAQ_KG50_SELECTED") if values.first() == Some(&Some(1.0)) => values.get(1).copied().flatten(),
+        _ => None,
+    }.filter(|v| v.is_finite())
 }
 
 pub fn save(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
@@ -1169,7 +1228,7 @@ pub fn calibrated_weight_kg(
     match sensor_id {
         "KG1000" => calibrated_channel_value(cfg, "ch1", raw),
         "KG50" => calibrated_channel_value(cfg, "kg50", raw).or_else(|| {
-            (!cfg.extra_channels.contains_key("kg50")).then_some(raw)
+            (cfg.kg50_input == Kg50Input::Amp2 && !cfg.extra_channels.contains_key("kg50")).then_some(raw)
         }),
         _ => None,
     }
@@ -1503,4 +1562,35 @@ pub struct NoiseCalibration {
     pub residual_sigma_raw: f32,
     pub tau_ms: f32,
     pub session_id: String,
+}
+
+#[cfg(test)]
+mod kg50_input_tests {
+    use super::*;
+    #[test]
+    fn source_switch_preserves_calibration_and_requires_new_p6_fit() {
+        let mut cfg = LoadcellCalibrationFile::default();
+        normalize_calibration(&mut cfg);
+        cfg.extra_channels.get_mut("kg50").unwrap().linear.m = Some(123.0);
+        switch_kg50_input(&mut cfg, Kg50Input::P6Differential);
+        assert_eq!(calibrated_weight_kg(&cfg, "KG50", 0.01), None);
+        normalize_calibration(&mut cfg);
+        assert_eq!(calibrated_weight_kg(&cfg, "KG50", 0.01), None);
+        assert_eq!(amp2_calibration(&cfg).extra_channels["kg50"].linear.m, Some(123.0));
+        cfg.extra_channels.insert("kg50".into(), GenericCalibrationChannel { linear: ChannelLinear { m: Some(1000.0), b: Some(0.0) }, ..Default::default() });
+        switch_kg50_input(&mut cfg, Kg50Input::Amp2);
+        assert_eq!(cfg.extra_channels["kg50"].linear.m, Some(123.0));
+        switch_kg50_input(&mut cfg, Kg50Input::P6Differential);
+        assert_eq!(calibrated_weight_kg(&cfg, "KG50", 0.01), Some(10.0));
+        let restored: LoadcellCalibrationFile = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(restored.kg50_input, Kg50Input::P6Differential);
+    }
+    #[test]
+    fn late_packets_from_other_input_are_not_relabelled() {
+        assert_eq!(selected_kg50_value(Kg50Input::Amp2, "KG50", &[Some(2.0)]), Some(2.0));
+        assert_eq!(selected_kg50_value(Kg50Input::P6Differential, "KG50", &[Some(2.0)]), None);
+        assert_eq!(selected_kg50_value(Kg50Input::Amp2, "DAQ_KG50_SELECTED", &[Some(1.0),Some(2.0)]), None);
+        assert_eq!(selected_kg50_value(Kg50Input::P6Differential, "DAQ_KG50_SELECTED", &[Some(1.0),Some(0.02)]), Some(0.02));
+        assert_eq!(selected_kg50_value(Kg50Input::P6Differential, "DAQ_KG50_SELECTED", &[Some(0.0),Some(0.02)]), None);
+    }
 }

@@ -121,6 +121,7 @@ pub fn initialize(router: &Router) -> Result<()> {
         "DAQ_LOG_CLOCK",
         "DAQ_THERMAL_CALIBRATION",
         "DAQ_FILTER_CALIBRATION",
+        "DAQ_KG50_INPUT",
     ] {
         router.enable_network_variable(
             crate::telemetry_schema::data_type(data_type),
@@ -174,7 +175,9 @@ pub fn initialize(router: &Router) -> Result<()> {
         u8::from(flight_buzzer_enabled()),
     )?)?;
     router.seed_managed_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?)?;
-    let calibration = crate::loadcell::load_or_default();
+    let selected = crate::loadcell::load_or_default();
+    router.seed_managed_variable(packet("DAQ_KG50_INPUT", "SD_CARD", selected.kg50_input.wire())?)?;
+    let calibration = crate::loadcell::amp2_calibration(&selected);
     router.seed_managed_variable(calibration_packet(&calibration)?)?;
     router.seed_managed_variable(kg50_calibration_packet(&calibration)?)?;
     router.seed_managed_variable(cached_daq_log_clock_packet()?)?;
@@ -304,6 +307,9 @@ pub fn set_daq_calibration(
     router: &Router,
     cfg: &crate::loadcell::LoadcellCalibrationFile,
 ) -> Result<()> {
+    let selected_input = cfg.kg50_input;
+    let amp2 = crate::loadcell::amp2_calibration(cfg);
+    let cfg = &amp2;
     let thermal = thermal_packet(cfg)?;
     let filter = filter_packet(cfg)?;
     let kg50 = kg50_calibration_packet(cfg)?;
@@ -311,6 +317,7 @@ pub fn set_daq_calibration(
     router.set_network_variable(kg50)?;
     router.set_network_variable(thermal)?;
     router.set_network_variable(filter)?;
+    router.set_network_variable(packet("DAQ_KG50_INPUT", "SD_CARD", selected_input.wire())?)?;
     Ok(())
 }
 

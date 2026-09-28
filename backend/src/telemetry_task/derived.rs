@@ -793,6 +793,12 @@ pub(super) fn telemetry_rows_from_packet_values(
     sender_id: &str,
     mut values: Vec<Option<f32>>,
 ) -> Vec<(String, Vec<Option<f32>>)> {
+    if matches!(&*pkt.data_type().as_str(), "KG50" | "DAQ_KG50_SELECTED") {
+        if sender_id != "DAQ" { return Vec::new(); }
+        let input = state.loadcell_calibration.lock().unwrap().kg50_input;
+        return loadcell::selected_kg50_value(input, &pkt.data_type().as_str(), &values)
+            .map(|value| vec![("KG50".into(), vec![Some(value)])]).unwrap_or_default();
+    }
     match pkt.data_type() {
         ty if ty == crate::telemetry_schema::data_type("GPS_DATA") => {
             values = normalized_gps_values(state, sender_id, &values);
