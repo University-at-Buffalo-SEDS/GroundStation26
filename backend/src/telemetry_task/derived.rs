@@ -93,9 +93,15 @@ pub(super) fn push_battery_sample_and_compute_drop_rate(
     voltage: f32,
     window_ms: i64,
 ) -> (f32, Option<f32>) {
+    // An unavailable ADC value must never seed an EMA: its next clamp would
+    // panic with NaN bounds and terminate the entire telemetry worker.
+    if !voltage.is_finite() { return (f32::NAN, None); }
     let by_source = BATTERY_ESTIMATOR_STATE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = by_source.lock().unwrap();
     let state = map.entry(source_id.to_string()).or_default();
+    if state.ema_voltage.is_some_and(|v| !v.is_finite()) {
+        *state = BatteryEstimatorState::default();
+    }
 
     let dt_s = state
         .last_remaining_ts_ms
@@ -484,6 +490,7 @@ pub(super) async fn emit_derived_battery_rows(
     voltage: f32,
     payload_json: &str,
 ) {
+    if !voltage.is_finite() { return; }
     let cfg = battery_layout_cfg().clone();
     if cfg.sources.is_empty() {
         return;
@@ -760,14 +767,17 @@ pub(super) fn f32_values_from_payload_bytes(bytes: &[u8]) -> Option<Vec<Option<f
     Some(
         bytes
             .chunks_exact(size_of::<f32>())
-            .map(|chunk| Some(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
+            .map(|chunk| {
+                let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                value.is_finite().then_some(value)
+            })
             .collect(),
     )
 }
 
 pub(super) fn telemetry_f32_values(pkt: &Packet) -> Option<Vec<Option<f32>>> {
     match pkt.data_as_f32() {
-        Ok(values) => Some(values.into_iter().map(Some).collect()),
+        Ok(values) => Some(values.into_iter().map(|v| v.is_finite().then_some(v)).collect()),
         Err(_) if pkt.data_type() == crate::telemetry_schema::data_type("GPS_DATA") => {
             f32_values_from_payload_bytes(pkt.payload())
         }
@@ -927,7 +937,7 @@ pub(super) fn smooth_remaining_minutes(
     let by_source = BATTERY_ESTIMATOR_STATE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = by_source.lock().unwrap();
     let state = map.entry(source_id.to_string()).or_default();
-    let Some(raw_val) = raw else {
+    let Some(raw_val) = raw.filter(|v| v.is_finite()) else {
         state.ema_remaining_min = None;
         return None;
     };
@@ -936,10 +946,34 @@ pub(super) fn smooth_remaining_minutes(
         .last_ts_ms
         .map(|t0| (ts_ms.saturating_sub(t0) as f32 / 1000.0).clamp(0.0, 10.0))
         .unwrap_or(0.0);
-    let prev = state.ema_remaining_min.unwrap_or(raw_val);
+    let prev = state.ema_remaining_min.filter(|v| v.is_finite()).unwrap_or(raw_val);
     let max_step = REMAINING_MAX_STEP_MIN_PER_SEC * dt_s.max(0.02);
     let slewed = raw_val.clamp(prev - max_step, prev + max_step);
     let smoothed = prev + REMAINING_EMA_ALPHA * (slewed - prev);
     state.ema_remaining_min = Some(smoothed.max(0.0));
     state.ema_remaining_min
+}
+
+#[cfg(test)]
+mod invalid_analog_tests {
+    use super::*;
+    #[test]
+    fn unavailable_adc_values_do_not_poison_battery_estimator() {
+        let source = "invalid-analog-regression";
+        let (invalid, rate) = push_battery_sample_and_compute_drop_rate(source, 1000, f32::NAN, 60000);
+        assert!(invalid.is_nan() && rate.is_none());
+        let (valid, _) = push_battery_sample_and_compute_drop_rate(source, 2000, 12.0, 60000);
+        assert_eq!(valid, 12.0);
+        push_battery_sample_and_compute_drop_rate(source, 3000, f32::INFINITY, 60000);
+        let (valid, _) = push_battery_sample_and_compute_drop_rate(source, 4000, 12.0, 60000);
+        assert_eq!(valid, 12.0);
+        assert!(smooth_remaining_minutes(source, 1000, Some(f32::NAN)).is_none());
+        assert_eq!(smooth_remaining_minutes(source, 2000, Some(10.0)), Some(10.0));
+    }
+    #[test]
+    fn nonfinite_wire_values_are_missing_without_discarding_other_channels() {
+        let bytes: Vec<u8> = [f32::NAN, 0.0000277, f32::INFINITY, f32::NEG_INFINITY]
+            .into_iter().flat_map(f32::to_le_bytes).collect();
+        assert_eq!(f32_values_from_payload_bytes(&bytes), Some(vec![None, Some(0.0000277), None, None]));
+    }
 }

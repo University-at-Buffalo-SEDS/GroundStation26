@@ -320,6 +320,7 @@ pub async fn telemetry_task(
     heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_failed = false;
     let mut last_backpressure_log_ms: u64 = 0;
+    let mut packet_worker_failure_reported = false;
     let packet_work_queue_size = env_usize(
         "GS_PACKET_WORK_QUEUE_SIZE",
         PACKET_WORK_QUEUE_SIZE,
@@ -1113,10 +1114,13 @@ pub async fn telemetry_task(
                                 break;
                             }
                             Err(TrySendError::Closed(_)) => {
-                                emit_warning(
-                                    &state,
-                                    "Warning: telemetry processing worker stopped unexpectedly",
-                                );
+                                if !packet_worker_failure_reported {
+                                    emit_warning(
+                                        &state,
+                                        "Warning: telemetry processing worker stopped unexpectedly; restart backend",
+                                    );
+                                    packet_worker_failure_reported = true;
+                                }
                                 break;
                             }
                         }
