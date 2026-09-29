@@ -87,10 +87,17 @@ pub(super) fn spawn_comms_worker_threads(
     let worker_name = comms_handle.name;
     let comms = comms_handle.comms;
     let tx_worker_state = state.clone();
-    let tx_worker_comms = comms_handle
-        .tx_comms
-        .clone()
-        .unwrap_or_else(|| comms.clone());
+    // UART reads can wait for incoming bytes while a write drains a long
+    // frame. Independent handles keep either direction from holding up the
+    // other; I2C and other shared-bus transports retain their single lock.
+    let tx_worker_comms = if let Some(writer) = comms_handle.tx_comms.clone() {
+        writer
+    } else {
+        let writer = comms.lock().expect("failed to get lock").try_clone_tx()?;
+        writer
+            .map(|writer| Arc::new(Mutex::new(writer)))
+            .unwrap_or_else(|| comms.clone())
+    };
     let tx_worker = thread::Builder::new()
         .name(format!("{}_comms_tx", worker_name))
         .spawn(move || {

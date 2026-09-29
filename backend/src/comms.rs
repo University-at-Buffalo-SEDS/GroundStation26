@@ -91,6 +91,12 @@ const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GB", "VB", "AB", "DAQ"];
 //  Comms Device Trait
 // ======================================================================
 pub trait CommsDevice: Send {
+    /// An independent writer for full-duplex transports. Shared-bus devices
+    /// keep the default so reads and writes remain serialized.
+    fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
+        Ok(None)
+    }
+
     /// True only when the last bounded receive exhausted its work budget.
     fn receive_budget_exhausted(&self) -> bool {
         false
@@ -1359,6 +1365,27 @@ fn hex_preview(bytes: &[u8], limit: usize) -> String {
 }
 
 impl CommsDevice for UartComms {
+    fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
+        #[cfg(target_os = "linux")]
+        let inner = self
+            .inner
+            .try_clone_native()
+            .map_err(std::io::Error::other)?;
+        #[cfg(not(target_os = "linux"))]
+        let inner = self.inner.try_clone().map_err(std::io::Error::other)?;
+        Ok(Some(Box::new(Self {
+            inner,
+            side_id: self.side_id,
+            rx_buf: Vec::new(),
+            raw_uart_data_frames: VecDeque::new(),
+            radio_window_updates: VecDeque::new(),
+            protocol: self.protocol.clone(),
+            #[cfg(target_os = "linux")]
+            baud_rate: self.baud_rate,
+            slow_start_deadline: None,
+        })))
+    }
+
     /// Blocking receive of one Packet
     fn recv_packet(
         &mut self,
@@ -3207,5 +3234,40 @@ mod i2c_v2_transaction_tests {
         );
         assert!(!bus.v2_ready);
         server.join().unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod uart_duplex_tests {
+    use super::*;
+
+    #[test]
+    fn cloned_uart_writer_sends_while_receive_handle_is_locked() {
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_secs(2)).unwrap();
+        let receiver = UartComms {
+            #[cfg(target_os = "linux")]
+            inner: port,
+            #[cfg(not(target_os = "linux"))]
+            inner: Box::new(port),
+            side_id: None,
+            rx_buf: Vec::new(),
+            raw_uart_data_frames: VecDeque::new(),
+            radio_window_updates: VecDeque::new(),
+            protocol: SerialProtocol::PacketFramed,
+            #[cfg(target_os = "linux")]
+            baud_rate: 57600,
+            slow_start_deadline: None,
+        };
+        let receiver = std::sync::Mutex::new(receiver);
+        let receive_guard = receiver.lock().unwrap();
+        let mut writer = receive_guard.try_clone_tx().unwrap().unwrap();
+        let send = std::thread::spawn(move || writer.send_data(&[1, 2, 3]).unwrap());
+        let mut wire = [0; 5];
+        let result = peer.read_exact(&mut wire);
+        drop(receive_guard);
+        send.join().unwrap();
+        result.unwrap();
+        assert_eq!(wire, [3, 0, 1, 2, 3]);
     }
 }
