@@ -41,8 +41,26 @@ fn backlog_push(backlog: &mut PriorityBacklog, priority: u8, payload: Vec<u8>, f
     }
 }
 
-fn backlog_pop(backlog: &mut PriorityBacklog) -> Option<(u8, Vec<u8>)> {
-    let priority = backlog.last_key_value().map(|(priority, _)| *priority)?;
+// Discovery and variable refreshes use priorities 254/255. Reserve one turn
+// after eight control frames for queued application traffic; otherwise a
+// continuous control backlog can outlive an ordered command's retry window.
+const MAX_CONTROL_BURST: usize = 8;
+fn backlog_pop(backlog: &mut PriorityBacklog, control_streak: &mut usize) -> Option<(u8, Vec<u8>)> {
+    let highest = backlog.last_key_value().map(|(priority, _)| *priority)?;
+    let priority = if *control_streak >= MAX_CONTROL_BURST {
+        backlog
+            .range(..254)
+            .next_back()
+            .map(|(priority, _)| *priority)
+            .unwrap_or(highest)
+    } else {
+        highest
+    };
+    if priority >= 254 {
+        *control_streak = control_streak.saturating_add(1);
+    } else {
+        *control_streak = 0;
+    }
     let queue = backlog.get_mut(&priority).expect("priority just selected");
     let payload = queue.pop_front();
     if queue.is_empty() {
@@ -56,17 +74,45 @@ mod priority_tests {
     use super::*;
 
     #[test]
+    fn control_flood_cannot_starve_queued_commands() {
+        let mut backlog = PriorityBacklog::new();
+        let mut streak = 0;
+        backlog_push(&mut backlog, 0, vec![42], false);
+        for _ in 0..MAX_CONTROL_BURST {
+            backlog_push(&mut backlog, 254, vec![1], false);
+            backlog_push(&mut backlog, 255, vec![2], false);
+            assert_eq!(backlog_pop(&mut backlog, &mut streak).unwrap().0, 255);
+        }
+        backlog_push(&mut backlog, 255, vec![3], false);
+        assert_eq!(backlog_pop(&mut backlog, &mut streak), Some((0, vec![42])));
+        assert_eq!(backlog_pop(&mut backlog, &mut streak).unwrap().0, 255);
+    }
+
+    #[test]
     fn priority_backlog_preserves_fifo_within_each_band() {
         let mut backlog = PriorityBacklog::new();
+        let mut control_streak = 0;
         backlog.entry(5).or_default().extend([vec![1], vec![2]]);
         backlog.entry(255).or_default().push_back(vec![3]);
         backlog.entry(254).or_default().push_back(vec![4]);
 
-        assert_eq!(backlog_pop(&mut backlog), Some((255, vec![3])));
-        assert_eq!(backlog_pop(&mut backlog), Some((254, vec![4])));
-        assert_eq!(backlog_pop(&mut backlog), Some((5, vec![1])));
-        assert_eq!(backlog_pop(&mut backlog), Some((5, vec![2])));
-        assert_eq!(backlog_pop(&mut backlog), None);
+        assert_eq!(
+            backlog_pop(&mut backlog, &mut control_streak),
+            Some((255, vec![3]))
+        );
+        assert_eq!(
+            backlog_pop(&mut backlog, &mut control_streak),
+            Some((254, vec![4]))
+        );
+        assert_eq!(
+            backlog_pop(&mut backlog, &mut control_streak),
+            Some((5, vec![1]))
+        );
+        assert_eq!(
+            backlog_pop(&mut backlog, &mut control_streak),
+            Some((5, vec![2]))
+        );
+        assert_eq!(backlog_pop(&mut backlog, &mut control_streak), None);
     }
 }
 pub(super) fn spawn_comms_worker_threads(
@@ -106,6 +152,7 @@ pub(super) fn spawn_comms_worker_threads(
             let mut suppressed_send_errors = 0;
             let mut next_tx_allowed_at = std::time::Instant::now();
             let mut backlog = PriorityBacklog::new();
+        let mut control_streak = 0;
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -120,19 +167,19 @@ pub(super) fn spawn_comms_worker_threads(
                     continue;
                 }
 
-                loop {
-                    match comms_handle.tx_rx.try_recv() {
-                        Ok((priority, payload)) => {
-                            backlog_push(&mut backlog, priority, payload, false);
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => return,
-                    }
-                }
-
                 let mut sent_any = false;
                 for _ in 0..GENERAL_COMMS_TX_BURST {
-                    let Some((priority, payload)) = backlog_pop(&mut backlog) else {
+                    // Pick up newly queued commands before every frame, not
+                    // after transmitting an entire burst of large schemas.
+                    // Bound draining so a busy producer cannot starve writes.
+                    for _ in 0..256 {
+                        match comms_handle.tx_rx.try_recv() {
+                            Ok((priority, payload)) => backlog_push(&mut backlog, priority, payload, false),
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => return,
+                        }
+                    }
+                    let Some((priority, payload)) = backlog_pop(&mut backlog, &mut control_streak) else {
                         break;
                     };
                     let mut comms = tx_worker_comms.lock().expect("failed to get lock");

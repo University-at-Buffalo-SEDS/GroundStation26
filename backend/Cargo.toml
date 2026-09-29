@@ -18,7 +18,7 @@ axum = { workspace = true, features = ["ws"] }
 tokio.workspace = true
 serde_json.workspace = true
 rppal = { git = "https://gitlab.rylanswebsite.com/rylan-meilutis/rppal.git", branch = "main", optional = true }
-SEDSnet = { git = "https://github.com/Rylan-Meilutis/SEDSnet.git", rev = "f597b0b473dd08baa876f6b97138f30d49e01339" }
+SEDSnet = { git = "https://github.com/Rylan-Meilutis/SEDSnet.git", rev = "798564f03c877b588b3641b44bdc8e53f48aa826" }
 
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls-ring", "sqlite"] }
 
