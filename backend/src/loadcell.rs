@@ -1702,3 +1702,87 @@ mod channel_save_tests {
         assert_eq!(json(&saved)["kg50_input_profiles"], json(&current)["kg50_input_profiles"]);
     }
 }
+
+// Display-only replay. Recorded calibrated values remain unchanged in SQLite.
+// Always start from raw samples: polynomial/thermal fits need not be invertible.
+pub struct HistoryCalibration {
+    cfg: LoadcellCalibrationFile,
+    temperatures: BTreeMap<String, (i64, f32)>,
+    processing: crate::loadcell_zero::Service,
+    fill_source: crate::fill_targets::FillSource,
+    target_kg: f32,
+}
+impl HistoryCalibration {
+    pub fn new(cfg: LoadcellCalibrationFile, targets: &FillTargetsConfig, flight: FlightState) -> Self {
+        Self { cfg, temperatures: BTreeMap::new(), processing: Default::default(),
+            fill_source: targets.fill_source, target_kg: active_fill_target_mass_kg(targets, flight) }
+    }
+    pub fn project(&mut self, row: crate::types::TelemetryRow) -> Vec<crate::types::TelemetryRow> {
+        if matches!(row.data_type.as_str(), DERIVED_WEIGHT_DATA_TYPE | DERIVED_WEIGHT_50_DATA_TYPE
+            | DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE | DERIVED_FILL_PERCENT_DATA_TYPE) {
+            return Vec::new();
+        }
+        if row.data_type == "DAQ_ADC_TEMPERATURE" {
+            if let Some(value) = row.values.first().copied().flatten().filter(|v| v.is_finite() && (-40.0..=125.0).contains(v)) {
+                self.temperatures.insert(row.sender_id.clone(), (row.timestamp_ms, value));
+            } else { self.temperatures.remove(&row.sender_id); }
+        }
+        let sensor = match row.data_type.as_str() {
+            "KG1000" => "KG1000", "KG50" => "KG50", "IADC" | "FUEL_TANK_PRESSURE" => "IADC",
+            _ => return vec![row],
+        };
+        let kind = match sensor { "KG1000" => DERIVED_WEIGHT_DATA_TYPE,
+            "KG50" => DERIVED_WEIGHT_50_DATA_TYPE, _ => DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE };
+        let temp = self.temperatures.get(&row.sender_id).and_then(|(ts, value)|
+            (row.timestamp_ms >= *ts && row.timestamp_ms - ts <= 2000).then_some(*value));
+        let value = row.values.first().copied().flatten()
+            .and_then(|raw| temperature_corrected_raw(&self.cfg, sensor, raw, temp))
+            .map(|raw| self.processing.filter(&self.cfg, &row.sender_id, sensor, row.timestamp_ms, raw))
+            .and_then(|raw| calibrated_sensor_value(&self.cfg, sensor, raw))
+            .filter(|v| v.is_finite());
+        if value.is_none() {
+            self.processing.filter(&self.cfg, &row.sender_id, sensor, row.timestamp_ms, f32::NAN);
+        }
+        let mut derived = row.clone(); derived.data_type = kind.into(); derived.values = vec![value];
+        let mut result = vec![row, derived];
+        if sensor == self.fill_source.sensor() {
+            let mut fill = result[1].clone(); fill.data_type = DERIVED_FILL_PERCENT_DATA_TYPE.into();
+            let mass = if sensor == "KG50" && !self.cfg.extra_channels.contains_key("kg50") { None }
+                else { value.map(|v| self.fill_source.mass(v)) };
+            fill.values = vec![mass.map(|mass| fill_percent(self.target_kg, mass))];
+            result.push(fill);
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod history_calibration_tests {
+    use super::*;
+    use crate::types::TelemetryRow;
+    #[test]
+    fn history_calibration_uses_current_thermal_fit_and_expires_stale_temperature() {
+        let mut cfg = LoadcellCalibrationFile::default();
+        cfg.ch1 = ChannelLinear { m: Some(2.), b: Some(1.) };
+        cfg.thermal.insert("KG1000".into(), ThermalCalibration { reference_c: 20., raw_per_c: 0.5, points: vec![] });
+        let mut replay = HistoryCalibration::new(cfg, &FillTargetsConfig::default(), FlightState::Startup);
+        let row = |timestamp_ms, kind: &str, value| TelemetryRow {
+            timestamp_ms, data_type: kind.into(), sender_id: "DAQ".into(), values: vec![value] };
+        replay.project(row(100, "DAQ_ADC_TEMPERATURE", Some(22.)));
+        assert_eq!(replay.project(row(101, "KG1000", Some(3.)))[1].values, vec![Some(5.)]);
+        assert_eq!(replay.project(row(2101, "KG1000", Some(3.)))[1].values, vec![None]);
+        assert_eq!(replay.project(row(2102, "KG1000", None))[1].values, vec![None]);
+    }
+    #[test]
+    fn history_calibration_replaces_old_weights_from_raw_without_touching_raw() {
+        let mut cfg = LoadcellCalibrationFile::default();
+        cfg.ch1 = ChannelLinear { m: Some(2.), b: Some(1.) };
+        let mut replay = HistoryCalibration::new(cfg, &FillTargetsConfig::default(), FlightState::Startup);
+        let raw = TelemetryRow {timestamp_ms: 100, data_type: "KG1000".into(), sender_id: "DAQ".into(), values: vec![Some(3.)]};
+        let output = replay.project(raw.clone());
+        assert_eq!(output[0].values, raw.values);
+        assert_eq!(output[1].values, vec![Some(7.)]);
+        let mut old = raw; old.data_type = DERIVED_WEIGHT_DATA_TYPE.into(); old.values = vec![Some(9000.)];
+        assert!(replay.project(old).is_empty());
+    }
+}

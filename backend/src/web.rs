@@ -373,6 +373,7 @@ pub enum WsOutMsg {
     RecordingStatus(RecordingStatusMsg),
     NetworkTime(NetworkTimeMsg),
     DashboardReset,
+    CalibrationChanged,
 }
 
 #[derive(Clone, Serialize)]
@@ -1081,8 +1082,8 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         let cache_covers_window =
             oldest_cache_ts.is_some_and(|oldest| oldest <= cutoff + RECENT_BUCKET_MS);
         if cache_covers_window {
-            let rows = compact_recent_rows(cache_snapshot, cutoff);
-            return Json(rows).into_response();
+            let rows = recalibrate_recent_rows(&state, cache_snapshot);
+            return Json(compact_recent_rows(rows, cutoff)).into_response();
         }
 
         let db_end_ms = oldest_cache_ts.unwrap_or(now_ms).saturating_sub(1);
@@ -1097,8 +1098,8 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
                 .into_iter()
                 .filter(|row| row.timestamp_ms >= cutoff && row.timestamp_ms <= now_ms),
         );
-        let rows = compact_recent_rows(merged_rows, cutoff);
-        return Json(rows).into_response();
+        let rows = recalibrate_recent_rows(&state, merged_rows);
+        return Json(compact_recent_rows(rows, cutoff)).into_response();
     }
 
     let db = state.telemetry_db_pool();
@@ -1112,11 +1113,20 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         return Json(Vec::<TelemetryRow>::new()).into_response();
     };
     let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
-    let rows = compact_recent_rows(
-        load_recent_rows_from_db(&state, cutoff, now_ms).await,
-        cutoff,
-    );
-    Json(rows).into_response()
+    let rows = load_recent_rows_from_db(&state, cutoff, now_ms).await;
+    Json(compact_recent_rows(recalibrate_recent_rows(&state, rows), cutoff)).into_response()
+}
+
+fn history_calibration(state: &AppState) -> loadcell::HistoryCalibration {
+    let cfg = state.loadcell_calibration.lock().unwrap().clone();
+    let targets = state.fill_targets_snapshot();
+    let flight = *state.state.lock().unwrap();
+    loadcell::HistoryCalibration::new(cfg, &targets, flight)
+}
+fn recalibrate_recent_rows(state: &AppState, mut rows: Vec<TelemetryRow>) -> Vec<TelemetryRow> {
+    rows.sort_by_key(|row| row.timestamp_ms);
+    let mut replay = history_calibration(state);
+    rows.into_iter().flat_map(|row| replay.project(row)).collect()
 }
 
 async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
@@ -1152,13 +1162,14 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
         None
     } else {
         oldest_cache_ts
-            .unwrap_or(now_ms)
-            .checked_sub(1)
+            .and_then(|ts| ts.checked_sub(1))
+            .or(Some(now_ms))
             .filter(|end_ms| *end_ms >= cutoff)
     };
 
     let state_for_task = Arc::clone(&state);
     let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+    let mut replay = history_calibration(&state);
     tokio::spawn(async move {
         if let Some(end_ms) = db_end_ms {
             let db = state_for_task.telemetry_db_pool();
@@ -1186,8 +1197,8 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
                     sender_id: row.get::<String, _>("sender_id"),
                     values: values_from_row(&row),
                 };
-                if send_ndjson_row(&tx, &telemetry_row).await.is_err() {
-                    return;
+                for row in replay.project(telemetry_row) {
+                    if send_ndjson_row(&tx, &row).await.is_err() { return; }
                 }
             }
         }
@@ -1196,8 +1207,8 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
             if row.timestamp_ms < cutoff || row.timestamp_ms > now_ms {
                 continue;
             }
-            if send_ndjson_row(&tx, &row).await.is_err() {
-                return;
+            for row in replay.project(row) {
+                if send_ndjson_row(&tx, &row).await.is_err() { return; }
             }
         }
     });
@@ -1951,6 +1962,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         }
 
         let adaptive_rate = std::env::var("GS_WS_ADAPTIVE_RATE").ok().as_deref() != Some("0");
+        let mut last_chart_calibration = String::new();
         let mut network_time_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         let telemetry_flush_ms: u64 = std::env::var("GS_WS_TELEMETRY_FLUSH_MS")
             .ok()
@@ -2229,6 +2241,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                 }
 
                 _ = network_time_tick.tick() => {
+                    let calibration = serde_json::to_string(&*state_for_send.loadcell_calibration.lock().unwrap()).unwrap_or_default();
+                    if calibration != last_chart_calibration {
+                        last_chart_calibration = calibration;
+                        telemetry_pending.clear();
+                        let msg = serde_json::to_string(&WsOutMsg::CalibrationChanged).unwrap_or_default();
+                        if ws_out_tx.send(msg).await.is_err() { break; }
+                    }
                     let msg = WsOutMsg::NetworkTime(NetworkTimeMsg {
                         timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
                     });
