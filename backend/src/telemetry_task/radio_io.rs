@@ -36,11 +36,28 @@ impl TxQueueBudget {
         priority: u8,
         payload: &[u8],
     ) -> sedsnet::TelemetryResult<()> {
+        // Side callbacks receive schema chunks individually. Once the first
+        // chunk is admitted, finish that transfer even when it crosses the
+        // normal queue target; otherwise every retry can stall at chunk two.
+        // These are locally generated SDT v3 chunk envelopes (not RX input).
+        let continuation = if payload.starts_with(b"SDT\x03") && payload.len() >= 16 {
+            let index = u16::from_le_bytes([payload[8], payload[9]]) as usize;
+            let total = u16::from_le_bytes([payload[10], payload[11]]) as usize;
+            if total == 0 || total > 64 || index >= total || payload.len() > 1024 {
+                return Err(sedsnet::TelemetryError::HandlerError(
+                    "radio chunk transfer exceeds budget",
+                ));
+            }
+            index != 0
+        } else {
+            false
+        };
+        let ceiling = self.limit + if continuation { 64 * 1024 } else { 0 };
         self.pending
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                 pending
                     .checked_add(payload.len())
-                    .filter(|total| *total <= self.limit)
+                    .filter(|total| *total <= ceiling)
             })
             .map_err(|_| sedsnet::TelemetryError::HandlerError("radio transport backpressure"))?;
         if sender.send((priority, payload.to_vec())).is_err() {
@@ -131,6 +148,52 @@ mod priority_tests {
         budget.complete(first.len());
         budget.try_send(&tx, 0, &[2; 32]).unwrap();
         assert_eq!(budget.pending.load(Ordering::Acquire), 1056);
+    }
+
+    #[test]
+    fn radio_budget_finishes_a_schema_larger_than_the_queue_target() {
+        use sedsnet::config::{DataEndpoint, DataType};
+        use sedsnet::router::{RouterConfig, RouterSideOptions};
+        let budget = Arc::new(TxQueueBudget::new(2048));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+        let callback_budget = budget.clone();
+        let callback_tx = tx.clone();
+        router.add_side_packed_with_options(
+            "test_uart",
+            move |frame| callback_budget.try_send(&callback_tx, 255, frame),
+            RouterSideOptions {
+                max_frame_bytes: 1024,
+                ..Default::default()
+            },
+        );
+        let mut seed = 123u32;
+        let body: Vec<u8> = (0..3600)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let packet = Packet::new(
+            DataType::DiscoverySchema,
+            &[DataEndpoint::Discovery],
+            "GS",
+            1,
+            Arc::from(body),
+        )
+        .unwrap();
+        router.tx(packet).unwrap();
+        assert!(budget.pending.load(Ordering::Acquire) > 3600);
+        assert!(budget.try_send(&tx, 255, &[0; 100]).is_err());
+        let mut frames = 0;
+        while let Ok((_, payload)) = rx.try_recv() {
+            budget.complete(payload.len());
+            frames += 1;
+        }
+        assert_eq!(frames, 4);
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
     }
 
     #[test]
