@@ -379,17 +379,22 @@ pub fn next_daq_log_session(anchor_ms: i64) -> u64 {
     (anchor_ms.max(1) as u64).max(last.saturating_add(1))
 }
 
+fn usable_daq_utc(network_ms: Option<u64>, wall_ms: i64) -> i64 {
+    network_ms
+        .and_then(|ms| i64::try_from(ms).ok())
+        .filter(|ms| (315_532_800_000..4_354_819_200_000).contains(ms))
+        .unwrap_or(wall_ms)
+}
+
 pub fn set_daq_log_clock(
     router: &Router,
     session: u64,
     clock: &crate::telemetry_db::LaunchClockMsg,
 ) -> Result<()> {
     let wall_now = get_current_timestamp_ms() as i64;
-    let network_now = router
-        .network_time()
-        .and_then(|t| t.unix_time_ms)
-        .map(|v| v as i64)
-        .unwrap_or(wall_now);
+    let network_now = usable_daq_utc(
+        router.network_time().and_then(|t| t.unix_time_ms), wall_now);
+
     let payload = daq_log_clock_payload(session, clock, wall_now, network_now)?;
     // Preserve the absolute deadline, not a fresh countdown on service restart.
     // Drop the disk-cache lock before entering SEDSNet (callbacks may use it).
@@ -454,6 +459,19 @@ pub fn flight_state() -> u8 {
 mod tests {
     use super::*;
     use sedsnet::router::{EndpointHandler, RouterConfig};
+
+    #[test]
+    fn daq_clock_ignores_uptime_and_overflow_but_preserves_valid_network_utc() {
+        let wall = 1_800_000_000_000;
+        for invalid in [None, Some(0), Some(500_000), Some(u64::MAX)] {
+            assert_eq!(usable_daq_utc(invalid, wall), wall);
+        }
+        assert_eq!(usable_daq_utc(Some(wall as u64 + 1234), wall), wall + 1234);
+        let router = Router::new(RouterConfig::new([]));
+        crate::telemetry_task::refresh_host_network_time(&router, wall as u64);
+        let utc = router.network_time().unwrap().unix_time_ms.unwrap();
+        assert!((wall as u64..wall as u64 + 1000).contains(&utc));
+    }
 
     #[test]
     fn daq_deadline_uses_t_zero_not_launch_button_or_reconnect_time() {

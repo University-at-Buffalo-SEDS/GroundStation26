@@ -122,6 +122,13 @@ mod recovery_tests {
     }
 }
 
+pub(crate) fn refresh_host_network_time(router: &Router, utc_ms: u64) {
+    // Calendar range shared with DAQ's timestamped logging validation.
+    if (315_532_800_000..4_354_819_200_000).contains(&utc_ms) {
+        router.set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(utc_ms));
+    }
+}
+
 pub fn set_network_time_router(router: Arc<Router>) {
     let _ = NETWORK_TIME_ROUTER.set(router);
 }

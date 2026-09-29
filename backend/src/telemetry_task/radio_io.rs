@@ -968,6 +968,7 @@ pub(super) fn spawn_router_worker_thread(
         .name("router_worker".to_string())
         .spawn(move || {
             let mut shutdown_rx = state.shutdown_subscribe();
+            let mut last_clock_refresh = std::time::Instant::now();
             loop {
                 match shutdown_rx.try_recv() {
                     Ok(_)
@@ -991,10 +992,14 @@ pub(super) fn spawn_router_worker_thread(
                         }
                     }
                 }
-                if timesync_enabled()
-                    && let Ok(queued) = router.poll_timesync()
-                {
-                    did_work |= queued;
+                if timesync_enabled() {
+                    if last_clock_refresh.elapsed() >= Duration::from_secs(1) {
+                        super::refresh_host_network_time(&router, get_current_timestamp_ms());
+                        last_clock_refresh = std::time::Instant::now();
+                    }
+                    if let Ok(queued) = router.poll_timesync() {
+                        did_work |= queued;
+                    }
                 }
                 if let Err(e) = process_router_queues(&router) {
                     log_telemetry_error("router queue processing failed", e);

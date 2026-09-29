@@ -952,6 +952,9 @@ async fn main() -> anyhow::Result<()> {
             }),
         )
     });
+    if telemetry_task::timesync_enabled() {
+        telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
+    }
     network_variables::initialize(&router)?;
     set_network_time_router(router.clone());
     let _ = state.topology_router.set(router.clone());
