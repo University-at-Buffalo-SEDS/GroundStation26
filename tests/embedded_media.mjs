@@ -35,7 +35,7 @@ const server = http.createServer(async (req, res) => {
 });
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 const origin=`http://127.0.0.1:${server.address().port}`;
-const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_BINARY,args:['--use-fake-device-for-media-stream','--use-fake-ui-for-media-stream','--autoplay-policy=no-user-gesture-required']});
+const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_BINARY || (process.platform==='darwin' && fs.existsSync('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome') ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : undefined),args:['--use-fake-device-for-media-stream','--use-fake-ui-for-media-stream','--autoplay-policy=no-user-gesture-required']});
 try {
   const context=await browser.newContext({permissions:['camera','microphone']});
   receiver=await context.newPage();await receiver.goto(origin+'/receiver');
@@ -53,7 +53,7 @@ try {
   await media.getByText('Connected with your dashboard session.',{exact:true}).waitFor();
   assert.equal(await media.locator('#login').isVisible(),false);
   assert.equal(await voice.locator('#login').isVisible(),false);
-  await voice.locator('#join').click();await voice.getByText('Connected to crew voice.',{exact:true}).waitFor();
+  await voice.locator('#join').click();await voice.getByText('Connected to voice chat.',{exact:true}).waitFor().catch(async error=>{console.error('Voice status:',await voice.locator('#status').innerText(),errors);throw error;});
   await voice.locator('#mode').selectOption('open');
   await media.locator('#publish-start').click();
   await media.getByText('Sharing camera with the Ground Station',{exact:true}).waitFor({timeout:20000});
@@ -77,9 +77,11 @@ try {
   await media.locator('#publish-start').click();await media.getByText('Sharing camera with the Ground Station',{exact:true}).waitFor({timeout:20000});
   permitted=false;
   await media.locator('#publish-preview').waitFor({state:'hidden',timeout:10000});
-  assert.equal(await media.locator('#publisher').isVisible(),false);
+  assert.equal(await media.locator('#publisher').isVisible(),true);
+  assert.equal(await media.locator('#publish-start').isDisabled(),true);
+  await media.getByText('Your account needs stream-manager permission to share this camera.',{exact:true}).waitFor();
   await page.evaluate(()=>{for(const f of document.querySelectorAll('iframe'))f.contentWindow.postMessage({type:'gs26-session',token:'',visible:true},location.origin);});
-  await voice.getByText('Sign in from the dashboard to join crew voice.',{exact:true}).waitFor();
+  await voice.getByText('Sign in from the dashboard to join voice chat.',{exact:true}).waitFor();
   assert.equal(await voice.locator('#mic-state').textContent(),'Microphone off');
   assert(!requests.some(r=>r.url.startsWith('/api/auth/')),'embedded tools never log in again');
   assert(requests.filter(r=>r.url.startsWith('/api/video/publish')).every(r=>r.auth==='Bearer test-producer'),'publishing always uses shared session');

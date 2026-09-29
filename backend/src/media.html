@@ -26,12 +26,13 @@
   <button>Sign in</button><button id="logout" type="button">Sign out</button>
 </form>
 <p id="message" role="status" aria-live="polite"></p>
-<section id="publisher" hidden>
+<section id="publisher">
 <h2>Use your camera as a stream source</h2>
 <p>Your camera becomes available to the Ground Station and may be recorded or selected for the audience broadcast. It stays on when you switch dashboard tabs. Stop sharing to release it.</p>
 <label>Camera<select id="publish-device"><option value="">System default</option></select></label>
-<button id="publish-devices">Refresh cameras</button>
-<button id="publish-start">Start sharing camera</button><button id="publish-stop" disabled>Stop sharing</button>
+<p id="publish-access" role="status">Connecting to your dashboard session…</p>
+<button id="publish-devices" disabled>Refresh cameras</button>
+<button id="publish-start" disabled>Start sharing camera</button><button id="publish-stop" disabled>Stop sharing</button>
 <p id="publish-status" role="status">Camera off</p>
 <video id="publish-preview" autoplay playsinline muted hidden></video>
 </section>
@@ -203,7 +204,12 @@ async function refreshPublishPermission() {
     const config = await (await api('/api/live_streams')).json();
     canPublish = !!token && config.can_manage_stream === true;
   } catch { canPublish = false; }
-  $('publisher').hidden = !canPublish;
+  $('publish-start').disabled = !canPublish || !!publisher;
+  $('publish-devices').disabled = !canPublish;
+  $('publish-access').hidden = canPublish;
+  $('publish-access').textContent = token
+    ? 'Your account needs stream-manager permission to share this camera.'
+    : embedded ? 'Sign in through the dashboard to share this camera.' : 'Sign in to share this camera.';
   if (!canPublish && publisher) stopPublishing('Camera stopped: publishing permission is unavailable.');
 }
 async function listPublishDevices() {
@@ -222,7 +228,7 @@ function stopPublishing(message = 'Camera off') {
     if (old.location) fetch(old.location, {method: 'DELETE', headers: {Authorization: `Bearer ${old.token}`}, keepalive: true}).catch(() => {});
   }
   $('publish-preview').srcObject = null; $('publish-preview').hidden = true;
-  $('publish-start').disabled = false; $('publish-stop').disabled = true; $('publish-device').disabled = false;
+  $('publish-start').disabled = !canPublish; $('publish-stop').disabled = true; $('publish-device').disabled = false;
   publishNotice(message);
 }
 $('publish-devices').onclick = listPublishDevices;
@@ -291,7 +297,7 @@ if (embedded) {
     stopAll(); token = event.data.token;
     notice(token ? 'Connected with your dashboard session.' : 'Sign in from the dashboard to use camera tools.');
     if (token) refresh().catch(error => notice(error.message));
-    else { canPublish = false; $('publisher').hidden = true; $('models').replaceChildren(); }
+    else { canPublish = false; $('models').replaceChildren(); refreshPublishPermission(); }
   });
 }
 
