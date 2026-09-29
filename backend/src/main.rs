@@ -26,32 +26,32 @@ mod i18n;
 mod layout;
 mod loadcell;
 mod loadcell_zero;
-mod thermal_settling;
-mod thermal_fit;
-mod network_traffic;
 mod logger;
 mod map;
 mod media;
 mod media_runtime;
+mod network_traffic;
 mod network_variables;
 mod recording_export;
-mod recording_report;
-mod system_clock;
 mod recording_range;
+mod recording_report;
 mod ring_buffer;
 mod rocket_commands;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 mod safety_task;
 mod sequences;
 mod state;
+mod system_clock;
 mod telemetry_db;
 mod telemetry_schema;
 mod telemetry_task;
 #[cfg(feature = "test_fire_mode")]
 mod test_fire_csv;
+mod thermal_fit;
+mod thermal_settling;
 mod types;
-mod web;
 mod voice;
+mod web;
 
 use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
@@ -66,7 +66,7 @@ use crate::telemetry_db::{
     ensure_sqlite_db_file, open_in_memory_telemetry_db, recover_sqlite_sidecars_in_dir,
 };
 use crate::telemetry_task::{
-    CommsWorkerHandle, flush_command_tx, get_current_timestamp_ms,
+    CommsWorkerHandle, TxQueueBudget, flush_command_tx, get_current_timestamp_ms,
     queue_locally_routed_flight_command, set_network_time_router, telemetry_task,
 };
 
@@ -959,8 +959,11 @@ async fn main() -> anyhow::Result<()> {
     let (rocket_tx, rocket_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
     let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
 
+    // At 57,600 baud this bounds accepted UART work to roughly 360 ms.
+    let rocket_tx_budget = Arc::new(TxQueueBudget::new(2048));
     let rocket_side = {
         let rocket_tx = rocket_tx.clone();
+        let budget = rocket_tx_budget.clone();
         let opts = RouterSideOptions {
             reliable_enabled: router_hop_reliable_enabled(&comms_links.av_bay),
             ..Default::default()
@@ -968,12 +971,7 @@ async fn main() -> anyhow::Result<()> {
         .with_small_packet_transport(1024);
         router.add_side_packed_with_priority_and_options(
             "rocket_comms",
-            move |pkt, priority| {
-                rocket_tx
-                    .send((priority, pkt.to_vec()))
-                    .map_err(|_| TelemetryError::HandlerError("rocket_comms tx queue closed"))?;
-                Ok(())
-            },
+            move |pkt, priority| budget.try_send(&rocket_tx, priority, pkt),
             opts,
         )
     };
@@ -1054,6 +1052,7 @@ async fn main() -> anyhow::Result<()> {
         vec![
             CommsWorkerHandle {
                 name: "rocket_comms",
+                tx_budget: Some(rocket_tx_budget.clone()),
                 comms: rocket_comms,
                 tx_comms: None,
                 side_id: rocket_side,
@@ -1064,6 +1063,7 @@ async fn main() -> anyhow::Result<()> {
             },
             CommsWorkerHandle {
                 name: "umbilical_comms",
+                tx_budget: None,
                 comms: umbilical_comms,
                 tx_comms: None,
                 side_id: umbilical_side,

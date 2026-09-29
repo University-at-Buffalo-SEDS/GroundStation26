@@ -7,7 +7,7 @@ pub(crate) use commands::{
     flush_command_tx, queue_abort_packet, queue_locally_routed_flight_command,
 };
 mod radio_io;
-pub use radio_io::CommsWorkerHandle;
+pub use radio_io::{CommsWorkerHandle, TxQueueBudget};
 #[cfg(test)]
 use radio_io::{radio_command_log_line, spawn_dedicated_radio_io_threads};
 use radio_io::{spawn_comms_worker_threads, spawn_router_worker_thread};
@@ -2800,6 +2800,7 @@ mod tests {
             state.clone(),
             router.clone(),
             vec![CommsWorkerHandle {
+                tx_budget: None,
                 name: "rocket_comms",
                 comms,
                 tx_comms: None,
@@ -2951,6 +2952,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                tx_budget: None,
                 name: "rocket_comms",
                 comms,
                 tx_comms: None,
@@ -3043,6 +3045,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                tx_budget: None,
                 name: "rocket_comms",
                 comms,
                 tx_comms: None,
@@ -3126,6 +3129,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                tx_budget: None,
                 name: "rocket_comms",
                 comms,
                 tx_comms: None,
@@ -3195,6 +3199,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                tx_budget: None,
                 name: "rocket_comms",
                 comms,
                 tx_comms: None,
@@ -3276,6 +3281,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                tx_budget: None,
                 name: "rocket_comms",
                 comms,
                 tx_comms: None,
@@ -3362,6 +3368,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                tx_budget: None,
                 name: "rocket_comms",
                 comms,
                 tx_comms: None,
@@ -3448,6 +3455,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                tx_budget: None,
                 name: "rocket_comms",
                 comms,
                 tx_comms: None,
@@ -3521,6 +3529,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                tx_budget: None,
                 name: "rocket_comms",
                 comms,
                 tx_comms: None,

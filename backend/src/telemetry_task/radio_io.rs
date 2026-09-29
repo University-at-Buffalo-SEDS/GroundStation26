@@ -4,6 +4,7 @@ use sedsnet::packet::Packet;
 use sedsnet::router::{Router, RouterSideId};
 use sedsnet::wire_format as serialize;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use tokio::sync::{broadcast, mpsc};
@@ -14,8 +15,52 @@ use super::{
     process_router_queues, timesync_enabled,
 };
 
+/// Bounds accepted bytes until the generic worker finishes the physical write.
+/// The router retains ownership of frames rejected with backpressure.
+pub struct TxQueueBudget {
+    pending: AtomicUsize,
+    limit: usize,
+}
+
+impl TxQueueBudget {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            pending: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    pub fn try_send(
+        &self,
+        sender: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
+        priority: u8,
+        payload: &[u8],
+    ) -> sedsnet::TelemetryResult<()> {
+        self.pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending
+                    .checked_add(payload.len())
+                    .filter(|total| *total <= self.limit)
+            })
+            .map_err(|_| sedsnet::TelemetryError::HandlerError("radio transport backpressure"))?;
+        if sender.send((priority, payload.to_vec())).is_err() {
+            self.complete(payload.len());
+            return Err(sedsnet::TelemetryError::HandlerError(
+                "radio tx queue closed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn complete(&self, len: usize) {
+        self.pending.fetch_sub(len, Ordering::AcqRel);
+    }
+}
+
 pub struct CommsWorkerHandle {
     pub name: &'static str,
+    /// Used by the generic worker; legacy/dedicated workers leave this None.
+    pub tx_budget: Option<Arc<TxQueueBudget>>,
     pub comms: Arc<Mutex<Box<dyn CommsDevice>>>,
     pub tx_comms: Option<Arc<Mutex<Box<dyn CommsDevice>>>>,
     pub side_id: RouterSideId,
@@ -72,6 +117,32 @@ fn backlog_pop(backlog: &mut PriorityBacklog, control_bytes: &mut usize) -> Opti
 #[cfg(test)]
 mod priority_tests {
     use super::*;
+
+    #[test]
+    fn radio_budget_stays_charged_until_write_completion() {
+        let budget = TxQueueBudget::new(2048);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        budget.try_send(&tx, 255, &[0; 1024]).unwrap();
+        budget.try_send(&tx, 255, &[1; 1024]).unwrap();
+        let (_, first) = rx.try_recv().unwrap();
+        assert!(budget.try_send(&tx, 0, &[2; 32]).is_err());
+        // Moving to a worker backlog or retrying a failed write frees nothing.
+        assert_eq!(budget.pending.load(Ordering::Acquire), 2048);
+        budget.complete(first.len());
+        budget.try_send(&tx, 0, &[2; 32]).unwrap();
+        assert_eq!(budget.pending.load(Ordering::Acquire), 1056);
+    }
+
+    #[test]
+    fn radio_budget_rejects_oversize_and_rolls_back_closed_channel() {
+        let budget = TxQueueBudget::new(2048);
+        let (tx, rx) = mpsc::unbounded_channel();
+        assert!(budget.try_send(&tx, 0, &[0; 2049]).is_err());
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        drop(rx);
+        assert!(budget.try_send(&tx, 0, &[0; 128]).is_err());
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn control_flood_cannot_starve_queued_commands() {
@@ -196,6 +267,9 @@ pub(super) fn spawn_comms_worker_threads(
                     let mut comms = tx_worker_comms.lock().expect("failed to get lock");
                     match comms.send_data(&payload) {
                         Ok(()) => {
+                            if let Some(budget) = &comms_handle.tx_budget {
+                                budget.complete(payload.len());
+                            }
                             sent_any = true;
                             log_link_control_send(worker_name, &payload);
                             log_radio_command_event("radio TX sent", worker_name, &payload);
