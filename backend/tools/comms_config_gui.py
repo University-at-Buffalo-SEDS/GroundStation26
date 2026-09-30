@@ -21,6 +21,7 @@ except ImportError:
     TK_AVAILABLE = False
 
 DEFAULT_BAUD_RATE = 57_600
+AV_BAY_BAUD_RATE = 115_200
 DEFAULT_SPI_SPEED_HZ = 1_000_000
 DEFAULT_SPI_MODE = 0
 DEFAULT_SPI_BITS_PER_WORD = 8
@@ -38,7 +39,7 @@ DEFAULT_CONFIG = {
     "av_bay": {
         "interface": "usb_serial",
         "port": "/dev/ttyUSB1",
-        "baud_rate": DEFAULT_BAUD_RATE,
+        "baud_rate": AV_BAY_BAUD_RATE,
         "spi_speed_hz": DEFAULT_SPI_SPEED_HZ,
         "spi_mode": DEFAULT_SPI_MODE,
         "spi_bits_per_word": DEFAULT_SPI_BITS_PER_WORD,
@@ -231,7 +232,7 @@ def normalize_config(cfg: dict) -> dict:
         merged[name].update(cfg.get(name, {}))
         merged[name]["interface"] = str(merged[name]["interface"])
         merged[name]["port"] = str(merged[name]["port"])
-        merged[name]["baud_rate"] = int(merged[name].get("baud_rate", DEFAULT_BAUD_RATE))
+        merged[name]["baud_rate"] = int(merged[name].get("baud_rate", DEFAULT_CONFIG[name]["baud_rate"]))
         merged[name]["spi_speed_hz"] = int(merged[name].get("spi_speed_hz", DEFAULT_SPI_SPEED_HZ))
         merged[name]["spi_mode"] = int(merged[name].get("spi_mode", DEFAULT_SPI_MODE))
         merged[name]["spi_bits_per_word"] = int(
