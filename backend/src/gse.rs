@@ -337,7 +337,7 @@ pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
             rt.fill_cutoff.reset();
             rt.ground_station_control
         };
-        state.add_notification(if enabled {
+        state.add_temporary_notification(if enabled {
             "Ground station automatic fill cutoff enabled"
         } else {
             "Ground station automatic fill cutoff disabled; operator must stop filling"

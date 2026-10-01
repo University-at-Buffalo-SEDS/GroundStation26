@@ -1106,15 +1106,25 @@ impl AppState {
             return existing.id;
         }
         let id = self.next_notification_id.fetch_add(1, Ordering::Relaxed) + 1;
-        notifications.push(PersistentNotification {
+        let notification = PersistentNotification {
             id,
             timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
             message,
             persistent,
             action_label,
             action_cmd,
-        });
-        let snapshot = notifications.clone();
+        };
+        // Transient confirmations go only to currently connected subscribers.
+        // Keeping them in server state replays them on reload and on later
+        // notification broadcasts, including contradictory toggle messages.
+        let snapshot = if persistent {
+            notifications.push(notification);
+            notifications.clone()
+        } else {
+            let mut snapshot = notifications.clone();
+            snapshot.push(notification);
+            snapshot
+        };
         drop(notifications);
         let _ = self.notifications_tx.send(snapshot);
         id
@@ -1599,6 +1609,26 @@ fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn temporary_notifications_are_live_only_and_do_not_replay() {
+        let state = test_app_state().await;
+        let mut live = state.notifications_tx.subscribe();
+        let alarm = state.add_notification("persistent fault");
+        live.try_recv().unwrap();
+        state.add_temporary_notification("toggle enabled");
+        let update = live.try_recv().unwrap();
+        assert_eq!(update.len(), 2);
+        assert!(!update[1].persistent);
+        let reload = state.notifications_snapshot();
+        assert_eq!(reload.len(), 1);
+        assert_eq!(reload[0].id, alarm);
+        state.add_temporary_notification("toggle disabled");
+        let update = live.try_recv().unwrap();
+        assert_eq!(update.len(), 2);
+        assert_eq!(update[1].message, "toggle disabled");
+        assert!(update.iter().all(|n| n.message != "toggle enabled"));
+    }
+
     use super::*;
     use crate::auth::AuthManager;
     use crate::fill_targets;
