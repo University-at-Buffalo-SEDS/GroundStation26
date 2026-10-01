@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 /// Order is pilot, vent, dump, nitrogen, nitrous. Ignition/retraction are never tested.
 pub const RELIEVED: [bool; 5] = [false, true, true, false, false];
+pub const VALVE_ACK_TIMEOUT_MS: u64 = 5000;
+
 pub const CLOSED: [bool; 5] = [false; 5];
 pub const FILL_READY: [bool; 5] = [false, true, false, false, false];
 
@@ -174,6 +176,7 @@ pub struct Engine {
     pub status: Status,
     pub claimed: bool,
     phase_since: u64,
+    command_since: u64,
     target: [bool; 5],
     samples: Vec<Sample>,
     self_index: usize,
@@ -202,6 +205,7 @@ impl Default for Engine {
             },
             claimed: false,
             phase_since: 0,
+            command_since: 0,
             target: CLOSED,
             samples: Vec::new(),
             self_index: 0,
@@ -275,6 +279,7 @@ impl Engine {
     fn configure(&mut self, phase: Phase, desired: [bool; 5], now: u64, message: &str) -> Effects {
         self.self_pending = 0;
         self.self_waiting = None;
+        self.command_since = now;
         self.target = desired;
         self.transition(phase, now, message);
         // Close supply valves before any other reconfiguration; opening a supply
@@ -449,12 +454,32 @@ impl Engine {
                             >= if self.self_confirmation_phase() {
                                 self.self_ack_since[i]
                             } else {
-                                self.phase_since
+                                self.command_since
                             }
                 })
             })
             && (!self.self_confirmation_phase()
                 || (self.self_pending == 0 && self.self_waiting.is_none()))
+    }
+    fn valve_ack_expired(&self, input: Inputs) -> bool {
+        input
+            .valves
+            .iter()
+            .zip(self.target)
+            .enumerate()
+            .any(|(i, (v, target))| {
+                // A queued self-test valve gets its own five seconds only after dispatch.
+                if self.self_confirmation_phase() && self.self_pending & (1 << i) != 0 {
+                    return false;
+                }
+                let since = if self.self_confirmation_phase() {
+                    self.self_ack_since[i]
+                } else {
+                    self.command_since
+                };
+                !v.is_some_and(|v| v.open == target && v.at_ms >= since)
+                    && input.now_ms.saturating_sub(since) >= VALVE_ACK_TIMEOUT_MS
+            })
     }
     fn valve_ack_timeout(&mut self, input: Inputs) -> Effects {
         let names = ["Pilot", "Vent", "Dump", "Nitrogen", "Nitrous"];
@@ -472,7 +497,7 @@ impl Engine {
                             < if self.self_confirmation_phase() {
                                 self.self_ack_since[i]
                             } else {
-                                self.phase_since
+                                self.command_since
                             } =>
                     {
                         "no fresh report"
@@ -542,7 +567,7 @@ impl Engine {
                     ..Effects::default()
                 };
             }
-            if elapsed > 5000 {
+            if self.valve_ack_expired(input) {
                 return self.valve_ack_timeout(input);
             }
             return Effects::default();
@@ -581,7 +606,17 @@ impl Engine {
                 | Phase::NitrogenSetup
                 | Phase::FillSetup
         );
-        if setup && elapsed > 5000 {
+        let awaiting_valves = setup
+            || matches!(
+                self.status.phase,
+                Phase::Raising
+                    | Phase::Settling
+                    | Phase::Holding
+                    | Phase::Dumping
+                    | Phase::Filling
+                    | Phase::Paused
+            );
+        if awaiting_valves && self.valve_ack_expired(input) {
             return self.valve_ack_timeout(input);
         }
         if self.self_confirmation_phase() {
@@ -730,9 +765,6 @@ impl Engine {
                 }
             }
             Phase::Settling => {
-                if elapsed > 5000 && !self.confirmed(input) {
-                    return self.fault(input.now_ms, "Nitrogen close acknowledgement timed out");
-                }
                 if elapsed >= 2000
                     && self.confirmed(input)
                     && let Some(mean) = self.sample_mean(input.now_ms.saturating_sub(1000))
@@ -845,28 +877,7 @@ impl Engine {
                     "Nitrous fill in progress",
                 );
             }
-            Phase::Filling if elapsed > 5000 && !self.confirmed(input) => {
-                return self.fault(
-                    input.now_ms,
-                    "Fill valve state does not match the requested configuration",
-                );
-            }
             _ => {}
-        }
-        if matches!(
-            self.status.phase,
-            Phase::Raising | Phase::Holding | Phase::Paused
-        ) && input
-            .valves
-            .iter()
-            .zip(self.target)
-            .any(|(v, desired)| v.is_none_or(|v| v.open != desired))
-            && elapsed > 5000
-        {
-            return self.fault(
-                input.now_ms,
-                "Unexpected valve state during automatic sequence",
-            );
         }
         Effects::default()
     }
@@ -1366,6 +1377,56 @@ mod tests {
         );
         assert!(effects.valves.contains(&(3, false)));
         assert!(effects.valves.contains(&(4, false)));
+    }
+    #[test]
+    fn self_test_gives_each_dispatched_valve_its_own_five_seconds() {
+        let mut rig = Rig::new();
+        let mut input = rig.input();
+        input.valves = [None; 5];
+        assert_eq!(
+            rig.engine.request(Action::SelfTest, input).unwrap().valves,
+            vec![(3, false)]
+        );
+        input.now_ms += 4000;
+        input.pressure.as_mut().unwrap().at_ms = input.now_ms;
+        input.valves[3] = Some(ValveState {
+            open: false,
+            at_ms: input.now_ms,
+        });
+        assert_eq!(rig.engine.tick(input).valves, vec![(4, false)]);
+        input.now_ms += 4999;
+        input.pressure.as_mut().unwrap().at_ms = input.now_ms;
+        assert!(rig.engine.tick(input).valves.is_empty());
+        assert_ne!(rig.engine.status.phase, Phase::Fault);
+        input.now_ms += 1;
+        input.pressure.as_mut().unwrap().at_ms = input.now_ms;
+        rig.engine.tick(input);
+        assert_eq!(rig.engine.status.phase, Phase::Fault);
+    }
+    #[test]
+    fn every_automatic_valve_phase_uses_the_same_ack_deadline() {
+        for phase in [
+            Phase::BaselineSetup,
+            Phase::NitrogenSetup,
+            Phase::FillSetup,
+            Phase::Raising,
+            Phase::Settling,
+            Phase::Holding,
+            Phase::Dumping,
+            Phase::Filling,
+            Phase::PauseSetup,
+            Phase::CancelSetup,
+            Phase::Paused,
+        ] {
+            let mut rig = Rig::new();
+            let mut input = rig.input();
+            rig.engine.configure(phase, CLOSED, input.now_ms, "test");
+            input.valves = [None; 5];
+            input.now_ms += 4999;
+            assert!(!rig.engine.valve_ack_expired(input), "{phase:?}");
+            input.now_ms += 1;
+            assert!(rig.engine.valve_ack_expired(input), "{phase:?}");
+        }
     }
     #[test]
     fn self_test_exercises_one_valve_at_a_time_and_restores_normally_open_valves() {
