@@ -536,6 +536,9 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         "prelaunch": prelaunch,
         "button_interlock_satisfied": interlock,
     });
+    response["dry_self_test_confirmed"] = serde_json::json!(
+        state.gse.lock().unwrap().engine.config.dry_self_test_confirmed
+    );
     response["configuration_error"] =
         serde_json::json!(state.gse.lock().unwrap().engine.config.validate().err());
     Json(response).into_response()
