@@ -178,6 +178,9 @@ pub struct Engine {
     samples: Vec<Sample>,
     self_index: usize,
     testing_valves: bool,
+    self_ack_since: [u64; 5],
+    self_pending: u8,
+    self_waiting: Option<usize>,
     hold_reference: Option<f32>,
     hold_samples: usize,
 }
@@ -203,6 +206,9 @@ impl Default for Engine {
             samples: Vec::new(),
             self_index: 0,
             testing_valves: false,
+            self_ack_since: [0; 5],
+            self_pending: 0,
+            self_waiting: None,
             hold_reference: None,
             hold_samples: 0,
         }
@@ -267,6 +273,8 @@ impl Engine {
         self.status.message = message.into();
     }
     fn configure(&mut self, phase: Phase, desired: [bool; 5], now: u64, message: &str) -> Effects {
+        self.self_pending = 0;
+        self.self_waiting = None;
         self.target = desired;
         self.transition(phase, now, message);
         // Close supply valves before any other reconfiguration; opening a supply
@@ -277,6 +285,64 @@ impl Engine {
                 .map(|i| (i, desired[i]))
                 .collect(),
             notification: None,
+        }
+    }
+    fn self_confirmation_phase(&self) -> bool {
+        self.testing_valves
+            && matches!(
+                self.status.phase,
+                Phase::BaselineSetup
+                    | Phase::SelfSetup
+                    | Phase::SelfOpen
+                    | Phase::SelfClose
+                    | Phase::SelfFinish
+            )
+    }
+    fn configure_self(
+        &mut self,
+        phase: Phase,
+        desired: [bool; 5],
+        input: Inputs,
+        message: &str,
+    ) -> Effects {
+        self.self_pending = 0;
+        self.self_waiting = None;
+        for i in 0..5 {
+            let already_confirmed = input.valves[i].is_some_and(|v| {
+                v.open == desired[i]
+                    && v.at_ms <= input.now_ms
+                    && if phase == Phase::BaselineSetup {
+                        input.now_ms - v.at_ms <= 2000
+                    } else {
+                        self.target[i] == desired[i] && v.at_ms >= self.self_ack_since[i]
+                    }
+            });
+            if already_confirmed {
+                self.self_ack_since[i] = input.valves[i].unwrap().at_ms;
+            } else {
+                self.self_pending |= 1 << i;
+                self.self_ack_since[i] = input.now_ms;
+            }
+        }
+        self.target = desired;
+        self.transition(phase, input.now_ms, message);
+        self.next_self_command(input.now_ms)
+    }
+    fn next_self_command(&mut self, now: u64) -> Effects {
+        // Establish safe supply states first; never burst both vent/dump moves.
+        let next = [3, 4, 0, 1, 2]
+            .into_iter()
+            .find(|i| self.self_pending & (1 << i) != 0);
+        self.self_waiting = next;
+        if let Some(i) = next {
+            self.self_pending &= !(1 << i);
+            self.self_ack_since[i] = now;
+            Effects {
+                valves: vec![(i, self.target[i])],
+                notification: None,
+            }
+        } else {
+            Effects::default()
         }
     }
     pub fn request(&mut self, action: Action, input: Inputs) -> Result<Effects, String> {
@@ -342,6 +408,14 @@ impl Engine {
                     self.status.self_test_locked = true;
                 }
                 self.samples.clear();
+                if self.testing_valves {
+                    return Ok(self.configure_self(
+                        Phase::BaselineSetup,
+                        RELIEVED,
+                        input,
+                        "Preparing empty-tank pressure calibration",
+                    ));
+                }
                 self.configure(
                     Phase::BaselineSetup,
                     RELIEVED,
@@ -367,7 +441,20 @@ impl Engine {
             .valves
             .iter()
             .zip(self.target)
-            .all(|(v, target)| v.is_some_and(|v| v.open == target && v.at_ms >= self.phase_since))
+            .enumerate()
+            .all(|(i, (v, target))| {
+                v.is_some_and(|v| {
+                    v.open == target
+                        && v.at_ms
+                            >= if self.self_confirmation_phase() {
+                                self.self_ack_since[i]
+                            } else {
+                                self.phase_since
+                            }
+                })
+            })
+            && (!self.self_confirmation_phase()
+                || (self.self_pending == 0 && self.self_waiting.is_none()))
     }
     fn valve_ack_timeout(&mut self, input: Inputs) -> Effects {
         let names = ["Pilot", "Vent", "Dump", "Nitrogen", "Nitrous"];
@@ -380,7 +467,16 @@ impl Engine {
                 let wanted = if target { "open" } else { "closed" };
                 let reason = match observed {
                     None => "no report",
-                    Some(v) if v.at_ms < self.phase_since => "no fresh report",
+                    Some(v)
+                        if v.at_ms
+                            < if self.self_confirmation_phase() {
+                                self.self_ack_since[i]
+                            } else {
+                                self.phase_since
+                            } =>
+                    {
+                        "no fresh report"
+                    }
                     Some(v) if v.open != target => "opposite state reported",
                     _ => return None,
                 };
@@ -488,6 +584,18 @@ impl Engine {
         if setup && elapsed > 5000 {
             return self.valve_ack_timeout(input);
         }
+        if self.self_confirmation_phase() {
+            if let Some(i) = self.self_waiting {
+                if input.valves[i]
+                    .is_some_and(|v| v.open == self.target[i] && v.at_ms >= self.self_ack_since[i])
+                {
+                    self.self_waiting = None;
+                    if self.self_pending != 0 {
+                        return self.next_self_command(input.now_ms);
+                    }
+                }
+            }
+        }
         match self.status.phase {
             Phase::BaselineSetup if self.confirmed(input) => {
                 self.samples.clear();
@@ -538,25 +646,29 @@ impl Engine {
                     .config
                     .pressure_step_psi
                     .min(self.config.nitrogen_target_psi);
+                if self.testing_valves {
+                    return self.configure_self(
+                        Phase::SelfSetup,
+                        RELIEVED,
+                        input,
+                        "Checking resting valve states before self-test",
+                    );
+                }
                 return self.configure(
-                    if self.testing_valves {
-                        Phase::SelfSetup
-                    } else {
-                        Phase::NitrogenSetup
-                    },
+                    Phase::NitrogenSetup,
                     CLOSED,
                     input.now_ms,
                     "Closing all valves before testing",
                 );
             }
             Phase::SelfSetup if self.confirmed(input) => {
-                let mut target = CLOSED;
-                target[self.self_index] = true;
-                return self.configure(
+                let mut target = RELIEVED;
+                target[self.self_index] = !RELIEVED[self.self_index];
+                return self.configure_self(
                     Phase::SelfOpen,
                     target,
-                    input.now_ms,
-                    "Opening one valve for self-test",
+                    input,
+                    "Moving one valve for self-test",
                 );
             }
             Phase::SelfOpen if self.confirmed(input) => self.transition(
@@ -565,30 +677,30 @@ impl Engine {
                 "Valve self-test: two-second dwell",
             ),
             Phase::SelfHold if elapsed >= 2000 => {
-                return self.configure(
+                return self.configure_self(
                     Phase::SelfClose,
-                    CLOSED,
-                    input.now_ms,
-                    "Closing tested valve",
+                    RELIEVED,
+                    input,
+                    "Restoring tested valve to its resting state",
                 );
             }
             Phase::SelfClose if self.confirmed(input) => {
                 self.self_index += 1;
                 if self.self_index == 5 {
-                    return self.configure(
+                    return self.configure_self(
                         Phase::SelfFinish,
                         RELIEVED,
-                        input.now_ms,
+                        input,
                         "Restoring dump and vent to open",
                     );
                 }
-                let mut target = CLOSED;
-                target[self.self_index] = true;
-                return self.configure(
+                let mut target = RELIEVED;
+                target[self.self_index] = !RELIEVED[self.self_index];
+                return self.configure_self(
                     Phase::SelfOpen,
                     target,
-                    input.now_ms,
-                    "Opening next valve for self-test",
+                    input,
+                    "Moving next valve for self-test",
                 );
             }
             Phase::NitrogenSetup if self.confirmed(input) => {
@@ -1184,6 +1296,78 @@ mod tests {
         assert!(!message.contains("Nitrogen closed:"));
     }
     #[test]
+    fn self_test_uses_recent_resting_reports_and_only_confirms_changed_valves() {
+        let mut rig = Rig::new();
+        let mut input = rig.input();
+        let effects = rig.engine.request(Action::SelfTest, input).unwrap();
+        // The normal vent/dump-open state requires no initial movement.
+        assert!(effects.valves.is_empty());
+        let mut commands = Vec::new();
+        for _ in 0..300 {
+            input.now_ms += 100;
+            input.pressure.as_mut().unwrap().at_ms = input.now_ms;
+            let effects = rig.engine.tick(input);
+            assert_ne!(rig.engine.status.phase, Phase::Fault);
+            assert!(effects.valves.len() <= 1);
+            for (i, open) in effects.valves {
+                commands.push((i, open));
+                // Only commanded valves send a new reply. Other cached reports
+                // retain their original timestamp throughout this session.
+                input.valves[i] = Some(ValveState {
+                    open,
+                    at_ms: input.now_ms,
+                });
+            }
+            if rig.engine.status.phase == Phase::Idle {
+                break;
+            }
+        }
+        assert_eq!(rig.engine.status.phase, Phase::Idle);
+        assert_eq!(
+            commands,
+            vec![
+                (0, true),
+                (0, false),
+                (1, false),
+                (1, true),
+                (2, false),
+                (2, true),
+                (3, true),
+                (3, false),
+                (4, true),
+                (4, false)
+            ]
+        );
+    }
+    #[test]
+    fn self_test_waits_for_each_unknown_resting_state_and_faults_without_reply() {
+        let mut rig = Rig::new();
+        let mut input = rig.input();
+        input.valves = [None; 5];
+        let effects = rig.engine.request(Action::SelfTest, input).unwrap();
+        assert_eq!(effects.valves, vec![(3, false)]);
+        input.now_ms += 100;
+        input.pressure.as_mut().unwrap().at_ms = input.now_ms;
+        assert!(rig.engine.tick(input).valves.is_empty());
+        input.valves[3] = Some(ValveState {
+            open: false,
+            at_ms: input.now_ms,
+        });
+        assert_eq!(rig.engine.tick(input).valves, vec![(4, false)]);
+        input.now_ms += 5100;
+        input.pressure.as_mut().unwrap().at_ms = input.now_ms;
+        let effects = rig.engine.tick(input);
+        assert_eq!(rig.engine.status.phase, Phase::Fault);
+        assert!(
+            effects
+                .notification
+                .unwrap()
+                .contains("Nitrous closed: no report")
+        );
+        assert!(effects.valves.contains(&(3, false)));
+        assert!(effects.valves.contains(&(4, false)));
+    }
+    #[test]
     fn self_test_exercises_one_valve_at_a_time_and_restores_normally_open_valves() {
         let mut rig = Rig::new();
         rig.request(Action::SelfTest);
@@ -1191,8 +1375,20 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..300 {
             if rig.engine.status.phase == Phase::SelfHold {
-                assert_eq!(rig.valves.iter().filter(|v| **v).count(), 1);
-                let valve = rig.valves.iter().position(|v| *v).unwrap();
+                assert_eq!(
+                    rig.valves
+                        .iter()
+                        .zip(RELIEVED)
+                        .filter(|(v, normal)| **v != *normal)
+                        .count(),
+                    1
+                );
+                let valve = rig
+                    .valves
+                    .iter()
+                    .zip(RELIEVED)
+                    .position(|(v, normal)| *v != normal)
+                    .unwrap();
                 if !seen.contains(&valve) {
                     seen.push(valve);
                 }
