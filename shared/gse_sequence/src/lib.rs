@@ -369,6 +369,31 @@ impl Engine {
             .zip(self.target)
             .all(|(v, target)| v.is_some_and(|v| v.open == target && v.at_ms >= self.phase_since))
     }
+    fn valve_ack_timeout(&mut self, input: Inputs) -> Effects {
+        let names = ["Pilot", "Vent", "Dump", "Nitrogen", "Nitrous"];
+        let pending: Vec<String> = input
+            .valves
+            .iter()
+            .zip(self.target)
+            .enumerate()
+            .filter_map(|(i, (observed, target))| {
+                let wanted = if target { "open" } else { "closed" };
+                let reason = match observed {
+                    None => "no report",
+                    Some(v) if v.at_ms < self.phase_since => "no fresh report",
+                    Some(v) if v.open != target => "opposite state reported",
+                    _ => return None,
+                };
+                Some(format!("{} {wanted}: {reason}", names[i]))
+            })
+            .collect();
+        let message = format!(
+            "Valve acknowledgement timed out in {:?}: {}",
+            self.status.phase,
+            pending.join("; ")
+        );
+        self.fault(input.now_ms, &message)
+    }
     fn sample_mean(&self, since: u64) -> Option<f32> {
         let samples: Vec<_> = self.samples.iter().filter(|s| s.at_ms >= since).collect();
         if samples.len() < 3 {
@@ -422,7 +447,7 @@ impl Engine {
                 };
             }
             if elapsed > 5000 {
-                return self.fault(input.now_ms, "Valve acknowledgement timed out");
+                return self.valve_ack_timeout(input);
             }
             return Effects::default();
         }
@@ -461,7 +486,7 @@ impl Engine {
                 | Phase::FillSetup
         );
         if setup && elapsed > 5000 {
-            return self.fault(input.now_ms, "Valve acknowledgement timed out");
+            return self.valve_ack_timeout(input);
         }
         match self.status.phase {
             Phase::BaselineSetup if self.confirmed(input) => {
@@ -1124,6 +1149,39 @@ mod tests {
         rig.effects(effects);
         assert_eq!(rig.engine.status.phase, Phase::Fault);
         assert!(!rig.valves[3] && !rig.valves[4]);
+    }
+    #[test]
+    fn valve_timeout_identifies_missing_stale_and_wrong_reports() {
+        let mut rig = Rig::new();
+        rig.now = 100;
+        rig.request(Action::SelfTest);
+        let mut input = rig.input();
+        input.now_ms += 5100;
+        input.pressure.as_mut().unwrap().at_ms = input.now_ms;
+        input.valves[0] = None;
+        input.valves[1] = Some(ValveState {
+            open: true,
+            at_ms: 0,
+        });
+        input.valves[2] = Some(ValveState {
+            open: false,
+            at_ms: input.now_ms,
+        });
+        input.valves[3] = Some(ValveState {
+            open: false,
+            at_ms: input.now_ms,
+        });
+        input.valves[4] = Some(ValveState {
+            open: false,
+            at_ms: input.now_ms,
+        });
+        let effects = rig.engine.tick(input);
+        assert_eq!(rig.engine.status.phase, Phase::Fault);
+        let message = effects.notification.unwrap();
+        assert!(message.contains("Pilot closed: no report"));
+        assert!(message.contains("Vent open: no fresh report"));
+        assert!(message.contains("Dump open: opposite state reported"));
+        assert!(!message.contains("Nitrogen closed:"));
     }
     #[test]
     fn self_test_exercises_one_valve_at_a_time_and_restores_normally_open_valves() {

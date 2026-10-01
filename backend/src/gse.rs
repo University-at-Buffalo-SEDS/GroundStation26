@@ -579,7 +579,9 @@ mod tests {
         let ground_ingress = Arc::new(std::sync::OnceLock::new());
         let ingress = ground_ingress.clone();
         let options = sedsnet::router::RouterSideOptions {
-            reliable_enabled: true,
+            // Match the deployed CAN/I2C and RF sides: no hop ACKs;
+            // ordered end-to-end command ACKs still drive this test link.
+            reliable_enabled: false,
             link_local_enabled: true,
             ..Default::default()
         };

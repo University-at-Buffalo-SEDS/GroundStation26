@@ -228,11 +228,13 @@ fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
         // Pico-Fi's polled I2C bridge owns delivery and cannot sustain
         // SEDSNet's bidirectional hop-ACK traffic without starving Gateway.
         CommsLinkConfig::I2c { .. } => false,
-        // Raw UART only provides outer framing on the RFD900x hop, so SEDSNet
-        // retains delivery semantics there.
-        CommsLinkConfig::Serial { .. }
-        | CommsLinkConfig::RaspberryPiGpioUart { .. }
-        | CommsLinkConfig::CustomSerial { .. } => true,
+        // RF disables hop sequencing on its RFD900x side. Match that policy:
+        // enabling it only here leaves unacknowledged frames in hop history.
+        // Router end-to-end command delivery remains enabled independently.
+        CommsLinkConfig::Serial { serial }
+        | CommsLinkConfig::RaspberryPiGpioUart { serial }
+        | CommsLinkConfig::CustomSerial { serial } =>
+            serial.protocol != crate::comms_config::SerialProtocol::RawUart,
         CommsLinkConfig::Spi { .. } | CommsLinkConfig::Can { .. } => true,
     }
 }
@@ -276,7 +278,7 @@ mod router_link_policy_tests {
     use super::*;
 
     #[test]
-    fn raw_uart_radio_keeps_sedsnet_reliability_enabled() {
+    fn raw_uart_radio_matches_rf_hop_policy() {
         let link = CommsLinkConfig::Serial {
             serial: crate::comms_config::SerialLinkConfig {
                 port: "sim://av-bay".to_owned(),
@@ -285,7 +287,12 @@ mod router_link_policy_tests {
             },
         };
 
-        assert!(router_hop_reliable_enabled(&link));
+        assert!(!router_hop_reliable_enabled(&link));
+        let mut framed = link.clone();
+        if let CommsLinkConfig::Serial { serial } = &mut framed {
+            serial.protocol = crate::comms_config::SerialProtocol::PacketFramed;
+        }
+        assert!(router_hop_reliable_enabled(&framed));
     }
 
     #[test]
