@@ -299,6 +299,14 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
                     crate::telemetry_task::flush_command_tx(router, "GSE supply close recovery");
                     return;
                 }
+                log::info!(
+                    "GSE command queued phase={:?} valve={} requested={} type={} payload={:02x}",
+                    state.gse.lock().unwrap().engine.status.phase,
+                    ["Pilot", "Vent", "Dump", "Nitrogen", "Nitrous"][index],
+                    if open { "open" } else { "closed" },
+                    if index < 3 { "VALVE_COMMAND" } else { "ACTUATOR_COMMAND" },
+                    payload,
+                );
                 state.set_pending_umbilical_valve_state(KEYS[index], open);
             }
             crate::telemetry_task::flush_command_tx(router, "GSE sequence");
@@ -587,7 +595,7 @@ mod tests {
             reliable_enabled: false,
             link_local_enabled: true,
             ..Default::default()
-        };
+        }.with_small_packet_transport(128);
         let peer_side = peer.add_side_packed_with_options(
             "test_ground",
             move |bytes| {
