@@ -59,7 +59,7 @@ impl TxQueueBudget {
                     .checked_add(payload.len())
                     .filter(|total| *total <= ceiling)
             })
-            .map_err(|_| sedsnet::TelemetryError::HandlerError("radio transport backpressure"))?;
+            .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
         if sender.send((priority, payload.to_vec())).is_err() {
             self.complete(payload.len());
             return Err(sedsnet::TelemetryError::HandlerError(
@@ -142,12 +142,56 @@ mod priority_tests {
         budget.try_send(&tx, 255, &[0; 1024]).unwrap();
         budget.try_send(&tx, 255, &[1; 1024]).unwrap();
         let (_, first) = rx.try_recv().unwrap();
-        assert!(budget.try_send(&tx, 0, &[2; 32]).is_err());
+        assert!(matches!(
+            budget.try_send(&tx, 0, &[2; 32]),
+            Err(sedsnet::TelemetryError::Io("side tx busy"))
+        ));
         // Moving to a worker backlog or retrying a failed write frees nothing.
         assert_eq!(budget.pending.load(Ordering::Acquire), 2048);
         budget.complete(first.len());
         budget.try_send(&tx, 0, &[2; 32]).unwrap();
         assert_eq!(budget.pending.load(Ordering::Acquire), 1056);
+    }
+
+    #[test]
+    fn radio_backpressure_retains_update_until_transport_drains() {
+        use sedsnet::config::{DataEndpoint, DataType};
+        use sedsnet::router::{RouterConfig, RouterSideOptions};
+        let budget = Arc::new(TxQueueBudget::new(2048));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        budget.try_send(&tx, 0, &[0; 2048]).unwrap();
+        let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+        let callback_budget = budget.clone();
+        router.add_side_packed_with_options(
+            "busy",
+            move |frame| callback_budget.try_send(&tx, 255, frame),
+            RouterSideOptions::default(),
+        );
+        let packet = Packet::new(
+            DataType::DiscoverySchema,
+            &[DataEndpoint::Discovery],
+            "GS",
+            1,
+            Arc::from([10u8, 11u8]),
+        )
+        .unwrap();
+        router.tx(packet.clone()).unwrap();
+        let (_, filler) = rx.try_recv().unwrap();
+        assert_eq!(filler.len(), 2048);
+        assert!(rx.try_recv().is_err());
+        budget.complete(filler.len());
+        router.process_tx_queue().unwrap();
+        let mut found = false;
+        while let Ok((_, bytes)) = rx.try_recv() {
+            budget.complete(bytes.len());
+            if let Ok(decoded) = serialize::unpack_packet(&bytes) {
+                found |= decoded == packet;
+            }
+        }
+        assert!(
+            found,
+            "accepted update must survive temporary transport saturation"
+        );
     }
 
     #[test]
