@@ -260,6 +260,18 @@ mod tests {
     }
 
     #[test]
+    fn commands_and_confirmations_use_protected_can_priority() {
+        let schema: serde_json::Value = serde_json::from_slice(SCHEMA_JSON).unwrap();
+        for name in ["ACTUATOR_COMMAND", "VALVE_COMMAND", "FLIGHT_COMMAND", "UMBILICAL_STATUS"] {
+            let ty = schema["types"].as_array().unwrap().iter()
+                .find(|item| item["name"] == name).expect("control type");
+            assert!(ty["priority"].as_u64().unwrap() >= 200, "{name}");
+            assert_eq!(ty["reliable"], true, "{name}");
+            assert_eq!(ty["reliable_mode"], "Ordered", "{name}");
+        }
+    }
+
+    #[test]
     fn heartbeat_matches_firmware_priority() {
         let schema: serde_json::Value =
             serde_json::from_slice(SCHEMA_JSON).expect("embedded telemetry schema");

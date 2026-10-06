@@ -203,7 +203,7 @@
       ],
       "reliable_mode": "Ordered",
       "reliable": true,
-      "priority": 0
+      "priority": 200
     },
     {
       "name": "FLIGHT_COMMAND",
@@ -221,7 +221,7 @@
       ],
       "reliable_mode": "Ordered",
       "reliable": true,
-      "priority": 0
+      "priority": 200
     },
     {
       "name": "FUEL_TANK_PRESSURE",
@@ -322,7 +322,7 @@
         "ACTUATOR_BOARD",
         "GROUND_STATION"
       ],
-      "priority": 0
+      "priority": 200
     },
     {
       "name": "UMBILICAL_STATUS",
