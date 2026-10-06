@@ -79,7 +79,7 @@ impl BoardStatus {
 #[derive(Clone)]
 pub struct AppState {
     /// Optional ring buffer for full telemetry packets (not JSON)
-    pub ring_buffer: Arc<Mutex<RingBuffer<Packet>>>,
+    pub ring_buffer: Arc<Mutex<RingBuffer<crate::ring_buffer::ReceivedPacket>>>,
 
     /// Commands from frontend → server (Arm, Disarm, Abort, etc.)
     pub cmd_tx: mpsc::Sender<TelemetryCommand>,

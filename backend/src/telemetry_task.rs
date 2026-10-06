@@ -335,7 +335,7 @@ pub async fn telemetry_task(
         262_144,
     );
     let packet_enqueue_burst = env_usize("GS_PACKET_ENQUEUE_BURST", PACKET_ENQUEUE_BURST, 32, 4096);
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Packet>(packet_work_queue_size);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<crate::ring_buffer::ReceivedPacket>(packet_work_queue_size);
     let db_overflow = DbOverflow;
 
     let db_worker = {
@@ -561,7 +561,15 @@ pub async fn telemetry_task(
         let db_overflow = db_overflow.clone();
         tokio::spawn(async move {
             while let Some(pkt) = packet_rx.recv().await {
-                for row in handle_packet(&state, &db_tx, &db_overflow, pkt).await {
+                let rows = match pkt {
+                    crate::ring_buffer::ReceivedPacket::Telemetry(pkt) =>
+                        handle_packet(&state, &db_tx, &db_overflow, pkt).await,
+                    crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, row } => {
+                        persist_umbilical_status(&state, &db_tx, &db_overflow, &packet, &row).await;
+                        Vec::new()
+                    }
+                };
+                for row in rows {
                     state.cache_recent_telemetry(row.clone());
                     let _ = state.ws_tx.send(row);
                 }
@@ -1498,6 +1506,57 @@ async fn queue_db_write(
     }
 }
 
+/// Apply confirmations before the recording queue can delay them. Source
+/// clocks may reset: ordered delivery, not timestamp comparison, governs state.
+pub(crate) fn apply_umbilical_status_at_ingress(
+    state: &Arc<AppState>, pkt: &Packet,
+) -> Option<TelemetryRow> {
+    let sender_id = state.canonical_network_sender_id(pkt.sender());
+    state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+    if let Ok(data) = pkt.data_as_u8() && data.len() == 2 {
+        let cmd_id = data[0];
+        let on = data[1] != 0;
+        if cmd_id == ValveBoardCommands::Sequence as u8 {
+            if on { start_launch_clock_from_valve_sequence_status(state); }
+            return None;
+        }
+        if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
+            state.set_umbilical_valve_state(key_cmd_id, key_on);
+            state.reconcile_pending_umbilical_valve_state(
+                key_cmd_id, key_on, crate::state::UMBILICAL_PENDING_VALVE_TIMEOUT,
+            );
+            if key_cmd_id == ValveBoardCommands::PilotOpen as u8 && key_on
+                && !crate::gse::active(state) {
+                transition_launch_clock_to_t_plus_from_pilot_open(state);
+            }
+            sequences::refresh_action_policy_now(state);
+            state.broadcast_action_policy_snapshot();
+            return Some(TelemetryRow {
+                timestamp_ms: get_current_timestamp_ms() as i64,
+                data_type: VALVE_STATE_DATA_TYPE.to_string(), sender_id,
+                values: valve_state_values(state).into_iter().collect(),
+            });
+        }
+    }
+    report_parse_error(state, &sender_id, &pkt.data_type().as_str(),
+        "expected 2-byte umbilical status payload");
+    None
+}
+
+async fn persist_umbilical_status(
+    state: &Arc<AppState>, db_tx: &mpsc::Sender<DbQueueItem>, db_overflow: &DbOverflow,
+    pkt: &Packet, row: &TelemetryRow,
+) {
+    let values_json = serde_json::to_string(
+        &row.values.iter().map(|v| v.map(|n| n as f64)).collect::<Vec<_>>(),
+    ).ok();
+    queue_db_write(state, db_tx, db_overflow, DbWrite::Telemetry {
+        timestamp_ms: row.timestamp_ms, source_timestamp_ms: Some(pkt.timestamp() as i64),
+        data_type: row.data_type.clone(), sender_id: row.sender_id.clone(),
+        values_json, payload_json: payload_json_from_pkt(pkt),
+    }).await;
+}
+
 async fn handle_packet(
     state: &Arc<AppState>,
     db_tx: &mpsc::Sender<DbQueueItem>,
@@ -1622,75 +1681,10 @@ async fn handle_packet(
     }
 
     if pkt.data_type() == crate::telemetry_schema::data_type("UMBILICAL_STATUS") {
-        if let Ok(data) = pkt.data_as_u8()
-            && data.len() == 2
-        {
-            let cmd_id = data[0];
-            let on = data[1] != 0;
-            if cmd_id == ValveBoardCommands::Sequence as u8 {
-                if on {
-                    start_launch_clock_from_valve_sequence_status(state);
-                }
-                return Vec::new();
-            }
-            if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
-                state.set_umbilical_valve_state(key_cmd_id, key_on);
-                state.reconcile_pending_umbilical_valve_state(
-                    key_cmd_id,
-                    key_on,
-                    crate::state::UMBILICAL_PENDING_VALVE_TIMEOUT,
-                );
-                if key_cmd_id == ValveBoardCommands::PilotOpen as u8
-                    && key_on
-                    && !crate::gse::active(state)
-                {
-                    transition_launch_clock_to_t_plus_from_pilot_open(state);
-                }
-                sequences::refresh_action_policy_now(state);
-                state.broadcast_action_policy_snapshot();
-
-                let ts_ms = get_current_timestamp_ms() as i64;
-                let values = valve_state_values(state);
-                let values_vec: Vec<Option<f32>> = values.into_iter().collect();
-                let values_json = serde_json::to_string(
-                    &values_vec
-                        .iter()
-                        .map(|v| v.map(|n| n as f64))
-                        .collect::<Vec<_>>(),
-                )
-                .ok();
-                let payload_json = payload_json_from_pkt(&pkt);
-
-                queue_db_write(
-                    state,
-                    db_tx,
-                    db_overflow,
-                    DbWrite::Telemetry {
-                        timestamp_ms: ts_ms,
-                        source_timestamp_ms: Some(pkt.timestamp() as i64),
-                        data_type: VALVE_STATE_DATA_TYPE.to_string(),
-                        sender_id: sender_id.clone(),
-                        values_json,
-                        payload_json,
-                    },
-                )
-                .await;
-
-                let row = TelemetryRow {
-                    timestamp_ms: ts_ms,
-                    data_type: VALVE_STATE_DATA_TYPE.to_string(),
-                    sender_id,
-                    values: values_vec,
-                };
-                return vec![row];
-            }
+        if let Some(row) = apply_umbilical_status_at_ingress(state, &pkt) {
+            persist_umbilical_status(state, db_tx, db_overflow, &pkt, &row).await;
+            return vec![row];
         }
-        report_parse_error(
-            state,
-            &sender_id,
-            &pkt.data_type().as_str(),
-            "expected 2-byte umbilical status payload",
-        );
         return Vec::new();
     }
 
@@ -4634,6 +4628,41 @@ mod tests {
             .find(|control| control.cmd == "Nitrogen")
             .expect("Nitrogen control should exist");
         assert_eq!(closed.actuated, Some(false));
+    }
+
+    #[tokio::test]
+    async fn full_recording_queue_does_not_delay_or_roll_back_live_valve_confirmation() {
+        let (db_tx, mut db_rx) = mpsc::channel(1);
+        let state = test_app_state(db_tx.clone()).await;
+        let overflow = test_db_overflow();
+        db_tx.send(DbQueueItem::Write(DbWrite::FlightState {
+            timestamp_ms: 0, state_code: 0,
+        })).await.unwrap();
+        let key = ActuatorBoardCommands::NitrousOpen as u8;
+        let make = |on| Packet::new(
+            crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "AB", 0,
+            Arc::from([key, on]),
+        ).unwrap();
+        let open = make(1);
+        let row = apply_umbilical_status_at_ingress(&state, &open).unwrap();
+        assert_eq!(state.get_umbilical_valve_state(key), Some(true));
+        let mut pending = Box::pin(persist_umbilical_status(&state, &db_tx, &overflow, &open, &row));
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut pending).await.is_err());
+        let close = make(0);
+        apply_umbilical_status_at_ingress(&state, &close).unwrap();
+        assert_eq!(state.get_umbilical_valve_state(key), Some(false));
+        db_rx.recv().await.unwrap();
+        pending.await;
+        // Finishing the old recording work must never reopen the live valve.
+        assert_eq!(state.get_umbilical_valve_state(key), Some(false));
+        match db_rx.recv().await.unwrap() {
+            DbQueueItem::Write(DbWrite::Telemetry { values_json, .. }) => {
+                let values: Vec<Option<f32>> = serde_json::from_str(&values_json.unwrap()).unwrap();
+                assert_eq!(values[5], Some(1.0));
+            }
+            _ => panic!("expected original arrival-time valve snapshot"),
+        }
     }
 
     #[tokio::test]

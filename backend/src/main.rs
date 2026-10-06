@@ -815,6 +815,19 @@ async fn main() -> anyhow::Result<()> {
                     pilot_open_ack_generation_handler.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
+                ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
+                if let Some(row) = telemetry_task::apply_umbilical_status_at_ingress(
+                    &ground_station_handler_state_clone, pkt,
+                ) {
+                    ground_station_handler_state_clone.cache_recent_telemetry(row.clone());
+                    let _ = ground_station_handler_state_clone.ws_tx.send(row.clone());
+                    ground_station_handler_state_clone.ring_buffer.lock().unwrap().push(
+                        crate::ring_buffer::ReceivedPacket::AppliedStatus { packet: pkt.clone(), row },
+                    );
+                }
+                return Ok(());
+            }
             ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
             let mut rb = ground_station_handler_state_clone
                 .ring_buffer
