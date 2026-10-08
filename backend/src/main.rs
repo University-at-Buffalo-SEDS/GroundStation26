@@ -101,6 +101,18 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .clamp(min, max)
 }
 
+fn network_delivery_tuning() -> sedsnet::config::RuntimeTuningConfig {
+    // RFD airtime for a 1 KiB schema chunk is about 327 ms at 64 kbps
+    // with the configured 40% link share. A 200 ms retry can duplicate a
+    // command before the modem drains one chunk, then exhaust its 1.8 s
+    // delivery window during a valid schema transfer. Initial sends remain
+    // immediate; only retransmission waits change.
+    sedsnet::config::RuntimeTuningConfig {
+        reliable_retransmit_ms: env_usize("GS_RELIABLE_RETRANSMIT_MS", 500, 100, 5000) as u32,
+        ..Default::default()
+    }
+}
+
 fn network_memory_config() -> sedsnet::config::RuntimeMemoryConfig {
     // This is a ceiling, not a preallocation. Keep physical transport queues
     // short so a stalled radio cannot turn extra host RAM into command latency.
@@ -284,6 +296,17 @@ fn request_startup_topology(router: &sedsnet::router::Router) -> sedsnet::Teleme
 
 #[cfg(test)]
 mod router_link_policy_tests {
+    #[test]
+    fn radio_delivery_window_exceeds_a_schema_transfer() {
+        let tuning = super::network_delivery_tuning();
+        tuning.validate().unwrap();
+        if std::env::var_os("GS_RELIABLE_RETRANSMIT_MS").is_none() {
+            assert_eq!(tuning.reliable_retransmit_ms, 500);
+            assert!(u64::from(tuning.reliable_retransmit_ms) *
+                u64::from(tuning.reliable_max_retries + 1) >= 4500);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -525,6 +548,7 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     telemetry_schema::initialize()?;
+    sedsnet::config::set_runtime_tuning_config(network_delivery_tuning())?;
 
     logger::init()?;
     log::info!(
