@@ -19,6 +19,7 @@ use super::{
 /// The router retains ownership of frames rejected with backpressure.
 pub struct TxQueueBudget {
     pending: AtomicUsize,
+    pending_control: AtomicUsize,
     limit: usize,
 }
 
@@ -26,6 +27,7 @@ impl TxQueueBudget {
     pub fn new(limit: usize) -> Self {
         Self {
             pending: AtomicUsize::new(0),
+            pending_control: AtomicUsize::new(0),
             limit,
         }
     }
@@ -52,16 +54,42 @@ impl TxQueueBudget {
         } else {
             false
         };
-        let ceiling = self.limit + if continuation { 64 * 1024 } else { 0 };
-        self.pending
+        // Discovery uses priority 254. ACKs (255) and board commands have
+        // their own bounded allowance, even while accepted schema chunks
+        // exceed the ordinary target. Ownership still lasts until the write.
+        let control = priority >= 200 && priority != 254;
+        if control {
+            self.pending_control
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    pending
+                        .checked_add(payload.len())
+                        .filter(|total| *total <= self.limit)
+                })
+                .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
+        }
+        let ceiling = if control {
+            self.limit.saturating_mul(2).saturating_add(64 * 1024)
+        } else {
+            self.limit
+                .saturating_add(if continuation { 64 * 1024 } else { 0 })
+        };
+        let reserved = self
+            .pending
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                 pending
                     .checked_add(payload.len())
                     .filter(|total| *total <= ceiling)
             })
-            .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
+            .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"));
+        if let Err(error) = reserved {
+            if control {
+                self.pending_control
+                    .fetch_sub(payload.len(), Ordering::AcqRel);
+            }
+            return Err(error);
+        }
         if sender.send((priority, payload.to_vec())).is_err() {
-            self.complete(payload.len());
+            self.complete(priority, payload.len());
             return Err(sedsnet::TelemetryError::HandlerError(
                 "radio tx queue closed",
             ));
@@ -69,8 +97,11 @@ impl TxQueueBudget {
         Ok(())
     }
 
-    fn complete(&self, len: usize) {
+    fn complete(&self, priority: u8, len: usize) {
         self.pending.fetch_sub(len, Ordering::AcqRel);
+        if priority >= 200 && priority != 254 {
+            self.pending_control.fetch_sub(len, Ordering::AcqRel);
+        }
     }
 }
 
@@ -141,18 +172,30 @@ struct WireBacklog {
 }
 impl WireBacklog {
     fn new(preserve_order: bool) -> Self {
-        Self { ordered: VecDeque::new(), priorities: PriorityBacklog::new(),
-            preserve_order, control_bytes: 0 }
+        Self {
+            ordered: VecDeque::new(),
+            priorities: PriorityBacklog::new(),
+            preserve_order,
+            control_bytes: 0,
+        }
     }
     fn push(&mut self, priority: u8, payload: Vec<u8>, front: bool) {
         if self.preserve_order {
-            if front { self.ordered.push_front((priority, payload)); }
-            else { self.ordered.push_back((priority, payload)); }
-        } else { backlog_push(&mut self.priorities, priority, payload, front); }
+            if front {
+                self.ordered.push_front((priority, payload));
+            } else {
+                self.ordered.push_back((priority, payload));
+            }
+        } else {
+            backlog_push(&mut self.priorities, priority, payload, front);
+        }
     }
     fn pop(&mut self) -> Option<(u8, Vec<u8>)> {
-        if self.preserve_order { self.ordered.pop_front() }
-        else { backlog_pop(&mut self.priorities, &mut self.control_bytes) }
+        if self.preserve_order {
+            self.ordered.pop_front()
+        } else {
+            backlog_pop(&mut self.priorities, &mut self.control_bytes)
+        }
     }
 }
 
@@ -168,26 +211,52 @@ mod priority_tests {
             let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let count = delivered.clone();
             let endpoint = crate::telemetry_schema::endpoint("GROUND_STATION");
-            let receiver = Router::new_with_clock(RouterConfig::new([
-                EndpointHandler::new_packet_handler(endpoint, move |_: &Packet| {
-                    count.fetch_add(1, Ordering::SeqCst); Ok(())
-                })
-            ]).with_reliable_enabled(false), Box::new(|| 0));
-            let side = receiver.add_side_packed_with_options("radio", |_| Ok(()),
-                RouterSideOptions { header_template_enabled: true,
-                    max_side_transport_templates: capacity, ..Default::default() });
+            let receiver = Router::new_with_clock(
+                RouterConfig::new([EndpointHandler::new_packet_handler(
+                    endpoint,
+                    move |_: &Packet| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )])
+                .with_reliable_enabled(false),
+                Box::new(|| 0),
+            );
+            let side = receiver.add_side_packed_with_options(
+                "radio",
+                |_| Ok(()),
+                RouterSideOptions {
+                    header_template_enabled: true,
+                    max_side_transport_templates: capacity,
+                    ..Default::default()
+                },
+            );
             let frames = Arc::new(Mutex::new(Vec::new()));
             let output = frames.clone();
             let sender = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
-            sender.add_side_packed_with_options("radio", move |bytes| {
-                output.lock().unwrap().push(bytes.to_vec()); Ok(())
-            }, RouterSideOptions { header_template_enabled: true,
-                max_side_transport_templates: 16, ..Default::default() });
+            sender.add_side_packed_with_options(
+                "radio",
+                move |bytes| {
+                    output.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                RouterSideOptions {
+                    header_template_enabled: true,
+                    max_side_transport_templates: 16,
+                    ..Default::default()
+                },
+            );
             for round in 0..2 {
                 for flow in 0..8 {
-                    let packet = Packet::new(crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
-                        &[endpoint], &format!("FLOW{flow}"), round * 8 + flow,
-                        Arc::from(12.0_f32.to_le_bytes())).unwrap().with_nonce((round * 8 + flow + 1) as u16);
+                    let packet = Packet::new(
+                        crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+                        &[endpoint],
+                        &format!("FLOW{flow}"),
+                        round * 8 + flow,
+                        Arc::from(12.0_f32.to_le_bytes()),
+                    )
+                    .unwrap()
+                    .with_nonce((round * 8 + flow + 1) as u16);
                     sender.tx(packet).unwrap();
                 }
                 for frame in frames.lock().unwrap().drain(..) {
@@ -196,10 +265,12 @@ mod priority_tests {
             }
             delivered.load(Ordering::SeqCst)
         }
-        assert!(run(4) < 16, "old RF cache must reproduce silent compact frame loss");
+        assert!(
+            run(4) < 16,
+            "old RF cache must reproduce silent compact frame loss"
+        );
         assert_eq!(run(16), 16);
     }
-
 
     #[test]
     fn radio_wire_order_survives_priority_bursts_and_failed_writes() {
@@ -213,8 +284,12 @@ mod priority_tests {
         assert_eq!(first, b"SDT\x01template");
         backlog.push(priority, first, true);
         backlog.push(255, b"SDT\x01new".to_vec(), false);
-        for expected in [b"SDT\x01template".as_slice(), b"SDT\x03chunk",
-            b"SDT\x02compact", b"SDT\x01new"] {
+        for expected in [
+            b"SDT\x01template".as_slice(),
+            b"SDT\x03chunk",
+            b"SDT\x02compact",
+            b"SDT\x01new",
+        ] {
             assert_eq!(backlog.pop().unwrap().1, expected);
         }
         assert!(backlog.pop().is_none());
@@ -224,21 +299,20 @@ mod priority_tests {
         assert_eq!(unpaced.pop().unwrap().1, vec![1]);
     }
 
-
     #[test]
     fn radio_budget_stays_charged_until_write_completion() {
         let budget = TxQueueBudget::new(2048);
         let (tx, mut rx) = mpsc::unbounded_channel();
         budget.try_send(&tx, 255, &[0; 1024]).unwrap();
         budget.try_send(&tx, 255, &[1; 1024]).unwrap();
-        let (_, first) = rx.try_recv().unwrap();
+        let (priority, first) = rx.try_recv().unwrap();
         assert!(matches!(
             budget.try_send(&tx, 0, &[2; 32]),
             Err(sedsnet::TelemetryError::Io("side tx busy"))
         ));
         // Moving to a worker backlog or retrying a failed write frees nothing.
         assert_eq!(budget.pending.load(Ordering::Acquire), 2048);
-        budget.complete(first.len());
+        budget.complete(priority, first.len());
         budget.try_send(&tx, 0, &[2; 32]).unwrap();
         assert_eq!(budget.pending.load(Ordering::Acquire), 1056);
     }
@@ -254,7 +328,7 @@ mod priority_tests {
         let callback_budget = budget.clone();
         router.add_side_packed_with_options(
             "busy",
-            move |frame| callback_budget.try_send(&tx, 255, frame),
+            move |frame| callback_budget.try_send(&tx, 254, frame),
             RouterSideOptions::default(),
         );
         let packet = Packet::new(
@@ -266,14 +340,14 @@ mod priority_tests {
         )
         .unwrap();
         router.tx(packet.clone()).unwrap();
-        let (_, filler) = rx.try_recv().unwrap();
+        let (priority, filler) = rx.try_recv().unwrap();
         assert_eq!(filler.len(), 2048);
         assert!(rx.try_recv().is_err());
-        budget.complete(filler.len());
+        budget.complete(priority, filler.len());
         router.process_tx_queue().unwrap();
         let mut found = false;
-        while let Ok((_, bytes)) = rx.try_recv() {
-            budget.complete(bytes.len());
+        while let Ok((priority, bytes)) = rx.try_recv() {
+            budget.complete(priority, bytes.len());
             if let Ok(decoded) = serialize::unpack_packet(&bytes) {
                 found |= decoded == packet;
             }
@@ -282,6 +356,33 @@ mod priority_tests {
             found,
             "accepted update must survive temporary transport saturation"
         );
+    }
+
+    #[test]
+    fn schema_burst_cannot_consume_ack_and_command_allowance() {
+        let budget = TxQueueBudget::new(2048);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for index in 0u16..8 {
+            let mut chunk = vec![0u8; 1024];
+            chunk[..4].copy_from_slice(b"SDT\x03");
+            chunk[8..10].copy_from_slice(&index.to_le_bytes());
+            chunk[10..12].copy_from_slice(&8u16.to_le_bytes());
+            budget.try_send(&tx, 254, &chunk).unwrap();
+        }
+        assert!(budget.try_send(&tx, 0, &[0; 32]).is_err());
+        budget.try_send(&tx, 255, &[1; 32]).unwrap();
+        budget.try_send(&tx, 245, &[2; 32]).unwrap();
+        assert_eq!(budget.pending_control.load(Ordering::Acquire), 64);
+        assert!(budget.try_send(&tx, 255, &[0; 2048]).is_err());
+        while let Ok((priority, payload)) = rx.try_recv() {
+            budget.complete(priority, payload.len());
+        }
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
+        drop(rx);
+        assert!(budget.try_send(&tx, 255, &[0; 32]).is_err());
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -295,7 +396,7 @@ mod priority_tests {
         let callback_tx = tx.clone();
         router.add_side_packed_with_options(
             "test_uart",
-            move |frame| callback_budget.try_send(&callback_tx, 255, frame),
+            move |frame| callback_budget.try_send(&callback_tx, 254, frame),
             RouterSideOptions {
                 max_frame_bytes: 1024,
                 ..Default::default()
@@ -320,10 +421,10 @@ mod priority_tests {
         .unwrap();
         router.tx(packet).unwrap();
         assert!(budget.pending.load(Ordering::Acquire) > 3600);
-        assert!(budget.try_send(&tx, 255, &[0; 100]).is_err());
+        assert!(budget.try_send(&tx, 0, &[0; 100]).is_err());
         let mut frames = 0;
-        while let Ok((_, payload)) = rx.try_recv() {
-            budget.complete(payload.len());
+        while let Ok((priority, payload)) = rx.try_recv() {
+            budget.complete(priority, payload.len());
             frames += 1;
         }
         assert_eq!(frames, 4);
@@ -465,7 +566,7 @@ pub(super) fn spawn_comms_worker_threads(
                     match comms.send_data(&payload) {
                         Ok(()) => {
                             if let Some(budget) = &comms_handle.tx_budget {
-                                budget.complete(payload.len());
+                                budget.complete(priority, payload.len());
                             }
                             sent_any = true;
                             log_link_control_send(worker_name, &payload);
