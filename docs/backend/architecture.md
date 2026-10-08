@@ -312,7 +312,7 @@ It serves the built web frontend from `frontend/dist/public`.
 
 ## Host network memory and diagnostics
 
-The hosted router uses a 256 MiB queue/state ceiling instead of the embedded
+The hosted router uses a 2 GiB queue/state ceiling instead of the embedded
 library's 100 KiB default. `GS_NETWORK_MEMORY_BUDGET_BYTES` can set a ceiling
 between 1 MiB and 2 GiB. Storage grows on demand; the ceiling is not allocated
 at startup. This covers retained routing, replay and packet queue state, not all

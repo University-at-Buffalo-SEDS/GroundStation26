@@ -104,7 +104,7 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
 fn network_memory_config() -> sedsnet::config::RuntimeMemoryConfig {
     // This is a ceiling, not a preallocation. Keep physical transport queues
     // short so a stalled radio cannot turn extra host RAM into command latency.
-    let budget = env_usize("GS_NETWORK_MEMORY_BUDGET_BYTES", 256 * 1024 * 1024,
+    let budget = env_usize("GS_NETWORK_MEMORY_BUDGET_BYTES", 2 * 1024 * 1024 * 1024,
                            1024 * 1024, 2 * 1024 * 1024 * 1024);
     sedsnet::config::RuntimeMemoryConfig::new(budget, 4096, 4096, 1.25)
         .expect("bounded host network memory configuration")
