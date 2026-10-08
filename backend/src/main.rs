@@ -101,6 +101,15 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .clamp(min, max)
 }
 
+fn network_memory_config() -> sedsnet::config::RuntimeMemoryConfig {
+    // This is a ceiling, not a preallocation. Keep physical transport queues
+    // short so a stalled radio cannot turn extra host RAM into command latency.
+    let budget = env_usize("GS_NETWORK_MEMORY_BUDGET_BYTES", 256 * 1024 * 1024,
+                           1024 * 1024, 2 * 1024 * 1024 * 1024);
+    sedsnet::config::RuntimeMemoryConfig::new(budget, 4096, 4096, 1.25)
+        .expect("bounded host network memory configuration")
+}
+
 fn network_router_time_divisor() -> u64 {
     std::env::var("GS_SIM_ROUTER_TIME_DIVISOR")
         .ok()
@@ -899,7 +908,8 @@ async fn main() -> anyhow::Result<()> {
         telemetry_error_handler,
     ])
     .with_sender(Board::GroundStation.sender_id())
-    .with_preferred_discovery_master(Board::GroundStation.sender_id());
+    .with_preferred_discovery_master(Board::GroundStation.sender_id())
+    .with_memory_config(network_memory_config())?;
     if telemetry_task::timesync_enabled() {
         cfg = cfg.with_timesync(TimeSyncConfig {
             role: TimeSyncRole::Source,

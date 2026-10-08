@@ -309,3 +309,17 @@ The backend also depends on:
 - `backend/calibration/...`
 
 It serves the built web frontend from `frontend/dist/public`.
+
+## Host network memory and diagnostics
+
+The hosted router uses a 256 MiB queue/state ceiling instead of the embedded
+library's 100 KiB default. `GS_NETWORK_MEMORY_BUDGET_BYTES` can set a ceiling
+between 1 MiB and 2 GiB. Storage grows on demand; the ceiling is not allocated
+at startup. This covers retained routing, replay and packet queue state, not all
+backend process memory. Physical radio TX buffering remains short and bounded.
+More RAM does not increase radio bandwidth or recover packets lost upstream.
+
+`GET /api/network_diagnostics` uses the same ViewData permission as the topology
+API and reports announcer ages/variables, per-type RX/TX counts, transport
+retries, dictionary evictions, shared queue bytes and pending reliable delivery.
+Use this to separate missing discovery from downstream delivery pressure.

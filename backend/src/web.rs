@@ -212,6 +212,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/network_time", get(get_network_time))
         .route("/api/launch_clock", get(get_launch_clock))
         .route("/api/network_topology", get(get_network_topology))
+        .route("/api/network_diagnostics", get(get_network_diagnostics))
         .route("/api/firmware/targets", get(get_firmware_targets))
         .route("/api/firmware/updates", get(get_firmware_updates))
         .route("/api/firmware/updates/{id}", get(get_firmware_update))
@@ -1610,6 +1611,51 @@ async fn get_network_topology(
     }
     Json(state.network_topology_snapshot(crate::telemetry_task::get_current_timestamp_ms()))
         .into_response()
+}
+
+/// Read-only detail beyond the dashboard's summarized topology.
+async fn get_network_diagnostics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    let Some(router) = state.topology_router.get() else {
+        return Json(serde_json::json!({"ready": false})).into_response();
+    };
+    let stats = router.export_runtime_stats();
+    let topology = router.export_topology();
+    let sides: Vec<_> = stats.sides.iter().map(|side| {
+        let types: Vec<_> = side.data_types.iter().map(|ty| serde_json::json!({
+            "data_type": ty.data_type.as_u32(), "rx_packets": ty.rx_packets,
+            "tx_packets": ty.tx_packets, "tx_retries": ty.tx_retries,
+            "handler_failures": ty.handler_failures,
+        })).collect();
+        serde_json::json!({"name": side.side_name, "rx_packets": side.rx_packets,
+            "tx_packets": side.tx_packets, "tx_retries": side.tx_retries,
+            "handler_failures": side.tx_handler_failures,
+            "template_evictions": side.side_transport_template_evictions,
+            "rx_templates": side.side_transport_rx_template_count, "data_types": types})
+    }).collect();
+    let routes: Vec<_> = topology.routes.iter().map(|route| {
+        let announcers: Vec<_> = route.announcers.iter().map(|peer| serde_json::json!({
+            "sender": peer.sender_id, "age_ms": peer.age_ms,
+            "endpoints": peer.reachable_endpoints.iter().map(|ep| format!("{ep:?}")).collect::<Vec<_>>(),
+            "variables": peer.reachable_network_variables.iter().map(|ty| ty.as_u32()).collect::<Vec<_>>(),
+        })).collect();
+        serde_json::json!({"side": route.side_name, "age_ms": route.age_ms, "announcers": announcers})
+    }).collect();
+    Json(serde_json::json!({"ready": true, "sides": sides, "routes": routes,
+        "queues": {"rx_len": stats.queues.rx_len, "tx_len": stats.queues.tx_len,
+            "shared_bytes": stats.queues.shared_queue_bytes_used, "replay_len": stats.queues.replay_len},
+        "reliable": {"pending": stats.reliable.end_to_end_pending_count,
+            "pending_destinations": stats.reliable.end_to_end_pending_destination_count},
+        "handler_failures": stats.total_handler_failures,
+        "handler_retries": stats.total_handler_retries,
+        "discovery": {"interval_ms": stats.discovery.current_announce_interval_ms,
+            "next_announce_ms": stats.discovery.next_announce_ms}
+    })).into_response()
 }
 
 #[derive(Serialize)]
