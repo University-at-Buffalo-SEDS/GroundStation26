@@ -352,7 +352,7 @@ pub(super) fn spawn_comms_worker_threads(
 
                 let now = std::time::Instant::now();
                 if now < next_tx_allowed_at {
-                    thread::sleep(next_tx_allowed_at.saturating_duration_since(now));
+                    thread::sleep(next_tx_allowed_at.saturating_duration_since(now).min(Duration::from_millis(1)));
                     continue;
                 }
 
@@ -372,6 +372,7 @@ pub(super) fn spawn_comms_worker_threads(
                         break;
                     };
                     let mut comms = tx_worker_comms.lock().expect("failed to get lock");
+                    let send_started_at = std::time::Instant::now();
                     match comms.send_data(&payload) {
                         Ok(()) => {
                             if let Some(budget) = &comms_handle.tx_budget {
@@ -386,6 +387,11 @@ pub(super) fn spawn_comms_worker_threads(
                                 );
                                 suppressed_send_errors = 0;
                                 last_send_error_log_ms = 0;
+                            }
+                            if worker_name == "rocket_comms" {
+                                // UART drain does not drain the RFD modem's air FIFO.
+                                next_tx_allowed_at = send_started_at + radio_air_time_for_payload(payload.len());
+                                break;
                             }
                         }
                         Err(e) => {
@@ -406,10 +412,11 @@ pub(super) fn spawn_comms_worker_threads(
                 }
 
                 if sent_any {
-                    // send_data drains the OS/device transport. An additional
-                    // per-packet delay only lowers throughput and increases
-                    // discovery/network-variable latency.
-                    next_tx_allowed_at = std::time::Instant::now();
+                    // Only the RFD modem needs an over-air budget. The Pico
+                    // path can keep draining at its device transport rate.
+                    if worker_name != "rocket_comms" {
+                        next_tx_allowed_at = std::time::Instant::now();
+                    }
                     thread::yield_now();
                 } else {
                     thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
@@ -1196,11 +1203,8 @@ fn radio_uplink_yield_grace_ms() -> u64 {
 
 fn radio_air_bit_rate_bps() -> u64 {
     static BPS: OnceLock<u64> = OnceLock::new();
-    /* The RFD900x UART and air link are configured for 57,600 bit/s. The old
-     * LoRa-era 9,600 bit/s default artificially held each packet in the host
-     * scheduler six times too long, so its backlog and command latency grew
-     * continuously even though the physical radio still had capacity. */
-    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 57_600, 300, 115_200) as u64)
+    // User-confirmed ATS2=64. UART remains 115200; RF firmware uses the same budget.
+    *BPS.get_or_init(|| env_usize("GS_RADIO_AIR_BIT_RATE_BPS", 64_000, 300, 250_000) as u64)
 }
 
 fn radio_air_frame_overhead_bytes() -> u64 {
@@ -1210,15 +1214,53 @@ fn radio_air_frame_overhead_bytes() -> u64 {
 
 fn radio_tx_cooldown_ms() -> u64 {
     static DELAY_MS: OnceLock<u64> = OnceLock::new();
-    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_TX_COOLDOWN_MS", 25, 0, 1_000) as u64)
+    *DELAY_MS.get_or_init(|| env_usize("GS_RADIO_TX_COOLDOWN_MS", 0, 0, 1_000) as u64)
+}
+
+fn radio_air_budget(
+    payload_len: usize,
+    air_bps: u64,
+    share_percent: u64,
+    overhead: u64,
+) -> Duration {
+    let bytes = payload_len as u128 + 4 + overhead as u128;
+    let bps = (air_bps as u128 * share_percent.clamp(1, 100) as u128 / 100).max(1);
+    let ms = (bytes * 8 * 1_000).div_ceil(bps).min(u64::MAX as u128);
+    Duration::from_millis(ms as u64)
 }
 
 fn radio_air_time_for_payload(payload_len: usize) -> Duration {
-    let framed_len = payload_len as u64 + 4;
-    let bytes = framed_len + radio_air_frame_overhead_bytes();
-    let bps = radio_air_bit_rate_bps().max(1);
-    let air_ms = ((bytes * 10 * 1_000) + bps - 1) / bps;
-    Duration::from_millis(air_ms.saturating_add(radio_tx_cooldown_ms()))
+    // Each end may consume 40% of the shared half-duplex link. Keep packets in
+    // the bounded priority queue rather than flooding the modem without CTS.
+    let share = env_usize("GS_RADIO_AIR_SHARE_PERCENT", 40, 1, 100) as u64;
+    radio_air_budget(
+        payload_len,
+        radio_air_bit_rate_bps(),
+        share,
+        radio_air_frame_overhead_bytes(),
+    )
+    .saturating_add(Duration::from_millis(radio_tx_cooldown_ms()))
+}
+
+#[cfg(test)]
+mod rfd_air_budget_tests {
+    use super::*;
+    #[test]
+    fn budgets_shared_air_link_instead_of_uart_baud() {
+        assert_eq!(
+            radio_air_budget(100, 64_000, 40, 16),
+            Duration::from_millis(38)
+        );
+        assert_eq!(
+            radio_air_budget(1024, 64_000, 40, 16),
+            Duration::from_millis(327)
+        );
+        assert_eq!(
+            radio_air_budget(100, 64_000, 80, 16),
+            Duration::from_millis(19)
+        );
+        assert!(radio_air_budget(usize::MAX, 0, 0, 128).as_millis() > 0);
+    }
 }
 
 fn maybe_log_green_radio_command_send(worker_name: &str, payload: &[u8]) {
