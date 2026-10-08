@@ -161,6 +161,47 @@ mod priority_tests {
     use super::*;
 
     #[test]
+    fn rf_receive_dictionary_retains_interleaved_control_flows() {
+        use sedsnet::router::{EndpointHandler, RouterConfig, RouterSideOptions};
+        crate::telemetry_schema::initialize().unwrap();
+        fn run(capacity: usize) -> usize {
+            let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = delivered.clone();
+            let endpoint = crate::telemetry_schema::endpoint("GROUND_STATION");
+            let receiver = Router::new_with_clock(RouterConfig::new([
+                EndpointHandler::new_packet_handler(endpoint, move |_: &Packet| {
+                    count.fetch_add(1, Ordering::SeqCst); Ok(())
+                })
+            ]).with_reliable_enabled(false), Box::new(|| 0));
+            let side = receiver.add_side_packed_with_options("radio", |_| Ok(()),
+                RouterSideOptions { header_template_enabled: true,
+                    max_side_transport_templates: capacity, ..Default::default() });
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let output = frames.clone();
+            let sender = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+            sender.add_side_packed_with_options("radio", move |bytes| {
+                output.lock().unwrap().push(bytes.to_vec()); Ok(())
+            }, RouterSideOptions { header_template_enabled: true,
+                max_side_transport_templates: 16, ..Default::default() });
+            for round in 0..2 {
+                for flow in 0..8 {
+                    let packet = Packet::new(crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+                        &[endpoint], &format!("FLOW{flow}"), round * 8 + flow,
+                        Arc::from(12.0_f32.to_le_bytes())).unwrap().with_nonce((round * 8 + flow + 1) as u16);
+                    sender.tx(packet).unwrap();
+                }
+                for frame in frames.lock().unwrap().drain(..) {
+                    receiver.rx_packed_from_side(&frame, side).unwrap();
+                }
+            }
+            delivered.load(Ordering::SeqCst)
+        }
+        assert!(run(4) < 16, "old RF cache must reproduce silent compact frame loss");
+        assert_eq!(run(16), 16);
+    }
+
+
+    #[test]
     fn radio_wire_order_survives_priority_bursts_and_failed_writes() {
         let mut backlog = WireBacklog::new(true);
         // A low-priority template followed by control/chunk traffic must not
