@@ -1647,7 +1647,6 @@ async fn get_network_diagnostics(
         serde_json::json!({"side": route.side_name, "age_ms": route.age_ms, "announcers": announcers})
     }).collect();
     Json(serde_json::json!({"ready": true, "sides": sides, "routes": routes,
-        "rf_link": crate::rf_diagnostics::snapshot(),
         "queues": {"rx_len": stats.queues.rx_len, "tx_len": stats.queues.tx_len,
             "shared_bytes": stats.queues.shared_queue_bytes_used, "replay_len": stats.queues.replay_len},
         "reliable": {"pending": stats.reliable.end_to_end_pending_count,

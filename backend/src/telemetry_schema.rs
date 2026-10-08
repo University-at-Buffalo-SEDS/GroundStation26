@@ -179,17 +179,6 @@ pub fn initialize() -> anyhow::Result<()> {
     INITIALIZED
         .get_or_init(|| {
             register_firmware_compatible_schema()?;
-            register_data_type_id_with_description_and_e2e_encryption(
-                DataType(1000),
-                "RF_LINK_DIAGNOSTICS",
-                "RF link health counters v1",
-                MessageElement::Static(32, MessageDataType::UInt32, MessageClass::Data),
-                &[endpoints::GROUND_STATION],
-                ReliableMode::None,
-                100,
-                E2eEncryptionPolicy::PreferOff,
-            )
-            .map_err(|err| err.to_string())?;
             for (name, expected) in [
                 ("GPS_DATA", types::GPS_DATA),
                 ("BAROMETER_DATA", types::BAROMETER_DATA),

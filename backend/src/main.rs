@@ -35,7 +35,6 @@ mod network_variables;
 mod recording_export;
 mod recording_range;
 mod recording_report;
-mod rf_diagnostics;
 mod ring_buffer;
 mod rocket_commands;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
@@ -733,10 +732,6 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("GROUND_STATION"),
         move |pkt: &Packet| {
-            if pkt.data_type() == sedsnet::config::DataType(1000) && pkt.sender() == "RF" {
-                crate::rf_diagnostics::observe(pkt.payload());
-                return Ok(());
-            }
             if std::env::var_os("GS_SIM_VALIDATE_TELEMETRY_RETURN").is_some() {
                 let board =
                     ground_station_handler_state_clone.board_from_network_sender(pkt.sender());
