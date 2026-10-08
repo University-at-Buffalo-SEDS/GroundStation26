@@ -131,9 +131,58 @@ fn backlog_pop(backlog: &mut PriorityBacklog, control_bytes: &mut usize) -> Opti
     payload.map(|payload| (priority, payload))
 }
 
+// Stateful side-transport frames must retain callback order. The router has
+// already selected logical packet priority before encoding template/chunk frames.
+struct WireBacklog {
+    ordered: VecDeque<(u8, Vec<u8>)>,
+    priorities: PriorityBacklog,
+    preserve_order: bool,
+    control_bytes: usize,
+}
+impl WireBacklog {
+    fn new(preserve_order: bool) -> Self {
+        Self { ordered: VecDeque::new(), priorities: PriorityBacklog::new(),
+            preserve_order, control_bytes: 0 }
+    }
+    fn push(&mut self, priority: u8, payload: Vec<u8>, front: bool) {
+        if self.preserve_order {
+            if front { self.ordered.push_front((priority, payload)); }
+            else { self.ordered.push_back((priority, payload)); }
+        } else { backlog_push(&mut self.priorities, priority, payload, front); }
+    }
+    fn pop(&mut self) -> Option<(u8, Vec<u8>)> {
+        if self.preserve_order { self.ordered.pop_front() }
+        else { backlog_pop(&mut self.priorities, &mut self.control_bytes) }
+    }
+}
+
 #[cfg(test)]
 mod priority_tests {
     use super::*;
+
+    #[test]
+    fn radio_wire_order_survives_priority_bursts_and_failed_writes() {
+        let mut backlog = WireBacklog::new(true);
+        // A low-priority template followed by control/chunk traffic must not
+        // be overtaken after its callback has accepted the encoded bytes.
+        backlog.push(0, b"SDT\x01template".to_vec(), false);
+        backlog.push(255, b"SDT\x03chunk".to_vec(), false);
+        backlog.push(254, b"SDT\x02compact".to_vec(), false);
+        let (priority, first) = backlog.pop().unwrap();
+        assert_eq!(first, b"SDT\x01template");
+        backlog.push(priority, first, true);
+        backlog.push(255, b"SDT\x01new".to_vec(), false);
+        for expected in [b"SDT\x01template".as_slice(), b"SDT\x03chunk",
+            b"SDT\x02compact", b"SDT\x01new"] {
+            assert_eq!(backlog.pop().unwrap().1, expected);
+        }
+        assert!(backlog.pop().is_none());
+        let mut unpaced = WireBacklog::new(false);
+        unpaced.push(0, vec![0], false);
+        unpaced.push(200, vec![1], false);
+        assert_eq!(unpaced.pop().unwrap().1, vec![1]);
+    }
+
 
     #[test]
     fn radio_budget_stays_charged_until_write_completion() {
@@ -340,8 +389,7 @@ pub(super) fn spawn_comms_worker_threads(
             let mut last_send_error_log_ms = 0;
             let mut suppressed_send_errors = 0;
             let mut next_tx_allowed_at = std::time::Instant::now();
-            let mut backlog = PriorityBacklog::new();
-        let mut control_bytes = 0;
+            let mut backlog = WireBacklog::new(worker_name == "rocket_comms");
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -363,12 +411,12 @@ pub(super) fn spawn_comms_worker_threads(
                     // Bound draining so a busy producer cannot starve writes.
                     for _ in 0..256 {
                         match comms_handle.tx_rx.try_recv() {
-                            Ok((priority, payload)) => backlog_push(&mut backlog, priority, payload, false),
+                            Ok((priority, payload)) => backlog.push(priority, payload, false),
                             Err(mpsc::error::TryRecvError::Empty) => break,
                             Err(mpsc::error::TryRecvError::Disconnected) => return,
                         }
                     }
-                    let Some((priority, payload)) = backlog_pop(&mut backlog, &mut control_bytes) else {
+                    let Some((priority, payload)) = backlog.pop() else {
                         break;
                     };
                     let mut comms = tx_worker_comms.lock().expect("failed to get lock");
@@ -398,7 +446,7 @@ pub(super) fn spawn_comms_worker_threads(
                             // A transport error means the packet never reached
                             // Pico-Fi. Preserve queue ordering and retry the
                             // entire logical packet from a new START slot.
-                            backlog_push(&mut backlog, priority, payload, true);
+                            backlog.push(priority, payload, true);
                             next_tx_allowed_at = std::time::Instant::now()
                                 + Duration::from_millis(COMMS_TX_GAP_MS);
                             log_repeated_worker_error(
