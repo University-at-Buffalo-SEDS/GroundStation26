@@ -287,6 +287,32 @@ mod router_link_policy_tests {
     use super::*;
 
     #[test]
+    fn hosted_router_retains_a_burst_larger_than_embedded_default() {
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = delivered.clone();
+        let endpoint = telemetry_schema::endpoint("GROUND_STATION");
+        let handler = EndpointHandler::new_packet_handler(endpoint, move |_packet: &Packet| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        let router = sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([handler])
+                .with_sender("GS")
+                .with_memory_config(network_memory_config()).unwrap(),
+        );
+        // A brief host worker pause must not silently evict the early readings.
+        // This burst exceeds the old 100 KiB shared state ceiling.
+        for i in 0..2048 {
+            let packet = Packet::new(telemetry_schema::data_type("BATTERY_VOLTAGE"),
+                &[endpoint], "AB", i, 15.0f32.to_le_bytes().to_vec().into()).unwrap();
+            router.rx_queue(packet).unwrap();
+        }
+        assert!(router.export_runtime_stats().queues.shared_queue_bytes_used > 100 * 1024);
+        router.process_rx_queue_with_timeout(0).unwrap();
+        assert_eq!(delivered.load(Ordering::Relaxed), 2048);
+    }
+
+    #[test]
     fn raw_uart_radio_matches_rf_hop_policy() {
         let link = CommsLinkConfig::Serial {
             serial: crate::comms_config::SerialLinkConfig {
