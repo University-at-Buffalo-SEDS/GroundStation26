@@ -234,15 +234,15 @@ mod tests {
     fn runtime_schema_uses_embedded_firmware_wire_ids() {
         initialize().expect("schema registration");
         assert_eq!(endpoint("SD_CARD"), DataEndpoint(100));
-        assert_eq!(endpoint("GROUND_STATION"), DataEndpoint(101));
-        assert_eq!(endpoint("FLIGHT_CONTROLLER"), DataEndpoint(102));
-        assert_eq!(endpoint("VALVE_BOARD"), DataEndpoint(103));
-        assert_eq!(endpoint("HEART_BEAT"), DataEndpoint(106));
-        assert_eq!(endpoint("ACTUATOR_BOARD"), DataEndpoint(107));
-        assert_eq!(data_type("GENERIC_ERROR"), DataType(100));
-        assert_eq!(data_type("VALVE_COMMAND"), DataType(109));
-        assert_eq!(data_type("AV_BAY_UNDERGLOW"), DataType(133));
-        assert_eq!(data_type("FLIGHT_BUZZER"), DataType(134));
+        assert_eq!(endpoint("GROUND_STATION"), DataEndpoint(191579769));
+        assert_eq!(endpoint("FLIGHT_CONTROLLER"), DataEndpoint(266702084));
+        assert_eq!(endpoint("VALVE_BOARD"), DataEndpoint(61303946));
+        assert_eq!(endpoint("HEART_BEAT"), DataEndpoint(179378936));
+        assert_eq!(endpoint("ACTUATOR_BOARD"), DataEndpoint(49912881));
+        assert_eq!(data_type("GENERIC_ERROR"), DataType(30636108));
+        assert_eq!(data_type("VALVE_COMMAND"), DataType(245583120));
+        assert_eq!(data_type("AV_BAY_UNDERGLOW"), DataType(68266860));
+        assert_eq!(data_type("FLIGHT_BUZZER"), DataType(169036741));
     }
 
     #[test]
@@ -296,14 +296,15 @@ mod tests {
         initialize().unwrap();
         let schema: serde_json::Value = serde_json::from_slice(SCHEMA_JSON).unwrap();
         let entries = [
-            ("DAQ_SAR_VOLTAGES", 143, 8),
-            ("DAQ_SDADC_VOLTAGES", 144, 6),
-            ("DAQ_CURRENT_SENSE", 145, 4),
-            ("DAQ_POWER_MONITOR", 146, 4),
+            ("DAQ_SAR_VOLTAGES", 227135715, 8),
+            ("DAQ_SDADC_VOLTAGES", 250592328, 6),
+            ("DAQ_CURRENT_SENSE", 69721613, 4),
+            ("DAQ_POWER_MONITOR", 87662373, 4),
         ];
         for (name, id, count) in entries {
             assert_eq!(data_type(name), DataType(id));
-            let ty = &schema["types"][(id - 100) as usize];
+            let ty = schema["types"].as_array().unwrap().iter()
+                .find(|entry| entry["name"] == name).unwrap();
             assert_eq!(ty["element"]["count"], count);
             assert_eq!(ty["element"]["data_type"], "Float32");
             assert_eq!(ty["endpoints"], serde_json::json!(["GROUND_STATION"]));

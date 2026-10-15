@@ -349,7 +349,11 @@ mod priority_tests {
         while let Ok((priority, bytes)) = rx.try_recv() {
             budget.complete(priority, bytes.len());
             if let Ok(decoded) = serialize::unpack_packet(&bytes) {
-                found |= decoded == packet;
+                // Sender names may resolve to a numeric address until discovery.
+                // The wire receipt identity must survive that normalization.
+                found |= decoded.packet_id() == packet.packet_id()
+                    && decoded.data_type() == packet.data_type()
+                    && decoded.payload() == packet.payload();
             }
         }
         assert!(
