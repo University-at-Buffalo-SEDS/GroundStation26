@@ -232,6 +232,7 @@ fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(
     }
 }
 
+#[cfg(any(target_os="linux",test))]
 fn is_valid_serialized_packet_or_ack(payload: &[u8]) -> bool {
     let Ok(frame) = serialize::peek_frame_info(payload) else {
         return false;
@@ -292,6 +293,8 @@ pub struct UartComms {
     raw_uart_data_frames: VecDeque<Vec<u8>>,
     radio_window_updates: VecDeque<RadioWindowUpdate>,
     protocol: SerialProtocol,
+    recovery: Option<crate::rrls::Shared>,
+    write_lock: std::sync::Arc<std::sync::Mutex<()>>,
     #[cfg(target_os = "linux")]
     baud_rate: u32,
     slow_start_deadline: Option<Instant>,
@@ -327,6 +330,8 @@ impl UartComms {
             raw_uart_data_frames: VecDeque::with_capacity(16),
             radio_window_updates: VecDeque::with_capacity(8),
             protocol: cfg.protocol.clone(),
+            recovery: crate::rrls::attach(&cfg.port),
+            write_lock: Default::default(),
             #[cfg(target_os = "linux")]
             baud_rate: cfg.baud_rate as u32,
             slow_start_deadline: Some(Instant::now() + UART_STARTUP_TIMEOUT),
@@ -456,6 +461,34 @@ impl UartComms {
         }
     }
 
+    fn drain_recovery_frames(&mut self) -> TelemetryResult<()> {
+        let shared = self.recovery.as_ref().unwrap().clone();
+        let outgoing = {
+            let mut mesh = shared.lock().unwrap();
+            let now = mesh.now();
+            while let Some((kind, payload)) = take_raw_uart_framed_payload(&mut self.rx_buf)? {
+                if kind == RawUartFrameKind::Ascii { continue; }
+                if let Some(frame) = mesh.incoming(kind == RawUartFrameKind::Command, &payload, now) {
+                    if frame.command {
+                        if let Some(window) = parse_radio_window_update(&frame.bytes) { self.radio_window_updates.push_back(window); }
+                    } else { self.raw_uart_data_frames.push_back(frame.bytes); }
+                }
+            }
+            mesh.tick(now);
+            (0..4).filter_map(|_| mesh.pop(now)).collect::<Vec<_>>()
+        };
+        for frame in outgoing {
+            let framed = if frame.command { build_raw_uart_command_frame(&frame.bytes) } else { build_raw_uart_frame(&frame.bytes) }
+                .map_err(|_| TelemetryError::HandlerError("RRLS frame too large"))?;
+            let _guard = self.write_lock.lock().unwrap();
+            #[cfg(target_os="linux")]
+            write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
+            #[cfg(not(target_os="linux"))]
+            { self.inner.write_all(&framed)?; self.inner.flush()?; }
+        }
+        Ok(())
+    }
+
     fn try_take_framed_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
         if self.rx_buf.len() < 2 {
             return Ok(None);
@@ -480,6 +513,10 @@ impl UartComms {
     }
 
     fn try_take_raw_uart_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
+        if self.recovery.is_some() {
+            self.drain_recovery_frames()?;
+            return Ok(self.raw_uart_data_frames.pop_front());
+        }
         let _ = drain_raw_uart_buffered_frames(
             &mut self.rx_buf,
             &mut self.raw_uart_data_frames,
@@ -510,13 +547,8 @@ impl UartComms {
             };
             processed_any = true;
             remaining -= 1;
-            if !is_valid_serialized_packet_or_ack(&payload) {
-                maybe_log_raw_uart_parse_issue(
-                    "dropping invalid serialized payload from framed raw UART packet",
-                    &payload[..payload.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
-                );
-                continue;
-            }
+            // Transport fragments and compact references are not standalone
+            // canonical packets. The owning router validates/reassembles them.
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
             packet_sink(payload);
         }
@@ -560,6 +592,7 @@ fn queue_uart_router_payload(
     Ok(())
 }
 
+#[cfg(any(target_os="linux",test))]
 fn queue_i2c_router_payload(
     router: &Router,
     side_id: RouterSideId,
@@ -839,6 +872,7 @@ enum RawUartFrameKind {
     Ascii,
 }
 
+#[cfg(any(target_os="linux",test))]
 fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
     if payload.len() < RAW_UART_FRAME_HEADER_SIZE {
         return None;
@@ -1380,6 +1414,8 @@ impl CommsDevice for UartComms {
             raw_uart_data_frames: VecDeque::new(),
             radio_window_updates: VecDeque::new(),
             protocol: self.protocol.clone(),
+            recovery: self.recovery.clone(),
+            write_lock: self.write_lock.clone(),
             #[cfg(target_os = "linux")]
             baud_rate: self.baud_rate,
             slow_start_deadline: None,
@@ -1420,6 +1456,14 @@ impl CommsDevice for UartComms {
 
     /// Blocking send of serialized bytes.
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let routed = if let Some(shared) = &self.recovery {
+            let mesh = shared.lock().unwrap();
+            let Some(frame) = mesh.local_tx(false, payload, mesh.now()) else { return Ok(()); };
+            Some(frame)
+        } else { None };
+        let recovery_command = routed.as_ref().is_some_and(|frame| frame.command);
+        let payload = routed.as_ref().map_or(payload, |frame| &frame.bytes[..]);
+        let _guard = self.write_lock.lock().unwrap();
         let len = payload.len();
 
         if len == 0 || len > u16::MAX as usize {
@@ -1436,7 +1480,7 @@ impl CommsDevice for UartComms {
             SerialProtocol::RawUart => {
                 #[cfg(target_os = "linux")]
                 {
-                    let framed = build_raw_uart_frame(payload)?;
+                    let framed = if recovery_command {build_raw_uart_command_frame(payload)?} else {build_raw_uart_frame(payload)?};
                     maybe_log_raw_uart_tx(&framed, &self.protocol);
                     write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
                     drain_fd_with_timeout(
@@ -1446,7 +1490,7 @@ impl CommsDevice for UartComms {
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    let framed = build_raw_uart_frame(payload)?;
+                    let framed = if recovery_command {build_raw_uart_command_frame(payload)?} else {build_raw_uart_frame(payload)?};
                     maybe_log_raw_uart_tx(&framed, &self.protocol);
                     self.inner.write_all(&framed)?;
                     self.inner.flush()?;
@@ -1480,7 +1524,14 @@ impl CommsDevice for UartComms {
             0,
             flags,
         ];
-        let framed = build_raw_uart_command_frame(&payload)?;
+        let routed;
+        let payload = if let Some(shared) = &self.recovery {
+            let mesh=shared.lock().unwrap();
+            let Some(frame)=mesh.local_tx(true,&payload,mesh.now()) else {return Ok(());};
+            routed=frame; &routed.bytes[..]
+        } else { &payload[..] };
+        let framed = build_raw_uart_command_frame(payload)?;
+        let _guard = self.write_lock.lock().unwrap();
         maybe_log_raw_uart_tx(&framed, &self.protocol);
         #[cfg(target_os = "linux")]
         {
@@ -2773,6 +2824,7 @@ mod raw_uart_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn uart_adapter_passes_small_transport_fragments_to_router_reassembly() {
         let delivered = Arc::new(Mutex::new(Vec::<Packet>::new()));
         let delivered_from_handler = delivered.clone();
@@ -2815,15 +2867,27 @@ mod raw_uart_tests {
                 .any(|fragment| !is_valid_serialized_packet_or_ack(fragment)),
             "transport fragments unexpectedly all parsed as canonical packets"
         );
+        let (_peer, port) = serialport::TTYPort::pair().unwrap();
+        let mut uart = UartComms {
+            #[cfg(target_os="linux")] inner:port,
+            #[cfg(not(target_os="linux"))] inner:Box::new(port),
+            side_id:Some(receiver_side), rx_buf:Vec::new(),
+            raw_uart_data_frames:VecDeque::new(),radio_window_updates:VecDeque::new(),
+            protocol:SerialProtocol::RawUart,recovery:None,write_lock:Default::default(),
+            #[cfg(target_os="linux")] baud_rate:115200,
+            slow_start_deadline:None,
+        };
         for fragment in fragments {
-            queue_uart_router_payload(
-                &receiver,
-                receiver_side,
-                &fragment,
-                &SerialProtocol::RawUart,
-                &mut |_| {},
-            )
-            .unwrap();
+            let framed=build_raw_uart_frame(&fragment).unwrap();
+            uart.rx_buf.extend_from_slice(&framed[..2]);
+            assert!(!uart.process_buffered_payloads_with_budget(&mut |_| panic!("partial frame delivered"),8).unwrap());
+            uart.rx_buf.extend_from_slice(&framed[2..]);
+            let mut delivered_bytes=0;
+            uart.process_buffered_payloads_with_budget(&mut |payload| {
+                delivered_bytes+=payload.len();
+                queue_uart_router_payload(&receiver,receiver_side,&payload,&SerialProtocol::RawUart,&mut |_|{}).unwrap();
+            },8).unwrap();
+            assert_eq!(delivered_bytes,fragment.len());
         }
         receiver.process_all_queues().unwrap();
 
@@ -3255,6 +3319,8 @@ mod uart_duplex_tests {
             raw_uart_data_frames: VecDeque::new(),
             radio_window_updates: VecDeque::new(),
             protocol: SerialProtocol::PacketFramed,
+            recovery: None,
+            write_lock: Default::default(),
             #[cfg(target_os = "linux")]
             baud_rate: 57600,
             slow_start_deadline: None,

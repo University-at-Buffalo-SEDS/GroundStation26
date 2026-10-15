@@ -213,6 +213,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/launch_clock", get(get_launch_clock))
         .route("/api/network_topology", get(get_network_topology))
         .route("/api/network_diagnostics", get(get_network_diagnostics))
+        .route("/api/rrls/status", get(|| async { Json(crate::rrls::status()) }))
         .route("/api/firmware/targets", get(get_firmware_targets))
         .route("/api/firmware/updates", get(get_firmware_updates))
         .route("/api/firmware/updates/{id}", get(get_firmware_update))

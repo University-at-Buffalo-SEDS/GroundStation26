@@ -16,6 +16,7 @@ use crate::types::{
     TelemetryCommand, TelemetryRow, canonical_sender_id,
 };
 use crate::web::{AlertAckStateMsg, AlertDto, ErrorMsg, FlightStateMsg, WarningMsg};
+#[cfg(test)]
 use sedsnet::packet::Packet;
 use sedsnet::router::Router;
 use sqlx::SqlitePool;
@@ -394,6 +395,7 @@ impl AppState {
         let _ = self.launch_clock_tx.send(next);
     }
 
+    #[cfg(any(feature="hitl_mode",feature="test_fire_mode"))]
     pub fn begin_daq_launch_log(&self) {
         // Rotate at command acceptance, without starting the UI clock before
         // Valve confirms the sequence. Its ACK/pilot report corrects T0 later.
@@ -1299,6 +1301,9 @@ impl AppState {
 
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
+        if crate::rrls::is_rrls() {
+            return matches!(cmd, TelemetryCommand::StartWritingNow | TelemetryCommand::StartWritingLastTwoMinutes | TelemetryCommand::PauseWritingDb | TelemetryCommand::StopWritingDb);
+        }
         if let Some(allowed) = crate::gse::command_allowed(self, cmd) {
             return allowed;
         }

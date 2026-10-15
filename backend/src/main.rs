@@ -36,6 +36,7 @@ mod recording_export;
 mod recording_range;
 mod recording_report;
 mod ring_buffer;
+mod rrls;
 mod rocket_commands;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 mod safety_task;
@@ -601,6 +602,7 @@ fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>
 }
 
 fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>>, bool) {
+    if rrls::is_rrls() { return (Arc::new(Mutex::new(Box::new(rrls::NoFill))), false); }
     match open_link(link) {
         Ok(r) => {
             gs_debug_println!("Umbilical comms online");
@@ -705,10 +707,12 @@ async fn main() -> anyhow::Result<()> {
     let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
     let loadcell_calibration = loadcell::load_or_default();
     let comms_links = comms_config::load_or_default();
+    rrls::configure(&comms_links.av_bay)?;
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let users_path = manifest_dir.join("users").join("users.json");
+    let users_path = std::env::var_os("GS_USERS_FILE").map(PathBuf::from)
+        .unwrap_or_else(|| manifest_dir.join("users").join("users.json"));
     let legacy_users_path = manifest_dir.join("data").join("users.json");
-    if !users_path.exists() && legacy_users_path.exists() {
+    if std::env::var_os("GS_USERS_FILE").is_none() && !users_path.exists() && legacy_users_path.exists() {
         if let Some(parent) = users_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -799,7 +803,7 @@ async fn main() -> anyhow::Result<()> {
 
     state.set_messages_snapshot(Vec::new());
 
-    gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
+    if !rrls::is_rrls() { gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel"); }
     let sequence_shutdown_rx = state.shutdown_subscribe();
     let mut sequence_task = start_sequence_task(state.clone(), sequence_shutdown_rx);
 
@@ -1039,7 +1043,7 @@ async fn main() -> anyhow::Result<()> {
         heartbeat_handler,
         telemetry_error_handler,
     ])
-    .with_sender(Board::GroundStation.sender_id())
+    .with_sender(if rrls::is_rrls() { "RRLS" } else { Board::GroundStation.sender_id() })
     .with_preferred_discovery_master(Board::GroundStation.sender_id())
     .with_memory_config(network_memory_config())?;
     if telemetry_task::timesync_enabled() {
@@ -1171,7 +1175,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to get umbilical comms lock")
         .set_side_id(umbilical_side);
 
-    network_variables::publish_current(&router)?;
+    if !rrls::is_rrls() { network_variables::publish_current(&router)?; }
     // The full-system simulator uses the production toggle path while each
     // phase starts a fresh GroundStation process. Keeping this behind an
     // explicit validation-only environment flag avoids altering deployment
@@ -1185,7 +1189,7 @@ async fn main() -> anyhow::Result<()> {
         log::info!("full-bay validation toggled AV bay underglow: {enabled}");
     }
 
-    let initial_discovery = if std::env::var("GS_SIM_COMPACT_INITIAL_DISCOVERY")
+    let initial_discovery = if rrls::is_rrls() { Ok(()) } else if std::env::var("GS_SIM_COMPACT_INITIAL_DISCOVERY")
         .ok()
         .as_deref()
         == Some("1")
@@ -1206,7 +1210,7 @@ async fn main() -> anyhow::Result<()> {
     // snapshot on every side at startup; discovered routers answer with their
     // current transitive graph, so fill and AV-bay routes recover without a
     // recurring broadcast/fanout workaround.
-    if let Err(err) = request_startup_topology(&router) {
+    if let Err(err) = if rrls::is_rrls() { Ok(()) } else { request_startup_topology(&router) } {
         eprintln!("WARNING: failed to request startup network topology: {err}");
     }
 
@@ -1790,11 +1794,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-    let mut st = tokio::spawn(safety_task(
-        state.clone(),
-        router.clone(),
-        safety_shutdown_rx,
-    ));
+    let mut st = { let state=state.clone(); let router=router.clone(); tokio::spawn(async move { if !rrls::is_rrls() { safety_task(state,router,safety_shutdown_rx).await; } }) };
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     let mut st = tokio::spawn(async move {
         let _ = safety_shutdown_rx;

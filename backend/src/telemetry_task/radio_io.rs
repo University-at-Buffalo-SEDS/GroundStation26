@@ -60,7 +60,7 @@ impl TxQueueBudget {
         let control = priority >= 200 && priority != 254;
         if control {
             self.pending_control
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                     pending
                         .checked_add(payload.len())
                         .filter(|total| *total <= self.limit)
@@ -75,7 +75,7 @@ impl TxQueueBudget {
         };
         let reserved = self
             .pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                 pending
                     .checked_add(payload.len())
                     .filter(|total| *total <= ceiling)

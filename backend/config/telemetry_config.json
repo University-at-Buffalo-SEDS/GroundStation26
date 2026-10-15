@@ -69,7 +69,7 @@
         "FLIGHT_CONTROLLER"
       ],
       "reliable": "Off",
-      "priority": 0
+      "priority": 255
     },
     {
       "name": "GYRO_DATA",

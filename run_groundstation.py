@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import signal
 import subprocess
 import sys
@@ -112,11 +113,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the frontend rebuild and only rebuild/run the backend.",
     )
+    parser.add_argument("--rrls", action="store_true", help="Run the headless recovery receiver/relay with local web and mobile access.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.rrls:
+        os.environ["GS_RRLS_ROLE"] = "rrls"
     testing_mode = args.testing or args.mode == "testing"
     hitl_mode = args.hitl_mode or args.mode == "hitl-mode"
     test_fire_mode = args.test_fire_mode or args.mode == "test-fire-mode"
@@ -130,7 +134,7 @@ def main() -> None:
         cmd.append("--release")
     cmd.extend(["-p", "groundstation_backend"])
     features: list[str] = []
-    if is_raspberry_pi():
+    if is_raspberry_pi() and not args.rrls:
         features.append("raspberry_pi")
     if testing_mode:
         features.append("testing")

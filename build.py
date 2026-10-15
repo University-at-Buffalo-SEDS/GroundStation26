@@ -459,6 +459,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py plain                   # docker only: pass --progress plain")
     print("  ./build.py log=build.log           # tee command output into a log file")
     print("  ./build.py docker [pi_build|no_pi] [testing]")
+    print("  ./build.py rrls                   # headless recovery backend + web UI, no local launch GPIO")
     print("  ./build.py backend_only            # local: build backend only")
     print("  ./build.py frontend_web            # local: build frontend web only")
     print("  ./build.py web                     # alias for frontend_web")
@@ -485,6 +486,7 @@ def main() -> None:
     use_existing = False
     frontend_dev = False
     backend_only = False
+    rrls_mode = False
     log_file_arg: Optional[str] = None
     frontend_only_platform: Optional[str] = None
 
@@ -496,7 +498,10 @@ def main() -> None:
 
     for raw_arg in raw_args:
         arg = raw_arg.lower()
-        if arg == "pi_build":
+        if arg == "rrls":
+            rrls_mode = True
+            force_no_pi = True
+        elif arg == "pi_build":
             force_pi = True
         elif arg == "no_pi":
             force_no_pi = True
@@ -535,6 +540,8 @@ def main() -> None:
             print(f"Error: Invalid argument '{arg}'.", file=sys.stderr)
             print_usage()
 
+    if rrls_mode:
+        print("RRLS build: no local launch GPIO. Run with GS_RRLS_ROLE=rrls or run_groundstation.py --rrls.")
     if force_pi and force_no_pi:
         print("Error: Cannot specify both 'pi_build' and 'no_pi'.", file=sys.stderr)
         sys.exit(1)

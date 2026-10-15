@@ -1,0 +1,19 @@
+[Unit]
+Description=SEDS Rocket Recovery and Localization System
+After=network.target
+
+[Service]
+Type=simple
+User=rrls
+WorkingDirectory=/opt/rrls/GroundStation26
+Environment=GS_RRLS_ROLE=rrls
+Environment=GS_BIND_ADDRESS=0.0.0.0:3000
+Environment=GS_COMMS_LINK_CONFIG=/etc/rrls/comms.json
+Environment=GS_USERS_FILE=/var/lib/rrls/users.json
+ExecStart=/opt/rrls/GroundStation26/target/release/groundstation_backend
+Restart=on-failure
+RestartSec=2
+StateDirectory=rrls
+
+[Install]
+WantedBy=multi-user.target

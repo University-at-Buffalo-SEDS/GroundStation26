@@ -191,6 +191,7 @@ pub fn before_fill(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
 }
 
 /// Starts concurrently with launch dispatch, never adding to countdown time.
+#[cfg(any(feature="hitl_mode",feature="test_fire_mode",test))]
 pub fn launch(state: &Arc<AppState>) {
     begin(state, "KG1000", false);
 }

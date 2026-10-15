@@ -1947,6 +1947,7 @@ fn payload_json_from_pkt(pkt: &Packet) -> String {
 }
 
 pub fn timesync_enabled() -> bool {
+    if crate::rrls::is_rrls() { return false; }
     if cfg!(feature = "testing") {
         return std::env::var("GROUNDSTATION_TIMESYNC").ok().as_deref() == Some("1");
     }

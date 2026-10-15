@@ -162,3 +162,5 @@ python3 download_map.py
 ```
 
 This uses the `map_downloader/` crate and writes map data into `data/`.
+
+RRLS recovery receiver/mesh relay: [setup and radio firmware requirements](docs/backend/rrls.md).

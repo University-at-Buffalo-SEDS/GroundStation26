@@ -116,7 +116,7 @@ impl FirmwareUpdateManager {
 
     fn next_source_port(&self) -> u16 {
         self.next_source_port
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |port| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |port| {
                 Some(if port == SOURCE_PORT_LAST {
                     SOURCE_PORT_FIRST
                 } else {
