@@ -319,21 +319,33 @@ mod priority_tests {
 
     #[test]
     fn radio_backpressure_retains_update_until_transport_drains() {
-        use sedsnet::config::{DataEndpoint, DataType};
+        use sedsnet::config::{register_data_type_with_description, register_endpoint_with_description};
+        use sedsnet::{MessageClass, MessageDataType, MessageElement, ReliableMode};
+        let endpoint = register_endpoint_with_description("RADIO_BACKPRESSURE_SINK", "", false).unwrap();
+        let ty = register_data_type_with_description("RADIO_BACKPRESSURE_VALUE", "",
+            MessageElement::Static(2, MessageDataType::UInt8, MessageClass::Data),
+            &[endpoint], ReliableMode::None, 200).unwrap();
         use sedsnet::router::{RouterConfig, RouterSideOptions};
         let budget = Arc::new(TxQueueBudget::new(2048));
         let (tx, mut rx) = mpsc::unbounded_channel();
         budget.try_send(&tx, 0, &[0; 2048]).unwrap();
-        let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tick = clock.clone();
+        let router = Router::new_with_clock(RouterConfig::default(),
+            Box::new(move || tick.load(Ordering::Acquire)));
         let callback_budget = budget.clone();
-        router.add_side_packed_with_options(
+        let side = router.add_side_packed_with_options(
             "busy",
             move |frame| callback_budget.try_send(&tx, 254, frame),
             RouterSideOptions::default(),
         );
+        // Discovery snapshots are regenerable/coalesced control state. Use an
+        // application frame to verify the transport's accepted-update contract.
+        router.rx_from_side(&sedsnet::discovery::build_discovery_announce(
+            "RADIO_BACKPRESSURE_PEER", 0, &[endpoint]).unwrap(), side).unwrap();
         let packet = Packet::new(
-            DataType::DiscoverySchema,
-            &[DataEndpoint::Discovery],
+            ty,
+            &[endpoint],
             "GS",
             1,
             Arc::from([10u8, 11u8]),
@@ -344,6 +356,9 @@ mod priority_tests {
         assert_eq!(filler.len(), 2048);
         assert!(rx.try_recv().is_err());
         budget.complete(priority, filler.len());
+        // Temporary refusals retry on the next millisecond instead of spinning
+        // repeatedly on a transport that has just reported itself full.
+        clock.store(1, Ordering::Release);
         router.process_tx_queue().unwrap();
         let mut found = false;
         while let Ok((priority, bytes)) = rx.try_recv() {
