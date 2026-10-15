@@ -372,7 +372,10 @@ pub async fn safety_task(
         let packets = {
             let rb = state.ring_buffer.lock().unwrap();
             let len = rb.len();
-            rb.recent(len).into_iter().cloned().collect::<Vec<_>>()
+            rb.recent(len).into_iter().map(|received| match received {
+                crate::ring_buffer::ReceivedPacket::Telemetry(packet)
+                | crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, .. } => packet.clone(),
+            }).collect::<Vec<_>>()
         };
 
         if packets.is_empty() {

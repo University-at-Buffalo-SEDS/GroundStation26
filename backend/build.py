@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import subprocess
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -107,6 +108,25 @@ def _configure_log_file(repo_root: Path, log_file_arg: Optional[str]) -> None:
     print(f"Logging command output to: {LOG_FILE}")
 
 
+def refresh_sedsnet_dependency(repo_root: Path) -> None:
+    """Refresh within the manifest's v4 range without a patch-version pin."""
+    if os.environ.get("CARGO_NET_OFFLINE", "").lower() in {"1", "true"}:
+        print("Offline build: keeping the cached SEDSnet v4 resolution.")
+        return
+    print("Refreshing SEDSnet within the configured v4 range...")
+    try:
+        result = subprocess.run(["cargo", "update", "--package", "SEDSnet"],
+            cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        print("SEDSnet refresh timed out; keeping the existing local resolution.")
+        return
+    if result.returncode != 0:
+        print("SEDSnet refresh unavailable; keeping the existing local resolution.")
+    elif result.stdout:
+        print(result.stdout, end="")
+
+
 def build_backend(
         backend_dir: Path,
         force_pi: bool,
@@ -156,6 +176,7 @@ def build_backend(
             cmd.extend(["--features", "test_fire_mode"])
 
     try:
+        refresh_sedsnet_dependency(backend_dir.parent)
         run(cmd, cwd=backend_dir)
     except FileNotFoundError as e:
         _print_missing_tool("Backend build", e, backend_dir)

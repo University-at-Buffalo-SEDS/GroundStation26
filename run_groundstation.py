@@ -6,6 +6,7 @@ import sys
 import time
 import platform
 from pathlib import Path
+from backend.build import refresh_sedsnet_dependency
 
 
 def warn_if_db_sidecars_present(repo_root: Path) -> None:
@@ -147,6 +148,7 @@ def main() -> None:
         print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")
         subprocess.run(frontend_cmd, cwd=repo_root, check=True)
     try:
+        refresh_sedsnet_dependency(repo_root)
         run(cmd, cwd=repo_root)
     except subprocess.CalledProcessError as e:
         print("Backend exited with error.", file=sys.stderr)

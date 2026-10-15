@@ -51,8 +51,7 @@
         "SD_CARD",
         "GROUND_STATION"
       ],
-      "reliable_mode": "Ordered",
-      "reliable": true,
+      "reliable": "Ordered",
       "priority": 0
     },
     {
@@ -69,8 +68,7 @@
         "SD_CARD",
         "FLIGHT_CONTROLLER"
       ],
-      "reliable_mode": "None",
-      "reliable": false,
+      "reliable": "Off",
       "priority": 0
     },
     {
@@ -85,8 +83,7 @@
       "endpoints": [
         "GROUND_STATION"
       ],
-      "reliable_mode": "None",
-      "reliable": false,
+      "reliable": "Off",
       "priority": 0
     },
     {
@@ -101,8 +98,7 @@
       "endpoints": [
         "GROUND_STATION"
       ],
-      "reliable_mode": "None",
-      "reliable": false,
+      "reliable": "Off",
       "priority": 0
     },
     {
@@ -118,8 +114,7 @@
         "GROUND_STATION",
         "SD_CARD"
       ],
-      "reliable_mode": "None",
-      "reliable": false,
+      "reliable": "Off",
       "priority": 0
     },
     {
@@ -135,8 +130,7 @@
         "GROUND_STATION",
         "SD_CARD"
       ],
-      "reliable_mode": "None",
-      "reliable": false,
+      "reliable": "Off",
       "priority": 0
     },
     {
@@ -151,8 +145,7 @@
       "endpoints": [
         "GROUND_STATION"
       ],
-      "reliable_mode": "None",
-      "reliable": false,
+      "reliable": "Off",
       "priority": 0
     },
     {
@@ -167,8 +160,7 @@
         "ABORT",
         "SD_CARD"
       ],
-      "reliable_mode": "Unordered",
-      "reliable": true,
+      "reliable": "Unordered",
       "priority": 0
     },
     {
@@ -184,8 +176,7 @@
         "GROUND_STATION",
         "SD_CARD"
       ],
-      "reliable_mode": "None",
-      "reliable": false,
+      "reliable": "Off",
       "priority": 0
     },
     {
@@ -201,8 +192,7 @@
         "GROUND_STATION",
         "VALVE_BOARD"
       ],
-      "reliable_mode": "Ordered",
-      "reliable": true,
+      "reliable": "Ordered",
       "priority": 200
     },
     {
@@ -219,8 +209,7 @@
         "SD_CARD",
         "FLIGHT_CONTROLLER"
       ],
-      "reliable_mode": "Ordered",
-      "reliable": true,
+      "reliable": "Ordered",
       "priority": 200
     },
     {
@@ -236,8 +225,7 @@
         "GROUND_STATION",
         "SD_CARD"
       ],
-      "reliable_mode": "None",
-      "reliable": false,
+      "reliable": "Off",
       "priority": 0
     },
     {
@@ -254,8 +242,7 @@
         "SD_CARD",
         "GROUND_STATION"
       ],
-      "reliable_mode": "Ordered",
-      "reliable": true,
+      "reliable": "Ordered",
       "priority": 16
     },
     {
@@ -272,8 +259,7 @@
         "GROUND_STATION",
         "FLIGHT_CONTROLLER"
       ],
-      "reliable_mode": "None",
-      "reliable": false,
+      "reliable": "Off",
       "priority": 255
     },
     {
@@ -288,8 +274,7 @@
         "SD_CARD",
         "GROUND_STATION"
       ],
-      "reliable_mode": "Ordered",
-      "reliable": true,
+      "reliable": "Ordered",
       "priority": 0
     },
     {
@@ -303,15 +288,13 @@
       "endpoints": [
         "GROUND_STATION"
       ],
-      "reliable_mode": "None",
-      "reliable": false,
+      "reliable": "Off",
       "priority": 0
     },
     {
       "name": "ACTUATOR_COMMAND",
       "doc": "Commands to be sent to the actuator board (1 u8)",
-      "reliable": true,
-      "reliable_mode": "Ordered",
+      "reliable": "Ordered",
       "class": "Data",
       "element": {
         "kind": "Static",
@@ -327,8 +310,7 @@
     {
       "name": "UMBILICAL_STATUS",
       "doc": "The status of the umbilical setup (valves, actuator position, ingnighter state, etc)(2 u8's valve, position)",
-      "reliable": true,
-      "reliable_mode": "Ordered",
+      "reliable": "Ordered",
       "class": "Data",
       "element": {
         "kind": "Static",
@@ -343,8 +325,7 @@
     {
       "name": "KG1000",
       "doc": "1000kg loadcell values (1 float32)",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "class": "Data",
       "element": {
         "kind": "Static",
@@ -359,8 +340,7 @@
     {
       "name": "KG50",
       "doc": "50kg Loadcell (1 float32)",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "class": "Data",
       "element": {
         "kind": "Static",
@@ -375,8 +355,7 @@
     {
       "name": "GPS_SATELLITE_NUMBER",
       "doc": "(1 x U8) The number of satelites the gps sees in the sky.",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "class": "Data",
       "element": {
         "kind": "Static",
@@ -391,8 +370,7 @@
     {
       "name": "EULER_ANGLES",
       "doc": "Initial condition euler angles: 3 x float32 values.",
-      "reliable": true,
-      "reliable_mode": "Unordered",
+      "reliable": "Unordered",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -408,8 +386,7 @@
     {
       "name": "ORDERED_MESSAGE",
       "doc": "Ordered Message: MessageData variant for responses to manual commands and critical state changes.",
-      "reliable": true,
-      "reliable_mode": "Ordered",
+      "reliable": "Ordered",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -424,8 +401,7 @@
     {
       "name": "ASCENT_STATE",
       "doc": "Ascent State: Quaternion vector (4 x 1 x float32) and shared state (2 x 1 x float32). Logged only to GroundStation.",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -440,8 +416,7 @@
     {
       "name": "DESCENT_STATE",
       "doc": "Descent State: low pass coordinates (2 x 1 x float32) and shared state (2 x 1 x float32). Logged only to GroundStation.",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -456,8 +431,7 @@
     {
       "name": "ASCENT_BIASES",
       "doc": "Ascent Biases: pre-launch command to update biases of Ascent KF (4 x float32).",
-      "reliable": true,
-      "reliable_mode": "Unordered",
+      "reliable": "Unordered",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -474,8 +448,7 @@
     {
       "name": "GYRO_LOCAL",
       "doc": "Gyro Data: 3 \u00d7 float32 elements (x, y, z). Logged only to SD.",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -490,8 +463,7 @@
     {
       "name": "ACCEL_LOCAL",
       "doc": "Accel Data: 3 \u00d7 float32 elements (x, y, z). Logged only to SD.",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -506,8 +478,7 @@
     {
       "name": "IMU_DATA",
       "doc": "Accel and Gyro Data: 6 \u00d7 float32 elements (ax, ay, az, gx, gy, gz). Logged only to GroundStation.",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -522,8 +493,7 @@
     {
       "name": "IMU_LOCAL",
       "doc": "Accel and Gyro Data: 6 \u00d7 float32 elements (ax, ay, az, gx, gy, gz). Logged only to SD.",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -538,8 +508,7 @@
     {
       "name": "BAROMETER_LOCAL",
       "doc": "Barometer Data: 3 \u00d7 float32 elements (alt, prs, tmp). Logged only to SD.",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -554,8 +523,7 @@
     {
       "name": "ASCENT_LOCAL",
       "doc": "Ascent State: Quaternion vector (4 x 1 x float32) and shared state (2 x 1 x float32). Logged only to SD.",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -570,8 +538,7 @@
     {
       "name": "DESCENT_LOCAL",
       "doc": "Descent State: low pass coordinates (2 x 1 x float32) and shared state (2 x 1 x float32). Logged only to SD.",
-      "reliable": false,
-      "reliable_mode": "None",
+      "reliable": "Off",
       "priority": 0,
       "class": "Data",
       "element": {
@@ -586,8 +553,7 @@
     {
       "name": "AV_BAY_UNDERGLOW",
       "doc": "Persistent avionics-bay underglow network variable (0 off, 1 on).",
-      "reliable": true,
-      "reliable_mode": "Ordered",
+      "reliable": "Ordered",
       "priority": 16,
       "class": "Data",
       "element": {
@@ -602,8 +568,7 @@
     {
       "name": "FLIGHT_BUZZER",
       "doc": "Persistent Flight Computer buzzer network variable (0 off, 1 on).",
-      "reliable": true,
-      "reliable_mode": "Ordered",
+      "reliable": "Ordered",
       "priority": 16,
       "class": "Data",
       "element": {
@@ -617,41 +582,41 @@
     },
     {
       "name": "RESERVED_135", "doc": "Reserved legacy rate ID; telemetry rates are compile-time board settings.",
-      "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
+      "reliable": "Ordered", "priority": 16, "class": "Data",
       "element": {"kind": "Static", "data_type": "Float32", "count": 1}, "endpoints": []
     },
     {
       "name": "RESERVED_136", "doc": "Reserved legacy rate ID; telemetry rates are compile-time board settings.",
-      "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
+      "reliable": "Ordered", "priority": 16, "class": "Data",
       "element": {"kind": "Static", "data_type": "Float32", "count": 1}, "endpoints": []
     },
     {
       "name": "DAQ_LOADCELL_CALIBRATION", "doc": "DAQ calibration [KG1000 slope, KG1000 intercept, IADC slope, IADC intercept].",
-      "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
+      "reliable": "Ordered", "priority": 16, "class": "Data",
       "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["SD_CARD"]
     },
     {
       "name": "DAQ_KG50_CALIBRATION",
       "doc": "KG50 calibration [c0,c1,c2,c3,c4,x0,tare]; kg=sum(ci*(raw-x0)^i)-tare.",
-      "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
+      "reliable": "Ordered", "priority": 16, "class": "Data",
       "element": {"kind": "Static", "data_type": "Float32", "count": 7},
       "endpoints": ["SD_CARD"]
     },
     {
       "name": "DAQ_LOG_CLOCK",
       "doc": "Retained DAQ session ID and T+120s close deadline, two little-endian u64 values; zeros reset recording.",
-      "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data",
+      "reliable": "Ordered", "priority": 16, "class": "Data",
       "element": {"kind": "Static", "data_type": "UInt8", "count": 16},
       "endpoints": ["SD_CARD"]
     },
-    {"name": "DAQ_ADC_TEMPERATURE", "doc": "MCP3564R die temperature in Celsius; NaN means unavailable.", "reliable": false, "reliable_mode": "Unordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 1}, "endpoints": ["GROUND_STATION"]},
-    {"name": "DAQ_THERMAL_CALIBRATION", "doc": "Raw offset compensation [KG1000 reference C, raw/C, KG50 reference C, raw/C]. Subtract slope*(T-reference) before mass calibration.", "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["SD_CARD"]},
-    {"name": "DAQ_FILTER_CALIBRATION", "doc": "Load-cell low-pass time constants [KG1000 ms, KG50 ms]; 0 disables, maximum 2000 ms.", "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 2}, "endpoints": ["SD_CARD"]},
-    {"name": "DAQ_SAR_VOLTAGES", "doc": "SAR_IN1..8 connector volts, nominal 3.3V reference; NaN unavailable.", "reliable": false, "reliable_mode": "None", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 8}, "endpoints": ["GROUND_STATION"]},
-    {"name": "DAQ_SDADC_VOLTAGES", "doc": "MCP CH2,CH3,CH4,CH5,HVAIN1(CH6),HVAIN2(CH7) connector volts; HVAIN includes 11x divider; NaN unavailable/stale.", "reliable": false, "reliable_mode": "None", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 6}, "endpoints": ["GROUND_STATION"]},
-    {"name": "DAQ_CURRENT_SENSE", "doc": "J7 volts, J8 volts, J7 amps, J8 amps. TMCS1108A1B nominal midpoint zero and 50mV/A.", "reliable": false, "reliable_mode": "None", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["GROUND_STATION"]},
-    {"name": "DAQ_POWER_MONITOR", "doc": "VMON ADC volts, IMON ADC volts, VMAIN volts, input amps. Nominal component scaling; low-current IMON is approximate.", "reliable": false, "reliable_mode": "None", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["GROUND_STATION"]},
-    {"name": "DAQ_KG50_INPUT", "doc": "Managed source: 0 AMP2/CH1, 1 P6 differential CH2-CH3. Selected input uses the fast scan.", "reliable": true, "reliable_mode": "Ordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "UInt8", "count": 1}, "endpoints": ["SD_CARD"]},
-    {"name": "DAQ_KG50_SELECTED", "doc": "[source, raw] for selected alternate KG50 input; source 1 is P6 CH2-CH3 volts. Source tag prevents mixing input calibrations.", "reliable": false, "reliable_mode": "None", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 2}, "endpoints": ["GROUND_STATION"]}
+    {"name": "DAQ_ADC_TEMPERATURE", "doc": "MCP3564R die temperature in Celsius; NaN means unavailable.", "reliable": "Off", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 1}, "endpoints": ["GROUND_STATION"]},
+    {"name": "DAQ_THERMAL_CALIBRATION", "doc": "Raw offset compensation [KG1000 reference C, raw/C, KG50 reference C, raw/C]. Subtract slope*(T-reference) before mass calibration.", "reliable": "Ordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["SD_CARD"]},
+    {"name": "DAQ_FILTER_CALIBRATION", "doc": "Load-cell low-pass time constants [KG1000 ms, KG50 ms]; 0 disables, maximum 2000 ms.", "reliable": "Ordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 2}, "endpoints": ["SD_CARD"]},
+    {"name": "DAQ_SAR_VOLTAGES", "doc": "SAR_IN1..8 connector volts, nominal 3.3V reference; NaN unavailable.", "reliable": "Off", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 8}, "endpoints": ["GROUND_STATION"]},
+    {"name": "DAQ_SDADC_VOLTAGES", "doc": "MCP CH2,CH3,CH4,CH5,HVAIN1(CH6),HVAIN2(CH7) connector volts; HVAIN includes 11x divider; NaN unavailable/stale.", "reliable": "Off", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 6}, "endpoints": ["GROUND_STATION"]},
+    {"name": "DAQ_CURRENT_SENSE", "doc": "J7 volts, J8 volts, J7 amps, J8 amps. TMCS1108A1B nominal midpoint zero and 50mV/A.", "reliable": "Off", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["GROUND_STATION"]},
+    {"name": "DAQ_POWER_MONITOR", "doc": "VMON ADC volts, IMON ADC volts, VMAIN volts, input amps. Nominal component scaling; low-current IMON is approximate.", "reliable": "Off", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["GROUND_STATION"]},
+    {"name": "DAQ_KG50_INPUT", "doc": "Managed source: 0 AMP2/CH1, 1 P6 differential CH2-CH3. Selected input uses the fast scan.", "reliable": "Ordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "UInt8", "count": 1}, "endpoints": ["SD_CARD"]},
+    {"name": "DAQ_KG50_SELECTED", "doc": "[source, raw] for selected alternate KG50 input; source 1 is P6 CH2-CH3 volts. Source tag prevents mixing input calibrations.", "reliable": "Off", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 2}, "endpoints": ["GROUND_STATION"]}
   ]
 }

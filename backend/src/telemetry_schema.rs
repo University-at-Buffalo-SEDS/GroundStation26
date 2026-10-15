@@ -16,30 +16,30 @@ static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
 pub mod types {
     use sedsnet::config::DataType;
 
-    pub const GPS_DATA: DataType = DataType(101);
-    pub const BAROMETER_DATA: DataType = DataType(106);
-    pub const FUEL_FLOW: DataType = DataType(108);
-    pub const FUEL_TANK_PRESSURE: DataType = DataType(111);
-    pub const BATTERY_VOLTAGE: DataType = DataType(104);
-    pub const BATTERY_CURRENT: DataType = DataType(105);
-    pub const KG1000: DataType = DataType(118);
-    pub const KG50: DataType = DataType(119);
-    pub const GPS_SATELLITE_NUMBER: DataType = DataType(120);
-    pub const ASCENT_STATE: DataType = DataType(123);
-    pub const DESCENT_STATE: DataType = DataType(124);
-    pub const IMU_DATA: DataType = DataType(128);
+    pub const GPS_DATA: DataType = DataType::identity("GPS_DATA");
+    pub const BAROMETER_DATA: DataType = DataType::identity("BAROMETER_DATA");
+    pub const FUEL_FLOW: DataType = DataType::identity("FUEL_FLOW");
+    pub const FUEL_TANK_PRESSURE: DataType = DataType::identity("FUEL_TANK_PRESSURE");
+    pub const BATTERY_VOLTAGE: DataType = DataType::identity("BATTERY_VOLTAGE");
+    pub const BATTERY_CURRENT: DataType = DataType::identity("BATTERY_CURRENT");
+    pub const KG1000: DataType = DataType::identity("KG1000");
+    pub const KG50: DataType = DataType::identity("KG50");
+    pub const GPS_SATELLITE_NUMBER: DataType = DataType::identity("GPS_SATELLITE_NUMBER");
+    pub const ASCENT_STATE: DataType = DataType::identity("ASCENT_STATE");
+    pub const DESCENT_STATE: DataType = DataType::identity("DESCENT_STATE");
+    pub const IMU_DATA: DataType = DataType::identity("IMU_DATA");
 }
 
 pub mod endpoints {
     use sedsnet::config::DataEndpoint;
 
-    pub const SD_CARD: DataEndpoint = DataEndpoint(100);
-    pub const GROUND_STATION: DataEndpoint = DataEndpoint(101);
-    pub const FLIGHT_CONTROLLER: DataEndpoint = DataEndpoint(102);
-    pub const VALVE_BOARD: DataEndpoint = DataEndpoint(103);
-    pub const ABORT: DataEndpoint = DataEndpoint(104);
-    pub const FLIGHT_STATE: DataEndpoint = DataEndpoint(105);
-    pub const ACTUATOR_BOARD: DataEndpoint = DataEndpoint(107);
+    pub const SD_CARD: DataEndpoint = DataEndpoint::identity("SD_CARD");
+    pub const GROUND_STATION: DataEndpoint = DataEndpoint::identity("GROUND_STATION");
+    pub const FLIGHT_CONTROLLER: DataEndpoint = DataEndpoint::identity("FLIGHT_CONTROLLER");
+    pub const VALVE_BOARD: DataEndpoint = DataEndpoint::identity("VALVE_BOARD");
+    pub const ABORT: DataEndpoint = DataEndpoint::identity("ABORT");
+    pub const FLIGHT_STATE: DataEndpoint = DataEndpoint::identity("FLIGHT_STATE");
+    pub const ACTUATOR_BOARD: DataEndpoint = DataEndpoint::identity("ACTUATOR_BOARD");
 }
 
 fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -88,12 +88,10 @@ fn register_firmware_compatible_schema() -> Result<(), String> {
         .ok_or_else(|| "schema endpoints must be an array".to_string())?;
     let mut endpoint_ids = HashMap::new();
 
-    // Embedded SEDSNet assigns each endpoint and type namespace from 100. Use
-    // those exact wire IDs here instead of the std registry's next free ID
-    // (203 after its built-ins), otherwise firmware discovery cannot decode.
-    for (index, endpoint) in endpoints.iter().enumerate() {
-        let id = DataEndpoint(100 + u32::try_from(index).map_err(|err| err.to_string())?);
+    // Local seeding and runtime discovery share order-independent identities.
+    for endpoint in endpoints {
         let name = required_str(endpoint, "name")?;
+        let id = DataEndpoint::identity(name);
         let alias = endpoint["rust"].as_str().unwrap_or(name);
         let description = endpoint["doc"]
             .as_str()
@@ -110,9 +108,9 @@ fn register_firmware_compatible_schema() -> Result<(), String> {
     let types = schema["types"]
         .as_array()
         .ok_or_else(|| "schema types must be an array".to_string())?;
-    for (index, ty) in types.iter().enumerate() {
-        let id = DataType(100 + u32::try_from(index).map_err(|err| err.to_string())?);
+    for ty in types {
         let name = required_str(ty, "name")?;
+        let id = DataType::identity(name);
         let description = ty["doc"]
             .as_str()
             .or_else(|| ty["description"].as_str())
@@ -129,14 +127,14 @@ fn register_firmware_compatible_schema() -> Result<(), String> {
             "Dynamic" => MessageElement::Dynamic(data_type, class),
             other => return Err(format!("unsupported schema element kind `{other}`")),
         };
-        let reliable = match ty["reliable_mode"].as_str() {
-            Some("Ordered") => ReliableMode::Ordered,
-            Some("Unordered") => ReliableMode::Unordered,
-            Some("None") | None if ty["reliable"].as_bool().unwrap_or(false) => {
-                ReliableMode::Ordered
-            }
-            Some("None") | None => ReliableMode::None,
-            Some(other) => return Err(format!("unsupported reliable mode `{other}`")),
+        if ty.get("reliable_mode").is_some() {
+            return Err("use a single reliable field".into());
+        }
+        let reliable = match required_str(ty, "reliable")? {
+            "Off" => ReliableMode::None,
+            "Ordered" => ReliableMode::Ordered,
+            "Unordered" => ReliableMode::Unordered,
+            other => return Err(format!("unsupported reliability `{other}`")),
         };
         let e2e = match ty["e2e_encryption"].as_str().unwrap_or("PreferOff") {
             "PreferOff" | "prefer_off" | "off" | "false" => E2eEncryptionPolicy::PreferOff,
@@ -153,10 +151,12 @@ fn register_firmware_compatible_schema() -> Result<(), String> {
                 let endpoint = endpoint
                     .as_str()
                     .ok_or_else(|| format!("type {name} endpoint must be a string"))?;
-                endpoint_ids
-                    .get(endpoint)
-                    .copied()
-                    .ok_or_else(|| format!("type {name} references unknown endpoint {endpoint}"))
+                Ok::<_, String>(
+                    endpoint_ids
+                        .get(endpoint)
+                        .copied()
+                        .unwrap_or_else(|| DataEndpoint::identity(endpoint)),
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         register_data_type_id_with_description_and_e2e_encryption(
@@ -255,19 +255,26 @@ mod tests {
             .iter()
             .find(|item| item["name"] == "UMBILICAL_STATUS")
             .expect("UMBILICAL_STATUS type");
-        assert_eq!(status["reliable"], true);
-        assert_eq!(status["reliable_mode"], "Ordered");
+        assert_eq!(status["reliable"], "Ordered");
     }
 
     #[test]
     fn commands_and_confirmations_use_protected_can_priority() {
         let schema: serde_json::Value = serde_json::from_slice(SCHEMA_JSON).unwrap();
-        for name in ["ACTUATOR_COMMAND", "VALVE_COMMAND", "FLIGHT_COMMAND", "UMBILICAL_STATUS"] {
-            let ty = schema["types"].as_array().unwrap().iter()
-                .find(|item| item["name"] == name).expect("control type");
+        for name in [
+            "ACTUATOR_COMMAND",
+            "VALVE_COMMAND",
+            "FLIGHT_COMMAND",
+            "UMBILICAL_STATUS",
+        ] {
+            let ty = schema["types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == name)
+                .expect("control type");
             assert!(ty["priority"].as_u64().unwrap() >= 200, "{name}");
-            assert_eq!(ty["reliable"], true, "{name}");
-            assert_eq!(ty["reliable_mode"], "Ordered", "{name}");
+            assert_eq!(ty["reliable"], "Ordered", "{name}");
         }
     }
 
@@ -282,7 +289,7 @@ mod tests {
             .find(|item| item["name"] == "HEARTBEAT")
             .expect("HEARTBEAT type");
         assert_eq!(heartbeat["priority"], 255);
-        assert_eq!(heartbeat["reliable"], false);
+        assert_eq!(heartbeat["reliable"], "Off");
     }
     #[test]
     fn daq_analog_schema_and_layouts_share_the_wire_contract() {

@@ -108,6 +108,9 @@ fn network_delivery_tuning() -> sedsnet::config::RuntimeTuningConfig {
     // delivery window during a valid schema transfer. Initial sends remain
     // immediate; only retransmission waits change.
     sedsnet::config::RuntimeTuningConfig {
+        // Embedded peers omit the zstd decoder. Header templates still reduce
+        // link overhead, but canonical payloads must remain decodable there.
+        payload_compress_threshold: usize::MAX,
         reliable_retransmit_ms: env_usize("GS_RELIABLE_RETRANSMIT_MS", 500, 100, 5000) as u32,
         ..Default::default()
     }
@@ -130,8 +133,47 @@ fn network_router_time_divisor() -> u64 {
         .unwrap_or(1)
 }
 
-fn validation_elapsed_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX) / network_router_time_divisor()
+fn simulation_clock_ms() -> Option<u64> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = PATH.get_or_init(|| {
+        if cfg!(feature = "hitl_mode") {
+            std::env::var_os("GS_SIM_CLOCK_FILE").map(std::path::PathBuf::from)
+        } else {
+            None
+        }
+    }).as_ref()?;
+    Some(read_simulation_clock(path, &LAST))
+}
+
+fn read_simulation_clock(path: &std::path::Path, last: &std::sync::atomic::AtomicU64) -> u64 {
+    // A read can overlap the writer's truncate/write. Keep the last valid
+    // monotonic tick rather than falling back to wall time during that race.
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(value) = text.trim().parse::<u64>() {
+            last.fetch_max(value, Ordering::Relaxed);
+        }
+    }
+    last.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy)]
+struct ValidationInstant {
+    wall: Instant,
+    simulated_ms: Option<u64>,
+}
+
+impl ValidationInstant {
+    fn now() -> Self {
+        Self { wall: Instant::now(), simulated_ms: simulation_clock_ms() }
+    }
+}
+
+fn validation_elapsed_ms(started: ValidationInstant) -> u64 {
+    if let (Some(start), Some(now)) = (started.simulated_ms, simulation_clock_ms()) {
+        return now.saturating_sub(start);
+    }
+    u64::try_from(started.wall.elapsed().as_millis()).unwrap_or(u64::MAX) / network_router_time_divisor()
 }
 
 fn validation_latency_limit_ms(name: &str, default: u64) -> u64 {
@@ -147,7 +189,7 @@ async fn wait_for_validation_reliable_delivery(
     label: &str,
     tx_before: &[(sedsnet::config::DataType, u64)],
 ) -> bool {
-    let started = Instant::now();
+    let started = ValidationInstant::now();
     let latency_limit_ms =
         validation_latency_limit_ms("GS_SIM_MANAGED_VARIABLE_MAX_LATENCY_MS", 2_500);
     let timeout_ms = std::env::var("GS_SIM_RELIABLE_ACK_TIMEOUT_MS")
@@ -158,7 +200,6 @@ async fn wait_for_validation_reliable_delivery(
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1_000);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         let stats = router.export_runtime_stats();
         let pending = stats.reliable.end_to_end_pending_destination_count;
@@ -188,7 +229,7 @@ async fn wait_for_validation_reliable_delivery(
             );
             return true;
         }
-        if Instant::now() >= deadline {
+        if validation_elapsed_ms(started) >= timeout_ms {
             log::error!(
                 "full-bay reliable delivery timed out for {label}: {pending} destination ACK(s) pending, tx queue depth {}, per-type tx before/after={transmission_counts:?}",
                 stats.queues.tx_len,
@@ -297,6 +338,34 @@ fn request_startup_topology(router: &sedsnet::router::Router) -> sedsnet::Teleme
 #[cfg(test)]
 mod router_link_policy_tests {
     #[test]
+    fn embedded_network_packets_do_not_require_a_zstd_decoder() {
+        let previous = sedsnet::config::runtime_tuning_config();
+        sedsnet::config::set_runtime_tuning_config(super::network_delivery_tuning()).unwrap();
+        let payload: std::sync::Arc<[u8]> = vec![0; 4096].into();
+        let packet = sedsnet::packet::Packet::new(
+            sedsnet::config::DataType::DiscoverySchema,
+            &[sedsnet::config::DataEndpoint::Discovery],
+            "GS", 1, payload.clone(),
+        ).unwrap();
+        let wire = sedsnet::wire_format::pack_packet(&packet);
+        sedsnet::config::set_runtime_tuning_config(previous).unwrap();
+        assert_eq!(wire[0] & 0x01, 0, "wire packet requires an embedded zstd decoder");
+        assert_eq!(sedsnet::wire_format::unpack_packet(&wire).unwrap().payload(), payload.as_ref());
+    }
+
+    #[test]
+    fn simulation_clock_survives_partial_writes_and_board_reset() {
+        let path = std::env::temp_dir().join(format!("gs-clock-test-{}", std::process::id()));
+        let last = std::sync::atomic::AtomicU64::new(0);
+        for (contents, expected) in [("1000", 1000), ("", 1000), ("10", 1000),
+            ("invalid", 1000), ("1010\n", 1010), ("0", 1010), ("1020", 1020)] {
+            std::fs::write(&path, contents).unwrap();
+            assert_eq!(super::read_simulation_clock(&path, &last), expected);
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(super::read_simulation_clock(&path, &last), 1020);
+    }
+    #[test]
     fn radio_delivery_window_exceeds_a_schema_transfer() {
         let tuning = super::network_delivery_tuning();
         tuning.validate().unwrap();
@@ -388,6 +457,19 @@ mod router_link_policy_tests {
         }
         assert!(probe.observe(6055, 150, 250, 5));
         assert!(!probe.observe(7055, 150, 250, 5));
+    }
+
+    #[test]
+    fn daq_stream_gate_accepts_250_hz_and_rejects_old_50_hz_cadence() {
+        let mut probe = StreamRateProbe::default();
+        for timestamp in [0, 20, 40, 60, 80, 100] {
+            assert!(!probe.observe(timestamp, 2, 6, 5));
+        }
+        for timestamp in [104, 108, 112, 116] {
+            assert!(!probe.observe(timestamp, 2, 6, 5));
+        }
+        assert!(probe.observe(120, 2, 6, 5));
+        assert!(!probe.observe(140, 2, 6, 5));
     }
 
     #[test]
@@ -829,12 +911,12 @@ async fn main() -> anyhow::Result<()> {
                 {
                     let valid = daq_loadcell_rate_handler.lock().unwrap().observe(
                         pkt.timestamp(),
-                        10,
-                        30,
+                        2,
+                        6,
                         5,
                     );
                     if valid && !daq_loadcell_rate_reported_handler.swap(true, Ordering::AcqRel) {
-                        log::info!("full-bay DAQ raw loadcell 50 Hz stream reached GroundStation");
+                        log::info!("full-bay DAQ raw loadcell 250 Hz stream reached GroundStation");
                     }
                 }
                 if let Some(
@@ -1016,7 +1098,9 @@ async fn main() -> anyhow::Result<()> {
         .fill_comms_connected
         .store(fill_comms_connected, Ordering::Relaxed);
 
-    let router = Arc::new(if network_router_time_divisor() == 1 {
+    let router = Arc::new(if simulation_clock_ms().is_some() {
+        sedsnet::router::Router::new_with_clock(cfg, Box::new(|| simulation_clock_ms().unwrap_or(0)))
+    } else if network_router_time_divisor() == 1 {
         sedsnet::router::Router::new(cfg)
     } else {
         // Renode advances several MCU instances cooperatively and can run much
@@ -1207,9 +1291,9 @@ async fn main() -> anyhow::Result<()> {
                         discovered.into_iter().collect::<Vec<_>>().join(",")
                     );
                     if validate_valve_roundtrip {
-                        let deadline = Instant::now() + Duration::from_secs(30);
+                        let ack_started = ValidationInstant::now();
                         while validation_pilot_ack_generation.load(Ordering::Acquire) == 0 {
-                            if Instant::now() >= deadline {
+                            if validation_elapsed_ms(ack_started) >= 30_000 {
                                 log::warn!(
                                     "full-bay managed-variable validation is continuing without an early Valve command acknowledgement"
                                 );
@@ -1354,7 +1438,7 @@ async fn main() -> anyhow::Result<()> {
                             break;
                         }
                     }
-                    let traffic_deadline = Instant::now() + Duration::from_secs(30);
+                    let traffic_started = ValidationInstant::now();
                     loop {
                         /* client_stats is link/announcer oriented: downstream
                          * boards nested inside a router's topology legitimately
@@ -1403,7 +1487,7 @@ async fn main() -> anyhow::Result<()> {
                             );
                             break;
                         }
-                        if Instant::now() >= traffic_deadline {
+                        if validation_elapsed_ms(traffic_started) >= 30_000 {
                             let observed = validation_state
                                 .board_status_snapshot(get_current_timestamp_ms())
                                 .boards
@@ -1498,7 +1582,7 @@ async fn main() -> anyhow::Result<()> {
         let validation_pilot_ack_generation = pilot_open_ack_generation.clone();
         let validation_discovery_ready = full_bay_discovery_ready.clone();
         tokio::spawn(async move {
-            let discovery_started = Instant::now();
+            let discovery_started = ValidationInstant::now();
             let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
             // Command validation must exercise learned discovery routing. The
             // linked simulator advances virtual MCU time more slowly than host
@@ -1558,7 +1642,7 @@ async fn main() -> anyhow::Result<()> {
              * manually constructing a packet here bypassed that schema lookup
              * and could leave it local to the GroundStation. */
             let ack_generation_before = validation_pilot_ack_generation.load(Ordering::Relaxed);
-            let command_started = Instant::now();
+            let command_started = ValidationInstant::now();
             let ack_latency_limit_ms =
                 validation_latency_limit_ms("GS_SIM_VALVE_ACK_MAX_LATENCY_MS", 2_500);
             let open_result =
@@ -1661,7 +1745,7 @@ async fn main() -> anyhow::Result<()> {
                 let open = round_index % 2 != 0;
                 for (slot, board, ty, command) in command_probe::validation_commands(open) {
                     let generation_before = soak_status.lock().unwrap().generation(slot, open);
-                    let started = Instant::now();
+                    let started = ValidationInstant::now();
                     if let Err(error) =
                         soak_router.log_queue(telemetry_schema::data_type(ty), &[command])
                     {
