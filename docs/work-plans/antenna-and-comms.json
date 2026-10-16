@@ -1,0 +1,123 @@
+{
+  "updated": "2026-10-15",
+  "constraints": [
+    "Preserve firmware main and GroundStation SEDSnet version-4 dependency selectors",
+    "Do not actuate outputs during diagnostics",
+    "Do not hide genuine stale data",
+    "Run simulator-based validation before declaring communication failures resolved",
+    "Keep existing HITL behavior unchanged; use it for full testing",
+    "Request the user-provided launch and test-fire sequences/procedures when procedure-specific implementation/testing starts; do not invent them",
+    "Do not relay video over RFD/RRLS radio. Camera/video traffic remains on local network links only."
+  ],
+  "tasks": [
+    {
+      "id": "cleanup",
+      "status": "complete",
+      "scope": "All board build scripts: remove selected build outputs and CRC32 target/Cargo.lock; report allocated-space estimate",
+      "validation": "Cleanup, existing build-script, and CLI tests passed in all eight checkouts; pushed"
+    },
+    {
+      "id": "diagnostics",
+      "status": "in_progress",
+      "scope": "Determine whether stale VB battery and 0.5\u20131.5 second GS-to-AV-bay variables are caused by sender identity, sensor acquisition, queueing, or radio scheduling",
+      "validation": "Capture live Pi diagnostics without actuation; reproduce identified causes in simulator and regressions",
+      "observations": [
+        "Pi currently marks every remote board stale despite incoming numeric-sender status packets; investigate mapping and running binary/dependency state before inferring sensor loss.",
+        "User reports 0.5\u20131.5 seconds GS-to-AV-bay managed-variable latency."
+      ]
+    },
+    {
+      "id": "ethernet",
+      "status": "pending",
+      "scope": "Optional Pico-Fi TCP client and server instead of I2C, using existing Pi Ethernet; bounded frame decoding, reconnect, disconnect/backpressure, and configurable setup; confirm shared web port requirement",
+      "validation": "Loopback protocol tests plus simulator network fault/reconnect cases"
+    },
+    {
+      "id": "aiming-data",
+      "status": "in_progress",
+      "scope": "Fresh rocket, GS GPS and RRLS GPS positions; local attached GPS integration; optional passively provided RSSI with explicit source, units and freshness",
+      "validation": "Invalid/stale/missing fixes, origin/target selection, RRLS disconnected/mesh delivery"
+    },
+    {
+      "id": "aiming-ui",
+      "status": "pending",
+      "scope": "Exclusive full-screen antenna aiming until exit; device IMU/compass; device/GS/RRLS GPS origin; rocket/RRLS/GS targets; horizontal and vertical split guidance with centered rocket; RSSI-assisted manual trim",
+      "validation": "Bearing/elevation wraparound and altitude-datum tests; sensor permission and cleanup tests; mobile viewport and native/Wasm builds"
+    },
+    {
+      "id": "mobile-ui-polish",
+      "status": "pending",
+      "scope": [
+        "Consistent touch-friendly buttons, spacing, states, and navigation for iOS and Android",
+        "Short labels and concise status text; move detailed explanations to formatted info dialogs",
+        "Clear mapping and illumination/state feedback for physical GroundStation controls",
+        "Dedicated sequence-testing interface that preserves backend interlocks and permissions",
+        "Prefer 2D rocket artwork: expand in the main area without a camera, return to compact mode alongside live cameras",
+        "Permission-checked admin area for users, stream mode/control, view management, and voice-chat management",
+        "Remove confusing prompts and walls of text"
+      ],
+      "validation": [
+        "Mobile portrait/landscape screenshots and touch-target checks",
+        "User/admin permission tests",
+        "Simulator-driven physical-control and sequence state tests without live actuation",
+        "Camera-present/absent layout transitions",
+        "Native and Wasm builds; document platform/device checks that cannot be run here",
+        "Verify touch targets and resource use on Ubuntu Raspberry Pi, including the native Linux app and served web UI where supported."
+      ]
+    },
+    {
+      "id": "rrls-radio-voice",
+      "status": "pending",
+      "scope": "Investigate and, where feasible, implement voice between main GroundStation and RRLS over a valid RFD mesh link, integrated with existing VC management. Evaluate a low-bitrate push-to-talk path and explicit link availability. Voice only: explicitly exclude video from the RFD relay.",
+      "validation": [
+        "Measure codec bitrate plus framing overhead against the configured radio airtime budget.",
+        "Bound and expire voice queues; prioritize commands, ACKs and recovery GPS ahead of voice.",
+        "Simulator tests for link loss/recovery, delay, loss and concurrent command/GPS traffic.",
+        "Verify browser/mobile/Pi microphone permission and audio-device failure handling; do not send microphone audio without explicit user action.",
+        "Assert camera/video frames cannot enter the RFD voice/relay transport; retain local-network camera viewing."
+      ]
+    },
+    {
+      "id": "procedure-input",
+      "status": "pending",
+      "scope": "At the procedure-testing stage, prompt the user for actual launch sequences, test-fire sequences, other operating procedures, expected steps and acceptance criteria; keep launch and test-fire behavior distinct without changing HITL.",
+      "validation": "Obtain and record operator-approved procedures before implementing their step-by-step acceptance tests."
+    },
+    {
+      "id": "ui-end-to-end",
+      "status": "pending",
+      "scope": "Inventory and exercise every UI button, control, navigation action and sequence against simulator-backed GroundStation. Include manual controls, physical-panel indicators, self-test/fill/pause/cancel, flight commands, calibration, recording/export, camera/stream/VC/admin and aiming controls.",
+      "validation": [
+        "Check command routing, ACKs and visible state changes, permission/interlock denial, timeouts, cancellation, reconnect and recovery.",
+        "Follow user-provided launch and test-fire procedures when available.",
+        "Use simulated isolated outputs only; retain full existing HITL behavior.",
+        "Report unavailable browser/native/device paths explicitly rather than claiming them tested.",
+        "Run all applicable UI/features against Ubuntu on Raspberry Pi, including cameras/streams/voice, export scrolling/downloads, authentication/admin, GPS/aiming and touch navigation; explicitly distinguish unavailable physical sensors from software failures."
+      ]
+    },
+    {
+      "id": "qualification",
+      "status": "pending",
+      "scope": "Run current simulator on Jupiter with current firmware, GS, SDK and bridge; targeted failures then extended soak; commit/push relevant fixes",
+      "validation": "Command/variable delivery latency, per-board battery freshness, reconnects, bounded memory and no crashes; record limits and distinguish simulation from hardware validation"
+    }
+  ],
+  "platform_matrix": [
+    "iOS",
+    "Android",
+    "Raspberry Pi running Ubuntu: browser UI and native app where supported",
+    "macOS browser/native regression builds"
+  ],
+  "open_findings": [
+    {
+      "id": "rf-sim-compact-ram",
+      "status": "open",
+      "finding": "RF TLSF+compact with GCC14 and SEDS_FIRMWARE_SIM_TEST=ON exceeds 112 KiB RAM by 16 bytes. Production macOS factory-image builds passed previously. Linked baseline uses RF heap packet storage to match deployed firmware; compact profile is not qualified by that run."
+    },
+    {
+      "id": "radio-fifo-control-latency",
+      "status": "candidate_fix",
+      "finding": "Actual SDK managed-variable frames use discovery transport priority 254 despite carrying application types. Candidate promotes only self-contained non-discovery frames to control reservation priority 255, preserves SDT order, and grants schema a turn after 1 KiB control traffic. All 13 focused scheduling regressions pass; latest linked simulation pending."
+    }
+  ]
+}
