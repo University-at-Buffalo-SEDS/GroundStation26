@@ -36,3 +36,17 @@ a loopback Pico-Fi peer and supplies its address through
 TCP framing against gateway UART firmware without involving I²C slots. The
 I²C model supports both protocol versions; v2 retains a packet across header
 peeks, partial reads and host reconnection until a full body is read.
+
+For the single-Pico Ethernet deployment, use `pico-fi-gateway-ethernet.json`
+in the `pico-fi` repository. It listens on the example `192.168.3.20:9000`
+and uses UART1 toward the gateway. Set its address, subnet and router to the
+actual Ethernet LAN before building; give the Pico a unique address.
+
+```sh
+PICO_FI_UART_BAUD_RATE=1000000 python3 build.py --config pico-fi-gateway-ethernet.json --release
+```
+
+The build prints the UF2 path. This profile removes the GroundStation-side
+I²C Pico from the deployment; the gateway-side Pico carries PICOFI1 TCP directly
+to the Pi through the Ethernet network. Existing two-Pico profiles are retained
+for older deployments. No physical configuration has been changed automatically.
