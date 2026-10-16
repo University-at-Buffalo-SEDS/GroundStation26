@@ -51,7 +51,7 @@ impl LanDiscovery {
         discovery.refresh = Some((discovery_port, interface.map(str::to_owned), Instant::now()));
         Ok(discovery)
     }
-    fn open_at(
+    pub(super) fn open_at(
         mode: TcpMode,
         tcp_port: u16,
         allowed_peer: Option<IpAddr>,

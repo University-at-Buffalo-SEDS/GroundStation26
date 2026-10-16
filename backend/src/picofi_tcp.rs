@@ -449,6 +449,98 @@ mod tests {
         }
     }
     #[test]
+    fn client_worker_discovers_pico_server_and_reconnects_to_a_new_port() {
+        use discovery_wire::{Kind, Message, Party, SIZE};
+        use std::net::{Ipv4Addr, UdpSocket};
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let discovery = LanDiscovery::open_at(
+            TcpMode::Client,
+            0,
+            None,
+            "127.0.0.1:0".parse().unwrap(),
+            vec![udp.local_addr().unwrap()],
+        )
+        .unwrap();
+        let config = PicoFiTcpConfig {
+            discovery: true,
+            discovery_port: udp.local_addr().unwrap().port(),
+            discovery_interface: None,
+            mode: TcpMode::Client,
+            address: "0.0.0.0:0".into(),
+            allowed_peer: None,
+        };
+        let (tx, outgoing) = mpsc::sync_channel(DEPTH);
+        let (incoming, rx) = mpsc::sync_channel(DEPTH);
+        let shared = Arc::new(Shared {
+            connected: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            tx,
+        });
+        let weak = Arc::downgrade(&shared);
+        let address = config.address.parse().unwrap();
+        let mut device = PicoFiTcp {
+            shared,
+            rx: Arc::new(Mutex::new(rx)),
+            side: None,
+            exhausted: false,
+        };
+        let handle = std::thread::spawn(move || {
+            worker(
+                weak,
+                outgoing,
+                incoming,
+                None,
+                address,
+                config,
+                Some(discovery),
+            )
+        });
+        for value in [41, 42] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut bytes = [0; SIZE];
+            let (n, source) = udp.recv_from(&mut bytes).unwrap();
+            let query = Message::decode(&bytes[..n]).unwrap();
+            assert_eq!(query.party, Party::GroundStation);
+            let offer = Message {
+                kind: Kind::Offer,
+                party: Party::Pico,
+                port: listener.local_addr().unwrap().port(),
+                nonce: query.nonce,
+                identity: [2, 9, 8, 7, 6, 5],
+            };
+            udp.send_to(&offer.encode(), source).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut peer = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline);
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            handshake(&mut peer, false).unwrap();
+            peer.set_nonblocking(false).unwrap();
+            while device.send_data(&[value]).is_err() {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let mut frame = [0; 5];
+            peer.read_exact(&mut frame).unwrap();
+            assert_eq!(frame, [0xb5, 0x4e, 1, 0, value]);
+            peer.shutdown(std::net::Shutdown::Both).unwrap();
+            while device.shared.connected.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
+        drop(device);
+        handle.join().unwrap();
+    }
+    #[test]
     fn fragmented_and_coalesced_frames_preserve_every_payload() {
         let (mut a, mut b) = pair();
         b.set_nonblocking(true).unwrap();
