@@ -648,7 +648,7 @@ impl AppState {
             return matches!(
                 board,
                 Board::ValveBoard | Board::GatewayBoard | Board::ActuatorBoard
-            );
+            ) || (!cfg!(feature = "hitl_mode") && board == Board::DaqBoard);
         }
 
         if !self.layout_expected_boards().contains(&board) {
@@ -1438,6 +1438,7 @@ impl AppState {
 
     /// Appends a telemetry row to the in-memory reseed cache and prunes old entries.
     pub fn cache_recent_telemetry(&self, row: TelemetryRow) {
+        crate::antenna::observe(&row);
         const CACHE_WINDOW_MS: i64 = 20 * 60 * 1000;
         const CACHE_MAX_ROWS: usize = 250_000;
 
@@ -2343,6 +2344,7 @@ pub(crate) mod tests {
     #[cfg(not(feature = "hitl_mode"))]
     async fn gse_actions_cannot_bypass_software_or_key_interlocks() {
         let state = test_app_state().await;
+        crate::gse::set_operational_prerequisites_for_test(&state);
         *state.state.lock().unwrap() = FlightState::Idle;
         {
             let mut rt = state.gse.lock().unwrap();

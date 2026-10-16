@@ -17,7 +17,7 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/api/live_streams') return json({can_manage_stream:permitted});
   if (url.pathname === '/api/video/streams' || url.pathname === '/api/stage-models') return json([]);
   if (url.pathname === '/api/video/recordings') return json({recordings:[],total:0,offset:0});
-  if (url.pathname === '/api/voice/status') return json({can_transmit:true});
+  if (url.pathname === '/api/voice/status') return json({can_transmit:true,radio:{configured:true,available:true}});
   if (url.pathname === '/api/video/publish' && req.method === 'POST') {
     let body=''; for await (const data of req) body+=data;
     if (!permitted) {res.statusCode=403;res.end('Permission denied');return;}
@@ -41,10 +41,11 @@ try {
   receiver=await context.newPage();await receiver.goto(origin+'/receiver');
   const page=await context.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));
   await page.addInitScript(()=>{
+    window.__radioControls=[];
     window.WebSocket=class {
       static OPEN=1;readyState=1;bufferedAmount=0;
       constructor(){setTimeout(()=>this.onopen?.(),0);}
-      send(data){if(typeof data==='string'&&JSON.parse(data).type==='auth')setTimeout(()=>this.onmessage?.({data:JSON.stringify({type:'joined',id:1})}),0);}
+      send(data){if(typeof data==='string'){const value=JSON.parse(data);if(value.type==='radio')window.__radioControls.push(value.enabled);if(value.type==='auth')setTimeout(()=>this.onmessage?.({data:JSON.stringify({type:'joined',id:1})}),0);}}
       close(){this.readyState=3;}
     };
   });
@@ -54,7 +55,14 @@ try {
   assert.equal(await media.locator('#login').isVisible(),false);
   assert.equal(await voice.locator('#login').isVisible(),false);
   await voice.locator('#join').click();await voice.getByText('Connected to voice chat.',{exact:true}).waitFor().catch(async error=>{console.error('Voice status:',await voice.locator('#status').innerText(),errors);throw error;});
+  assert.equal(await voice.locator('#radio-enable').isChecked(),false,'radio requires a separate explicit opt-in');
+  await voice.locator('#radio-enable').check();
+  assert.equal(await voice.locator('#mode').inputValue(),'ptt','radio is push-to-talk only');
+  assert.equal(await page.frames().find(f=>f.url().includes('/radio?')).evaluate(()=>window.__radioControls.at(-1)),true);
   await voice.locator('#mode').selectOption('open');
+  assert.equal(await voice.locator('#radio-enable').isChecked(),false,'open mic remains local');
+  assert.equal(await page.frames().find(f=>f.url().includes('/radio?')).evaluate(()=>window.__radioControls.at(-1)),false);
+
   await media.locator('#publish-start').click();
   await media.getByText('Sharing camera with the Ground Station',{exact:true}).waitFor({timeout:20000});
   const hide=()=>page.evaluate(()=>{for(const f of document.querySelectorAll('iframe')){f.style.display='none';f.contentWindow.postMessage({type:'gs26-session',token:'test-producer',visible:false},location.origin);}});

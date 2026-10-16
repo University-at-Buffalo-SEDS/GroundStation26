@@ -1,5 +1,7 @@
 //! Deterministic ground-fill sequencing. This crate performs no hardware I/O.
 use serde::{Deserialize, Serialize};
+pub mod qd_wait;
+pub mod qualification;
 
 /// Order is pilot, vent, dump, nitrogen, nitrous. Ignition/retraction are never tested.
 pub const RELIEVED: [bool; 5] = [false, true, true, false, false];
@@ -138,7 +140,7 @@ pub enum Phase {
     Cancelled,
     Fault,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Baseline {
     pub average_psi: f32,
     pub min_psi: f32,
@@ -219,6 +221,24 @@ impl Default for Engine {
     }
 }
 impl Engine {
+    /// Establish startup outputs only after the caller verifies live routes,
+    /// fresh pressure and the operating interlock. A qualified filled tank is
+    /// held closed; an empty checkout opens dump and vent.
+    pub fn prepare_startup(&mut self, now_ms: u64, hold_filled: bool) -> Effects {
+        self.claimed = true;
+        self.testing_valves = false;
+        self.nitrous_session = hold_filled;
+        self.configure(
+            if hold_filled {
+                Phase::PauseSetup
+            } else {
+                Phase::CancelSetup
+            },
+            if hold_filled { CLOSED } else { RELIEVED },
+            now_ms,
+            "Confirming startup valve configuration",
+        )
+    }
     pub fn active(&self) -> bool {
         !matches!(
             self.status.phase,
@@ -958,6 +978,25 @@ mod tests {
                 self.tick();
             }
             self.pressure = 5.0;
+        }
+    }
+    #[test]
+    fn startup_relief_and_filled_restart_do_not_replay_a_sequence() {
+        for (hold_filled, desired, settled) in [
+            (false, RELIEVED, Phase::Cancelled),
+            (true, CLOSED, Phase::Paused),
+        ] {
+            let mut rig = Rig::new();
+            rig.valves = std::array::from_fn(|i| !desired[i]);
+            let effects = rig.engine.prepare_startup(rig.now, hold_filled);
+            rig.effects(effects);
+            assert_eq!(rig.valves, desired);
+            rig.until(settled);
+            for _ in 0..100 {
+                rig.tick();
+                assert_eq!(rig.engine.status.phase, settled);
+                assert_eq!(rig.valves, desired);
+            }
         }
     }
     #[test]

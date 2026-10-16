@@ -261,10 +261,7 @@ pub(crate) mod tests {
             let path = std::env::temp_dir().join(format!(
                 "gs-csv-test-{}-{}",
                 std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
+                rand::random::<u128>()
             ));
             std::fs::create_dir(&path).unwrap();
             Self(path)

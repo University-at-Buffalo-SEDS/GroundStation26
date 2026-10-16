@@ -532,6 +532,7 @@ pub async fn safety_task(
             }
         }
 
+        if !crate::gse::automatic_abort_allowed(&state) { abort = false; }
         if abort {
             state.set_abort_indicator_latched(true);
             crate::sequences::refresh_action_policy_now(&state);

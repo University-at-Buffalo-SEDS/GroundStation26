@@ -217,11 +217,12 @@ mod tests {
         let csv = std::fs::read_to_string(&csv_path).unwrap();
         let samples: Vec<Vec<&str>> = csv.lines().skip(3).map(|line| line.split(',').collect()).collect();
         assert_eq!(samples.len(), 2);
-        assert_eq!(samples[0].len(), 14);
+        assert_eq!(samples[0].len(), 15);
         assert_eq!(samples[0][3], "9000");
-        assert_eq!(samples[0][12..], ["2", "5"]);
+        assert_eq!(samples[0][12..14], ["2", "5"]);
+        assert_eq!(samples[0][14], ""); // No invented ADC temperature.
         assert_eq!(samples[1][3], "9001");
-        assert_eq!(samples[1][12..], ["3", "7"]);
+        assert_eq!(samples[1][12..14], ["3", "7"]);
         assert_eq!(samples[0][4], ""); // No fabricated 1000 kg readings.
         std::fs::remove_dir_all(dir).unwrap();
     }

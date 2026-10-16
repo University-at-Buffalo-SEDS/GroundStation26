@@ -116,6 +116,7 @@ pub struct PasswordHashRecord {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamRole {
+    Admin,
     StreamMaster,
     StreamAdmin,
     StreamViewer,
@@ -196,12 +197,14 @@ impl AuthPrincipal {
     pub fn can_manage_stream(&self) -> bool {
         if self.roles.contains(&StreamRole::StreamViewer)
             && !self.roles.contains(&StreamRole::StreamAdmin)
+            && !self.roles.contains(&StreamRole::Admin)
         {
             return false;
         }
         !self.anonymous
             && (self.roles.contains(&StreamRole::StreamMaster)
                 || self.roles.contains(&StreamRole::StreamAdmin)
+                || self.roles.contains(&StreamRole::Admin)
                 || self
                     .command_access
                     .allowed_commands
@@ -358,6 +361,47 @@ impl AuthManager {
         }
         let raw = serde_json::to_string_pretty(&UsersFile::default()).map_err(|e| e.to_string())?;
         fs::write(&self.path, raw).map_err(|e| e.to_string())
+    }
+
+    /// Serialize every in-process account edit and atomically replace the file.
+    pub fn update_users<T>(
+        &self,
+        update: impl FnOnce(&mut UsersFile) -> Result<T, String>,
+    ) -> Result<T, String> {
+        static WRITE: Mutex<()> = Mutex::new(());
+        let _guard = WRITE
+            .lock()
+            .map_err(|_| "Account update lock unavailable")?;
+        let mut config = self.load_users_file()?;
+        let result = update(&mut config)?;
+        let parent = self.path.parent().ok_or("Missing accounts directory")?;
+        let temporary = parent.join(format!(
+            ".users-{}.upload",
+            URL_SAFE_NO_PAD.encode(generate_random_bytes(12))
+        ));
+        let save = (|| -> Result<(), String> {
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary).map_err(|e| e.to_string())?;
+            use std::io::Write;
+            file.write_all(&serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            std::fs::rename(&temporary, &self.path).map_err(|e| e.to_string())?;
+            std::fs::File::open(parent)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| e.to_string())
+        })();
+        if save.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        save?;
+        Ok(result)
     }
 
     pub fn load_users_file(&self) -> Result<UsersFile, String> {
@@ -531,11 +575,18 @@ impl AuthManager {
                 .iter()
                 .find(|u| u.username.eq_ignore_ascii_case(&username) && !u.disabled)
                 .ok_or_else(|| AuthFailure::Unauthorized("Account disabled or removed".into()))?;
-            // Read clock authority from the current account on every request.
+            // Revocation applies immediately to existing sessions. A session
+            // never gains data/command authority beyond its original grant.
+            let current = user.permissions.normalized();
+            permissions.view_data &= current.view_data;
+            permissions.send_commands &= current.send_commands;
             permissions.set_system_time = user.permissions.set_system_time;
-            permissions.voice_transmit = user.permissions.voice_transmit && user.permissions.view_data;
+            permissions.voice_transmit =
+                user.permissions.voice_transmit && user.permissions.view_data;
             if !permissions.allows(required) {
-                return Err(AuthFailure::Forbidden("session does not have the required permission".into()));
+                return Err(AuthFailure::Forbidden(
+                    "session does not have the required permission".into(),
+                ));
             }
             let (command_access, calibration_access) = configured_user_access(&config, &username);
 
@@ -589,7 +640,10 @@ impl AuthManager {
                 Ok(AuthPrincipal {
                     roles: Vec::new(),
                     username: None,
-                    permissions: Permissions { voice_transmit: false, ..config.anonymous.normalized() },
+                    permissions: Permissions {
+                        voice_transmit: false,
+                        ..config.anonymous.normalized()
+                    },
                     expires_at_ms: None,
                     anonymous: true,
                     session_type: None,

@@ -41,6 +41,11 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
         TelemetryCommand::AdvanceFlightState => FlightComputerCommands::AdvanceFlightState as u8,
         TelemetryCommand::RewindFlightState => FlightComputerCommands::RewindFlightState as u8,
         TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
+        TelemetryCommand::AbortAfter100 => FlightComputerCommands::AbortAfter100 as u8,
+        TelemetryCommand::AbortAfter250 => FlightComputerCommands::AbortAfter250 as u8,
+        TelemetryCommand::ReinitAfter15 => FlightComputerCommands::ReinitAfter15 as u8,
+        TelemetryCommand::ReinitAfter30 => FlightComputerCommands::ReinitAfter30 as u8,
+        TelemetryCommand::ReinitAfter50 => FlightComputerCommands::ReinitAfter50 as u8,
         _ => return None,
     })
 }
@@ -108,7 +113,10 @@ mod recovery_tests {
         assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
         assert_eq!(updates.try_recv().unwrap().state, FlightState::Idle);
         assert_eq!(state.launch_clock_snapshot(), clock);
-        assert_eq!(state.get_umbilical_valve_state(ActuatorBoardCommands::NitrousOpen as u8), Some(true));
+        assert_eq!(
+            state.get_umbilical_valve_state(ActuatorBoardCommands::NitrousOpen as u8),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -118,7 +126,10 @@ mod recovery_tests {
         let mut updates = state.launch_clock_tx.subscribe();
         state.reset_launch_clock();
         assert_eq!(state.local_flight_state_snapshot(), FlightState::Ascent);
-        assert_eq!(updates.try_recv().unwrap(), crate::telemetry_db::LaunchClockMsg::idle());
+        assert_eq!(
+            updates.try_recv().unwrap(),
+            crate::telemetry_db::LaunchClockMsg::idle()
+        );
     }
 }
 
@@ -134,7 +145,12 @@ pub fn set_network_time_router(router: Arc<Router>) {
 }
 
 pub(crate) fn recording_network_utc_ms() -> Option<i64> {
-    NETWORK_TIME_ROUTER.get()?.network_time()?.unix_time_ms?.try_into().ok()
+    NETWORK_TIME_ROUTER
+        .get()?
+        .network_time()?
+        .unix_time_ms?
+        .try_into()
+        .ok()
 }
 
 fn send_valve_launch_sequence_command(router: &Router) -> bool {
@@ -232,22 +248,12 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
             .await;
         gs_debug_println!("Ground-station launch auto-started DB recording");
     }
-    #[cfg(feature = "test_fire_mode")]
-    {
-        if let Err(e) = queue_locally_routed_flight_command(
-            &router,
-            "Ground-station launch FC command",
-            &[FlightComputerCommands::Launch as u8],
-        ) {
-            log_telemetry_error("failed to log Ground-station launch FC command", e);
-        } else {
-            flush_command_tx(&router, "Ground-station launch FC command tx");
-        }
-    }
     if !send_valve_launch_sequence_command(&router) {
         state.clear_launch_sequence_command_pending();
         return;
     }
+    #[cfg(not(feature = "hitl_mode"))]
+    state.set_local_flight_state(FlightState::Launch);
     state.begin_daq_launch_log();
     crate::auto_zero::launch(&state);
     state.set_launch_indicator_latched(true);
@@ -295,6 +301,8 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
     };
     let valve_command_sent = send_valve_launch_sequence_command(&router);
     if flight_command_sent || valve_command_sent {
+        #[cfg(not(feature = "hitl_mode"))]
+        state.set_local_flight_state(FlightState::Launch);
         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         crate::auto_zero::launch(&state);
         state.set_launch_indicator_latched(true);
@@ -335,7 +343,8 @@ pub async fn telemetry_task(
         262_144,
     );
     let packet_enqueue_burst = env_usize("GS_PACKET_ENQUEUE_BURST", PACKET_ENQUEUE_BURST, 32, 4096);
-    let (packet_tx, mut packet_rx) = mpsc::channel::<crate::ring_buffer::ReceivedPacket>(packet_work_queue_size);
+    let (packet_tx, mut packet_rx) =
+        mpsc::channel::<crate::ring_buffer::ReceivedPacket>(packet_work_queue_size);
     let db_overflow = DbOverflow;
 
     let db_worker = {
@@ -562,8 +571,9 @@ pub async fn telemetry_task(
         tokio::spawn(async move {
             while let Some(pkt) = packet_rx.recv().await {
                 let rows = match pkt {
-                    crate::ring_buffer::ReceivedPacket::Telemetry(pkt) =>
-                        handle_packet(&state, &db_tx, &db_overflow, pkt).await,
+                    crate::ring_buffer::ReceivedPacket::Telemetry(pkt) => {
+                        handle_packet(&state, &db_tx, &db_overflow, pkt).await
+                    }
                     crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, row } => {
                         persist_umbilical_status(&state, &db_tx, &db_overflow, &packet, &row).await;
                         Vec::new()
@@ -848,6 +858,9 @@ pub async fn telemetry_task(
                                 gs_debug_println!("Postinit command sent to flight computer");
                             }
                         TelemetryCommand::Launch => {
+                                #[cfg(all(feature = "test_fire_mode", not(feature = "hitl_mode")))]
+                                handle_local_ground_station_launch_command(state.clone(), router.clone()).await;
+                                #[cfg(not(all(feature = "test_fire_mode", not(feature = "hitl_mode"))))]
                                 handle_flight_computer_launch_command(state.clone(), router.clone()).await;
                             }
                         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
@@ -1068,12 +1081,12 @@ pub async fn telemetry_task(
                         | TelemetryCommand::ReinitBarometer
                         | TelemetryCommand::EnableIMU
                         | TelemetryCommand::DisableIMU
-                        | TelemetryCommand::AbortAfter15
+                        | TelemetryCommand::AbortAfter100
                         | TelemetryCommand::AbortAfter40
-                        | TelemetryCommand::AbortAfter70
-                        | TelemetryCommand::ReinitAfter12
-                        | TelemetryCommand::ReinitAfter26
-                        | TelemetryCommand::ReinitAfter44 => {
+                        | TelemetryCommand::AbortAfter250
+                        | TelemetryCommand::ReinitAfter15
+                        | TelemetryCommand::ReinitAfter30
+                        | TelemetryCommand::ReinitAfter50 => {
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &router,
@@ -1296,15 +1309,27 @@ async fn insert_db_batch_once(
     writes: &[DbWrite],
 ) -> Result<(), sqlx::Error> {
     let mut tx = db.begin().await?;
-    if writes.iter().any(|w| matches!(w, DbWrite::Calibration { .. })) {
+    if writes
+        .iter()
+        .any(|w| matches!(w, DbWrite::Calibration { .. }))
+    {
         sqlx::query("CREATE TABLE IF NOT EXISTS calibration_history (timestamp_ms INTEGER NOT NULL, sender_id TEXT NOT NULL, sensor_id TEXT NOT NULL, config_json TEXT NOT NULL, PRIMARY KEY(timestamp_ms,sender_id,sensor_id))").execute(&mut *tx).await?;
     }
     for write in writes {
         match write {
-            DbWrite::Calibration { timestamp_ms, sender_id, sensor_id, config_json } => {
+            DbWrite::Calibration {
+                timestamp_ms,
+                sender_id,
+                sensor_id,
+                config_json,
+            } => {
                 sqlx::query("INSERT OR REPLACE INTO calibration_history VALUES (?,?,?,?)")
-                    .bind(timestamp_ms).bind(sender_id).bind(sensor_id).bind(config_json)
-                    .execute(&mut *tx).await?;
+                    .bind(timestamp_ms)
+                    .bind(sender_id)
+                    .bind(sensor_id)
+                    .bind(config_json)
+                    .execute(&mut *tx)
+                    .await?;
             }
             DbWrite::FlightState {
                 timestamp_ms,
@@ -1509,52 +1534,84 @@ async fn queue_db_write(
 /// Apply confirmations before the recording queue can delay them. Source
 /// clocks may reset: ordered delivery, not timestamp comparison, governs state.
 pub(crate) fn apply_umbilical_status_at_ingress(
-    state: &Arc<AppState>, pkt: &Packet,
+    state: &Arc<AppState>,
+    pkt: &Packet,
 ) -> Option<TelemetryRow> {
     let sender_id = state.canonical_network_sender_id(pkt.sender());
     state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
-    if let Ok(data) = pkt.data_as_u8() && data.len() == 2 {
+    if let Ok(data) = pkt.data_as_u8()
+        && data.len() == 2
+    {
         let cmd_id = data[0];
         let on = data[1] != 0;
         if cmd_id == ValveBoardCommands::Sequence as u8 {
-            if on { start_launch_clock_from_valve_sequence_status(state); }
+            if on {
+                start_launch_clock_from_valve_sequence_status(state);
+            }
             return None;
         }
         if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
             state.set_umbilical_valve_state(key_cmd_id, key_on);
+            crate::gse::qd_confirmation(state, &sender_id, key_cmd_id, key_on, pkt.timestamp());
+            crate::gse::report_safety(state);
             state.reconcile_pending_umbilical_valve_state(
-                key_cmd_id, key_on, crate::state::UMBILICAL_PENDING_VALVE_TIMEOUT,
+                key_cmd_id,
+                key_on,
+                crate::state::UMBILICAL_PENDING_VALVE_TIMEOUT,
             );
-            if key_cmd_id == ValveBoardCommands::PilotOpen as u8 && key_on
-                && !crate::gse::active(state) {
+            if key_cmd_id == ValveBoardCommands::PilotOpen as u8
+                && key_on
+                && !crate::gse::active(state)
+            {
                 transition_launch_clock_to_t_plus_from_pilot_open(state);
             }
             sequences::refresh_action_policy_now(state);
             state.broadcast_action_policy_snapshot();
             return Some(TelemetryRow {
                 timestamp_ms: get_current_timestamp_ms() as i64,
-                data_type: VALVE_STATE_DATA_TYPE.to_string(), sender_id,
+                data_type: VALVE_STATE_DATA_TYPE.to_string(),
+                sender_id,
                 values: valve_state_values(state).into_iter().collect(),
             });
         }
     }
-    report_parse_error(state, &sender_id, &pkt.data_type().as_str(),
-        "expected 2-byte umbilical status payload");
+    report_parse_error(
+        state,
+        &sender_id,
+        &pkt.data_type().as_str(),
+        "expected 2-byte umbilical status payload",
+    );
     None
 }
 
 async fn persist_umbilical_status(
-    state: &Arc<AppState>, db_tx: &mpsc::Sender<DbQueueItem>, db_overflow: &DbOverflow,
-    pkt: &Packet, row: &TelemetryRow,
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbQueueItem>,
+    db_overflow: &DbOverflow,
+    pkt: &Packet,
+    row: &TelemetryRow,
 ) {
     let values_json = serde_json::to_string(
-        &row.values.iter().map(|v| v.map(|n| n as f64)).collect::<Vec<_>>(),
-    ).ok();
-    queue_db_write(state, db_tx, db_overflow, DbWrite::Telemetry {
-        timestamp_ms: row.timestamp_ms, source_timestamp_ms: Some(pkt.timestamp() as i64),
-        data_type: row.data_type.clone(), sender_id: row.sender_id.clone(),
-        values_json, payload_json: payload_json_from_pkt(pkt),
-    }).await;
+        &row.values
+            .iter()
+            .map(|v| v.map(|n| n as f64))
+            .collect::<Vec<_>>(),
+    )
+    .ok();
+    queue_db_write(
+        state,
+        db_tx,
+        db_overflow,
+        DbWrite::Telemetry {
+            timestamp_ms: row.timestamp_ms,
+            source_timestamp_ms: Some(pkt.timestamp() as i64),
+            data_type: row.data_type.clone(),
+            sender_id: row.sender_id.clone(),
+            values_json,
+            payload_json: payload_json_from_pkt(pkt),
+        },
+    )
+    .await;
 }
 
 async fn handle_packet(
@@ -1947,7 +2004,9 @@ fn payload_json_from_pkt(pkt: &Packet) -> String {
 }
 
 pub fn timesync_enabled() -> bool {
-    if crate::rrls::is_rrls() { return false; }
+    if crate::rrls::is_rrls() {
+        return false;
+    }
     if cfg!(feature = "testing") {
         return std::env::var("GROUNDSTATION_TIMESYNC").ok().as_deref() == Some("1");
     }
@@ -2110,59 +2169,54 @@ mod tests {
 
     #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
     #[tokio::test]
-    async fn test_fire_ground_station_launch_sends_flight_computer_launch_command() {
-        let (db_tx, db_rx) = mpsc::channel(8);
-        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
-        let mut policy = state.action_policy_snapshot();
-        for control in policy.controls.iter_mut() {
-            if control.cmd == "GroundStationLaunch" {
-                control.enabled = true;
-            }
-        }
-        state.set_action_policy(policy);
-
+    async fn test_fire_launch_uses_fill_system_without_av_bay() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let capture = sent.clone();
         let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
-        let (radio_tx, mut radio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        router.add_side_packed("rocket_comms", move |bytes| {
-            radio_tx
-                .send(bytes.to_vec())
-                .map_err(|_| sedsnet::TelemetryError::HandlerError("radio tx closed"))
-        });
+        let side = router.add_side_packed_with_options(
+            "umbilical_comms",
+            move |bytes| {
+                capture.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            },
+            sedsnet::router::RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: true,
+                ..Default::default()
+            },
+        );
+        // Only the valve board is present: test fires have no AV bay.
+        let discovery = sedsnet::discovery::build_discovery_announce(
+            Board::ValveBoard.sender_id(),
+            123,
+            &[crate::telemetry_schema::endpoint("VALVE_BOARD")],
+        )
+        .unwrap();
+        router
+            .rx_packed_from_side(&serialize::pack_packet(&discovery), side)
+            .unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        sent.lock().unwrap().clear();
 
-        let shutdown_rx = state.shutdown_subscribe();
-        let telemetry = tokio::spawn(telemetry_task(
-            state.clone(),
-            router,
-            Vec::new(),
-            cmd_rx,
-            db_rx,
-            shutdown_rx,
-        ));
-
-        state
-            .cmd_tx
-            .send(TelemetryCommand::GroundStationLaunch)
-            .await
-            .expect("failed to send test-fire launch command");
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let Some(wire) = radio_rx.recv().await else {
-                    panic!("flight command tx channel closed");
-                };
-                let pkt = serialize::unpack_packet(&wire)
-                    .expect("failed to deserialize flight command packet");
-                if pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
-                    assert_eq!(pkt.payload(), &[FlightComputerCommands::Launch as u8]);
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("timed out waiting for test-fire launch flight-command packet");
-
-        state.request_shutdown();
-        telemetry.await.expect("telemetry task join failed");
+        handle_local_ground_station_launch_command(state, router.clone()).await;
+        router.process_all_queues_with_timeout(0).unwrap();
+        let sent = sent.lock().unwrap();
+        let packets: Vec<_> = sent
+            .iter()
+            .filter_map(|wire| serialize::unpack_packet(wire).ok())
+            .collect();
+        assert!(packets.iter().any(|packet| packet.data_type()
+            == crate::telemetry_schema::data_type("VALVE_COMMAND")
+            && packet.payload() == &[ValveBoardCommands::Sequence as u8]));
+        assert!(
+            packets
+                .iter()
+                .all(|packet| packet.data_type()
+                    != crate::telemetry_schema::data_type("FLIGHT_COMMAND")),
+            "test-fire launch must not send commands to an absent flight computer"
+        );
     }
 
     #[cfg(feature = "hitl_mode")]
@@ -2221,6 +2275,26 @@ mod tests {
                 TelemetryCommand::AbortAfter40,
                 FlightComputerCommands::AbortAfter40 as u8,
             ),
+            (
+                TelemetryCommand::AbortAfter100,
+                FlightComputerCommands::AbortAfter100 as u8,
+            ),
+            (
+                TelemetryCommand::AbortAfter250,
+                FlightComputerCommands::AbortAfter250 as u8,
+            ),
+            (
+                TelemetryCommand::ReinitAfter15,
+                FlightComputerCommands::ReinitAfter15 as u8,
+            ),
+            (
+                TelemetryCommand::ReinitAfter30,
+                FlightComputerCommands::ReinitAfter30 as u8,
+            ),
+            (
+                TelemetryCommand::ReinitAfter50,
+                FlightComputerCommands::ReinitAfter50 as u8,
+            ),
         ];
 
         for (telemetry_cmd, expected_id) in cases {
@@ -2266,65 +2340,95 @@ mod tests {
     }
 
     #[test]
-    fn flight_command_transmits_to_rocket_side_when_fc_is_discovered_there() {
-        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-        let sent_clone = sent.clone();
-        let router = Router::new(sedsnet::router::RouterConfig::new([]));
-        let rocket_side = router.add_side_packed_with_options(
-            "rocket_comms",
-            move |bytes| {
-                sent_clone
-                    .lock()
-                    .expect("failed to lock sent packets")
-                    .push(bytes.to_vec());
-                Ok(())
-            },
-            sedsnet::router::RouterSideOptions {
-                reliable_enabled: true,
-                link_local_enabled: true,
-                ..Default::default()
-            },
-        );
-        let discovery = sedsnet::discovery::build_discovery_announce(
-            Board::RFBoard.sender_id(),
-            123,
-            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
-        )
-        .expect("failed to build RF discovery");
-        let discovery_wire = serialize::pack_packet(&discovery);
-        router
-            .rx_packed_from_side(&discovery_wire, rocket_side)
-            .expect("failed to queue RF discovery");
-        router
-            .process_all_queues_with_timeout(0)
-            .expect("failed to process RF discovery");
+    fn exposed_flight_commands_transmit_to_the_discovered_rocket_side() {
+        crate::telemetry_schema::initialize().unwrap();
+        // Match FC's existing compatibility protocol, including every visible
+        // threshold control. These are isolated packet captures, not outputs.
+        for command in [
+            FlightComputerCommands::Postinit,
+            FlightComputerCommands::Launch,
+            FlightComputerCommands::MonitorAltitude,
+            FlightComputerCommands::RevokeMonitorAltitude,
+            FlightComputerCommands::ConsecutiveSamples,
+            FlightComputerCommands::RevokeConsecutiveSamples,
+            FlightComputerCommands::ResetFailures,
+            FlightComputerCommands::RevokeResetFailures,
+            FlightComputerCommands::ValidateMeasms,
+            FlightComputerCommands::RevokeValidateMeasms,
+            FlightComputerCommands::DeployParachute,
+            FlightComputerCommands::ExpandParachute,
+            FlightComputerCommands::EvaluationRelax,
+            FlightComputerCommands::EvaluationFocus,
+            FlightComputerCommands::EvaluationAbort,
+            FlightComputerCommands::ReinitSensors,
+            FlightComputerCommands::ReinitBarometer,
+            FlightComputerCommands::EnableIMU,
+            FlightComputerCommands::DisableIMU,
+            #[cfg(feature = "hitl_mode")]
+            FlightComputerCommands::AdvanceFlightState,
+            #[cfg(feature = "hitl_mode")]
+            FlightComputerCommands::RewindFlightState,
+            FlightComputerCommands::AbortAfter40,
+            FlightComputerCommands::AbortAfter100,
+            FlightComputerCommands::AbortAfter250,
+            FlightComputerCommands::ReinitAfter15,
+            FlightComputerCommands::ReinitAfter30,
+            FlightComputerCommands::ReinitAfter50,
+        ] {
+            let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let sent_clone = sent.clone();
+            let router = Router::new(sedsnet::router::RouterConfig::new([]));
+            let rocket_side = router.add_side_packed_with_options(
+                "rocket_comms",
+                move |bytes| {
+                    sent_clone
+                        .lock()
+                        .expect("failed to lock sent packets")
+                        .push(bytes.to_vec());
+                    Ok(())
+                },
+                sedsnet::router::RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: true,
+                    ..Default::default()
+                },
+            );
+            let discovery = sedsnet::discovery::build_discovery_announce(
+                Board::RFBoard.sender_id(),
+                123,
+                &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
+            )
+            .expect("failed to build RF discovery");
+            let discovery_wire = serialize::pack_packet(&discovery);
+            router
+                .rx_packed_from_side(&discovery_wire, rocket_side)
+                .expect("failed to queue RF discovery");
+            router
+                .process_all_queues_with_timeout(0)
+                .expect("failed to process RF discovery");
 
-        queue_locally_routed_flight_command(
-            &router,
-            "test flight command",
-            &[FlightComputerCommands::MonitorAltitude as u8],
-        )
-        .expect("failed to queue flight command");
-        router
-            .process_all_queues_with_timeout(0)
-            .expect("failed to process router queues");
+            queue_locally_routed_flight_command(&router, "test flight command", &[command as u8])
+                .expect("failed to queue flight command");
+            router
+                .process_all_queues_with_timeout(0)
+                .expect("failed to process router queues");
 
-        let sent = sent.lock().expect("failed to lock sent packets");
-        let flight_packets = sent
-            .iter()
-            .filter_map(|wire| serialize::unpack_packet(wire).ok())
-            .filter(|pkt| pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND"))
-            .collect::<Vec<_>>();
-        assert!(!flight_packets.is_empty());
-        assert_eq!(
-            flight_packets[0].payload(),
-            &[FlightComputerCommands::MonitorAltitude as u8]
-        );
-        assert!(
-            flight_packets[0]
-                .endpoints()
-                .contains(&crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"))
-        );
+            let sent = sent.lock().expect("failed to lock sent packets");
+            let flight_packets = sent
+                .iter()
+                .filter_map(|wire| serialize::unpack_packet(wire).ok())
+                .filter(|pkt| {
+                    pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND")
+                })
+                .collect::<Vec<_>>();
+            assert!(!flight_packets.is_empty());
+            assert_eq!(flight_packets[0].payload(), &[command as u8]);
+            assert!(
+                flight_packets[0]
+                    .endpoints()
+                    .contains(&crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"))
+            );
+        }
     }
 
     #[tokio::test]
@@ -4135,17 +4239,27 @@ mod tests {
         state.set_fill_targets(targets);
         let overflow = test_db_overflow();
         let mut ws = state.ws_tx.subscribe();
-        let pkt = Packet::new(crate::telemetry_schema::data_type("KG1000"),
+        let pkt = Packet::new(
+            crate::telemetry_schema::data_type("KG1000"),
             &[crate::telemetry_schema::endpoint("GROUND_STATION")],
-            Board::DaqBoard.sender_id(), 123_400, f32_payload(&[-4.25])).unwrap();
+            Board::DaqBoard.sender_id(),
+            123_400,
+            f32_payload(&[-4.25]),
+        )
+        .unwrap();
         let raw = handle_packet(&state, &db_tx, &overflow, pkt).await;
         assert_eq!(raw[0].values, vec![Some(-4.25)]);
         assert_eq!(ws.try_recv().unwrap().values, vec![Some(-4.25)]);
         assert_eq!(ws.try_recv().unwrap().values, vec![Some(42.5)]);
         assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(4.25));
-        let pkt = Packet::new(crate::telemetry_schema::data_type("KG50"),
+        let pkt = Packet::new(
+            crate::telemetry_schema::data_type("KG50"),
             &[crate::telemetry_schema::endpoint("GROUND_STATION")],
-            Board::DaqBoard.sender_id(), 123_500, f32_payload(&[20.])).unwrap();
+            Board::DaqBoard.sender_id(),
+            123_500,
+            f32_payload(&[20.]),
+        )
+        .unwrap();
         handle_packet(&state, &db_tx, &overflow, pkt).await;
         assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(4.25));
         let mut targets = state.fill_targets_snapshot();
@@ -4164,12 +4278,20 @@ mod tests {
         {
             let mut rt = state.auto_zero.lock().unwrap();
             *rt = crate::auto_zero::Runtime::testing(true);
-            for _ in 0..200 { rt.observe("KG1000", 0.1); }
+            for _ in 0..200 {
+                rt.observe("KG1000", 0.1);
+            }
         }
-        assert!(!crate::auto_zero::before_fill(&state, &TelemetryCommand::StartFill));
+        assert!(!crate::auto_zero::before_fill(
+            &state,
+            &TelemetryCommand::StartFill
+        ));
         assert!(!state.auto_zero.lock().unwrap().pending());
         *state.auto_zero.lock().unwrap() = crate::auto_zero::Runtime::testing(false);
-        assert!(!crate::auto_zero::before_fill(&state, &TelemetryCommand::StartFill));
+        assert!(!crate::auto_zero::before_fill(
+            &state,
+            &TelemetryCommand::StartFill
+        ));
         crate::auto_zero::launch(&state);
         assert!(!state.auto_zero.lock().unwrap().pending());
     }
@@ -4183,7 +4305,10 @@ mod tests {
         crate::auto_zero::launch(&state);
         assert!(start.elapsed() < Duration::from_millis(100));
         assert!(state.auto_zero.lock().unwrap().pending());
-        let command = tokio::time::timeout(Duration::from_secs(6), commands.recv()).await.unwrap().unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(6), commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(command, TelemetryCommand::Abort));
         assert!(!state.auto_zero.lock().unwrap().pending());
     }
@@ -4194,15 +4319,30 @@ mod tests {
         let state = test_app_state(db_tx.clone()).await;
         let db_overflow = test_db_overflow();
         *state.latest_fill_mass_kg.lock().unwrap() = Some(123.0);
-        state.loadcell_calibration.lock().unwrap().extra_channels.insert("kg50".into(),
-            loadcell::GenericCalibrationChannel {
-                linear: loadcell::ChannelLinear { m: Some(2.0), b: Some(1.0) },
-                ..Default::default()
-            });
+        state
+            .loadcell_calibration
+            .lock()
+            .unwrap()
+            .extra_channels
+            .insert(
+                "kg50".into(),
+                loadcell::GenericCalibrationChannel {
+                    linear: loadcell::ChannelLinear {
+                        m: Some(2.0),
+                        b: Some(1.0),
+                    },
+                    ..Default::default()
+                },
+            );
         let mut ws_rx = state.ws_tx.subscribe();
-        let pkt = Packet::new(crate::telemetry_schema::data_type("KG50"),
+        let pkt = Packet::new(
+            crate::telemetry_schema::data_type("KG50"),
             &[crate::telemetry_schema::endpoint("GROUND_STATION")],
-            Board::DaqBoard.sender_id(), 456_789, f32_payload(&[4.25])).unwrap();
+            Board::DaqBoard.sender_id(),
+            456_789,
+            f32_payload(&[4.25]),
+        )
+        .unwrap();
         let rows = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
         assert_eq!(rows[0].data_type, "KG50");
         assert_eq!(rows[0].values, vec![Some(4.25)]);
@@ -4210,9 +4350,17 @@ mod tests {
         assert_eq!(calibrated.data_type, loadcell::DERIVED_WEIGHT_50_DATA_TYPE);
         assert_eq!(calibrated.values, vec![Some(9.5)]);
         assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(9.5));
-        for expected in ["KG50", loadcell::DERIVED_WEIGHT_50_DATA_TYPE, loadcell::DERIVED_FILL_PERCENT_DATA_TYPE] {
+        for expected in [
+            "KG50",
+            loadcell::DERIVED_WEIGHT_50_DATA_TYPE,
+            loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
+        ] {
             match db_rx.try_recv().unwrap() {
-                DbQueueItem::Write(DbWrite::Telemetry { data_type, source_timestamp_ms, .. }) => {
+                DbQueueItem::Write(DbWrite::Telemetry {
+                    data_type,
+                    source_timestamp_ms,
+                    ..
+                }) => {
                     assert_eq!(data_type, expected);
                     assert_eq!(source_timestamp_ms, Some(456_789));
                 }
@@ -4221,19 +4369,33 @@ mod tests {
         }
         match db_rx.try_recv().unwrap() {
             DbQueueItem::Write(write @ DbWrite::Calibration { .. }) => {
-                let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
-                    .connect("sqlite::memory:").await.unwrap();
+                let db = sqlx::sqlite::SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect("sqlite::memory:")
+                    .await
+                    .unwrap();
                 insert_db_batch_once(&db, &[write]).await.unwrap();
-                let json: String = sqlx::query_scalar("SELECT config_json FROM calibration_history WHERE sensor_id='KG50'")
-                    .fetch_one(&db).await.unwrap();
+                let json: String = sqlx::query_scalar(
+                    "SELECT config_json FROM calibration_history WHERE sensor_id='KG50'",
+                )
+                .fetch_one(&db)
+                .await
+                .unwrap();
                 let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
-                assert_eq!(metadata["calibration"]["extra_channels"]["kg50"]["linear"]["m"],2.0);
+                assert_eq!(
+                    metadata["calibration"]["extra_channels"]["kg50"]["linear"]["m"],
+                    2.0
+                );
                 db.close().await;
             }
             other => panic!("missing recorded regression: {other:?}"),
         }
-        assert!(state.recent_telemetry_snapshot().iter().any(|r|
-            r.data_type == loadcell::DERIVED_WEIGHT_50_DATA_TYPE));
+        assert!(
+            state
+                .recent_telemetry_snapshot()
+                .iter()
+                .any(|r| r.data_type == loadcell::DERIVED_WEIGHT_50_DATA_TYPE)
+        );
     }
 
     #[tokio::test]
@@ -4278,9 +4440,7 @@ mod tests {
                 .iter()
                 .map(|row| row.data_type.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                loadcell::DERIVED_WEIGHT_DATA_TYPE
-            ]
+            vec![loadcell::DERIVED_WEIGHT_DATA_TYPE]
         );
         assert_eq!(broadcast_rows[0].sender_id, Board::DaqBoard.sender_id());
         assert_eq!(broadcast_rows[0].values, vec![Some(4.25)]);
@@ -4294,8 +4454,7 @@ mod tests {
                 .any(|row| row.data_type == loadcell::DERIVED_WEIGHT_DATA_TYPE)
         );
         assert!(
-            !
-            cache
+            !cache
                 .iter()
                 .any(|row| row.data_type == loadcell::DERIVED_FILL_PERCENT_DATA_TYPE)
         );
@@ -4514,7 +4673,11 @@ mod tests {
             assert!(derived_rows.is_empty());
         } else {
             assert_eq!(derived_rows.len(), 6);
-            assert!(derived_rows.iter().any(|row| row.data_type == "AV_BAY_BATTERY_PERCENT"));
+            assert!(
+                derived_rows
+                    .iter()
+                    .any(|row| row.data_type == "AV_BAY_BATTERY_PERCENT")
+            );
         }
     }
 
@@ -4636,20 +4799,35 @@ mod tests {
         let (db_tx, mut db_rx) = mpsc::channel(1);
         let state = test_app_state(db_tx.clone()).await;
         let overflow = test_db_overflow();
-        db_tx.send(DbQueueItem::Write(DbWrite::FlightState {
-            timestamp_ms: 0, state_code: 0,
-        })).await.unwrap();
+        db_tx
+            .send(DbQueueItem::Write(DbWrite::FlightState {
+                timestamp_ms: 0,
+                state_code: 0,
+            }))
+            .await
+            .unwrap();
         let key = ActuatorBoardCommands::NitrousOpen as u8;
-        let make = |on| Packet::new(
-            crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
-            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "AB", 0,
-            Arc::from([key, on]),
-        ).unwrap();
+        let make = |on| {
+            Packet::new(
+                crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "AB",
+                0,
+                Arc::from([key, on]),
+            )
+            .unwrap()
+        };
         let open = make(1);
         let row = apply_umbilical_status_at_ingress(&state, &open).unwrap();
         assert_eq!(state.get_umbilical_valve_state(key), Some(true));
-        let mut pending = Box::pin(persist_umbilical_status(&state, &db_tx, &overflow, &open, &row));
-        assert!(tokio::time::timeout(Duration::from_millis(10), &mut pending).await.is_err());
+        let mut pending = Box::pin(persist_umbilical_status(
+            &state, &db_tx, &overflow, &open, &row,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut pending)
+                .await
+                .is_err()
+        );
         let close = make(0);
         apply_umbilical_status_at_ingress(&state, &close).unwrap();
         assert_eq!(state.get_umbilical_valve_state(key), Some(false));
@@ -4712,14 +4890,21 @@ mod tests {
                 let packet = Packet::new(
                     crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
                     &[crate::telemetry_schema::endpoint("GROUND_STATION")],
-                    sender, 1234, Arc::from([key, on]),
-                ).unwrap();
+                    sender,
+                    1234,
+                    Arc::from([key, on]),
+                )
+                .unwrap();
                 let rows = handle_packet(&state, &db_tx, &overflow, packet).await;
                 assert_eq!(rows[0].values[channel], Some(f32::from(on)));
                 assert_eq!(state.get_umbilical_valve_state(key), Some(on != 0));
                 assert_eq!(state.get_pending_umbilical_valve_state(key), None);
-                let control = state.action_policy_snapshot().controls.into_iter()
-                    .find(|control| control.cmd == command).unwrap();
+                let control = state
+                    .action_policy_snapshot()
+                    .controls
+                    .into_iter()
+                    .find(|control| control.cmd == command)
+                    .unwrap();
                 assert_eq!(control.actuated, Some(on != 0));
             }
         }

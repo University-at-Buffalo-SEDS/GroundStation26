@@ -1,6 +1,8 @@
 #[path = "i2c_packet.rs"]
 #[allow(dead_code)]
 mod i2c_packet;
+#[path = "picofi_tcp.rs"]
+mod picofi_tcp;
 use crate::comms_config::{
     CanLinkConfig, CommsLinkConfig, I2cLinkConfig, SerialLinkConfig, SerialProtocol, SpiLinkConfig,
 };
@@ -173,6 +175,7 @@ pub fn link_description(cfg: &CommsLinkConfig) -> String {
         CommsLinkConfig::Spi { spi } => spi_description(spi),
         CommsLinkConfig::Can { can } => can_description(can),
         CommsLinkConfig::I2c { i2c } => i2c_description(i2c),
+        CommsLinkConfig::PicoFiTcp { tcp } => format!("picofi_tcp {:?} {}", tcp.mode, tcp.address),
     }
 }
 
@@ -184,11 +187,13 @@ pub fn open_link(cfg: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> 
         CommsLinkConfig::Spi { spi } => Ok(Box::new(SpiComms::open(spi)?)),
         CommsLinkConfig::Can { can } => Ok(Box::new(CanComms::open(can)?)),
         CommsLinkConfig::I2c { i2c } => Ok(Box::new(I2cComms::open(i2c)?)),
+        CommsLinkConfig::PicoFiTcp { tcp } => Ok(Box::new(picofi_tcp::PicoFiTcp::open(tcp)?)),
     }
 }
 
 pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
     match cfg {
+        CommsLinkConfig::PicoFiTcp { .. } => "Check the Pico Ethernet address/port, opposite client/server mode, allowed peer IP, and PICOFI1 firmware. The TCP port is separate from the web UI port.".into(),
         CommsLinkConfig::Serial { serial } | CommsLinkConfig::CustomSerial { serial } => {
             format!(
                 "Check that {} exists, is the correct serial device, and is not already in use. Prefer a stable /dev/serial/by-id path when available.",
@@ -232,7 +237,7 @@ fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(
     }
 }
 
-#[cfg(any(target_os="linux",test))]
+#[cfg(any(target_os = "linux", test))]
 fn is_valid_serialized_packet_or_ack(payload: &[u8]) -> bool {
     let Ok(frame) = serialize::peek_frame_info(payload) else {
         return false;
@@ -467,24 +472,38 @@ impl UartComms {
             let mut mesh = shared.lock().unwrap();
             let now = mesh.now();
             while let Some((kind, payload)) = take_raw_uart_framed_payload(&mut self.rx_buf)? {
-                if kind == RawUartFrameKind::Ascii { continue; }
-                if let Some(frame) = mesh.incoming(kind == RawUartFrameKind::Command, &payload, now) {
+                if kind == RawUartFrameKind::Ascii {
+                    continue;
+                }
+                if let Some(frame) = mesh.incoming(kind == RawUartFrameKind::Command, &payload, now)
+                {
                     if frame.command {
-                        if let Some(window) = parse_radio_window_update(&frame.bytes) { self.radio_window_updates.push_back(window); }
-                    } else { self.raw_uart_data_frames.push_back(frame.bytes); }
+                        if let Some(window) = parse_radio_window_update(&frame.bytes) {
+                            self.radio_window_updates.push_back(window);
+                        }
+                    } else {
+                        self.raw_uart_data_frames.push_back(frame.bytes);
+                    }
                 }
             }
             mesh.tick(now);
             (0..4).filter_map(|_| mesh.pop(now)).collect::<Vec<_>>()
         };
         for frame in outgoing {
-            let framed = if frame.command { build_raw_uart_command_frame(&frame.bytes) } else { build_raw_uart_frame(&frame.bytes) }
-                .map_err(|_| TelemetryError::HandlerError("RRLS frame too large"))?;
+            let framed = if frame.command {
+                build_raw_uart_command_frame(&frame.bytes)
+            } else {
+                build_raw_uart_frame(&frame.bytes)
+            }
+            .map_err(|_| TelemetryError::HandlerError("RRLS frame too large"))?;
             let _guard = self.write_lock.lock().unwrap();
-            #[cfg(target_os="linux")]
+            #[cfg(target_os = "linux")]
             write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
-            #[cfg(not(target_os="linux"))]
-            { self.inner.write_all(&framed)?; self.inner.flush()?; }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.inner.write_all(&framed)?;
+                self.inner.flush()?;
+            }
         }
         Ok(())
     }
@@ -584,6 +603,19 @@ fn queue_uart_router_payload(
     protocol: &SerialProtocol,
     packet_tap: &mut dyn FnMut(&Packet),
 ) -> TelemetryResult<()> {
+    if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
+        if let Ok(packet) = serialize::unpack_packet(payload) {
+            if packet.data_type() == sedsnet::config::DataType::ReliableAck {
+                log::info!(
+                    "full-bay ACK transport RX side={side_id} sim={:?} source_ms={} owners={:?} receipt={:02x?}",
+                    crate::simulation_clock_ms(),
+                    packet.timestamp(),
+                    serialize::peek_envelope(payload).map(|envelope| envelope.target_senders),
+                    packet.payload()
+                );
+            }
+        }
+    }
     maybe_log_raw_uart_decoded(payload, protocol);
     maybe_log_raw_uart_router_queue_before(payload, protocol);
     tap_non_groundstation_gps_payload(payload, packet_tap);
@@ -592,7 +624,7 @@ fn queue_uart_router_payload(
     Ok(())
 }
 
-#[cfg(any(target_os="linux",test))]
+#[cfg(any(target_os = "linux", test))]
 fn queue_i2c_router_payload(
     router: &Router,
     side_id: RouterSideId,
@@ -872,7 +904,7 @@ enum RawUartFrameKind {
     Ascii,
 }
 
-#[cfg(any(target_os="linux",test))]
+#[cfg(any(target_os = "linux", test))]
 fn parse_link_frame(payload: &[u8]) -> Option<((u8, u8), &[u8])> {
     if payload.len() < RAW_UART_FRAME_HEADER_SIZE {
         return None;
@@ -1458,9 +1490,13 @@ impl CommsDevice for UartComms {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         let routed = if let Some(shared) = &self.recovery {
             let mesh = shared.lock().unwrap();
-            let Some(frame) = mesh.local_tx(false, payload, mesh.now()) else { return Ok(()); };
+            let Some(frame) = mesh.local_tx(false, payload, mesh.now()) else {
+                return Ok(());
+            };
             Some(frame)
-        } else { None };
+        } else {
+            None
+        };
         let recovery_command = routed.as_ref().is_some_and(|frame| frame.command);
         let payload = routed.as_ref().map_or(payload, |frame| &frame.bytes[..]);
         let _guard = self.write_lock.lock().unwrap();
@@ -1480,7 +1516,11 @@ impl CommsDevice for UartComms {
             SerialProtocol::RawUart => {
                 #[cfg(target_os = "linux")]
                 {
-                    let framed = if recovery_command {build_raw_uart_command_frame(payload)?} else {build_raw_uart_frame(payload)?};
+                    let framed = if recovery_command {
+                        build_raw_uart_command_frame(payload)?
+                    } else {
+                        build_raw_uart_frame(payload)?
+                    };
                     maybe_log_raw_uart_tx(&framed, &self.protocol);
                     write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
                     drain_fd_with_timeout(
@@ -1490,7 +1530,11 @@ impl CommsDevice for UartComms {
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    let framed = if recovery_command {build_raw_uart_command_frame(payload)?} else {build_raw_uart_frame(payload)?};
+                    let framed = if recovery_command {
+                        build_raw_uart_command_frame(payload)?
+                    } else {
+                        build_raw_uart_frame(payload)?
+                    };
                     maybe_log_raw_uart_tx(&framed, &self.protocol);
                     self.inner.write_all(&framed)?;
                     self.inner.flush()?;
@@ -1526,10 +1570,15 @@ impl CommsDevice for UartComms {
         ];
         let routed;
         let payload = if let Some(shared) = &self.recovery {
-            let mesh=shared.lock().unwrap();
-            let Some(frame)=mesh.local_tx(true,&payload,mesh.now()) else {return Ok(());};
-            routed=frame; &routed.bytes[..]
-        } else { &payload[..] };
+            let mesh = shared.lock().unwrap();
+            let Some(frame) = mesh.local_tx(true, &payload, mesh.now()) else {
+                return Ok(());
+            };
+            routed = frame;
+            &routed.bytes[..]
+        } else {
+            &payload[..]
+        };
         let framed = build_raw_uart_command_frame(payload)?;
         let _guard = self.write_lock.lock().unwrap();
         maybe_log_raw_uart_tx(&framed, &self.protocol);
@@ -2869,25 +2918,50 @@ mod raw_uart_tests {
         );
         let (_peer, port) = serialport::TTYPort::pair().unwrap();
         let mut uart = UartComms {
-            #[cfg(target_os="linux")] inner:port,
-            #[cfg(not(target_os="linux"))] inner:Box::new(port),
-            side_id:Some(receiver_side), rx_buf:Vec::new(),
-            raw_uart_data_frames:VecDeque::new(),radio_window_updates:VecDeque::new(),
-            protocol:SerialProtocol::RawUart,recovery:None,write_lock:Default::default(),
-            #[cfg(target_os="linux")] baud_rate:115200,
-            slow_start_deadline:None,
+            #[cfg(target_os = "linux")]
+            inner: port,
+            #[cfg(not(target_os = "linux"))]
+            inner: Box::new(port),
+            side_id: Some(receiver_side),
+            rx_buf: Vec::new(),
+            raw_uart_data_frames: VecDeque::new(),
+            radio_window_updates: VecDeque::new(),
+            protocol: SerialProtocol::RawUart,
+            recovery: None,
+            write_lock: Default::default(),
+            #[cfg(target_os = "linux")]
+            baud_rate: 115200,
+            slow_start_deadline: None,
         };
         for fragment in fragments {
-            let framed=build_raw_uart_frame(&fragment).unwrap();
+            let framed = build_raw_uart_frame(&fragment).unwrap();
             uart.rx_buf.extend_from_slice(&framed[..2]);
-            assert!(!uart.process_buffered_payloads_with_budget(&mut |_| panic!("partial frame delivered"),8).unwrap());
+            assert!(
+                !uart
+                    .process_buffered_payloads_with_budget(
+                        &mut |_| panic!("partial frame delivered"),
+                        8
+                    )
+                    .unwrap()
+            );
             uart.rx_buf.extend_from_slice(&framed[2..]);
-            let mut delivered_bytes=0;
-            uart.process_buffered_payloads_with_budget(&mut |payload| {
-                delivered_bytes+=payload.len();
-                queue_uart_router_payload(&receiver,receiver_side,&payload,&SerialProtocol::RawUart,&mut |_|{}).unwrap();
-            },8).unwrap();
-            assert_eq!(delivered_bytes,fragment.len());
+            let mut delivered_bytes = 0;
+            uart.process_buffered_payloads_with_budget(
+                &mut |payload| {
+                    delivered_bytes += payload.len();
+                    queue_uart_router_payload(
+                        &receiver,
+                        receiver_side,
+                        &payload,
+                        &SerialProtocol::RawUart,
+                        &mut |_| {},
+                    )
+                    .unwrap();
+                },
+                8,
+            )
+            .unwrap();
+            assert_eq!(delivered_bytes, fragment.len());
         }
         receiver.process_all_queues().unwrap();
 

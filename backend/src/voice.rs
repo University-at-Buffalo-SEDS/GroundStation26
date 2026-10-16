@@ -1,5 +1,5 @@
-//! Browser voice only: bounded PCM relay over the existing authenticated WebSocket link.
-//! No radio hardware, external signaling service, or voice recording.
+//! Bounded local WebSocket crew voice, with an opt-in RRLS Opus bridge.
+//! Camera/video and voice recording are outside the radio voice path.
 use crate::{auth::Permission, state::AppState};
 use axum::{
     Router,
@@ -112,6 +112,7 @@ impl VoiceHub {
 struct Peer {
     name: String,
     transmitting: bool,
+    radio_enabled: bool,
     tx: mpsc::Sender<Message>,
 }
 struct VoiceState {
@@ -122,15 +123,48 @@ struct VoiceState {
 }
 
 pub fn routes(app: Arc<AppState>, hub: Arc<VoiceHub>) -> Router<Arc<AppState>> {
+    let voice_state = Arc::new(VoiceState {
+        app,
+        hub,
+        peers: Mutex::new(BTreeMap::new()),
+        next: AtomicU32::new(1),
+    });
+    if crate::rrls::voice_status().0 {
+        let weak = Arc::downgrade(&voice_state);
+        let mut audio = crate::radio_voice::subscribe();
+        tokio::spawn(async move {
+            loop {
+                let frame = match audio.recv().await {
+                    Ok(frame) => frame,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
+                if frame.created.elapsed() > Duration::from_millis(180) {
+                    continue;
+                }
+                let Some(state) = weak.upgrade() else {
+                    break;
+                };
+                for pcm in frame.pcm.chunks_exact(320) {
+                    let mut packet = Vec::with_capacity(4 + FRAME_BYTES);
+                    packet.extend_from_slice(&0xffff_fffeu32.to_le_bytes());
+                    for sample in pcm {
+                        packet.extend_from_slice(&sample.to_le_bytes());
+                    }
+                    let bytes = packet[4..].to_vec();
+                    let packet = Message::Binary(packet.into());
+                    for peer in state.peers.lock().await.values() {
+                        let _ = peer.tx.try_send(packet.clone());
+                    }
+                    state.hub.capture(0xffff_fffe, &bytes).await;
+                }
+            }
+        });
+    }
     Router::new()
         .route("/api/voice/ws", get(upgrade))
         .route("/api/voice/status", get(capabilities))
-        .with_state(Arc::new(VoiceState {
-            app,
-            hub,
-            peers: Mutex::new(BTreeMap::new()),
-            next: AtomicU32::new(1),
-        }))
+        .with_state(voice_state)
         .route("/radio", get(|| async { Html(include_str!("voice.html")) }))
         .route(
             "/assets/voice.js",
@@ -166,7 +200,7 @@ async fn capabilities(
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     match crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await {
-        Ok(p) => axum::Json(serde_json::json!({"can_transmit":!p.anonymous && p.permissions.allows(Permission::VoiceTransmit),"broadcast_enabled":state.hub.enabled().await})).into_response(),
+        Ok(p) => axum::Json(serde_json::json!({"can_transmit":!p.anonymous && p.permissions.allows(Permission::VoiceTransmit),"broadcast_enabled":state.hub.enabled().await,"radio":crate::radio_voice::status()})).into_response(),
         Err(response) => response,
     }
 }
@@ -182,6 +216,7 @@ async fn upgrade(State(state): State<Arc<VoiceState>>, ws: WebSocketUpgrade) -> 
 enum Control {
     Auth { token: String },
     Transmitting { enabled: bool },
+    Radio { enabled: bool },
     Ping,
 }
 
@@ -251,6 +286,7 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
             Peer {
                 name: principal.username.unwrap_or_else(|| "Crew".into()),
                 transmitting: false,
+                radio_enabled: false,
                 tx,
             },
         );
@@ -269,6 +305,7 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
                         if !budget.accept() || bytes.len() != FRAME_BYTES { break; }
                         let peers = state.peers.lock().await;
                         if !peers.get(&id).is_some_and(|p| p.transmitting) { continue; }
+                        let radio=peers.get(&id).is_some_and(|p|p.radio_enabled);
                         let mut packet = Vec::with_capacity(4 + FRAME_BYTES);
                         packet.extend_from_slice(&id.to_le_bytes()); packet.extend_from_slice(&bytes);
                         let packet = Message::Binary(packet.into());
@@ -277,6 +314,7 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
                         }
                         drop(peers);
                         state.hub.capture(id, &bytes).await;
+                        if radio {crate::radio_voice::submit(id,&bytes);}
                     }
                     Message::Text(raw) => {
                         if !budget.accept() { break; }
@@ -285,6 +323,18 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
                                 let mut peers = state.peers.lock().await;
                                 if let Some(peer) = peers.get_mut(&id) { peer.transmitting = enabled; }
                                 roster(&peers);
+                                drop(peers);
+                                if !enabled {crate::radio_voice::release(id);}
+                            }
+                            Ok(Control::Radio{enabled})=>{
+                                let allowed=enabled && crate::rrls::voice_status().1;
+                                let mut peers=state.peers.lock().await;
+                                if let Some(peer)=peers.get_mut(&id) {
+                                    peer.radio_enabled=allowed;
+                                    let _=peer.tx.try_send(text(serde_json::json!({"type":"radio_state","enabled":allowed})));
+                                }
+                                drop(peers);
+                                if !allowed {crate::radio_voice::release(id);}
                             }
                             Ok(Control::Ping) => {},
                             _ => break,
@@ -302,11 +352,18 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
                 if last_message.elapsed() > Duration::from_secs(40) { break; }
                 if !matches!(state.app.auth.authorize_token(&state.app.auth_db, Some(&token), Permission::VoiceTransmit).await, Ok(p) if !p.anonymous) { break; }
                 roster(&*state.peers.lock().await);
+                let radio=crate::radio_voice::status();
+                if radio["available"].as_bool()!=Some(true) {
+                    if let Some(peer)=state.peers.lock().await.get_mut(&id) {peer.radio_enabled=false;}
+                    crate::radio_voice::release(id);
+                }
+                if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(text(serde_json::json!({"type":"radio_link","radio":radio})))).await,Ok(Ok(()))) {break;}
                 let enabled = state.hub.enabled().await;
                 if !matches!(tokio::time::timeout(Duration::from_secs(2), socket.send(text(serde_json::json!({"type":"broadcast_state","enabled":enabled})))).await, Ok(Ok(()))) { break; }
             }
         }
     }
+    crate::radio_voice::release(id);
     let mut peers = state.peers.lock().await;
     peers.remove(&id);
     roster(&peers);

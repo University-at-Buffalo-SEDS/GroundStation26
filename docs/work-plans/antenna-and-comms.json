@@ -1,5 +1,5 @@
 {
-  "updated": "2026-10-15",
+  "updated": "2026-10-16",
   "constraints": [
     "Preserve firmware main and GroundStation SEDSnet version-4 dependency selectors",
     "Do not actuate outputs during diagnostics",
@@ -24,29 +24,33 @@
       "observations": [
         "Pi currently marks every remote board stale despite incoming numeric-sender status packets; investigate mapping and running binary/dependency state before inferring sensor loss.",
         "User reports 0.5\u20131.5 seconds GS-to-AV-bay managed-variable latency."
-      ]
+      ],
+      "progress": "Reproduced queued ACK redirection after return-cache eviction and echo; freeze the selected destination in the existing queue entry, with Router and Relay regressions. RF register capture proves SEDS_IO admission refusals: wire its existing protected work class, account exact TLSF free space and materialize full scratch in allocator regressions. RF byte-ring and circular UART DMA remove short-IDLE slot exhaustion and rearm gaps; apply circular DMA to both gateways. Both 16-second linked transports pass all three managed rounds within 140\u2013240 ms, with zero sampled UART errors. Exact 4.2.3 seven-MCU 600-second runs are in progress; sustained-loss elimination is not yet qualified."
     },
     {
       "id": "ethernet",
-      "status": "pending",
+      "status": "in_progress",
       "scope": "Optional Pico-Fi TCP client and server instead of I2C, using existing Pi Ethernet; bounded frame decoding, reconnect, disconnect/backpressure, and configurable setup; confirm shared web port requirement",
-      "validation": "Loopback protocol tests plus simulator network fault/reconnect cases"
+      "validation": "Loopback protocol tests plus simulator network fault/reconnect cases",
+      "progress": "Bounded TCP client/server PICOFI1 transport, reconnect and configuration implemented; six real loopback tests pass on macOS and Ubuntu ARM64. Actual bounded simulator TCP peer and I2C v2 model pass short linked checks with fragmented framing, duplex traffic and protected controls. Both transports are undergoing the 600-second restart/fault qualification."
     },
     {
       "id": "aiming-data",
-      "status": "in_progress",
+      "status": "complete",
       "scope": "Fresh rocket, GS GPS and RRLS GPS positions; local attached GPS integration; optional passively provided RSSI with explicit source, units and freshness",
-      "validation": "Invalid/stale/missing fixes, origin/target selection, RRLS disconnected/mesh delivery"
+      "validation": "Invalid/stale/missing fixes, origin/target selection, RRLS disconnected/mesh delivery",
+      "progress": "Authenticated position/RSSI endpoint, opt-in bounded GPSD and RRLS position exchange implemented. GPSD fix age and 2D altitude checks tested; end-to-end RRLS checks remain. Software acceptance complete on macOS and Ubuntu ARM64 with isolated/synthetic devices. Actual phone orientation, antennas, radio audio quality and physical panel feedback remain field checks, not simulated hardware claims. Paired RRLS mesh tests cover position envelope validation, fallback/direct command retention and 600-second loss/recovery; RSSI is optional and never inferred for asynchronous RFD firmware."
     },
     {
       "id": "aiming-ui",
-      "status": "pending",
+      "status": "complete",
       "scope": "Exclusive full-screen antenna aiming until exit; device IMU/compass; device/GS/RRLS GPS origin; rocket/RRLS/GS targets; horizontal and vertical split guidance with centered rocket; RSSI-assisted manual trim",
-      "validation": "Bearing/elevation wraparound and altitude-datum tests; sensor permission and cleanup tests; mobile viewport and native/Wasm builds"
+      "validation": "Bearing/elevation wraparound and altitude-datum tests; sensor permission and cleanup tests; mobile viewport and native/Wasm builds",
+      "progress": "Exclusive split guidance screen implemented. Web preview compiles with matching Dioxus CLI 0.7.10; six macOS geometry tests and four sensor tests pass. Isolated headless browser acceptance passes at 320/390/844/1280 pixel widths, including sensor cleanup, missing/stale fixes and datum mismatch. No desktop access required. Physical compass and Pi hardware checks remain. Software acceptance complete on macOS and Ubuntu ARM64 with isolated/synthetic devices. Actual phone orientation, antennas, radio audio quality and physical panel feedback remain field checks, not simulated hardware claims."
     },
     {
       "id": "mobile-ui-polish",
-      "status": "pending",
+      "status": "complete",
       "scope": [
         "Consistent touch-friendly buttons, spacing, states, and navigation for iOS and Android",
         "Short labels and concise status text; move detailed explanations to formatted info dialogs",
@@ -63,11 +67,12 @@
         "Camera-present/absent layout transitions",
         "Native and Wasm builds; document platform/device checks that cannot be run here",
         "Verify touch targets and resource use on Ubuntu Raspberry Pi, including the native Linux app and served web UI where supported."
-      ]
+      ],
+      "progress": "Admin accounts, session revocation, stream/view controls, concise help dialogs, operational qualification/reset/QD clock and 2D camera fallback implemented. Physical-panel mirror now uses the backend GPIO mapping and requested lamp states; headless tests cover grouped/manual, locked, active/blinking and unavailable states. Mac and Ubuntu ARM64 browser checks pass. Requested lamp state is not measured hardware feedback. Software acceptance complete on macOS and Ubuntu ARM64 with isolated/synthetic devices. Actual phone orientation, antennas, radio audio quality and physical panel feedback remain field checks, not simulated hardware claims."
     },
     {
       "id": "rrls-radio-voice",
-      "status": "pending",
+      "status": "complete",
       "scope": "Investigate and, where feasible, implement voice between main GroundStation and RRLS over a valid RFD mesh link, integrated with existing VC management. Evaluate a low-bitrate push-to-talk path and explicit link availability. Voice only: explicitly exclude video from the RFD relay.",
       "validation": [
         "Measure codec bitrate plus framing overhead against the configured radio airtime budget.",
@@ -75,17 +80,19 @@
         "Simulator tests for link loss/recovery, delay, loss and concurrent command/GPS traffic.",
         "Verify browser/mobile/Pi microphone permission and audio-device failure handling; do not send microphone audio without explicit user action.",
         "Assert camera/video frames cannot enter the RFD voice/relay transport; retain local-network camera viewing."
-      ]
+      ],
+      "progress": "Opt-in host-only 8 kb/s Opus PTT, off by default. Actual paired codec/envelope and 600-second virtual congestion tests pass: 6000 commands/GPS updates precede voice, bounded three-frame queue expires at 180 ms, no echo/duplicates after disconnect. Browser opt-in/PTT checks pass on Mac and Ubuntu ARM64. About 11.1 kb/s framed before modem overhead. Physical radio/audio quality remains unqualified. Software acceptance complete on macOS and Ubuntu ARM64 with isolated/synthetic devices. Actual phone orientation, antennas, radio audio quality and physical panel feedback remain field checks, not simulated hardware claims."
     },
     {
       "id": "procedure-input",
-      "status": "pending",
+      "status": "complete",
       "scope": "At the procedure-testing stage, prompt the user for actual launch sequences, test-fire sequences, other operating procedures, expected steps and acceptance criteria; keep launch and test-fire behavior distinct without changing HITL.",
-      "validation": "Obtain and record operator-approved procedures before implementing their step-by-step acceptance tests."
+      "validation": "Obtain and record operator-approved procedures before implementing their step-by-step acceptance tests.",
+      "progress": "Operator procedure confirmed and saved below. Existing valve-board ignition timings are retained; no unconfirmed timings are introduced."
     },
     {
       "id": "ui-end-to-end",
-      "status": "pending",
+      "status": "complete",
       "scope": "Inventory and exercise every UI button, control, navigation action and sequence against simulator-backed GroundStation. Include manual controls, physical-panel indicators, self-test/fill/pause/cancel, flight commands, calibration, recording/export, camera/stream/VC/admin and aiming controls.",
       "validation": [
         "Check command routing, ACKs and visible state changes, permission/interlock denial, timeouts, cancellation, reconnect and recovery.",
@@ -93,13 +100,15 @@
         "Use simulated isolated outputs only; retain full existing HITL behavior.",
         "Report unavailable browser/native/device paths explicitly rather than claiming them tested.",
         "Run all applicable UI/features against Ubuntu on Raspberry Pi, including cameras/streams/voice, export scrolling/downloads, authentication/admin, GPS/aiming and touch navigation; explicitly distinguish unavailable physical sensors from software failures."
-      ]
+      ],
+      "progress": "Mac backend HITL 289 passed/1 ignored, flight 296 passed/1 ignored, test-fire 297 passed/1 ignored before the latest radio scheduling regression. Native UI 96 passed/7 ignored and Wasm build pass. Headless dashboard now exercises all 55 command buttons and both recovery confirmation acceptance/cancellation; this found and fixed the missing JavaScript return in reset confirmations. Routed test-fire checkout/fill and flight five-second QD acceptance pass. Every advertised and shipped-layout command maps to the backend request enum; closed-worker HTTP/WS failures report. Updated Ubuntu ARM64 dashboard browser acceptance passes all 55 buttons and recovery dialog acceptance/cancellation. Audit found five accepted-but-undispatched HITL threshold requests. Updated keys/labels to FC existing abort thresholds 40/100/250 and reinit thresholds 15/30/50; every exposed FC command is captured on a discovered fake radio route. No FC protocol/firmware change. Custom grants/layouts fail closed and are documented for review. Final candidate macOS backend checks pass: HITL 291, test-fire 299, flight 298; one ignored in each. Latest Ubuntu ARM64 backend 298 passed/one ignored and all 55-button browser, chart, sensor and map checks pass."
     },
     {
       "id": "qualification",
-      "status": "pending",
+      "status": "in_progress",
       "scope": "Run current simulator on Jupiter with current firmware, GS, SDK and bridge; targeted failures then extended soak; commit/push relevant fixes",
-      "validation": "Command/variable delivery latency, per-board battery freshness, reconnects, bounded memory and no crashes; record limits and distinguish simulation from hardware validation"
+      "validation": "Command/variable delivery latency, per-board battery freshness, reconnects, bounded memory and no crashes; record limits and distinguish simulation from hardware validation",
+      "progress": "All eight macOS TLSF+compact factory builds and all seven Jupiter linked-firmware factory builds pass against the 4.2.3 candidate. SDK full build.py test passes; packaging dry-run rerun after release milestone metadata correction. Backend profiles pass on macOS (291 HITL, 299 test-fire, 298 flight; one ignored each), Ubuntu ARM64 298/one ignored; final 19 host radio tests pass. Both exact-candidate 600-second linked MCU runs are in progress with the 500 ms managed deadline, reconnects, fresh valve power, scheduled ACKs and memory/error guards."
     }
   ],
   "platform_matrix": [
@@ -111,13 +120,87 @@
   "open_findings": [
     {
       "id": "rf-sim-compact-ram",
-      "status": "open",
-      "finding": "RF TLSF+compact with GCC14 and SEDS_FIRMWARE_SIM_TEST=ON exceeds 112 KiB RAM by 16 bytes. Production macOS factory-image builds passed previously. Linked baseline uses RF heap packet storage to match deployed firmware; compact profile is not qualified by that run."
+      "status": "fixed",
+      "finding": "Reused disjoint TLSF initialization bookkeeping storage and bounded counter widths, saving 16 bytes without shrinking pools. Heap and compact simulator factory builds pass; adapter regressions pass."
     },
     {
       "id": "radio-fifo-control-latency",
       "status": "candidate_fix",
-      "finding": "Actual SDK managed-variable frames use discovery transport priority 254 despite carrying application types. Candidate promotes only self-contained non-discovery frames to control reservation priority 255, preserves SDT order, and grants schema a turn after 1 KiB control traffic. All 13 focused scheduling regressions pass; latest linked simulation pending."
+      "finding": "RF UART FIFO now reserves existing capacity for independent canonical control/ACK frames and permits bounded bypass without reordering SDT frames. Native sanitizer regressions and heap/compact firmware builds pass. Linked RF ACK timing improved; gateway ACK loss remains."
+    },
+    {
+      "id": "valve-simulator-i2c",
+      "status": "candidate_fix",
+      "finding": "LTC2990 model lost HAL RELOAD split writes; GPIO AF read used ODR rather than external pad. Corrected both and added regressions. Valve fixture now includes both monitors and SDA/SCL pullups. Linked continuity qualification still pending."
+    },
+    {
+      "id": "pico-mailbox-fifo",
+      "status": "candidate_fix",
+      "finding": "Actual I2C v1 and SPI stage_response used try_pop_latest, silently discarding distinct queued ACKs. Changed to FIFO, removed lossy staging API, added simulator distinct-ACK regression and rebuilt paired Pico firmware. Bounded overwrite-on-full policy remains; linked queue-eviction tracing ongoing."
+    },
+    {
+      "id": "radio-simulator-clock",
+      "status": "candidate_fix",
+      "finding": "Host radio airtime used wall-clock deadlines while firmware UART/modem ran in virtual time. Added virtual-only deadline pacing when an explicit simulator clock is configured; ordinary operation/HITL without that clock keeps Instant. Validation must measure each round transmission/ACK, not wait for unrelated schema/telemetry TX queues to become empty."
+    },
+    {
+      "id": "host-route-backlog",
+      "status": "candidate_fix",
+      "finding": "Detailed traces show priority-255 address/topology advertisements fill both the command allowance and its FIFO. Separate canonical route scheduling and exclude discovery/SDT from the application-control reserve while retaining accepted frames and alternating metadata turns. Regression passes; linked check pending."
+    },
+    {
+      "id": "managed-ingress-service",
+      "status": "candidate_fix",
+      "finding": "Gateway simulator receive-result capture proves FLIGHT_STATE is rejected by memory admission (four early refusals). Registered managed values with schema priority 16 also entered threaded RX at 16 rather than service priority 254. Preserve service priority and bounded protected admission without shrinking working estimates; regression reproduces old refusal and passes heap/compact. All seven candidate firmware builds pass; repeat linked check pending."
+    },
+    {
+      "id": "queued-ack-echo-return-route",
+      "status": "candidate_fix",
+      "finding": "Native regression reproduces a queued radio ACK redirected by a CAN echo. Router and Relay now preserve original live ingress within the retry window; expiry and disabled-side tests retain alternate-path recovery. No additional retained state. First linked I2C/TCP checks of the initial guard pass; bounded-window refinement is undergoing rebuild/repetition."
+    },
+    {
+      "id": "rf-uart-idle-capacity",
+      "status": "candidate_fix",
+      "finding": "RF ISR ring allocated one 256-byte slot per short IDLE fragment; a native sanitizer regression reproduces exhaustion after four 13-byte fragments. Replace it with the same 1024-byte capacity stored as a byte ring, saving slot lengths. Enable USART1 hardware FIFO and add RX error/drop probes. Correct G4 simulator FIFO from 16 to eight bytes using the bundled HAL depth definitions; add UART model capacity/overrun regression. Linked repetition still required."
+    },
+    {
+      "id": "rf-protected-admission-not-wired",
+      "status": "candidate_fix",
+      "finding": "Renode return-register trace proves valid managed frames return SEDS_IO under pressure. RF still used legacy two-argument admission, so registered protected controls could not use control headroom. Wire RF to extended work classes; retain full estimates and contiguous floor, use exact constant-time TLSF free accounting and a private fallback trial. Actual allocator regressions materialize the full work and verify 4 KiB general reserve, protected exhaustion and recovery."
+    },
+    {
+      "id": "uart-normal-dma-rearm-gap",
+      "status": "candidate_fix",
+      "finding": "Read-only simulator captures show gateway UART hardware errors and RF normal-DMA receive gaps. Switch RF USART1 and both gateways USART2 to circular ReceiveToIdle with HT/TC/IDLE delta accounting; retain current DMA buffers and queues. Native tests cover partial positions, wraparound, duplicate callbacks, invalid positions and restart generation."
     }
-  ]
+  ],
+  "operator_procedure_requirements": {
+    "source": "User replies 2026-10-16",
+    "hitl": "Keep existing HITL behavior unchanged for complete testing.",
+    "test_fire": "No AV bay is present at test-fire site; never require FC/RF/PB or rocket GPS there.",
+    "startup": "All fill valves closed except dump and vent.",
+    "qualification": "Self-test then nitrogen test, then main fill to configured set point, then launch eligibility. Completed prerequisites survive board power cycles and service restarts until explicit UI reset.",
+    "connectivity": "All fill-system boards must be connected with stable topology before sequences. Warn on unstable connectivity; dropping boards outside idle before Launch triggers abort.",
+    "valve_safety": "Correct valve misconfiguration. Nitrogen opening during nitrous fill or other unsafe cross-flow must immediately latch a fault and request abort before Launch.",
+    "abort_boundary": "Automatic GroundStation aborts cease on entry to FlightState::Launch, including countdown. Do not change independent FC recovery/watchdog or assume manual emergency controls should be removed.",
+    "flight_launch": "Notify FC of impending launch and require valid command/return routes plus fresh rocket GPS lock. These requirements do not apply to test-fire.",
+    "quick_disconnect": "In regular launch mode, require a fresh QD command acknowledgement and wait five seconds FROM ACK before launch. A launch request during QD wait queues once, blinks T-clock and notifies remaining delay. Recheck live gates before releasing the queued launch.",
+    "open_details": [
+      "Exact launch/test-fire valve and ignition action order/timings beyond existing sequence; preserve existing output timing until confirmed."
+    ],
+    "nitrogen_test": "All valves closed except Nitrogen, which is stepped slowly with a closed-valve pressure-settling period between steps.",
+    "restart_outputs": "A saved filled tank is held closed on service restart. Empty checkout requests dump/vent open only with fresh empty-tank pressure, stable routes and the operating interlock; restarting never replays a launch request."
+  },
+  "headless_validation": {
+    "method": "Isolated headless Chromium profile, synthetic positions/sensors/camera/audio; no Computer Use or desktop permissions.",
+    "passed": [
+      "Antenna preview: source/target selection, split layouts at 320/390/844/1280 px, GPS/compass cleanup, stale or missing fixes, altitude datum mismatch, invalid trim and API failure.",
+      "Full dashboard: exclusive aiming entry/exit, cards and pins, mobile tab picker/checklist, export scrolling, stream permissions, camera recovery, embedded media session handoff.",
+      "Embedded media: shared login, fake-camera WebRTC publishing, hidden-tab persistence, open mic/PTT, logout and permission loss.",
+      "Broadcast program: H.264 playback, single decoder, sound, portrait grid, delay changes, camera/server loss and 2D fallback.",
+      "All 55 dashboard command buttons dispatch exactly once through an isolated WebSocket; reset confirmation acceptance sends once and cancellation sends none.",
+      "Final macOS backend: HITL 291, test-fire 299, flight 298 passed, one ignored each; Ubuntu ARM64 backend 298 passed, one ignored. Native UI 96 passed/seven ignored. All eight macOS factory builds pass for the 4.2.3 candidate."
+    ],
+    "remaining": "Exact-candidate 600-second linked I2C and TCP soaks, publication, registry-only builds and final commit/push. Physical phone compass/camera/audio, native iOS/Android packaging and RFD field tests remain unavailable."
+  }
 }

@@ -20,6 +20,8 @@ const UP_COMMAND: u8 = 4;
 const AV_BAY_DATA: u8 = 5;
 const AV_BAY_COMMAND: u8 = 6;
 const READY: u8 = 7;
+const POSITION: u8 = 8;
+const VOICE: u8 = 9;
 #[derive(Clone, Copy)]
 struct FrameClass {
     priority: u8,
@@ -61,11 +63,10 @@ pub fn configure(link: &crate::comms_config::CommsLinkConfig) -> anyhow::Result<
     let mut random = [0; 4];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random)
         .map_err(|_| anyhow::anyhow!("cannot generate recovery session identity"))?;
+    let mut mesh = Mesh::new(role, u32::from_le_bytes(random));
+    mesh.voice_enabled = std::env::var("GS_RRLS_VOICE").ok().as_deref() == Some("1");
     RADIO
-        .set((
-            serial.port.clone(),
-            Arc::new(Mutex::new(Mesh::new(role, u32::from_le_bytes(random)))),
-        ))
+        .set((serial.port.clone(), Arc::new(Mutex::new(mesh))))
         .map_err(|_| anyhow::anyhow!("RRLS radio already configured"))?;
     Ok(())
 }
@@ -127,10 +128,12 @@ struct Queued {
 }
 pub struct Mesh {
     pub role: Role,
+    voice_enabled: bool,
     started: Instant,
     session: u32,
     sequence: u32,
     last_health_sent: Option<u64>,
+    last_position_sent: Option<u64>,
     primary_session: Option<u32>,
     primary_sequence: u32,
     health_received: Option<u64>,
@@ -154,10 +157,12 @@ impl Mesh {
     pub fn new(role: Role, session: u32) -> Self {
         Self {
             role,
+            voice_enabled: false,
             started: Instant::now(),
             session,
             sequence: 0,
             last_health_sent: None,
+            last_position_sent: None,
             primary_session: None,
             primary_sequence: 0,
             health_received: None,
@@ -230,30 +235,62 @@ impl Mesh {
                     now,
                 );
             }
-        } else if !self.active(now) {
-            self.clear();
-            self.last_ready_sent = None;
-        } else if self
-            .last_ready_sent
-            .is_none_or(|v| now.saturating_sub(v) >= 500)
+        } else {
+            if !self.active(now) {
+                self.clear();
+                if !self.voice_enabled {
+                    self.last_ready_sent = None;
+                }
+            }
+            let peer_fresh = self
+                .health_received
+                .is_some_and(|last| now.saturating_sub(last) < LEASE_MS);
+            if (self.active(now) || self.voice_enabled && peer_fresh)
+                && self
+                    .last_ready_sent
+                    .is_none_or(|last| now.saturating_sub(last) >= 500)
+            {
+                let mut ready = self.primary_session.unwrap().to_le_bytes().to_vec();
+                ready.extend_from_slice(&self.primary_sequence.to_le_bytes());
+                self.enqueue(
+                    Outgoing {
+                        command: true,
+                        bytes: encode(READY, &ready),
+                    },
+                    255,
+                    now,
+                );
+                self.last_ready_sent = Some(now);
+            }
+        }
+        if self
+            .last_position_sent
+            .is_none_or(|last| now.saturating_sub(last) >= 5_000)
         {
-            let mut ready = self.primary_session.unwrap().to_le_bytes().to_vec();
-            ready.extend_from_slice(&self.primary_sequence.to_le_bytes());
-            self.enqueue(
-                Outgoing {
-                    command: true,
-                    bytes: encode(READY, &ready),
-                },
-                255,
-                now,
-            );
-            self.last_ready_sent = Some(now);
+            if let Some(fix) = crate::antenna::local_fix()
+                && let Some(encoded) = crate::antenna::encode_position(&fix)
+            {
+                let mut payload = Vec::with_capacity(39);
+                payload.push(if self.role == Role::Primary { 0 } else { 1 });
+                payload.extend_from_slice(&encoded);
+                self.enqueue(
+                    Outgoing {
+                        command: true,
+                        bytes: encode(POSITION, &payload),
+                    },
+                    250,
+                    now,
+                );
+                self.last_position_sent = Some(now);
+            }
         }
     }
     fn clear(&mut self) {
-        self.dropped += self.queue.len() as u64;
-        self.queue.clear();
-        self.bytes = 0;
+        let old = self.queue.len();
+        self.queue
+            .retain(|q| matches!(q.frame.bytes.get(3), Some(&POSITION) | Some(&VOICE)));
+        self.dropped += (old - self.queue.len()) as u64;
+        self.bytes = self.queue.iter().map(|q| q.frame.bytes.len()).sum();
     }
     fn enqueue(&mut self, frame: Outgoing, priority: u8, now: u64) {
         if frame.bytes.len() > MAX_PAYLOAD + 8 {
@@ -319,7 +356,15 @@ impl Mesh {
                 .max_by_key(|(i, q)| (q.priority, std::cmp::Reverse(*i)))
                 .map(|(i, _)| i)?;
             let q = &self.queue[i];
-            if now.saturating_sub(q.at) > if q.priority == 255 { 1500 } else { 250 } {
+            if now.saturating_sub(q.at)
+                > if q.frame.bytes.get(3) == Some(&VOICE) {
+                    180
+                } else if q.priority == 255 {
+                    1500
+                } else {
+                    250
+                }
+            {
                 let old = self.queue.remove(i).unwrap();
                 self.bytes -= old.frame.bytes.len();
                 self.dropped += 1;
@@ -337,6 +382,46 @@ impl Mesh {
             self.forwarded += 1;
             return Some(q.frame);
         }
+    }
+    pub fn voice_available(&self, now: u64) -> bool {
+        self.voice_enabled
+            && match self.role {
+                Role::Primary => self
+                    .relay_seen
+                    .is_some_and(|last| now.saturating_sub(last) < LEASE_MS),
+                Role::Rrls => self
+                    .health_received
+                    .is_some_and(|last| now.saturating_sub(last) < LEASE_MS),
+            }
+    }
+    pub fn queue_voice(&mut self, payload: &[u8], now: u64) {
+        if !self.voice_available(now) || payload.len() > crate::radio_voice::MAX_PACKET {
+            return;
+        }
+        while self
+            .queue
+            .iter()
+            .filter(|q| q.frame.bytes.get(3) == Some(&VOICE))
+            .count()
+            >= 3
+        {
+            let index = self
+                .queue
+                .iter()
+                .position(|q| q.frame.bytes.get(3) == Some(&VOICE))
+                .unwrap();
+            let old = self.queue.remove(index).unwrap();
+            self.bytes -= old.frame.bytes.len();
+            self.dropped += 1;
+        }
+        self.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(VOICE, payload),
+            },
+            1,
+            now,
+        );
     }
     fn classify(&mut self, bytes: &[u8]) -> Option<FrameClass> {
         fn id(bytes: &[u8], off: &mut usize) -> Option<u32> {
@@ -436,6 +521,20 @@ impl Mesh {
         if command && payload.starts_with(b"RR") {
             let (kind, data) = decode(payload)?;
             match (self.role, kind) {
+                (_, VOICE) if self.voice_available(now) => {
+                    crate::radio_voice::receive(self.role, data);
+                    None
+                }
+
+                (_, POSITION)
+                    if data.len() == 39
+                        && data[0] == if self.role == Role::Primary { 1 } else { 0 } =>
+                {
+                    if let Some(fix) = crate::antenna::decode_position(&data[1..]) {
+                        crate::antenna::accept_remote_fix(fix);
+                    }
+                    None
+                }
                 (Role::Primary, READY) if data.len() == 8 => {
                     let session = u32::from_le_bytes(data[..4].try_into().ok()?);
                     let seq = u32::from_le_bytes(data[4..].try_into().ok()?);
@@ -589,6 +688,151 @@ mod tests {
         p.extend_from_slice(&seq.to_le_bytes());
         p.push(direct as u8);
         encode(HEALTH, &p)
+    }
+    #[test]
+    fn optional_voice_presence_does_not_enable_standby_forwarding_or_flood_ready() {
+        let mut primary = Mesh::new(Role::Primary, 1);
+        primary.voice_enabled = true;
+        let mut recovery = Mesh::new(Role::Rrls, 2);
+        recovery.voice_enabled = true;
+        primary.tick(0);
+        let health = primary.pop(0).unwrap();
+        recovery.incoming(true, &health.bytes, 0);
+        recovery.tick(0);
+        let ready = recovery.pop(0).unwrap();
+        assert_eq!(decode(&ready.bytes).unwrap().0, READY);
+        primary.incoming(true, &ready.bytes, 0);
+        assert!(primary.voice_available(0));
+        assert!(recovery.voice_available(0));
+        assert!(!primary.active(0));
+        assert!(!recovery.active(0));
+        for now in 1..500 {
+            recovery.tick(now);
+            assert!(recovery.pop(now).is_none());
+        }
+        assert!(!primary.voice_available(LEASE_MS));
+    }
+    #[test]
+    fn paired_radio_voice_decodes_once_without_echo_and_stops_after_link_loss() {
+        let mut primary = Mesh::new(Role::Primary, 1);
+        let mut recovery = Mesh::new(Role::Rrls, 2);
+        primary.voice_enabled = true;
+        recovery.voice_enabled = true;
+        primary.tick(0);
+        recovery.incoming(true, &primary.pop(0).unwrap().bytes, 0);
+        recovery.tick(0);
+        primary.incoming(true, &recovery.pop(0).unwrap().bytes, 0);
+        let mut audio = crate::radio_voice::subscribe();
+        for role in [Role::Primary, Role::Rrls] {
+            let (sender, receiver) = if role == Role::Primary {
+                (&mut primary, &mut recovery)
+            } else {
+                (&mut recovery, &mut primary)
+            };
+            sender.queue_voice(&crate::radio_voice::test_packet(role), 1);
+            let packet = sender.pop(1).unwrap();
+            assert!(receiver.incoming(true, &packet.bytes, 1).is_none());
+            assert_eq!(audio.try_recv().unwrap().pcm.len(), 960);
+            assert!(receiver.incoming(true, &packet.bytes, 2).is_none());
+            assert!(audio.try_recv().is_err(), "duplicate audio cannot replay");
+            assert!(receiver.pop(2).is_none(), "received voice cannot echo");
+            receiver.incoming(true, &packet.bytes, LEASE_MS + 1);
+            sender.queue_voice(&crate::radio_voice::test_packet(role), LEASE_MS + 1);
+            assert!(sender.pop(LEASE_MS + 1).is_none());
+            assert!(audio.try_recv().is_err());
+        }
+    }
+    #[test]
+    fn ten_minutes_of_voice_congestion_never_delays_command_or_gps_turns() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        mesh.voice_enabled = true;
+        let mut controls = 0;
+        let mut gps = 0;
+        for now in (0..600_000).step_by(20) {
+            // Repeated ten-second disconnects must stop voice admission.
+            let connected = now % 60_000 < 50_000;
+            if connected {
+                mesh.relay_seen = Some(now);
+            }
+            let before = mesh.queue.len();
+            mesh.queue_voice(&[0; 71], now);
+            if !mesh.voice_available(now) {
+                assert_eq!(mesh.queue.len(), before);
+            }
+            if now % 100 == 0 {
+                mesh.enqueue(
+                    Outgoing {
+                        command: true,
+                        bytes: encode(UP_COMMAND, b"command"),
+                    },
+                    254,
+                    now,
+                );
+                mesh.enqueue(
+                    Outgoing {
+                        command: true,
+                        bytes: encode(DOWN_DATA, b"gps"),
+                    },
+                    255,
+                    now,
+                );
+                assert_eq!(decode(&mesh.pop(now).unwrap().bytes).unwrap().1, b"gps");
+                gps += 1;
+                assert_eq!(decode(&mesh.pop(now).unwrap().bytes).unwrap().1, b"command");
+                controls += 1;
+            }
+            // A deliberately slow radio drains only one voice frame per 120 ms.
+            if now % 120 == 0 {
+                mesh.pop(now);
+            }
+            assert!(mesh.queue.len() <= 3);
+            assert!(mesh.bytes <= 3 * (crate::radio_voice::MAX_PACKET + 8));
+        }
+        assert_eq!((controls, gps), (6000, 6000));
+        assert!(
+            mesh.dropped > 0,
+            "congestion sheds voice instead of growing memory"
+        );
+        assert!(
+            mesh.pop(600_200).is_none(),
+            "old audio expires across a reconnect"
+        );
+    }
+    #[test]
+    fn voice_is_bounded_expires_and_yields_to_gps_and_commands() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        mesh.voice_enabled = true;
+        mesh.relay_seen = Some(0);
+        let payload = vec![0; 71];
+        for _ in 0..100 {
+            mesh.queue_voice(&payload, 0);
+        }
+        assert_eq!(mesh.queue.len(), 3);
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(UP_COMMAND, b"command"),
+            },
+            254,
+            0,
+        );
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(DOWN_DATA, b"gps"),
+            },
+            255,
+            0,
+        );
+        assert_eq!(decode(&mesh.pop(0).unwrap().bytes).unwrap().0, DOWN_DATA);
+        assert_eq!(decode(&mesh.pop(0).unwrap().bytes).unwrap().0, UP_COMMAND);
+        assert!(mesh.pop(181).is_none(), "expired voice is never replayed");
+        assert!(mesh.queue.is_empty());
+        mesh.queue_voice(&vec![0; crate::radio_voice::MAX_PACKET + 1], 181);
+        assert!(
+            mesh.pop(181).is_none(),
+            "video-sized payloads cannot enter voice"
+        );
     }
     #[test]
     fn direct_ground_uplink_is_namespaced_away_from_rocket_templates() {
@@ -906,5 +1150,20 @@ impl crate::comms::CommsDevice for NoFill {
     }
     fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
+    }
+}
+
+pub fn voice_transport() -> Option<Shared> {
+    RADIO
+        .get()
+        .map(|(_, shared)| shared.clone())
+        .filter(|shared| shared.lock().unwrap().voice_enabled)
+}
+pub fn voice_status() -> (bool, bool) {
+    if let Some(shared) = voice_transport() {
+        let mesh = shared.lock().unwrap();
+        (true, mesh.voice_available(mesh.now()))
+    } else {
+        (false, false)
     }
 }

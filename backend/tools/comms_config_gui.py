@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import ipaddress
 import os
 import platform
 import sys
@@ -27,6 +28,8 @@ DEFAULT_SPI_MODE = 0
 DEFAULT_SPI_BITS_PER_WORD = 8
 
 INTERFACE_OPTIONS = [
+    "pico_fi_tcp",
+    "i2c",
     "usb_serial",
     "raspberry_pi_gpio_uart",
     "custom_serial",
@@ -89,12 +92,12 @@ def repo_root() -> Path:
 
 
 def default_config_path() -> Path:
-    return repo_root() / "backend" / "comms" / "coms.json"
+    return repo_root() / "backend" / "comms" / "comms.json"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Configure GroundStation radio links.")
-    parser.add_argument("--config", default=str(default_config_path()), help="Path to coms.json.")
+    parser.add_argument("--config", default=str(default_config_path()), help="Path to comms.json.")
     parser.add_argument("--gui", action="store_true", help="Force GUI mode.")
     parser.add_argument("--tui", action="store_true", help="Force interactive terminal mode.")
     parser.add_argument("--cli", action="store_true", help="Apply settings from CLI flags and save without prompts.")
@@ -107,6 +110,11 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument(f"--{prefix}-spi-bits")
         parser.add_argument(f"--{prefix}-can-tx-id")
         parser.add_argument(f"--{prefix}-can-rx-id")
+        parser.add_argument(f"--{prefix}-tcp-mode", choices=["client", "server"], help="Pico-Fi TCP connection direction")
+        parser.add_argument(f"--{prefix}-tcp-address", help="Numeric IP:port; server binds, client connects")
+        parser.add_argument(f"--{prefix}-allowed-peer", help="Pico IP allowed by a TCP server")
+        for field in ["bus", "addr", "protocol-version"]:
+            parser.add_argument(f"--{prefix}-i2c-{field}", help="I2C parameter (decimal or 0x hexadecimal)")
     return parser.parse_args()
 
 
@@ -230,6 +238,10 @@ def normalize_config(cfg: dict) -> dict:
     merged.update({k: v for k, v in cfg.items() if k not in {"av_bay", "fill_box"}})
     for name in ("av_bay", "fill_box"):
         merged[name].update(cfg.get(name, {}))
+        for field, default in {"mode":"client", "address":"127.0.0.1:9000", "allowed_peer":None,
+                               "bus":1, "addr":0x55, "protocol_version":2,
+                               "chunk_delay_ms":0, "initial_wait_ms":0}.items():
+            merged[name].setdefault(field, default)
         merged[name]["interface"] = str(merged[name]["interface"])
         merged[name]["port"] = str(merged[name]["port"])
         merged[name]["baud_rate"] = int(merged[name].get("baud_rate", DEFAULT_CONFIG[name]["baud_rate"]))
@@ -256,6 +268,33 @@ def validate_config(cfg: dict) -> dict:
         item = cfg[name]
         if item["interface"] not in INTERFACE_OPTIONS:
             raise ValueError(f"{name} interface is invalid")
+        if item["interface"] == "pico_fi_tcp":
+            if item["mode"] not in {"client", "server"}:
+                raise ValueError(f"{name} TCP mode must be client or server")
+            address = item["address"]
+            try:
+                host, port = address.rsplit(":", 1)
+                ip = ipaddress.ip_address(host.strip("[]"))
+                if ":" in host and not (host.startswith("[") and host.endswith("]")):
+                    raise ValueError("IPv6 requires brackets")
+                if not 1 <= int(port) <= 65535:
+                    raise ValueError("port must be 1–65535")
+            except (ValueError, AttributeError) as exc:
+                raise ValueError(f"{name} TCP address must be a numeric IP:port") from exc
+            peer = item.get("allowed_peer")
+            if peer:
+                try: ipaddress.ip_address(peer)
+                except ValueError as exc: raise ValueError(f"{name} allowed peer must be a numeric IP") from exc
+            if item["mode"] == "server" and not ip.is_loopback and not peer:
+                raise ValueError(f"{name} TCP server requires an allowed Pico peer IP")
+            item["allowed_peer"] = peer or None
+            continue
+        if item["interface"] == "i2c":
+            if not 0 <= int(item["bus"]) <= 255 or not 1 <= int(item["addr"]) <= 0x7f:
+                raise ValueError(f"{name} I2C bus/address out of range")
+            if int(item["protocol_version"]) not in (1,2):
+                raise ValueError(f"{name} I2C protocol must be 1 or 2")
+            continue
         if not item["port"].strip():
             raise ValueError(f"{name} device / port / iface cannot be empty")
         if int(item["baud_rate"]) <= 0:
@@ -332,6 +371,8 @@ def cmdline_uses_serial_console() -> bool | None:
 
 
 def interface_candidates(interface_name: str, env: EnvironmentInfo) -> list[str]:
+    if interface_name == "pico_fi_tcp":
+        return ["127.0.0.1:9000", "0.0.0.0:9000"]
     if interface_name == "raspberry_pi_gpio_uart":
         values = existing_paths(GPIO_PORT_CANDIDATES)
         for fallback in GPIO_PORT_CANDIDATES:
@@ -365,6 +406,11 @@ def build_help_lines(cfg: dict, env: EnvironmentInfo) -> list[str]:
         "",
     ]
 
+    if any(cfg[name]["interface"] == "pico_fi_tcp" for name in ("av_bay", "fill_box")):
+        lines += ["Pico-Fi TCP:", "- Uses the Pi's existing Ethernet interface; no I2C required.",
+                  "- Client connects to the Pico; server listens for its connection.",
+                  "- Use a separate TCP port from the web UI. Public listeners require the Pico peer IP.",
+                  "- Firmware must use the PICOFI1 handshake and B5 4E packet framing.", ""]
     wants_gpio_uart = any(cfg[name]["interface"] == "raspberry_pi_gpio_uart" for name in ("av_bay", "fill_box"))
     wants_spi = any(cfg[name]["interface"] == "spi" for name in ("av_bay", "fill_box"))
     wants_can = any(cfg[name]["interface"] == "can" for name in ("av_bay", "fill_box"))
@@ -453,7 +499,7 @@ def set_link_field(cfg: dict, link_name: str, field_name: str, value: str | None
     if value is None:
         return
     key = link_name.replace("-", "_")
-    if field_name in {"baud_rate", "spi_speed_hz", "spi_mode", "spi_bits_per_word", "can_tx_id", "can_rx_id"}:
+    if field_name in {"baud_rate", "spi_speed_hz", "spi_mode", "spi_bits_per_word", "can_tx_id", "can_rx_id", "bus", "addr", "protocol_version"}:
         cfg[key][field_name] = int(value, 0)
     else:
         cfg[key][field_name] = value
@@ -474,6 +520,9 @@ def apply_cli_overrides(cfg: dict, args: argparse.Namespace) -> dict:
         set_link_field(cfg, key, "spi_bits_per_word", getattr(args, f"{prefix.replace('-', '_')}_spi_bits"))
         set_link_field(cfg, key, "can_tx_id", getattr(args, f"{prefix.replace('-', '_')}_can_tx_id"))
         set_link_field(cfg, key, "can_rx_id", getattr(args, f"{prefix.replace('-', '_')}_can_rx_id"))
+        for field, suffix in {"mode":"tcp_mode", "address":"tcp_address", "allowed_peer":"allowed_peer",
+                              "bus":"i2c_bus", "addr":"i2c_addr", "protocol_version":"i2c_protocol_version"}.items():
+            set_link_field(cfg, key, field, getattr(args, f"{prefix.replace('-', '_')}_{suffix}", None))
     return validate_config(cfg)
 
 
@@ -508,6 +557,15 @@ def configure_link_tui(link_label: str, link_key: str, cfg: dict, env: Environme
         current["interface"],
     )
     current["interface"] = interface_name
+    if interface_name == "pico_fi_tcp":
+        current["mode"] = prompt_choice("TCP mode", ["client", "server"], current["mode"])
+        current["address"] = prompt("TCP IP:port", current["address"])
+        current["allowed_peer"] = prompt("Allowed Pico IP (server)", current.get("allowed_peer") or "") or None
+        return
+    if interface_name == "i2c":
+        for field in ["bus", "addr", "protocol_version"]:
+            current[field] = parse_int(prompt(f"I2C {field}", str(current[field])), field)
+        return
     candidates = interface_candidates(interface_name, env)
     if candidates:
         print(f"{link_label} detected candidates: {', '.join(candidates)}")
@@ -561,6 +619,8 @@ if TK_AVAILABLE:
         can_tx_var: tk.StringVar
         can_rx_var: tk.StringVar
         port_combo: ttk.Combobox
+        extra_vars: dict[str, tk.StringVar]
+        extra_frames: dict[str, ttk.Frame]
 
 
     class RadioConfigGui(tk.Tk):
@@ -626,6 +686,7 @@ if TK_AVAILABLE:
                 can_tx_var=tk.StringVar(value=hex(cfg["can_tx_id"])),
                 can_rx_var=tk.StringVar(value=hex(cfg["can_rx_id"])),
                 port_combo=ttk.Combobox(parent),
+                extra_vars={}, extra_frames={},
             )
             ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=6)
             interface_combo = ttk.Combobox(parent, textvariable=widgets.interface_var, values=INTERFACE_OPTIONS,
@@ -643,6 +704,25 @@ if TK_AVAILABLE:
             ttk.Entry(parent, textvariable=widgets.can_tx_var).grid(row=row, column=7, sticky="ew", padx=(0, 8), pady=6)
             ttk.Entry(parent, textvariable=widgets.can_rx_var).grid(row=row, column=8, sticky="ew", pady=6)
             self.link_widgets[key] = widgets
+            groups = {
+                "pico_fi_tcp": [("mode", "TCP mode"), ("address", "IP:port"), ("allowed_peer", "Allowed Pico IP")],
+                "i2c": [("bus", "Bus"), ("addr", "Address"), ("protocol_version", "Protocol (1 or 2)")],
+            }
+            for interface, fields in groups.items():
+                extra = ttk.LabelFrame(parent, text=f"{label} {interface}", padding=8)
+                extra.grid(row=4+row, column=0, columnspan=9, sticky="ew")
+                widgets.extra_frames[interface] = extra
+                for index, (field, title) in enumerate(fields):
+                    variable = tk.StringVar(value=str(cfg[field]) if cfg.get(field) is not None else "")
+                    widgets.extra_vars[field] = variable
+                    ttk.Label(extra, text=title).grid(row=0, column=index*2, padx=6)
+                    if field == "mode":
+                        control = ttk.Combobox(extra, textvariable=variable, values=["client", "server"], state="readonly")
+                    else:
+                        control = ttk.Entry(extra, textvariable=variable)
+                    control.grid(row=0, column=index*2+1, sticky="ew", padx=6)
+                    extra.columnconfigure(index*2+1, weight=1)
+                    variable.trace_add("write", lambda *_args: self._refresh_help())
             interface_combo.bind("<<ComboboxSelected>>", lambda _event, name=key: self._sync_port_options(name))
             for variable in (
                     widgets.interface_var,
@@ -684,6 +764,9 @@ if TK_AVAILABLE:
 
         def _sync_port_options(self, key: str) -> None:
             widgets = self.link_widgets[key]
+            for interface, frame in widgets.extra_frames.items():
+                if widgets.interface_var.get() == interface: frame.grid()
+                else: frame.grid_remove()
             candidates = interface_candidates(widgets.interface_var.get(), self.env)
             widgets.port_combo["values"] = candidates
             if not widgets.port_var.get() and candidates:
@@ -703,6 +786,8 @@ if TK_AVAILABLE:
                     "can_tx_id": parse_int(widgets.can_tx_var.get(), f"{key} can_tx_id"),
                     "can_rx_id": parse_int(widgets.can_rx_var.get(), f"{key} can_rx_id"),
                 }
+                for field, variable in widgets.extra_vars.items():
+                    set_link_field(cfg, key, field, variable.get())
             return validate_config(cfg)
 
         def _save(self) -> None:
@@ -720,6 +805,8 @@ if TK_AVAILABLE:
             messagebox.showinfo("Saved", f"Saved {self.config_path}")
 
         def _refresh_help(self) -> None:
+            if not hasattr(self, "help_text"):
+                return
             cfg = self._collect_config_safe()
             detected_text = (
                     "Serial: " + ", ".join(self.env.serial_ports) + "\n"

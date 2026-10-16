@@ -622,17 +622,17 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         TelemetryCommand::RewindFlightState => "RewindFlightState",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::AbortAfter15 => "AbortAfter15",
+        TelemetryCommand::AbortAfter100 => "AbortAfter100",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter40 => "AbortAfter40",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::AbortAfter70 => "AbortAfter70",
+        TelemetryCommand::AbortAfter250 => "AbortAfter250",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter12 => "ReinitAfter12",
+        TelemetryCommand::ReinitAfter15 => "ReinitAfter15",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter26 => "ReinitAfter26",
+        TelemetryCommand::ReinitAfter30 => "ReinitAfter30",
         #[cfg(feature = "hitl_mode")]
-        TelemetryCommand::ReinitAfter44 => "ReinitAfter44",
+        TelemetryCommand::ReinitAfter50 => "ReinitAfter50",
     }
 }
 
@@ -717,12 +717,12 @@ pub fn all_command_names() -> Vec<&'static str> {
         "DisableIMU",
         "AdvanceFlightState",
         "RewindFlightState",
-        "AbortAfter15",
+        "AbortAfter100",
         "AbortAfter40",
-        "AbortAfter70",
-        "ReinitAfter12",
-        "ReinitAfter26",
-        "ReinitAfter44",
+        "AbortAfter250",
+        "ReinitAfter15",
+        "ReinitAfter30",
+        "ReinitAfter50",
     ]
 }
 

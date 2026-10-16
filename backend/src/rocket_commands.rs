@@ -26,6 +26,11 @@ pub enum FlightComputerCommands {
     #[cfg(feature = "hitl_mode")]
     RewindFlightState = 22,
     AbortAfter40 = 23,
+    AbortAfter100 = 24,
+    AbortAfter250 = 25,
+    ReinitAfter15 = 26,
+    ReinitAfter30 = 27,
+    ReinitAfter50 = 28,
 }
 
 #[repr(u8)]

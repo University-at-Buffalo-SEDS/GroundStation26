@@ -14,6 +14,7 @@ RUN set -e; \
         curl \
         libudev-dev \
         pkg-config \
+        cmake \
         xz-utils; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 

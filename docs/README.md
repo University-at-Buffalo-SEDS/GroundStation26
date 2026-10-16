@@ -37,3 +37,9 @@ independently.
 3. Read the frontend or backend architecture doc depending on which side you are changing.
 4. Use `docs/frontend/api.md` when changing HTTP or WebSocket behavior.
 5. Use `docs/backend/i2c.md` when changing the Linux-to-Pico I2C transport.
+
+- [Application administration](application-administration.md): account roles, permissions and session revocation.
+- [Optional RRLS radio voice](rrls-radio-voice.md): opt-in push-to-talk and radio budget.
+- [Pico-Fi over Ethernet](picofi-ethernet.md): TCP client/server setup.
+
+- [Flight command controls](flight-command-controls.md): threshold meanings and custom-layout migration.

@@ -74,17 +74,17 @@ pub enum TelemetryCommand {
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     RewindFlightState,
     #[cfg(feature = "hitl_mode")]
-    AbortAfter15,
+    AbortAfter100,
     #[cfg(feature = "hitl_mode")]
     AbortAfter40,
     #[cfg(feature = "hitl_mode")]
-    AbortAfter70,
+    AbortAfter250,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter12,
+    ReinitAfter15,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter26,
+    ReinitAfter30,
     #[cfg(feature = "hitl_mode")]
-    ReinitAfter44,
+    ReinitAfter50,
     StartFill,
     PauseFill,
     CancelFill,

@@ -531,6 +531,46 @@ fn allowed_from_policy(state: &AppState, policy: &ActionPolicyMsg) -> AllowedAct
     }
 }
 
+/// Read-only mirror of the same mapping and LED calculation used by the panel.
+/// Brightness describes the requested output, not electrical lamp feedback.
+pub(crate) fn panel_indicators(state: &AppState) -> serde_json::Value {
+    let policy = state.action_policy_snapshot();
+    let now = crate::telemetry_task::get_current_timestamp_ms();
+    let rows: Vec<_> = [
+        ("Pilot", "Pilot"),
+        ("Vent", "NormallyOpen"),
+        ("Dump", "Dump"),
+        ("Nitrogen", "Nitrogen"),
+        ("Nitrous", "Nitrous"),
+        ("QD", "RetractPlumbing"),
+        ("Launch", "Launch"),
+        ("Igniter", "Igniter"),
+        ("Abort", "Abort"),
+    ]
+    .into_iter()
+    .map(|(physical, original)| {
+        let command = crate::gse::panel_name(state, original);
+        let control = policy.controls.iter().find(|c| c.cmd == command);
+        let label = match command.as_str() {
+            "ValveSelfTest" => "Valve test",
+            "NitrogenTest" => "Nitrogen test",
+            "StartFill" => "Start fill",
+            "PauseFill" => "Pause fill",
+            "CancelFill" => "Cancel fill",
+            "RetractPlumbing" => "QD retract",
+            _ => physical,
+        };
+        serde_json::json!({"physical":physical,"action":label,"command":command,
+            "enabled":control.is_some_and(|c|c.enabled),
+            "actuated":control.and_then(|c|c.actuated),
+            "blink":control.map(|c|&c.blink),
+            "brightness":led_for(state,&policy,original,now)})
+    })
+    .collect();
+    serde_json::json!({"key_enabled":policy.key_enabled,
+        "software_buttons_enabled":policy.software_buttons_enabled,"controls":rows})
+}
+
 fn led_for(state: &AppState, policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -> f64 {
     let mapped = crate::gse::panel_name(state, cmd);
     let cmd = mapped.as_str();
@@ -708,5 +748,41 @@ fn set_binary_output(
     last_levels.insert(pin, next);
     if let Err(e) = gpio.write_output_pin(pin, enabled) {
         eprintln!("GPIO output pin {pin} write failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn panel_mirror_tracks_grouped_and_manual_button_meanings() {
+        let state = crate::state::tests::test_app_state().await;
+        for (grouped, expected) in [
+            (
+                true,
+                [
+                    "ValveSelfTest",
+                    "PauseFill",
+                    "CancelFill",
+                    "NitrogenTest",
+                    "StartFill",
+                ],
+            ),
+            (
+                false,
+                ["Pilot", "NormallyOpen", "Dump", "Nitrogen", "Nitrous"],
+            ),
+        ] {
+            state.gse.lock().unwrap().engine.config.grouped_panel = grouped;
+            let value = panel_indicators(&state);
+            let controls = value["controls"].as_array().unwrap();
+            assert_eq!(controls.len(), 9);
+            for (control, command) in controls.iter().take(5).zip(expected) {
+                assert_eq!(control["command"], command);
+                assert!((0.0..=1.0).contains(&control["brightness"].as_f64().unwrap()));
+            }
+            assert_eq!(controls[5]["action"], "QD retract");
+            assert_eq!(controls[8]["command"], "Abort");
+        }
     }
 }

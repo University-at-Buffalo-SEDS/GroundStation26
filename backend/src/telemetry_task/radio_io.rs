@@ -15,6 +15,66 @@ use super::{
     process_router_queues, timesync_enabled,
 };
 
+// Managed values retain their application type on wire but use discovery's
+// scheduling priority (254). Only self-contained application frames can safely
+// bypass the schema FIFO. This is a host transport tag, not a wire/API change.
+fn radio_transport_priority(priority: u8, payload: &[u8]) -> u8 {
+    if priority == 254
+        && !payload.starts_with(b"SDT")
+        && serialize::peek_frame_info_unchecked(payload)
+            .is_ok_and(|info| !sedsnet::discovery::is_discovery_type(info.envelope.ty))
+    {
+        255
+    } else {
+        priority
+    }
+}
+
+// Only delivery/application controls may consume the reserved command bytes.
+// Discovery's priority-255 address/topology snapshots must not exhaust them.
+fn uses_command_reserve(priority: u8, payload: &[u8]) -> bool {
+    priority >= 200
+        && priority != 254
+        && !payload.starts_with(b"SDT")
+        && !serialize::peek_frame_info_unchecked(payload)
+            .is_ok_and(|info| sedsnet::discovery::is_discovery_type(info.envelope.ty))
+}
+
+// A linked simulator runs MCU UARTs and modem budgets in virtual time. Using
+// host wall time for this one pacer floods the simulated radio when emulation
+// slows down, creating artificial receive backlogs and ACK latency. Normal
+// GroundStation operation continues to use Instant, including ordinary HITL.
+#[derive(Clone, Copy)]
+struct TxDeadline {
+    wall: std::time::Instant,
+    simulated_ms: Option<u64>,
+}
+impl TxDeadline {
+    fn now() -> Self {
+        Self {
+            wall: std::time::Instant::now(),
+            simulated_ms: crate::simulation_clock_ms(),
+        }
+    }
+    fn after(self, delay: Duration) -> Self {
+        Self {
+            wall: self.wall + delay,
+            simulated_ms: self
+                .simulated_ms
+                .map(|now| now.saturating_add(delay.as_millis() as u64)),
+        }
+    }
+    fn ready_at(self, wall: std::time::Instant, simulated_ms: Option<u64>) -> bool {
+        match (self.simulated_ms, simulated_ms) {
+            (Some(deadline), Some(now)) => now >= deadline,
+            _ => wall >= self.wall,
+        }
+    }
+    fn ready(self) -> bool {
+        self.ready_at(std::time::Instant::now(), crate::simulation_clock_ms())
+    }
+}
+
 /// Bounds accepted bytes until the generic worker finishes the physical write.
 /// The router retains ownership of frames rejected with backpressure.
 pub struct TxQueueBudget {
@@ -38,6 +98,7 @@ impl TxQueueBudget {
         priority: u8,
         payload: &[u8],
     ) -> sedsnet::TelemetryResult<()> {
+        let priority = radio_transport_priority(priority, payload);
         // Side callbacks receive schema chunks individually. Once the first
         // chunk is admitted, finish that transfer even when it crosses the
         // normal queue target; otherwise every retry can stall at chunk two.
@@ -45,7 +106,10 @@ impl TxQueueBudget {
         let continuation = if payload.starts_with(b"SDT\x03") && payload.len() >= 16 {
             let index = u16::from_le_bytes([payload[8], payload[9]]) as usize;
             let total = u16::from_le_bytes([payload[10], payload[11]]) as usize;
-            if total == 0 || total > 64 || index >= total || payload.len() > 1024 {
+            // Smaller airtime chunks must not reduce the existing 64 KiB
+            // byte allowance for a dynamic schema. Keep a separate bounded
+            // frame count; the aggregate byte ceiling below still applies.
+            if total == 0 || total > 512 || index >= total || payload.len() > 1024 {
                 return Err(sedsnet::TelemetryError::HandlerError(
                     "radio chunk transfer exceeds budget",
                 ));
@@ -57,7 +121,7 @@ impl TxQueueBudget {
         // Discovery uses priority 254. ACKs (255) and board commands have
         // their own bounded allowance, even while accepted schema chunks
         // exceed the ordinary target. Ownership still lasts until the write.
-        let control = priority >= 200 && priority != 254;
+        let control = uses_command_reserve(priority, payload);
         if control {
             self.pending_control
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
@@ -89,17 +153,27 @@ impl TxQueueBudget {
             return Err(error);
         }
         if sender.send((priority, payload.to_vec())).is_err() {
-            self.complete(priority, payload.len());
+            self.complete(priority, &payload);
             return Err(sedsnet::TelemetryError::HandlerError(
                 "radio tx queue closed",
             ));
         }
+        if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
+            log::info!(
+                "full-bay transport admitted sim={:?} priority={} len={} type={:?}",
+                crate::simulation_clock_ms(),
+                priority,
+                payload.len(),
+                serialize::peek_frame_info_unchecked(payload).map(|info| info.envelope.ty)
+            );
+        }
         Ok(())
     }
 
-    fn complete(&self, priority: u8, len: usize) {
+    fn complete(&self, priority: u8, payload: &[u8]) {
+        let len = payload.len();
         self.pending.fetch_sub(len, Ordering::AcqRel);
-        if priority >= 200 && priority != 254 {
+        if uses_command_reserve(priority, payload) {
             self.pending_control.fetch_sub(len, Ordering::AcqRel);
         }
     }
@@ -162,10 +236,13 @@ fn backlog_pop(backlog: &mut PriorityBacklog, control_bytes: &mut usize) -> Opti
     payload.map(|payload| (priority, payload))
 }
 
-// Stateful side-transport frames must retain callback order. The router has
-// already selected logical packet priority before encoding template/chunk frames.
+// Stateful side-transport frames retain callback order. Self-contained control
+// packets can bypass that stream: they neither install nor reference templates.
 struct WireBacklog {
     ordered: VecDeque<(u8, Vec<u8>)>,
+    routing: VecDeque<(u8, Vec<u8>)>,
+    ordered_metadata_next: bool,
+    priority_bytes: usize,
     priorities: PriorityBacklog,
     preserve_order: bool,
     control_bytes: usize,
@@ -174,13 +251,34 @@ impl WireBacklog {
     fn new(preserve_order: bool) -> Self {
         Self {
             ordered: VecDeque::new(),
+            routing: VecDeque::new(),
+            ordered_metadata_next: false,
+            priority_bytes: 0,
             priorities: PriorityBacklog::new(),
             preserve_order,
             control_bytes: 0,
         }
     }
     fn push(&mut self, priority: u8, payload: Vec<u8>, front: bool) {
-        if self.preserve_order {
+        let priority = radio_transport_priority(priority, &payload);
+        // These bytes come from the local router callback. SDT envelopes may
+        // depend on earlier dictionary/chunk frames; canonical controls do not.
+        let independent_control = priority >= 16 && priority != 254 && !payload.starts_with(b"SDT");
+        // Route advertisements and application controls both carry priority
+        // 255. A FIFO in that band put a newly requested state change behind
+        // seconds of startup advertisements. Preserve every accepted route
+        // update, but service it separately from independent commands/ACKs.
+        let routing = priority == 255
+            && !payload.starts_with(b"SDT")
+            && serialize::peek_frame_info_unchecked(&payload)
+                .is_ok_and(|info| sedsnet::discovery::is_discovery_type(info.envelope.ty));
+        if self.preserve_order && routing {
+            if front {
+                self.routing.push_front((priority, payload));
+            } else {
+                self.routing.push_back((priority, payload));
+            }
+        } else if self.preserve_order && !independent_control {
             if front {
                 self.ordered.push_front((priority, payload));
             } else {
@@ -192,7 +290,28 @@ impl WireBacklog {
     }
     fn pop(&mut self) -> Option<(u8, Vec<u8>)> {
         if self.preserve_order {
-            self.ordered.pop_front()
+            // Bound control bursts so schema/bootstrap still makes progress.
+            if !self.priorities.is_empty()
+                && (self.control_bytes < MAX_CONTROL_BYTES
+                    || (self.ordered.is_empty() && self.routing.is_empty()))
+            {
+                let packet = backlog_pop(&mut self.priorities, &mut self.priority_bytes);
+                self.control_bytes = self
+                    .control_bytes
+                    .saturating_add(packet.as_ref().map_or(0, |(_, payload)| payload.len()));
+                return packet;
+            }
+            self.control_bytes = 0;
+            // Alternate route repair and the stateful schema stream. Neither
+            // may starve even under a sustained independent-control workload.
+            if !self.routing.is_empty() && (self.ordered.is_empty() || !self.ordered_metadata_next)
+            {
+                self.ordered_metadata_next = true;
+                self.routing.pop_front()
+            } else {
+                self.ordered_metadata_next = false;
+                self.ordered.pop_front()
+            }
         } else {
             backlog_pop(&mut self.priorities, &mut self.control_bytes)
         }
@@ -300,6 +419,213 @@ mod priority_tests {
     }
 
     #[test]
+    fn canonical_variable_update_bypasses_schema_backlog_without_reordering_templates() {
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+            &[crate::telemetry_schema::endpoint("AV_BAY_UNDERGLOW_OWNER")],
+            "GS",
+            123,
+            Arc::from([1_u8]),
+        )
+        .unwrap();
+        let control = serialize::pack_packet(&packet).to_vec();
+        let mut backlog = WireBacklog::new(true);
+        // At a conservative 25 ms/frame, 60 queued schema frames previously
+        // delayed a one-byte state change by 1.5 seconds.
+        let frames: Vec<_> = (0_u8..60)
+            .map(|index| vec![b'S', b'D', b'T', 3, index])
+            .collect();
+        for frame in &frames {
+            backlog.push(254, frame.clone(), false);
+        }
+        backlog.push(16, control.clone(), false);
+        assert_eq!(backlog.pop(), Some((16, control.clone())));
+        // A failed write must retry the complete canonical packet.
+        backlog.push(16, control.clone(), true);
+        assert_eq!(backlog.pop(), Some((16, control)));
+        for expected in frames {
+            assert_eq!(backlog.pop(), Some((254, expected)));
+        }
+        assert!(backlog.pop().is_none());
+    }
+
+    #[test]
+    fn actual_managed_variable_update_is_independent_of_queued_templates() {
+        use sedsnet::router::{NetworkVariablePermissions, RouterConfig, RouterSideOptions};
+        crate::telemetry_schema::initialize().unwrap();
+        let source = Arc::new(Router::new_with_clock(
+            RouterConfig::new([]).with_sender("GS"),
+            Box::new(|| 0),
+        ));
+        let peer = Router::new_with_clock(RouterConfig::new([]).with_sender("RF"), Box::new(|| 0));
+        let ty = crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW");
+        source
+            .enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
+            .unwrap();
+        peer.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+            .unwrap();
+        let frames = Arc::new(Mutex::new(Vec::<(u8, Vec<u8>)>::new()));
+        let captured = frames.clone();
+        source.add_side_packed_with_priority_and_options(
+            "radio",
+            move |bytes, priority| {
+                captured.lock().unwrap().push((priority, bytes.to_vec()));
+                Ok(())
+            },
+            RouterSideOptions::default().with_small_packet_transport(1024),
+        );
+        let destination = source.clone();
+        peer.add_side_packet("ground", move |packet| destination.rx_from_side(packet, 0));
+        peer.announce_discovery().unwrap();
+        peer.process_all_queues_with_timeout(0).unwrap();
+        source.process_all_queues_with_timeout(0).unwrap();
+        frames.lock().unwrap().clear();
+        source
+            .set_network_variable(
+                Packet::new(
+                    ty,
+                    &[crate::telemetry_schema::endpoint("AV_BAY_UNDERGLOW_OWNER")],
+                    "GS",
+                    123,
+                    Arc::from([1_u8]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        source.process_all_queues_with_timeout(0).unwrap();
+        let (priority, control) = frames
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, bytes)| {
+                serialize::unpack_packet(bytes).is_ok_and(|packet| packet.data_type() == ty)
+            })
+            .cloned()
+            .expect("Actual managed-variable update must be self-contained on the radio side");
+        assert_eq!(
+            priority,
+            sedsnet::transport_priority(sedsnet::config::DataType::ManagedVariableValue)
+        );
+        let scheduled_priority = radio_transport_priority(priority, &control);
+        assert_eq!(scheduled_priority, 255);
+        // A full schema allowance cannot reject a small application update.
+        let budget = TxQueueBudget::new(2048);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        budget.try_send(&tx, 254, &[0; 2048]).unwrap();
+        budget.try_send(&tx, priority, &control).unwrap();
+        let (metadata_priority, metadata) = rx.try_recv().unwrap();
+        let (app_priority, application) = rx.try_recv().unwrap();
+        assert_eq!(app_priority, 255);
+        budget.complete(app_priority, &application);
+        budget.complete(metadata_priority, &metadata);
+        assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        let mut backlog = WireBacklog::new(true);
+        backlog.push(254, b"SDT\x03pending-schema".to_vec(), false);
+        backlog.push(priority, control.clone(), false);
+        assert_eq!(backlog.pop(), Some((scheduled_priority, control)));
+        assert_eq!(backlog.pop().unwrap().1, b"SDT\x03pending-schema");
+    }
+
+    #[test]
+    fn startup_route_backlog_cannot_delay_independent_managed_controls() {
+        crate::telemetry_schema::initialize().unwrap();
+        let route = serialize::pack_packet(
+            &Packet::new(
+                sedsnet::config::DataType::DiscoveryAnnounce,
+                &[sedsnet::config::DataEndpoint::TelemetryError],
+                "GS",
+                1,
+                Arc::from([]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        let control = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+                &[crate::telemetry_schema::endpoint("AV_BAY_UNDERGLOW_OWNER")],
+                "GS",
+                2,
+                Arc::from([1_u8]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        let budget = TxQueueBudget::new(route.len() * 4);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for _ in 0..4 {
+            budget.try_send(&tx, 255, &route).unwrap();
+        }
+        assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
+        budget.try_send(&tx, 254, &control).unwrap();
+        while let Ok((priority, payload)) = rx.try_recv() {
+            budget.complete(priority, &payload);
+        }
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
+        let mut backlog = WireBacklog::new(true);
+        for _ in 0..32 {
+            backlog.push(255, route.clone(), false);
+        }
+        backlog.push(254, b"SDT\x03schema-first".to_vec(), false);
+        backlog.push(254, b"SDT\x03schema-second".to_vec(), false);
+        backlog.push(254, control.clone(), false);
+        assert_eq!(backlog.pop(), Some((255, control)));
+        // Accepted route updates are retained, and schema order is unchanged.
+        assert_eq!(backlog.pop(), Some((255, route.clone())));
+        assert_eq!(backlog.pop().unwrap().1, b"SDT\x03schema-first");
+        assert_eq!(backlog.pop(), Some((255, route.clone())));
+        assert_eq!(backlog.pop().unwrap().1, b"SDT\x03schema-second");
+        for _ in 0..30 {
+            assert_eq!(backlog.pop(), Some((255, route.clone())));
+        }
+        assert!(backlog.pop().is_none());
+    }
+
+    #[test]
+    fn ack_flood_yields_to_commands_as_well_as_both_metadata_streams() {
+        let mut backlog = WireBacklog::new(true);
+        backlog.push(254, b"SDT\x03schema".to_vec(), false);
+        for _ in 0..100 {
+            backlog.push(255, vec![0; 128], false);
+        }
+        backlog.push(200, vec![42], false);
+        let mut command_seen = false;
+        let mut schema_seen = false;
+        for _ in 0..(MAX_CONTROL_BYTES / 128 + 3) {
+            let (priority, payload) = backlog.pop().unwrap();
+            command_seen |= priority == 200 && payload == [42];
+            schema_seen |= payload == b"SDT\x03schema";
+        }
+        assert!(command_seen, "ACKs must not starve lower-priority commands");
+        assert!(
+            schema_seen,
+            "independent controls must yield to the schema stream"
+        );
+    }
+
+    #[test]
+    fn continuous_canonical_controls_cannot_starve_the_stateful_stream() {
+        let mut backlog = WireBacklog::new(true);
+        backlog.push(254, b"SDT\x03schema".to_vec(), false);
+        for _ in 0..100 {
+            backlog.push(16, vec![0; 128], false);
+        }
+        let mut controls = 0;
+        loop {
+            let (priority, _) = backlog.pop().unwrap();
+            if priority == 254 {
+                break;
+            }
+            controls += 1;
+            assert!(controls <= MAX_CONTROL_BYTES / 128);
+        }
+        assert_eq!(controls, MAX_CONTROL_BYTES / 128);
+    }
+
+    #[test]
     fn radio_budget_stays_charged_until_write_completion() {
         let budget = TxQueueBudget::new(2048);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -312,57 +638,72 @@ mod priority_tests {
         ));
         // Moving to a worker backlog or retrying a failed write frees nothing.
         assert_eq!(budget.pending.load(Ordering::Acquire), 2048);
-        budget.complete(priority, first.len());
+        budget.complete(priority, &first);
         budget.try_send(&tx, 0, &[2; 32]).unwrap();
         assert_eq!(budget.pending.load(Ordering::Acquire), 1056);
     }
 
     #[test]
     fn radio_backpressure_retains_update_until_transport_drains() {
-        use sedsnet::config::{register_data_type_with_description, register_endpoint_with_description};
+        use sedsnet::config::{
+            register_data_type_with_description, register_endpoint_with_description,
+        };
         use sedsnet::{MessageClass, MessageDataType, MessageElement, ReliableMode};
-        let endpoint = register_endpoint_with_description("RADIO_BACKPRESSURE_SINK", "", false).unwrap();
-        let ty = register_data_type_with_description("RADIO_BACKPRESSURE_VALUE", "",
+        let endpoint =
+            register_endpoint_with_description("RADIO_BACKPRESSURE_SINK", "", false).unwrap();
+        let ty = register_data_type_with_description(
+            "RADIO_BACKPRESSURE_VALUE",
+            "",
             MessageElement::Static(2, MessageDataType::UInt8, MessageClass::Data),
-            &[endpoint], ReliableMode::None, 200).unwrap();
+            &[endpoint],
+            ReliableMode::None,
+            200,
+        )
+        .unwrap();
         use sedsnet::router::{RouterConfig, RouterSideOptions};
         let budget = Arc::new(TxQueueBudget::new(2048));
         let (tx, mut rx) = mpsc::unbounded_channel();
         budget.try_send(&tx, 0, &[0; 2048]).unwrap();
         let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let tick = clock.clone();
-        let router = Router::new_with_clock(RouterConfig::default(),
-            Box::new(move || tick.load(Ordering::Acquire)));
+        let router = Router::new_with_clock(
+            RouterConfig::default(),
+            Box::new(move || tick.load(Ordering::Acquire)),
+        );
         let callback_budget = budget.clone();
         let side = router.add_side_packed_with_options(
             "busy",
-            move |frame| callback_budget.try_send(&tx, 254, frame),
+            // Exercise ordinary best-effort backpressure here; actual managed
+            // updates have their protected reserve checked above.
+            move |frame| callback_budget.try_send(&tx, 0, frame),
             RouterSideOptions::default(),
         );
         // Discovery snapshots are regenerable/coalesced control state. Use an
         // application frame to verify the transport's accepted-update contract.
-        router.rx_from_side(&sedsnet::discovery::build_discovery_announce(
-            "RADIO_BACKPRESSURE_PEER", 0, &[endpoint]).unwrap(), side).unwrap();
-        let packet = Packet::new(
-            ty,
-            &[endpoint],
-            "GS",
-            1,
-            Arc::from([10u8, 11u8]),
-        )
-        .unwrap();
+        router
+            .rx_from_side(
+                &sedsnet::discovery::build_discovery_announce(
+                    "RADIO_BACKPRESSURE_PEER",
+                    0,
+                    &[endpoint],
+                )
+                .unwrap(),
+                side,
+            )
+            .unwrap();
+        let packet = Packet::new(ty, &[endpoint], "GS", 1, Arc::from([10u8, 11u8])).unwrap();
         router.tx(packet.clone()).unwrap();
         let (priority, filler) = rx.try_recv().unwrap();
         assert_eq!(filler.len(), 2048);
         assert!(rx.try_recv().is_err());
-        budget.complete(priority, filler.len());
+        budget.complete(priority, &filler);
         // Temporary refusals retry on the next millisecond instead of spinning
         // repeatedly on a transport that has just reported itself full.
         clock.store(1, Ordering::Release);
         router.process_tx_queue().unwrap();
         let mut found = false;
         while let Ok((priority, bytes)) = rx.try_recv() {
-            budget.complete(priority, bytes.len());
+            budget.complete(priority, &bytes);
             if let Ok(decoded) = serialize::unpack_packet(&bytes) {
                 // Sender names may resolve to a numeric address until discovery.
                 // The wire receipt identity must survive that normalization.
@@ -394,7 +735,7 @@ mod priority_tests {
         assert_eq!(budget.pending_control.load(Ordering::Acquire), 64);
         assert!(budget.try_send(&tx, 255, &[0; 2048]).is_err());
         while let Ok((priority, payload)) = rx.try_recv() {
-            budget.complete(priority, payload.len());
+            budget.complete(priority, &payload);
         }
         assert_eq!(budget.pending.load(Ordering::Acquire), 0);
         assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
@@ -402,6 +743,25 @@ mod priority_tests {
         assert!(budget.try_send(&tx, 255, &[0; 32]).is_err());
         assert_eq!(budget.pending.load(Ordering::Acquire), 0);
         assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn short_schema_chunks_keep_the_existing_byte_budget() {
+        let budget = TxQueueBudget::new(2048);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for index in 0u16..200 {
+            let mut chunk = vec![0; 256];
+            chunk[..4].copy_from_slice(b"SDT\x03");
+            chunk[8..10].copy_from_slice(&index.to_le_bytes());
+            chunk[10..12].copy_from_slice(&200u16.to_le_bytes());
+            budget.try_send(&tx, 254, &chunk).unwrap();
+        }
+        budget.try_send(&tx, 255, &[1; 32]).unwrap();
+        assert_eq!(budget.pending.load(Ordering::Acquire), 51_232);
+        while let Ok((priority, payload)) = rx.try_recv() {
+            budget.complete(priority, &payload);
+        }
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -443,7 +803,7 @@ mod priority_tests {
         assert!(budget.try_send(&tx, 0, &[0; 100]).is_err());
         let mut frames = 0;
         while let Ok((priority, payload)) = rx.try_recv() {
-            budget.complete(priority, payload.len());
+            budget.complete(priority, &payload);
             frames += 1;
         }
         assert_eq!(frames, 4);
@@ -549,8 +909,10 @@ pub(super) fn spawn_comms_worker_threads(
             let mut comms_shutdown_rx = tx_worker_state.shutdown_subscribe();
             let mut last_send_error_log_ms = 0;
             let mut suppressed_send_errors = 0;
-            let mut next_tx_allowed_at = std::time::Instant::now();
-            let mut backlog = WireBacklog::new(worker_name == "rocket_comms");
+            let mut next_tx_allowed_at = TxDeadline::now();
+            // Pico-Fi and radio sides both use stateful SDT dictionaries.
+            // Preserve their relative order on every generic packed link.
+            let mut backlog = WireBacklog::new(true);
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -559,9 +921,8 @@ pub(super) fn spawn_comms_worker_threads(
                     Err(broadcast::error::TryRecvError::Empty) => {}
                 }
 
-                let now = std::time::Instant::now();
-                if now < next_tx_allowed_at {
-                    thread::sleep(next_tx_allowed_at.saturating_duration_since(now).min(Duration::from_millis(1)));
+                if !next_tx_allowed_at.ready() {
+                    thread::sleep(Duration::from_millis(1));
                     continue;
                 }
 
@@ -581,11 +942,14 @@ pub(super) fn spawn_comms_worker_threads(
                         break;
                     };
                     let mut comms = tx_worker_comms.lock().expect("failed to get lock");
-                    let send_started_at = std::time::Instant::now();
+                    let send_started_at = TxDeadline::now();
+                    if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
+                        log::info!("full-bay transport selected side={worker_name} sim={:?} priority={priority} len={} type={:?}", crate::simulation_clock_ms(), payload.len(), serialize::peek_frame_info_unchecked(&payload).map(|info| info.envelope.ty));
+                    }
                     match comms.send_data(&payload) {
                         Ok(()) => {
                             if let Some(budget) = &comms_handle.tx_budget {
-                                budget.complete(priority, payload.len());
+                                budget.complete(priority, &payload);
                             }
                             sent_any = true;
                             log_link_control_send(worker_name, &payload);
@@ -599,7 +963,7 @@ pub(super) fn spawn_comms_worker_threads(
                             }
                             if worker_name == "rocket_comms" {
                                 // UART drain does not drain the RFD modem's air FIFO.
-                                next_tx_allowed_at = send_started_at + radio_air_time_for_payload(payload.len());
+                                next_tx_allowed_at = send_started_at.after(radio_air_time_for_payload(payload.len()));
                                 break;
                             }
                         }
@@ -608,8 +972,7 @@ pub(super) fn spawn_comms_worker_threads(
                             // Pico-Fi. Preserve queue ordering and retry the
                             // entire logical packet from a new START slot.
                             backlog.push(priority, payload, true);
-                            next_tx_allowed_at = std::time::Instant::now()
-                                + Duration::from_millis(COMMS_TX_GAP_MS);
+                            next_tx_allowed_at = TxDeadline::now().after(Duration::from_millis(COMMS_TX_GAP_MS));
                             log_repeated_worker_error(
                                 &format!("{worker_name} comms worker send_data failed"),
                                 &e.to_string(),
@@ -624,7 +987,7 @@ pub(super) fn spawn_comms_worker_threads(
                     // Only the RFD modem needs an over-air budget. The Pico
                     // path can keep draining at its device transport rate.
                     if worker_name != "rocket_comms" {
-                        next_tx_allowed_at = std::time::Instant::now();
+                        next_tx_allowed_at = TxDeadline::now();
                     }
                     thread::yield_now();
                 } else {
@@ -1441,7 +1804,15 @@ fn radio_air_budget(
 fn radio_air_time_for_payload(payload_len: usize) -> Duration {
     // Each end may consume 40% of the shared half-duplex link. Keep packets in
     // the bounded priority queue rather than flooding the modem without CTS.
-    let share = env_usize("GS_RADIO_AIR_SHARE_PERCENT", 40, 1, 100) as u64;
+    // With optional RRLS voice, two hosts may share the radio with RF.
+    // 25% + 25% + RF's 40% leaves 10% for additional modem overhead.
+    let voice_enabled = std::env::var("GS_RRLS_VOICE").as_deref() == Ok("1");
+    let share = env_usize(
+        "GS_RADIO_AIR_SHARE_PERCENT",
+        if voice_enabled { 25 } else { 40 },
+        1,
+        100,
+    ) as u64;
     radio_air_budget(
         payload_len,
         radio_air_bit_rate_bps(),
@@ -1465,10 +1836,40 @@ mod rfd_air_budget_tests {
             Duration::from_millis(327)
         );
         assert_eq!(
+            radio_air_budget(256, 64_000, 40, 16),
+            Duration::from_millis(87)
+        );
+        assert_eq!(
             radio_air_budget(100, 64_000, 80, 16),
             Duration::from_millis(19)
         );
         assert!(radio_air_budget(usize::MAX, 0, 0, 128).as_millis() > 0);
+    }
+    #[test]
+    fn voice_frame_fits_a_quarter_share_without_using_the_rocket_reservation() {
+        assert_eq!(
+            radio_air_budget(79, 64_000, 25, 16),
+            Duration::from_millis(50)
+        );
+        assert!(radio_air_budget(79, 64_000, 25, 16) < Duration::from_millis(60));
+    }
+    #[test]
+    fn slow_emulation_cannot_spend_virtual_radio_airtime_using_wall_time() {
+        let wall = std::time::Instant::now();
+        let deadline = TxDeadline {
+            wall,
+            simulated_ms: Some(1000),
+        }
+        .after(Duration::from_millis(87));
+        assert!(!deadline.ready_at(wall + Duration::from_secs(10), Some(1086)));
+        assert!(deadline.ready_at(wall, Some(1087)));
+        let real = TxDeadline {
+            wall,
+            simulated_ms: None,
+        }
+        .after(Duration::from_millis(87));
+        assert!(!real.ready_at(wall + Duration::from_millis(86), None));
+        assert!(real.ready_at(wall + Duration::from_millis(87), None));
     }
 }
 
@@ -1547,6 +1948,20 @@ fn log_link_control_send(worker_name: &str, payload: &[u8]) {
     let Ok(pkt) = serialize::unpack_packet(payload) else {
         return;
     };
+    if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some()
+        && ["FLIGHT_STATE", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER"]
+            .iter()
+            .any(|name| pkt.data_type() == crate::telemetry_schema::data_type(name))
+    {
+        log::info!(
+            "full-bay control transport TX side={worker_name} sim={:?} type={:?} source_ms={} packet_id={:#x} owners={:?}",
+            crate::simulation_clock_ms(),
+            pkt.data_type(),
+            pkt.timestamp(),
+            pkt.packet_id(),
+            serialize::peek_envelope(payload).map(|envelope| envelope.target_senders)
+        );
+    }
     if pkt.data_type() != crate::telemetry_schema::data_type("FLIGHT_STATE") {
         return;
     }

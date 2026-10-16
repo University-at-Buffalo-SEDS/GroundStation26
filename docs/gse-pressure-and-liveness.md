@@ -49,3 +49,49 @@ check setup commands, fill prerequisites, waiting for valve confirmations,
 opening nitrous, and closing at the target mass. Frontend unit tests check the
 button command names and WebSocket message payloads. These are software tests,
 not browser-driven clicks or qualification of a physical pressure system.
+
+## Operational qualification and restart
+
+Outside HITL, checkout proceeds in this order: valve self-test, nitrogen test,
+nitrous fill to the saved target, launch eligibility. Completed checks and the
+measured nitrogen baseline are stored atomically in config/gse_qualification.json
+(override with GS_GSE_QUALIFICATION). They survive backend and board restarts.
+A corrupt or unwritable record blocks automation.
+
+Use **Reset operation checks** in Actions to clear them deliberately. The
+backend requires command permission, valve-self-test access, Startup or Idle,
+and no running sequence. Resetting checks does not actuate an output or replay
+a queued launch. Changing pressure-test limits after checkout requires resetting
+the checks first.
+
+Startup configuration waits for fresh pressure, the operating interlock and
+two seconds of stable fill-system routes. Empty checkout closes supplies and
+pilot and opens dump/vent. A previously qualified filled tank is held closed
+after a service restart. Test-fire requires gateway, valve, actuator and DAQ;
+it does not require the absent AV bay.
+
+During nitrogen pressurization all other valves are closed; nitrogen closes
+during settling and hold periods. Nitrous filling opens vent/nitrous and closes
+pilot/dump/nitrogen. Unexpected nitrogen flow during nitrous fill, or nitrous
+flow during nitrogen checkout/filled hold, latches a fault immediately on the
+report rather than waiting for the five-second acknowledgement timeout.
+Steady pilot/dump/vent mismatches request the intended sequence state; supply
+valves are never automatically reopened from an unsolicited report.
+
+Before Launch, connectivity loss during an operation latches an abort. Flight
+launch additionally requires fresh RF rocket GPS, live FC command/return
+routes and fresh closed-valve reports. Retract QD must receive a new positive
+actuator acknowledgement; the five-second settling interval starts at that
+acknowledgement. An early launch click queues once, blinks the T-clock and
+reports the remaining wait. Live prerequisites are checked again before dispatch.
+
+Automatic GroundStation abort/correction stops upon entry to Launch, including
+countdown, as specified by the operating procedure. Manual Abort and FC's
+independent recovery/watchdog behavior are unchanged. Existing ignition timing
+is retained. HITL retains its existing full-testing behavior.
+
+Software acceptance covers engine transitions and confirmations, restart
+storage, prerequisite order, wrong/cached QD acknowledgements, target versus
+stabilization cutoff, topology loss, cross-flow faults, steady valve correction
+and the Launch boundary. It does not qualify physical valve timing, sensors,
+wiring or the pressure system.

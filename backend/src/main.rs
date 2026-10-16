@@ -1,3 +1,5 @@
+mod admin;
+mod radio_voice;
 // main.rs
 
 macro_rules! gs_debug_println {
@@ -8,6 +10,7 @@ macro_rules! gs_debug_println {
     };
 }
 
+mod antenna;
 mod auth;
 mod auto_zero;
 mod command_probe;
@@ -36,8 +39,8 @@ mod recording_export;
 mod recording_range;
 mod recording_report;
 mod ring_buffer;
-mod rrls;
 mod rocket_commands;
+mod rrls;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 mod safety_task;
 mod sequences;
@@ -120,8 +123,12 @@ fn network_delivery_tuning() -> sedsnet::config::RuntimeTuningConfig {
 fn network_memory_config() -> sedsnet::config::RuntimeMemoryConfig {
     // This is a ceiling, not a preallocation. Keep physical transport queues
     // short so a stalled radio cannot turn extra host RAM into command latency.
-    let budget = env_usize("GS_NETWORK_MEMORY_BUDGET_BYTES", 2 * 1024 * 1024 * 1024,
-                           1024 * 1024, 2 * 1024 * 1024 * 1024);
+    let budget = env_usize(
+        "GS_NETWORK_MEMORY_BUDGET_BYTES",
+        2 * 1024 * 1024 * 1024,
+        1024 * 1024,
+        2 * 1024 * 1024 * 1024,
+    );
     sedsnet::config::RuntimeMemoryConfig::new(budget, 4096, 4096, 1.25)
         .expect("bounded host network memory configuration")
 }
@@ -137,13 +144,15 @@ fn network_router_time_divisor() -> u64 {
 fn simulation_clock_ms() -> Option<u64> {
     static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = PATH.get_or_init(|| {
-        if cfg!(feature = "hitl_mode") {
-            std::env::var_os("GS_SIM_CLOCK_FILE").map(std::path::PathBuf::from)
-        } else {
-            None
-        }
-    }).as_ref()?;
+    let path = PATH
+        .get_or_init(|| {
+            if cfg!(feature = "hitl_mode") {
+                std::env::var_os("GS_SIM_CLOCK_FILE").map(std::path::PathBuf::from)
+            } else {
+                None
+            }
+        })
+        .as_ref()?;
     Some(read_simulation_clock(path, &LAST))
 }
 
@@ -166,7 +175,10 @@ struct ValidationInstant {
 
 impl ValidationInstant {
     fn now() -> Self {
-        Self { wall: Instant::now(), simulated_ms: simulation_clock_ms() }
+        Self {
+            wall: Instant::now(),
+            simulated_ms: simulation_clock_ms(),
+        }
     }
 }
 
@@ -174,7 +186,8 @@ fn validation_elapsed_ms(started: ValidationInstant) -> u64 {
     if let (Some(start), Some(now)) = (started.simulated_ms, simulation_clock_ms()) {
         return now.saturating_sub(start);
     }
-    u64::try_from(started.wall.elapsed().as_millis()).unwrap_or(u64::MAX) / network_router_time_divisor()
+    u64::try_from(started.wall.elapsed().as_millis()).unwrap_or(u64::MAX)
+        / network_router_time_divisor()
 }
 
 fn validation_latency_limit_ms(name: &str, default: u64) -> u64 {
@@ -183,6 +196,29 @@ fn validation_latency_limit_ms(name: &str, default: u64) -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+async fn wait_for_validation_idle(router: &sedsnet::router::Router) -> bool {
+    let started = ValidationInstant::now();
+    loop {
+        let stats = router.export_runtime_stats();
+        if stats.reliable.end_to_end_pending_destination_count == 0 {
+            log::info!(
+                "full-bay prior reliable traffic drained before managed-variable measurement: {} ms",
+                validation_elapsed_ms(started)
+            );
+            return true;
+        }
+        if validation_elapsed_ms(started) >= 30_000 {
+            log::error!(
+                "full-bay prior reliable traffic did not drain: tx={}, pending={}",
+                stats.queues.tx_len,
+                stats.reliable.end_to_end_pending_destination_count
+            );
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn wait_for_validation_reliable_delivery(
@@ -201,9 +237,22 @@ async fn wait_for_validation_reliable_delivery(
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1_000);
+    let mut delivery_ms = None;
+    let mut last_pending = Vec::new();
     loop {
         let stats = router.export_runtime_stats();
-        let pending = stats.reliable.end_to_end_pending_destination_count;
+        let details = router.export_reliable_pending_stats();
+        let pending: usize = details
+            .iter()
+            .filter(|entry| tx_before.iter().any(|(ty, _)| *ty == entry.data_type))
+            .map(|entry| entry.pending_destinations.len())
+            .sum();
+        if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
+            if details != last_pending {
+                log::info!("full-bay reliable pending for {label}: {details:?}");
+                last_pending = details;
+            }
+        }
         let transmission_counts = tx_before
             .iter()
             .map(|(expected, before)| {
@@ -218,15 +267,39 @@ async fn wait_for_validation_reliable_delivery(
             })
             .collect::<Vec<_>>();
         let elapsed_ms = validation_elapsed_ms(started);
-        if elapsed_ms >= minimum_observation_ms && stats.queues.tx_len == 0 && pending == 0 {
-            if elapsed_ms > latency_limit_ms {
+        // Test the round's actual transmissions and destination ACKs. A busy
+        // telemetry/schema queue is not a missing ACK, and need not be empty
+        // for controls to complete under continuous network load.
+        let delivered = pending == 0
+            && transmission_counts
+                .iter()
+                .all(|(_, before, after)| after > before);
+        if delivered {
+            delivery_ms.get_or_insert(elapsed_ms);
+        }
+        // An empty pending table is not proof of an ACK: retry exhaustion
+        // removes entries too. Fail at the delivery deadline while the
+        // outstanding destinations are still observable, before retry expiry
+        // can be mistaken for successful completion.
+        if delivery_ms.is_none() && elapsed_ms > latency_limit_ms {
+            log::error!(
+                "full-bay reliable delivery missed latency deadline for {label}: {elapsed_ms} ms > {latency_limit_ms} ms, {pending} destination ACK(s) pending, per-type tx before/after={transmission_counts:?}"
+            );
+            return false;
+        }
+        // Completion is an event: once all transmissions and their ACKs have
+        // finished, later heartbeats/schema work cannot undo that event or
+        // turn its latency into the length of an unrelated quiet interval.
+        if elapsed_ms >= minimum_observation_ms && delivery_ms.is_some() {
+            let delivery_ms = delivery_ms.expect("delivered timestamp recorded");
+            if delivery_ms > latency_limit_ms {
                 log::error!(
-                    "full-bay reliable delivery exceeded latency bound for {label}: {elapsed_ms} ms > {latency_limit_ms} ms"
+                    "full-bay reliable delivery exceeded latency bound for {label}: {delivery_ms} ms > {latency_limit_ms} ms"
                 );
                 return false;
             }
             log::info!(
-                "full-bay managed-variable latency within bound: {elapsed_ms} ms <= {latency_limit_ms} ms ({label}); queues quiesced; per-type tx before/after={transmission_counts:?}"
+                "full-bay managed-variable latency within bound: {delivery_ms} ms <= {latency_limit_ms} ms ({label}); observed for {elapsed_ms} ms; first completion recorded; per-type tx before/after={transmission_counts:?}"
             );
             return true;
         }
@@ -290,15 +363,54 @@ fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
     match link {
         // Pico-Fi's polled I2C bridge owns delivery and cannot sustain
         // SEDSNet's bidirectional hop-ACK traffic without starving Gateway.
-        CommsLinkConfig::I2c { .. } => false,
+        CommsLinkConfig::I2c { .. } | CommsLinkConfig::PicoFiTcp { .. } => false,
         // RF disables hop sequencing on its RFD900x side. Match that policy:
         // enabling it only here leaves unacknowledged frames in hop history.
         // Router end-to-end command delivery remains enabled independently.
         CommsLinkConfig::Serial { serial }
         | CommsLinkConfig::RaspberryPiGpioUart { serial }
-        | CommsLinkConfig::CustomSerial { serial } =>
-            serial.protocol != crate::comms_config::SerialProtocol::RawUart,
+        | CommsLinkConfig::CustomSerial { serial } => {
+            serial.protocol != crate::comms_config::SerialProtocol::RawUart
+        }
         CommsLinkConfig::Spi { .. } | CommsLinkConfig::Can { .. } => true,
+    }
+}
+
+struct ValvePowerFreshness {
+    clock: ValidationInstant,
+    last_source: [Option<u64>; 2],
+    last_received: [Option<u64>; 2],
+    stale_reported: [bool; 2],
+}
+impl Default for ValvePowerFreshness {
+    fn default() -> Self {
+        Self {
+            clock: ValidationInstant::now(),
+            last_source: [None; 2],
+            last_received: [None; 2],
+            stale_reported: [false; 2],
+        }
+    }
+}
+impl ValvePowerFreshness {
+    fn observe(&mut self, index: usize, source: u64, now: u64) -> Option<u64> {
+        if self.last_source[index] == Some(source) {
+            return None;
+        }
+        let gap = self.check(index, now);
+        self.last_source[index] = Some(source);
+        self.last_received[index] = Some(now);
+        self.stale_reported[index] = false;
+        gap
+    }
+    fn check(&mut self, index: usize, now: u64) -> Option<u64> {
+        let gap = now.saturating_sub(self.last_received[index]?);
+        if gap > 3_000 && !self.stale_reported[index] {
+            self.stale_reported[index] = true;
+            Some(gap)
+        } else {
+            None
+        }
     }
 }
 
@@ -346,20 +458,39 @@ mod router_link_policy_tests {
         let packet = sedsnet::packet::Packet::new(
             sedsnet::config::DataType::DiscoverySchema,
             &[sedsnet::config::DataEndpoint::Discovery],
-            "GS", 1, payload.clone(),
-        ).unwrap();
+            "GS",
+            1,
+            payload.clone(),
+        )
+        .unwrap();
         let wire = sedsnet::wire_format::pack_packet(&packet);
         sedsnet::config::set_runtime_tuning_config(previous).unwrap();
-        assert_eq!(wire[0] & 0x01, 0, "wire packet requires an embedded zstd decoder");
-        assert_eq!(sedsnet::wire_format::unpack_packet(&wire).unwrap().payload(), payload.as_ref());
+        assert_eq!(
+            wire[0] & 0x01,
+            0,
+            "wire packet requires an embedded zstd decoder"
+        );
+        assert_eq!(
+            sedsnet::wire_format::unpack_packet(&wire)
+                .unwrap()
+                .payload(),
+            payload.as_ref()
+        );
     }
 
     #[test]
     fn simulation_clock_survives_partial_writes_and_board_reset() {
         let path = std::env::temp_dir().join(format!("gs-clock-test-{}", std::process::id()));
         let last = std::sync::atomic::AtomicU64::new(0);
-        for (contents, expected) in [("1000", 1000), ("", 1000), ("10", 1000),
-            ("invalid", 1000), ("1010\n", 1010), ("0", 1010), ("1020", 1020)] {
+        for (contents, expected) in [
+            ("1000", 1000),
+            ("", 1000),
+            ("10", 1000),
+            ("invalid", 1000),
+            ("1010\n", 1010),
+            ("0", 1010),
+            ("1020", 1020),
+        ] {
             std::fs::write(&path, contents).unwrap();
             assert_eq!(super::read_simulation_clock(&path, &last), expected);
         }
@@ -372,8 +503,11 @@ mod router_link_policy_tests {
         tuning.validate().unwrap();
         if std::env::var_os("GS_RELIABLE_RETRANSMIT_MS").is_none() {
             assert_eq!(tuning.reliable_retransmit_ms, 500);
-            assert!(u64::from(tuning.reliable_retransmit_ms) *
-                u64::from(tuning.reliable_max_retries + 1) >= 4500);
+            assert!(
+                u64::from(tuning.reliable_retransmit_ms)
+                    * u64::from(tuning.reliable_max_retries + 1)
+                    >= 4500
+            );
         }
     }
 
@@ -391,13 +525,20 @@ mod router_link_policy_tests {
         let router = sedsnet::router::Router::new(
             sedsnet::router::RouterConfig::new([handler])
                 .with_sender("GS")
-                .with_memory_config(network_memory_config()).unwrap(),
+                .with_memory_config(network_memory_config())
+                .unwrap(),
         );
         // A brief host worker pause must not silently evict the early readings.
         // This burst exceeds the old 100 KiB shared state ceiling.
         for i in 0..2048 {
-            let packet = Packet::new(telemetry_schema::data_type("BATTERY_VOLTAGE"),
-                &[endpoint], "AB", i, 15.0f32.to_le_bytes().to_vec().into()).unwrap();
+            let packet = Packet::new(
+                telemetry_schema::data_type("BATTERY_VOLTAGE"),
+                &[endpoint],
+                "AB",
+                i,
+                15.0f32.to_le_bytes().to_vec().into(),
+            )
+            .unwrap();
             router.rx_queue(packet).unwrap();
         }
         assert!(router.export_runtime_stats().queues.shared_queue_bytes_used > 100 * 1024);
@@ -602,7 +743,9 @@ fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>
 }
 
 fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>>, bool) {
-    if rrls::is_rrls() { return (Arc::new(Mutex::new(Box::new(rrls::NoFill))), false); }
+    if rrls::is_rrls() {
+        return (Arc::new(Mutex::new(Box::new(rrls::NoFill))), false);
+    }
     match open_link(link) {
         Ok(r) => {
             gs_debug_println!("Umbilical comms online");
@@ -709,10 +852,14 @@ async fn main() -> anyhow::Result<()> {
     let comms_links = comms_config::load_or_default();
     rrls::configure(&comms_links.av_bay)?;
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let users_path = std::env::var_os("GS_USERS_FILE").map(PathBuf::from)
+    let users_path = std::env::var_os("GS_USERS_FILE")
+        .map(PathBuf::from)
         .unwrap_or_else(|| manifest_dir.join("users").join("users.json"));
     let legacy_users_path = manifest_dir.join("data").join("users.json");
-    if std::env::var_os("GS_USERS_FILE").is_none() && !users_path.exists() && legacy_users_path.exists() {
+    if std::env::var_os("GS_USERS_FILE").is_none()
+        && !users_path.exists()
+        && legacy_users_path.exists()
+    {
         if let Some(parent) = users_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -803,7 +950,9 @@ async fn main() -> anyhow::Result<()> {
 
     state.set_messages_snapshot(Vec::new());
 
-    if !rrls::is_rrls() { gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel"); }
+    if !rrls::is_rrls() {
+        gpio_panel::setup_gpio_panel(state.clone()).expect("failed to setup gpio panel");
+    }
     let sequence_shutdown_rx = state.shutdown_subscribe();
     let mut sequence_task = start_sequence_task(state.clone(), sequence_shutdown_rx);
 
@@ -829,6 +978,26 @@ async fn main() -> anyhow::Result<()> {
     let power_seen_handler = power_seen.clone();
     let power_rate_reported = Arc::new(AtomicBool::new(false));
     let power_rate_reported_handler = power_rate_reported.clone();
+    let valve_power_freshness = Arc::new(Mutex::new(ValvePowerFreshness::default()));
+    let valve_power_rates = Mutex::new([StreamRateProbe::default(), StreamRateProbe::default()]);
+    let valve_power_reported = [AtomicBool::new(false), AtomicBool::new(false)];
+    if std::env::var_os("GS_SIM_VALIDATE_VALVE_POWER").is_some() {
+        let freshness = valve_power_freshness.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut probe = freshness.lock().unwrap();
+                let now = validation_elapsed_ms(probe.clock);
+                for index in 0..2 {
+                    if let Some(gap) = probe.check(index, now) {
+                        log::error!(
+                            "full-bay Valve power telemetry stale: channel={index}, gap={gap} ms"
+                        );
+                    }
+                }
+            }
+        });
+    }
     let daq_loadcell_rate = Arc::new(Mutex::new(StreamRateProbe::default()));
     let daq_loadcell_rate_handler = daq_loadcell_rate.clone();
     let daq_loadcell_rate_reported = Arc::new(AtomicBool::new(false));
@@ -894,6 +1063,45 @@ async fn main() -> anyhow::Result<()> {
                         log::info!("full-bay Flight barometer 5 Hz stream reached GroundStation");
                     }
                 }
+                if std::env::var_os("GS_SIM_VALIDATE_VALVE_POWER").is_some()
+                    && board == Some(Board::ValveBoard)
+                {
+                    let index = if pkt.data_type() == telemetry_schema::data_type("BATTERY_VOLTAGE")
+                    {
+                        Some(0)
+                    } else if pkt.data_type() == telemetry_schema::data_type("BATTERY_CURRENT") {
+                        Some(1)
+                    } else {
+                        None
+                    };
+                    if let Some(index) = index {
+                        if pkt
+                            .data_as_f32()
+                            .is_ok_and(|values| values.len() == 1 && values[0].is_finite())
+                        {
+                            let mut probe = valve_power_freshness.lock().unwrap();
+                            let now = validation_elapsed_ms(probe.clock);
+                            if let Some(gap) = probe.observe(index, pkt.timestamp(), now) {
+                                log::error!(
+                                    "full-bay Valve power telemetry stale: channel={index}, gap={gap} ms"
+                                );
+                            }
+                            drop(probe);
+                            if valve_power_rates.lock().unwrap()[index].observe(
+                                pkt.timestamp(),
+                                700,
+                                1500,
+                                2,
+                            ) && !valve_power_reported[index].swap(true, Ordering::AcqRel)
+                            {
+                                log::info!(
+                                    "full-bay Valve {} 1 Hz stream reached GroundStation",
+                                    if index == 0 { "battery" } else { "current" }
+                                );
+                            }
+                        }
+                    }
+                }
                 if board == Some(Board::PowerBoard)
                     && pkt.data_type() == telemetry_schema::data_type("BATTERY_VOLTAGE")
                 {
@@ -913,12 +1121,11 @@ async fn main() -> anyhow::Result<()> {
                 if board == Some(Board::DaqBoard)
                     && pkt.data_type() == telemetry_schema::data_type("KG1000")
                 {
-                    let valid = daq_loadcell_rate_handler.lock().unwrap().observe(
-                        pkt.timestamp(),
-                        2,
-                        6,
-                        5,
-                    );
+                    let valid =
+                        daq_loadcell_rate_handler
+                            .lock()
+                            .unwrap()
+                            .observe(pkt.timestamp(), 2, 6, 5);
                     if valid && !daq_loadcell_rate_reported_handler.swap(true, Ordering::AcqRel) {
                         log::info!("full-bay DAQ raw loadcell 250 Hz stream reached GroundStation");
                     }
@@ -963,13 +1170,19 @@ async fn main() -> anyhow::Result<()> {
             if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
                 ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
                 if let Some(row) = telemetry_task::apply_umbilical_status_at_ingress(
-                    &ground_station_handler_state_clone, pkt,
+                    &ground_station_handler_state_clone,
+                    pkt,
                 ) {
                     ground_station_handler_state_clone.cache_recent_telemetry(row.clone());
                     let _ = ground_station_handler_state_clone.ws_tx.send(row.clone());
-                    ground_station_handler_state_clone.ring_buffer.lock().unwrap().push(
-                        crate::ring_buffer::ReceivedPacket::AppliedStatus { packet: pkt.clone(), row },
-                    );
+                    ground_station_handler_state_clone
+                        .ring_buffer
+                        .lock()
+                        .unwrap()
+                        .push(crate::ring_buffer::ReceivedPacket::AppliedStatus {
+                            packet: pkt.clone(),
+                            row,
+                        });
                 }
                 return Ok(());
             }
@@ -1043,7 +1256,11 @@ async fn main() -> anyhow::Result<()> {
         heartbeat_handler,
         telemetry_error_handler,
     ])
-    .with_sender(if rrls::is_rrls() { "RRLS" } else { Board::GroundStation.sender_id() })
+    .with_sender(if rrls::is_rrls() {
+        "RRLS"
+    } else {
+        Board::GroundStation.sender_id()
+    })
     .with_preferred_discovery_master(Board::GroundStation.sender_id())
     .with_memory_config(network_memory_config())?;
     if telemetry_task::timesync_enabled() {
@@ -1103,7 +1320,10 @@ async fn main() -> anyhow::Result<()> {
         .store(fill_comms_connected, Ordering::Relaxed);
 
     let router = Arc::new(if simulation_clock_ms().is_some() {
-        sedsnet::router::Router::new_with_clock(cfg, Box::new(|| simulation_clock_ms().unwrap_or(0)))
+        sedsnet::router::Router::new_with_clock(
+            cfg,
+            Box::new(|| simulation_clock_ms().unwrap_or(0)),
+        )
     } else if network_router_time_divisor() == 1 {
         sedsnet::router::Router::new(cfg)
     } else {
@@ -1130,7 +1350,7 @@ async fn main() -> anyhow::Result<()> {
     let (rocket_tx, rocket_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
     let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
 
-    // At 57,600 baud this bounds accepted UART work to roughly 360 ms.
+    // Bound queued radio work independently of the much faster Pico link.
     let rocket_tx_budget = Arc::new(TxQueueBudget::new(2048));
     let rocket_side = {
         let rocket_tx = rocket_tx.clone();
@@ -1139,7 +1359,9 @@ async fn main() -> anyhow::Result<()> {
             reliable_enabled: router_hop_reliable_enabled(&comms_links.av_bay),
             ..Default::default()
         }
-        .with_small_packet_transport(1024);
+        // Bound an uninterruptible schema chunk to about 87 ms at the
+        // configured 64 kbit/s radio and 40% airtime share.
+        .with_small_packet_transport(256);
         router.add_side_packed_with_priority_and_options(
             "rocket_comms",
             move |pkt, priority| budget.try_send(&rocket_tx, priority, pkt),
@@ -1175,7 +1397,9 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to get umbilical comms lock")
         .set_side_id(umbilical_side);
 
-    if !rrls::is_rrls() { network_variables::publish_current(&router)?; }
+    if !rrls::is_rrls() {
+        network_variables::publish_current(&router)?;
+    }
     // The full-system simulator uses the production toggle path while each
     // phase starts a fresh GroundStation process. Keeping this behind an
     // explicit validation-only environment flag avoids altering deployment
@@ -1189,7 +1413,9 @@ async fn main() -> anyhow::Result<()> {
         log::info!("full-bay validation toggled AV bay underglow: {enabled}");
     }
 
-    let initial_discovery = if rrls::is_rrls() { Ok(()) } else if std::env::var("GS_SIM_COMPACT_INITIAL_DISCOVERY")
+    let initial_discovery = if rrls::is_rrls() {
+        Ok(())
+    } else if std::env::var("GS_SIM_COMPACT_INITIAL_DISCOVERY")
         .ok()
         .as_deref()
         == Some("1")
@@ -1210,7 +1436,11 @@ async fn main() -> anyhow::Result<()> {
     // snapshot on every side at startup; discovered routers answer with their
     // current transitive graph, so fill and AV-bay routes recover without a
     // recurring broadcast/fanout workaround.
-    if let Err(err) = if rrls::is_rrls() { Ok(()) } else { request_startup_topology(&router) } {
+    if let Err(err) = if rrls::is_rrls() {
+        Ok(())
+    } else {
+        request_startup_topology(&router)
+    } {
         eprintln!("WARNING: failed to request startup network topology: {err}");
     }
 
@@ -1376,6 +1606,12 @@ async fn main() -> anyhow::Result<()> {
                             round + 1,
                             validation_router.export_topology().routes
                         );
+                        // The pending counter is global. Drain the preceding FC
+                        // command and startup calibration first so their ACKs
+                        // cannot be mislabeled as managed-variable latency.
+                        if !wait_for_validation_idle(&validation_router).await {
+                            break;
+                        }
                         let expected_types = [
                             flight_states
                                 .get(round)
@@ -1794,11 +2030,21 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-    let mut st = { let state=state.clone(); let router=router.clone(); tokio::spawn(async move { if !rrls::is_rrls() { safety_task(state,router,safety_shutdown_rx).await; } }) };
+    let mut st = {
+        let state = state.clone();
+        let router = router.clone();
+        tokio::spawn(async move {
+            if !rrls::is_rrls() {
+                safety_task(state, router, safety_shutdown_rx).await;
+            }
+        })
+    };
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     let mut st = tokio::spawn(async move {
         let _ = safety_shutdown_rx;
     });
+
+    let _antenna_gpsd = antenna::start_gpsd(state.shutdown_subscribe());
 
     // --- Webserver ---
     let mut video_runtime = media_runtime::VideoRuntime::start();
@@ -1882,4 +2128,26 @@ async fn main() -> anyhow::Result<()> {
     }
     log::info!("groundstation backend shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod valve_power_freshness_tests {
+    use super::*;
+    #[test]
+    fn duplicate_packets_cannot_hide_stale_reports_and_recovery_resets_the_alarm() {
+        let mut probe = ValvePowerFreshness::default();
+        assert_eq!(probe.observe(0, 10, 0), None);
+        assert_eq!(probe.observe(0, 10, 2500), None);
+        assert_eq!(probe.check(0, 3001), Some(3001));
+        assert_eq!(probe.check(0, 4000), None);
+        assert_eq!(probe.observe(0, 11, 4100), None);
+        assert_eq!(probe.check(0, 7101), Some(3001));
+    }
+    #[test]
+    fn a_late_packet_cannot_erase_a_gap_before_the_watchdog_runs() {
+        let mut probe = ValvePowerFreshness::default();
+        probe.observe(1, 1, 100);
+        assert_eq!(probe.observe(1, 2, 4100), Some(4000));
+        assert_eq!(probe.check(0, 99999), None);
+    }
 }

@@ -778,12 +778,12 @@ impl FlightSimState {
             | TelemetryCommand::RevokeResetFailures
             | TelemetryCommand::ValidateMeasms
             | TelemetryCommand::RevokeValidateMeasms
-            | TelemetryCommand::AbortAfter15
+            | TelemetryCommand::AbortAfter100
             | TelemetryCommand::AbortAfter40
-            | TelemetryCommand::AbortAfter70
-            | TelemetryCommand::ReinitAfter12
-            | TelemetryCommand::ReinitAfter26
-            | TelemetryCommand::ReinitAfter44
+            | TelemetryCommand::AbortAfter250
+            | TelemetryCommand::ReinitAfter15
+            | TelemetryCommand::ReinitAfter30
+            | TelemetryCommand::ReinitAfter50
             | TelemetryCommand::AdvanceFlightState
             | TelemetryCommand::RewindFlightState => {
                 // No-op in simulator mode; these commands are forwarded by telemetry_task.

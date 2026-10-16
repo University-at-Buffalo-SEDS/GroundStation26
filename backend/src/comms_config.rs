@@ -63,9 +63,29 @@ pub struct I2cLinkConfig {
     pub initial_wait_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpMode {
+    Client,
+    Server,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PicoFiTcpConfig {
+    pub mode: TcpMode,
+    /// Numeric IP:port, using the Pi's existing Ethernet interface.
+    pub address: String,
+    /// Required for a server bound outside loopback; only this Pico may connect.
+    #[serde(default)]
+    pub allowed_peer: Option<std::net::IpAddr>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "interface", rename_all = "snake_case")]
 pub enum CommsLinkConfig {
+    PicoFiTcp {
+        #[serde(flatten)]
+        tcp: PicoFiTcpConfig,
+    },
     #[serde(alias = "usb_serial")]
     Serial {
         #[serde(flatten)]
@@ -189,6 +209,7 @@ impl CommsLinkConfig {
             Self::Spi { spi } => &spi.port,
             Self::Can { can } => &can.port,
             Self::I2c { .. } => "/dev/i2c-*",
+            Self::PicoFiTcp { tcp } => &tcp.address,
         }
     }
 }
@@ -240,6 +261,17 @@ pub fn load_or_default() -> CommsLinksConfig {
 }
 
 fn apply_simulator_serial_overrides(config: &mut CommsLinksConfig) {
+    if std::env::var("GS_SIMULATED_SERIAL_PTY").as_deref() == Ok("1") {
+        if let Ok(address) = std::env::var("GS_FILL_PICO_TCP_ADDRESS") {
+            config.fill_box = CommsLinkConfig::PicoFiTcp {
+                tcp: PicoFiTcpConfig {
+                    mode: TcpMode::Client,
+                    address,
+                    allowed_peer: None,
+                },
+            };
+        }
+    }
     for (name, link, fallback_baud_rate) in [
         (
             "GS_AV_BAY_SERIAL_PORT",

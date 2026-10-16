@@ -10,8 +10,15 @@ body{display:flex;flex-direction:column;overflow:auto}#viewport{position:relativ
 #playback-controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;min-width:0}#status{font-size:12px;color:#b9c9d5;flex:1 1 150px}#status:empty{display:none}
 #stream-sound{display:flex;gap:8px;align-items:center;flex-wrap:wrap}button{font:inherit;background:#24374b;color:white;border:1px solid #697e8e;border-radius:6px;padding:7px 10px;cursor:pointer}input[type=range]{width:85px;max-width:100%}#audio-status{font-size:11px;color:#b9c9d5}
 @media(max-width:420px){#program-bar{grid-template-columns:72px minmax(0,1fr);padding:8px;gap:8px}#rocket-inset svg{height:88px}#banner{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}#playback-controls{grid-column:1 / -1}}
+#model-stage[data-flat="true"]{align-items:center;justify-content:center;flex-direction:column;background:radial-gradient(ellipse at 50% 70%,#203b50,#0b1725 70%)}
+#model-stage[data-flat="true"] #rocket-inset{padding:16px;max-width:700px;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:0;height:100%}
+#model-stage[data-flat="true"] #rocket-inset svg{height:min(58vh,520px);min-height:120px;max-height:calc(100% - 40px);width:100%;filter:drop-shadow(0 12px 20px #0005)}
+#model-stage[data-flat="true"] #rocket-phase{font-size:clamp(16px,3vw,24px);font-weight:600;margin-top:12px;letter-spacing:.04em}
+#program-bar[data-rocket-main="true"]{grid-template-columns:minmax(0,1fr)}
+button{min-height:44px;border-radius:10px}button:focus-visible{outline:3px solid #67c7ef;outline-offset:2px}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
-<div id="viewport"><div id="stage"></div><div id="model-stage"></div></div><footer id="program-bar" aria-label="Program status"><div id="rocket-inset" aria-label="Delayed rocket state"><svg viewBox="0 0 100 180" role="img" aria-label="Single-stage rocket"><g id="chute" style="display:none"><path d="M10 32 Q50 -8 90 32Z" fill="#e5ecf2"/><path d="M10 32L50 63L90 32" fill="none" stroke="#99afc0"/></g><path d="M40 145L28 159V130L40 120M60 145L72 159V130L60 120" fill="#8498a8"/><path d="M40 145V68L50 45L60 68V145Z" fill="#e5ecf2"/><path id="flame" d="M42 148L50 175L58 148Z" fill="#ff984a" style="display:none"/></svg><div id="rocket-phase">Unknown</div></div><div id="banner"></div><div id="playback-controls"><div id="status" role="status">Building delayed program buffer…</div><div id="stream-sound"></div></div></footer><script src="/assets/hls.min.js"></script><script type="module" src="/assets/three/vehicle-renderer.js"></script>
+<div id="viewport"><div id="stage"></div><div id="model-stage"></div></div><footer id="program-bar" aria-label="Program status"><div id="rocket-inset" aria-label="Delayed rocket state"><svg viewBox="0 0 100 180" role="img" aria-label="Single-stage rocket"><g id="chute" style="display:none"><path d="M10 32 Q50 -8 90 32Z" fill="#e5ecf2"/><path d="M10 32L50 63L90 32" fill="none" stroke="#99afc0"/></g><path d="M40 145L28 159V130L40 120M60 145L72 159V130L60 120" fill="#8498a8"/><path d="M40 145V68L50 45L60 68V145Z" fill="#e5ecf2"/><path id="flame" d="M42 148L50 175L58 148Z" fill="#ff984a" style="display:none"/></svg><div id="rocket-phase">Unknown</div></div><div id="banner"></div><div id="playback-controls"><div id="status" role="status">Building delayed program buffer…</div><div id="stream-sound"></div></div></footer><script src="/assets/hls.min.js"></script><script src="/assets/program-art.js"></script>
 <script>
 'use strict';
 const stage=document.querySelector('#stage'),status=document.querySelector('#status'),banner=document.querySelector('#banner');
@@ -41,11 +48,14 @@ function modelDisplay(videoReady,tile=null){
  
  inset.setAttribute('aria-label',onGround?'Delayed rocket and fill equipment':'Delayed rocket state');
  const selected=state?.broadcast.layout==='model'||!!tile;
- const show=selected||(!videoReady&&!state?.streams?.length);
+ const flat=!selected&&!videoReady;
+ const show=selected||flat;
+ window.gsProgramArt.layout(holder,inset,document.querySelector('#program-bar'),flat);
  Object.assign(holder.style,tile||{left:'0',top:'0',width:'100%',height:'100%'});
  holder.style.right='auto';holder.style.bottom='auto';
- holder.style.display=show?'block':'none';
- if(!show){holder.replaceChildren();}else{
+ holder.style.display=flat?'flex':show?'block':'none';
+ if(!selected){holder.querySelector('gs-vehicle-viewer')?.remove();}else{
+  window.__gs26VehicleRenderer ||= import('/assets/three/vehicle-renderer.js').catch(()=>{status.textContent='3D preview unavailable';});
   let model=holder.querySelector('gs-vehicle-viewer');if(!model&&customElements.get('gs-vehicle-viewer')){model=document.createElement('gs-vehicle-viewer');holder.append(model);}
   const config=state?.model;
   const ground=onGround;
@@ -109,12 +119,12 @@ function render(){
  }else if(['grid','grid-model'].includes(state.broadcast.layout)){
   const entries=[...players.entries()],withModel=state.broadcast.layout==='grid-model',count=entries.length+(withModel?1:0),columns=stage.clientWidth<500?1:count<=1?1:count<=4?2:3,rows=Math.max(1,Math.ceil(count/columns));let ready=0;
   entries.forEach(([id,p],i)=>{p.video.style.zIndex='1';p.video.style.width=100/columns+'%';p.video.style.height=100/rows+'%';p.video.style.left=(i%columns)*100/columns+'%';p.video.style.top=Math.floor(i/columns)*100/rows+'%';p.video.style.opacity=p.ready?'1':'0';if(p.ready)ready++;});
-  status.textContent=!supportsVideo?unsupportedVideo:ready?'':state.streams.length?(lastVideoError||'Buffering delayed video'):'No active camera — model view';displayed='';modelDisplay(ready>0,withModel?{left:(entries.length%columns)*100/columns+'%',top:Math.floor(entries.length/columns)*100/rows+'%',width:100/columns+'%',height:100/rows+'%'}:null);
+  status.textContent=!supportsVideo?unsupportedVideo:ready?'':state.streams.length?(lastVideoError||'Buffering delayed video'):'No active camera';displayed='';modelDisplay(ready>0,withModel?{left:(entries.length%columns)*100/columns+'%',top:Math.floor(entries.length/columns)*100/rows+'%',width:100/columns+'%',height:100/rows+'%'}:null);
  }else{
   for(const p of players.values()){p.video.style.width='100%';p.video.style.height='100%';p.video.style.left='0';p.video.style.top='0';}
   displayed=players.get(preferred)?.ready?preferred:'';
   for(const [id,p]of players){p.video.style.zIndex=id===displayed?'2':'1';p.video.style.opacity=id===displayed&&p.ready?'1':'0';}
-  status.textContent=!supportsVideo?unsupportedVideo:players.get(displayed)?.ready?'':state.streams.length?(lastVideoError||'Buffering delayed video'):'No active camera — model view';modelDisplay(!!players.get(displayed)?.ready);
+  status.textContent=!supportsVideo?unsupportedVideo:players.get(displayed)?.ready?'':state.streams.length?(lastVideoError||'Buffering delayed video'):'No active camera';modelDisplay(!!players.get(displayed)?.ready);
  }
 }
 const timer=setInterval(render,100);

@@ -1,12 +1,20 @@
 import {signIn} from '/assets/media-login.js';
 const $=id=>document.getElementById(id);
-let token='', session=null, muted=false, held=false, joining=false;
+let token='', session=null, muted=false, held=false, joining=false, radioAvailable=false;
+function radioLink(radio){
+  $('radio-controls').hidden=!radio?.configured;
+  radioAvailable=radio?.available===true;
+  $('radio-enable').disabled=!session?.ready||!radioAvailable;
+  $('radio-status').textContent=radioAvailable?'Recovery radio ready · 8 kb/s push-to-talk':'Recovery radio unavailable · local voice still works';
+  if(!radioAvailable){$('radio-enable').checked=false;if(session)session.radio=false;}
+}
 const notice=text=>{$('status').textContent=text;};
 function updateControls(){
   $('join').disabled=!token||!!session||joining;$('leave').disabled=!session;
   $('device').disabled=!!session||joining;$('mode').disabled=joining;
   $('mute').disabled=!session?.ready;$('ptt').disabled=!session?.ready||muted||$('mode').value!=='ptt';
   $('logout').disabled=!token;$('signin').disabled=!!session||joining;
+  $('radio-enable').disabled=!session?.ready||!radioAvailable;
 }
 function transmit(){
   const enabled=!!session?.ready&&!muted&&($('mode').value==='open'||held);
@@ -15,6 +23,8 @@ function transmit(){
       session.transmitting=enabled;
       if(session.ws?.readyState===WebSocket.OPEN)session.ws.send(JSON.stringify({type:'transmitting',enabled}));
     }
+    const radio=$('radio-enable').checked&&$('mode').value==='ptt';
+    if(session.radio!==radio&&session.ws?.readyState===WebSocket.OPEN){session.radio=radio;session.ws.send(JSON.stringify({type:'radio',enabled:radio}));}
     session.stream?.getAudioTracks().forEach(t=>{t.enabled=enabled;});
     session.node?.port.postMessage({type:'settings',transmit:enabled,gain:Number($('gain').value)/100,volume:Number($('volume').value)/100});
   }
@@ -24,7 +34,7 @@ function transmit(){
   updateControls();
 }
 function leave(message='Left voice. Microphone released.'){
-  const old=session;session=null;held=false;joining=false;
+  const old=session;session=null;held=false;joining=false;$('radio-enable').checked=false;
   if(old){clearInterval(old.ping);old.ws?.close();old.stream?.getTracks().forEach(t=>t.stop());old.node?.disconnect();old.context?.close().catch(()=>{});}
   $('peers').replaceChildren();$('count').textContent='0 / 12';$('level').value=0;transmit();notice(message);
 }
@@ -56,7 +66,9 @@ $('join').onclick=async()=>{
     await s.context.audioWorklet.addModule('/assets/voice-worklet.js');
     if(session!==s)return;
     const access=await fetch('/api/voice/status',{headers:{Authorization:`Bearer ${token}`}});
-    if(!access.ok || !(await access.json()).can_transmit)throw new Error('Your account needs the voice_transmit permission. Stream viewers can listen through the audience program.');
+    const capabilities=access.ok?await access.json():null;
+    if(!capabilities?.can_transmit)throw new Error('Your account needs the voice_transmit permission. Stream viewers can listen through the audience program.');
+    radioLink(capabilities.radio);
     if(session!==s)return;
     const stream=await navigator.mediaDevices.getUserMedia({audio:{deviceId:$('device').value?{exact:$('device').value}:undefined,channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:false}});
     if(session!==s){stream.getTracks().forEach(t=>t.stop());return;}
@@ -80,6 +92,9 @@ $('join').onclick=async()=>{
       }
       let m;try{m=JSON.parse(event.data);}catch{return;}
       if(m.type==='error'){leave(m.message);return;}
+      if(m.type==='radio_link'){radioLink(m.radio);}
+      if(m.type==='radio_state'){$('radio-enable').checked=m.enabled;session.radio=m.enabled;}
+
       if(m.type==='broadcast_state')$('broadcast-notice').textContent=m.enabled?'Voice chat audio is included in the audience broadcast, with the program delay.':'Voice chat audio is not included in the audience broadcast.';
       if(m.type==='joined'){s.ready=true;s.id=m.id;joining=false;transmit();notice('Connected to voice chat.');}
       if(m.type==='roster'){
@@ -97,7 +112,8 @@ $('join').onclick=async()=>{
 };
 $('leave').onclick=()=>leave();$('devices').onclick=devices;
 $('mute').onclick=()=>{muted=!muted;held=false;transmit();};
-$('mode').onchange=()=>{held=false;transmit();};
+$('mode').onchange=()=>{held=false;if($('mode').value!=='ptt')$('radio-enable').checked=false;transmit();};
+$('radio-enable').onchange=()=>{if($('radio-enable').checked)$('mode').value='ptt';held=false;transmit();};
 for(const name of ['gain','volume'])$(name).oninput=()=>{$(`${name}-label`).textContent=`${$(name).value}%`;transmit();};
 $('ptt').onpointerdown=event=>{if($('ptt').disabled)return;event.preventDefault();$('ptt').setPointerCapture(event.pointerId);held=true;transmit();};
 const release=()=>{held=false;transmit();};

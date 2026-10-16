@@ -408,15 +408,15 @@
         "group": "Flight controls"
       },
       {
-        "label": "Abort After 15",
-        "cmd": "AbortAfter15",
+        "label": "Abort threshold 100",
+        "cmd": "AbortAfter100",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe",
         "group": "Flight controls"
       },
       {
-        "label": "Abort After 40",
+        "label": "Abort threshold 40",
         "cmd": "AbortAfter40",
         "border": "#38bdf8",
         "bg": "#0b1220",
@@ -424,32 +424,32 @@
         "group": "Flight controls"
       },
       {
-        "label": "Abort After 70",
-        "cmd": "AbortAfter70",
+        "label": "Abort threshold 250",
+        "cmd": "AbortAfter250",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe",
         "group": "Flight controls"
       },
       {
-        "label": "Reinit After 12",
-        "cmd": "ReinitAfter12",
+        "label": "Reinit threshold 15",
+        "cmd": "ReinitAfter15",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe",
         "group": "Flight controls"
       },
       {
-        "label": "Reinit After 26",
-        "cmd": "ReinitAfter26",
+        "label": "Reinit threshold 30",
+        "cmd": "ReinitAfter30",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe",
         "group": "Flight controls"
       },
       {
-        "label": "Reinit After 44",
-        "cmd": "ReinitAfter44",
+        "label": "Reinit threshold 50",
+        "cmd": "ReinitAfter50",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe",

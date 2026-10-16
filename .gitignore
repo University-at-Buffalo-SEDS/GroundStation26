@@ -26,3 +26,7 @@ Cargo.lock
 
 # Long unloaded characterization recordings (retained locally, not source).
 /backend/calibration/zero_captures/
+
+# Saved operational checks are local runtime data, never firmware defaults.
+/backend/config/gse_qualification.json
+/backend/config/gse_qualification.upload

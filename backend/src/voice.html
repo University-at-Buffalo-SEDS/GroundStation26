@@ -19,6 +19,9 @@
 <button id="devices">Refresh microphones</button>
 <label>Transmit mode<select id="mode"><option value="ptt">Push to talk</option><option value="open">Open mic</option></select></label>
 <button id="mute" disabled aria-pressed="false">Mute microphone</button></div>
+<div id="radio-controls" hidden style="margin-top:16px">
+<label style="display:flex;align-items:center;gap:12px;min-height:48px"><input id="radio-enable" type="checkbox" disabled style="width:24px;height:24px"> Relay push-to-talk over recovery radio</label>
+<p id="radio-status" role="status">Recovery radio unavailable</p></div>
 <div class="sliders"><label>Microphone gain <output id="gain-label">100%</output><input id="gain" type="range" min="0" max="200" value="100"></label>
 <label>Speaker volume <output id="volume-label">100%</output><input id="volume" type="range" min="0" max="150" value="100"></label></div>
 <p id="mic-state">Microphone off</p><label>Input level<meter id="level" min="0" max="1" value="0"></meter></label>

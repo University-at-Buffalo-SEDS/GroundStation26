@@ -252,6 +252,21 @@ def cli_mode(args: argparse.Namespace) -> int:
     elif args.command == "set-ttl":
         cfg["session_ttl_seconds"] = max(1, int(args.seconds))
         changed = True
+    elif args.command == "set-role":
+        user = next((u for u in cfg["users"] if u["username"].casefold() == args.username.casefold()), None)
+        if user is None:
+            raise ValueError("Unknown account")
+        roles = [role for role in user.get("roles", []) if role != args.role]
+        if args.access == "grant":
+            roles.append(args.role)
+            user["permissions"]["view_data"] = True
+        elif args.role == "admin" and not any(
+            other is not user and not other.get("disabled") and "admin" in other.get("roles", [])
+            for other in cfg["users"]
+        ):
+            raise ValueError("Keep at least one enabled application administrator")
+        user["roles"] = roles
+        changed = True
     elif args.command == "set-voice-permission":
         user = next((u for u in cfg["users"] if u["username"].casefold() == args.username.casefold()), None)
         if user is None:
@@ -876,6 +891,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     ttl = sub.add_parser("set-ttl", help="Set session TTL in seconds")
     ttl.add_argument("seconds", type=int)
+
+    role = sub.add_parser("set-role", help="Grant or revoke an application/stream role without granting hardware commands")
+    role.add_argument("username")
+    role.add_argument("role", choices=["admin", "stream_admin", "stream_master", "stream_viewer"])
+    role.add_argument("access", choices=["grant", "revoke"])
 
     remove = sub.add_parser("remove-user", help="Delete a user")
     remove.add_argument("username")

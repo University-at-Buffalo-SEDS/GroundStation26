@@ -1,6 +1,6 @@
 // Requires Playwright, Chrome and FFmpeg. Uses synthetic HLS, no station or MediaMTX.
 import assert from 'node:assert/strict';
-import {readFileSync,mkdtempSync,rmSync} from 'node:fs';
+import {readFileSync,mkdtempSync,rmSync,cpSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {execFileSync} from 'node:child_process';
@@ -8,7 +8,8 @@ const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 const dir=mkdtempSync(join(tmpdir(),'gs-program-test-'));
 let browser;
 try {
-  execFileSync('ffmpeg',['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc2=size=640x360:rate=10','-t','120','-an','-c:v','libx264','-preset','ultrafast','-profile:v','baseline','-pix_fmt','yuv420p','-g','10','-keyint_min','10','-sc_threshold','0','-f','hls','-hls_time','1','-hls_list_size','0','-hls_segment_type','fmp4','-hls_segment_filename',join(dir,'seg%d.m4s'),join(dir,'index.m3u8')]);
+  if(process.env.GS_PROGRAM_TEST_MEDIA) cpSync(process.env.GS_PROGRAM_TEST_MEDIA,dir,{recursive:true});
+  else execFileSync('ffmpeg',['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc2=size=640x360:rate=10','-t','120','-an','-c:v','libx264','-preset','ultrafast','-profile:v','baseline','-pix_fmt','yuv420p','-g','10','-keyint_min','10','-sc_threshold','0','-f','hls','-hls_time','1','-hls_list_size','0','-hls_segment_type','fmp4','-hls_segment_filename',join(dir,'seg%d.m4s'),join(dir,'index.m3u8')]);
   browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_BINARY,args:['--autoplay-policy=no-user-gesture-required']});
   const page=await browser.newPage({viewport:{width:360,height:800}});
   const errors=[];page.on('pageerror',e=>errors.push(e.message));
@@ -25,6 +26,7 @@ try {
     const path=new URL(route.request().url()).pathname;
     if(path==='/program')return route.fulfill({contentType:'text/html',body:readFileSync('backend/src/media/program.html')});
     if(path==='/assets/hls.min.js')return route.fulfill({contentType:'text/javascript',body:readFileSync('backend/assets/hls.min.js')});
+    if(path==='/assets/program-art.js')return route.fulfill({contentType:'text/javascript',body:readFileSync('backend/src/media/program-art.js')});
     if(path==='/assets/program-audio.js')return route.fulfill({contentType:'text/javascript',body:readFileSync('backend/src/media/program-audio.js')});
     if(path==='/assets/three/vehicle-renderer.js')return route.fulfill({contentType:'text/javascript',body:"customElements.define('gs-vehicle-viewer',class extends HTMLElement{});"});
     if(path==='/api/media-assets/program/state') {
@@ -70,6 +72,7 @@ try {
   layout='grid-model';
   await page.waitForFunction(()=>document.querySelector('#model-stage').style.display==='block'&&document.querySelector('#model-stage').style.height.includes('33.3'));
   assert.equal(await page.locator('video').count(),2,'model tile coexists with the camera feeds');
+  await page.locator('#model-stage gs-vehicle-viewer').waitFor();
   assert.equal(await page.locator('#model-stage gs-vehicle-viewer').count(),1);
   layout='model';
   await page.waitForFunction(()=>!document.querySelector('video')&&document.querySelector('#model-stage').style.height==='100%');
@@ -79,7 +82,11 @@ try {
   assert.equal(await page.locator('#model-stage').isVisible(),false);
   delay=10;await page.waitForTimeout(1600);
   await page.waitForFunction(()=>[...document.querySelectorAll('video')].some(v=>v.style.opacity==='1'));
-  live=false;await page.waitForFunction(()=>!document.querySelector('video')&&document.querySelector('#model-stage').style.display==='block');await page.locator('#rocket-inset').waitFor({state:'visible'});
+  live=false;await page.waitForFunction(()=>!document.querySelector('video')&&document.querySelector('#model-stage').dataset.flat==='true');await page.locator('#rocket-inset').waitFor({state:'visible'});
+  assert.equal(await page.locator('#model-stage #rocket-inset').count(),1,'2D rocket fills the main area without a camera');
+  assert.equal(await page.locator('#model-stage gs-vehicle-viewer').count(),0,'fallback needs no 3D viewer');
+  live=true;await page.waitForFunction(()=>document.querySelector('video')?.style.opacity==='1');
+  assert.equal(await page.locator('#program-bar #rocket-inset').count(),1,'same artwork returns beside the live camera');
   offline=true;await page.waitForFunction(()=>document.querySelector('#status').textContent.includes('unavailable'));
   await page.locator('#rocket-inset').waitFor({state:'visible'});
   assert.equal(errors.length,0,errors.join('\n'));

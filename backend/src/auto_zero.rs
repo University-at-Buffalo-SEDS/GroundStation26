@@ -302,15 +302,18 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
                 }
             }
             Err(e) => {
+                let request_abort = !fill && crate::gse::automatic_abort_allowed(&state);
                 state.add_notification(format!(
                     "Automatic zero failed: {e}. {}",
                     if fill {
                         "Fill was not started."
-                    } else {
+                    } else if request_abort {
                         "Launch abort requested."
+                    } else {
+                        "Previous tare retained; no automatic abort after entering Launch."
                     }
                 ));
-                if !fill {
+                if request_abort {
                     let _ = state.cmd_tx.send(TelemetryCommand::Abort).await;
                 }
             }

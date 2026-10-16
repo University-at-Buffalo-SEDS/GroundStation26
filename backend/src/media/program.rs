@@ -6,6 +6,9 @@ use axum::Json;
 pub(super) fn routes() -> Router<Arc<MediaState>> {
     Router::new()
         .route("/api/media-assets/program", get(page))
+        .route("/assets/program-art.js", get(|| async {
+            ([(header::CONTENT_TYPE,"text/javascript")],include_str!("program-art.js"))
+        }))
         .route("/api/media-assets/program/state", get(program_state))
         .route("/api/media-assets/program/audio", get(program_audio))
         .route("/assets/program-audio.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript")],include_str!("program-audio.js")) }))
@@ -453,7 +456,7 @@ async fn hls(
 
 async fn roles(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> ApiResult<Response> {
     let p = crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await?;
-    if p.anonymous || !p.roles.contains(&StreamRole::StreamAdmin) {
+    if p.anonymous || !p.roles.iter().any(|role|matches!(role,StreamRole::StreamAdmin|StreamRole::Admin)) {
         return Err(error(
             StatusCode::FORBIDDEN,
             "Stream administrator required",
@@ -478,56 +481,20 @@ async fn set_role(
 ) -> ApiResult<Response> {
     let _guard = state.presentation_write.lock().await;
     let p = crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await?;
-    if p.anonymous || !p.roles.contains(&StreamRole::StreamAdmin) {
+    if p.anonymous || !p.roles.iter().any(|role|matches!(role,StreamRole::StreamAdmin|StreamRole::Admin)) {
         return Err(error(
             StatusCode::FORBIDDEN,
             "Stream administrator required",
         ));
     }
-    let mut config = state
-        .app
-        .auth
-        .load_users_file()
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Cannot read accounts"))?;
-    let user = config
-        .users
-        .iter_mut()
-        .find(|u| u.username == change.username)
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "Unknown user"))?;
-    user.roles
-        .retain(|r| *r != StreamRole::StreamMaster && *r != StreamRole::StreamViewer);
-    if change.stream_master {
-        user.roles.push(StreamRole::StreamMaster);
-        user.permissions.view_data = true;
-    }
-    // An explicit viewer role overrides legacy StreamControl without changing the
-    // command allowlist (an empty allowlist means ALL hardware commands).
-    if !change.stream_master {
-        user.roles.push(StreamRole::StreamViewer);
-    }
-    let close_previews = !change.stream_master
-        && !user.permissions.send_commands
-        && !user.roles.contains(&StreamRole::StreamAdmin);
-    let path = state.app.auth.path();
-    let temp = path.with_extension("roles-upload");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temp).map_err(io_error)?;
-    use std::io::Write;
-    file.write_all(&serde_json::to_vec_pretty(&config).map_err(|_| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Cannot serialize accounts",
-        )
-    })?)
-    .map_err(io_error)?;
-    file.sync_all().map_err(io_error)?;
-    std::fs::rename(temp, path).map_err(io_error)?;
+    let close_previews = state.app.auth.update_users(|config| {
+        let user = config.users.iter_mut().find(|u|u.username==change.username).ok_or("Unknown user")?;
+        user.roles.retain(|role|*role!=StreamRole::StreamMaster&&*role!=StreamRole::StreamViewer);
+        if change.stream_master {user.roles.push(StreamRole::StreamMaster);user.permissions.view_data=true;}
+        else {user.roles.push(StreamRole::StreamViewer);}
+        Ok(!change.stream_master && !user.permissions.send_commands
+            && !user.roles.iter().any(|role|matches!(role,StreamRole::StreamAdmin|StreamRole::Admin)))
+    }).map_err(|_|error(StatusCode::CONFLICT,"Cannot update stream role"))?;
     if close_previews {
         let mut sessions = state.preview_sessions.lock().await;
         let closing: Vec<_> = sessions
