@@ -34,7 +34,6 @@ use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
 pub const ROCKET_COMMS_PORT: &str = "/dev/ttyAMA0";
-pub const UMBILICAL_COMMS_PORT: &str = "/dev/ttyUSB2";
 pub const COMMS_BAUD_RATE: usize = 57_600;
 pub const MAX_PACKET_SIZE: usize = 256;
 const STREAM_PACKET_MAX_SIZE: usize = 4_096;

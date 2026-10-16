@@ -7,8 +7,8 @@
     "protocol": "raw_uart"
   },
   "fill_box": {
-    "interface": "i2c",
-    "port": "/dev/i2c-1",
-    "baud_rate": 115200
+    "interface": "pico_fi_tcp",
+    "mode": "client",
+    "address": "192.168.3.20:9000"
   }
 }

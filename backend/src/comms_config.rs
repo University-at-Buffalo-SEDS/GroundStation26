@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::comms::{COMMS_BAUD_RATE, ROCKET_COMMS_PORT, UMBILICAL_COMMS_PORT};
+use crate::comms::{COMMS_BAUD_RATE, ROCKET_COMMS_PORT};
 
 const DEFAULT_CONFIG_PATH: &str = "comms/comms.json";
 const LEGACY_CONFIG_PATHS: &[&str] = &[
@@ -188,11 +188,11 @@ impl Default for CommsLinksConfig {
                     protocol: SerialProtocol::RawUart,
                 },
             },
-            fill_box: CommsLinkConfig::Serial {
-                serial: SerialLinkConfig {
-                    port: UMBILICAL_COMMS_PORT.to_string(),
-                    baud_rate: 115_200,
-                    protocol: SerialProtocol::RawUart,
+            fill_box: CommsLinkConfig::PicoFiTcp {
+                tcp: PicoFiTcpConfig {
+                    mode: TcpMode::Client,
+                    address: "192.168.3.20:9000".to_owned(),
+                    allowed_peer: None,
                 },
             },
         }
@@ -429,7 +429,7 @@ mod tests {
     };
 
     #[test]
-    fn default_config_matches_legacy_ports() {
+    fn default_config_uses_ethernet_for_gateway_and_radio_uart_for_av_bay() {
         let cfg = CommsLinksConfig::default();
         assert_eq!(cfg.version, 1);
         assert_eq!(
@@ -444,11 +444,11 @@ mod tests {
         );
         assert_eq!(
             cfg.fill_box,
-            CommsLinkConfig::Serial {
-                serial: SerialLinkConfig {
-                    port: "/dev/ttyUSB2".to_string(),
-                    baud_rate: 115_200,
-                    protocol: SerialProtocol::RawUart,
+            CommsLinkConfig::PicoFiTcp {
+                tcp: super::PicoFiTcpConfig {
+                    mode: super::TcpMode::Client,
+                    address: "192.168.3.20:9000".to_owned(),
+                    allowed_peer: None,
                 },
             }
         );

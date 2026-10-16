@@ -20,6 +20,14 @@ class CommsSetupTests(unittest.TestCase):
     def test_default_filename_matches_backend(self):
         self.assertEqual(m.default_config_path().name,'comms.json')
 
+    def test_new_install_and_shipped_gateway_settings_use_main_network(self):
+        cfg=m.validate_config(m.normalize_config({}))
+        shipped=m.validate_config(m.load_config(m.default_config_path()))
+        for config in (cfg,shipped):
+            self.assertEqual(config['fill_box']['interface'],'pico_fi_tcp')
+            self.assertEqual(config['fill_box']['mode'],'client')
+            self.assertEqual(config['fill_box']['address'],'192.168.3.20:9000')
+
     def test_tcp_client_and_server_round_trip_preserve_other_link(self):
         for mode,address,peer in [('client','192.168.3.8:9000',None),('server','0.0.0.0:9000','192.168.3.8'),('server','[::1]:9000',None)]:
             cfg=m.validate_config(self.config(mode=mode,address=address,allowed_peer=peer,port=''))

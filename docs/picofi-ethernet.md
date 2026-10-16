@@ -1,8 +1,8 @@
 # Pico-Fi Ethernet link
 
-GroundStation can connect directly to the existing Pico-Fi TCP bridge instead of polling I²C. This uses the Pi's normal Ethernet interface. The web UI and local camera streams continue using their existing ports.
+GroundStation uses the Pi’s main Ethernet interface for gateway Pico-Fi TCP traffic and browser/mobile clients. The web UI, camera streams and Pico-Fi share the physical interface and use separate TCP ports. The AV-bay RFD radio retains its 115,200-baud UART connection. I²C is a legacy option and is outside current deployment qualification.
 
-In `backend/comms/comms.json`, replace only `fill_box` with one of these configurations, then restart the backend. Keep `av_bay` unchanged.
+The shipped `backend/comms/comms.json` and new-install defaults select TCP client mode. `192.168.3.20:9000` is an example Pico address: set it to the actual endpoint before deployment. Existing saved configurations are preserved; change `fill_box` explicitly when migrating from I²C, then restart the backend. Keep `av_bay` unchanged.
 
 GroundStation connects to a Pico running `TcpServer`:
 
@@ -23,16 +23,14 @@ The existing Pico protocol is unchanged: `PICOFI1` handshake, then `B5 4E`, litt
 This transport carries network packets only. It does not relay camera/video traffic over the RFD link.
 
 The configuration tool also supports this interface through CLI, TUI and Tk.
-Run `python3 backend/tools/comms_config_gui.py --help` for options. TCP and I²C
-are selectable; changing the bridge interface does not replace the Pi's main
-Ethernet setup.
+Run `python3 backend/tools/comms_config_gui.py --help` for options. TCP is the default. The backend uses the Pi’s existing Ethernet routing; no second Ethernet adapter or I²C link is required.
 
 The gateway/Pico UART pair used by network qualification is 1,000,000 baud.
 Both firmware ends must match. The RFD radio UART remains 115,200 baud. Full
 network tests select the Pico1M build explicitly; set
 `SEDS_FIRMWARE_SIM_PICO_BAUD=115200` only for a deliberate lower-capacity comparison.
 
-The linked simulator also supports `pico_fi_tcp_to_uart` host links: it binds
+The linked simulator defaults to `pico_fi_tcp_to_uart` host links: it binds
 a loopback Pico-Fi peer and supplies its address through
 `GS_FILL_PICO_TCP_ADDRESS` when `GS_SIMULATED_SERIAL_PTY=1`. This tests actual
 TCP framing against gateway UART firmware without involving I²C slots. The

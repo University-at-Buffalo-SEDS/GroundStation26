@@ -50,7 +50,9 @@ DEFAULT_CONFIG = {
         "can_rx_id": 0x221,
     },
     "fill_box": {
-        "interface": "usb_serial",
+        "interface": "pico_fi_tcp",
+        "mode": "client",
+        "address": "192.168.3.20:9000",
         "port": "/dev/ttyUSB2",
         "baud_rate": DEFAULT_BAUD_RATE,
         "spi_speed_hz": DEFAULT_SPI_SPEED_HZ,
@@ -242,7 +244,10 @@ def normalize_config(cfg: dict) -> dict:
                                "bus":1, "addr":0x55, "protocol_version":2,
                                "chunk_delay_ms":0, "initial_wait_ms":0}.items():
             merged[name].setdefault(field, default)
-        merged[name]["interface"] = str(merged[name]["interface"])
+        # The backend's generic serial variant uses the same fields as the
+        # setup tool's custom-serial choice; preserve existing radio settings.
+        interface_name = str(merged[name]["interface"])
+        merged[name]["interface"] = "custom_serial" if interface_name == "serial" else interface_name
         merged[name]["port"] = str(merged[name]["port"])
         merged[name]["baud_rate"] = int(merged[name].get("baud_rate", DEFAULT_CONFIG[name]["baud_rate"]))
         merged[name]["spi_speed_hz"] = int(merged[name].get("spi_speed_hz", DEFAULT_SPI_SPEED_HZ))
