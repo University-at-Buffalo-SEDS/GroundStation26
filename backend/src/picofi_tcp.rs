@@ -10,6 +10,11 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
 };
+#[path = "picofi_discovery_wire.rs"]
+mod discovery_wire;
+#[path = "picofi_lan.rs"]
+mod lan;
+use lan::LanDiscovery;
 const HELLO: &[u8; 7] = b"PICOFI1";
 const MAX: usize = 4096;
 const DEPTH: usize = 128;
@@ -27,11 +32,23 @@ pub struct PicoFiTcp {
 }
 impl PicoFiTcp {
     pub fn open(config: &PicoFiTcpConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !config.discovery || config.discovery_port != 0,
+            "Discovery UDP port must be nonzero (default {})",
+            discovery_wire::PORT
+        );
         let address: SocketAddr = config
             .address
             .parse()
             .context("Pico-Fi address must be a numeric IP:port")?;
-        anyhow::ensure!(address.port() != 0, "Pico-Fi TCP port must be nonzero");
+        anyhow::ensure!(
+            address.port() != 0 || config.discovery,
+            "Manual Pico-Fi TCP port must be nonzero"
+        );
+        anyhow::ensure!(
+            !config.discovery || address.is_ipv4(),
+            "Pico-Fi discovery requires an IPv4 Ethernet address"
+        );
         let listener = if config.mode == TcpMode::Server {
             let l = TcpListener::bind(address)?;
             l.set_nonblocking(true)?;
@@ -41,10 +58,26 @@ impl PicoFiTcp {
         };
         if config.mode == TcpMode::Server {
             anyhow::ensure!(
-                config.allowed_peer.is_some() || address.ip().is_loopback(),
-                "A non-loopback Pico-Fi server requires allowed_peer (Pico IP)"
+                config.discovery || config.allowed_peer.is_some() || address.ip().is_loopback(),
+                "A non-loopback Pico-Fi server requires discovery or allowed_peer (Pico IP)"
             );
         }
+        let discovery = if config.discovery {
+            let port = listener
+                .as_ref()
+                .map(|l| l.local_addr())
+                .transpose()?
+                .map_or(address.port(), |a| a.port());
+            Some(LanDiscovery::open(
+                config.mode,
+                port,
+                config.allowed_peer,
+                config.discovery_port,
+                config.discovery_interface.as_deref(),
+            )?)
+        } else {
+            None
+        };
         let (tx, outgoing) = mpsc::sync_channel(DEPTH);
         let (incoming, rx) = mpsc::sync_channel(DEPTH);
         let shared = Arc::new(Shared {
@@ -56,7 +89,7 @@ impl PicoFiTcp {
         let cfg = config.clone();
         std::thread::Builder::new()
             .name("picofi-tcp".into())
-            .spawn(move || worker(weak, outgoing, incoming, listener, address, cfg))?;
+            .spawn(move || worker(weak, outgoing, incoming, listener, address, cfg, discovery))?;
         Ok(Self {
             shared,
             rx: Arc::new(Mutex::new(rx)),
@@ -230,8 +263,12 @@ fn worker(
     listener: Option<TcpListener>,
     address: SocketAddr,
     config: PicoFiTcpConfig,
+    mut discovery: Option<LanDiscovery>,
 ) {
     loop {
+        if let Some(discovery) = discovery.as_mut() {
+            discovery.poll(false);
+        }
         let Some(shared) = weak.upgrade() else { return };
         shared.connected.store(false, Ordering::Release);
         let generation = shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -239,13 +276,24 @@ fn worker(
         drop(shared);
         let candidate = match &listener {
             Some(l) => l.accept().and_then(|(s, peer)| {
-                if config.allowed_peer.is_none_or(|ip| ip == peer.ip()) {
+                if config.allowed_peer.is_none_or(|ip| ip == peer.ip())
+                    && discovery.as_ref().is_none_or(|d| d.authorized(peer.ip()))
+                {
                     Ok(s)
                 } else {
                     Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
                 }
             }),
-            None => TcpStream::connect_timeout(&address, Duration::from_millis(250)),
+            None => {
+                let target = discovery
+                    .as_ref()
+                    .map_or(Some(address), LanDiscovery::candidate);
+                target
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                    .and_then(|target| {
+                        TcpStream::connect_timeout(&target, Duration::from_millis(250))
+                    })
+            }
         };
         let socket = candidate.and_then(|mut s| {
             handshake(&mut s, listener.is_none())?;
@@ -262,6 +310,9 @@ fn worker(
         let mut inbound = None;
         let mut pending: Option<(Vec<u8>, usize, Instant)> = None;
         'session: loop {
+            if let Some(discovery) = discovery.as_mut() {
+                discovery.poll(true);
+            }
             if weak.strong_count() == 0 {
                 return;
             }
@@ -318,6 +369,9 @@ fn worker(
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        if let Some(discovery) = discovery.as_mut() {
+            discovery.reconnect();
+        }
     }
 }
 #[cfg(test)]
@@ -328,6 +382,71 @@ mod tests {
         let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (b, _) = listener.accept().unwrap();
         (a, b)
+    }
+    #[test]
+    fn discovered_ephemeral_server_transfers_frames_and_rediscovers_after_disconnect() {
+        use discovery_wire::{Kind, Message, Party, SIZE};
+        use std::net::{Ipv4Addr, UdpSocket};
+        let reservation = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let discovery_port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let config = PicoFiTcpConfig {
+            discovery: true,
+            discovery_port,
+            discovery_interface: None,
+            mode: TcpMode::Server,
+            address: "0.0.0.0:0".into(),
+            allowed_peer: None,
+        };
+        let mut device = PicoFiTcp::open(&config).unwrap();
+        let discovery = UdpSocket::bind("127.0.0.1:0").unwrap();
+        discovery
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        for nonce in [10, 11] {
+            let query = Message {
+                kind: Kind::Query,
+                party: Party::Pico,
+                port: 0,
+                nonce,
+                identity: [2, 3, 4, 5, 6, 7],
+            };
+            discovery
+                .send_to(&query.encode(), (Ipv4Addr::LOCALHOST, discovery_port))
+                .unwrap();
+            let mut bytes = [0; SIZE];
+            let (n, _) = discovery.recv_from(&mut bytes).unwrap();
+            let offer = Message::decode(&bytes[..n]).unwrap();
+            assert!(offer.compatible_offer(query));
+            assert_ne!(offer.port, 0);
+            let mut peer = TcpStream::connect((Ipv4Addr::LOCALHOST, offer.port)).unwrap();
+            handshake(&mut peer, true).unwrap();
+            peer.set_nonblocking(false).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while device.send_data(&[nonce as u8]).is_err() {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let mut frame = [0; 5];
+            peer.read_exact(&mut frame).unwrap();
+            assert_eq!(frame, [0xb5, 0x4e, 1, 0, nonce as u8]);
+            peer.write_all(&[0xb5, 0x4e, 1, 0, 42]).unwrap();
+            let mut received = vec![];
+            while received.is_empty() {
+                assert!(Instant::now() < deadline);
+                device
+                    .recv_serialized_packets(&mut |frame| received.push(frame))
+                    .unwrap();
+                std::thread::yield_now();
+            }
+            assert_eq!(received, vec![vec![42]]);
+            peer.shutdown(std::net::Shutdown::Both).unwrap();
+            drop(peer);
+            while device.shared.connected.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
     }
     #[test]
     fn fragmented_and_coalesced_frames_preserve_every_payload() {
@@ -388,6 +507,9 @@ mod tests {
         let address = reserved.local_addr().unwrap();
         drop(reserved);
         let config = PicoFiTcpConfig {
+            discovery: false,
+            discovery_port: discovery_wire::PORT,
+            discovery_interface: None,
             mode: TcpMode::Server,
             address: address.to_string(),
             allowed_peer: None,
@@ -412,6 +534,9 @@ mod tests {
         a.write_all(b"NOTPICO").unwrap();
         assert!(handshake(&mut b, false).is_err());
         let config = PicoFiTcpConfig {
+            discovery: false,
+            discovery_port: discovery_wire::PORT,
+            discovery_interface: None,
             mode: TcpMode::Server,
             address: "0.0.0.0:0".into(),
             allowed_peer: None,
@@ -423,6 +548,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let cfg = PicoFiTcpConfig {
+            discovery: false,
+            discovery_port: discovery_wire::PORT,
+            discovery_interface: None,
             mode: TcpMode::Client,
             address: address.to_string(),
             allowed_peer: None,

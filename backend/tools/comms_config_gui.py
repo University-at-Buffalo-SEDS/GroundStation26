@@ -51,8 +51,9 @@ DEFAULT_CONFIG = {
     },
     "fill_box": {
         "interface": "pico_fi_tcp",
-        "mode": "client",
-        "address": "192.168.3.20:9000",
+        "mode": "server",
+        "address": "0.0.0.0:0",
+        "discovery": True,
         "port": "/dev/ttyUSB2",
         "baud_rate": DEFAULT_BAUD_RATE,
         "spi_speed_hz": DEFAULT_SPI_SPEED_HZ,
@@ -114,6 +115,9 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument(f"--{prefix}-can-rx-id")
         parser.add_argument(f"--{prefix}-tcp-mode", choices=["client", "server"], help="Pico-Fi TCP connection direction")
         parser.add_argument(f"--{prefix}-tcp-address", help="Numeric IP:port; server binds, client connects")
+        parser.add_argument(f"--{prefix}-discovery", choices=["on", "off"], help="Discover compatible Pico-Fi hosts on Ethernet")
+        parser.add_argument(f"--{prefix}-discovery-interface", help="Ethernet interface for LAN discovery (automatic by default)")
+        parser.add_argument(f"--{prefix}-discovery-port", help="LAN discovery UDP port (default 49361)")
         parser.add_argument(f"--{prefix}-allowed-peer", help="Pico IP allowed by a TCP server")
         for field in ["bus", "addr", "protocol-version"]:
             parser.add_argument(f"--{prefix}-i2c-{field}", help="I2C parameter (decimal or 0x hexadecimal)")
@@ -240,7 +244,9 @@ def normalize_config(cfg: dict) -> dict:
     merged.update({k: v for k, v in cfg.items() if k not in {"av_bay", "fill_box"}})
     for name in ("av_bay", "fill_box"):
         merged[name].update(cfg.get(name, {}))
-        for field, default in {"mode":"client", "address":"127.0.0.1:9000", "allowed_peer":None,
+        if cfg.get(name) and "discovery" not in cfg[name]:
+            merged[name]["discovery"] = False
+        for field, default in {"mode":"client", "address":"127.0.0.1:9000", "allowed_peer":None, "discovery":False, "discovery_port":49361, "discovery_interface":None,
                                "bus":1, "addr":0x55, "protocol_version":2,
                                "chunk_delay_ms":0, "initial_wait_ms":0}.items():
             merged[name].setdefault(field, default)
@@ -276,21 +282,33 @@ def validate_config(cfg: dict) -> dict:
         if item["interface"] == "pico_fi_tcp":
             if item["mode"] not in {"client", "server"}:
                 raise ValueError(f"{name} TCP mode must be client or server")
+            discovery = item.get("discovery", False)
+            if isinstance(discovery, str):
+                if discovery.lower() not in {"on", "off", "true", "false"}:
+                    raise ValueError(f"{name} discovery must be on or off")
+                discovery = discovery.lower() in {"on", "true"}
+            item["discovery"] = bool(discovery)
+            item["discovery_port"] = int(item.get("discovery_port", 49361))
+            if not 1 <= item["discovery_port"] <= 65535:
+                raise ValueError(f"{name} discovery UDP port must be 1–65535")
+            item["discovery_interface"] = item.get("discovery_interface") or None
             address = item["address"]
             try:
                 host, port = address.rsplit(":", 1)
                 ip = ipaddress.ip_address(host.strip("[]"))
                 if ":" in host and not (host.startswith("[") and host.endswith("]")):
                     raise ValueError("IPv6 requires brackets")
-                if not 1 <= int(port) <= 65535:
+                if not (0 if discovery else 1) <= int(port) <= 65535:
                     raise ValueError("port must be 1–65535")
             except (ValueError, AttributeError) as exc:
                 raise ValueError(f"{name} TCP address must be a numeric IP:port") from exc
+            if discovery and ip.version != 4:
+                raise ValueError(f"{name} discovery requires IPv4")
             peer = item.get("allowed_peer")
             if peer:
                 try: ipaddress.ip_address(peer)
                 except ValueError as exc: raise ValueError(f"{name} allowed peer must be a numeric IP") from exc
-            if item["mode"] == "server" and not ip.is_loopback and not peer:
+            if item["mode"] == "server" and not ip.is_loopback and not peer and not discovery:
                 raise ValueError(f"{name} TCP server requires an allowed Pico peer IP")
             item["allowed_peer"] = peer or None
             continue
@@ -414,7 +432,7 @@ def build_help_lines(cfg: dict, env: EnvironmentInfo) -> list[str]:
     if any(cfg[name]["interface"] == "pico_fi_tcp" for name in ("av_bay", "fill_box")):
         lines += ["Pico-Fi TCP:", "- Uses the Pi's existing Ethernet interface; no I2C required.",
                   "- Client connects to the Pico; server listens for its connection.",
-                  "- Use a separate TCP port from the web UI. Public listeners require the Pico peer IP.",
+                  "- Use a separate TCP port from the web UI. Discovery permits dynamic Pico addresses; manual public listeners require a peer IP.",
                   "- Firmware must use the PICOFI1 handshake and B5 4E packet framing.", ""]
     wants_gpio_uart = any(cfg[name]["interface"] == "raspberry_pi_gpio_uart" for name in ("av_bay", "fill_box"))
     wants_spi = any(cfg[name]["interface"] == "spi" for name in ("av_bay", "fill_box"))
@@ -526,6 +544,7 @@ def apply_cli_overrides(cfg: dict, args: argparse.Namespace) -> dict:
         set_link_field(cfg, key, "can_tx_id", getattr(args, f"{prefix.replace('-', '_')}_can_tx_id"))
         set_link_field(cfg, key, "can_rx_id", getattr(args, f"{prefix.replace('-', '_')}_can_rx_id"))
         for field, suffix in {"mode":"tcp_mode", "address":"tcp_address", "allowed_peer":"allowed_peer",
+                              "discovery":"discovery", "discovery_interface":"discovery_interface", "discovery_port":"discovery_port",
                               "bus":"i2c_bus", "addr":"i2c_addr", "protocol_version":"i2c_protocol_version"}.items():
             set_link_field(cfg, key, field, getattr(args, f"{prefix.replace('-', '_')}_{suffix}", None))
     return validate_config(cfg)
@@ -565,6 +584,8 @@ def configure_link_tui(link_label: str, link_key: str, cfg: dict, env: Environme
     if interface_name == "pico_fi_tcp":
         current["mode"] = prompt_choice("TCP mode", ["client", "server"], current["mode"])
         current["address"] = prompt("TCP IP:port", current["address"])
+        current["discovery"] = prompt_choice("Automatic discovery", ["on", "off"], "on" if current.get("discovery") else "off") == "on"
+        current["discovery_interface"] = prompt("Ethernet interface (blank for automatic)", current.get("discovery_interface") or "") or None
         current["allowed_peer"] = prompt("Allowed Pico IP (server)", current.get("allowed_peer") or "") or None
         return
     if interface_name == "i2c":
@@ -710,7 +731,7 @@ if TK_AVAILABLE:
             ttk.Entry(parent, textvariable=widgets.can_rx_var).grid(row=row, column=8, sticky="ew", pady=6)
             self.link_widgets[key] = widgets
             groups = {
-                "pico_fi_tcp": [("mode", "TCP mode"), ("address", "IP:port"), ("allowed_peer", "Allowed Pico IP")],
+                "pico_fi_tcp": [("mode", "TCP mode"), ("address", "IP:port"), ("allowed_peer", "Allowed Pico IP"), ("discovery", "Discovery (on/off)"), ("discovery_interface", "Ethernet interface")],
                 "i2c": [("bus", "Bus"), ("addr", "Address"), ("protocol_version", "Protocol (1 or 2)")],
             }
             for interface, fields in groups.items():
@@ -718,7 +739,7 @@ if TK_AVAILABLE:
                 extra.grid(row=4+row, column=0, columnspan=9, sticky="ew")
                 widgets.extra_frames[interface] = extra
                 for index, (field, title) in enumerate(fields):
-                    variable = tk.StringVar(value=str(cfg[field]) if cfg.get(field) is not None else "")
+                    variable = tk.StringVar(value=("on" if cfg[field] else "off") if field == "discovery" else (str(cfg[field]) if cfg.get(field) is not None else ""))
                     widgets.extra_vars[field] = variable
                     ttk.Label(extra, text=title).grid(row=0, column=index*2, padx=6)
                     if field == "mode":

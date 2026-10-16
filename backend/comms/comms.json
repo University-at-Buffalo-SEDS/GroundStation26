@@ -8,7 +8,9 @@
   },
   "fill_box": {
     "interface": "pico_fi_tcp",
-    "mode": "client",
-    "address": "192.168.3.20:9000"
+    "mode": "server",
+    "address": "0.0.0.0:0",
+    "discovery": true,
+    "discovery_port": 49361
   }
 }

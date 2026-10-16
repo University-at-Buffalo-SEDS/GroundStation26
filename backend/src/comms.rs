@@ -192,7 +192,7 @@ pub fn open_link(cfg: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> 
 
 pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
     match cfg {
-        CommsLinkConfig::PicoFiTcp { .. } => "Check the Pico Ethernet address/port, opposite client/server mode, allowed peer IP, and PICOFI1 firmware. The TCP port is separate from the web UI port.".into(),
+        CommsLinkConfig::PicoFiTcp { .. } => "Check Ethernet discovery, opposite client/server mode, DHCP/link-local addressing, and PICOFI1 firmware. Manual endpoints require matching addresses and peer settings. The TCP port is separate from the web UI port.".into(),
         CommsLinkConfig::Serial { serial } | CommsLinkConfig::CustomSerial { serial } => {
             format!(
                 "Check that {} exists, is the correct serial device, and is not already in use. Prefer a stable /dev/serial/by-id path when available.",

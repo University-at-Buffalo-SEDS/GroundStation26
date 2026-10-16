@@ -25,14 +25,20 @@
         "Pi currently marks every remote board stale despite incoming numeric-sender status packets; investigate mapping and running binary/dependency state before inferring sensor loss.",
         "User reports 0.5\u20131.5 seconds GS-to-AV-bay managed-variable latency."
       ],
-      "progress": "Reproduced queued ACK redirection after return-cache eviction and echo; freeze the selected destination in the existing queue entry, with Router and Relay regressions. RF register capture proves SEDS_IO admission refusals: wire its existing protected work class, account exact TLSF free space and materialize full scratch in allocator regressions. RF byte-ring and circular UART DMA remove short-IDLE slot exhaustion and rearm gaps; apply circular DMA to both gateways. Both 16-second linked transports pass all three managed rounds within 140\u2013240 ms, with zero sampled UART errors. Exact 4.2.3 seven-MCU 600-second runs are in progress; sustained-loss elimination is not yet qualified. Read-only linked traces prove gateway CAN receive returns SEDS_IO for two consecutive valve battery reports despite successful valve publication; sampled CPU fault/UART errors remain zero. Fair bulk reclamation passes Router/Relay allocation regressions but alone does not eliminate all I2C gaps. New candidate avoids replacing optional compression entries under pressure when route/type/peer state is already warm. Cold peer/type and managed-role-change refusal regressions pass. All eight final macOS factory builds and both Jupiter bridge builds pass. Linked requalification is running; no release yet."
+      "progress": "Qualification remains in progress. Both initial 25-second gates passed; paired 600-second runs then failed the unchanged 500 ms managed-receipt limit after the GS restart at 200 simulated seconds. Failed partial captures are retained, not qualified. Read-only traces reproduced async CAN-copy reserve loss and double-charging decode work, then isolated the remaining child receipt to actuator AB. Actuator returned SEDS_IO with 5912 bytes free while using legacy ordinary admission, accepting only after a temporary allocation expired. All five leaf adapters now retain bounded protected-control admission, full decoder estimates, 512-byte emergency headroom and ordinary 4 KiB bulk reserve. Actual callback-registration/allocator regressions reproduce the old refusal and pass; all board native suites and macOS/Jupiter factory builds pass. A separate SDK regression repairs frozen-control physical callback priority for foreign routers; standalone Relay already preserves queue classification. Both matching transport and focused service-restart gates precede another full 600-second run. No hardware or live Pi service is changed; publication remains gated."
     },
     {
       "id": "ethernet",
       "status": "in_progress",
-      "scope": "Optional Pico-Fi TCP client and server instead of I2C, using existing Pi Ethernet; bounded frame decoding, reconnect, disconnect/backpressure, and configurable setup; confirm shared web port requirement",
-      "validation": "Loopback protocol tests plus simulator network fault/reconnect cases",
-      "progress": "Bounded TCP client/server PICOFI1 transport, reconnect and configuration implemented; six real loopback tests pass on macOS and Ubuntu ARM64. Actual bounded simulator TCP peer and I2C v2 model pass short linked checks with fragmented framing, duplex traffic and protected controls. Both transports are undergoing the 600-second restart/fault qualification."
+      "scope": "Use the Pi main Ethernet for gateway Pico-Fi TCP and UI/mobile clients. GroundStation hosts by default; discover compatible hosts in both directions without fixed IPs. Support DHCP and link-local fallback with conflict handling, bounded framing, reconnect/backpressure and setup. I2C deployment work excluded.",
+      "validation": [
+        "Real loopback and isolated-LAN discovery with GS server/Pico client and reverse roles",
+        "Malformed/incompatible/stale discovery replies, multiple compatible hosts and reconnect after address changes",
+        "DHCP success, no-DHCP link-local fallback, ARP address conflicts and DHCP recovery",
+        "Keep discovery on Ethernet; do not forward discovery onto RFD, CAN or application-command queues",
+        "Full linked command/ACK/freshness qualification with existing limits"
+      ],
+      "progress": "Automatic host discovery and DHCP/probed IPv4LL implemented. Mac flight/HITL/test-fire and Pi Ubuntu ARM64 suites pass (304/297/305 and 311 tests respectively, one ignored per suite). Pico commit ef7a2e2 passes 35 native + 2 integration tests and both role builds. Simulator native discovery/reconnect tests pass. Seven-board discovery qualification is rerunning after fixing diagnostics-output permissions; original SDK986ca72 600-second TCP soak passed its forced GS restart and remains running. No I2C work or live Pi network changes."
     },
     {
       "id": "aiming-data",
@@ -108,7 +114,7 @@
       "status": "in_progress",
       "scope": "Run current simulator on Jupiter with current firmware, GS, SDK and bridge; targeted failures then extended soak; commit/push relevant fixes",
       "validation": "Command/variable delivery latency, per-board battery freshness, reconnects, bounded memory and no crashes; record limits and distinguish simulation from hardware validation",
-      "progress": "All eight macOS TLSF+compact factory builds and all seven Jupiter linked-firmware factory builds pass against the 4.2.3 candidate. SDK full build.py test passes; packaging dry-run rerun after release milestone metadata correction. Backend profiles pass on macOS (291 HITL, 299 test-fire, 298 flight; one ignored each), Ubuntu ARM64 298/one ignored; final 19 host radio tests pass. Both exact-candidate 600-second linked MCU runs are in progress with the 500 ms managed deadline, reconnects, fresh valve power, scheduled ACKs and memory/error guards. The first 4.2.3 I2C long run failed the freshness guard at about 69 virtual seconds (3010 ms battery gap). Capture release423-i2c-stale-partial retains evidence; 32 Pico mailbox evictions include SDT template frames. Release remains blocked. TCP continues independently. Packed 8 KiB mailboxes and paused network readers now have burst/wrap/backpressure regressions and paired Pico builds; corrected I2C run is being prepared. The packed-mailbox run then failed at about 19 virtual seconds without queue rejection/eviction; saved release423-packed-i2c-stale-partial. Pico repair is necessary but insufficient. A read-only Renode instruction-hook capture now correlates valve publication, gateway CAN RX return codes and UART admission. No new sensor-priority policy is assumed without that evidence. Read-only linked traces prove gateway CAN receive returns SEDS_IO for two consecutive valve battery reports despite successful valve publication; sampled CPU fault/UART errors remain zero. Fair bulk reclamation passes Router/Relay allocation regressions but alone does not eliminate all I2C gaps. New candidate avoids replacing optional compression entries under pressure when route/type/peer state is already warm. Cold peer/type and managed-role-change refusal regressions pass. All eight final macOS factory builds and both Jupiter bridge builds pass. Linked requalification is running; no release yet. SDK 14f863d release dry run passes 523 default and 542 compact-compression/fair-admission tests, package verification and wheel build; installed wheel passes all 28 Python tests without skips. New 25-second I2C linked run passes. TCP short run fails one FC buzzer receipt deadline; a separate read-only radio/FC ACK trace passes all three rounds in 160\u2013210 ms. Repeat tracing is underway; release remains blocked pending intermittent receipt failure and 600-second runs."
+      "progress": "Supported transport is now main Ethernet PICOFI1 TCP, per user instruction. Its short/restart gates passed and managed updates recovered in 170\u2013180 ms after service restart, but the 600-second candidate failed Valve power freshness at about 180 seconds. Failed partials are retained. Native testing now reproduces compact reconstruction bypassing dominant-sender reclamation; SDK 0e36f5d repairs both Router and Relay without reducing work estimates/reserves. All eight macOS and seven Jupiter factory builds pass. New TCP short/restart/600-second qualification is starting on the matching image. I2C deployment work has stopped. No release, hardware actuation or live Pi service restart."
     }
   ],
   "platform_matrix": [
@@ -177,6 +183,11 @@
       "id": "pico-short-frame-mailbox-eviction",
       "status": "candidate_fix",
       "finding": "Long I2C capture logs 32 mailbox evictions including SDT templates, then valve battery stale gaps. Eight inline 4 KiB slots exhausted count long before byte capacity. Replace storage with an 8 KiB byte ring and 128 I2C packet descriptors, saving about 47 KiB across I2C queues. Network replies use non-evicting admission and readers pause while still servicing host-to-network requests. Apply to SPI replies too. Native burst, wrapping, ownership and wakeup tests plus paired builds pass; linked requalification pending."
+    },
+    {
+      "id": "compact-telemetry-fair-admission",
+      "status": "candidate_fix",
+      "finding": "Supported TCP soak reproduced both Valve power channels going stale at about 180 simulated seconds without sampled CPU/allocator faults. Gateway instruction trace also proves successful Valve publication followed by SEDS_IO admission refusal. Compact reconstruction bypassed dominant-sender reclamation, unlike canonical ingress. A real-allocation regression fails before repair and passes for Router and standalone Relay, retaining both old and new low-rate reports, CRC validation, full work estimates and the 4 KiB reserve. SDK 0e36f5d, all seven Jupiter/eight macOS factory builds pass; new TCP short/restart/full soak pipeline underway. No qualified 600-second verdict yet."
     }
   ],
   "operator_procedure_requirements": {
@@ -204,8 +215,15 @@
       "Embedded media: shared login, fake-camera WebRTC publishing, hidden-tab persistence, open mic/PTT, logout and permission loss.",
       "Broadcast program: H.264 playback, single decoder, sound, portrait grid, delay changes, camera/server loss and 2D fallback.",
       "All 55 dashboard command buttons dispatch exactly once through an isolated WebSocket; reset confirmation acceptance sends once and cancellation sends none.",
-      "Final macOS backend: HITL 291, test-fire 299, flight 298 passed, one ignored each; Ubuntu ARM64 backend 298 passed, one ignored. Native UI 96 passed/seven ignored. All eight macOS factory builds pass for the 4.2.3 candidate."
+      "Final macOS backend: HITL 291, test-fire 299, flight 298 passed, one ignored each; Ubuntu ARM64 backend with Raspberry Pi support 305 passed, one ignored. Native UI 96 passed/seven ignored. All eight macOS factory builds pass for the 4.2.3 candidate."
     ],
-    "remaining": "Exact-candidate 600-second linked I2C and TCP soaks, publication, registry-only builds and final commit/push. Physical phone compass/camera/audio, native iOS/Android packaging and RFD field tests remain unavailable."
+    "remaining": "Exact-candidate 600-second linked TCP soak, publication, registry-only builds and final commit/push. I2C removed from deployment by user instruction. Physical phone compass/camera/audio, native iOS/Android packaging and RFD field tests remain unavailable."
+  },
+  "transport_decision": {
+    "date": "2026-10-16",
+    "source": "User instruction",
+    "supported": "Pi main Ethernet for gateway Pico-Fi TCP and browser/mobile clients; separate service ports on the same physical interface",
+    "excluded": "No further I2C deployment work or I2C release qualification",
+    "endpoint": "Automatic compatible-host discovery; GroundStation hosts by default. Pico uses DHCP or an address selected when DHCP is unavailable. Reverse GS-client/Pico-server discovery must also work."
   }
 }

@@ -14,6 +14,7 @@ spec.loader.exec_module(m)
 class CommsSetupTests(unittest.TestCase):
     def config(self, **options):
         cfg=m.normalize_config({})
+        cfg['fill_box']['discovery']=False
         cfg['fill_box'].update(interface='pico_fi_tcp', **options)
         return cfg
 
@@ -25,8 +26,9 @@ class CommsSetupTests(unittest.TestCase):
         shipped=m.validate_config(m.load_config(m.default_config_path()))
         for config in (cfg,shipped):
             self.assertEqual(config['fill_box']['interface'],'pico_fi_tcp')
-            self.assertEqual(config['fill_box']['mode'],'client')
-            self.assertEqual(config['fill_box']['address'],'192.168.3.20:9000')
+            self.assertEqual(config['fill_box']['mode'],'server')
+            self.assertTrue(config['fill_box']['discovery'])
+            self.assertEqual(config['fill_box']['address'],'0.0.0.0:0')
 
     def test_tcp_client_and_server_round_trip_preserve_other_link(self):
         for mode,address,peer in [('client','192.168.3.8:9000',None),('server','0.0.0.0:9000','192.168.3.8'),('server','[::1]:9000',None)]:
@@ -38,6 +40,15 @@ class CommsSetupTests(unittest.TestCase):
 
     def test_public_server_requires_peer_and_rejects_invalid_address(self):
         for options in [dict(mode='server',address='0.0.0.0:9000'),dict(address='example.org:9000'),dict(address='127.0.0.1:0'),dict(address='127.0.0.1:65536'),dict(address='::1:9000'),dict(allowed_peer='not-an-ip')]:
+            with self.subTest(options=options),self.assertRaises(ValueError):m.validate_config(self.config(**options))
+
+    def test_discovery_configuration_and_legacy_manual_endpoint(self):
+        self.assertFalse(m.validate_config({'fill_box': {'interface':'pico_fi_tcp','mode':'client','address':'192.0.2.1:9000'}})['fill_box']['discovery'])
+        for mode in ('client','server'):
+            cfg=m.validate_config(self.config(mode=mode,address='0.0.0.0:0',discovery='on',discovery_interface='eth0'))
+            self.assertTrue(cfg['fill_box']['discovery'])
+            self.assertEqual(cfg['fill_box']['discovery_interface'],'eth0')
+        for options in (dict(discovery='maybe'),dict(discovery=True,discovery_port=0),dict(discovery=True,address='[::1]:9000')):
             with self.subTest(options=options),self.assertRaises(ValueError):m.validate_config(self.config(**options))
 
     def test_i2c_does_not_need_a_serial_device(self):

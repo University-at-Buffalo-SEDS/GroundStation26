@@ -71,10 +71,17 @@ pub enum TcpMode {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PicoFiTcpConfig {
+    /// Find a compatible peer on the Ethernet LAN instead of pinning its IP.
+    #[serde(default)]
+    pub discovery: bool,
+    #[serde(default = "default_discovery_port")]
+    pub discovery_port: u16,
+    #[serde(default)]
+    pub discovery_interface: Option<String>,
     pub mode: TcpMode,
     /// Numeric IP:port, using the Pi's existing Ethernet interface.
     pub address: String,
-    /// Required for a server bound outside loopback; only this Pico may connect.
+    /// Optional discovery IP pin; required for manual non-loopback listeners.
     #[serde(default)]
     pub allowed_peer: Option<std::net::IpAddr>,
 }
@@ -153,6 +160,10 @@ fn default_spi_bits_per_word() -> u8 {
     8
 }
 
+fn default_discovery_port() -> u16 {
+    49361
+}
+
 fn default_can_tx_id() -> u32 {
     0x120
 }
@@ -190,8 +201,11 @@ impl Default for CommsLinksConfig {
             },
             fill_box: CommsLinkConfig::PicoFiTcp {
                 tcp: PicoFiTcpConfig {
-                    mode: TcpMode::Client,
-                    address: "192.168.3.20:9000".to_owned(),
+                    discovery: true,
+                    discovery_port: default_discovery_port(),
+                    discovery_interface: None,
+                    mode: TcpMode::Server,
+                    address: "0.0.0.0:0".to_owned(),
                     allowed_peer: None,
                 },
             },
@@ -265,12 +279,30 @@ fn apply_simulator_serial_overrides(config: &mut CommsLinksConfig) {
         if let Ok(address) = std::env::var("GS_FILL_PICO_TCP_ADDRESS") {
             config.fill_box = CommsLinkConfig::PicoFiTcp {
                 tcp: PicoFiTcpConfig {
+                    discovery: false,
+                    discovery_port: default_discovery_port(),
+                    discovery_interface: None,
                     mode: TcpMode::Client,
                     address,
                     allowed_peer: None,
                 },
             };
         }
+    }
+    if std::env::var("GS_SIMULATED_SERIAL_PTY").as_deref() == Ok("1")
+        && let Ok(port) = std::env::var("GS_FILL_PICO_DISCOVERY_PORT")
+        && let Ok(port) = port.parse::<u16>()
+    {
+        config.fill_box = CommsLinkConfig::PicoFiTcp {
+            tcp: PicoFiTcpConfig {
+                discovery: true,
+                discovery_port: port,
+                discovery_interface: None,
+                mode: TcpMode::Server,
+                address: "127.0.0.1:0".into(),
+                allowed_peer: None,
+            },
+        };
     }
     for (name, link, fallback_baud_rate) in [
         (
@@ -446,8 +478,11 @@ mod tests {
             cfg.fill_box,
             CommsLinkConfig::PicoFiTcp {
                 tcp: super::PicoFiTcpConfig {
-                    mode: super::TcpMode::Client,
-                    address: "192.168.3.20:9000".to_owned(),
+                    discovery: true,
+                    discovery_port: super::default_discovery_port(),
+                    discovery_interface: None,
+                    mode: super::TcpMode::Server,
+                    address: "0.0.0.0:0".to_owned(),
                     allowed_peer: None,
                 },
             }
