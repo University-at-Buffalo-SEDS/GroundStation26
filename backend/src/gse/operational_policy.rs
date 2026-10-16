@@ -502,16 +502,41 @@ mod tests {
         confirm_test_valves(&state, valves);
         let mut elapsed = 3000;
         let mut consumed = 0;
+        // The fake routed peer does not emit board heartbeats. Model them
+        // explicitly for this connected-procedure scenario, including slow Pi
+        // test runners; production freshness deadlines remain unchanged.
+        let refresh_boards = || {
+            for board in [
+                Board::GatewayBoard,
+                Board::ValveBoard,
+                Board::ActuatorBoard,
+                Board::DaqBoard,
+            ] {
+                state.mark_board_seen(
+                    board.sender_id(),
+                    crate::telemetry_task::get_current_timestamp_ms(),
+                );
+            }
+        };
         for (command, milestone, done) in [
             ("ValveSelfTest", Milestone::SelfTest, Phase::Idle),
             ("NitrogenTest", Milestone::NitrogenTest, Phase::Passed),
             ("StartFill", Milestone::FillTarget, Phase::Paused),
         ] {
             let cmd: TelemetryCommand = serde_json::from_value(serde_json::json!(command)).unwrap();
+            refresh_boards();
+            // The routed fixture has no physical panel. A policy refresh on
+            // Raspberry Pi correctly fails closed for its absent enable input;
+            // supply the operator's simulated enable before each request.
+            let mut policy = state.action_policy_snapshot();
+            policy.key_enabled = true;
+            policy.software_buttons_enabled = true;
+            state.set_action_policy(policy);
             assert_eq!(command_allowed(&state, &cmd), Some(true), "{command}");
             assert!(handle_command(&state, &cmd));
             for _ in 0..1200 {
                 pump_test_link(&state, &peer);
+                refresh_boards();
                 {
                     let commands = sent.lock().unwrap();
                     for (kind, bytes) in &commands[consumed..] {

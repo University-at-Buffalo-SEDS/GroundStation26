@@ -43,3 +43,5 @@ independently.
 - [Pico-Fi over Ethernet](picofi-ethernet.md): TCP client/server setup.
 
 - [Flight command controls](flight-command-controls.md): threshold meanings and custom-layout migration.
+
+- [Software acceptance](software-acceptance-2026-10-16.md): tested paths, platform results and device-validation limits.
