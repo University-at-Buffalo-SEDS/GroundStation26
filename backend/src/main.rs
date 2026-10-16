@@ -106,16 +106,16 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
 }
 
 fn network_delivery_tuning() -> sedsnet::config::RuntimeTuningConfig {
-    // RFD airtime for a 1 KiB schema chunk is about 327 ms at 64 kbps
-    // with the configured 40% link share. A 200 ms retry can duplicate a
-    // command before the modem drains one chunk, then exhaust its 1.8 s
-    // delivery window during a valid schema transfer. Initial sends remain
-    // immediate; only retransmission waits change.
+    // Radio schema frames are bounded to 256 bytes. At the configured
+    // 40% share of a 64 kbps link, one framed chunk takes under 90 ms.
+    // Retry at 250 ms so one lost receipt can recover inside a 500 ms target;
+    // 18 attempts retain the previous 4.5-second total delivery window.
     sedsnet::config::RuntimeTuningConfig {
         // Embedded peers omit the zstd decoder. Header templates still reduce
         // link overhead, but canonical payloads must remain decodable there.
         payload_compress_threshold: usize::MAX,
-        reliable_retransmit_ms: env_usize("GS_RELIABLE_RETRANSMIT_MS", 500, 100, 5000) as u32,
+        reliable_retransmit_ms: env_usize("GS_RELIABLE_RETRANSMIT_MS", 250, 100, 5000) as u32,
+        reliable_max_retries: 17,
         ..Default::default()
     }
 }
@@ -502,7 +502,8 @@ mod router_link_policy_tests {
         let tuning = super::network_delivery_tuning();
         tuning.validate().unwrap();
         if std::env::var_os("GS_RELIABLE_RETRANSMIT_MS").is_none() {
-            assert_eq!(tuning.reliable_retransmit_ms, 500);
+            assert_eq!(tuning.reliable_retransmit_ms, 250);
+            assert_eq!(tuning.reliable_max_retries, 17);
             assert!(
                 u64::from(tuning.reliable_retransmit_ms)
                     * u64::from(tuning.reliable_max_retries + 1)
