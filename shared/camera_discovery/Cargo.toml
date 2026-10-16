@@ -1,0 +1,10 @@
+[package]
+name = "gs-camera-discovery"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+tokio.workspace = true
+ring = "0.17.14"
+if-addrs = "0.15.0"

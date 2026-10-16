@@ -34,10 +34,19 @@ struct StreamConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    /// `auto` discovers the station using the shared video password.
     host: String,
+    #[serde(default)]
+    discovery_interface: Option<String>,
+    #[serde(default = "default_discovery_port")]
+    discovery_port: u16,
     port: u16,
     username: String,
     streams: Vec<StreamConfig>,
+}
+
+fn default_discovery_port() -> u16 {
+    gs_camera_discovery::PORT
 }
 
 impl Config {
@@ -54,6 +63,13 @@ impl Config {
         ensure!(
             self.port > 0 && !self.username.is_empty(),
             "port and username are required"
+        );
+        ensure!(self.discovery_port != 0, "discovery_port must be nonzero");
+        ensure!(
+            self.discovery_interface
+                .as_ref()
+                .is_none_or(|name| !name.is_empty() && name.len() <= 64),
+            "invalid discovery interface"
         );
         ensure!(self.streams.len() <= 16, "at most 16 streams are supported");
         let mut ids = HashSet::new();
@@ -219,6 +235,7 @@ fn ffmpeg_args(config: &Config, stream: &StreamConfig, password: &str) -> Vec<St
 }
 
 struct Pipeline {
+    automatic: bool,
     config: Config,
     stream: StreamConfig,
     camera: Child,
@@ -228,7 +245,16 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    async fn start(config: &Config, stream: &StreamConfig, password: &str) -> Result<Self> {
+    async fn start(
+        config: &Config,
+        stream: &StreamConfig,
+        password: &str,
+        automatic: bool,
+    ) -> Result<Self> {
+        ensure!(
+            config.host != "auto",
+            "receiver discovery has not completed"
+        );
         let mut camera = Command::new("rpicam-vid")
             .args(camera_args(stream))
             .stdin(Stdio::null())
@@ -271,6 +297,7 @@ impl Pipeline {
             }
         });
         Ok(Self {
+            automatic,
             config: config.clone(),
             stream: stream.clone(),
             camera,
@@ -285,6 +312,8 @@ impl Pipeline {
             && self.config.host == config.host
             && self.config.port == config.port
             && self.config.username == config.username
+            && self.config.discovery_interface == config.discovery_interface
+            && self.config.discovery_port == config.discovery_port
     }
 
     async fn healthy(&mut self) -> bool {
@@ -302,6 +331,7 @@ impl Pipeline {
 
 #[derive(Default, Clone, Serialize)]
 struct StreamStatus {
+    destination: Option<String>,
     state: String,
     restarts: u64,
 }
@@ -411,6 +441,8 @@ async fn run(path: PathBuf, socket_path: PathBuf) -> Result<()> {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut running = BTreeMap::<String, Pipeline>::new();
     let mut retry = BTreeMap::<String, Instant>::new();
+    let mut discovered = None;
+    let mut previous_discovery_interface = None;
     eprintln!(
         "video sender ready; control socket {}",
         socket_path.display()
@@ -423,11 +455,23 @@ async fn run(path: PathBuf, socket_path: PathBuf) -> Result<()> {
             _ = changed.changed() => {},
             _ = tick.tick() => {},
         }
-        let config = daemon.changes.borrow().clone();
+        let mut config = daemon.changes.borrow().clone();
+        let automatic = config.host == "auto";
+        if config.discovery_interface != previous_discovery_interface {
+            discovered = None;
+            previous_discovery_interface = config.discovery_interface.clone();
+        }
         let mut stop = Vec::new();
         for (id, pipeline) in &mut running {
             let wanted = config.streams.iter().find(|s| &s.id == id && s.enabled);
-            if !wanted.is_some_and(|s| pipeline.matches(&config, s)) {
+            let mut destination = config.clone();
+            if automatic {
+                destination.host = pipeline.config.host.clone();
+                destination.port = pipeline.config.port;
+            }
+            if pipeline.automatic != automatic
+                || !wanted.is_some_and(|s| pipeline.matches(&destination, s))
+            {
                 stop.push((id.clone(), false));
             } else if !pipeline.healthy().await {
                 stop.push((id.clone(), true));
@@ -438,6 +482,7 @@ async fn run(path: PathBuf, socket_path: PathBuf) -> Result<()> {
                 pipeline.stop().await;
             }
             if failed {
+                discovered = None;
                 retry.insert(id.clone(), Instant::now() + Duration::from_secs(3));
             }
             eprintln!(
@@ -448,6 +493,41 @@ async fn run(path: PathBuf, socket_path: PathBuf) -> Result<()> {
                     "applying configuration"
                 }
             );
+        }
+        if automatic
+            && discovered.is_none()
+            && let Some(pipeline) = running.values().next()
+        {
+            discovered = pipeline
+                .config
+                .host
+                .parse()
+                .ok()
+                .map(|ip| std::net::SocketAddr::new(ip, pipeline.config.port));
+        }
+        if automatic && running.is_empty() && config.streams.iter().any(|stream| stream.enabled) {
+            // A failed publish discards the old address. Resolve again rather than
+            // persisting a DHCP address or endlessly retrying the obsolete peer.
+            discovered = match gs_camera_discovery::targets(
+                config.discovery_port,
+                config.discovery_interface.as_deref(),
+            ) {
+                Ok(targets) => match gs_camera_discovery::discover(&targets, &password).await {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        eprintln!("camera discovery: {error}");
+                        None
+                    }
+                },
+                Err(error) => {
+                    eprintln!("camera discovery: {error}");
+                    None
+                }
+            };
+        }
+        if automatic && let Some(endpoint) = discovered {
+            config.host = endpoint.ip().to_string();
+            config.port = endpoint.port();
         }
         daemon
             .status
@@ -462,8 +542,15 @@ async fn run(path: PathBuf, socket_path: PathBuf) -> Result<()> {
                 .get(&stream.id)
                 .cloned()
                 .unwrap_or_default();
+            status.destination = if automatic && discovered.is_none() {
+                None
+            } else {
+                Some(format!("{}:{}", config.host, config.port))
+            };
             if !stream.enabled {
                 status.state = "disabled".into();
+            } else if automatic && discovered.is_none() && !running.contains_key(&stream.id) {
+                status.state = "discovering groundstation".into();
             } else if running.contains_key(&stream.id) {
                 status.state = "running".into();
             } else if retry
@@ -473,7 +560,7 @@ async fn run(path: PathBuf, socket_path: PathBuf) -> Result<()> {
                 status.state = "retrying".into();
             } else {
                 status.restarts += 1;
-                match Pipeline::start(&config, stream, &password).await {
+                match Pipeline::start(&config, stream, &password, automatic).await {
                     Ok(pipeline) => {
                         running.insert(stream.id.clone(), pipeline);
                         status.state = "running".into();
@@ -539,6 +626,21 @@ mod tests {
     use super::*;
     fn example() -> Config {
         serde_json::from_str(include_str!("../config.example.json")).unwrap()
+    }
+
+    #[test]
+    fn automatic_and_existing_fixed_destinations_validate_without_rewriting_host() {
+        let automatic = example();
+        assert_eq!(automatic.host, "auto");
+        assert_eq!(automatic.discovery_port, 49362);
+        automatic.validate().unwrap();
+        let mut fixed = automatic.clone();
+        fixed.host = "192.168.7.3".into();
+        fixed.validate().unwrap();
+        let updated = updated_config(&automatic, "front", "fps", json!(25)).unwrap();
+        assert_eq!(updated.host, "auto");
+        fixed.discovery_port = 0;
+        assert!(fixed.validate().is_err());
     }
 
     #[test]

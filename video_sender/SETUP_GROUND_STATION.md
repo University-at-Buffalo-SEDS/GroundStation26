@@ -1,5 +1,7 @@
 # Ground Station receiver: native/systemd setup
 
+For changing LAN addresses, see [automatic GroundStation discovery](DISCOVERY.md).
+
 Run these steps **on the computer running Ground Station**, such as the Pi at
 `192.168.7.3`. A Mac or Linux camera publisher only needs FFmpeg; it does not need
 MediaMTX installed locally.

@@ -1,5 +1,7 @@
 # Test video from macOS through Ground Station
 
+For changing LAN addresses, see [automatic GroundStation discovery](DISCOVERY.md).
+
 This validates **macOS FFmpeg → RTSP/TCP → Ground Station MediaMTX → backend → browser**,
 including live WebRTC and delayed HLS playback. It does not test Pi camera capture
 or SEDSNet telemetry. Examples use Ground Station at `192.168.7.3`.

@@ -5,6 +5,7 @@ edition.workspace = true
 license-file.workspace = true
 
 [dependencies]
+gs-camera-discovery = { path = "../shared/camera_discovery" }
 anyhow = "1.0.104"
 serde.workspace = true
 serde_json.workspace = true

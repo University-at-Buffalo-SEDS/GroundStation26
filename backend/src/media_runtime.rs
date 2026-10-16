@@ -12,10 +12,14 @@ const CONFIG: &str = include_str!("../config/mediamtx.yml");
 pub struct VideoRuntime {
     pub password: String,
     task: Option<tokio::task::JoinHandle<()>>,
+    discovery: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for VideoRuntime {
     fn drop(&mut self) {
+        if let Some(task) = &self.discovery {
+            task.abort();
+        }
         if let Some(task) = &self.task {
             task.abort(); // Child uses kill_on_drop, including during early backend exit.
         }
@@ -41,16 +45,43 @@ impl VideoRuntime {
     /// Video failures must not prevent telemetry and hardware control from starting.
     pub fn start() -> Self {
         let password = std::env::var("GS_VIDEO_PASSWORD").unwrap_or_default();
-        match Self::try_start(password.clone()) {
+        let mut runtime = match Self::try_start(password.clone()) {
             Ok(runtime) => runtime,
             Err(error) => {
                 log::error!("video receiver not started: {error:#}");
                 Self {
                     password,
                     task: None,
+                    discovery: None,
                 }
             }
+        };
+        // External/Compose receivers opt in with their locally reachable RTSP port.
+        // Do not advertise remote relays under this machine's address.
+        let port = std::env::var("GS_VIDEO_DISCOVERY_RTSP_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .or_else(|| runtime.task.as_ref().map(|_| 8554));
+        if std::env::var("GS_VIDEO_DISCOVERY").as_deref() != Ok("0")
+            && !runtime.password.is_empty()
+            && let Some(port) = port.filter(|port| *port != 0)
+        {
+            let secret = runtime.password.clone();
+            let address = std::env::var("GS_VIDEO_DISCOVERY_BIND")
+                .unwrap_or_else(|_| format!("0.0.0.0:{}", gs_camera_discovery::PORT));
+            runtime.discovery = Some(tokio::spawn(async move {
+                let result = async {
+                    let socket = tokio::net::UdpSocket::bind(&address).await?;
+                    log::info!("camera LAN discovery listening on {address}");
+                    gs_camera_discovery::serve(socket, port, &secret).await
+                }
+                .await;
+                if let Err(error) = result {
+                    log::warn!("camera LAN discovery unavailable: {error}");
+                }
+            }));
         }
+        runtime
     }
 
     fn try_start(mut password: String) -> Result<Self> {
@@ -68,6 +99,7 @@ impl VideoRuntime {
             return Ok(Self {
                 password,
                 task: None,
+                discovery: None,
             });
         }
         let directory = std::env::var_os("GS_VIDEO_RUNTIME_DIR")
@@ -110,10 +142,15 @@ impl VideoRuntime {
         Ok(Self {
             password,
             task: Some(task),
+            discovery: None,
         })
     }
 
     pub async fn stop(&mut self) {
+        if let Some(task) = self.discovery.take() {
+            task.abort();
+            let _ = task.await;
+        }
         if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;
@@ -327,6 +364,7 @@ mod tests {
         });
         ready_rx.await.unwrap();
         let mut runtime = VideoRuntime {
+            discovery: None,
             password: String::new(),
             task: Some(task),
         };

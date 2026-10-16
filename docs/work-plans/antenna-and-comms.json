@@ -115,6 +115,17 @@
       "scope": "Run current simulator on Jupiter with current firmware, GS, SDK and bridge; targeted failures then extended soak; commit/push relevant fixes",
       "validation": "Command/variable delivery latency, per-board battery freshness, reconnects, bounded memory and no crashes; record limits and distinguish simulation from hardware validation",
       "progress": "Supported transport is now main Ethernet PICOFI1 TCP, per user instruction. Its short/restart gates passed and managed updates recovered in 170\u2013180 ms after service restart, but the 600-second candidate failed Valve power freshness at about 180 seconds. Failed partials are retained. Native testing now reproduces compact reconstruction bypassing dominant-sender reclamation; SDK 0e36f5d repairs both Router and Relay without reducing work estimates/reserves. All eight macOS and seven Jupiter factory builds pass. New TCP short/restart/600-second qualification is starting on the matching image. I2C deployment work has stopped. No release, hardware actuation or live Pi service restart."
+    },
+    {
+      "id": "camera-discovery",
+      "status": "complete",
+      "scope": "Discover the GroundStation RTSP receiver on the main LAN and reconnect camera publishers after address changes without fixed IP edits. Keep credentials, viewer permissions and RFD video exclusion.",
+      "validation": [
+        "Authenticated real UDP discovery and TCP reconnection on macOS and Ubuntu/Pi",
+        "Wrong password, replay, invalid service/length/port and fixed-address compatibility",
+        "Native sender and receiver builds/tests; no camera hardware available for capture test"
+      ],
+      "progress": "Implemented shared authenticated LAN discovery, automatic sender reconnect after publish/progress failure, fixed-address compatibility, interface/port selection and destination status. macOS and Ubuntu Pi each pass 5 protocol/UDP/TCP tests + 5 sender tests and strict Clippy. Pi exercises actual changed IPv4 address and port; macOS changed port without privileged loopback aliases. Mac full backend 305 pass/1 ignored and Pi 5 video lifecycle tests pass. Docker copies shared crate. Camera hardware capture/MediaMTX publishing field check remains unavailable; video is LAN-only."
     }
   ],
   "platform_matrix": [

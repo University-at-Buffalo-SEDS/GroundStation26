@@ -47,6 +47,7 @@ COPY video_sender/Cargo.toml video_sender/
 COPY video_sender/src video_sender/src
 COPY video_sender/config.example.json video_sender/
 COPY shared/gse_sequence shared/gse_sequence
+COPY shared/camera_discovery shared/camera_discovery
 
 # Top-level workspace manifest and main build script
 COPY Cargo.toml ./
