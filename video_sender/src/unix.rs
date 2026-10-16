@@ -590,11 +590,25 @@ pub async fn main() -> Result<()> {
     let socket =
         PathBuf::from(std::env::var_os("GS_VIDEO_SOCKET").unwrap_or_else(|| DEFAULT_SOCKET.into()));
     match args.first().map(String::as_str) {
+        Some("advertise") if args.len() == 2 => {
+            let port = args[1].parse::<u16>().context("RTSP port must be 1–65535")?;
+            ensure!(port != 0, "RTSP port must be 1–65535");
+            let secret = std::env::var("GS_VIDEO_PASSWORD").context("GS_VIDEO_PASSWORD is required")?;
+            ensure!(!secret.is_empty(), "GS_VIDEO_PASSWORD must not be empty");
+            let address = std::env::var("GS_VIDEO_DISCOVERY_BIND")
+                .unwrap_or_else(|_| format!("0.0.0.0:{}", gs_camera_discovery::PORT));
+            let socket = tokio::net::UdpSocket::bind(&address).await?;
+            eprintln!("camera receiver discovery ready on {}; RTSP port {port}", socket.local_addr()?);
+            tokio::select! {
+                result = gs_camera_discovery::serve(socket, port, &secret) => result.context("camera discovery listener"),
+                result = tokio::signal::ctrl_c() => result.context("shutdown signal"),
+            }
+        }
         Some("daemon") if args.len() == 2 => run(PathBuf::from(&args[1]), socket).await,
         Some("check") if args.len() == 2 => { load_config(Path::new(&args[1])).await?; println!("configuration valid"); Ok(()) },
         Some("status" | "reload") if args.len() == 1 => request(&socket, json!({"op":args[0]})).await,
         Some("set") if args.len() == 4 => request(&socket, json!({"op":"set", "stream":args[1], "field":args[2], "value":serde_json::from_str::<Value>(&args[3]).context("value must be a JSON number or boolean")?})).await,
-        _ => { eprintln!("Usage: gs-video-sender daemon CONFIG.json | check CONFIG.json | status | reload | set STREAM FIELD VALUE\nGS_VIDEO_SOCKET overrides the local control socket."); bail!("invalid arguments") }
+        _ => { eprintln!("Usage: gs-video-sender daemon CONFIG.json | check CONFIG.json | status | reload | set STREAM FIELD VALUE | advertise RTSP_PORT\nGS_VIDEO_SOCKET overrides the local control socket."); bail!("invalid arguments") }
     }
 }
 

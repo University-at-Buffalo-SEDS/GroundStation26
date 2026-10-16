@@ -39,6 +39,19 @@ GS_VIDEO_PASSWORD=<same publishing password as MediaMTX and the sender>
 GS_VIDEO_DISCOVERY_RTSP_PORT=8554
 ```
 
+For Docker bridge networking, publishing a UDP port alone does not reliably
+forward LAN broadcast discovery. Run a responder on the Linux/Pi host (or a
+container using host networking), with the same video password:
+
+```sh
+cargo build -p gs-video-sender --release
+GS_VIDEO_PASSWORD="$GS_VIDEO_PASSWORD" ./target/release/gs-video-sender advertise 8554
+```
+
+This mode only answers discovery; it does not start a camera or FFmpeg. Advertise
+the host-published RTSP port, and disable the backend's duplicate discovery with
+`GS_VIDEO_DISCOVERY=0`. Native/systemd GroundStation does not need this helper.
+
 Only advertise a receiver reachable at GroundStation's own LAN address. Remote
 external relays should retain a fixed sender destination. To disable discovery,
 set `GS_VIDEO_DISCOVERY=0`. For installations changing the discovery port, set

@@ -125,7 +125,7 @@
         "Wrong password, replay, invalid service/length/port and fixed-address compatibility",
         "Native sender and receiver builds/tests; no camera hardware available for capture test"
       ],
-      "progress": "Implemented shared authenticated LAN discovery, automatic sender reconnect after publish/progress failure, fixed-address compatibility, interface/port selection and destination status. macOS and Ubuntu Pi each pass 5 protocol/UDP/TCP tests + 5 sender tests and strict Clippy. Pi exercises actual changed IPv4 address and port; macOS changed port without privileged loopback aliases. Mac full backend 305 pass/1 ignored and Pi 5 video lifecycle tests pass. Docker copies shared crate. Camera hardware capture/MediaMTX publishing field check remains unavailable; video is LAN-only."
+      "progress": "Implemented shared authenticated LAN discovery, automatic sender reconnect after publish/progress failure, fixed-address compatibility, interface/port selection and destination status. macOS and Ubuntu Pi each pass 5 protocol/UDP/TCP tests + 5 sender tests and strict Clippy. Pi exercises actual changed IPv4 address and port; macOS changed port without privileged loopback aliases. Mac full backend 305 pass/1 ignored and Pi 5 video lifecycle tests pass. Docker copies shared crate. Camera hardware capture/MediaMTX publishing field check remains unavailable; video is LAN-only. Added standalone advertise mode for native host-network discovery in external/Compose deployments; process-level CLI tests reject invalid authentication and zero RTSP port without camera binaries. Both Mac and Pi now pass 12 camera tests and strict Clippy; independent Python wire interoperability smoke passes."
     }
   ],
   "platform_matrix": [
