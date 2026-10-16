@@ -188,6 +188,17 @@
       "id": "compact-telemetry-fair-admission",
       "status": "candidate_fix",
       "finding": "Supported TCP soak reproduced both Valve power channels going stale at about 180 simulated seconds without sampled CPU/allocator faults. Gateway instruction trace also proves successful Valve publication followed by SEDS_IO admission refusal. Compact reconstruction bypassed dominant-sender reclamation, unlike canonical ingress. A real-allocation regression fails before repair and passes for Router and standalone Relay, retaining both old and new low-rate reports, CRC validation, full work estimates and the 4 KiB reserve. SDK 0e36f5d, all seven Jupiter/eight macOS factory builds pass; new TCP short/restart/full soak pipeline underway. No qualified 600-second verdict yet."
+    },
+    {
+      "id": "gateway-uart-fragment-capacity",
+      "status": "fixed-source-pending-linked-qualification",
+      "finding": "Automatic Ethernet discovery startup exposed 4\u20135 dropped UART IDLE chunks. Renode register capture proves eight descriptors were full with only about 1.5 KiB of the existing 4 KiB payload RAM occupied; incoming 9/250/261/114-byte fragments were refused.",
+      "repair": "Both gateways pack received bytes into a 4096-byte circular buffer, preserving bounded foreground service and rejecting only true byte exhaustion. No extra RAM; old regression fails, new sanitized regression and both 130-test native suites pass. Both Mac factories and Jupiter simulator factory build.",
+      "commits": {
+        "gateway-board": "a47f741",
+        "gateway-board26": "ca6ccd6"
+      },
+      "qualification": "New discovery 25-second startup, 30-second service restart and 600-second mixed-restart gates queued/running with unchanged zero-UART-drop, 500 ms managed-variable, 3 s valve-power and 2.5 s command-ACK limits. Original SDK600s soak continues separately."
     }
   ],
   "operator_procedure_requirements": {
