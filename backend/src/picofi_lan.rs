@@ -336,7 +336,14 @@ mod tests {
         }
         host.send_to(&[0; SIZE + 1], target).unwrap();
         ready(&client.socket);
-        client.poll(false);
+        // Loopback datagrams may arrive across multiple nonblocking polls.
+        // Exercise that normal service pattern within the selection window.
+        let until = Instant::now() + Duration::from_millis(300);
+        while client.best.map(|(identity, _)| identity) != Some([3; 6]) {
+            assert!(Instant::now() < until, "compatible offers did not arrive");
+            client.poll(false);
+            std::thread::yield_now();
+        }
         assert_eq!(client.best.unwrap().0, [3; 6]);
         client.settle = Some(Instant::now());
         client.poll(false);
