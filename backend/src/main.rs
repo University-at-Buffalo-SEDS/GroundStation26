@@ -250,7 +250,7 @@ async fn wait_for_validation_reliable_delivery(
         if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
             if details != last_pending {
                 log::info!("full-bay reliable pending for {label}: {details:?}");
-                last_pending = details;
+                last_pending.clone_from(&details);
             }
         }
         let transmission_counts = tx_before
