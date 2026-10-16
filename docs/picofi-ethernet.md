@@ -45,10 +45,13 @@ Both firmware ends must match. The RFD radio UART remains 115,200 baud. Full
 network tests select the Pico1M build explicitly; set
 `SEDS_FIRMWARE_SIM_PICO_BAUD=115200` only for a deliberate lower-capacity comparison.
 
-The linked simulator defaults to `pico_fi_tcp_to_uart` host links: it binds
-a loopback Pico-Fi peer and supplies its address through
-`GS_FILL_PICO_TCP_ADDRESS` when `GS_SIMULATED_SERIAL_PTY=1`. This tests actual
-TCP framing against gateway UART firmware without involving I²C slots. The
+The board network runners default to `pico_fi_discovery_to_uart` host links.
+They supply a private UDP discovery port through `GS_FILL_PICO_DISCOVERY_PORT`
+when `GS_SIMULATED_SERIAL_PTY=1`; the Pico model discovers GroundStation's
+automatically selected TCP listener. This tests actual UDP discovery and TCP
+framing against gateway UART firmware without involving I²C slots. Set
+`SEDS_FIRMWARE_SIM_FILL_TRANSPORT=tcp` for a manual-address comparison using
+`GS_FILL_PICO_TCP_ADDRESS`. The
 I²C model supports both protocol versions; v2 retains a packet across header
 peeks, partial reads and host reconnection until a full body is read.
 

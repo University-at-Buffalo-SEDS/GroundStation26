@@ -38,7 +38,7 @@
         "Keep discovery on Ethernet; do not forward discovery onto RFD, CAN or application-command queues",
         "Full linked command/ACK/freshness qualification with existing limits"
       ],
-      "progress": "Automatic host discovery and DHCP/probed IPv4LL implemented. Mac flight/HITL/test-fire and Pi Ubuntu ARM64 suites pass (304/297/305 and 311 tests respectively, one ignored per suite). Pico commit ef7a2e2 passes 35 native + 2 integration tests and both role builds. Simulator native discovery/reconnect tests pass. Seven-board discovery qualification is rerunning after fixing diagnostics-output permissions; original SDK986ca72 600-second TCP soak passed its forced GS restart and remains running. No I2C work or live Pi network changes."
+      "progress": "Automatic host discovery and DHCP/probed IPv4LL implemented and committed. Mac flight/HITL/test-fire, Pi ARM64 full suite and both-role UDP/TCP reconnect tests pass. Pico 35 native + 2 integration tests and both role MCU builds pass. All eight board runners now default to discovered Ethernet (24 selector tests pass). Gateway UART fragment-capacity fix passes native130 in each variant, both Mac factories, and Jupiter factory. Linked discovery startup25 and service-restart30 gates pass; full600 mixed-restart soak is running. Original SDK986 networking600 soak remains running separately. I2C excluded; live Pi networking unchanged."
     },
     {
       "id": "aiming-data",
@@ -198,7 +198,7 @@
         "gateway-board": "a47f741",
         "gateway-board26": "ca6ccd6"
       },
-      "qualification": "New discovery 25-second startup, 30-second service restart and 600-second mixed-restart gates queued/running with unchanged zero-UART-drop, 500 ms managed-variable, 3 s valve-power and 2.5 s command-ACK limits. Original SDK600s soak continues separately."
+      "qualification": "Startup25 and service-restart30 PASS with zero UART drops and unchanged latency/freshness guards. Full600 mixed-restart automatic-discovery soak is running."
     }
   ],
   "operator_procedure_requirements": {
