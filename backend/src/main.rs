@@ -283,7 +283,7 @@ async fn wait_for_validation_reliable_delivery(
         // can be mistaken for successful completion.
         if delivery_ms.is_none() && elapsed_ms > latency_limit_ms {
             log::error!(
-                "full-bay reliable delivery missed latency deadline for {label}: {elapsed_ms} ms > {latency_limit_ms} ms, {pending} destination ACK(s) pending, per-type tx before/after={transmission_counts:?}"
+                "full-bay reliable delivery missed latency deadline for {label}: {elapsed_ms} ms > {latency_limit_ms} ms, {pending} destination ACK(s) pending, per-type tx before/after={transmission_counts:?}, pending deliveries={details:?}"
             );
             return false;
         }
