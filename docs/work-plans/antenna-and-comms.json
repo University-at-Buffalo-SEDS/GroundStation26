@@ -18,18 +18,18 @@
     },
     {
       "id": "diagnostics",
-      "status": "in_progress",
+      "status": "complete",
       "scope": "Determine whether stale VB battery and 0.5\u20131.5 second GS-to-AV-bay variables are caused by sender identity, sensor acquisition, queueing, or radio scheduling",
       "validation": "Capture live Pi diagnostics without actuation; reproduce identified causes in simulator and regressions",
       "observations": [
         "Pi currently marks every remote board stale despite incoming numeric-sender status packets; investigate mapping and running binary/dependency state before inferring sensor loss.",
         "User reports 0.5\u20131.5 seconds GS-to-AV-bay managed-variable latency."
       ],
-      "progress": "Candidate SDK7f1a2ad fixes bounded sender/stream fairness, scoped arena pins, obsolete per-link full-recovery cache retention and normalized-topology serialization copies. Native release541/561, Macwheel28Python, GS Mac305/298/306 and Pi312 (+1ignored), all8Mac/all7Jupiter factories pass. Immutable imagec5a95e11 with all7ReleaseBorrowedTopology passes startup25 and restart30 (all three GS boots recover;20 ACKs10\u201320ms; no freshness/fault failures). Full600 automatic-Ethernet discovery soak is running with unchanged500ms managed/3000ms power/2500ms ACK guards and zero-UART-drop requirement. No release claimed. Earlier failed candidates and actual gateway allocation trace are retained in Simulator qualification documentation; original TCP600 and separate sensor-only600 comparison passed."
+      "progress": "SDK7f1a2ad passed startup25, service-restart30 and full600 automatic-Ethernet mixed-restart qualification with all7ReleaseBorrowedTopology images. All20 command ACKs completed: VB max230ms, AB max60ms;9managed updates max260ms. No power-freshness violations, UART drops or sampled allocator/panic/stack faults. Frozen image/source/ELF/capture hashes archived in FirmwareSimulator/docs/qualification/sedsnet-4.2.3-borrowed-topology600.json. Native541/561, installedwheel28Python, GS Mac305/298/306+Pi312 and all8Mac/all7Jupiter factories pass. Publication, normal registry rebuild and final pushes remain pending."
     },
     {
       "id": "ethernet",
-      "status": "in_progress",
+      "status": "complete",
       "scope": "Use the Pi main Ethernet for gateway Pico-Fi TCP and UI/mobile clients. GroundStation hosts by default; discover compatible hosts in both directions without fixed IPs. Support DHCP and link-local fallback with conflict handling, bounded framing, reconnect/backpressure and setup. I2C deployment work excluded.",
       "validation": [
         "Real loopback and isolated-LAN discovery with GS server/Pico client and reverse roles",
@@ -38,7 +38,7 @@
         "Keep discovery on Ethernet; do not forward discovery onto RFD, CAN or application-command queues",
         "Full linked command/ACK/freshness qualification with existing limits"
       ],
-      "progress": "Candidate SDK7f1a2ad fixes bounded sender/stream fairness, scoped arena pins, obsolete per-link full-recovery cache retention and normalized-topology serialization copies. Native release541/561, Macwheel28Python, GS Mac305/298/306 and Pi312 (+1ignored), all8Mac/all7Jupiter factories pass. Immutable imagec5a95e11 with all7ReleaseBorrowedTopology passes startup25 and restart30 (all three GS boots recover;20 ACKs10\u201320ms; no freshness/fault failures). Full600 automatic-Ethernet discovery soak is running with unchanged500ms managed/3000ms power/2500ms ACK guards and zero-UART-drop requirement. No release claimed. Earlier failed candidates and actual gateway allocation trace are retained in Simulator qualification documentation; original TCP600 and separate sensor-only600 comparison passed."
+      "progress": "SDK7f1a2ad passed startup25, service-restart30 and full600 automatic-Ethernet mixed-restart qualification with all7ReleaseBorrowedTopology images. All20 command ACKs completed: VB max230ms, AB max60ms;9managed updates max260ms. No power-freshness violations, UART drops or sampled allocator/panic/stack faults. Frozen image/source/ELF/capture hashes archived in FirmwareSimulator/docs/qualification/sedsnet-4.2.3-borrowed-topology600.json. Native541/561, installedwheel28Python, GS Mac305/298/306+Pi312 and all8Mac/all7Jupiter factories pass. Publication, normal registry rebuild and final pushes remain pending."
     },
     {
       "id": "aiming-data",
@@ -114,7 +114,7 @@
       "status": "in_progress",
       "scope": "Run current simulator on Jupiter with current firmware, GS, SDK and bridge; targeted failures then extended soak; commit/push relevant fixes",
       "validation": "Command/variable delivery latency, per-board battery freshness, reconnects, bounded memory and no crashes; record limits and distinguish simulation from hardware validation",
-      "progress": "Candidate SDK7f1a2ad fixes bounded sender/stream fairness, scoped arena pins, obsolete per-link full-recovery cache retention and normalized-topology serialization copies. Native release541/561, Macwheel28Python, GS Mac305/298/306 and Pi312 (+1ignored), all8Mac/all7Jupiter factories pass. Immutable imagec5a95e11 with all7ReleaseBorrowedTopology passes startup25 and restart30 (all three GS boots recover;20 ACKs10\u201320ms; no freshness/fault failures). Full600 automatic-Ethernet discovery soak is running with unchanged500ms managed/3000ms power/2500ms ACK guards and zero-UART-drop requirement. No release claimed. Earlier failed candidates and actual gateway allocation trace are retained in Simulator qualification documentation; original TCP600 and separate sensor-only600 comparison passed."
+      "progress": "SDK7f1a2ad passed startup25, service-restart30 and full600 automatic-Ethernet mixed-restart qualification with all7ReleaseBorrowedTopology images. All20 command ACKs completed: VB max230ms, AB max60ms;9managed updates max260ms. No power-freshness violations, UART drops or sampled allocator/panic/stack faults. Frozen image/source/ELF/capture hashes archived in FirmwareSimulator/docs/qualification/sedsnet-4.2.3-borrowed-topology600.json. Native541/561, installedwheel28Python, GS Mac305/298/306+Pi312 and all8Mac/all7Jupiter factories pass. Publication, normal registry rebuild and final pushes remain pending."
     },
     {
       "id": "camera-discovery",
@@ -239,7 +239,7 @@
       "All 55 dashboard command buttons dispatch exactly once through an isolated WebSocket; reset confirmation acceptance sends once and cancellation sends none.",
       "Final macOS backend: HITL 291, test-fire 299, flight 298 passed, one ignored each; Ubuntu ARM64 backend with Raspberry Pi support 305 passed, one ignored. Native UI 96 passed/seven ignored. All eight macOS factory builds pass for the 4.2.3 candidate."
     ],
-    "remaining": "Exact-candidate 600-second linked TCP soak, publication, registry-only builds and final commit/push. I2C removed from deployment by user instruction. Physical phone compass/camera/audio, native iOS/Android packaging and RFD field tests remain unavailable."
+    "remaining": "Publication, registry-only builds and final commit/push. Physical phone compass/camera/audio, native iOS/Android packaging and RFD field tests remain unavailable."
   },
   "transport_decision": {
     "date": "2026-10-16",
