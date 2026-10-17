@@ -239,7 +239,7 @@
       "All 55 dashboard command buttons dispatch exactly once through an isolated WebSocket; reset confirmation acceptance sends once and cancellation sends none.",
       "Final macOS backend: HITL 291, test-fire 299, flight 298 passed, one ignored each; Ubuntu ARM64 backend with Raspberry Pi support 305 passed, one ignored. Native UI 96 passed/seven ignored. All eight macOS factory builds pass for the 4.2.3 candidate."
     ],
-    "remaining": "Publication, registry-only builds and final commit/push. Physical phone compass/camera/audio, native iOS/Android packaging and RFD field tests remain unavailable."
+    "remaining": "Finish fresh Ubuntu Pi registry tests and simulator image publication, then final push audit. Field phone/compass/camera/audio, native iOS/Android packaging and RFD behavior remain unavailable."
   },
   "transport_decision": {
     "date": "2026-10-16",
@@ -247,5 +247,18 @@
     "supported": "Pi main Ethernet for gateway Pico-Fi TCP and browser/mobile clients; separate service ports on the same physical interface",
     "excluded": "No further I2C deployment work or I2C release qualification",
     "endpoint": "Automatic compatible-host discovery; GroundStation hosts by default. Pico uses DHCP or an address selected when DHCP is unavailable. Reverse GS-client/Pico-server discovery must also work."
+  },
+  "release_verification": {
+    "sedsnet": "4.2.3",
+    "sdk_main": "7f1a2ad",
+    "github_release": "https://github.com/Rylan-Meilutis/SEDSnet/releases/tag/v4.2.3",
+    "crates_io": "published",
+    "release_workflow": "https://github.com/Rylan-Meilutis/SEDSnet/actions/runs/38994937379",
+    "release_workflow_status": "success",
+    "pypi": "upload skipped successfully without token; all platform wheel builds passed",
+    "macos_registry": "305 passed, one hardware test ignored; release build passed",
+    "ubuntu_pi_registry": "fresh dependency-set build running in isolated workspace",
+    "simulator_image": "publication pending",
+    "selectors": "firmware main; GroundStation version4 unchanged"
   }
 }
