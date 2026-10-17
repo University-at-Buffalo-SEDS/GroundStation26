@@ -114,7 +114,7 @@
       "status": "in_progress",
       "scope": "Run current simulator on Jupiter with current firmware, GS, SDK and bridge; targeted failures then extended soak; commit/push relevant fixes",
       "validation": "Command/variable delivery latency, per-board battery freshness, reconnects, bounded memory and no crashes; record limits and distinguish simulation from hardware validation",
-      "progress": "SDK7f1a2ad passed startup25, service-restart30 and full600 automatic-Ethernet mixed-restart qualification with all7ReleaseBorrowedTopology images. All20 command ACKs completed: VB max230ms, AB max60ms;9managed updates max260ms. No power-freshness violations, UART drops or sampled allocator/panic/stack faults. Frozen image/source/ELF/capture hashes archived in FirmwareSimulator/docs/qualification/sedsnet-4.2.3-borrowed-topology600.json. Native541/561, installedwheel28Python, GS Mac305/298/306+Pi312 and all8Mac/all7Jupiter factories pass. Publication, normal registry rebuild and final pushes remain pending."
+      "progress": "SDK7f1a2ad passed startup25, service-restart30 and full600 automatic-Ethernet mixed-restart qualification with all7ReleaseBorrowedTopology images. All20 command ACKs completed: VB max230ms, AB max60ms;9managed updates max260ms. No power-freshness violations, UART drops or sampled allocator/panic/stack faults. Frozen image/source/ELF/capture hashes archived in FirmwareSimulator/docs/qualification/sedsnet-4.2.3-borrowed-topology600.json. Native541/561, installedwheel28Python, GS Mac305/298/306+Pi312 and all8Mac/all7Jupiter factories pass. Publication, normal registry rebuild and final pushes remain pending. SEDSnet4.2.3 published on GitHub and crates.io; full release workflow green, PyPI skips without token. Registry-only GS Mac305+release and UbuntuPi312 pass (one hardware test ignored each). All source branches pushed. Only Simulator GHCR publication remains blocked by disabled repository Actions; enabling it was rejected by automatic approval review and needs user authorization."
     },
     {
       "id": "camera-discovery",
@@ -239,7 +239,7 @@
       "All 55 dashboard command buttons dispatch exactly once through an isolated WebSocket; reset confirmation acceptance sends once and cancellation sends none.",
       "Final macOS backend: HITL 291, test-fire 299, flight 298 passed, one ignored each; Ubuntu ARM64 backend with Raspberry Pi support 305 passed, one ignored. Native UI 96 passed/seven ignored. All eight macOS factory builds pass for the 4.2.3 candidate."
     ],
-    "remaining": "Finish fresh Ubuntu Pi registry tests and simulator image publication, then final push audit. Field phone/compass/camera/audio, native iOS/Android packaging and RFD behavior remain unavailable."
+    "remaining": "Simulator container publication is blocked by repository Actions enablement requiring user approval. All source, native/registry, browser and linked-simulator acceptance checks are complete. Field phone/compass/camera/audio, native iOS/Android packaging and RFD behavior remain unavailable."
   },
   "transport_decision": {
     "date": "2026-10-16",
@@ -257,8 +257,10 @@
     "release_workflow_status": "success",
     "pypi": "upload skipped successfully without token; all platform wheel builds passed",
     "macos_registry": "305 passed, one hardware test ignored; release build passed",
-    "ubuntu_pi_registry": "fresh dependency-set build running in isolated workspace",
-    "simulator_image": "publication pending",
-    "selectors": "firmware main; GroundStation version4 unchanged"
+    "ubuntu_pi_registry": "312 passed, one hardware test ignored; fresh registry dependency resolution in isolated workspace",
+    "simulator_image": "Blocked: GitHub workflow dispatch returns HTTP422 Actions disabled; automatic approval rejected persistent repository Actions enablement. No execution-permission setting changed.",
+    "selectors": "firmware main; GroundStation version4 unchanged",
+    "simulator_source_release": "https://github.com/University-at-Buffalo-SEDS/FirmwareSimulator/releases/tag/v0.4.13",
+    "firmware_ui_pico": "All existing source branches pushed. Duplicate gateway histories merged without source changes; both gateway checkouts share1dd5a06."
   }
 }
