@@ -12,12 +12,13 @@ use tokio::net::UdpSocket;
 
 pub const PORT: u16 = 49362;
 const SIZE: usize = 64;
-const MAGIC: &[u8; 8] = b"GSCAM001";
+const MAGIC: &[u8; 8] = b"GSCAM002";
 
-fn packet(kind: u8, port: u16, nonce: [u8; 16], secret: &str) -> [u8; SIZE] {
+fn packet(kind: u8, port: u16, nonce: [u8; 16], secret: &str, address: Ipv4Addr) -> [u8; SIZE] {
     let mut bytes = [0; SIZE];
     bytes[..8].copy_from_slice(MAGIC);
     bytes[8] = kind;
+    bytes[10..14].copy_from_slice(&address.octets());
     bytes[14..16].copy_from_slice(&port.to_le_bytes());
     bytes[16..32].copy_from_slice(&nonce);
     let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
@@ -26,12 +27,12 @@ fn packet(kind: u8, port: u16, nonce: [u8; 16], secret: &str) -> [u8; SIZE] {
     bytes
 }
 
-fn decode(bytes: &[u8], kind: u8, secret: &str) -> Option<(u16, [u8; 16])> {
+fn decode(bytes: &[u8], kind: u8, secret: &str) -> Option<(u16, [u8; 16], Ipv4Addr)> {
     if secret.is_empty()
         || bytes.len() != SIZE
         || &bytes[..8] != MAGIC
         || bytes[8] != kind
-        || bytes[9..14] != [0; 5]
+        || bytes[9] != 0
     {
         return None;
     }
@@ -39,10 +40,18 @@ fn decode(bytes: &[u8], kind: u8, secret: &str) -> Option<(u16, [u8; 16])> {
     hmac::verify(&key, &bytes[..32], &bytes[32..]).ok()?;
     let port = u16::from_le_bytes(bytes[14..16].try_into().ok()?);
     let nonce = bytes[16..32].try_into().ok()?;
-    if nonce == [0; 16] || (kind == 1 && port != 0) || (kind == 2 && port == 0) {
+    let address = Ipv4Addr::from(<[u8; 4]>::try_from(&bytes[10..14]).ok()?);
+    if nonce == [0; 16]
+        || (kind == 1 && (port != 0 || !address.is_unspecified()))
+        || (kind == 2
+            && (port == 0
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_broadcast()))
+    {
         return None;
     }
-    Some((port, nonce))
+    Some((port, nonce, address))
 }
 
 /// Enumerate directed LAN broadcasts afresh on every reconnect (DHCP/IPv4LL).
@@ -79,7 +88,7 @@ pub async fn discover(targets: &[SocketAddr], secret: &str) -> io::Result<Option
     SystemRandom::new()
         .fill(&mut nonce)
         .map_err(|_| io::Error::other("discovery randomness unavailable"))?;
-    let query = packet(1, 0, nonce, secret);
+    let query = packet(1, 0, nonce, secret, Ipv4Addr::UNSPECIFIED);
     let mut sent = false;
     let mut last_error = None;
     for target in targets.iter().take(16) {
@@ -101,9 +110,9 @@ pub async fn discover(targets: &[SocketAddr], secret: &str) -> io::Result<Option
             break;
         };
         let (length, peer) = result?;
-        if let Some((port, received)) = decode(&bytes[..length], 2, secret)
+        if let Some((port, received, address)) = decode(&bytes[..length], 2, secret)
             && received == nonce
-            && peer.is_ipv4()
+            && peer.ip() == std::net::IpAddr::V4(address)
             && !peer.ip().is_unspecified()
         {
             let endpoint = SocketAddr::new(peer.ip(), port);
@@ -113,6 +122,21 @@ pub async fn discover(targets: &[SocketAddr], secret: &str) -> io::Result<Option
         }
     }
     Ok(best)
+}
+
+async fn reply_address(socket: &UdpSocket, peer: SocketAddr) -> io::Result<Ipv4Addr> {
+    if let std::net::IpAddr::V4(ip) = socket.local_addr()?.ip()
+        && !ip.is_unspecified()
+    {
+        return Ok(ip);
+    }
+    // Query the kernel's current source route, including after DHCP changes.
+    let route = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    route.connect(peer).await?;
+    match route.local_addr()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_unspecified() => Ok(ip),
+        _ => Err(io::Error::other("no camera discovery IPv4 route")),
+    }
 }
 
 /// Serve signed replies at a bounded rate. Credentials never appear on the wire.
@@ -134,11 +158,18 @@ pub async fn serve(socket: UdpSocket, rtsp_port: u16, secret: &str) -> io::Resul
             continue;
         }
         received += 1;
-        if let Some((_, nonce)) = decode(&bytes[..length], 1, secret) {
+        if let Some((_, nonce, _)) = decode(&bytes[..length], 1, secret)
+            && peer.is_ipv4()
+            && !peer.ip().is_unspecified()
+            && !peer.ip().is_multicast()
+        {
+            let Ok(address) = reply_address(&socket, peer).await else {
+                continue;
+            };
             // A peer may disappear or the LAN may be renumbered between receive
             // and reply. Keep the listener alive for the next discovery attempt.
             let _ = socket
-                .send_to(&packet(2, rtsp_port, nonce, secret), peer)
+                .send_to(&packet(2, rtsp_port, nonce, secret, address), peer)
                 .await;
         }
     }
@@ -151,19 +182,70 @@ mod tests {
     #[test]
     fn rejects_bad_auth_shape_service_and_replayed_challenge() {
         let nonce = [42; 16];
-        let valid = packet(2, 8554, nonce, "secret");
-        assert_eq!(decode(&valid, 2, "secret"), Some((8554, nonce)));
+        let valid = packet(2, 8554, nonce, "secret", Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            decode(&valid, 2, "secret"),
+            Some((8554, nonce, Ipv4Addr::LOCALHOST))
+        );
         assert!(decode(&valid, 2, "other").is_none());
         assert!(decode(&valid, 1, "secret").is_none());
         assert!(decode(&valid[..63], 2, "secret").is_none());
-        assert!(decode(&packet(2, 0, nonce, "secret"), 2, "secret").is_none());
-        assert!(decode(&packet(1, 8554, nonce, "secret"), 1, "secret").is_none());
-        assert!(decode(&packet(2, 8554, [0; 16], "secret"), 2, "secret").is_none());
+        assert!(
+            decode(
+                &packet(2, 0, nonce, "secret", Ipv4Addr::LOCALHOST),
+                2,
+                "secret"
+            )
+            .is_none()
+        );
+        assert!(
+            decode(
+                &packet(1, 8554, nonce, "secret", Ipv4Addr::UNSPECIFIED),
+                1,
+                "secret"
+            )
+            .is_none()
+        );
+        assert!(
+            decode(
+                &packet(2, 8554, [0; 16], "secret", Ipv4Addr::LOCALHOST),
+                2,
+                "secret"
+            )
+            .is_none()
+        );
         for index in 0..SIZE {
             let mut corrupt = valid;
             corrupt[index] ^= 1;
             assert!(decode(&corrupt, 2, "secret").is_none(), "byte {index}");
         }
+        for address in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(224, 0, 0, 1),
+        ] {
+            assert!(decode(&packet(2, 8554, nonce, "secret", address), 2, "secret").is_none());
+        }
+        assert!(
+            decode(
+                &packet(1, 0, nonce, "secret", Ipv4Addr::LOCALHOST),
+                1,
+                "secret"
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn wildcard_listener_signs_the_current_reply_address() {
+        let receiver = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, receiver.local_addr().unwrap().port()));
+        let task = tokio::spawn(async move { serve(receiver, 8554, "secret").await });
+        assert_eq!(
+            discover(&[target], "secret").await.unwrap(),
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 8554)))
+        );
+        task.abort();
     }
 
     #[tokio::test]
@@ -221,12 +303,21 @@ mod tests {
             let mut bytes = [0; SIZE + 1];
             let (_, peer) = socket.recv_from(&mut bytes).await.unwrap();
             socket
-                .send_to(&packet(2, 8554, [9; 16], "secret"), peer)
+                .send_to(
+                    &packet(2, 8554, [9; 16], "secret", Ipv4Addr::LOCALHOST),
+                    peer,
+                )
                 .await
                 .unwrap();
             socket
                 .send_to(
-                    &packet(2, 8554, bytes[16..32].try_into().unwrap(), "other"),
+                    &packet(
+                        2,
+                        8554,
+                        bytes[16..32].try_into().unwrap(),
+                        "other",
+                        Ipv4Addr::LOCALHOST,
+                    ),
                     peer,
                 )
                 .await
@@ -234,5 +325,43 @@ mod tests {
         });
         assert!(discover(&[target], "secret").await.unwrap().is_none());
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relayed_signed_offer_cannot_redirect_to_another_address() {
+        let receiver_ip = if cfg!(target_os = "macos") {
+            // macOS needs root for additional loopback aliases. A second
+            // address already assigned to this host stays entirely local.
+            let Some(ip) = if_addrs::get_if_addrs()
+                .unwrap()
+                .into_iter()
+                .find_map(|entry| match entry.addr {
+                    if_addrs::IfAddr::V4(addr) if !addr.ip.is_loopback() => Some(addr.ip),
+                    _ => None,
+                })
+            else {
+                return;
+            };
+            ip
+        } else {
+            Ipv4Addr::new(127, 0, 0, 2)
+        };
+        let receiver = UdpSocket::bind((receiver_ip, 0)).await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let service = tokio::spawn(async move { serve(receiver, 8554, "secret").await });
+        let relay = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = relay.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut bytes = [0; SIZE + 1];
+            let (n, client) = relay.recv_from(&mut bytes).await.unwrap();
+            relay.send_to(&bytes[..n], receiver_addr).await.unwrap();
+            let (n, source) = relay.recv_from(&mut bytes).await.unwrap();
+            assert_eq!(source, receiver_addr);
+            // Relay a genuine response unchanged, without knowing its key.
+            relay.send_to(&bytes[..n], client).await.unwrap();
+        });
+        assert!(discover(&[target], "secret").await.unwrap().is_none());
+        task.await.unwrap();
+        service.abort();
     }
 }

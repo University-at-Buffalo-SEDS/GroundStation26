@@ -24,8 +24,12 @@ queries. `gs-video-sender status` shows each stream's resolved destination or
 the lowest responding IPv4 address/port wins; use different passwords to pair
 separate stations.
 
-Replies use a separate, versioned 64-byte camera discovery protocol with
-HMAC-SHA256 and a fresh 128-bit challenge. Passwords are never broadcast and a
+Replies use the separate 64-byte `GSCAM002` camera discovery protocol with
+HMAC-SHA256 and a fresh 128-bit challenge. The signed receiver IPv4 address must
+match the reply's source; forwarding a genuine reply from another address cannot
+redirect the publisher. Wildcard listeners select their current address using
+the kernel's route to the requesting camera. Rebuild the sender and GroundStation
+together so their discovery versions match. Passwords are never broadcast and a
 reply for an earlier attempt cannot redirect the current publisher. Publishing
 continues to require MediaMTX's existing username/password; discovery does not
 make streams public or change viewer permissions. Use a strong video password.

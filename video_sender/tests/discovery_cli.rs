@@ -37,7 +37,7 @@ async fn actual_responder_authenticates_and_advertises_without_camera_programs()
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let key = hmac::Key::new(hmac::HMAC_SHA256, b"isolated-test-secret");
     let mut query = [0u8; 64];
-    query[..8].copy_from_slice(b"GSCAM001");
+    query[..8].copy_from_slice(b"GSCAM002");
     query[8] = 1;
     query[16..32].fill(23);
     let tag = hmac::sign(&key, &query[..32]);
@@ -58,8 +58,9 @@ async fn actual_responder_authenticates_and_advertises_without_camera_programs()
         .unwrap();
     assert_eq!(peer, address);
     assert_eq!(length, 64);
-    assert_eq!(&reply[..8], b"GSCAM001");
+    assert_eq!(&reply[..8], b"GSCAM002");
     assert_eq!(reply[8], 2);
+    assert_eq!(reply[10..14], [127, 0, 0, 1]);
     assert_eq!(u16::from_le_bytes(reply[14..16].try_into().unwrap()), 8554);
     assert_eq!(reply[16..32], query[16..32]);
     hmac::verify(&key, &reply[..32], &reply[32..64]).unwrap();
