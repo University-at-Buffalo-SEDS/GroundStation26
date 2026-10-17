@@ -1,5 +1,5 @@
 {
-  "updated": "2026-10-16",
+  "updated": "2026-10-17",
   "constraints": [
     "Preserve firmware main and GroundStation SEDSnet version-4 dependency selectors",
     "Do not actuate outputs during diagnostics",
@@ -25,7 +25,7 @@
         "Pi currently marks every remote board stale despite incoming numeric-sender status packets; investigate mapping and running binary/dependency state before inferring sensor loss.",
         "User reports 0.5\u20131.5 seconds GS-to-AV-bay managed-variable latency."
       ],
-      "progress": "SDK7f1a2ad passed startup25, service-restart30 and full600 automatic-Ethernet mixed-restart qualification with all7ReleaseBorrowedTopology images. All20 command ACKs completed: VB max230ms, AB max60ms;9managed updates max260ms. No power-freshness violations, UART drops or sampled allocator/panic/stack faults. Frozen image/source/ELF/capture hashes archived in FirmwareSimulator/docs/qualification/sedsnet-4.2.3-borrowed-topology600.json. Native541/561, installedwheel28Python, GS Mac305/298/306+Pi312 and all8Mac/all7Jupiter factories pass. Publication, normal registry rebuild and final pushes remain pending."
+      "progress": "Complete: SDK7f1a2ad passed all-seven-board automatic-Ethernet startup25/restart30/full600 with20ACKs(VBmax230ms,ABmax60ms),9managed updates(max260ms),no power-freshness/UART-drop/sampled allocator/panic/stack faults. SEDSnet4.2.3 is published on GitHub/crates.io; release pipeline green; PyPI correctly skips without token. Normal GS registry Mac305 tests+release build and UbuntuPi312 tests pass, one hardware test ignored per mode. Native AMD64/ARM64 simulator images built manually and passed complete packaged checks and anonymous pull/run; publicv0.4.13/latest/STM32 aliases sharesha256:cc62b61c395704474b9300429f052220ffc76bca9fdbabeae1e6be75ecc49e83. All source branches pushed. Proofs are in FirmwareSimulator/docs/qualification."
     },
     {
       "id": "ethernet",
@@ -38,7 +38,7 @@
         "Keep discovery on Ethernet; do not forward discovery onto RFD, CAN or application-command queues",
         "Full linked command/ACK/freshness qualification with existing limits"
       ],
-      "progress": "SDK7f1a2ad passed startup25, service-restart30 and full600 automatic-Ethernet mixed-restart qualification with all7ReleaseBorrowedTopology images. All20 command ACKs completed: VB max230ms, AB max60ms;9managed updates max260ms. No power-freshness violations, UART drops or sampled allocator/panic/stack faults. Frozen image/source/ELF/capture hashes archived in FirmwareSimulator/docs/qualification/sedsnet-4.2.3-borrowed-topology600.json. Native541/561, installedwheel28Python, GS Mac305/298/306+Pi312 and all8Mac/all7Jupiter factories pass. Publication, normal registry rebuild and final pushes remain pending."
+      "progress": "Complete: SDK7f1a2ad passed all-seven-board automatic-Ethernet startup25/restart30/full600 with20ACKs(VBmax230ms,ABmax60ms),9managed updates(max260ms),no power-freshness/UART-drop/sampled allocator/panic/stack faults. SEDSnet4.2.3 is published on GitHub/crates.io; release pipeline green; PyPI correctly skips without token. Normal GS registry Mac305 tests+release build and UbuntuPi312 tests pass, one hardware test ignored per mode. Native AMD64/ARM64 simulator images built manually and passed complete packaged checks and anonymous pull/run; publicv0.4.13/latest/STM32 aliases sharesha256:cc62b61c395704474b9300429f052220ffc76bca9fdbabeae1e6be75ecc49e83. All source branches pushed. Proofs are in FirmwareSimulator/docs/qualification."
     },
     {
       "id": "aiming-data",
@@ -111,10 +111,10 @@
     },
     {
       "id": "qualification",
-      "status": "in_progress",
+      "status": "complete",
       "scope": "Run current simulator on Jupiter with current firmware, GS, SDK and bridge; targeted failures then extended soak; commit/push relevant fixes",
       "validation": "Command/variable delivery latency, per-board battery freshness, reconnects, bounded memory and no crashes; record limits and distinguish simulation from hardware validation",
-      "progress": "SDK7f1a2ad passed startup25, service-restart30 and full600 automatic-Ethernet mixed-restart qualification with all7ReleaseBorrowedTopology images. All20 command ACKs completed: VB max230ms, AB max60ms;9managed updates max260ms. No power-freshness violations, UART drops or sampled allocator/panic/stack faults. Frozen image/source/ELF/capture hashes archived in FirmwareSimulator/docs/qualification/sedsnet-4.2.3-borrowed-topology600.json. Native541/561, installedwheel28Python, GS Mac305/298/306+Pi312 and all8Mac/all7Jupiter factories pass. Publication, normal registry rebuild and final pushes remain pending. SEDSnet4.2.3 published on GitHub and crates.io; full release workflow green, PyPI skips without token. Registry-only GS Mac305+release and UbuntuPi312 pass (one hardware test ignored each). All source branches pushed. Only Simulator GHCR publication remains blocked by disabled repository Actions; enabling it was rejected by automatic approval review and needs user authorization."
+      "progress": "Complete: SDK7f1a2ad passed all-seven-board automatic-Ethernet startup25/restart30/full600 with20ACKs(VBmax230ms,ABmax60ms),9managed updates(max260ms),no power-freshness/UART-drop/sampled allocator/panic/stack faults. SEDSnet4.2.3 is published on GitHub/crates.io; release pipeline green; PyPI correctly skips without token. Normal GS registry Mac305 tests+release build and UbuntuPi312 tests pass, one hardware test ignored per mode. Native AMD64/ARM64 simulator images built manually and passed complete packaged checks and anonymous pull/run; publicv0.4.13/latest/STM32 aliases sharesha256:cc62b61c395704474b9300429f052220ffc76bca9fdbabeae1e6be75ecc49e83. All source branches pushed. Proofs are in FirmwareSimulator/docs/qualification."
     },
     {
       "id": "camera-discovery",
@@ -138,78 +138,92 @@
     {
       "id": "rf-sim-compact-ram",
       "status": "fixed",
-      "finding": "Reused disjoint TLSF initialization bookkeeping storage and bounded counter widths, saving 16 bytes without shrinking pools. Heap and compact simulator factory builds pass; adapter regressions pass."
+      "finding": "Reused disjoint TLSF initialization bookkeeping storage and bounded counter widths, saving 16 bytes without shrinking pools. Heap and compact simulator factory builds pass; adapter regressions pass.",
+      "resolution": "Native heap/compact RAM/build regressions pass. Full linked qualification uses heap on bridges and compact on leaves."
     },
     {
       "id": "radio-fifo-control-latency",
-      "status": "candidate_fix",
-      "finding": "RF UART FIFO now reserves existing capacity for independent canonical control/ACK frames and permits bounded bypass without reordering SDT frames. Native sanitizer regressions and heap/compact firmware builds pass. Linked RF ACK timing improved; gateway ACK loss remains."
+      "status": "fixed",
+      "finding": "RF UART FIFO now reserves existing capacity for independent canonical control/ACK frames and permits bounded bypass without reordering SDT frames. Native sanitizer regressions and heap/compact firmware builds pass. Linked RF ACK timing improved; gateway ACK loss remains.",
+      "resolution": "Source regressions pass and combined supported Ethernet/radio startup, service-restart and600-second mixed-restart qualification passed. Historical candidate finding is retained above; no hardware-field guarantee is implied."
     },
     {
       "id": "valve-simulator-i2c",
-      "status": "candidate_fix",
-      "finding": "LTC2990 model lost HAL RELOAD split writes; GPIO AF read used ODR rather than external pad. Corrected both and added regressions. Valve fixture now includes both monitors and SDA/SCL pullups. Linked continuity qualification still pending."
+      "status": "fixed",
+      "finding": "LTC2990 model lost HAL RELOAD split writes; GPIO AF read used ODR rather than external pad. Corrected both and added regressions. Valve fixture now includes both monitors and SDA/SCL pullups. Linked continuity qualification still pending.",
+      "resolution": "Source regressions pass and combined supported Ethernet/radio startup, service-restart and600-second mixed-restart qualification passed. Historical candidate finding is retained above; no hardware-field guarantee is implied."
     },
     {
       "id": "pico-mailbox-fifo",
-      "status": "candidate_fix",
-      "finding": "Actual I2C v1 and SPI stage_response used try_pop_latest, silently discarding distinct queued ACKs. Changed to FIFO, removed lossy staging API, added simulator distinct-ACK regression and rebuilt paired Pico firmware. Bounded overwrite-on-full policy remains; linked queue-eviction tracing ongoing."
+      "status": "excluded_from_deployment",
+      "finding": "Actual I2C v1 and SPI stage_response used try_pop_latest, silently discarding distinct queued ACKs. Changed to FIFO, removed lossy staging API, added simulator distinct-ACK regression and rebuilt paired Pico firmware. Bounded overwrite-on-full policy remains; linked queue-eviction tracing ongoing.",
+      "resolution": "Historical native repair retained. User removed Pi I2C/SPI transport qualification from deployment; no linked I2C/SPI or hardware fix is claimed."
     },
     {
       "id": "radio-simulator-clock",
-      "status": "candidate_fix",
-      "finding": "Host radio airtime used wall-clock deadlines while firmware UART/modem ran in virtual time. Added virtual-only deadline pacing when an explicit simulator clock is configured; ordinary operation/HITL without that clock keeps Instant. Validation must measure each round transmission/ACK, not wait for unrelated schema/telemetry TX queues to become empty."
+      "status": "fixed",
+      "finding": "Host radio airtime used wall-clock deadlines while firmware UART/modem ran in virtual time. Added virtual-only deadline pacing when an explicit simulator clock is configured; ordinary operation/HITL without that clock keeps Instant. Validation must measure each round transmission/ACK, not wait for unrelated schema/telemetry TX queues to become empty.",
+      "resolution": "Source regressions pass and combined supported Ethernet/radio startup, service-restart and600-second mixed-restart qualification passed. Historical candidate finding is retained above; no hardware-field guarantee is implied."
     },
     {
       "id": "host-route-backlog",
-      "status": "candidate_fix",
-      "finding": "Detailed traces show priority-255 address/topology advertisements fill both the command allowance and its FIFO. Separate canonical route scheduling and exclude discovery/SDT from the application-control reserve while retaining accepted frames and alternating metadata turns. Regression passes; linked check pending."
+      "status": "fixed",
+      "finding": "Detailed traces show priority-255 address/topology advertisements fill both the command allowance and its FIFO. Separate canonical route scheduling and exclude discovery/SDT from the application-control reserve while retaining accepted frames and alternating metadata turns. Regression passes; linked check pending.",
+      "resolution": "Source regressions pass and combined supported Ethernet/radio startup, service-restart and600-second mixed-restart qualification passed. Historical candidate finding is retained above; no hardware-field guarantee is implied."
     },
     {
       "id": "managed-ingress-service",
-      "status": "candidate_fix",
-      "finding": "Gateway simulator receive-result capture proves FLIGHT_STATE is rejected by memory admission (four early refusals). Registered managed values with schema priority 16 also entered threaded RX at 16 rather than service priority 254. Preserve service priority and bounded protected admission without shrinking working estimates; regression reproduces old refusal and passes heap/compact. All seven candidate firmware builds pass; repeat linked check pending."
+      "status": "fixed",
+      "finding": "Gateway simulator receive-result capture proves FLIGHT_STATE is rejected by memory admission (four early refusals). Registered managed values with schema priority 16 also entered threaded RX at 16 rather than service priority 254. Preserve service priority and bounded protected admission without shrinking working estimates; regression reproduces old refusal and passes heap/compact. All seven candidate firmware builds pass; repeat linked check pending.",
+      "resolution": "Source regressions pass and combined supported Ethernet/radio startup, service-restart and600-second mixed-restart qualification passed. Historical candidate finding is retained above; no hardware-field guarantee is implied."
     },
     {
       "id": "queued-ack-echo-return-route",
-      "status": "candidate_fix",
-      "finding": "Native regression reproduces a queued radio ACK redirected by a CAN echo. Router and Relay now preserve original live ingress within the retry window; expiry and disabled-side tests retain alternate-path recovery. No additional retained state. First linked I2C/TCP checks of the initial guard pass; bounded-window refinement is undergoing rebuild/repetition."
+      "status": "fixed",
+      "finding": "Native regression reproduces a queued radio ACK redirected by a CAN echo. Router and Relay now preserve original live ingress within the retry window; expiry and disabled-side tests retain alternate-path recovery. No additional retained state. First linked I2C/TCP checks of the initial guard pass; bounded-window refinement is undergoing rebuild/repetition.",
+      "resolution": "Source regressions pass and combined supported Ethernet/radio startup, service-restart and600-second mixed-restart qualification passed. Historical candidate finding is retained above; no hardware-field guarantee is implied."
     },
     {
       "id": "rf-uart-idle-capacity",
-      "status": "candidate_fix",
-      "finding": "RF ISR ring allocated one 256-byte slot per short IDLE fragment; a native sanitizer regression reproduces exhaustion after four 13-byte fragments. Replace it with the same 1024-byte capacity stored as a byte ring, saving slot lengths. Enable USART1 hardware FIFO and add RX error/drop probes. Correct G4 simulator FIFO from 16 to eight bytes using the bundled HAL depth definitions; add UART model capacity/overrun regression. Linked repetition still required."
+      "status": "fixed",
+      "finding": "RF ISR ring allocated one 256-byte slot per short IDLE fragment; a native sanitizer regression reproduces exhaustion after four 13-byte fragments. Replace it with the same 1024-byte capacity stored as a byte ring, saving slot lengths. Enable USART1 hardware FIFO and add RX error/drop probes. Correct G4 simulator FIFO from 16 to eight bytes using the bundled HAL depth definitions; add UART model capacity/overrun regression. Linked repetition still required.",
+      "resolution": "Source regressions pass and combined supported Ethernet/radio startup, service-restart and600-second mixed-restart qualification passed. Historical candidate finding is retained above; no hardware-field guarantee is implied."
     },
     {
       "id": "rf-protected-admission-not-wired",
-      "status": "candidate_fix",
-      "finding": "Renode return-register trace proves valid managed frames return SEDS_IO under pressure. RF still used legacy two-argument admission, so registered protected controls could not use control headroom. Wire RF to extended work classes; retain full estimates and contiguous floor, use exact constant-time TLSF free accounting and a private fallback trial. Actual allocator regressions materialize the full work and verify 4 KiB general reserve, protected exhaustion and recovery."
+      "status": "fixed",
+      "finding": "Renode return-register trace proves valid managed frames return SEDS_IO under pressure. RF still used legacy two-argument admission, so registered protected controls could not use control headroom. Wire RF to extended work classes; retain full estimates and contiguous floor, use exact constant-time TLSF free accounting and a private fallback trial. Actual allocator regressions materialize the full work and verify 4 KiB general reserve, protected exhaustion and recovery.",
+      "resolution": "Source regressions pass and combined supported Ethernet/radio startup, service-restart and600-second mixed-restart qualification passed. Historical candidate finding is retained above; no hardware-field guarantee is implied."
     },
     {
       "id": "uart-normal-dma-rearm-gap",
-      "status": "candidate_fix",
-      "finding": "Read-only simulator captures show gateway UART hardware errors and RF normal-DMA receive gaps. Switch RF USART1 and both gateways USART2 to circular ReceiveToIdle with HT/TC/IDLE delta accounting; retain current DMA buffers and queues. Native tests cover partial positions, wraparound, duplicate callbacks, invalid positions and restart generation."
+      "status": "fixed",
+      "finding": "Read-only simulator captures show gateway UART hardware errors and RF normal-DMA receive gaps. Switch RF USART1 and both gateways USART2 to circular ReceiveToIdle with HT/TC/IDLE delta accounting; retain current DMA buffers and queues. Native tests cover partial positions, wraparound, duplicate callbacks, invalid positions and restart generation.",
+      "resolution": "Source regressions pass and combined supported Ethernet/radio startup, service-restart and600-second mixed-restart qualification passed. Historical candidate finding is retained above; no hardware-field guarantee is implied."
     },
     {
       "id": "pico-short-frame-mailbox-eviction",
-      "status": "candidate_fix",
-      "finding": "Long I2C capture logs 32 mailbox evictions including SDT templates, then valve battery stale gaps. Eight inline 4 KiB slots exhausted count long before byte capacity. Replace storage with an 8 KiB byte ring and 128 I2C packet descriptors, saving about 47 KiB across I2C queues. Network replies use non-evicting admission and readers pause while still servicing host-to-network requests. Apply to SPI replies too. Native burst, wrapping, ownership and wakeup tests plus paired builds pass; linked requalification pending."
+      "status": "excluded_from_deployment",
+      "finding": "Long I2C capture logs 32 mailbox evictions including SDT templates, then valve battery stale gaps. Eight inline 4 KiB slots exhausted count long before byte capacity. Replace storage with an 8 KiB byte ring and 128 I2C packet descriptors, saving about 47 KiB across I2C queues. Network replies use non-evicting admission and readers pause while still servicing host-to-network requests. Apply to SPI replies too. Native burst, wrapping, ownership and wakeup tests plus paired builds pass; linked requalification pending.",
+      "resolution": "Historical native repair retained. User removed Pi I2C/SPI transport qualification from deployment; no linked I2C/SPI or hardware fix is claimed."
     },
     {
       "id": "compact-telemetry-fair-admission",
-      "status": "candidate_fix",
-      "finding": "Supported TCP soak reproduced both Valve power channels going stale at about 180 simulated seconds without sampled CPU/allocator faults. Gateway instruction trace also proves successful Valve publication followed by SEDS_IO admission refusal. Compact reconstruction bypassed dominant-sender reclamation, unlike canonical ingress. A real-allocation regression fails before repair and passes for Router and standalone Relay, retaining both old and new low-rate reports, CRC validation, full work estimates and the 4 KiB reserve. SDK 0e36f5d, all seven Jupiter/eight macOS factory builds pass; new TCP short/restart/full soak pipeline underway. No qualified 600-second verdict yet."
+      "status": "fixed",
+      "finding": "Supported TCP soak reproduced both Valve power channels going stale at about 180 simulated seconds without sampled CPU/allocator faults. Gateway instruction trace also proves successful Valve publication followed by SEDS_IO admission refusal. Compact reconstruction bypassed dominant-sender reclamation, unlike canonical ingress. A real-allocation regression fails before repair and passes for Router and standalone Relay, retaining both old and new low-rate reports, CRC validation, full work estimates and the 4 KiB reserve. SDK 0e36f5d, all seven Jupiter/eight macOS factory builds pass; new TCP short/restart/full soak pipeline underway. No qualified 600-second verdict yet.",
+      "resolution": "Source regressions pass and combined supported Ethernet/radio startup, service-restart and600-second mixed-restart qualification passed. Historical candidate finding is retained above; no hardware-field guarantee is implied."
     },
     {
       "id": "gateway-uart-fragment-capacity",
-      "status": "fixed-source-pending-linked-qualification",
+      "status": "fixed",
       "finding": "Automatic Ethernet discovery startup exposed 4\u20135 dropped UART IDLE chunks. Renode register capture proves eight descriptors were full with only about 1.5 KiB of the existing 4 KiB payload RAM occupied; incoming 9/250/261/114-byte fragments were refused.",
       "repair": "Both gateways pack received bytes into a 4096-byte circular buffer, preserving bounded foreground service and rejecting only true byte exhaustion. No extra RAM; old regression fails, new sanitized regression and both 130-test native suites pass. Both Mac factories and Jupiter simulator factory build.",
       "commits": {
         "gateway-board": "a47f741",
         "gateway-board26": "ca6ccd6"
       },
-      "qualification": "Startup25 and service-restart30 PASS with zero UART drops and unchanged latency/freshness guards. Full600 mixed-restart automatic-discovery soak is running."
+      "qualification": "Startup25/restart30/full600 passed under unchanged limits; zero UART drops.",
+      "resolution": "Source regressions pass and combined supported Ethernet/radio startup, service-restart and600-second mixed-restart qualification passed. Historical candidate finding is retained above; no hardware-field guarantee is implied."
     }
   ],
   "operator_procedure_requirements": {
@@ -239,7 +253,7 @@
       "All 55 dashboard command buttons dispatch exactly once through an isolated WebSocket; reset confirmation acceptance sends once and cancellation sends none.",
       "Final macOS backend: HITL 291, test-fire 299, flight 298 passed, one ignored each; Ubuntu ARM64 backend with Raspberry Pi support 305 passed, one ignored. Native UI 96 passed/seven ignored. All eight macOS factory builds pass for the 4.2.3 candidate."
     ],
-    "remaining": "Simulator container publication is blocked by repository Actions enablement requiring user approval. All source, native/registry, browser and linked-simulator acceptance checks are complete. Field phone/compass/camera/audio, native iOS/Android packaging and RFD behavior remain unavailable."
+    "remaining": "Software acceptance and release steps complete. Physical phone compass/camera/audio, native iOS/Android packaging and RFD field behavior remain unavailable field checks."
   },
   "transport_decision": {
     "date": "2026-10-16",
@@ -258,7 +272,17 @@
     "pypi": "upload skipped successfully without token; all platform wheel builds passed",
     "macos_registry": "305 passed, one hardware test ignored; release build passed",
     "ubuntu_pi_registry": "312 passed, one hardware test ignored; fresh registry dependency resolution in isolated workspace",
-    "simulator_image": "Blocked: GitHub workflow dispatch returns HTTP422 Actions disabled; automatic approval rejected persistent repository Actions enablement. No execution-permission setting changed.",
+    "simulator_image": {
+      "status": "published and anonymously verified",
+      "image": "ghcr.io/university-at-buffalo-seds/firmwaresimulator:v0.4.13",
+      "digest": "sha256:cc62b61c395704474b9300429f052220ffc76bca9fdbabeae1e6be75ecc49e83",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "method": "manual native builds; organization Actions unchanged",
+      "proof": "FirmwareSimulator/docs/qualification/sedsnet-4.2.3-manual-image.json"
+    },
     "selectors": "firmware main; GroundStation version4 unchanged",
     "simulator_source_release": "https://github.com/University-at-Buffalo-SEDS/FirmwareSimulator/releases/tag/v0.4.13",
     "firmware_ui_pico": "All existing source branches pushed. Duplicate gateway histories merged without source changes; both gateway checkouts share1dd5a06."
