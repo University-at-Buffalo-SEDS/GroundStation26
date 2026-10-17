@@ -155,6 +155,7 @@ pub struct AppState {
     /// Loadcell calibration data loaded from JSON and editable at runtime.
     pub loadcell_processing: Arc<crate::loadcell_zero::Service>,
     pub network_traffic: Arc<Mutex<crate::network_traffic::Sampler>>,
+    pub network_health: Arc<Mutex<crate::network_health::Tracker>>,
     pub loadcell_calibration: Arc<Mutex<LoadcellCalibrationFile>>,
     pub auto_zero: Arc<Mutex<crate::auto_zero::Runtime>>,
     pub daq_log_session: Arc<Mutex<u64>>,
@@ -543,9 +544,19 @@ impl AppState {
 
     /// Updates heartbeat tracking for a board after a packet arrives from that sender.
     pub fn mark_board_seen(&self, sender: &str, timestamp_ms: u64) {
-        let Some(board) = self.board_from_network_sender(sender) else {
-            return;
-        };
+        let board = self.board_from_network_sender(sender);
+        if let Some(board) = board {
+            self.network_health.lock().unwrap().observe(
+                board.sender_id(), std::time::Instant::now(), timestamp_ms);
+        } else {
+            let resolved = sender.strip_prefix("@addr:")
+                .and_then(|address| address.parse::<u32>().ok())
+                .and_then(|address| self.topology_router.get()?.resolve_address(address))
+                .map(|address| address.hostname);
+            self.network_health.lock().unwrap().observe(
+                resolved.as_deref().unwrap_or(sender), std::time::Instant::now(), timestamp_ms);
+        }
+        let Some(board) = board else { return; };
         let mut map = self.board_status.lock().unwrap();
         let mut force_broadcast = false;
         if let Some(status) = map.get_mut(&board) {
@@ -747,9 +758,24 @@ impl AppState {
                 nodes: Vec::new(),
                 links: Vec::new(),
                 traffic: None,
+                health: self.network_health.lock().unwrap().snapshot(std::time::Instant::now(), cfg!(feature = "test_fire_mode")),
             };
         };
         let exported = router.export_topology();
+        let health = {
+            let mut tracker = self.network_health.lock().unwrap();
+            let now = std::time::Instant::now();
+            for route in &exported.routes {
+                for announcer in &route.announcers {
+                    tracker.announcement(&announcer.sender_id, &route.side_name,
+                        announcer.last_seen_ms, announcer.age_ms, now, now_ms);
+                    for node in &announcer.routers {
+                        tracker.membership(&node.sender_id, &route.side_name);
+                    }
+                }
+            }
+            tracker.snapshot(now, cfg!(feature = "test_fire_mode"))
+        };
         let mut traffic_sampler = self.network_traffic.lock().unwrap();
         let runtime = router.export_runtime_stats();
         let traffic = traffic_sampler.sample(std::time::Instant::now(), &runtime.sides);
@@ -943,6 +969,7 @@ impl AppState {
             nodes,
             links,
             traffic: Some(traffic),
+            health,
         }
     }
 
@@ -1505,6 +1532,7 @@ impl AppState {
     }
 
     pub fn clear_runtime_data_for_sim_reset(&self) {
+        self.network_health.lock().unwrap().clear();
         self.ring_buffer.lock().unwrap().clear();
         self.recent_telemetry_cache.lock().unwrap().clear();
         self.recent_alerts_cache.lock().unwrap().clear();
@@ -2455,6 +2483,20 @@ pub(crate) mod tests {
         assert_eq!(crate::gse::panel_name(&state, "Dump"), "Dump");
     }
 
+    #[tokio::test]
+    async fn network_health_observes_runtime_senders_and_respects_mode() {
+        let state = test_app_state().await;
+        state.mark_board_seen("RUNTIME_SENSOR", 10);
+        state.mark_board_seen("FC", 10);
+        state.mark_board_seen("VB", 10);
+        let snapshot = state.network_topology_snapshot(11);
+        assert!(snapshot.health.iter().any(|r| r.sender_id == "RUNTIME_SENSOR" && r.healthy));
+        assert!(snapshot.health.iter().any(|r| r.sender_id == "VB"));
+        assert_eq!(snapshot.health.iter().any(|r| r.sender_id == "FC"), !cfg!(feature = "test_fire_mode"));
+        state.clear_runtime_data_for_sim_reset();
+        assert!(state.network_topology_snapshot(12).health.is_empty());
+    }
+
     pub(crate) async fn test_app_state() -> Arc<AppState> {
         let db = SqlitePool::connect("sqlite::memory:")
             .await
@@ -2517,6 +2559,7 @@ pub(crate) mod tests {
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
             network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
+            network_health: Arc::new(Mutex::new(crate::network_health::Tracker::default())),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
             auto_zero: Default::default(),
             daq_log_session: Default::default(),

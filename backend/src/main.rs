@@ -34,6 +34,7 @@ mod map;
 mod media;
 mod media_runtime;
 mod network_traffic;
+mod network_health;
 mod network_variables;
 mod recording_export;
 mod recording_range;
@@ -901,6 +902,7 @@ async fn main() -> anyhow::Result<()> {
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
         network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
+            network_health: Arc::new(Mutex::new(crate::network_health::Tracker::default())),
         loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
         auto_zero: Default::default(),
         daq_log_session: Default::default(),

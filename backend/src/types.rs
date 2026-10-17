@@ -266,8 +266,25 @@ pub struct NetworkTopologyLink {
     pub status: NetworkTopologyStatus,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
+pub struct NetworkBoardHealthEntry {
+    pub sender_id: String,
+    pub healthy: bool,
+    pub age_ms: u64,
+    pub last_seen_ms: u64,
+    pub disconnects: u64,
+    pub reconnects: u64,
+    pub rx_observations: u64,
+    pub observed_ms: u64,
+    pub offline_ms: u64,
+    pub longest_outage_ms: u64,
+    pub current_outage_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]
 pub struct NetworkTopologyMsg {
+    #[serde(default)]
+    pub health: Vec<NetworkBoardHealthEntry>,
     pub generated_ms: u64,
     #[serde(default)]
     pub simulated: bool,

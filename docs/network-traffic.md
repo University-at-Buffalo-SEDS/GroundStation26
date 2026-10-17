@@ -24,3 +24,9 @@ WebSocket messages include an optional `traffic` object with `interval_ms` and
 `sides`. Each side has `side_id`, `name`, direction flags, cumulative `totals`,
 and nullable `delta`. Rate = delta × 1000 / interval_ms. Older backends omit
 this object and the UI reports backend traffic as unavailable.
+
+## Network health in Detailed Info
+
+Health cards are created from observed sender identities and fresh discovery announcers, including runtime-added senders. A disconnected board remains visible with its history. Test-fire mode excludes FC, RF, PowerBoard, RRLS and unknown rocket-only senders; fill-system boards and unknown senders observed on the umbilical link remain visible. Cached nested topology entries alone cannot mark a board alive.
+
+A board becomes unhealthy after 12 seconds without received evidence. Each outage increments disconnects once; the next fresh observation increments reconnects once. The backend retains counts across tab changes, browser reloads and client reconnections. History is scoped to the backend process and clears on simulation reset. Monotonic time determines outages, so changing UTC cannot create false disconnects. The cards also show last-receive age, availability, longest/current outage and receive observations. Observations are not exact wire packet counts, and liveness does not prove internal CPU/sensor health or absence of packet loss.

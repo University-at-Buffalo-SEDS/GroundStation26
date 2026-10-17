@@ -126,6 +126,27 @@
         "Native sender and receiver builds/tests; no camera hardware available for capture test"
       ],
       "progress": "Authenticated GSCAM002 discovery and automatic reconnect implemented for native managed receivers and standalone host-network advertisement. Sender host:auto refreshes current interfaces/addresses when reconnecting. Signed receiver IPv4 must equal UDP source, preventing relayed replies from redirecting streams. Mac and Ubuntu Pi each pass14 protocol/sender/CLI tests and strict Clippy; independently implemented Python query validates both actual release CLI binaries. Changed-address/port, wildcard-bind, authentication, replay, stall and reconnect cases covered. Camera/video remains LAN-only. Rebuild sender and backend together; real camera capture/MediaMTX field verification remains unavailable."
+    },
+    {
+      "id": "dynamic-network-health",
+      "status": "complete",
+      "scope": "Observed sender health, disconnect/reconnect history, dynamic runtime senders, mode-sensitive AV-bay filtering and responsive Detailed Info cards.",
+      "validation": "Deterministic monotonic liveness/outage/discovery tests, full backend and UI regressions, browser narrow/wide layout checks.",
+      "progress": "Dynamic backend-owned sender history and responsive Detailed Info cards implemented. Normal backend 310 pass/1 hardware ignored; test-fire 311 pass/1 ignored; HITL targeted 5 pass; UI 98 pass/7 existing ignored. Real-component browser checks pass at 320/390/844/1280 widths, retaining unhealthy/unknown boards and preserving counts on client disconnect. Full macOS native/UI Wasm builds pass. No hardware behavior changed."
+    },
+    {
+      "id": "frontend-docker-targets",
+      "status": "awaiting_validation",
+      "scope": "Docker frontend builders, explicit target listing, all device targets and all,sims expansion with per-target output.",
+      "validation": "CLI and Docker invocation tests; representative real container build; native worker requirements explicit.",
+      "progress": "Dockerfile and target selector implemented; 7 Python tests pass including all/all,sims expansion, command framing, listing, dry-run, unavailable workers and continuing after a failed target. Actual Docker build is pending: local Docker API probe did not respond; automatic approval review rejected copying UI source to Jupiter for detached Docker validation as outside prior simulator authorization. Explicit authorization requested. No remote source transfer or build occurred. Apple and Windows builds explicitly require their native workers."
+    },
+    {
+      "id": "sedsnet-cargo-cli",
+      "status": "complete",
+      "scope": "Cargo-style SEDSnet commands and flags, matching CMake invocation and migrated repository tooling/docs.",
+      "validation": "Argument/release-tool tests, actual native and embedded CMake builds, consuming board builds.",
+      "progress": "Cargo-style parser, CMake, C test and release-tool callers migrated, docs/changelog updated. Python tooling 33 tests pass with 9 existing binding-dependent skips; standalone native macOS CMake release build passes. All eight board factory images build with updated SDK build.py/CMake and existing board-prepared SDK/runtime configuration. Existing firmware build.py flags and main/v4 source policies unchanged. The native C integration harness also passes all five C executables, including runtime-schema, topology and timesync cases."
     }
   ],
   "platform_matrix": [
