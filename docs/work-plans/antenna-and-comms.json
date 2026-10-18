@@ -136,10 +136,10 @@
     },
     {
       "id": "frontend-docker-targets",
-      "status": "awaiting_validation",
+      "status": "complete",
       "scope": "Docker frontend builders, explicit target listing, all device targets and all,sims expansion with per-target output.",
       "validation": "CLI and Docker invocation tests; representative real container build; native worker requirements explicit.",
-      "progress": "Dockerfile and target selector implemented; 7 Python tests pass including all/all,sims expansion, command framing, listing, dry-run, unavailable workers and continuing after a failed target. Actual Docker build is pending: local Docker API probe did not respond; automatic approval review rejected copying UI source to Jupiter for detached Docker validation as outside prior simulator authorization. Explicit authorization requested. No remote source transfer or build occurred. Apple and Windows builds explicitly require their native workers."
+      "progress": "Local Docker Desktop recovered; user updated it to 4.95.0. Native ARM64 Web Docker build passes end to end, exporting valid Wasm/index artifacts. Web selects the native host architecture; explicit cross-platform Linux/Android targets retain their architecture. Preserve inherited Rust paths and cache required wasm-bindgen/esbuild tools in the builder image. Use checksum-verified Binaryen 133 to parse Rust 1.99 output. All 9 target/argument/batch/container-environment tests pass. No source transfer to Jupiter needed. Apple/Windows native-worker requirements remain explicit. Evidence: docs/qualification/frontend-docker-2026-10-17.json."
     },
     {
       "id": "sedsnet-cargo-cli",
