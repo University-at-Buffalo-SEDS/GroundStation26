@@ -112,10 +112,22 @@ pub struct GenericCalibrationChannel {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Kg50Input { #[default] Amp2, P6Differential }
+pub enum Kg50Input {
+    #[default]
+    Amp2,
+    P6Differential,
+}
 impl Kg50Input {
-    pub fn wire(self) -> u8 { if self == Self::P6Differential { 1 } else { 0 } }
-    fn key(self) -> &'static str { if self == Self::P6Differential { "p6_differential" } else { "amp2" } }
+    pub fn wire(self) -> u8 {
+        if self == Self::P6Differential { 1 } else { 0 }
+    }
+    fn key(self) -> &'static str {
+        if self == Self::P6Differential {
+            "p6_differential"
+        } else {
+            "amp2"
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -453,10 +465,15 @@ fn sync_extra_channels_into_legacy(cfg: &mut LoadcellCalibrationFile) {
 
 pub fn normalize_calibration(cfg: &mut LoadcellCalibrationFile) {
     if cfg.kg50_input == Kg50Input::Amp2 {
-    cfg.extra_channels.entry("kg50".into()).or_insert_with(|| GenericCalibrationChannel {
-        linear: ChannelLinear { m: Some(1.0), b: Some(0.0) },
-        ..Default::default()
-    });
+        cfg.extra_channels
+            .entry("kg50".into())
+            .or_insert_with(|| GenericCalibrationChannel {
+                linear: ChannelLinear {
+                    m: Some(1.0),
+                    b: Some(0.0),
+                },
+                ..Default::default()
+            });
     }
     sync_legacy_channels_into_extra(cfg);
     sync_extra_channels_into_legacy(cfg);
@@ -465,19 +482,32 @@ pub fn normalize_calibration(cfg: &mut LoadcellCalibrationFile) {
 
 /// Switch calibration coordinates with the physical input, retaining both profiles.
 pub fn switch_kg50_input(cfg: &mut LoadcellCalibrationFile, input: Kg50Input) {
-    if input == cfg.kg50_input { return; }
+    if input == cfg.kg50_input {
+        return;
+    }
     let previous = Kg50InputProfile {
         channel: cfg.extra_channels.remove("kg50"),
         thermal: cfg.thermal.remove("KG50"),
         noise: cfg.noise.remove("KG50"),
         captures: cfg.temperature_captures.remove("KG50").unwrap_or_default(),
     };
-    cfg.kg50_input_profiles.insert(cfg.kg50_input.key().into(), previous);
-    let next = cfg.kg50_input_profiles.remove(input.key()).unwrap_or_default();
-    if let Some(v) = next.channel { cfg.extra_channels.insert("kg50".into(), v); }
-    if let Some(v) = next.thermal { cfg.thermal.insert("KG50".into(), v); }
-    if let Some(v) = next.noise { cfg.noise.insert("KG50".into(), v); }
-    cfg.temperature_captures.insert("KG50".into(), next.captures);
+    cfg.kg50_input_profiles
+        .insert(cfg.kg50_input.key().into(), previous);
+    let next = cfg
+        .kg50_input_profiles
+        .remove(input.key())
+        .unwrap_or_default();
+    if let Some(v) = next.channel {
+        cfg.extra_channels.insert("kg50".into(), v);
+    }
+    if let Some(v) = next.thermal {
+        cfg.thermal.insert("KG50".into(), v);
+    }
+    if let Some(v) = next.noise {
+        cfg.noise.insert("KG50".into(), v);
+    }
+    cfg.temperature_captures
+        .insert("KG50".into(), next.captures);
     cfg.kg50_input = input;
     normalize_calibration(cfg);
 }
@@ -490,12 +520,19 @@ pub fn amp2_calibration(cfg: &LoadcellCalibrationFile) -> LoadcellCalibrationFil
     result
 }
 
-pub fn selected_kg50_value(input: Kg50Input, data_type: &str, values: &[Option<f32>]) -> Option<f32> {
+pub fn selected_kg50_value(
+    input: Kg50Input,
+    data_type: &str,
+    values: &[Option<f32>],
+) -> Option<f32> {
     match (input, data_type) {
         (Kg50Input::Amp2, "KG50") => values.first().copied().flatten(),
-        (Kg50Input::P6Differential, "DAQ_KG50_SELECTED") if values.first() == Some(&Some(1.0)) => values.get(1).copied().flatten(),
+        (Kg50Input::P6Differential, "DAQ_KG50_SELECTED") if values.first() == Some(&Some(1.0)) => {
+            values.get(1).copied().flatten()
+        }
         _ => None,
-    }.filter(|v| v.is_finite())
+    }
+    .filter(|v| v.is_finite())
 }
 
 /// A UI save is explicitly scoped to one calibration channel. Everything else
@@ -506,10 +543,15 @@ pub struct CalibrationUpdate {
     pub calibration: LoadcellCalibrationFile,
 }
 
-pub fn merge_channel_update(current: &LoadcellCalibrationFile, update: &CalibrationUpdate) -> Result<LoadcellCalibrationFile, String> {
+pub fn merge_channel_update(
+    current: &LoadcellCalibrationFile,
+    update: &CalibrationUpdate,
+) -> Result<LoadcellCalibrationFile, String> {
     let channel = update.channel.as_str();
     let sensor = match channel {
-        "ch1" => "KG1000", "kg50" => "KG50", "iadc" => "IADC",
+        "ch1" => "KG1000",
+        "kg50" => "KG50",
+        "iadc" => "IADC",
         _ => return Err("Unknown calibration channel".into()),
     };
     if channel == "kg50" && update.calibration.kg50_input != current.kg50_input {
@@ -519,13 +561,28 @@ pub fn merge_channel_update(current: &LoadcellCalibrationFile, update: &Calibrat
     let mut result = current.clone();
     // An omitted selected channel means an explicit reset. Keep an empty entry
     // so normalization cannot resurrect its old legacy slope, zero or points.
-    result.extra_channels.insert(channel.into(), incoming.extra_channels.get(channel).cloned().unwrap_or_default());
+    result.extra_channels.insert(
+        channel.into(),
+        incoming
+            .extra_channels
+            .get(channel)
+            .cloned()
+            .unwrap_or_default(),
+    );
     result.thermal.remove(sensor);
-    if let Some(value) = incoming.thermal.get(sensor) { result.thermal.insert(sensor.into(), value.clone()); }
+    if let Some(value) = incoming.thermal.get(sensor) {
+        result.thermal.insert(sensor.into(), value.clone());
+    }
     result.noise.remove(sensor);
-    if let Some(value) = incoming.noise.get(sensor) { result.noise.insert(sensor.into(), value.clone()); }
+    if let Some(value) = incoming.noise.get(sensor) {
+        result.noise.insert(sensor.into(), value.clone());
+    }
     result.temperature_captures.remove(sensor);
-    if let Some(value) = incoming.temperature_captures.get(sensor) { result.temperature_captures.insert(sensor.into(), value.clone()); }
+    if let Some(value) = incoming.temperature_captures.get(sensor) {
+        result
+            .temperature_captures
+            .insert(sensor.into(), value.clone());
+    }
     // Make the selected authoritative generic channel agree with legacy fields
     // before migration normalization (including explicit zero/fit removal).
     sync_extra_channels_into_legacy(&mut result);
@@ -545,16 +602,31 @@ fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> Result<(), 
     let raw =
         serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize calibration: {e}"))?;
     if let Ok(previous) = std::fs::read(&path) {
-        if previous == raw.as_bytes() { return Ok(()); }
-        let backups = path.parent().unwrap_or(std::path::Path::new(".")).join("calibration_backups");
-        std::fs::create_dir_all(&backups).map_err(|e| format!("create calibration backups: {e}"))?;
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?.as_nanos();
-        let backup = backups.join(format!("{}-{stamp}.json", path.file_stem().unwrap_or_default().to_string_lossy()));
+        if previous == raw.as_bytes() {
+            return Ok(());
+        }
+        let backups = path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("calibration_backups");
+        std::fs::create_dir_all(&backups)
+            .map_err(|e| format!("create calibration backups: {e}"))?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        let backup = backups.join(format!(
+            "{}-{stamp}.json",
+            path.file_stem().unwrap_or_default().to_string_lossy()
+        ));
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&backup)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
             .map_err(|e| format!("create calibration backup: {e}"))?;
-        file.write_all(&previous).map_err(|e| format!("save calibration backup: {e}"))?;
+        file.write_all(&previous)
+            .map_err(|e| format!("save calibration backup: {e}"))?;
     }
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, raw).map_err(|e| format!("write calibration {path:?}: {e}"))?;
@@ -1279,7 +1351,8 @@ pub fn calibrated_weight_kg(
     match sensor_id {
         "KG1000" => calibrated_channel_value(cfg, "ch1", raw),
         "KG50" => calibrated_channel_value(cfg, "kg50", raw).or_else(|| {
-            (cfg.kg50_input == Kg50Input::Amp2 && !cfg.extra_channels.contains_key("kg50")).then_some(raw)
+            (cfg.kg50_input == Kg50Input::Amp2 && !cfg.extra_channels.contains_key("kg50"))
+                .then_some(raw)
         }),
         _ => None,
     }
@@ -1291,7 +1364,9 @@ pub fn calibrated_sensor_value(
     raw: f32,
 ) -> Option<f32> {
     match sensor_id {
-        RAW_LOADCELL_DATA_TYPE_1000KG | RAW_LOADCELL_DATA_TYPE_50KG => calibrated_weight_kg(cfg, sensor_id, raw),
+        RAW_LOADCELL_DATA_TYPE_1000KG | RAW_LOADCELL_DATA_TYPE_50KG => {
+            calibrated_weight_kg(cfg, sensor_id, raw)
+        }
         RAW_PRESSURE_TRANSDUCER_DATA_TYPE => calibrated_channel_value(cfg, "iadc", raw),
         _ => None,
     }
@@ -1318,7 +1393,9 @@ pub fn kg50_daq_coefficients(cfg: &LoadcellCalibrationFile) -> Result<[f32; 7], 
         if terms[0].is_none() || terms[1].is_none() {
             return Err("50 kg polynomial calibration is incomplete".into());
         }
-        for i in 0..=degree { c[degree - i] = terms[i].unwrap_or(0.0); }
+        for i in 0..=degree {
+            c[degree - i] = terms[i].unwrap_or(0.0);
+        }
         c[5] = fit.x0.unwrap_or(0.0);
     }
     if let Some(zero) = channel.zero_raw {
@@ -1367,29 +1444,46 @@ mod tests {
     fn kg50_calibration_is_independent_and_matches_daq_polynomial_with_tare() {
         let mut cfg = LoadcellCalibrationFile::default();
         assert_eq!(calibrated_weight_kg(&cfg, "KG50", 2.0), Some(2.0));
-        cfg.extra_channels.insert("kg50".into(), GenericCalibrationChannel {
-            linear: ChannelLinear { m: Some(3.0), b: Some(4.0) },
-            zero_raw: Some(2.0),
-            ..Default::default()
-        });
+        cfg.extra_channels.insert(
+            "kg50".into(),
+            GenericCalibrationChannel {
+                linear: ChannelLinear {
+                    m: Some(3.0),
+                    b: Some(4.0),
+                },
+                zero_raw: Some(2.0),
+                ..Default::default()
+            },
+        );
         assert_eq!(calibrated_weight_kg(&cfg, "KG50", 5.0), Some(9.0));
         assert_eq!(calibrated_weight_kg(&cfg, "KG1000", 5.0), Some(5.0));
         for degree in 1..=4 {
             cfg.extra_channels.get_mut("kg50").unwrap().fit = Some(FitMeta {
-                fit_type: Some(if degree == 1 { "linear".into() } else { format!("poly{degree}") }),
-                a: Some(0.5), b: Some(-2.0), c: Some(3.0), d: Some(4.0), e: Some(1.0),
+                fit_type: Some(if degree == 1 {
+                    "linear".into()
+                } else {
+                    format!("poly{degree}")
+                }),
+                a: Some(0.5),
+                b: Some(-2.0),
+                c: Some(3.0),
+                d: Some(4.0),
+                e: Some(1.0),
                 x0: Some(1.0),
             });
             let c = kg50_daq_coefficients(&cfg).unwrap();
             for raw in [-3.0, 0.0, 2.0, 5.0] {
                 let x = raw - c[5];
-                let sd = ((((c[4]*x+c[3])*x+c[2])*x+c[1])*x+c[0])-c[6];
+                let sd = ((((c[4] * x + c[3]) * x + c[2]) * x + c[1]) * x + c[0]) - c[6];
                 assert_eq!(Some(sd), calibrated_weight_kg(&cfg, "KG50", raw));
             }
         }
         let saved = serde_json::to_string(&cfg).unwrap();
         let restored = serde_json::from_str(&saved).unwrap();
-        assert_eq!(kg50_daq_coefficients(&cfg), kg50_daq_coefficients(&restored));
+        assert_eq!(
+            kg50_daq_coefficients(&cfg),
+            kg50_daq_coefficients(&restored)
+        );
     }
 
     #[test]
@@ -1422,7 +1516,10 @@ mod tests {
         // Coefficients reconstructed from the recording; mass must remain
         // linear outside its observed -132.95 kg minimum. Only fill percentage
         // is intentionally restricted to 0..100, never the measured mass.
-        cfg.ch1 = ChannelLinear { m: Some(9977.795), b: Some(-147.32314) };
+        cfg.ch1 = ChannelLinear {
+            m: Some(9977.795),
+            b: Some(-147.32314),
+        };
         let floor = calibrated_weight_kg(&cfg, "KG1000", 0.0014401439).unwrap();
         assert!((floor + 132.95367).abs() < 0.001);
         assert!(calibrated_weight_kg(&cfg, "KG1000", 0.0).unwrap() < -147.0);
@@ -1468,14 +1565,28 @@ pub struct ThermalCalibration {
 }
 
 fn thermal_key(sensor: &str) -> &str {
-    match sensor { "ch1" | "KG1000" => "KG1000", "kg50" => "KG50", _ => sensor }
+    match sensor {
+        "ch1" | "KG1000" => "KG1000",
+        "kg50" => "KG50",
+        _ => sensor,
+    }
 }
 
-pub fn temperature_corrected_raw(cfg: &LoadcellCalibrationFile, sensor: &str,
-                                 raw: f32, temperature: Option<f32>) -> Option<f32> {
-    if !raw.is_finite() { return None; }
-    let Some(t) = cfg.thermal.get(thermal_key(sensor)) else { return Some(raw); };
-    if t.raw_per_c == 0.0 { return Some(raw); }
+pub fn temperature_corrected_raw(
+    cfg: &LoadcellCalibrationFile,
+    sensor: &str,
+    raw: f32,
+    temperature: Option<f32>,
+) -> Option<f32> {
+    if !raw.is_finite() {
+        return None;
+    }
+    let Some(t) = cfg.thermal.get(thermal_key(sensor)) else {
+        return Some(raw);
+    };
+    if t.raw_per_c == 0.0 {
+        return Some(raw);
+    }
     let temperature = temperature.filter(|t| t.is_finite() && (-40.0..=125.0).contains(t))?;
     let value = raw - t.raw_per_c * (temperature - t.reference_c);
     value.is_finite().then_some(value)
@@ -1483,50 +1594,84 @@ pub fn temperature_corrected_raw(cfg: &LoadcellCalibrationFile, sensor: &str,
 
 pub fn validate_thermal(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
     for (sensor, n) in &cfg.noise {
-        if !matches!(sensor.as_str(), "KG1000" | "KG50") || !n.tau_ms.is_finite() || !(0.0..=2000.0).contains(&n.tau_ms)
-            || !n.sigma_raw.is_finite() || n.sigma_raw < 0. || !n.residual_sigma_raw.is_finite() || n.residual_sigma_raw < 0. {
+        if !matches!(sensor.as_str(), "KG1000" | "KG50")
+            || !n.tau_ms.is_finite()
+            || !(0.0..=2000.0).contains(&n.tau_ms)
+            || !n.sigma_raw.is_finite()
+            || n.sigma_raw < 0.
+            || !n.residual_sigma_raw.is_finite()
+            || n.residual_sigma_raw < 0.
+        {
             return Err("Invalid load-cell noise/filter calibration".into());
         }
     }
     for (sensor, t) in &cfg.thermal {
-        if !matches!(sensor.as_str(), "KG1000" | "KG50") || !t.reference_c.is_finite()
-            || !(-40.0..=125.0).contains(&t.reference_c) || !t.raw_per_c.is_finite()
-            || t.points.len() > 64 || t.points.iter().any(|p| !p[0].is_finite()
-                || !(-40.0..=125.0).contains(&p[0]) || !p[1].is_finite()) {
+        if !matches!(sensor.as_str(), "KG1000" | "KG50")
+            || !t.reference_c.is_finite()
+            || !(-40.0..=125.0).contains(&t.reference_c)
+            || !t.raw_per_c.is_finite()
+            || t.points.len() > 64
+            || t.points
+                .iter()
+                .any(|p| !p[0].is_finite() || !(-40.0..=125.0).contains(&p[0]) || !p[1].is_finite())
+        {
             return Err("Invalid load-cell thermal calibration".into());
         }
     }
     Ok(())
 }
 
-pub fn capture_thermal_zero(cfg: &mut LoadcellCalibrationFile, sensor: &str,
-                            raw: f32, temperature: f32) -> Result<(), String> {
+pub fn capture_thermal_zero(
+    cfg: &mut LoadcellCalibrationFile,
+    sensor: &str,
+    raw: f32,
+    temperature: f32,
+) -> Result<(), String> {
     let sensor = thermal_key(sensor);
-    if !matches!(sensor, "KG1000" | "KG50") || !raw.is_finite()
-        || !temperature.is_finite() || !(-40.0..=125.0).contains(&temperature) {
+    if !matches!(sensor, "KG1000" | "KG50")
+        || !raw.is_finite()
+        || !temperature.is_finite()
+        || !(-40.0..=125.0).contains(&temperature)
+    {
         return Err("Invalid thermal zero sample".into());
     }
     let mut t = cfg.thermal.get(sensor).cloned().unwrap_or_default();
-    if t.points.len() >= 64 { return Err("At most 64 thermal points are supported".into()); }
+    if t.points.len() >= 64 {
+        return Err("At most 64 thermal points are supported".into());
+    }
     t.points.push([temperature, raw]);
     // Keep the saved correction/reference while accumulating an inconclusive fit.
     if !cfg.thermal.contains_key(sensor) {
         t.reference_c = temperature;
     }
-    let points: Vec<_> = t.points.iter().map(|p| [p[0] as f64, p[1] as f64]).collect();
+    let points: Vec<_> = t
+        .points
+        .iter()
+        .map(|p| [p[0] as f64, p[1] as f64])
+        .collect();
     let quality = crate::thermal_fit::assess(&points);
     if quality.ready {
         t.raw_per_c = quality.slope as f32;
-        if !t.raw_per_c.is_finite() { return Err("Thermal fit overflow".into()); }
+        if !t.raw_per_c.is_finite() {
+            return Err("Thermal fit overflow".into());
+        }
     }
     cfg.thermal.insert(sensor.into(), t);
     Ok(())
 }
 
-pub fn recent_adc_temperature<'a>(rows: impl DoubleEndedIterator<Item = &'a crate::types::TelemetryRow>, sender: &str, now_ms: i64) -> Option<f32> {
-    rows.rev().find(|row| row.data_type == "DAQ_ADC_TEMPERATURE"
-        && row.sender_id == sender && row.timestamp_ms <= now_ms
-        && now_ms.saturating_sub(row.timestamp_ms) <= 2000)
+pub fn recent_adc_temperature<'a>(
+    rows: impl DoubleEndedIterator<Item = &'a crate::types::TelemetryRow>,
+    sender: &str,
+    now_ms: i64,
+) -> Option<f32> {
+    rows.rev()
+        .find(|row| {
+            row.data_type == "DAQ_ADC_TEMPERATURE"
+                && row.sender_id == sender
+                && row.timestamp_ms <= now_ms
+                && now_ms.saturating_sub(row.timestamp_ms) <= 2000
+        })
         .and_then(|row| row.values.first().copied().flatten())
         .filter(|v| v.is_finite() && (-40.0..=125.0).contains(v))
 }
@@ -1537,11 +1682,22 @@ mod thermal_tests {
     #[test]
     fn inconclusive_points_preserve_existing_correction_and_small_span_can_fit() {
         let mut cfg = LoadcellCalibrationFile::default();
-        cfg.thermal.insert("KG1000".into(), ThermalCalibration {
-            reference_c: 20., raw_per_c: 0.02, points: vec![],
-        });
+        cfg.thermal.insert(
+            "KG1000".into(),
+            ThermalCalibration {
+                reference_c: 20.,
+                raw_per_c: 0.02,
+                points: vec![],
+            },
+        );
         for i in 0..5 {
-            capture_thermal_zero(&mut cfg, "KG1000", 0.2 + i as f32 * 0.001, 30. + i as f32 * 0.1).unwrap();
+            capture_thermal_zero(
+                &mut cfg,
+                "KG1000",
+                0.2 + i as f32 * 0.001,
+                30. + i as f32 * 0.1,
+            )
+            .unwrap();
             assert_eq!(cfg.thermal["KG1000"].reference_c, 20.);
             assert_eq!(cfg.thermal["KG1000"].raw_per_c, 0.02);
         }
@@ -1553,24 +1709,50 @@ mod thermal_tests {
     #[test]
     fn fit_corrects_both_directions_and_requires_temperature() {
         let mut cfg = LoadcellCalibrationFile::default();
-        assert_eq!(temperature_corrected_raw(&cfg, "KG1000", 12.0, None), Some(12.0));
+        assert_eq!(
+            temperature_corrected_raw(&cfg, "KG1000", 12.0, None),
+            Some(12.0)
+        );
         capture_thermal_zero(&mut cfg, "KG1000", 10.0, 20.0).unwrap();
         for i in 1..=5 {
-            capture_thermal_zero(&mut cfg, "KG1000", 10.0 + i as f32 * 0.4, 20.0 + i as f32 * 2.).unwrap();
+            capture_thermal_zero(
+                &mut cfg,
+                "KG1000",
+                10.0 + i as f32 * 0.4,
+                20.0 + i as f32 * 2.,
+            )
+            .unwrap();
         }
-        assert_eq!(temperature_corrected_raw(&cfg, "ch1", 12.0, Some(30.0)), Some(10.0));
-        assert_eq!(temperature_corrected_raw(&cfg, "KG1000", 8.0, Some(10.0)), Some(10.0));
+        assert_eq!(
+            temperature_corrected_raw(&cfg, "ch1", 12.0, Some(30.0)),
+            Some(10.0)
+        );
+        assert_eq!(
+            temperature_corrected_raw(&cfg, "KG1000", 8.0, Some(10.0)),
+            Some(10.0)
+        );
         assert_eq!(temperature_corrected_raw(&cfg, "KG1000", 12.0, None), None);
-        assert_eq!(temperature_corrected_raw(&cfg, "KG50", 12.0, None), Some(12.0));
+        assert_eq!(
+            temperature_corrected_raw(&cfg, "KG50", 12.0, None),
+            Some(12.0)
+        );
         assert!(capture_thermal_zero(&mut cfg, "KG50", f32::NAN, 20.0).is_err());
-        let restored: LoadcellCalibrationFile = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        let restored: LoadcellCalibrationFile =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert!((restored.thermal["KG1000"].raw_per_c - 0.2).abs() < 1e-6);
     }
     #[test]
     fn freshness_and_sender_are_required() {
-        let rows = vec![crate::types::TelemetryRow { timestamp_ms: 1000,
-            data_type: "DAQ_ADC_TEMPERATURE".into(), sender_id: "SD_CARD".into(), values: vec![Some(25.0)] }];
-        assert_eq!(recent_adc_temperature(rows.iter(), "SD_CARD", 2000), Some(25.0));
+        let rows = vec![crate::types::TelemetryRow {
+            timestamp_ms: 1000,
+            data_type: "DAQ_ADC_TEMPERATURE".into(),
+            sender_id: "SD_CARD".into(),
+            values: vec![Some(25.0)],
+        }];
+        assert_eq!(
+            recent_adc_temperature(rows.iter(), "SD_CARD", 2000),
+            Some(25.0)
+        );
         assert_eq!(recent_adc_temperature(rows.iter(), "OTHER", 2000), None);
         assert_eq!(recent_adc_temperature(rows.iter(), "SD_CARD", 3001), None);
         assert_eq!(recent_adc_temperature(rows.iter(), "SD_CARD", 999), None);
@@ -1584,11 +1766,23 @@ pub struct TemperatureCapture {
     pub temperature_c: Option<f32>,
 }
 
-pub fn record_capture_temperature(cfg: &mut LoadcellCalibrationFile, sensor: &str,
-                                  expected: f32, raw: f32, temperature_c: Option<f32>) {
-    let points = cfg.temperature_captures.entry(thermal_key(sensor).into()).or_default();
+pub fn record_capture_temperature(
+    cfg: &mut LoadcellCalibrationFile,
+    sensor: &str,
+    expected: f32,
+    raw: f32,
+    temperature_c: Option<f32>,
+) {
+    let points = cfg
+        .temperature_captures
+        .entry(thermal_key(sensor).into())
+        .or_default();
     points.retain(|p| (p.expected - expected).abs() >= 1e-6);
-    points.push(TemperatureCapture { expected, raw, temperature_c });
+    points.push(TemperatureCapture {
+        expected,
+        raw,
+        temperature_c,
+    });
 }
 
 #[cfg(test)]
@@ -1599,8 +1793,12 @@ mod temperature_capture_tests {
         let mut cfg = LoadcellCalibrationFile::default();
         record_capture_temperature(&mut cfg, "ch1", 0., 0.01, Some(24.));
         record_capture_temperature(&mut cfg, "ch1", 10., 0.04, Some(25.));
-        let saved: LoadcellCalibrationFile = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(saved.temperature_captures["KG1000"][0].temperature_c, Some(24.));
+        let saved: LoadcellCalibrationFile =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            saved.temperature_captures["KG1000"][0].temperature_c,
+            Some(24.)
+        );
         assert_eq!(saved.temperature_captures["KG1000"][1].raw, 0.04);
         let old: LoadcellCalibrationFile = serde_json::from_str("{}").unwrap();
         assert!(old.thermal.is_empty() && old.temperature_captures.is_empty());
@@ -1627,55 +1825,138 @@ mod kg50_input_tests {
         assert_eq!(calibrated_weight_kg(&cfg, "KG50", 0.01), None);
         normalize_calibration(&mut cfg);
         assert_eq!(calibrated_weight_kg(&cfg, "KG50", 0.01), None);
-        assert_eq!(amp2_calibration(&cfg).extra_channels["kg50"].linear.m, Some(123.0));
-        cfg.extra_channels.insert("kg50".into(), GenericCalibrationChannel { linear: ChannelLinear { m: Some(1000.0), b: Some(0.0) }, ..Default::default() });
+        assert_eq!(
+            amp2_calibration(&cfg).extra_channels["kg50"].linear.m,
+            Some(123.0)
+        );
+        cfg.extra_channels.insert(
+            "kg50".into(),
+            GenericCalibrationChannel {
+                linear: ChannelLinear {
+                    m: Some(1000.0),
+                    b: Some(0.0),
+                },
+                ..Default::default()
+            },
+        );
         switch_kg50_input(&mut cfg, Kg50Input::Amp2);
         assert_eq!(cfg.extra_channels["kg50"].linear.m, Some(123.0));
         switch_kg50_input(&mut cfg, Kg50Input::P6Differential);
         assert_eq!(calibrated_weight_kg(&cfg, "KG50", 0.01), Some(10.0));
-        let restored: LoadcellCalibrationFile = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        let restored: LoadcellCalibrationFile =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(restored.kg50_input, Kg50Input::P6Differential);
     }
     #[test]
     fn late_packets_from_other_input_are_not_relabelled() {
-        assert_eq!(selected_kg50_value(Kg50Input::Amp2, "KG50", &[Some(2.0)]), Some(2.0));
-        assert_eq!(selected_kg50_value(Kg50Input::P6Differential, "KG50", &[Some(2.0)]), None);
-        assert_eq!(selected_kg50_value(Kg50Input::Amp2, "DAQ_KG50_SELECTED", &[Some(1.0),Some(2.0)]), None);
-        assert_eq!(selected_kg50_value(Kg50Input::P6Differential, "DAQ_KG50_SELECTED", &[Some(1.0),Some(0.02)]), Some(0.02));
-        assert_eq!(selected_kg50_value(Kg50Input::P6Differential, "DAQ_KG50_SELECTED", &[Some(0.0),Some(0.02)]), None);
+        assert_eq!(
+            selected_kg50_value(Kg50Input::Amp2, "KG50", &[Some(2.0)]),
+            Some(2.0)
+        );
+        assert_eq!(
+            selected_kg50_value(Kg50Input::P6Differential, "KG50", &[Some(2.0)]),
+            None
+        );
+        assert_eq!(
+            selected_kg50_value(
+                Kg50Input::Amp2,
+                "DAQ_KG50_SELECTED",
+                &[Some(1.0), Some(2.0)]
+            ),
+            None
+        );
+        assert_eq!(
+            selected_kg50_value(
+                Kg50Input::P6Differential,
+                "DAQ_KG50_SELECTED",
+                &[Some(1.0), Some(0.02)]
+            ),
+            Some(0.02)
+        );
+        assert_eq!(
+            selected_kg50_value(
+                Kg50Input::P6Differential,
+                "DAQ_KG50_SELECTED",
+                &[Some(0.0), Some(0.02)]
+            ),
+            None
+        );
     }
 }
 
 #[cfg(test)]
 mod channel_save_tests {
     use super::*;
-    fn json(cfg: &LoadcellCalibrationFile) -> serde_json::Value { serde_json::to_value(cfg).unwrap() }
+    fn json(cfg: &LoadcellCalibrationFile) -> serde_json::Value {
+        serde_json::to_value(cfg).unwrap()
+    }
     #[test]
     fn stale_save_and_reset_preserve_the_other_loadcell_in_both_directions() {
         let mut current = LoadcellCalibrationFile::default();
         normalize_calibration(&mut current);
         current.extra_channels.get_mut("ch1").unwrap().linear.m = Some(1234.0);
         current.extra_channels.get_mut("ch1").unwrap().zero_raw = Some(0.03);
-        current.extra_channels.get_mut("ch1").unwrap().points.push(CalibrationPoint { expected: 8.0, raw: 0.04 });
-        current.thermal.insert("KG1000".into(), ThermalCalibration::default());
+        current
+            .extra_channels
+            .get_mut("ch1")
+            .unwrap()
+            .points
+            .push(CalibrationPoint {
+                expected: 8.0,
+                raw: 0.04,
+            });
+        current
+            .thermal
+            .insert("KG1000".into(), ThermalCalibration::default());
         sync_extra_channels_into_legacy(&mut current);
         let original = json(&current);
         let mut stale = LoadcellCalibrationFile::default();
         normalize_calibration(&mut stale);
         stale.extra_channels.get_mut("kg50").unwrap().linear.m = Some(5678.0);
-        let saved = merge_channel_update(&current, &CalibrationUpdate { channel: "kg50".into(), calibration: stale }).unwrap();
-        assert_eq!(json(&saved)["extra_channels"]["ch1"], original["extra_channels"]["ch1"]);
-        assert_eq!(json(&saved)["thermal"]["KG1000"], original["thermal"]["KG1000"]);
+        let saved = merge_channel_update(
+            &current,
+            &CalibrationUpdate {
+                channel: "kg50".into(),
+                calibration: stale,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            json(&saved)["extra_channels"]["ch1"],
+            original["extra_channels"]["ch1"]
+        );
+        assert_eq!(
+            json(&saved)["thermal"]["KG1000"],
+            original["thermal"]["KG1000"]
+        );
         assert_eq!(saved.ch1.m, Some(1234.0));
         assert_eq!(saved.extra_channels["kg50"].linear.m, Some(5678.0));
-        let reset = merge_channel_update(&saved, &CalibrationUpdate { channel: "ch1".into(), calibration: LoadcellCalibrationFile::default() }).unwrap();
-        assert_eq!(json(&reset)["extra_channels"]["kg50"], json(&saved)["extra_channels"]["kg50"]);
-        assert!(reset.ch1.m.is_none() && reset.ch1_zero_raw.is_none() && reset.points_ch1.is_empty());
+        let reset = merge_channel_update(
+            &saved,
+            &CalibrationUpdate {
+                channel: "ch1".into(),
+                calibration: LoadcellCalibrationFile::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            json(&reset)["extra_channels"]["kg50"],
+            json(&saved)["extra_channels"]["kg50"]
+        );
+        assert!(
+            reset.ch1.m.is_none() && reset.ch1_zero_raw.is_none() && reset.points_ch1.is_empty()
+        );
     }
     #[test]
     fn saving_backs_up_the_previous_file_and_unchanged_saves_do_not_add_backups() {
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("gs-calibration-backup-{}-{stamp}", std::process::id()));
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gs-calibration-backup-{}-{stamp}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("calibration.json");
         let mut cfg = LoadcellCalibrationFile::default();
@@ -1683,23 +1964,55 @@ mod channel_save_tests {
         let previous = std::fs::read(&path).unwrap();
         cfg.ch1.m = Some(100.0);
         save_at(&cfg, &path).unwrap();
-        let backups: Vec<_> = std::fs::read_dir(dir.join("calibration_backups")).unwrap().collect();
+        let backups: Vec<_> = std::fs::read_dir(dir.join("calibration_backups"))
+            .unwrap()
+            .collect();
         assert_eq!(backups.len(), 1);
-        assert_eq!(std::fs::read(backups[0].as_ref().unwrap().path()).unwrap(), previous);
+        assert_eq!(
+            std::fs::read(backups[0].as_ref().unwrap().path()).unwrap(),
+            previous
+        );
         save_at(&cfg, &path).unwrap();
-        assert_eq!(std::fs::read_dir(dir.join("calibration_backups")).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(dir.join("calibration_backups"))
+                .unwrap()
+                .count(),
+            1
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn unscoped_save_is_rejected_and_source_guard_applies_only_to_kg50() {
-        assert!(serde_json::from_value::<CalibrationUpdate>(json(&LoadcellCalibrationFile::default())).is_err());
+        assert!(
+            serde_json::from_value::<CalibrationUpdate>(json(&LoadcellCalibrationFile::default()))
+                .is_err()
+        );
         let mut current = LoadcellCalibrationFile::default();
         switch_kg50_input(&mut current, Kg50Input::P6Differential);
         let stale = LoadcellCalibrationFile::default();
-        assert!(merge_channel_update(&current, &CalibrationUpdate { channel: "kg50".into(), calibration: stale.clone() }).is_err());
-        let saved = merge_channel_update(&current, &CalibrationUpdate { channel: "ch1".into(), calibration: stale }).unwrap();
+        assert!(
+            merge_channel_update(
+                &current,
+                &CalibrationUpdate {
+                    channel: "kg50".into(),
+                    calibration: stale.clone()
+                }
+            )
+            .is_err()
+        );
+        let saved = merge_channel_update(
+            &current,
+            &CalibrationUpdate {
+                channel: "ch1".into(),
+                calibration: stale,
+            },
+        )
+        .unwrap();
         assert_eq!(saved.kg50_input, Kg50Input::P6Differential);
-        assert_eq!(json(&saved)["kg50_input_profiles"], json(&current)["kg50_input_profiles"]);
+        assert_eq!(
+            json(&saved)["kg50_input_profiles"],
+            json(&current)["kg50_input_profiles"]
+        );
     }
 }
 
@@ -1713,42 +2026,93 @@ pub struct HistoryCalibration {
     target_kg: f32,
 }
 impl HistoryCalibration {
-    pub fn new(cfg: LoadcellCalibrationFile, targets: &FillTargetsConfig, flight: FlightState) -> Self {
-        Self { cfg, temperatures: BTreeMap::new(), processing: Default::default(),
-            fill_source: targets.fill_source, target_kg: active_fill_target_mass_kg(targets, flight) }
+    pub fn new(
+        cfg: LoadcellCalibrationFile,
+        targets: &FillTargetsConfig,
+        flight: FlightState,
+    ) -> Self {
+        Self {
+            cfg,
+            temperatures: BTreeMap::new(),
+            processing: Default::default(),
+            fill_source: targets.fill_source,
+            target_kg: active_fill_target_mass_kg(targets, flight),
+        }
     }
     pub fn project(&mut self, row: crate::types::TelemetryRow) -> Vec<crate::types::TelemetryRow> {
-        if matches!(row.data_type.as_str(), DERIVED_WEIGHT_DATA_TYPE | DERIVED_WEIGHT_50_DATA_TYPE
-            | DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE | DERIVED_FILL_PERCENT_DATA_TYPE) {
+        if matches!(
+            row.data_type.as_str(),
+            DERIVED_WEIGHT_DATA_TYPE
+                | DERIVED_WEIGHT_50_DATA_TYPE
+                | DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE
+                | DERIVED_FILL_PERCENT_DATA_TYPE
+        ) {
             return Vec::new();
         }
         if row.data_type == "DAQ_ADC_TEMPERATURE" {
-            if let Some(value) = row.values.first().copied().flatten().filter(|v| v.is_finite() && (-40.0..=125.0).contains(v)) {
-                self.temperatures.insert(row.sender_id.clone(), (row.timestamp_ms, value));
-            } else { self.temperatures.remove(&row.sender_id); }
+            if let Some(value) = row
+                .values
+                .first()
+                .copied()
+                .flatten()
+                .filter(|v| v.is_finite() && (-40.0..=125.0).contains(v))
+            {
+                self.temperatures
+                    .insert(row.sender_id.clone(), (row.timestamp_ms, value));
+            } else {
+                self.temperatures.remove(&row.sender_id);
+            }
         }
         let sensor = match row.data_type.as_str() {
-            "KG1000" => "KG1000", "KG50" => "KG50", "IADC" | "FUEL_TANK_PRESSURE" => "IADC",
+            "KG1000" => "KG1000",
+            "KG50" => "KG50",
+            "IADC" | "FUEL_TANK_PRESSURE" => "IADC",
             _ => return vec![row],
         };
-        let kind = match sensor { "KG1000" => DERIVED_WEIGHT_DATA_TYPE,
-            "KG50" => DERIVED_WEIGHT_50_DATA_TYPE, _ => DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE };
-        let temp = self.temperatures.get(&row.sender_id).and_then(|(ts, value)|
-            (row.timestamp_ms >= *ts && row.timestamp_ms - ts <= 2000).then_some(*value));
-        let value = row.values.first().copied().flatten()
+        let kind = match sensor {
+            "KG1000" => DERIVED_WEIGHT_DATA_TYPE,
+            "KG50" => DERIVED_WEIGHT_50_DATA_TYPE,
+            _ => DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE,
+        };
+        let temp = self
+            .temperatures
+            .get(&row.sender_id)
+            .and_then(|(ts, value)| {
+                (row.timestamp_ms >= *ts && row.timestamp_ms - ts <= 2000).then_some(*value)
+            });
+        let value = row
+            .values
+            .first()
+            .copied()
+            .flatten()
             .and_then(|raw| temperature_corrected_raw(&self.cfg, sensor, raw, temp))
-            .map(|raw| self.processing.filter(&self.cfg, &row.sender_id, sensor, row.timestamp_ms, raw))
+            .map(|raw| {
+                self.processing
+                    .filter(&self.cfg, &row.sender_id, sensor, row.timestamp_ms, raw)
+            })
             .and_then(|raw| calibrated_sensor_value(&self.cfg, sensor, raw))
             .filter(|v| v.is_finite());
         if value.is_none() {
-            self.processing.filter(&self.cfg, &row.sender_id, sensor, row.timestamp_ms, f32::NAN);
+            self.processing.filter(
+                &self.cfg,
+                &row.sender_id,
+                sensor,
+                row.timestamp_ms,
+                f32::NAN,
+            );
         }
-        let mut derived = row.clone(); derived.data_type = kind.into(); derived.values = vec![value];
+        let mut derived = row.clone();
+        derived.data_type = kind.into();
+        derived.values = vec![value];
         let mut result = vec![row, derived];
         if sensor == self.fill_source.sensor() {
-            let mut fill = result[1].clone(); fill.data_type = DERIVED_FILL_PERCENT_DATA_TYPE.into();
-            let mass = if sensor == "KG50" && !self.cfg.extra_channels.contains_key("kg50") { None }
-                else { value.map(|v| self.fill_source.mass(v)) };
+            let mut fill = result[1].clone();
+            fill.data_type = DERIVED_FILL_PERCENT_DATA_TYPE.into();
+            let mass = if sensor == "KG50" && !self.cfg.extra_channels.contains_key("kg50") {
+                None
+            } else {
+                value.map(|v| self.fill_source.mass(v))
+            };
             fill.values = vec![mass.map(|mass| fill_percent(self.target_kg, mass))];
             result.push(fill);
         }
@@ -1763,26 +2127,61 @@ mod history_calibration_tests {
     #[test]
     fn history_calibration_uses_current_thermal_fit_and_expires_stale_temperature() {
         let mut cfg = LoadcellCalibrationFile::default();
-        cfg.ch1 = ChannelLinear { m: Some(2.), b: Some(1.) };
-        cfg.thermal.insert("KG1000".into(), ThermalCalibration { reference_c: 20., raw_per_c: 0.5, points: vec![] });
-        let mut replay = HistoryCalibration::new(cfg, &FillTargetsConfig::default(), FlightState::Startup);
+        cfg.ch1 = ChannelLinear {
+            m: Some(2.),
+            b: Some(1.),
+        };
+        cfg.thermal.insert(
+            "KG1000".into(),
+            ThermalCalibration {
+                reference_c: 20.,
+                raw_per_c: 0.5,
+                points: vec![],
+            },
+        );
+        let mut replay =
+            HistoryCalibration::new(cfg, &FillTargetsConfig::default(), FlightState::Startup);
         let row = |timestamp_ms, kind: &str, value| TelemetryRow {
-            timestamp_ms, data_type: kind.into(), sender_id: "DAQ".into(), values: vec![value] };
+            timestamp_ms,
+            data_type: kind.into(),
+            sender_id: "DAQ".into(),
+            values: vec![value],
+        };
         replay.project(row(100, "DAQ_ADC_TEMPERATURE", Some(22.)));
-        assert_eq!(replay.project(row(101, "KG1000", Some(3.)))[1].values, vec![Some(5.)]);
-        assert_eq!(replay.project(row(2101, "KG1000", Some(3.)))[1].values, vec![None]);
-        assert_eq!(replay.project(row(2102, "KG1000", None))[1].values, vec![None]);
+        assert_eq!(
+            replay.project(row(101, "KG1000", Some(3.)))[1].values,
+            vec![Some(5.)]
+        );
+        assert_eq!(
+            replay.project(row(2101, "KG1000", Some(3.)))[1].values,
+            vec![None]
+        );
+        assert_eq!(
+            replay.project(row(2102, "KG1000", None))[1].values,
+            vec![None]
+        );
     }
     #[test]
     fn history_calibration_replaces_old_weights_from_raw_without_touching_raw() {
         let mut cfg = LoadcellCalibrationFile::default();
-        cfg.ch1 = ChannelLinear { m: Some(2.), b: Some(1.) };
-        let mut replay = HistoryCalibration::new(cfg, &FillTargetsConfig::default(), FlightState::Startup);
-        let raw = TelemetryRow {timestamp_ms: 100, data_type: "KG1000".into(), sender_id: "DAQ".into(), values: vec![Some(3.)]};
+        cfg.ch1 = ChannelLinear {
+            m: Some(2.),
+            b: Some(1.),
+        };
+        let mut replay =
+            HistoryCalibration::new(cfg, &FillTargetsConfig::default(), FlightState::Startup);
+        let raw = TelemetryRow {
+            timestamp_ms: 100,
+            data_type: "KG1000".into(),
+            sender_id: "DAQ".into(),
+            values: vec![Some(3.)],
+        };
         let output = replay.project(raw.clone());
         assert_eq!(output[0].values, raw.values);
         assert_eq!(output[1].values, vec![Some(7.)]);
-        let mut old = raw; old.data_type = DERIVED_WEIGHT_DATA_TYPE.into(); old.values = vec![Some(9000.)];
+        let mut old = raw;
+        old.data_type = DERIVED_WEIGHT_DATA_TYPE.into();
+        old.values = vec![Some(9000.)];
         assert!(replay.project(old).is_empty());
     }
 }

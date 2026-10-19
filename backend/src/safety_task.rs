@@ -372,10 +372,15 @@ pub async fn safety_task(
         let packets = {
             let rb = state.ring_buffer.lock().unwrap();
             let len = rb.len();
-            rb.recent(len).into_iter().map(|received| match received {
-                crate::ring_buffer::ReceivedPacket::Telemetry(packet)
-                | crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, .. } => packet.clone(),
-            }).collect::<Vec<_>>()
+            rb.recent(len)
+                .into_iter()
+                .map(|received| match received {
+                    crate::ring_buffer::ReceivedPacket::Telemetry(packet)
+                    | crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, .. } => {
+                        packet.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
         };
 
         if packets.is_empty() {
@@ -532,7 +537,9 @@ pub async fn safety_task(
             }
         }
 
-        if !crate::gse::automatic_abort_allowed(&state) { abort = false; }
+        if !crate::gse::automatic_abort_allowed(&state) {
+            abort = false;
+        }
         if abort {
             state.set_abort_indicator_latched(true);
             crate::sequences::refresh_action_policy_now(&state);

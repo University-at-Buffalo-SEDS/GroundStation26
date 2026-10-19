@@ -396,7 +396,7 @@ impl AppState {
         let _ = self.launch_clock_tx.send(next);
     }
 
-    #[cfg(any(feature="hitl_mode",feature="test_fire_mode"))]
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     pub fn begin_daq_launch_log(&self) {
         // Rotate at command acceptance, without starting the UI clock before
         // Valve confirms the sequence. Its ACK/pilot report corrects T0 later.
@@ -415,8 +415,11 @@ impl AppState {
             );
         }
         if let Some(router) = self.topology_router.get() {
-            if let Err(error) = crate::network_variables::set_daq_log_clock(router, *session, clock) {
-                self.add_notification(format!("DAQ launch log clock could not be published: {error}"));
+            if let Err(error) = crate::network_variables::set_daq_log_clock(router, *session, clock)
+            {
+                self.add_notification(format!(
+                    "DAQ launch log clock could not be published: {error}"
+                ));
             }
         }
     }
@@ -547,16 +550,25 @@ impl AppState {
         let board = self.board_from_network_sender(sender);
         if let Some(board) = board {
             self.network_health.lock().unwrap().observe(
-                board.sender_id(), std::time::Instant::now(), timestamp_ms);
+                board.sender_id(),
+                std::time::Instant::now(),
+                timestamp_ms,
+            );
         } else {
-            let resolved = sender.strip_prefix("@addr:")
+            let resolved = sender
+                .strip_prefix("@addr:")
                 .and_then(|address| address.parse::<u32>().ok())
                 .and_then(|address| self.topology_router.get()?.resolve_address(address))
                 .map(|address| address.hostname);
             self.network_health.lock().unwrap().observe(
-                resolved.as_deref().unwrap_or(sender), std::time::Instant::now(), timestamp_ms);
+                resolved.as_deref().unwrap_or(sender),
+                std::time::Instant::now(),
+                timestamp_ms,
+            );
         }
-        let Some(board) = board else { return; };
+        let Some(board) = board else {
+            return;
+        };
         let mut map = self.board_status.lock().unwrap();
         let mut force_broadcast = false;
         if let Some(status) = map.get_mut(&board) {
@@ -758,7 +770,11 @@ impl AppState {
                 nodes: Vec::new(),
                 links: Vec::new(),
                 traffic: None,
-                health: self.network_health.lock().unwrap().snapshot(std::time::Instant::now(), cfg!(feature = "test_fire_mode")),
+                health: self
+                    .network_health
+                    .lock()
+                    .unwrap()
+                    .snapshot(std::time::Instant::now(), cfg!(feature = "test_fire_mode")),
             };
         };
         let exported = router.export_topology();
@@ -767,8 +783,14 @@ impl AppState {
             let now = std::time::Instant::now();
             for route in &exported.routes {
                 for announcer in &route.announcers {
-                    tracker.announcement(&announcer.sender_id, &route.side_name,
-                        announcer.last_seen_ms, announcer.age_ms, now, now_ms);
+                    tracker.announcement(
+                        &announcer.sender_id,
+                        &route.side_name,
+                        announcer.last_seen_ms,
+                        announcer.age_ms,
+                        now,
+                        now_ms,
+                    );
                     for node in &announcer.routers {
                         tracker.membership(&node.sender_id, &route.side_name);
                     }
@@ -1329,7 +1351,13 @@ impl AppState {
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
         if crate::rrls::is_rrls() {
-            return matches!(cmd, TelemetryCommand::StartWritingNow | TelemetryCommand::StartWritingLastTwoMinutes | TelemetryCommand::PauseWritingDb | TelemetryCommand::StopWritingDb);
+            return matches!(
+                cmd,
+                TelemetryCommand::StartWritingNow
+                    | TelemetryCommand::StartWritingLastTwoMinutes
+                    | TelemetryCommand::PauseWritingDb
+                    | TelemetryCommand::StopWritingDb
+            );
         }
         if let Some(allowed) = crate::gse::command_allowed(self, cmd) {
             return allowed;
@@ -1801,8 +1829,15 @@ pub(crate) mod tests {
             .find(|node| node.sender_id.as_deref() == Some(Board::ValveBoard.sender_id()))
             .expect("valve router missing from discovered topology");
 
-        let traffic = snapshot.traffic.as_ref().expect("router traffic is exported");
-        let side = traffic.sides.iter().find(|side| side.side_id == ground_side).unwrap();
+        let traffic = snapshot
+            .traffic
+            .as_ref()
+            .expect("router traffic is exported");
+        let side = traffic
+            .sides
+            .iter()
+            .find(|side| side.side_id == ground_side)
+            .unwrap();
         assert_eq!(side.name, "fill_link");
         assert_eq!(Some(side.totals), ground.stats);
         assert!(side.totals.packets_received > 0);
@@ -2490,9 +2525,17 @@ pub(crate) mod tests {
         state.mark_board_seen("FC", 10);
         state.mark_board_seen("VB", 10);
         let snapshot = state.network_topology_snapshot(11);
-        assert!(snapshot.health.iter().any(|r| r.sender_id == "RUNTIME_SENSOR" && r.healthy));
+        assert!(
+            snapshot
+                .health
+                .iter()
+                .any(|r| r.sender_id == "RUNTIME_SENSOR" && r.healthy)
+        );
         assert!(snapshot.health.iter().any(|r| r.sender_id == "VB"));
-        assert_eq!(snapshot.health.iter().any(|r| r.sender_id == "FC"), !cfg!(feature = "test_fire_mode"));
+        assert_eq!(
+            snapshot.health.iter().any(|r| r.sender_id == "FC"),
+            !cfg!(feature = "test_fire_mode")
+        );
         state.clear_runtime_data_for_sim_reset();
         assert!(state.network_topology_snapshot(12).health.is_empty());
     }

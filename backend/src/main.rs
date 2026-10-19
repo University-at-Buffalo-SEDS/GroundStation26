@@ -33,8 +33,8 @@ mod logger;
 mod map;
 mod media;
 mod media_runtime;
-mod network_traffic;
 mod network_health;
+mod network_traffic;
 mod network_variables;
 mod recording_export;
 mod recording_range;
@@ -133,6 +133,8 @@ fn network_memory_config() -> sedsnet::config::RuntimeMemoryConfig {
     sedsnet::config::RuntimeMemoryConfig::new(budget, 4096, 4096, 1.25)
         .expect("bounded host network memory configuration")
 }
+
+const RADIO_SIDE_MAX_FRAME_BYTES: usize = 192;
 
 fn network_router_time_divisor() -> u64 {
     std::env::var("GS_SIM_ROUTER_TIME_DIVISOR")
@@ -902,7 +904,7 @@ async fn main() -> anyhow::Result<()> {
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
         network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
-            network_health: Arc::new(Mutex::new(crate::network_health::Tracker::default())),
+        network_health: Arc::new(Mutex::new(crate::network_health::Tracker::default())),
         loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
         auto_zero: Default::default(),
         daq_log_session: Default::default(),
@@ -1362,9 +1364,9 @@ async fn main() -> anyhow::Result<()> {
             reliable_enabled: router_hop_reliable_enabled(&comms_links.av_bay),
             ..Default::default()
         }
-        // Bound an uninterruptible schema chunk to about 87 ms at the
+        // Bound an uninterruptible schema chunk to about 67 ms at the
         // configured 64 kbit/s radio and 40% airtime share.
-        .with_small_packet_transport(256);
+        .with_small_packet_transport(RADIO_SIDE_MAX_FRAME_BYTES);
         router.add_side_packed_with_priority_and_options(
             "rocket_comms",
             move |pkt, priority| budget.try_send(&rocket_tx, priority, pkt),

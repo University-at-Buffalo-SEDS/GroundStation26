@@ -683,12 +683,18 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
         ("ResetFlightState", "Reset flight state to Idle"),
         ("ResetTClock", "Reset T-clock"),
     ] {
-        if !layout.actions_tab.actions.iter().any(|action| action.cmd == cmd) {
+        if !layout
+            .actions_tab
+            .actions
+            .iter()
+            .any(|action| action.cmd == cmd)
+        {
             layout.actions_tab.actions.push(
                 serde_json::from_value(serde_json::json!({
                     "cmd": cmd, "label": label, "group": "Operator recovery",
                     "border": "#f59e0b", "bg": "#451a03", "fg": "#fef3c7"
-                })).expect("valid operator recovery action"),
+                }))
+                .expect("valid operator recovery action"),
             );
         }
     }

@@ -1,6 +1,9 @@
 import {signIn} from '/assets/media-login.js';
 const $=id=>document.getElementById(id);
 let token='', session=null, muted=false, held=false, joining=false, radioAvailable=false;
+const noiseSupported=navigator.mediaDevices?.getSupportedConstraints?.().noiseSuppression===true;
+$('noise-suppression').disabled=!noiseSupported;
+if(!noiseSupported){$('noise-suppression').checked=false;$('noise-status').textContent='Noise suppression is unavailable in this browser.';}
 function radioLink(radio){
   $('radio-controls').hidden=!radio?.configured;
   radioAvailable=radio?.available===true;
@@ -12,12 +15,14 @@ const notice=text=>{$('status').textContent=text;};
 function updateControls(){
   $('join').disabled=!token||!!session||joining;$('leave').disabled=!session;
   $('device').disabled=!!session||joining;$('mode').disabled=joining;
-  $('mute').disabled=!session?.ready;$('ptt').disabled=!session?.ready||muted||$('mode').value!=='ptt';
+  $('mute').disabled=!session?.ready||$('mode').value==='off';$('ptt').disabled=!session?.ready||muted||$('mode').value!=='ptt';
   $('logout').disabled=!token;$('signin').disabled=!!session||joining;
   $('radio-enable').disabled=!session?.ready||!radioAvailable;
+  $('noise-suppression').disabled=!noiseSupported||joining||!!session?.reconfiguring;
 }
 function transmit(){
-  const enabled=!!session?.ready&&!muted&&($('mode').value==='open'||held);
+  const mode=$('mode').value;
+  const enabled=!!session?.ready&&!session.reconfiguring&&!muted&&(mode==='open'||(mode==='ptt'&&held));
   if(session){
     if(session.transmitting!==enabled){
       session.transmitting=enabled;
@@ -30,7 +35,7 @@ function transmit(){
   }
   $('ptt').setAttribute('aria-pressed',String(enabled&&$('mode').value==='ptt'));
   $('mute').setAttribute('aria-pressed',String(muted));$('mute').textContent=muted?'Unmute microphone':'Mute microphone';
-  $('mic-state').textContent=!session?'Microphone off':enabled?'Transmitting to crew':muted?'Microphone muted':'Listening · hold to talk';
+  $('mic-state').textContent=!session?'Microphone off':session.reconfiguring?'Updating microphone…':enabled?'Transmitting to crew':mode==='off'?'Microphone off · listening':muted?'Microphone muted':'Listening · hold to talk';
   updateControls();
 }
 function leave(message='Left voice. Microphone released.'){
@@ -70,9 +75,13 @@ $('join').onclick=async()=>{
     if(!capabilities?.can_transmit)throw new Error('Your account needs the voice_transmit permission. Stream viewers can listen through the audience program.');
     radioLink(capabilities.radio);
     if(session!==s)return;
-    const stream=await navigator.mediaDevices.getUserMedia({audio:{deviceId:$('device').value?{exact:$('device').value}:undefined,channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:false}});
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{deviceId:$('device').value?{exact:$('device').value}:undefined,channelCount:1,echoCancellation:true,noiseSuppression:noiseSupported?$('noise-suppression').checked:undefined,autoGainControl:false}});
     if(session!==s){stream.getTracks().forEach(t=>t.stop());return;}
     s.stream=stream;s.stream.getAudioTracks().forEach(t=>{t.enabled=false;t.onended=()=>{if(session===s)leave('Microphone disconnected. Rejoin to choose another device.');};});
+    if(noiseSupported){
+      const actual=stream.getAudioTracks()[0]?.getSettings?.().noiseSuppression;
+      if(typeof actual==='boolean'){$('noise-suppression').checked=actual;$('noise-status').textContent=actual?'Noise suppression on':'Noise suppression off';}
+    }
     s.node=new AudioWorkletNode(s.context,'crew-audio',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});
     s.source=s.context.createMediaStreamSource(stream);s.source.connect(s.node);s.node.connect(s.context.destination);
     s.node.port.onmessage=({data:m})=>{
@@ -110,6 +119,47 @@ $('join').onclick=async()=>{
     notice('Connecting to voice…');await devices();
   }catch(e){if(session===s)leave(`Cannot join voice: ${e.message}`);}
 };
+$('noise-suppression').onchange=async()=>{
+  const enabled=$('noise-suppression').checked;
+  const current=session;
+  if(!current?.stream)return;
+  current.reconfiguring=true;held=false;transmit();
+  let replacement;
+  try {
+    let actual;
+    try {
+      for(const track of current.stream.getAudioTracks())await track.applyConstraints({noiseSuppression:{exact:enabled}});
+      actual=current.stream.getAudioTracks()[0]?.getSettings?.().noiseSuppression;
+    } catch { /* Some devices apply processing options only when opened. */ }
+    if(session!==current)return;
+    if(actual!==enabled){
+      replacement=await navigator.mediaDevices.getUserMedia({audio:{deviceId:$('device').value?{exact:$('device').value}:undefined,channelCount:1,echoCancellation:true,noiseSuppression:{exact:enabled},autoGainControl:false}});
+      replacement.getAudioTracks().forEach(track=>{track.enabled=false;});
+      if(session!==current)return;
+      actual=replacement.getAudioTracks()[0]?.getSettings?.().noiseSuppression;
+      if(typeof actual==='boolean'&&actual!==enabled)throw Error('The microphone did not apply the requested setting');
+      const source=current.context.createMediaStreamSource(replacement);
+      source.connect(current.node);
+      const old=current.stream;
+      current.source.disconnect();current.source=source;current.stream=replacement;replacement=null;
+      current.stream.getAudioTracks().forEach(track=>{track.onended=()=>{if(session===current)leave('Microphone disconnected. Rejoin to choose another device.');};});
+      old.getTracks().forEach(track=>{track.onended=null;track.stop();});
+    }
+    $('noise-suppression').checked=enabled;
+    $('noise-status').textContent=actual===enabled?(enabled?'Noise suppression on':'Noise suppression off'):'Requested setting applied; device does not report processing state.';
+  } catch(error) {
+    if(session===current){
+      const actual=current.stream.getAudioTracks()[0]?.getSettings?.().noiseSuppression;
+      $('noise-suppression').checked=typeof actual==='boolean'?actual:!enabled;
+      $('noise-status').textContent=`Cannot change noise suppression: ${error.message}`;
+    }
+  } finally {
+    replacement?.getTracks().forEach(track=>track.stop());
+    current.reconfiguring=false;
+    if(session===current)transmit();
+    updateControls();
+  }
+};
 $('leave').onclick=()=>leave();$('devices').onclick=devices;
 $('mute').onclick=()=>{muted=!muted;held=false;transmit();};
 $('mode').onchange=()=>{held=false;if($('mode').value!=='ptt')$('radio-enable').checked=false;transmit();};
@@ -136,6 +186,12 @@ if (new URLSearchParams(location.search).get('embedded') === '1' && parent !== w
   let receivedSession = false;
   window.addEventListener('message', event => {
     if (event.source !== parent || event.data?.type !== 'gs26-session' || typeof event.data.token !== 'string') return;
+    if (event.data.theme && typeof event.data.theme==='object') {
+      for(const name of ['--gs26-app-background','--gs26-app-text','--gs26-panel-background','--gs26-panel-alt-background','--gs26-border','--gs26-text-muted','--gs26-button-background','--gs26-button-border','--gs26-button-text']) {
+        const value=event.data.theme[name];
+        if(typeof value==='string' && CSS.supports('color',value))document.documentElement.style.setProperty(name,value);
+      }
+    }
     if (!event.data.visible) release();
     if (!receivedSession || token !== event.data.token) {
       receivedSession = true;

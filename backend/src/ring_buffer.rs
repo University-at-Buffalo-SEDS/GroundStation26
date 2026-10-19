@@ -4,10 +4,15 @@ use std::collections::VecDeque;
 // its arrival-time snapshot, so a delayed recording cannot roll it back.
 pub enum ReceivedPacket {
     Telemetry(sedsnet::packet::Packet),
-    AppliedStatus { packet: sedsnet::packet::Packet, row: crate::types::TelemetryRow },
+    AppliedStatus {
+        packet: sedsnet::packet::Packet,
+        row: crate::types::TelemetryRow,
+    },
 }
 impl From<sedsnet::packet::Packet> for ReceivedPacket {
-    fn from(packet: sedsnet::packet::Packet) -> Self { Self::Telemetry(packet) }
+    fn from(packet: sedsnet::packet::Packet) -> Self {
+        Self::Telemetry(packet)
+    }
 }
 
 pub struct RingBuffer<T> {

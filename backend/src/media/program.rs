@@ -6,12 +6,26 @@ use axum::Json;
 pub(super) fn routes() -> Router<Arc<MediaState>> {
     Router::new()
         .route("/api/media-assets/program", get(page))
-        .route("/assets/program-art.js", get(|| async {
-            ([(header::CONTENT_TYPE,"text/javascript")],include_str!("program-art.js"))
-        }))
+        .route(
+            "/assets/program-art.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript")],
+                    include_str!("program-art.js"),
+                )
+            }),
+        )
         .route("/api/media-assets/program/state", get(program_state))
         .route("/api/media-assets/program/audio", get(program_audio))
-        .route("/assets/program-audio.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript")],include_str!("program-audio.js")) }))
+        .route(
+            "/assets/program-audio.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript")],
+                    include_str!("program-audio.js"),
+                )
+            }),
+        )
         .route("/api/media-assets/hls/{id}/{file}", get(hls))
         .route("/api/stream-roles", get(roles).post(set_role))
         .route("/api/dashboard_status", get(dashboard_status))
@@ -124,18 +138,28 @@ async fn program_state(
 }
 
 #[derive(Deserialize)]
-struct AudioCursor { #[serde(default)] after: u64 }
+struct AudioCursor {
+    #[serde(default)]
+    after: u64,
+}
 
-async fn program_audio(State(state): State<Arc<MediaState>>, Query(query): Query<MediaQuery>,
-    Query(cursor): Query<AudioCursor>, headers: HeaderMap) -> ApiResult<Response> {
+async fn program_audio(
+    State(state): State<Arc<MediaState>>,
+    Query(query): Query<MediaQuery>,
+    Query(cursor): Query<AudioCursor>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     authorize_media(&state, &headers, &query, "program").await?;
     let broadcast = read_presentation(&state).await?.broadcast;
     let batch = if broadcast.comms_audio_enabled {
-        state.voice.audience_batch(cursor.after, broadcast.delay_seconds).await
+        state
+            .voice
+            .audience_batch(cursor.after, broadcast.delay_seconds)
+            .await
     } else {
         serde_json::json!({"enabled":false,"generation":0,"cursor":0,"frames":[]})
     };
-    Ok(([(header::CACHE_CONTROL,"no-store")], Json(batch)).into_response())
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(batch)).into_response())
 }
 
 fn model_snapshot(app: &AppState, model: &Vehicle, now: u64) -> serde_json::Value {
@@ -456,7 +480,12 @@ async fn hls(
 
 async fn roles(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> ApiResult<Response> {
     let p = crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await?;
-    if p.anonymous || !p.roles.iter().any(|role|matches!(role,StreamRole::StreamAdmin|StreamRole::Admin)) {
+    if p.anonymous
+        || !p
+            .roles
+            .iter()
+            .any(|role| matches!(role, StreamRole::StreamAdmin | StreamRole::Admin))
+    {
         return Err(error(
             StatusCode::FORBIDDEN,
             "Stream administrator required",
@@ -481,20 +510,43 @@ async fn set_role(
 ) -> ApiResult<Response> {
     let _guard = state.presentation_write.lock().await;
     let p = crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await?;
-    if p.anonymous || !p.roles.iter().any(|role|matches!(role,StreamRole::StreamAdmin|StreamRole::Admin)) {
+    if p.anonymous
+        || !p
+            .roles
+            .iter()
+            .any(|role| matches!(role, StreamRole::StreamAdmin | StreamRole::Admin))
+    {
         return Err(error(
             StatusCode::FORBIDDEN,
             "Stream administrator required",
         ));
     }
-    let close_previews = state.app.auth.update_users(|config| {
-        let user = config.users.iter_mut().find(|u|u.username==change.username).ok_or("Unknown user")?;
-        user.roles.retain(|role|*role!=StreamRole::StreamMaster&&*role!=StreamRole::StreamViewer);
-        if change.stream_master {user.roles.push(StreamRole::StreamMaster);user.permissions.view_data=true;}
-        else {user.roles.push(StreamRole::StreamViewer);}
-        Ok(!change.stream_master && !user.permissions.send_commands
-            && !user.roles.iter().any(|role|matches!(role,StreamRole::StreamAdmin|StreamRole::Admin)))
-    }).map_err(|_|error(StatusCode::CONFLICT,"Cannot update stream role"))?;
+    let close_previews = state
+        .app
+        .auth
+        .update_users(|config| {
+            let user = config
+                .users
+                .iter_mut()
+                .find(|u| u.username == change.username)
+                .ok_or("Unknown user")?;
+            user.roles.retain(|role| {
+                *role != StreamRole::StreamMaster && *role != StreamRole::StreamViewer
+            });
+            if change.stream_master {
+                user.roles.push(StreamRole::StreamMaster);
+                user.permissions.view_data = true;
+            } else {
+                user.roles.push(StreamRole::StreamViewer);
+            }
+            Ok(!change.stream_master
+                && !user.permissions.send_commands
+                && !user
+                    .roles
+                    .iter()
+                    .any(|role| matches!(role, StreamRole::StreamAdmin | StreamRole::Admin)))
+        })
+        .map_err(|_| error(StatusCode::CONFLICT, "Cannot update stream role"))?;
     if close_previews {
         let mut sessions = state.preview_sessions.lock().await;
         let closing: Vec<_> = sessions
@@ -594,13 +646,19 @@ mod tests {
         assert!(stale["stats"][0]["value"].is_null());
         for sample in 1..=5 {
             let now = 106_000 + sample * 200;
-            app.recent_telemetry_cache.lock().unwrap().push_back(crate::types::TelemetryRow {
-                timestamp_ms: now as i64,
-                data_type: "GPS_DATA".into(),
-                sender_id: "RF".into(),
-                values: vec![Some(42.0), Some(-78.0), Some(sample as f32)],
-            });
-            assert_eq!(telemetry_snapshot(&app, &profile, now)["stats"][0]["value"].as_f64(), Some(sample as f64));
+            app.recent_telemetry_cache
+                .lock()
+                .unwrap()
+                .push_back(crate::types::TelemetryRow {
+                    timestamp_ms: now as i64,
+                    data_type: "GPS_DATA".into(),
+                    sender_id: "RF".into(),
+                    values: vec![Some(42.0), Some(-78.0), Some(sample as f32)],
+                });
+            assert_eq!(
+                telemetry_snapshot(&app, &profile, now)["stats"][0]["value"].as_f64(),
+                Some(sample as f64)
+            );
         }
     }
     #[test]

@@ -4,15 +4,15 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Ground station · Video & stage models</title>
 <style>
-  :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #10151d; color: #e8eef7; }
-  body { max-width: 1440px; margin: auto; padding: 24px; }
-  a { color: #87cfff; } h1 { font-size: 1.7rem; } h2 { margin-top: 32px; }
-  input, button { font: inherit; padding: 9px; border: 1px solid #526176; border-radius: 5px; background: #202c3b; color: inherit; }
+  :root { color-scheme: dark; font: 16px system-ui, sans-serif; background:var(--gs26-app-background,#030712);color:var(--gs26-app-text,#edf3ff); }
+  body { box-sizing:border-box;max-width: 1200px; margin: auto; padding: 24px; }
+  a { color: #87cfff; } h1 { font-size:22px;font-weight:600;letter-spacing:-.02em; } h2 { font-size:18px;font-weight:600;margin-top:24px; }
+  input,select,button {box-sizing:border-box;min-height:44px;max-width:100%;font:inherit;padding:9px 12px;border:1px solid var(--gs26-button-border,#42536d);border-radius:10px;background:var(--gs26-button-background,#162235);color:inherit;}button{font-size:14px;font-weight:600;}input:not([type=checkbox]):not([type=file]),select{width:min(100%,18rem)}
   button { cursor: pointer; } button:disabled { opacity: .5; }
   form { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
-  label { display: grid; gap: 6px; } p { color: #bac9dc; }
+  label{display:grid;gap:7px;font-size:14px;min-width:0}p{color:var(--gs26-text-muted,#9fb0c7);font-size:14px;line-height:1.5}
   #cameras { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: 18px; }
-  article { background: #1b2634; padding: 14px; border-radius: 8px; }
+  article{background:var(--gs26-panel-background,#0b1628);padding:16px;border:1px solid var(--gs26-border,#314156);border-radius:12px;}
   video { width: 100%; aspect-ratio: 16 / 9; background: black; }
   article h3 { margin-top: 0; } #message { min-height: 1.5em; color: #ffcb80; }
   li { margin: 12px 0; } li button { margin-left: 16px; }
@@ -292,6 +292,12 @@ if (embedded) {
   let receivedSession = false;
   window.addEventListener('message', event => {
     if (event.source !== parent || event.data?.type !== 'gs26-session' || typeof event.data.token !== 'string') return;
+    if(event.data.theme && typeof event.data.theme==='object'){
+      for(const name of ['--gs26-app-background','--gs26-app-text','--gs26-panel-background','--gs26-panel-alt-background','--gs26-border','--gs26-text-muted','--gs26-button-background','--gs26-button-border','--gs26-button-text']){
+        const value=event.data.theme[name];
+        if(typeof value==='string'&&CSS.supports('color',value))document.documentElement.style.setProperty(name,value);
+      }
+    }
     if (receivedSession && token === event.data.token) return;
     receivedSession = true;
     stopAll(); token = event.data.token;

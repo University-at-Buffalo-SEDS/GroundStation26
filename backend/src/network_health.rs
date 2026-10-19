@@ -1,5 +1,5 @@
 //! Diagnostic liveness history. Silence is not evidence of a reboot or a CPU fault.
-use crate::types::{NetworkBoardHealthEntry, canonical_sender_id};
+use crate::types::{BoardDiagnostics, NetworkBoardHealthEntry, canonical_sender_id};
 use std::{collections::HashMap, time::Instant};
 pub const TIMEOUT_MS: u64 = 12_000;
 #[derive(Default)]
@@ -7,6 +7,7 @@ pub struct Tracker {
     boards: HashMap<String, Record>,
 }
 struct Record {
+    diagnostics: Option<(BoardDiagnostics, Instant)>,
     first: Instant,
     last: Instant,
     healthy: bool,
@@ -61,6 +62,45 @@ impl Record {
         }
     }
 }
+// Integer wire fields retain exact counter values; do not round through f32 telemetry rows.
+pub(crate) fn decode_diagnostics(w: &[u32]) -> Option<BoardDiagnostics> {
+    if w.len() != 24 || w[0] != 1 || w[4] == 0 || w[4] > 1_000_000_000 {
+        return None;
+    }
+    let value = |index: usize, mask: u32| {
+        if w[1] & mask != 0 {
+            Some(w[index])
+        } else {
+            None
+        }
+    };
+    Some(BoardDiagnostics {
+        version: w[0],
+        received_age_ms: 0,
+        uptime_ticks: u64::from(w[2]) | (u64::from(w[3]) << 32),
+        uptime_frequency_hz: w[4],
+        reset_flags: w[5],
+        watchdog_missing_mask: w[6],
+        heap_live_bytes: value(7, 1),
+        heap_peak_bytes: value(8, 1),
+        heap_region_bytes: value(9, 1),
+        allocation_failures: value(10, 1),
+        admission_refusals: w[11],
+        can_rx_drops: value(12, 2),
+        can_tx_rejected: value(13, 4),
+        uart_rx_drops: value(14, 8),
+        tx_queue_high_water: value(15, 64),
+        sd_accepted_records: value(16, 16),
+        sd_processed_records: value(17, 16),
+        sd_rejected_records: value(18, 16),
+        sd_flushed_records: value(19, 16),
+        sd_write_errors: value(20, 16),
+        sd_max_write_ms: value(21, 128),
+        adc_overruns: value(22, 32),
+        diagnostic_send_failures: w[23],
+    })
+}
+
 impl Tracker {
     fn record(&mut self, sender: &str, now: Instant, wall_ms: u64) -> &mut Record {
         // Allocate sender storage only on first observation, not on every sample.
@@ -68,6 +108,7 @@ impl Tracker {
             self.boards.insert(
                 sender.to_owned(),
                 Record {
+                    diagnostics: None,
                     first: now,
                     last: now,
                     healthy: true,
@@ -84,6 +125,23 @@ impl Tracker {
             );
         }
         self.boards.get_mut(sender).unwrap()
+    }
+    pub fn observe_diagnostics(
+        &mut self,
+        sender: &str,
+        words: &[u32],
+        now: Instant,
+        wall_ms: u64,
+    ) -> bool {
+        let Some(report) = decode_diagnostics(words) else {
+            return false;
+        };
+        let sender = canonical_sender_id(sender.trim());
+        if sender.is_empty() || sender == "GS" || sender.starts_with('@') {
+            return false;
+        }
+        self.record(&sender, now, wall_ms).diagnostics = Some((report, now));
+        true
     }
     pub fn observe(&mut self, sender: &str, now: Instant, wall_ms: u64) {
         let sender = canonical_sender_id(sender.trim());
@@ -139,6 +197,11 @@ impl Tracker {
                 age.saturating_sub(TIMEOUT_MS)
             };
             rows.push(NetworkBoardHealthEntry {
+                diagnostics: r.diagnostics.as_ref().map(|(report, received)| {
+                    let mut report = report.clone();
+                    report.received_age_ms = elapsed(now, *received);
+                    report
+                }),
                 sender_id: sender.clone(),
                 healthy: r.healthy,
                 age_ms: age,
@@ -224,5 +287,49 @@ mod tests {
         assert_eq!(h.snapshot(t, false).len(), 8);
         h.clear();
         assert!(h.snapshot(t, false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn exact_uptime_optional_capabilities_and_invalid_versions() {
+        let mut words = [0; 24];
+        words[0] = 1;
+        words[2] = u32::MAX;
+        words[3] = 7;
+        words[4] = 1000;
+        words[7] = 123;
+        let report = decode_diagnostics(&words).unwrap();
+        assert_eq!(report.uptime_ticks, (7u64 << 32) | u64::from(u32::MAX));
+        assert_eq!(report.heap_live_bytes, None);
+        assert_eq!(report.can_rx_drops, None);
+        words[1] = 1 | 2 | 16;
+        let report = decode_diagnostics(&words).unwrap();
+        assert_eq!(report.heap_live_bytes, Some(123));
+        assert_eq!(report.can_rx_drops, Some(0));
+        assert_eq!(report.sd_flushed_records, Some(0));
+        words[0] = 2;
+        assert!(decode_diagnostics(&words).is_none());
+        words[0] = 1;
+        words[4] = 0;
+        assert!(decode_diagnostics(&words).is_none());
+        assert!(decode_diagnostics(&[]).is_none());
+    }
+    #[test]
+    fn diagnostics_age_separately_and_do_not_fake_traffic_or_hide_modes() {
+        let mut tracker = Tracker::default();
+        let at = Instant::now();
+        tracker.observe("FC", at, 1000);
+        let mut words = [0; 24];
+        words[0] = 1;
+        words[2] = 1234;
+        words[4] = 1000;
+        assert!(tracker.observe_diagnostics("FC", &words, at, 1000));
+        let rows = tracker.snapshot(at + std::time::Duration::from_secs(16), false);
+        assert!(!rows[0].healthy);
+        assert_eq!(rows[0].diagnostics.as_ref().unwrap().received_age_ms, 16000);
+        assert!(tracker.snapshot(at, true).is_empty());
     }
 }

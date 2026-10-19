@@ -1,10 +1,10 @@
 //! Authenticated WebRTC signaling, camera discovery and persistent per-stage GLB assets.
 #[path = "media/contract.rs"]
 mod contract;
-#[path = "media/recordings.rs"]
-mod recordings;
 #[path = "media/publishing.rs"]
 mod publishing;
+#[path = "media/recordings.rs"]
+mod recordings;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
@@ -42,7 +42,11 @@ struct MediaState {
     publishers: Mutex<Vec<publishing::Publisher>>,
 }
 
-pub fn router(app: Arc<AppState>, relay_password: String, voice: Arc<crate::voice::VoiceHub>) -> Router<Arc<AppState>> {
+pub fn router(
+    app: Arc<AppState>,
+    relay_password: String,
+    voice: Arc<crate::voice::VoiceHub>,
+) -> Router<Arc<AppState>> {
     let state = Arc::new(MediaState {
         app,
         client: reqwest::Client::builder()
@@ -72,7 +76,9 @@ pub fn router(app: Arc<AppState>, relay_password: String, voice: Arc<crate::voic
     });
     tokio::spawn(publishing::reap(state.clone()));
     let initial = state.clone();
-    tokio::spawn(async move { contract::initialize_voice_broadcast(&initial).await; });
+    tokio::spawn(async move {
+        contract::initialize_voice_broadcast(&initial).await;
+    });
     Router::new()
         .merge(contract::routes())
         .merge(recordings::routes())

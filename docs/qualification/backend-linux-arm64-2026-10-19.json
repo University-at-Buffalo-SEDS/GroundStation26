@@ -1,0 +1,43 @@
+{
+  "platform": "linux/arm64",
+  "sdk": "4.2.4 candidate path selected and Cargo proof checked",
+  "backend_modes": [
+    "normal",
+    "hitl_mode",
+    "test_fire_mode"
+  ],
+  "raspberry_pi_feature_check": true,
+  "exit": 0,
+  "wall_seconds": 202.2379078338854,
+  "tests": [
+    {
+      "mode": "normal",
+      "passed": 320,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "mode": "hitl_mode",
+      "passed": 313,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "mode": "test_fire_mode",
+      "passed": 321,
+      "failed": 0,
+      "ignored": 1
+    }
+  ],
+  "date": "2026-10-19",
+  "source_proof": "SEDSnet v4.2.4 (/workspace/SEDSnet)",
+  "source_files": {
+    "SEDSnet/src/router.rs": "03d11c90fcd1d37fa36c67376b74030913308ed8c76116cc241a47b066f608d3",
+    "SEDSnet/src/relay.rs": "62d5392a3ed7f4c6ecaba490cbd788f75265f0b482a65dd9c6d92c8dfc832b02",
+    "GroundStation26/backend/src/telemetry_task.rs": "c746c5960ad92559210e91c3beb48c6cb7dc73e0b53b3b2b933dd679aeec9f30"
+  },
+  "limits": [
+    "Native Linux ARM64 container validation; physical Raspberry Pi GPIO, Ethernet wiring, microphones and mobile sensors require hardware testing.",
+    "Production backend dependency remains major version4; the isolated test workspace selects the candidate path."
+  ]
+}

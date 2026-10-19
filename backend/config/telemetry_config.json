@@ -581,42 +581,225 @@
       ]
     },
     {
-      "name": "RESERVED_135", "doc": "Reserved legacy rate ID; telemetry rates are compile-time board settings.",
-      "reliable": "Ordered", "priority": 16, "class": "Data",
-      "element": {"kind": "Static", "data_type": "Float32", "count": 1}, "endpoints": []
+      "name": "RESERVED_135",
+      "doc": "Reserved legacy rate ID; telemetry rates are compile-time board settings.",
+      "reliable": "Ordered",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 1
+      },
+      "endpoints": []
     },
     {
-      "name": "RESERVED_136", "doc": "Reserved legacy rate ID; telemetry rates are compile-time board settings.",
-      "reliable": "Ordered", "priority": 16, "class": "Data",
-      "element": {"kind": "Static", "data_type": "Float32", "count": 1}, "endpoints": []
+      "name": "RESERVED_136",
+      "doc": "Reserved legacy rate ID; telemetry rates are compile-time board settings.",
+      "reliable": "Ordered",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 1
+      },
+      "endpoints": []
     },
     {
-      "name": "DAQ_LOADCELL_CALIBRATION", "doc": "DAQ calibration [KG1000 slope, KG1000 intercept, IADC slope, IADC intercept].",
-      "reliable": "Ordered", "priority": 16, "class": "Data",
-      "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["SD_CARD"]
+      "name": "DAQ_LOADCELL_CALIBRATION",
+      "doc": "DAQ calibration [KG1000 slope, KG1000 intercept, IADC slope, IADC intercept].",
+      "reliable": "Ordered",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 4
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
     },
     {
       "name": "DAQ_KG50_CALIBRATION",
       "doc": "KG50 calibration [c0,c1,c2,c3,c4,x0,tare]; kg=sum(ci*(raw-x0)^i)-tare.",
-      "reliable": "Ordered", "priority": 16, "class": "Data",
-      "element": {"kind": "Static", "data_type": "Float32", "count": 7},
-      "endpoints": ["SD_CARD"]
+      "reliable": "Ordered",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 7
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
     },
     {
       "name": "DAQ_LOG_CLOCK",
       "doc": "Retained DAQ session ID and T+120s close deadline, two little-endian u64 values; zeros reset recording.",
-      "reliable": "Ordered", "priority": 16, "class": "Data",
-      "element": {"kind": "Static", "data_type": "UInt8", "count": 16},
-      "endpoints": ["SD_CARD"]
+      "reliable": "Ordered",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 16
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
     },
-    {"name": "DAQ_ADC_TEMPERATURE", "doc": "MCP3564R die temperature in Celsius; NaN means unavailable.", "reliable": "Off", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 1}, "endpoints": ["GROUND_STATION"]},
-    {"name": "DAQ_THERMAL_CALIBRATION", "doc": "Raw offset compensation [KG1000 reference C, raw/C, KG50 reference C, raw/C]. Subtract slope*(T-reference) before mass calibration.", "reliable": "Ordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["SD_CARD"]},
-    {"name": "DAQ_FILTER_CALIBRATION", "doc": "Load-cell low-pass time constants [KG1000 ms, KG50 ms]; 0 disables, maximum 2000 ms.", "reliable": "Ordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 2}, "endpoints": ["SD_CARD"]},
-    {"name": "DAQ_SAR_VOLTAGES", "doc": "SAR_IN1..8 connector volts, nominal 3.3V reference; NaN unavailable.", "reliable": "Off", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 8}, "endpoints": ["GROUND_STATION"]},
-    {"name": "DAQ_SDADC_VOLTAGES", "doc": "MCP CH2,CH3,CH4,CH5,HVAIN1(CH6),HVAIN2(CH7) connector volts; HVAIN includes 11x divider; NaN unavailable/stale.", "reliable": "Off", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 6}, "endpoints": ["GROUND_STATION"]},
-    {"name": "DAQ_CURRENT_SENSE", "doc": "J7 volts, J8 volts, J7 amps, J8 amps. TMCS1108A1B nominal midpoint zero and 50mV/A.", "reliable": "Off", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["GROUND_STATION"]},
-    {"name": "DAQ_POWER_MONITOR", "doc": "VMON ADC volts, IMON ADC volts, VMAIN volts, input amps. Nominal component scaling; low-current IMON is approximate.", "reliable": "Off", "priority": 0, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 4}, "endpoints": ["GROUND_STATION"]},
-    {"name": "DAQ_KG50_INPUT", "doc": "Managed source: 0 AMP2/CH1, 1 P6 differential CH2-CH3. Selected input uses the fast scan.", "reliable": "Ordered", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "UInt8", "count": 1}, "endpoints": ["SD_CARD"]},
-    {"name": "DAQ_KG50_SELECTED", "doc": "[source, raw] for selected alternate KG50 input; source 1 is P6 CH2-CH3 volts. Source tag prevents mixing input calibrations.", "reliable": "Off", "priority": 16, "class": "Data", "element": {"kind": "Static", "data_type": "Float32", "count": 2}, "endpoints": ["GROUND_STATION"]}
+    {
+      "name": "DAQ_ADC_TEMPERATURE",
+      "doc": "MCP3564R die temperature in Celsius; NaN means unavailable.",
+      "reliable": "Off",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 1
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ]
+    },
+    {
+      "name": "DAQ_THERMAL_CALIBRATION",
+      "doc": "Raw offset compensation [KG1000 reference C, raw/C, KG50 reference C, raw/C]. Subtract slope*(T-reference) before mass calibration.",
+      "reliable": "Ordered",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 4
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
+    },
+    {
+      "name": "DAQ_FILTER_CALIBRATION",
+      "doc": "Load-cell low-pass time constants [KG1000 ms, KG50 ms]; 0 disables, maximum 2000 ms.",
+      "reliable": "Ordered",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 2
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
+    },
+    {
+      "name": "DAQ_SAR_VOLTAGES",
+      "doc": "SAR_IN1..8 connector volts, nominal 3.3V reference; NaN unavailable.",
+      "reliable": "Off",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 8
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ]
+    },
+    {
+      "name": "DAQ_SDADC_VOLTAGES",
+      "doc": "MCP CH2,CH3,CH4,CH5,HVAIN1(CH6),HVAIN2(CH7) connector volts; HVAIN includes 11x divider; NaN unavailable/stale.",
+      "reliable": "Off",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 6
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ]
+    },
+    {
+      "name": "DAQ_CURRENT_SENSE",
+      "doc": "J7 volts, J8 volts, J7 amps, J8 amps. TMCS1108A1B nominal midpoint zero and 50mV/A.",
+      "reliable": "Off",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 4
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ]
+    },
+    {
+      "name": "DAQ_POWER_MONITOR",
+      "doc": "VMON ADC volts, IMON ADC volts, VMAIN volts, input amps. Nominal component scaling; low-current IMON is approximate.",
+      "reliable": "Off",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 4
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ]
+    },
+    {
+      "name": "DAQ_KG50_INPUT",
+      "doc": "Managed source: 0 AMP2/CH1, 1 P6 differential CH2-CH3. Selected input uses the fast scan.",
+      "reliable": "Ordered",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 1
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
+    },
+    {
+      "name": "DAQ_KG50_SELECTED",
+      "doc": "[source, raw] for selected alternate KG50 input; source 1 is P6 CH2-CH3 volts. Source tag prevents mixing input calibrations.",
+      "reliable": "Off",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 2
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ]
+    },
+    {
+      "name": "BOARD_HEALTH",
+      "doc": "Version 1 board diagnostics: 24 uint32 fields; optional capabilities, uptime clock, reset, allocator, transport and storage counters.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 24
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 0
+    }
   ]
 }

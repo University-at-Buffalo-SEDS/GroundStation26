@@ -1826,6 +1826,13 @@ fn radio_air_time_for_payload(payload_len: usize) -> Duration {
 mod rfd_air_budget_tests {
     use super::*;
     #[test]
+    fn radio_chunk_leaves_control_latency_headroom() {
+        assert!(
+            radio_air_budget(crate::RADIO_SIDE_MAX_FRAME_BYTES, 64_000, 40, 16)
+                <= Duration::from_millis(70)
+        );
+    }
+    #[test]
     fn budgets_shared_air_link_instead_of_uart_baud() {
         assert_eq!(
             radio_air_budget(100, 64_000, 40, 16),

@@ -1632,6 +1632,18 @@ async fn handle_packet(
     }
     let sender_id = state.canonical_network_sender_id(pkt.sender());
 
+    if pkt.data_type() == crate::telemetry_schema::data_type("BOARD_HEALTH") {
+        if let Ok(words) = pkt.data_as_u32() {
+            state.network_health.lock().unwrap().observe_diagnostics(
+                &sender_id,
+                &words,
+                std::time::Instant::now(),
+                get_current_timestamp_ms(),
+            );
+        }
+        return Vec::new();
+    }
+
     if pkt.data_type() == crate::telemetry_schema::data_type("WARNING") {
         if let Ok(msg) = pkt.data_as_string() {
             emit_warning(state, msg.to_string());

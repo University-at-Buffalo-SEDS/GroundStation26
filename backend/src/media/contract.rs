@@ -257,7 +257,10 @@ async fn read_presentation(state: &MediaState) -> ApiResult<Presentation> {
 pub(super) async fn initialize_voice_broadcast(state: &MediaState) {
     let _guard = state.presentation_write.lock().await;
     if let Ok(presentation) = read_presentation(state).await {
-        state.voice.set_broadcast(presentation.broadcast.comms_audio_enabled).await;
+        state
+            .voice
+            .set_broadcast(presentation.broadcast.comms_audio_enabled)
+            .await;
     }
 }
 
@@ -289,7 +292,11 @@ pub(super) struct MediaQuery {
     session: Option<String>,
 }
 
-pub(super) async fn ticket(state: &MediaState, headers: &HeaderMap, resource: &str) -> ApiResult<String> {
+pub(super) async fn ticket(
+    state: &MediaState,
+    headers: &HeaderMap,
+    resource: &str,
+) -> ApiResult<String> {
     let authorization = headers.get(header::AUTHORIZATION).cloned();
     let mut tickets = state.tickets.lock().await;
     tickets.retain(|ticket| ticket.expires > Instant::now());
@@ -493,7 +500,10 @@ async fn control_broadcast(
         .ok_or_else(|| error(StatusCode::CONFLICT, "Broadcast revision exhausted"))?;
     presentation.broadcast = broadcast.clone();
     write_presentation(&state, &presentation).await?;
-    state.voice.set_broadcast(broadcast.comms_audio_enabled).await;
+    state
+        .voice
+        .set_broadcast(broadcast.comms_audio_enabled)
+        .await;
     Ok(axum::Json(broadcast))
 }
 
@@ -604,7 +614,10 @@ async fn save_vehicle(
     if !vehicle.ground_model_url.is_empty()
         && vehicle.ground_model_url != "/assets/models/gse-site.glb"
     {
-        return Err(error(StatusCode::BAD_REQUEST, "Select the bundled ground site model"));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "Select the bundled ground site model",
+        ));
     }
     if vehicle.motions.len() > 128
         || vehicle.motions.iter().any(|m| {

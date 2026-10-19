@@ -191,7 +191,7 @@ pub fn before_fill(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
 }
 
 /// Starts concurrently with launch dispatch, never adding to countdown time.
-#[cfg(any(feature="hitl_mode",feature="test_fire_mode",test))]
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode", test))]
 pub fn launch(state: &Arc<AppState>) {
     begin(state, "KG1000", false);
 }
@@ -361,7 +361,10 @@ mod tests {
         // explicit cutoff so this test does not depend on host clock precision.
         let latest = rt.kg1000.back().unwrap().at;
         assert!(!rt.samples("KG1000", latest).is_empty());
-        assert!(rt.samples("KG1000", latest + Duration::from_nanos(1)).is_empty());
+        assert!(
+            rt.samples("KG1000", latest + Duration::from_nanos(1))
+                .is_empty()
+        );
         rt.pending = true;
         let old = rt.generation;
         rt.cancel();

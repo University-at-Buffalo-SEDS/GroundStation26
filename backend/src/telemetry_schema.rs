@@ -303,8 +303,12 @@ mod tests {
         ];
         for (name, id, count) in entries {
             assert_eq!(data_type(name), DataType(id));
-            let ty = schema["types"].as_array().unwrap().iter()
-                .find(|entry| entry["name"] == name).unwrap();
+            let ty = schema["types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap();
             assert_eq!(ty["element"]["count"], count);
             assert_eq!(ty["element"]["data_type"], "Float32");
             assert_eq!(ty["endpoints"], serde_json::json!(["GROUND_STATION"]));

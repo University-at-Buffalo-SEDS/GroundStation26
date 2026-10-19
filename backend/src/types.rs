@@ -267,7 +267,36 @@ pub struct NetworkTopologyLink {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
+pub struct BoardDiagnostics {
+    pub version: u32,
+    pub received_age_ms: u64,
+    pub uptime_ticks: u64,
+    pub uptime_frequency_hz: u32,
+    pub reset_flags: u32,
+    pub watchdog_missing_mask: u32,
+    pub heap_live_bytes: Option<u32>,
+    pub heap_peak_bytes: Option<u32>,
+    pub heap_region_bytes: Option<u32>,
+    pub allocation_failures: Option<u32>,
+    pub admission_refusals: u32,
+    pub can_rx_drops: Option<u32>,
+    pub can_tx_rejected: Option<u32>,
+    pub uart_rx_drops: Option<u32>,
+    pub tx_queue_high_water: Option<u32>,
+    pub sd_accepted_records: Option<u32>,
+    pub sd_processed_records: Option<u32>,
+    pub sd_rejected_records: Option<u32>,
+    pub sd_flushed_records: Option<u32>,
+    pub sd_write_errors: Option<u32>,
+    pub sd_max_write_ms: Option<u32>,
+    pub adc_overruns: Option<u32>,
+    pub diagnostic_send_failures: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
 pub struct NetworkBoardHealthEntry {
+    #[serde(default)]
+    pub diagnostics: Option<BoardDiagnostics>,
     pub sender_id: String,
     pub healthy: bool,
     pub age_ms: u64,

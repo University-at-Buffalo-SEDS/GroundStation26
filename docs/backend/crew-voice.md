@@ -26,8 +26,7 @@ Changing this permission does not grant hardware-control or broadcast-management
 
 ## Include comms in the audience stream
 
-In **Mission → Stream controls → Broadcast studio**, check **Include crew audio
-in audience stream (delayed)**, then select **Apply broadcast settings**. This
+In **Mission → Stream controls → Broadcast studio**, check **Include crew voice (VC)** under **Audience audio**, then select **Apply broadcast settings**. This
 requires stream-manager/admin access and is off by default. Connected crew see a
 notice when their audio is included in the broadcast.
 
@@ -53,14 +52,13 @@ recording. Audio is held only in a bounded in-memory delay buffer.
 The default is **push to talk**: hold the button or Space while the voice page has
 focus. Space does not activate while typing or using another control. Release,
 window blur, and hiding the page release push-to-talk. **Open mic** allows a
-continuous call. **Mute microphone** overrides either mode. **Leave voice**, sign
+continuous call. **Mic off · listen only** stops transmission while keeping incoming audio connected. **Mute microphone** overrides either transmitting mode. **Leave voice**, sign
 out, a disconnected microphone, or a lost server connection releases capture.
 There is no automatic reconnect that silently turns a microphone back on.
 
 Select the microphone before joining; leave and rejoin to change it. Device names
 may remain hidden until the browser grants permission. Microphone gain is 0–200%;
-speaker volume is 0–150%. Browser echo cancellation and noise suppression are
-requested; headphones remain useful. The input meter shows the enabled microphone
+speaker volume is 0–150%. Browser echo cancellation is requested. **Noise suppression** can be turned on or off before joining or during a call when the browser/device supports it; unsupported devices show the control disabled. Changing transmit mode or suppressing noise does not grant new permissions; headphones remain useful. The input meter shows the enabled microphone
 level. The roster indicates whose microphone is open, not a speech detector.
 
 ## Connection and deployment

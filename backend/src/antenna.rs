@@ -404,6 +404,10 @@ mod tests {
 /// filtered/relative coordinates and cannot prove a current receiver lock.
 #[cfg(not(feature = "hitl_mode"))]
 pub fn rocket_launch_fix_locked() -> bool {
-    cache().lock().unwrap().rocket[0].as_ref()
-        .is_some_and(|value| { let fix=value.snapshot();fix.valid() && !fix.stale && fix.altitude_m.is_some() })
+    cache().lock().unwrap().rocket[0]
+        .as_ref()
+        .is_some_and(|value| {
+            let fix = value.snapshot();
+            fix.valid() && !fix.stale && fix.altitude_m.is_some()
+        })
 }

@@ -20,7 +20,7 @@ try {
       };
     });
     await page.goto(`${origin}/radio`);await page.fill('#username',username);await page.fill('#password','fixture');await page.click('#signin');
-    await page.click('#join');await page.waitForFunction(()=>document.querySelector('#status').textContent==='Connected to crew voice.');
+    await page.click('#join');await page.waitForFunction(()=>document.querySelector('#status').textContent==='Connected to voice chat.');
     clients.push({context,page});
   }
   const [a,b]=clients.map(c=>c.page);
@@ -37,7 +37,23 @@ try {
   await a.selectOption('#mode','open');await a.waitForFunction(n=>audioSent>n+3,before);
   await a.click('#mute');await a.waitForTimeout(150);const muted=await a.evaluate(()=>audioSent);await a.waitForTimeout(200);
   assert.equal(await a.evaluate(()=>audioSent),muted,'mute stops open mic');
-  await a.click('#mute');await a.selectOption('#mode','ptt');
+  await a.click('#mute');
+  await a.selectOption('#mode','off');await a.waitForTimeout(150);
+  const offFrames=await a.evaluate(()=>audioSent);await a.waitForTimeout(200);
+  assert.equal(await a.evaluate(()=>audioSent),offFrames,'listen-only mode cannot transmit');
+  assert.equal(await a.locator('#ptt').isDisabled(),true);
+  assert.equal(await a.locator('#mic-state').textContent(),'Microphone off · listening');
+  if(await a.locator('#noise-suppression').isEnabled()) {
+    await a.locator('#noise-suppression').uncheck();
+    await a.waitForFunction(()=>document.querySelector('#noise-suppression').disabled===false);
+    assert.equal(await a.locator('#noise-suppression').isChecked(),false);
+    await a.getByText('Noise suppression off',{exact:true}).waitFor();
+    await a.locator('#noise-suppression').check();
+    await a.waitForFunction(()=>document.querySelector('#noise-suppression').disabled===false);
+    assert.equal(await a.locator('#noise-suppression').isChecked(),true);
+    await a.getByText('Noise suppression on',{exact:true}).waitFor();
+  }
+  await a.selectOption('#mode','ptt');
   await a.locator('#ptt').focus();await a.keyboard.down('Space');await a.waitForFunction(n=>audioSent>n+3,muted);await a.keyboard.up('Space');
   await a.locator('#ptt').focus();await a.keyboard.down('Space');await a.evaluate(()=>window.dispatchEvent(new Event('blur')));await a.keyboard.up('Space');
   assert.equal(await a.locator('#ptt').getAttribute('aria-pressed'),'false','blur releases PTT');

@@ -1,0 +1,65 @@
+{
+  "candidate": "SEDSnet4.2.4 unpublished; shared transport receive budget",
+  "status": "Compact helper implementation adopted; full source-matched rebuilds and simulator qualification pending",
+  "capture": "Jupiter:receipt-diagnostics/bay-1792379104896398535",
+  "observed_failure": {
+    "type": "FLIGHT_BUZZER",
+    "packet_id": 2237713083956123803,
+    "registered_ms": 2730,
+    "completed_ms": 3270,
+    "actual_sdk_latency_ms": 540,
+    "retry_ms": [
+      2980,
+      3230
+    ],
+    "rf_incomplete_payload_bytes_first_sample": 10230,
+    "rf_live_peak_bytes": 61620,
+    "first_two_sample_admission_refusals": [
+      128,
+      172
+    ]
+  },
+  "cause": "Incomplete side-chunk assemblies had an independent receive budget on each link and were missing from shared queue byte accounting. Partial transfers and queued traffic could together retain more than the configured budget.",
+  "negative_controls": {
+    "two_links_retained_fragment_cost": 24288,
+    "configured_fragment_headroom": 16384,
+    "router_relay_accounting_and_active_progress_failures": 4,
+    "oversized_metadata_evicted_an_unrelated_transfer_failures": 2,
+    "fixture_compile_errors_in_reported_negative_controls": 0
+  },
+  "fix": {
+    "same_queue_budget": true,
+    "same_application_allocator_capacity": true,
+    "learned_routes_not_evicted": true,
+    "known_bulk_reclaimed_by_dominant_sender": true,
+    "active_transfer_excluded_from_unrelated_reclamation": true,
+    "crc_and_shape_checks_retained": true,
+    "duplicates_do_not_allocate_or_grow_usage": true,
+    "diagnostic": "side_transport_chunk_reclaims"
+  },
+  "checks": {
+    "focused_heap": 16,
+    "focused_active_arena": 16,
+    "full_default_passed": 591,
+    "full_default_ignored": 2,
+    "full_experimental_passed": 615,
+    "full_experimental_ignored": 3,
+    "strict_clippy": "passed",
+    "python_tests": 41,
+    "gs_backend_modes": [
+      "normal",
+      "HITL",
+      "test-fire"
+    ],
+    "initial_macos_factory_passes": 7,
+    "initial_fc_overflow_bytes": 4008,
+    "per_link_cache_probe_fc_overflow_bytes": 816,
+    "compact_helper_probe_fc_flash_bytes": 474512,
+    "compact_helper_probe_fc_spare_bytes": 112
+  },
+  "limits": [
+    "Full checks above refer to the first shared-budget implementation. Size-refined source must be rechecked before qualification.",
+    "No new long network soak or physical-card/ADC throughput qualification claimed.",
+    "No commits, pushes or release made."
+  ]
+}

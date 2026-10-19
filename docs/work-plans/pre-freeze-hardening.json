@@ -1,0 +1,47 @@
+{
+  "updated": "2026-10-19",
+  "tasks": [
+    {
+      "id": "bounded-ui-replay",
+      "status": "complete",
+      "scope": "Bound history-reload live replay by rows and bytes, expose truncation, test delayed reload and reset cancellation",
+      "evidence": "Row/byte bounded replay; 450k-arrival and wide-row tests; UI native/web builds and headless browser at320/390/844/1280 pass."
+    },
+    {
+      "id": "sd-clock-consistency",
+      "status": "complete",
+      "scope": "Keep DAQ acquisition settings; record wrap-safe monotonic uptime ticks/frequency in DAQ and FC, unify CSV schema and preserve all FC vector/message data; test transient SD failure and final drain",
+      "evidence": "Unified13-column format with1ms nominal1000Hz uptime and retained writes/rotation/final drain. Original600svirtual capture:DAQ acquired=accepted936179, flushed=on-card936147,32accepted records still in buffers at snapshot; FC flushed=on-card19392,307accepted records still in buffers. Both CSV validators pass clock/sequence/count reconciliation. DAQ raw drops/I/O losses and both writers' write errors were zero. FC startup-unavailable rejections were counted separately, so this does not assert every pre-initialization FC record was accepted. Network qualification separately remains failed. Physical-card throughput/durability remains hardware follow-up."
+    },
+    {
+      "id": "board-diagnostics",
+      "status": "complete",
+      "scope": "Low-rate versioned uptime/reset/memory/queue/drop/storage diagnostics from all boards to dynamic GroundStation health panel; no board-specific logic in SEDSnet",
+      "evidence": "All8 apps emit versioned exactUInt32 health with optional caps. Backend normal/HITL/testfire and UI tests pass; health browser verifies counters and stale diagnostics."
+    },
+    {
+      "id": "performance-baselines",
+      "status": "complete",
+      "scope": "Repeatable CPU/allocation baselines using existing SEDSnet benches and regression thresholds with actual evidence",
+      "evidence": "Matched nine same-host Criterion cases and source hashes saved; mixed timing results, no general CPU speedup claimed. Retained header/type metadata reduced. Actual4KiB SDK transfer uses92 rather than114physical CAN frames (19.3%fewer), verified heap/arena and mixed128\u2192110receiver compatibility. FullSDK554existing tests+newpacketization test pass; two existing tests ignored. Negative controls reproduce the pressure failures. Docs/performance-matched-2026-10-18.json and docs/can-packetization-2026-10-18.json in SEDSnet."
+    },
+    {
+      "id": "extended-qualification",
+      "status": "complete",
+      "scope": "Longer mixed-network simulator qualification, slow-client/reconnect stress and SD count reconciliation; distinguish physical-card throughput from simulation",
+      "evidence": "All-current SDK4.2.4 qualification passes: three strict starts,120-second restart,600-second seven-board mixed-restart soak and both SD reconciliations. Actual SDK source is verified in the Linux hosted image and macOS normal/HITL/test-fire tests. All203 network assertions pass. Measured latencies, memory/admission counts and accepted-versus-flushed SD totals are recorded in docs/work-plans/evidence/prefreeze-final-qualification-2026-10-19.json. Eight macOS and seven Linux firmware factories pass; full SDK release Nextest604/604 and experimental626 tests pass, dedicated Python48/no skips and five native C Release programs pass. Best-effort admission refusals remain counted. Physical-card/ADC throughput and power-loss durability remain hardware follow-up."
+    },
+    {
+      "id": "cohesive-operational-ui",
+      "status": "complete",
+      "scope": "Consistent mission-control navigation and touch controls across pages; antenna aiming in Settings with animated horizontal/vertical guidance, heading-up relative GPS map and distance; dense customizable information panels; explicit microphone on/off and live noise suppression; optional crew voice in audience stream.",
+      "evidence": "Shared44px controls and bounded fields; grouped desktop navigation with mobile tab picker, settings-only aiming, animated heading-up relative GPS map and distance; native103tests pass; web builds and four-viewport antenna browser pass; full dashboard browser passes all55simulated command buttons plus settings/role/checklist/export/mobile checks, and saved layouts on Detailed, Connection and Data views. Screenshots visually reviewed. Two-client real PCM browser tests pass including microphone off and live noise-suppression off/on via controlled recapture. Optional audience crew voice retains permissions. Hardware and native mobile sensor behavior remain follow-up; this does not qualify the unresolved network failures. Final matchingDioxus0.7.10 web build is warning-free; native103tests and all55command/browser checks pass after live-card polish. Live WebSocket fixtures verify distinct GB/VB batteries, both loadcells and valve readings at1280/844/390/320px; screenshots reviewed. Startup trends wait for two points and use available history width."
+    }
+  ],
+  "constraints": [
+    "No output actuation or flashing",
+    "Preserve main/v4 dependency selectors and existing HITL behavior",
+    "Record and count losses; never claim physical SD durability from buffered writes or simulated storage"
+  ],
+  "hardware_follow_up": "Reconcile physical ADC/log counts at configured rate and measure card flush stalls and power-loss behavior when hardware returns. Simulation does not establish physical-card durability."
+}

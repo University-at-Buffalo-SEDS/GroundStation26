@@ -67,10 +67,12 @@ pub async fn export_recording_csv(
         linear_formula(calibration.iadc.m, calibration.iadc.b)
     )?;
 
-    let kg50 = crate::loadcell::kg50_daq_coefficients(calibration)
-        .map_err(anyhow::Error::msg)?;
-    writeln!(writer, "CALIBRATION_50KG,,,,,,,,,,,,\"c0={};c1={};c2={};c3={};c4={};x0={};tare={}\",",
-        kg50[0], kg50[1], kg50[2], kg50[3], kg50[4], kg50[5], kg50[6])?;
+    let kg50 = crate::loadcell::kg50_daq_coefficients(calibration).map_err(anyhow::Error::msg)?;
+    writeln!(
+        writer,
+        "CALIBRATION_50KG,,,,,,,,,,,,\"c0={};c1={};c2={};c3={};c4={};x0={};tare={}\",",
+        kg50[0], kg50[1], kg50[2], kg50[3], kg50[4], kg50[5], kg50[6]
+    )?;
     let mut state = ExportState::default();
     let mut seq: u16 = 0;
     let filters = crate::loadcell_zero::Service::default();
@@ -84,8 +86,12 @@ pub async fn export_recording_csv(
             "DAQ_ADC_TEMPERATURE" => {
                 let sender: String = row.get("sender_id");
                 temperatures.retain(|r| r.sender_id != sender);
-                temperatures.push(crate::types::TelemetryRow { timestamp_ms: row.get("timestamp_ms"),
-                    data_type, sender_id: sender, values });
+                temperatures.push(crate::types::TelemetryRow {
+                    timestamp_ms: row.get("timestamp_ms"),
+                    data_type,
+                    sender_id: sender,
+                    values,
+                });
             }
             "FUEL_TANK_PRESSURE" | "IADC" => {
                 state.pressure_raw = first_value;
@@ -99,14 +105,43 @@ pub async fn export_recording_csv(
             "KG50" => {
                 let rx_timestamp: String = row.get("rx_timestamp");
                 let source_timestamp_ms: i64 = row.get("source_timestamp_ms");
-                let temperature = crate::loadcell::recent_adc_temperature(temperatures.iter(),
-                    &row.get::<String, _>("sender_id"), row.get("timestamp_ms"));
-                let calibrated = first_value.and_then(|raw| crate::loadcell::temperature_corrected_raw(calibration, "KG50", raw, temperature))
-                    .map(|raw| filters.filter(calibration, &row.get::<String, _>("sender_id"), "KG50", row.get("timestamp_ms"), raw))
-                    .and_then(|raw| crate::loadcell::calibrated_weight_kg(calibration, "KG50", raw));
-                writeln!(writer, "{},{},{},{},,,,,,,,,{},{},{}",
-                    rx_timestamp, TEST_FIRE_HEADER, seq % 256, source_timestamp_ms,
-                    display_opt(first_value), display_opt(calibrated), display_opt(temperature))?;
+                let temperature = crate::loadcell::recent_adc_temperature(
+                    temperatures.iter(),
+                    &row.get::<String, _>("sender_id"),
+                    row.get("timestamp_ms"),
+                );
+                let calibrated = first_value
+                    .and_then(|raw| {
+                        crate::loadcell::temperature_corrected_raw(
+                            calibration,
+                            "KG50",
+                            raw,
+                            temperature,
+                        )
+                    })
+                    .map(|raw| {
+                        filters.filter(
+                            calibration,
+                            &row.get::<String, _>("sender_id"),
+                            "KG50",
+                            row.get("timestamp_ms"),
+                            raw,
+                        )
+                    })
+                    .and_then(|raw| {
+                        crate::loadcell::calibrated_weight_kg(calibration, "KG50", raw)
+                    });
+                writeln!(
+                    writer,
+                    "{},{},{},{},,,,,,,,,{},{},{}",
+                    rx_timestamp,
+                    TEST_FIRE_HEADER,
+                    seq % 256,
+                    source_timestamp_ms,
+                    display_opt(first_value),
+                    display_opt(calibrated),
+                    display_opt(temperature)
+                )?;
                 seq = seq.wrapping_add(1);
             }
             "KG1000" => {
@@ -114,11 +149,27 @@ pub async fn export_recording_csv(
                 let source_timestamp_ms: i64 = row.get("source_timestamp_ms");
                 let payload_json: String = row.get("payload_json");
                 let raw_loadcell = first_value.unwrap_or_default();
-                let temperature = crate::loadcell::recent_adc_temperature(temperatures.iter(),
-                    &row.get::<String, _>("sender_id"), row.get("timestamp_ms"));
-                let calibrated = crate::loadcell::temperature_corrected_raw(calibration, "KG1000", raw_loadcell, temperature)
-                    .map(|raw| filters.filter(calibration, &row.get::<String, _>("sender_id"), "KG1000", row.get("timestamp_ms"), raw))
-                    .and_then(|raw| calibrated_loadcell(calibration, raw));
+                let temperature = crate::loadcell::recent_adc_temperature(
+                    temperatures.iter(),
+                    &row.get::<String, _>("sender_id"),
+                    row.get("timestamp_ms"),
+                );
+                let calibrated = crate::loadcell::temperature_corrected_raw(
+                    calibration,
+                    "KG1000",
+                    raw_loadcell,
+                    temperature,
+                )
+                .map(|raw| {
+                    filters.filter(
+                        calibration,
+                        &row.get::<String, _>("sender_id"),
+                        "KG1000",
+                        row.get("timestamp_ms"),
+                        raw,
+                    )
+                })
+                .and_then(|raw| calibrated_loadcell(calibration, raw));
                 let crc = crc16_ccitt_false(&parse_payload_json(&payload_json));
                 writeln!(
                     writer,
@@ -194,28 +245,53 @@ mod tests {
 
     #[tokio::test]
     async fn kg50_only_recording_exports_every_sample_with_its_timestamp() {
-        let dir = std::env::temp_dir().join(format!("gs-kg50-csv-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "gs-kg50-csv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("recording.db");
         let csv_path = dir.join("recording.csv");
-        let db = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db_path.display())).await.unwrap();
+        let db = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER, source_timestamp_ms INTEGER, data_type TEXT, values_json TEXT, payload_json TEXT, sender_id TEXT)")
             .execute(&db).await.unwrap();
         for (i, raw) in [2.0, 3.0].iter().enumerate() {
             sqlx::query("INSERT INTO telemetry VALUES (?, ?, ?, 'KG50', ?, '[]', 'DAQ')")
-                .bind(i as i64).bind(10000_i64 + i as i64).bind(9000_i64 + i as i64)
-                .bind(format!("[{raw}]")).execute(&db).await.unwrap();
+                .bind(i as i64)
+                .bind(10000_i64 + i as i64)
+                .bind(9000_i64 + i as i64)
+                .bind(format!("[{raw}]"))
+                .execute(&db)
+                .await
+                .unwrap();
         }
         db.close().await;
         let mut cfg = LoadcellCalibrationFile::default();
-        cfg.extra_channels.insert("kg50".into(), crate::loadcell::GenericCalibrationChannel {
-            linear: crate::loadcell::ChannelLinear { m: Some(2.0), b: Some(1.0) },
-            ..Default::default()
-        });
-        export_recording_csv(db_path.to_str().unwrap(), &csv_path, &cfg).await.unwrap();
+        cfg.extra_channels.insert(
+            "kg50".into(),
+            crate::loadcell::GenericCalibrationChannel {
+                linear: crate::loadcell::ChannelLinear {
+                    m: Some(2.0),
+                    b: Some(1.0),
+                },
+                ..Default::default()
+            },
+        );
+        export_recording_csv(db_path.to_str().unwrap(), &csv_path, &cfg)
+            .await
+            .unwrap();
         let csv = std::fs::read_to_string(&csv_path).unwrap();
-        let samples: Vec<Vec<&str>> = csv.lines().skip(3).map(|line| line.split(',').collect()).collect();
+        let samples: Vec<Vec<&str>> = csv
+            .lines()
+            .skip(3)
+            .map(|line| line.split(',').collect())
+            .collect();
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].len(), 15);
         assert_eq!(samples[0][3], "9000");
