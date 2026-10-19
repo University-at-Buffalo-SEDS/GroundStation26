@@ -1,0 +1,176 @@
+{
+  "date": "2026-10-19",
+  "status": "published",
+  "sdk": {
+    "version": "4.2.4",
+    "source_selector": "main",
+    "groundstation_manifest_requirement": "4",
+    "github": "https://github.com/Rylan-Meilutis/SEDSnet/releases/tag/v4.2.4",
+    "crates": "https://crates.io/crates/SEDSnet/4.2.4",
+    "pypi": "https://pypi.org/project/sedsnet/4.2.4/",
+    "pypi_verified_artifacts": 8,
+    "local_registry_publication": true,
+    "credential_values_logged": false
+  },
+  "simulator": {
+    "version": "v0.4.14",
+    "repository": "ghcr.io/university-at-buffalo-seds/firmwaresimulator",
+    "source_commit": "34b7316fcb59bd25ad9213c4a3d386c127c2d095",
+    "groundstation_commit": "351edf27a19f539bfdb554fc00dcc965c3a14c69",
+    "manifest_digest": "sha256:cf91b07cbb123f8a68f4c02390a6d118e7e5e4c0518710b98ec9ac8fae769edf",
+    "native_platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "anonymous_pull_run": "passed on both platforms",
+    "packaged_checks": "passed on both platforms",
+    "organization_actions_changes": false
+  },
+  "qualification": {
+    "strict_starts": 3,
+    "restart_virtual_seconds": 120,
+    "long_soak_virtual_seconds": 600,
+    "observations": 60,
+    "assertions_passed": 203,
+    "latency": {
+      "acknowledgements": {
+        "VB": {
+          "count": 58,
+          "min_ms": 10,
+          "max_ms": 270
+        },
+        "AB": {
+          "count": 58,
+          "min_ms": 10,
+          "max_ms": 40
+        }
+      },
+      "managed_variable_rounds": {
+        "count": 9,
+        "min_ms": 130,
+        "max_ms": 210
+      },
+      "valve_power_stale_events": 0,
+      "timeouts": 0
+    },
+    "daq_fc_sd_reconciliation": "passed; accepted-but-buffered rows remain explicit",
+    "sdk_standard_nextest_passed": 604,
+    "sdk_experimental_nextest_passed": 626,
+    "native_codec_pressure_seconds": 600,
+    "native_codec_pressure_rounds": 14558397,
+    "macos_and_linux_factories": "passed",
+    "source_proof": "Both firmware and hosted backend use verified SDK4.2.4"
+  },
+  "repositories": {
+    "SEDSnet": {
+      "repo": "SEDSnet",
+      "branch": "dev",
+      "commit": "781df378aad05be84f39811d49257eab8161134d",
+      "pushed": true,
+      "also_main": true,
+      "current_head": "781df378aad05be84f39811d49257eab8161134d"
+    },
+    "GroundStation26": {
+      "repo": "GroundStation26",
+      "branch": "dev",
+      "commit": "351edf27a19f539bfdb554fc00dcc965c3a14c69",
+      "pushed": true,
+      "also_main": false,
+      "current_head": "351edf27a19f539bfdb554fc00dcc965c3a14c69"
+    },
+    "Seds-Ground-Station-Frontend": {
+      "repo": "Seds-Ground-Station-Frontend",
+      "branch": "dev",
+      "commit": "c1c3c5fcfab31943f9a1c33dcf28472304069871",
+      "pushed": true,
+      "also_main": false,
+      "current_head": "c1c3c5fcfab31943f9a1c33dcf28472304069871"
+    },
+    "FirmwareSimulator": {
+      "repo": "FirmwareSimulator",
+      "branch": "main",
+      "commit": "34b7316fcb59bd25ad9213c4a3d386c127c2d095",
+      "pushed": true,
+      "also_main": false,
+      "current_head": "d093ed468263688234f3d4ea0ce3ead78f1ca4be"
+    },
+    "ActuatorBoard26": {
+      "repo": "ActuatorBoard26",
+      "branch": "migration/sedlaunch-sedsnet-mainline",
+      "commit": "81e16ffb53f85ede3e87dfe19018cca02acfe7d6",
+      "pushed": true,
+      "also_main": false,
+      "current_head": "81e16ffb53f85ede3e87dfe19018cca02acfe7d6"
+    },
+    "DAQ-Board": {
+      "repo": "DAQ-Board",
+      "branch": "migration/sedlaunch-sedsnet-mainline",
+      "commit": "c4faa06fc6694de6ec87555a642f11cea697aa43",
+      "pushed": true,
+      "also_main": false,
+      "current_head": "c4faa06fc6694de6ec87555a642f11cea697aa43"
+    },
+    "FlightComputer26": {
+      "repo": "FlightComputer26",
+      "branch": "migration/sedlaunch-sedsnet-mainline",
+      "commit": "492ac32f1409ccee057cb5ebcae5d61c64f681ec",
+      "pushed": true,
+      "also_main": false,
+      "current_head": "492ac32f1409ccee057cb5ebcae5d61c64f681ec"
+    },
+    "PowerBoard26": {
+      "repo": "PowerBoard26",
+      "branch": "migration/sedlaunch-sedsnet-mainline",
+      "commit": "73666ff13c09d963e885be40c74a4a4e156e0263",
+      "pushed": true,
+      "also_main": false,
+      "current_head": "73666ff13c09d963e885be40c74a4a4e156e0263"
+    },
+    "RFBoard26": {
+      "repo": "RFBoard26",
+      "branch": "migration/sedlaunch-sedsnet-mainline",
+      "commit": "f2df62be635dd4b0f20a5082d43c37fb65ab4688",
+      "pushed": true,
+      "also_main": false,
+      "current_head": "f2df62be635dd4b0f20a5082d43c37fb65ab4688"
+    },
+    "ValveBoard26": {
+      "repo": "ValveBoard26",
+      "branch": "migration/sedlaunch-sedsnet-mainline",
+      "commit": "acaf978cb6888133c4f13aa94714e1f50a21d375",
+      "pushed": true,
+      "also_main": false,
+      "current_head": "acaf978cb6888133c4f13aa94714e1f50a21d375"
+    },
+    "gateway-board26": {
+      "repo": "gateway-board26",
+      "branch": "migration/sedlaunch-sedsnet-mainline",
+      "commit": "ce034ee295693a97541fdf2d3095b2d9c6000d05",
+      "pushed": true,
+      "also_main": false,
+      "current_head": "ce034ee295693a97541fdf2d3095b2d9c6000d05"
+    }
+  },
+  "gateway_alias": {
+    "alias": "gateway-board",
+    "canonical": "gateway-board26",
+    "branch": "migration/sedlaunch-sedsnet-mainline",
+    "commit": "ce034ee295693a97541fdf2d3095b2d9c6000d05",
+    "exact_tree_verified": true,
+    "pushed_through_canonical": true
+  },
+  "wiki": {
+    "commit": "8fc1a98ee8d66904eacc4ada825adb1f04b6430d",
+    "pushed": true,
+    "pages": [
+      "Build-and-Configure.md",
+      "Changelogs.md",
+      "Technical-Queues-and-Memory.md"
+    ]
+  },
+  "limits": [
+    "Physical ADC/card throughput, flush stalls and power-loss durability require hardware testing.",
+    "Best-effort network admission refusals remain counted; this is not an unlimited-load losslessness claim.",
+    "Native mobile sensors, physical front-panel GPIO and signing-store deployment remain platform/hardware follow-up."
+  ]
+}

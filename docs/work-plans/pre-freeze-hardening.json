@@ -43,5 +43,6 @@
     "Preserve main/v4 dependency selectors and existing HITL behavior",
     "Record and count losses; never claim physical SD durability from buffered writes or simulated storage"
   ],
-  "hardware_follow_up": "Reconcile physical ADC/log counts at configured rate and measure card flush stalls and power-loss behavior when hardware returns. Simulation does not establish physical-card durability."
+  "hardware_follow_up": "Reconcile physical ADC/log counts at configured rate and measure card flush stalls and power-loss behavior when hardware returns. Simulation does not establish physical-card durability.",
+  "publication_evidence": "docs/work-plans/evidence/prefreeze-release-publication-2026-10-19.json"
 }
