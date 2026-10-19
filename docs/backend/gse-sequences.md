@@ -221,3 +221,19 @@ The Actions tab includes two independent, confirmation-protected recovery contro
 
 Normal command authorization and button interlocks still apply. These are not
   substitutes for Abort, and do not cancel a launch sequence running on a board.
+
+## Clearing abort
+
+The on-screen **Clear GSE abort** button is available while the shared flight
+state is Aborted, in GSE actions and the State view. It has no physical-panel
+mapping. It requires command permission and explicit confirmation, and refuses
+an active sequence. Recovery persists and publishes Idle so reconnection uses
+the replacement shared state, clears the local sequence fault and resets
+operation checks. It preserves the T-clock and sends no output commands or
+automatic startup valve sequence. Repeat self-test and nitrogen test before fill.
+
+This does not clear a board-local abort latch. Clear GroundStation first, then
+remove all power from affected GSE boards before reconnecting them. The updated
+valve and actuator firmware retain their abort through software/watchdog/NRST
+resets while continuing communication. A retained latch clears when the hardware
+backup domain loses power, including any separate VBAT or USB/backfeed supply.

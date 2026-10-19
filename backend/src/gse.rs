@@ -605,6 +605,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(get_config).put(save_config).post(save_config),
         )
         .route("/api/gse/status", get(status))
+        .route("/api/gse/abort/clear", axum::routing::post(clear_abort))
         .route(
             "/api/gse/qualification/reset",
             axum::routing::post(reset_qualification),
@@ -750,6 +751,92 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clear_abort_rejects_non_aborted_and_active_sequences() {
+        let state = crate::state::tests::test_app_state().await;
+        for phase in [
+            FlightState::Idle,
+            FlightState::NitrousFill,
+            FlightState::Launch,
+            FlightState::Ascent,
+        ] {
+            *state.state.lock().unwrap() = phase;
+            assert_eq!(
+                clear_ground_abort(&state).unwrap_err().0,
+                StatusCode::CONFLICT
+            );
+            assert_eq!(state.local_flight_state_snapshot(), phase);
+        }
+        *state.state.lock().unwrap() = FlightState::Aborted;
+        state.gse.lock().unwrap().engine.status.phase = Phase::BaselineSetup;
+        assert_eq!(
+            clear_ground_abort(&state).unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Aborted);
+    }
+
+    #[tokio::test]
+    async fn clear_abort_publishes_idle_without_output_commands() {
+        let (state, sent, peer) = button_test_state().await;
+        *state.state.lock().unwrap() = FlightState::Aborted;
+        crate::network_variables::set_flight_state(
+            state.topology_router.get().unwrap(),
+            FlightState::Aborted as u8,
+        )
+        .unwrap();
+        let clock = state.launch_clock_snapshot();
+        #[cfg(not(feature = "hitl_mode"))]
+        let path = std::env::temp_dir().join(format!("gs-clear-abort-{}.json", std::process::id()));
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.engine.fault(0, "Operator abort");
+            rt.engine.config.dry_self_test_confirmed = true;
+            #[cfg(not(feature = "hitl_mode"))]
+            {
+                rt.operational.path = Some(path.clone());
+                rt.operational
+                    .saved
+                    .qualification
+                    .latch(Fault::TopologyLost);
+            }
+        }
+        clear_ground_abort(&state).unwrap();
+        for _ in 0..10 {
+            tick(&state, true);
+        }
+        pump_test_link(&state, &peer);
+        let cached = state
+            .topology_router
+            .get()
+            .unwrap()
+            .cached_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+            .expect("reconnecting nodes need a replacement managed value");
+        assert_eq!(cached.payload(), &[FlightState::Idle as u8]);
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+        assert_eq!(
+            crate::network_variables::flight_state(),
+            FlightState::Idle as u8
+        );
+        assert_eq!(state.launch_clock_snapshot(), clock);
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "clearing must not actuate outputs"
+        );
+        let rt = state.gse.lock().unwrap();
+        assert_eq!(rt.engine.status.phase, Phase::Idle);
+        assert!(!rt.engine.config.dry_self_test_confirmed);
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            let saved = operational::Saved::load(&path).unwrap();
+            assert!(saved.qualification.fault().is_none());
+            assert!(!saved.qualification.completed(Milestone::SelfTest));
+            assert_eq!(saved.qualification.generation(), 1);
+            assert!(rt.operational.startup_configured);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 
     pub(super) type TestCommands = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 
@@ -1131,6 +1218,78 @@ pub fn qd_confirmation(state: &AppState, sender: &str, key: u8, open: bool, sour
     #[cfg(feature = "hitl_mode")]
     let _ = (state, sender, key, open, source_ms);
 }
+/// Operator recovery only: never dispatch a valve, ignition or launch command.
+fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)> {
+    let mut rt = state.gse.lock().unwrap();
+    if *state.state.lock().unwrap() != FlightState::Aborted {
+        return Err((StatusCode::CONFLICT, "GroundStation is not aborted".into()));
+    }
+    if rt.engine.active() {
+        return Err((
+            StatusCode::CONFLICT,
+            "Stop the active sequence first".into(),
+        ));
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        if rt.operational.running {
+            return Err((
+                StatusCode::CONFLICT,
+                "Stop the active sequence first".into(),
+            ));
+        }
+        // Invalidate delayed completions and require explicit requalification.
+        rt.operational
+            .saved
+            .qualification
+            .reset()
+            .map_err(|e| (StatusCode::CONFLICT, e.into()))?;
+        rt.operational.saved.baseline = None;
+        rt.operational.saved.fill_target_kg = None;
+        rt.operational
+            .persist()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        rt.operational.persist_error = None;
+        rt.operational.qd = QdWait::default();
+        rt.operational.qd_dispatch_utc_ms = None;
+        // Do not restart automatic boot valve setup during abort recovery.
+        // The next explicit self-test establishes and checks its own baseline.
+        rt.operational.startup_configured = true;
+    }
+    let router = state.topology_router.get().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Network is not initialized".into(),
+    ))?;
+    // Update the persisted managed value as well as the local/UI state, so
+    // discovery and reconnection cannot replay this station's old abort value.
+    crate::network_variables::set_flight_state(router, FlightState::Idle as u8)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let config = rt.engine.config.clone();
+    rt.engine = Engine::default();
+    rt.engine.config = config;
+    rt.engine.config.dry_self_test_confirmed = false;
+    state.set_local_flight_state(FlightState::Idle);
+    drop(rt);
+    crate::sequences::refresh_action_policy_now(state);
+    state.broadcast_action_policy_snapshot();
+    Ok(())
+}
+
+async fn clear_abort(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let principal =
+        match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
+            Ok(p) => p,
+            Err(error) => return error,
+        };
+    if !principal.allows_command_name("ValveSelfTest") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match clear_ground_abort(&state) {
+        Ok(()) => Json(serde_json::json!({"cleared": true})).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 async fn reset_qualification(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let principal =
         match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
