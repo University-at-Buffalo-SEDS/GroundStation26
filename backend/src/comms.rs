@@ -44,7 +44,11 @@ const RAW_UART_COMMAND_SYNC_1: u8 = 0x5B;
 const RAW_UART_ASCII_SYNC_0: u8 = 0xA7;
 const RAW_UART_ASCII_SYNC_1: u8 = 0x7A;
 const RAW_UART_FRAME_HEADER_SIZE: usize = 4;
-const RAW_UART_MAX_FRAME_BYTES: usize = 4_096;
+const UART_READ_CHUNK_BYTES: usize = 512;
+// A read can finish a maximum-sized payload and also start the next frame.
+// Keep the framing header and one read of headroom before applying the cap.
+const RAW_UART_MAX_FRAME_BYTES: usize =
+    STREAM_PACKET_MAX_SIZE + RAW_UART_FRAME_HEADER_SIZE + UART_READ_CHUNK_BYTES;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
 const RADIO_SCHED_MAGIC_0: u8 = 0x52;
 const RADIO_SCHED_MAGIC_1: u8 = 0x53;
@@ -366,7 +370,7 @@ impl UartComms {
         self.update_uart_timeout_mode()?;
         #[cfg(target_os = "linux")]
         {
-            let mut scratch = [0u8; 512];
+            let mut scratch = [0u8; UART_READ_CHUNK_BYTES];
             match read_once_fd_with_poll(self.inner.as_raw_fd(), &mut scratch, timeout) {
                 Ok(0) => {
                     maybe_log_raw_uart_read_outcome(
@@ -419,7 +423,7 @@ impl UartComms {
             } else {
                 None
             };
-            let mut scratch = [0u8; 512];
+            let mut scratch = [0u8; UART_READ_CHUNK_BYTES];
             let result = match self.inner.read(&mut scratch) {
                 Ok(0) => {
                     maybe_log_raw_uart_read_outcome(
@@ -2968,6 +2972,30 @@ mod raw_uart_tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].data_type(), packet.data_type());
         assert_eq!(delivered[0].payload(), packet.payload());
+    }
+
+    #[test]
+    fn raw_uart_maximum_frame_survives_a_read_straddling_the_next_frame() {
+        let payload = vec![0x33; STREAM_PACKET_MAX_SIZE];
+        let next = vec![9, 8, 7];
+        let mut stream = build_raw_uart_frame(&payload).unwrap();
+        stream.extend_from_slice(&build_raw_uart_frame(&next).unwrap());
+        let mut buffered = Vec::new();
+        let mut received = Vec::new();
+        // Match the real reader: a 512-byte read can finish one frame and
+        // include the start of another. A legal payload plus its UART header
+        // must never be clipped by a payload-sized buffer ceiling.
+        for bytes in stream.chunks(UART_READ_CHUNK_BYTES) {
+            buffered.extend_from_slice(bytes);
+            while let Some((kind, body)) = take_raw_uart_framed_payload(&mut buffered).unwrap() {
+                assert!(matches!(kind, RawUartFrameKind::Data));
+                received.push(body);
+            }
+        }
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0], payload);
+        assert_eq!(received[1], next);
+        assert!(buffered.is_empty());
     }
 
     #[test]

@@ -2,8 +2,8 @@
 
 The application `admin` role controls accounts and opens the administration
 area from the dashboard. Stream-only administrators cannot manage accounts.
-An application administrator does not automatically receive hardware command
-or calibration permission.
+Application administrators inherit every application permission, including commands,
+calibration, voice and stream management. Hardware interlocks still apply.
 
 Bootstrap an existing account locally, using the same users configuration
 file as the backend:
@@ -14,7 +14,7 @@ python3 backend/tools/users_config_gui.py set-role USER admin grant
 ```
 
 Check the tool's `--file` option when the service uses a nondefault path.
-This grants data viewing and the administration role, not hardware control.
+This grants the administration role and its full application access.
 No account is created or elevated automatically by an upgrade.
 
 The administration page supports account creation, disabling, permissions,
@@ -25,5 +25,5 @@ returns password hashes. At least one enabled administrator with data access
 must remain.
 
 Broadcast, dashboard-view editing and voice controls are linked from the
-administration area and retain their own permissions. Creating an account
+administration area. Other roles retain their explicit permissions. Creating an account
 starts with viewing permission only; grant command access deliberately.

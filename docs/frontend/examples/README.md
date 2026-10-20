@@ -14,7 +14,7 @@ usable credentials. Replace `EXAMPLE_*_TICKET` values with server-issued scoped 
 - [Program state](program-state.json): delayed telemetry plus current editorial state;
   telemetry may instead be null while history warms.
 - [Role list](stream-roles.json) and [role change](stream-role-change.request.json):
-  admin-only API examples; assignment does not grant hardware commands.
+  admin-only API examples; application admins inherit all application permissions.
 
 The [presentation profile](../../backend/presentation.example.json) shows backend
 binding configuration. Empty/missing `stats` inherits defaults; nonempty replaces
