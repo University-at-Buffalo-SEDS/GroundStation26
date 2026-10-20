@@ -101,6 +101,19 @@ async fn save_user_inner(
     {
         return (StatusCode::BAD_REQUEST, "Invalid username or command list").into_response();
     }
+    // Reject self-demotion before hashing passwords or invalidating sessions.
+    if principal
+        .username
+        .as_deref()
+        .is_some_and(|actor| actor.eq_ignore_ascii_case(&account.username))
+        && (account.disabled || !account.roles.contains(&StreamRole::Admin))
+    {
+        return (
+            StatusCode::CONFLICT,
+            "You cannot remove your own administrator access or disable your account",
+        )
+            .into_response();
+    }
     let password = account
         .password
         .take()
@@ -379,6 +392,69 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert!(!state.auth.load_users_file().unwrap().users[0].disabled);
+    }
+    #[tokio::test]
+    async fn admin_cannot_demote_self_even_with_another_admin() {
+        let (_root, state, headers) = fixture("admin").await;
+        state
+            .auth
+            .update_users(|config| {
+                config.users[1].roles = vec![StreamRole::Admin];
+                Ok(())
+            })
+            .unwrap();
+        let mut account = Account::from(state.auth.load_users_file().unwrap().users.remove(0));
+        account.username = "ADMINISTRATOR".into();
+        account.roles.clear();
+        account.password = Some("must not revoke this session".into());
+        assert_eq!(
+            save_user(State(state.clone()), headers, Json(account))
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(
+            state.auth.load_users_file().unwrap().users[0]
+                .roles
+                .contains(&StreamRole::Admin)
+        );
+        assert!(
+            state
+                .auth
+                .authorize_token(&state.auth_db, Some("admin-test"), Permission::ViewData)
+                .await
+                .is_ok()
+        );
+    }
+    #[tokio::test]
+    async fn admin_can_grant_and_revoke_another_users_admin_access() {
+        let (_root, state, headers) = fixture("admin").await;
+        let mut account = Account::from(state.auth.load_users_file().unwrap().users.remove(1));
+        account.roles = vec![StreamRole::Admin];
+        assert_eq!(
+            save_user(State(state.clone()), headers.clone(), Json(account))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(
+            state.auth.load_users_file().unwrap().users[1]
+                .roles
+                .contains(&StreamRole::Admin)
+        );
+        let mut account = Account::from(state.auth.load_users_file().unwrap().users.remove(1));
+        account.roles.clear();
+        assert_eq!(
+            save_user(State(state.clone()), headers, Json(account))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(
+            !state.auth.load_users_file().unwrap().users[1]
+                .roles
+                .contains(&StreamRole::Admin)
+        );
     }
     #[tokio::test]
     async fn permission_revocation_applies_to_existing_operator_sessions() {

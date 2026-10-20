@@ -98,8 +98,19 @@ The unused fill-box field is required by the shared configuration format; RRLS
 does not open it. Select this file with `GS_COMMS_LINK_CONFIG`.
 
 ```sh
-GS_COMMS_LINK_CONFIG=/etc/rrls/comms.json python3 run_groundstation.py --rrls --backend-only-build
+GS_COMMS_LINK_CONFIG=/etc/rrls/comms.json python3 run_rrls.py --backend-only-build
 ```
+
+On macOS, run the same launcher with an unprivileged HTTPS port:
+
+```sh
+GS_COMMS_LINK_CONFIG=/path/to/rrls-comms.json GS_HTTPS_BIND_ADDRESS=0.0.0.0:3443 python3 run_rrls.py
+```
+
+Open `https://localhost:3443`. Use the Mac's actual `/dev/cu.*` radio device in
+`rrls-comms.json`. `run_rrls.py` accepts the same options as
+`run_groundstation.py`, including `--debug` and `--backend-only-build`;
+it always enables RRLS mode. Run `python3 run_rrls.py --help` to list options.
 
 For boot-time operation, adapt [rrls.service](rrls.service) to the installed user
 and paths. `GS_USERS_FILE` selects RRLS's own users file; provision accounts using
