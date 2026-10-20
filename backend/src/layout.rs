@@ -10,6 +10,8 @@ const DEFAULT_TEST_FIRE_LAYOUT_PATH: &str = "layout/layout_test_fire.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
+    #[serde(default)]
+    pub test_fire_mode: bool,
     pub version: u32,
     #[serde(default)]
     pub branding: BrandingConfig,
@@ -677,6 +679,7 @@ pub fn load_layout() -> Result<LayoutConfig, String> {
 }
 
 fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
+    layout.test_fire_mode = cfg!(feature = "test_fire_mode");
     ensure_gse_sequence_actions(layout);
     #[cfg(feature = "hitl_mode")]
     for (cmd, label) in [

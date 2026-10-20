@@ -14,7 +14,7 @@ try {
   const page=await browser.newPage({viewport:{width:360,height:800}});
   const errors=[];page.on('pageerror',e=>errors.push(e.message));
   const start=Date.now()-20000;
-  let live=true,offline=false,layout='hero',delay=3,audioCursor=0;
+  let live=true,offline=false,layout='hero',delay=3,audioCursor=0,replay=null;
   await page.addInitScript(()=>{
     window.audioFrames=0;
     const start=AudioBufferSourceNode.prototype.start;
@@ -31,13 +31,16 @@ try {
     if(path==='/assets/three/vehicle-renderer.js')return route.fulfill({contentType:'text/javascript',body:"customElements.define('gs-vehicle-viewer',class extends HTMLElement{});"});
     if(path==='/api/media-assets/program/state') {
       if(offline)return route.fulfill({status:503,body:'offline'});
-      return route.fulfill({json:{server_now_ms:Date.now(),broadcast:{delay_seconds:delay,comms_audio_enabled:true,label:'Test mission',featured_stream_id:'camera',layout},streams:live?['camera','other'].map(id=>({id,label:id,url:`/hls/${id}/index.m3u8`})):[],telemetry:{phase:'Idle',t_clock:'T− 00:10.00',stats:[{label:'Altitude',value:12,precision:1,unit:'m'}]}}});
+      return route.fulfill({json:{server_now_ms:Date.now(),broadcast:{replay:replay&&Date.now()<replay.started_at_ms+replay.duration_seconds*1000/replay.speed?replay:null,delay_seconds:delay,comms_audio_enabled:true,label:'Test mission',featured_stream_id:'camera',layout},streams:live?(replay&&Date.now()<replay.started_at_ms+replay.duration_seconds*1000/replay.speed?replay.cameras.map(c=>c.id):['camera','other']).map(id=>({id,label:id,url:`/hls/${id}/index.m3u8`})):[],telemetry:{phase:'Idle',t_clock:'T− 00:10.00',stats:[{label:'Altitude',value:12,precision:1,unit:'m'}]}}});
     }
     if(path==='/api/media-assets/program/audio')return route.fulfill({json:{enabled:true,generation:1,cursor:++audioCursor,frames:[{id:1,pcm:Buffer.alloc(640).toString('base64')}]}});
     if(path.endsWith('index.m3u8')){
-      const end=Math.floor((Date.now()-start)/1000)-delay;
-      const lines=['#EXTM3U','#EXT-X-VERSION:7','#EXT-X-TARGETDURATION:1','#EXT-X-MEDIA-SEQUENCE:0','#EXT-X-MAP:URI="init.mp4"'];
-      for(let i=0;i<end;i++)lines.push(`#EXT-X-PROGRAM-DATE-TIME:${new Date(start+i*1000).toISOString()}`,'#EXTINF:1,',`seg${i}.m4s`);
+      const frozen=replay&&Date.now()<replay.started_at_ms+replay.duration_seconds*1000/replay.speed;
+      const first=frozen?Math.max(0,Math.floor((replay.source_end_ms-replay.duration_seconds*1000-start)/1000)):0;
+      const end=frozen?Math.ceil((replay.source_end_ms-start)/1000):Math.floor((Date.now()-start)/1000)-delay;
+      const lines=['#EXTM3U','#EXT-X-VERSION:7','#EXT-X-TARGETDURATION:1',`#EXT-X-MEDIA-SEQUENCE:${first}`,'#EXT-X-MAP:URI="init.mp4"'];
+      for(let i=first;i<end;i++)lines.push(`#EXT-X-PROGRAM-DATE-TIME:${new Date(start+i*1000).toISOString()}`,'#EXTINF:1,',`seg${i}.m4s`);
+      if(frozen)lines.push('#EXT-X-ENDLIST');
       return route.fulfill({contentType:'application/vnd.apple.mpegurl',body:lines.join('\n')+'\n'});
     }
     const file=path.split('/').pop();
@@ -65,6 +68,23 @@ try {
     assert(boxes.bar.y>=boxes.view.bottom-1,'status bar does not cover video');
     assert(boxes.width<=size.width,'no horizontal overflow');
   }
+  await page.setViewportSize({width:360,height:800});
+  // The second camera was not on air in hero mode; replay selects it first.
+  replay={id:'replay-one',duration_seconds:6,speed:0.25,started_at_ms:Date.now(),source_end_ms:Date.now()-delay*1000-2500,cameras:[{id:'other',x:20,y:70,zoom:2},{id:'camera',x:50,y:50,zoom:1}]};
+  await page.waitForFunction(()=>document.querySelectorAll('video').length===2&&[...document.querySelectorAll('video')].every(v=>v.playbackRate===0.25&&v.style.opacity==='1'));
+  assert.match(await page.locator('#banner').innerText(),/Replay/i);
+  const second=page.locator('video[aria-label="other"]');
+  assert.equal(await second.evaluate(v=>v.style.transform),'scale(2)');
+  const clipBefore=await second.evaluate(v=>v.currentTime);await page.waitForTimeout(2400);
+  const advanced=(await second.evaluate(v=>v.currentTime))-clipBefore;
+  assert(advanced>0.2&&advanced<1.5,'quarter-speed video advances without chasing live time: '+advanced);
+  replay.cameras.reverse();replay.cameras.find(c=>c.id==='other').zoom=2.5;
+  await page.waitForFunction(()=>document.querySelector('video[aria-label="other"]').style.transform==='scale(2.5)');
+  const positions=await page.locator('video').evaluateAll(vs=>Object.fromEntries(vs.map(v=>[v.getAttribute('aria-label'),v.parentElement.style.top])));
+  assert.equal(positions.camera,'0%');assert.equal(positions.other,'50%','reorder changes existing decoder tiles');
+  replay.started_at_ms=Date.now()-30000;
+  await page.waitForFunction(()=>document.querySelectorAll('video').length===1&&document.querySelector('video').playbackRate===1&&document.querySelector('video').style.opacity==='1');
+  replay=null;
   await page.setViewportSize({width:360,height:800});layout='grid';
   await page.waitForFunction(()=>document.querySelectorAll('video').length===2&&[...document.querySelectorAll('video')].every(v=>v.style.opacity==='1'));
   assert.deepEqual(await page.locator('video').evaluateAll(v=>v.map(x=>x.style.width)),['100%','100%'],'portrait grid stacks cameras');

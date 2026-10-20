@@ -4,6 +4,8 @@ use serde::Deserialize;
 use std::{collections::BTreeMap, time::Instant};
 #[path = "program.rs"]
 mod program;
+#[path = "replay.rs"]
+pub(crate) mod replay;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -15,6 +17,7 @@ pub(super) struct Broadcast {
     hidden_stream_ids: Vec<String>,
     layout: String,
     revision: u64,
+    replay: Option<replay::Plan>,
 }
 
 impl Default for Broadcast {
@@ -27,6 +30,7 @@ impl Default for Broadcast {
             hidden_stream_ids: Vec::new(),
             layout: "hero".into(),
             revision: 0,
+            replay: None,
         }
     }
 }
@@ -189,6 +193,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
     Router::new()
         .route("/api/live_streams", get(live_streams))
         .route("/api/live_streams/control", post(control_broadcast))
+        .merge(replay::routes())
         .merge(program::routes())
         .route("/assets/three/{file}", get(three_asset))
         .route(
@@ -248,8 +253,14 @@ async fn read_presentation(state: &MediaState) -> ApiResult<Presentation> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Presentation::default()),
             Err(err) => Err(io_error(err)),
         }?;
+    if let Some(plan) = &presentation.broadcast.replay {
+        if !replay::available(state, plan).await { presentation.broadcast.replay = None; }
+    }
     if presentation.stats.is_empty() {
         presentation.stats = default_stats();
+    }
+    if cfg!(feature="test_fire_mode") && !presentation.stats.iter().any(|s|s.label=="Thrust") {
+        presentation.stats.push(BroadcastStat{label:"Thrust".into(),unit:"N".into(),precision:1,binding:Binding{data_type:"LOADCELL_WEIGHT_KG".into(),sender_id:None,index:0,scale:9.80665,offset:0.0}});
     }
     Ok(presentation)
 }
@@ -493,6 +504,7 @@ async fn control_broadcast(
             "Broadcast changed; refresh before editing",
         ));
     }
+    replay::prepare(&state, &mut broadcast, &presentation.broadcast).await?;
     broadcast.revision = presentation
         .broadcast
         .revision

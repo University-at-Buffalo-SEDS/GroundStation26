@@ -54,7 +54,7 @@ async fn page(
     )
         .into_response())
 }
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -99,16 +99,18 @@ async fn program_state(
     authorize(&state, &headers, Permission::ViewData).await?;
     let presentation = read_presentation(&state).await?;
     let mut streams = Vec::new();
-    for stream in fetch_streams(&state)
-        .await
-        .unwrap_or_default()
-        .0
-        .into_iter()
-        .filter(|s| s.live && !presentation.broadcast.hidden_stream_ids.contains(&s.id))
-        .take(8)
-    {
-        let access = ticket(&state, &headers, &format!("stream:{}", stream.id)).await?;
-        streams.push(serde_json::json!({"id":stream.id,"label":presentation.stream_labels.get(&stream.id).unwrap_or(&stream.id),"url":format!("/api/media-assets/hls/{}/index.m3u8?ticket={access}",stream.id)}));
+    let available = fetch_streams(&state).await.unwrap_or_default().0;
+    let chosen: Vec<String> = if let Some(replay)=&presentation.broadcast.replay {
+        replay.cameras.iter().map(|c|c.id.clone()).collect()
+    } else {
+        available.iter().filter(|s|s.live && !presentation.broadcast.hidden_stream_ids.contains(&s.id)).take(8).map(|s|s.id.clone()).collect()
+    };
+    for id in chosen {
+        let access = ticket(&state, &headers, &format!("stream:{id}")).await?;
+        let url = if let Some(replay)=&presentation.broadcast.replay {
+            format!("/api/media-assets/replay/{}/{id}/index.m3u8?ticket={access}",replay.id)
+        }else{format!("/api/media-assets/hls/{id}/index.m3u8?ticket={access}")};
+        streams.push(serde_json::json!({"id":id,"label":presentation.stream_labels.get(&id).unwrap_or(&id),"url":url}));
     }
     let model = load_vehicle(state.clone(), headers.clone()).await?;
     let now = now_ms();
@@ -127,13 +129,15 @@ async fn program_state(
     {
         history.pop_front();
     }
-    let target = now.saturating_sub(presentation.broadcast.delay_seconds as u64 * 1000 + 2500);
-    let telemetry = history
+    let target = presentation.broadcast.replay.as_ref().map(|p|p.target(now)).unwrap_or_else(||now.saturating_sub(presentation.broadcast.delay_seconds as u64 * 1000 + 2500));
+    let live_telemetry = history
         .iter()
         .rev()
         .find(|(t, _)| *t <= target)
         .filter(|(t, _)| target.saturating_sub(*t) < 2000)
         .map(|(_, v)| v.clone());
+    drop(history);
+    let telemetry=if let Some(plan)=&presentation.broadcast.replay {super::replay::telemetry(&state,&plan.id,target).await}else{live_telemetry};
     Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"model":model,"server_now_ms":now,"telemetry":telemetry}))).into_response())
 }
 
@@ -151,7 +155,7 @@ async fn program_audio(
 ) -> ApiResult<Response> {
     authorize_media(&state, &headers, &query, "program").await?;
     let broadcast = read_presentation(&state).await?.broadcast;
-    let batch = if broadcast.comms_audio_enabled {
+    let batch = if broadcast.comms_audio_enabled && broadcast.replay.is_none() {
         state
             .voice
             .audience_batch(cursor.after, broadcast.delay_seconds)
@@ -200,10 +204,12 @@ async fn dashboard_status(
     )
         .into_response())
 }
-fn telemetry_snapshot(app: &AppState, presentation: &Presentation, now: u64) -> serde_json::Value {
+pub(super) fn telemetry_snapshot(app: &AppState, presentation: &Presentation, now: u64) -> serde_json::Value {
+    let phase=*app.state.lock().unwrap();
+    let fill_visible=cfg!(feature="test_fire_mode") || matches!(phase,crate::types::FlightState::Startup|crate::types::FlightState::Idle|crate::types::FlightState::PreFill|crate::types::FlightState::FillTest|crate::types::FlightState::NitrogenFill|crate::types::FlightState::NitrousFill|crate::types::FlightState::Armed|crate::types::FlightState::Aborted);
     let stats: Vec<_> = {
         let rows = app.recent_telemetry_cache.lock().unwrap();
-        presentation.stats.iter().map(|stat|{
+        presentation.stats.iter().filter(|stat|fill_visible || !matches!(stat.binding.data_type.as_str(),"KG50"|"KG1000"|"LOADCELL_WEIGHT_KG"|"LOADCELL_50_WEIGHT_KG"|"LOADCELL_FILL_PERCENT"|"FUEL_TANK_PRESSURE"|"PRESSURE_TRANSDUCER_CALIBRATED"|"VALVE_STATE")).map(|stat|{
             let b=&stat.binding;
             let value=rows.iter().rev().find(|r|r.data_type==b.data_type && b.sender_id.as_ref().is_none_or(|s|s==&r.sender_id))
                 .filter(|r|r.timestamp_ms>=0 && now.saturating_sub(r.timestamp_ms as u64)<5000)
@@ -211,7 +217,7 @@ fn telemetry_snapshot(app: &AppState, presentation: &Presentation, now: u64) -> 
             serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision.min(6),"binding":b})
         }).collect()
     };
-    serde_json::json!({"phase":format!("{:?}",*app.state.lock().unwrap()),"stats":stats,"t_clock":program_t_clock(&app.launch_clock_snapshot(),now.min(i64::MAX as u64) as i64)})
+    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":cfg!(feature="test_fire_mode"),"stats":stats,"t_clock":program_t_clock(&app.launch_clock_snapshot(),now.min(i64::MAX as u64) as i64)})
 }
 
 fn valid_hls_file(name: &str) -> bool {
@@ -225,7 +231,7 @@ fn valid_hls_file(name: &str) -> bool {
             .iter()
             .any(|s| name.ends_with(s))
 }
-fn rewrite_playlist(text: &str, ticket: &str) -> Result<String, ()> {
+pub(super) fn rewrite_playlist(text: &str, ticket: &str) -> Result<String, ()> {
     let uri = |v: &str| -> Result<String, ()> {
         parse_hls_uri(v)?;
         Ok(format!(
@@ -251,7 +257,7 @@ fn rewrite_playlist(text: &str, ticket: &str) -> Result<String, ()> {
         .collect::<Result<Vec<_>, _>>()
         .map(|v| v.join("\n") + "\n")
 }
-fn parse_hls_uri(uri: &str) -> Result<&str, ()> {
+pub(super) fn parse_hls_uri(uri: &str) -> Result<&str, ()> {
     let (file, query) = uri
         .split_once('?')
         .map_or((uri, None), |(f, q)| (f, Some(q)));
@@ -277,7 +283,7 @@ fn parse_hls_uri(uri: &str) -> Result<&str, ()> {
 }
 /// Retain only complete segments older than the audience delay. This is enforced
 /// again on segment fetch, not merely a seek instruction in a viewer's browser.
-fn delayed_playlist(text: &str, cutoff: u64) -> Result<(String, Vec<(String, u64)>), ()> {
+pub(super) fn delayed_playlist(text: &str, cutoff: u64) -> Result<(String, Vec<(String, u64)>), ()> {
     if !text.contains("#EXTINF:") {
         return Ok((text.into(), Vec::new()));
     }

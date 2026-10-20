@@ -262,6 +262,7 @@ mod tests {
             voice: Arc::new(crate::voice::VoiceHub::default()),
             presentation_write: Mutex::new(()),
             tickets: Mutex::new(Vec::new()),
+            replays: Mutex::new(Default::default()),
             program_history: Mutex::new(std::collections::VecDeque::new()),
             hls_segments: Mutex::new(std::collections::HashMap::new()),
             preview_sessions: Mutex::new(Vec::new()),

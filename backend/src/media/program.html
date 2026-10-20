@@ -35,7 +35,7 @@ function modelDisplay(videoReady,tile=null){
  const fresh=state&&lastPoll&&performance.now()-lastPoll<=2500;
  const telemetry=fresh?state.telemetry:null;
  const phase=telemetry?.phase||'Unknown';
- const onGround=['Startup','Idle','PreFill','FillTest','NitrogenFill','NitrousFill','Armed'].includes(phase);
+ const onGround=!!telemetry?.test_fire_mode||['Startup','Idle','PreFill','FillTest','NitrogenFill','NitrousFill','Armed'].includes(phase);
  const svg=inset.querySelector('svg');
  let equipment=svg.querySelector('#ground-equipment');
  if(!equipment){
@@ -47,7 +47,7 @@ function modelDisplay(videoReady,tile=null){
  svg.setAttribute('viewBox',onGround?'-110 0 215 180':'0 0 100 180');
  
  inset.setAttribute('aria-label',onGround?'Delayed rocket and fill equipment':'Delayed rocket state');
- const selected=state?.broadcast.layout==='model'||!!tile;
+ const selected=!state?.broadcast.replay&&(state?.broadcast.layout==='model'||!!tile);
  const flat=!selected&&!videoReady;
  const show=selected||flat;
  window.gsProgramArt.layout(holder,inset,document.querySelector('#program-bar'),flat);
@@ -68,11 +68,11 @@ function modelDisplay(videoReady,tile=null){
  document.querySelector('#flame').style.display=phase==='Ascent'?'':'none';
  document.querySelector('#chute').style.display=['ParachuteDeploy','Descent','Landed','Recovery'].includes(phase)?'':'none';
 }
-function remove(id){const p=players.get(id);if(p){p.hls.destroy();p.video.remove();players.delete(id);}}
+function remove(id){const p=players.get(id);if(p){p.hls.destroy();p.tile.remove();players.delete(id);}}
 function create(feed){
- const video=document.createElement('video');sound(video);video.playsInline=true;video.disableRemotePlayback=true;video.preload='auto';video.setAttribute('aria-label',feed.label);stage.append(video);
+ const video=document.createElement('video');sound(video);video.playsInline=true;video.disableRemotePlayback=true;video.preload='auto';video.setAttribute('aria-label',feed.label);const tile=document.createElement("div");tile.style.cssText="position:absolute;overflow:hidden;width:100%;height:100%";video.style.cssText="position:absolute;width:100%;height:100%";tile.append(video);stage.append(tile);
  const hls=new Hls({autoStartLoad:false,lowLatencyMode:false,maxBufferLength:12,maxMaxBufferLength:20,backBufferLength:5,liveSyncDuration:3,liveMaxLatencyDuration:85,maxLiveSyncPlaybackRate:1,enableWorker:true});
- const p={video,hls,details:null,started:false,ready:false,failed:false,lastFrame:0,lastSeek:-Infinity};players.set(feed.id,p);
+ const p={video,tile,hls,details:null,started:false,ready:false,failed:false,lastFrame:0,lastSeek:-Infinity};players.set(feed.id,p);
  hls.on(Hls.Events.MANIFEST_PARSED,()=>hls.startLoad(-1));
  hls.on(Hls.Events.LEVEL_LOADED,(_,data)=>{p.details=data.details;});
  hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal){p.failed=true;video.style.opacity=0;lastVideoError=data.type===Hls.ErrorTypes.MEDIA_ERROR?'Video decoder failed — check H.264 codec support in the native app':'Video connection failed — retrying buffered stream';}});
@@ -80,15 +80,15 @@ function create(feed){
  if(video.requestVideoFrameCallback){const frame=()=>{p.lastFrame=performance.now();if(!stopped&&players.get(feed.id)===p)video.requestVideoFrameCallback(frame);};video.requestVideoFrameCallback(frame);}
 }
 function card(name,value){const card=document.createElement('div'),a=document.createElement('div'),b=document.createElement('div');a.className='name';b.className='value';a.textContent=name;b.textContent=value;card.append(a,b);banner.append(card);}
-function drawBanner(){banner.replaceChildren();card('Mission',state.broadcast.label||'Program');card('Video delay',state.broadcast.delay_seconds+' s');const telemetry=state.telemetry;card('T clock',telemetry?.t_clock||'—');if(!telemetry){card('Telemetry','Buffering delayed telemetry');return;}card('Flight phase',telemetry.phase);const page=Math.floor(serverNow()/5000)%Math.max(1,Math.ceil(telemetry.stats.length/3));for(const stat of telemetry.stats.slice(page*3,page*3+3)){card(stat.label,stat.value==null?'—':Number(stat.value).toFixed(stat.precision)+' '+stat.unit);}}
+function drawBanner(){banner.replaceChildren();card('Mission',state.broadcast.label||'Program');card(state.broadcast.replay?'Replay':'Video delay',state.broadcast.replay?state.broadcast.replay.duration_seconds+' s · '+state.broadcast.replay.speed+'×':state.broadcast.delay_seconds+' s');const telemetry=state.telemetry;card('T clock',telemetry?.t_clock||'—');if(!telemetry){card('Telemetry',state.broadcast.replay?'No telemetry captured for this replay':'Buffering delayed telemetry');return;}card('Flight phase',telemetry.phase);const page=Math.floor(serverNow()/5000)%Math.max(1,Math.ceil(telemetry.stats.length/3));for(const stat of telemetry.stats.slice(page*3,page*3+3)){card(stat.label,stat.value==null?'—':Number(stat.value).toFixed(stat.precision)+' '+stat.unit);}}
 async function poll(){
  try{
   const start=Date.now(),r=await fetch('/api/media-assets/program/state?ticket='+encodeURIComponent(ticket),{cache:'no-store'});if(!r.ok)throw Error('Program unavailable');const next=await r.json();clockOffset=next.server_now_ms-(start+Date.now())/2;
-  if(state&&next.broadcast.delay_seconds!==state.broadcast.delay_seconds){for(const id of [...players.keys()])remove(id);displayed='';}
+  if(state&&(next.broadcast.delay_seconds!==state.broadcast.delay_seconds||(next.broadcast.replay?.id||'')!==(state.broadcast.replay?.id||''))){for(const id of [...players.keys()])remove(id);displayed='';}
   state=next;lastPoll=performance.now();
-  window.gsProgramAudioState={enabled:state.broadcast.comms_audio_enabled,delay:state.broadcast.delay_seconds,fresh:true};window.dispatchEvent(new CustomEvent("gs-program-audio-state",{detail:window.gsProgramAudioState}));
+  window.gsProgramAudioState={enabled:state.broadcast.comms_audio_enabled&&!state.broadcast.replay,delay:state.broadcast.delay_seconds,fresh:true};window.dispatchEvent(new CustomEvent("gs-program-audio-state",{detail:window.gsProgramAudioState}));
   // Decode only the featured camera in hero mode, especially on the Pi.
-  const feeds=state.broadcast.layout==='model'?[]:['grid','grid-model'].includes(state.broadcast.layout)?state.streams:state.streams.filter(s=>s.id===(state.streams.find(s=>s.id===state.broadcast.featured_stream_id)||state.streams[0])?.id);
+  const feeds=state.broadcast.replay?state.streams:state.broadcast.layout==='model'?[]:['grid','grid-model'].includes(state.broadcast.layout)?state.streams:state.streams.filter(s=>s.id===(state.streams.find(s=>s.id===state.broadcast.featured_stream_id)||state.streams[0])?.id);
   const ids=new Set(feeds.map(s=>s.id));for(const id of [...players.keys()])if(!ids.has(id))remove(id);
   for(const feed of feeds){if(players.get(feed.id)?.failed)remove(feed.id);if(supportsVideo&&!players.has(feed.id))create(feed);}
   drawBanner();
@@ -98,8 +98,16 @@ async function poll(){
 function render(){
  if(stopped)return;
  if(!state||!lastPoll||performance.now()-lastPoll>2500){for(const p of players.values()){p.video.pause();p.video.style.opacity=0;}modelDisplay(false);return;}
- const target=serverNow()-state.broadcast.delay_seconds*1000-2500;
- for(const p of players.values()){
+ const replay=state.broadcast.replay;
+ const layout=replay?(state.streams.length>1?"grid":"hero"):state.broadcast.layout;
+ const target=replay?Math.min(replay.source_end_ms,replay.source_end_ms-replay.duration_seconds*1000+Math.max(0,serverNow()-replay.started_at_ms)*replay.speed):serverNow()-state.broadcast.delay_seconds*1000-2500;
+ for(const [id,p] of players){
+  const frame=replay?.cameras.find(c=>c.id===id);
+  p.video.playbackRate=replay?.speed||1;
+  p.video.style.objectFit=frame&&frame.zoom>1?'cover':'contain';
+  p.video.style.objectPosition=frame?`${frame.x}% ${frame.y}%`:'50% 50%';
+  p.video.style.transform=frame?`scale(${frame.zoom})`:'none';
+  p.video.style.transformOrigin=frame?`${frame.x}% ${frame.y}%`:'50% 50%';
   p.ready=false;const fragments=p.details?.fragments||[];
   const f=fragments.find(f=>f.programDateTime!=null&&f.programDateTime<=target&&f.endProgramDateTime>target);
   if(!f){p.video.pause();p.video.style.opacity=0;continue;}
@@ -113,17 +121,17 @@ function render(){
   p.ready=!p.failed&&time!=null&&Math.abs(time-target)<1500&&p.video.readyState>=2&&!p.video.seeking&&frameFresh;
   p.video.play().catch(()=>{});
  }
- const preferred=players.has(state.broadcast.featured_stream_id)?state.broadcast.featured_stream_id:state.streams[0]?.id;
- if(state.broadcast.layout==='model'){
+ const preferred=replay?state.streams[0]?.id:players.has(state.broadcast.featured_stream_id)?state.broadcast.featured_stream_id:state.streams[0]?.id;
+ if(layout==='model'){
   status.textContent='3D model selected by stream operator';modelDisplay(false);
- }else if(['grid','grid-model'].includes(state.broadcast.layout)){
-  const entries=[...players.entries()],withModel=state.broadcast.layout==='grid-model',count=entries.length+(withModel?1:0),columns=stage.clientWidth<500?1:count<=1?1:count<=4?2:3,rows=Math.max(1,Math.ceil(count/columns));let ready=0;
-  entries.forEach(([id,p],i)=>{p.video.style.zIndex='1';p.video.style.width=100/columns+'%';p.video.style.height=100/rows+'%';p.video.style.left=(i%columns)*100/columns+'%';p.video.style.top=Math.floor(i/columns)*100/rows+'%';p.video.style.opacity=p.ready?'1':'0';if(p.ready)ready++;});
+ }else if(['grid','grid-model'].includes(layout)){
+  const entries=state.streams.map(s=>[s.id,players.get(s.id)]).filter(([,p])=>p),withModel=layout==='grid-model',count=entries.length+(withModel?1:0),columns=stage.clientWidth<500?1:count<=1?1:count<=4?2:3,rows=Math.max(1,Math.ceil(count/columns));let ready=0;
+  entries.forEach(([id,p],i)=>{p.tile.style.zIndex='1';p.tile.style.width=100/columns+'%';p.tile.style.height=100/rows+'%';p.tile.style.left=(i%columns)*100/columns+'%';p.tile.style.top=Math.floor(i/columns)*100/rows+'%';p.video.style.opacity=p.ready?'1':'0';if(p.ready)ready++;});
   status.textContent=!supportsVideo?unsupportedVideo:ready?'':state.streams.length?(lastVideoError||'Buffering delayed video'):'No active camera';displayed='';modelDisplay(ready>0,withModel?{left:(entries.length%columns)*100/columns+'%',top:Math.floor(entries.length/columns)*100/rows+'%',width:100/columns+'%',height:100/rows+'%'}:null);
  }else{
-  for(const p of players.values()){p.video.style.width='100%';p.video.style.height='100%';p.video.style.left='0';p.video.style.top='0';}
+  for(const p of players.values()){p.tile.style.width='100%';p.tile.style.height='100%';p.tile.style.left='0';p.tile.style.top='0';}
   displayed=players.get(preferred)?.ready?preferred:'';
-  for(const [id,p]of players){p.video.style.zIndex=id===displayed?'2':'1';p.video.style.opacity=id===displayed&&p.ready?'1':'0';}
+  for(const [id,p]of players){p.tile.style.zIndex=id===displayed?'2':'1';p.video.style.opacity=id===displayed&&p.ready?'1':'0';}
   status.textContent=!supportsVideo?unsupportedVideo:players.get(displayed)?.ready?'':state.streams.length?(lastVideoError||'Buffering delayed video'):'No active camera';modelDisplay(!!players.get(displayed)?.ready);
  }
 }
